@@ -1728,8 +1728,33 @@ class WebCrawlConfig(BaseModel):
 
     # Other configuration
     user_agent: Optional[str] = Field(
-        default="Mozilla/5.0 (xagent WebCrawler/1.0)",
-        description="User-Agent string for HTTP requests",
+        default=(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/130.0.0.0 Safari/537.36"
+        ),
+        description=(
+            "User-Agent for HTTP requests. "
+            "ONLY applied when tls_impersonate is None -- the crawler then "
+            "uses plain httpx with this UA. "
+            "When tls_impersonate is set (e.g. 'auto', the default), "
+            "curl_cffi controls headers to keep TLS fingerprint and HTTP "
+            "UA consistent; overriding the UA here would create a "
+            "fingerprint mismatch that defeats WAF bypass and is therefore "
+            "IGNORED on that path."
+        ),
+    )
+    tls_impersonate: Optional[str] = Field(
+        default="auto",
+        description=(
+            "TLS fingerprint to impersonate via curl_cffi. "
+            "Pass None to disable (uses plain httpx -- fastest, but no WAF bypass). "
+            "Pass 'auto' (default) to try a built-in fallback chain in order "
+            "until one succeeds. "
+            "Pass a specific impersonate spec (e.g. 'safari17_0', 'chrome120') "
+            "to lock to that fingerprint without fallback. "
+            "See https://github.com/yifeikong/curl_cffi for valid specs."
+        ),
     )
     timeout: int = Field(
         default=30,
