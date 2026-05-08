@@ -319,6 +319,28 @@ async def run_web_ingestion(
 
     crawled_urls_list = [r.url for r in crawl_results if r.status == "success"]
 
+    # Build a status-aware message. Previously this was unconditionally
+    # "Web ingestion completed: ..." even on error, which produced the
+    # "red error toast + green-toned 'completed' text" UX in the frontend
+    # whenever every crawl attempt got blocked. On error/partial we now
+    # surface the first failing URL and its reason so the user sees
+    # something actionable.
+    if status == "error" and failed_urls:
+        first_url, first_err = next(iter(failed_urls.items()))
+        message = f"Website crawling failed: {first_url} returned {first_err}"
+    elif status == "partial" and failed_urls:
+        first_url, first_err = next(iter(failed_urls.items()))
+        message = (
+            f"Web ingestion partial: {documents_created} documents from "
+            f"{pages_crawled} pages, {len(failed_urls)} failed "
+            f"(first: {first_url} returned {first_err})"
+        )
+    else:
+        message = (
+            f"Web ingestion completed: {documents_created} documents, "
+            f"{total_chunks} chunks, {total_embeddings} embeddings"
+        )
+
     result = WebIngestionResult(
         status=status,
         collection=collection,
@@ -330,10 +352,7 @@ async def run_web_ingestion(
         embeddings_created=total_embeddings,
         crawled_urls=crawled_urls_list,
         failed_urls=failed_urls,
-        message=(
-            f"Web ingestion completed: {documents_created} documents, "
-            f"{total_chunks} chunks, {total_embeddings} embeddings"
-        ),
+        message=message,
         warnings=warnings,
         elapsed_time_ms=elapsed_ms,
     )

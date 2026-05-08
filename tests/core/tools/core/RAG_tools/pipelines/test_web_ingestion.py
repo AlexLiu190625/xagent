@@ -130,6 +130,47 @@ class TestWebIngestionPipeline:
         assert "Crawl failed" in result.message
 
     @pytest.mark.asyncio
+    async def test_error_message_uses_first_failed_url(
+        self, crawl_config, ingestion_config
+    ):
+        """When the crawler returns normally but every URL was blocked
+        (e.g. all 403s), the result message must reflect the actual
+        failure -- NOT the misleading 'Web ingestion completed' string
+        that previously appeared with status=error.
+
+        Regression test for the UX bug where the frontend showed a red
+        error toast carrying "completed: 0 documents" text whenever a
+        site was WAF-blocked.
+        """
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            # Crawler returns successfully but with empty results +
+            # populated failed_urls (this is the path that previously
+            # produced the misleading message)
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=[])
+            mock_crawler.failed_urls = {
+                "https://www.detrack.com": "HTTP 403",
+                "https://www.detrack.com/about": "HTTP 403",
+            }
+            mock_crawler.total_urls_found = 0
+            mock_crawler_class.return_value = mock_crawler
+
+            result = await run_web_ingestion(
+                collection="test_collection",
+                crawl_config=crawl_config,
+                ingestion_config=ingestion_config,
+            )
+
+        assert result.status == "error"
+        assert result.documents_created == 0
+        # The message must surface the actual failure, not "completed"
+        assert "completed" not in result.message.lower()
+        assert "https://www.detrack.com" in result.message
+        assert "HTTP 403" in result.message
+
+    @pytest.mark.asyncio
     async def test_partial_ingestion_failure(self, crawl_config, ingestion_config):
         """Test handling of partial ingestion failures."""
         # Mock crawl results
