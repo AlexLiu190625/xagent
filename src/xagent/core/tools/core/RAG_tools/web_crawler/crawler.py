@@ -192,9 +192,7 @@ class WebCrawler:
         if config.tls_impersonate is None:
             self._policy_user_agent: str = config.user_agent or _DEFAULT_USER_AGENT
         else:
-            first_fp = next(
-                (fp for fp in self._tls_chain if fp is not None), None
-            )
+            first_fp = next((fp for fp in self._tls_chain if fp is not None), None)
             self._policy_user_agent = (
                 _IMPERSONATE_TO_UA.get(first_fp, "*") if first_fp else "*"
             )

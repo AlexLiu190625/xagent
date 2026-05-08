@@ -315,6 +315,7 @@ class TestWebCrawler:
             call_log: list to append the impersonate spec on every .get()
             response_for: callable(impersonate) -> MagicMock response
         """
+
         def make_session(impersonate=None, **kwargs):
             sess = AsyncMock()
             sess.__aenter__ = AsyncMock(return_value=sess)
