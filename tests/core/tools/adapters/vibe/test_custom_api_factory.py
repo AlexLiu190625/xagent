@@ -38,6 +38,7 @@ async def test_create_db_custom_api_tools_with_configs():
             "url": "https://api.example.com/api1",
             "method": "POST",
             "headers": {"X-Key": "$k1"},
+            "body": '{"message": "hello"}',
             "env": {"k1": "v1"},
         }
     ]
@@ -46,6 +47,10 @@ async def test_create_db_custom_api_tools_with_configs():
     assert len(tools) == 1
     assert tools[0].name == "api_api1_call"
     assert "Configured endpoint: https://api.example.com/api1" in tools[0].description
+    # Body template must thread through to the tool so POST requests
+    # actually carry the configured payload at runtime.
+    assert tools[0]._default_body == '{"message": "hello"}'
+    assert "Configured body template:" in tools[0].description
 
 
 @pytest.mark.asyncio

@@ -889,3 +889,90 @@ class TestWebToolConfigUserOverride:
             assert "calculator" in tool_names
         finally:
             set_user_tool_overrides_hook(None)
+
+
+class TestWebToolConfigCustomApi:
+    """Verify WebToolConfig.get_custom_api_configs() exposes the body field
+    so that POST custom-api tools actually send their configured payload."""
+
+    def test_get_custom_api_configs_includes_body(self):
+        """Regression test for production bug (Task 898 / Agent 170):
+
+        A user had a Custom API entry with method=POST and a JSON body
+        template, but their POST requests went out with empty bodies.
+        Root cause: WebToolConfig.get_custom_api_configs() built its
+        config dict without the `body` field, so by the time the tool
+        was constructed the body template was already gone.
+
+        This test mirrors the actual production record (Post_HelloAPI)
+        and asserts the body field survives the DB -> dict translation.
+        """
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        # Mirror of production custom_apis row (id=5, name=Post_HelloAPI)
+        api = MagicMock()
+        api.name = "Post_HelloAPI"
+        api.description = None
+        api.url = "https://helloapi-u6nc.onrender.com/"
+        api.method = "POST"
+        api.headers = {}
+        api.body = '{\n  "message": "example message"\n}'
+        api.env = None
+
+        user_api = MagicMock()
+        user_api.custom_api = api
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [user_api]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=33,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = cfg.get_custom_api_configs()
+
+        assert len(configs) == 1
+        config = configs[0]
+        assert config["name"] == "Post_HelloAPI"
+        assert config["method"] == "POST"
+        # The crucial assertion: body must propagate
+        assert config["body"] == '{\n  "message": "example message"\n}'
+
+    def test_get_custom_api_configs_body_optional(self):
+        """When the user has not configured a body (e.g. GET-only tools),
+        the body field should still be present in the config but None,
+        so downstream code can rely on the key existing."""
+        from unittest.mock import MagicMock
+
+        from xagent.web.tools.config import WebToolConfig
+
+        api = MagicMock()
+        api.name = "Get_HiAPI"
+        api.description = None
+        api.url = "https://helloapi-u6nc.onrender.com/"
+        api.method = "GET"
+        api.headers = {"message": ""}
+        api.body = None
+        api.env = None
+
+        user_api = MagicMock()
+        user_api.custom_api = api
+
+        db = MagicMock()
+        db.query.return_value.filter.return_value.all.return_value = [user_api]
+
+        cfg = WebToolConfig(
+            db=db,
+            request=MagicMock(),
+            user_id=33,
+            workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        )
+        configs = cfg.get_custom_api_configs()
+
+        assert len(configs) == 1
+        assert "body" in configs[0]
+        assert configs[0]["body"] is None
