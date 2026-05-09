@@ -71,7 +71,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = sample_html
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -99,7 +98,6 @@ class TestWebCrawler:
             mock_resp = MagicMock()
             mock_resp.status_code = 200
             mock_resp.text = responses.get(url, "")
-            mock_resp.raise_for_status = MagicMock()
             return mock_resp
 
         mock_client = AsyncMock()
@@ -134,7 +132,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = sample_html
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -163,7 +160,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = sample_html
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -184,9 +180,7 @@ class TestWebCrawler:
         # Mock HTTP error response
         mock_response = MagicMock()
         mock_response.status_code = 404
-        mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
-            "Not Found", request=MagicMock(), response=mock_response
-        )
+        mock_response.text = "<html><body>Not Found</body></html>"
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -223,7 +217,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = "<html><body>Hi</body></html>"
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -253,7 +246,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = sample_html
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -273,7 +265,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = sample_html
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -302,7 +293,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = sample_html
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -411,7 +401,6 @@ class TestWebCrawler:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.text = sample_html
-        mock_response.raise_for_status = MagicMock()
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response

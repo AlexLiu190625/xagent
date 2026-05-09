@@ -288,13 +288,9 @@ class WebCrawler:
                 self._tls_chain contains None. curl_cffi sessions get no
                 explicit headers -- their impersonate spec sets them.
         """
-        # Imported lazily so that environments which never use TLS
-        # impersonation don't pay the curl_cffi C-extension import cost
-        # at module load.
-        from curl_cffi.requests import AsyncSession as CffiSession
-
         async with AsyncExitStack() as stack:
             sessions: Dict[Optional[str], Any] = {}
+            cffi_session_cls: Any = None
             for fp in self._tls_chain:
                 if fp is None:
                     sess: Any = httpx.AsyncClient(
@@ -302,7 +298,13 @@ class WebCrawler:
                         timeout=self.config.timeout,
                     )
                 else:
-                    sess = CffiSession(
+                    if cffi_session_cls is None:
+                        # Imported lazily so environments using the default
+                        # httpx path do not need the optional waf-crawl extra.
+                        from curl_cffi.requests import AsyncSession as CffiSession
+
+                        cffi_session_cls = CffiSession
+                    sess = cffi_session_cls(
                         impersonate=fp,
                         timeout=self.config.timeout,
                     )
