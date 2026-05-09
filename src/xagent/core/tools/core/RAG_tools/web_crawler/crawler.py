@@ -521,9 +521,17 @@ class WebCrawler:
                 logger.debug("Crawling %s (depth: %s)", url, depth)
 
                 # Fetch page (with TLS fingerprint fallback chain)
-                response, _ = await self._fetch_with_fallback(sessions, url)
+                response, fingerprint_used = await self._fetch_with_fallback(
+                    sessions, url
+                )
                 if response is None:
                     error_msg = "All TLS fingerprints raised exceptions"
+                    logger.error("Failed to crawl %s: %s", url, error_msg)
+                    self.failed_urls[url] = error_msg
+                    return None, set()
+
+                if fingerprint_used is None and 200 <= response.status_code < 300:
+                    error_msg = "TLS fallback exhausted with challenge page"
                     logger.error("Failed to crawl %s: %s", url, error_msg)
                     self.failed_urls[url] = error_msg
                     return None, set()

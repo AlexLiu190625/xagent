@@ -522,6 +522,45 @@ class TestWebCrawler:
         assert results[0].status == "success"
 
     @pytest.mark.asyncio
+    async def test_exhausted_challenge_pages_fail_crawl(self, monkeypatch):
+        """If every fingerprint returns a 200 challenge wrapper, fail the URL."""
+        config = WebCrawlConfig(
+            start_url="https://example.com",
+            max_pages=1,
+            request_delay=0,
+            tls_impersonate="auto",
+        )
+
+        challenge_body = (
+            "<!DOCTYPE html><html><head><title>Just a moment...</title>"
+            "</head><body>Checking your browser before accessing the "
+            "site. cf-challenge in progress.</body></html>"
+        )
+        call_log = []
+        cffi_requests = self._install_fake_cffi(monkeypatch)
+
+        def response_for(impersonate):
+            resp = MagicMock()
+            resp.status_code = 200
+            resp.text = challenge_body
+            return resp
+
+        with patch.object(
+            cffi_requests,
+            "AsyncSession",
+            side_effect=self._make_cffi_session_factory(call_log, response_for),
+        ):
+            crawler = WebCrawler(config)
+            results = await crawler.crawl()
+
+        assert call_log == ["chrome116", "safari17_0", "safari15_5"]
+        assert results == []
+        assert "https://example.com" in crawler.failed_urls
+        assert crawler.failed_urls["https://example.com"] == (
+            "TLS fallback exhausted with challenge page"
+        )
+
+    @pytest.mark.asyncio
     async def test_tls_exception_chain_logs_warning(self, monkeypatch, caplog):
         """If every fingerprint raises, operators should get a warning summary."""
         config = WebCrawlConfig(
