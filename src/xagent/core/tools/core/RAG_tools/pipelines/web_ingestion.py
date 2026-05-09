@@ -296,19 +296,11 @@ async def run_web_ingestion(
     # (pages_failed includes both crawl failures and ingestion failures)
     pages_failed = len(failed_urls)
 
-    # Determine overall status
-    # Check if there were any ingestion failures
-    # (in failed_urls but not in crawler failed_urls)
-    has_ingestion_failures = any(
-        url in failed_urls and url not in crawler.failed_urls
-        for url in [r.url for r in crawl_results if r.status == "success"]
-    )
-
     # Status determination:
     # - "error": No docs created AND there were actual failures
     # - "partial": Some docs created but some failures
     # - "success": No failures (empty results are successful)
-    total_failures = pages_failed + (1 if has_ingestion_failures else 0)
+    total_failures = pages_failed
 
     if documents_created == 0 and total_failures > 0:
         status = "error"

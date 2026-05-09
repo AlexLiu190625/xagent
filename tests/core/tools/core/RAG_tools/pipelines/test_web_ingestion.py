@@ -247,6 +247,10 @@ class TestWebIngestionPipeline:
         assert result.pages_crawled == 2
         assert result.documents_created == 1
         assert result.pages_failed == 1
+        assert "partial" in result.message.lower()
+        assert "completed" not in result.message.lower()
+        assert "https://example.com/page2" in result.message
+        assert "Parse failed" in result.message
         assert len(result.failed_urls) == 1
         assert "https://example.com/page2" in result.failed_urls
 
