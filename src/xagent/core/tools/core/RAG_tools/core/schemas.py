@@ -1737,7 +1737,7 @@ class WebCrawlConfig(BaseModel):
             "User-Agent for HTTP requests. "
             "ONLY applied when tls_impersonate is None -- the crawler then "
             "uses plain httpx with this UA. "
-            "When tls_impersonate is set (e.g. 'auto', the default), "
+            "When tls_impersonate is set (e.g. 'auto'), "
             "curl_cffi controls headers to keep TLS fingerprint and HTTP "
             "UA consistent; overriding the UA here would create a "
             "fingerprint mismatch that defeats WAF bypass and is therefore "
@@ -1745,14 +1745,16 @@ class WebCrawlConfig(BaseModel):
         ),
     )
     tls_impersonate: Optional[str] = Field(
-        default="auto",
+        default=None,
         description=(
             "TLS fingerprint to impersonate via curl_cffi. "
-            "Pass None to disable (uses plain httpx -- fastest, but no WAF bypass). "
-            "Pass 'auto' (default) to try a built-in fallback chain in order "
-            "until one succeeds. "
+            "Defaults to None (plain httpx -- fastest, but no WAF bypass). "
+            "Pass 'auto' to try a built-in fallback chain in order until one "
+            "succeeds. "
             "Pass a specific impersonate spec (e.g. 'safari17_0', 'chrome120') "
             "to lock to that fingerprint without fallback. "
+            "Install the waf-crawl extra to enable curl_cffi-backed "
+            "impersonation. "
             "See https://github.com/yifeikong/curl_cffi for valid specs."
         ),
     )

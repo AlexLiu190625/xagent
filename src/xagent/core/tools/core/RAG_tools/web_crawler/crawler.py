@@ -1,6 +1,7 @@
 """Core web crawler implementation."""
 
 import asyncio
+import importlib
 import logging
 import time
 from collections import deque
@@ -74,6 +75,21 @@ def _looks_like_challenge_page(body: str) -> bool:
         return False
     lowered = body[:3000].lower()
     return any(marker in lowered for marker in _CHALLENGE_PAGE_MARKERS)
+
+
+def _ensure_curl_cffi_available() -> None:
+    """Validate optional curl_cffi dependency before starting async crawl work."""
+    try:
+        importlib.import_module("curl_cffi.requests")
+    except ModuleNotFoundError as e:
+        if e.name and e.name.startswith("curl_cffi"):
+            raise ImportError(
+                "WebCrawlConfig.tls_impersonate requires the optional "
+                "curl_cffi dependency. Install it with `pip install "
+                "'xagent[waf-crawl]'` or set tls_impersonate=None to use "
+                "plain httpx."
+            ) from e
+        raise
 
 
 # Default User-Agent used when tls_impersonate is None and the user has
@@ -177,8 +193,10 @@ class WebCrawler:
         if config.tls_impersonate is None:
             self._tls_chain: Tuple[Optional[str], ...] = (None,)
         elif config.tls_impersonate == "auto":
+            _ensure_curl_cffi_available()
             self._tls_chain = _TLS_AUTO_CHAIN
         else:
+            _ensure_curl_cffi_available()
             self._tls_chain = (config.tls_impersonate,)
 
         # Effective User-Agent for policy decisions (robots.txt, etc.).
@@ -321,6 +339,7 @@ class WebCrawler:
         """
         last_response = None
         last_status: Optional[int] = None
+        exception_log: List[str] = []
 
         for i, fp in enumerate(self._tls_chain):
             sess = sessions[fp]
@@ -376,6 +395,7 @@ class WebCrawler:
                 )
                 return response, None
             except Exception as e:
+                exception_log.append(f"{fp_label}:{type(e).__name__}: {e}")
                 logger.debug(
                     "TLS fp=%s raised %s for %s, trying next",
                     fp_label,
@@ -391,6 +411,13 @@ class WebCrawler:
                 [f or "httpx" for f in self._tls_chain],
             )
             return last_response, None
+
+        if exception_log:
+            logger.warning(
+                "All TLS fingerprints failed for url=%s exceptions=%s",
+                url,
+                exception_log,
+            )
 
         return None, None
 

@@ -1,8 +1,11 @@
-from typing import Any
+from typing import Any, Mapping
 
 class Response:
+    content: bytes
+    headers: Mapping[str, str]
     status_code: int
     text: str
+    url: str
 
 class AsyncSession:
     def __init__(

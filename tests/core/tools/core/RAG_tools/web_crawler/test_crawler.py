@@ -1,5 +1,8 @@
 """Unit tests for web crawler."""
 
+import logging
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -54,6 +57,12 @@ class TestWebCrawler:
         assert len(crawler.visited_urls) == 0
         assert len(crawler.pending_urls) == 0
         assert len(crawler.crawl_results) == 0
+
+    def test_default_tls_impersonate_uses_httpx(self):
+        """Unmodified configs should stay on the plain httpx path by default."""
+        config = WebCrawlConfig(start_url="https://example.com")
+
+        assert config.tls_impersonate is None
 
     @pytest.mark.asyncio
     async def test_crawl_single_page(self, crawl_config, sample_html):
@@ -330,8 +339,21 @@ class TestWebCrawler:
 
         return make_session
 
+    @staticmethod
+    def _install_fake_cffi(monkeypatch):
+        """Install fake curl_cffi modules so optional-dependency tests stay hermetic."""
+        cffi_module = types.ModuleType("curl_cffi")
+        requests_module = types.ModuleType("curl_cffi.requests")
+        requests_module.AsyncSession = MagicMock()
+        cffi_module.requests = requests_module
+        monkeypatch.setitem(sys.modules, "curl_cffi", cffi_module)
+        monkeypatch.setitem(sys.modules, "curl_cffi.requests", requests_module)
+        return requests_module
+
     @pytest.mark.asyncio
-    async def test_tls_fallback_chain_advances_on_waf_block(self, sample_html):
+    async def test_tls_fallback_chain_advances_on_waf_block(
+        self, sample_html, monkeypatch
+    ):
         """When chain[0] returns 403 and chain[1] returns 200, the second
         fingerprint must be used and the page must succeed. httpx must
         not be touched at all on the auto path.
@@ -344,6 +366,7 @@ class TestWebCrawler:
         )
 
         call_log = []
+        cffi_requests = self._install_fake_cffi(monkeypatch)
 
         def response_for(impersonate):
             resp = MagicMock()
@@ -356,8 +379,9 @@ class TestWebCrawler:
             return resp
 
         with (
-            patch(
-                "curl_cffi.requests.AsyncSession",
+            patch.object(
+                cffi_requests,
+                "AsyncSession",
                 side_effect=self._make_cffi_session_factory(call_log, response_for),
             ) as p_cffi,
             patch("httpx.AsyncClient") as p_httpx,
@@ -396,16 +420,36 @@ class TestWebCrawler:
 
         with (
             patch("httpx.AsyncClient", return_value=mock_client) as p_httpx,
-            patch("curl_cffi.requests.AsyncSession") as p_cffi,
+            patch(
+                "importlib.import_module",
+                side_effect=AssertionError("curl_cffi should not be imported"),
+            ) as p_import,
         ):
             crawler = WebCrawler(config)
             await crawler.crawl()
 
         p_httpx.assert_called()
-        p_cffi.assert_not_called()
+        p_import.assert_not_called()
+
+    def test_tls_impersonate_requires_waf_crawl_extra(self):
+        """Opt-in TLS impersonation should fail early when curl_cffi is absent."""
+        config = WebCrawlConfig(
+            start_url="https://example.com",
+            max_pages=1,
+            request_delay=0,
+            tls_impersonate="auto",
+        )
+        error = ModuleNotFoundError("No module named 'curl_cffi'")
+        error.name = "curl_cffi"
+
+        with (
+            patch("importlib.import_module", side_effect=error),
+            pytest.raises(ImportError, match="waf-crawl"),
+        ):
+            WebCrawler(config)
 
     @pytest.mark.asyncio
-    async def test_404_does_not_trigger_fallback_chain(self):
+    async def test_404_does_not_trigger_fallback_chain(self, monkeypatch):
         """Ordinary HTTP errors (404, 401, 500) must fail fast.
 
         Only WAF-like statuses (403, 429, 503...) should advance the
@@ -421,6 +465,7 @@ class TestWebCrawler:
         )
 
         call_log = []
+        cffi_requests = self._install_fake_cffi(monkeypatch)
 
         def response_for(impersonate):
             resp = MagicMock()
@@ -428,8 +473,9 @@ class TestWebCrawler:
             resp.text = "<html><body>not found</body></html>"
             return resp
 
-        with patch(
-            "curl_cffi.requests.AsyncSession",
+        with patch.object(
+            cffi_requests,
+            "AsyncSession",
             side_effect=self._make_cffi_session_factory(call_log, response_for),
         ):
             crawler = WebCrawler(config)
@@ -442,7 +488,7 @@ class TestWebCrawler:
         assert "404" in crawler.failed_urls["https://example.com"]
 
     @pytest.mark.asyncio
-    async def test_challenge_page_advances_chain(self, sample_html):
+    async def test_challenge_page_advances_chain(self, sample_html, monkeypatch):
         """A 200 response that's actually a CF JS challenge wrapper must
         be treated like a WAF block (advance to next fingerprint), not
         accepted as content -- otherwise the KB gets polluted with
@@ -461,6 +507,7 @@ class TestWebCrawler:
             "site. cf-challenge in progress.</body></html>"
         )
         call_log = []
+        cffi_requests = self._install_fake_cffi(monkeypatch)
 
         def response_for(impersonate):
             resp = MagicMock()
@@ -471,8 +518,9 @@ class TestWebCrawler:
                 resp.text = sample_html
             return resp
 
-        with patch(
-            "curl_cffi.requests.AsyncSession",
+        with patch.object(
+            cffi_requests,
+            "AsyncSession",
             side_effect=self._make_cffi_session_factory(call_log, response_for),
         ):
             crawler = WebCrawler(config)
@@ -483,3 +531,32 @@ class TestWebCrawler:
         assert call_log[1] == "safari17_0"
         assert len(results) == 1
         assert results[0].status == "success"
+
+    @pytest.mark.asyncio
+    async def test_tls_exception_chain_logs_warning(self, monkeypatch, caplog):
+        """If every fingerprint raises, operators should get a warning summary."""
+        config = WebCrawlConfig(
+            start_url="https://example.com",
+            max_pages=1,
+            request_delay=0,
+            tls_impersonate="auto",
+        )
+        cffi_requests = self._install_fake_cffi(monkeypatch)
+
+        def make_session(impersonate=None, **kwargs):
+            sess = AsyncMock()
+            sess.__aenter__ = AsyncMock(return_value=sess)
+            sess.__aexit__ = AsyncMock(return_value=None)
+            sess.get = AsyncMock(side_effect=TimeoutError(f"{impersonate} timed out"))
+            return sess
+
+        with (
+            patch.object(cffi_requests, "AsyncSession", side_effect=make_session),
+            caplog.at_level(logging.WARNING),
+        ):
+            crawler = WebCrawler(config)
+            await crawler.crawl()
+
+        assert "All TLS fingerprints failed" in caplog.text
+        assert "chrome116:TimeoutError" in caplog.text
+        assert "https://example.com" in crawler.failed_urls
