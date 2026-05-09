@@ -327,7 +327,7 @@ async def run_web_ingestion(
     # something actionable.
     if status == "error" and failed_urls:
         first_url, first_err = next(iter(failed_urls.items()))
-        message = f"Website crawling failed: {first_url} returned {first_err}"
+        message = f"Web ingestion failed: {first_url} returned {first_err}"
     elif status == "partial" and failed_urls:
         first_url, first_err = next(iter(failed_urls.items()))
         message = (

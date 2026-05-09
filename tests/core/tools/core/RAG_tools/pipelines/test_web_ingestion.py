@@ -167,6 +167,7 @@ class TestWebIngestionPipeline:
         assert result.documents_created == 0
         # The message must surface the actual failure, not "completed"
         assert "completed" not in result.message.lower()
+        assert result.message.startswith("Web ingestion failed:")
         assert "https://www.detrack.com" in result.message
         assert "HTTP 403" in result.message
 
