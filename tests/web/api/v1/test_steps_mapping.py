@@ -91,6 +91,45 @@ def test_dag_plan_pair_becomes_thinking_planning():
     assert steps[0]["data"]["phase"] == "planning"
 
 
+def test_two_dag_plan_pairs_produce_two_separate_steps():
+    """Replan in one task: two dag_plan_start/end pairs must produce
+    two distinct planning steps (regression for the previous
+    pair-key collision where both used ``plan:{task_id}`` and the
+    second start silently overwrote the first's pending entry).
+    """
+    events = [
+        _ev(
+            "dag_plan_start",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_end",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_start",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "dag_plan_end",
+            task_id="t1",
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 2
+    assert all(
+        s["type"] == "thinking" and s["data"]["phase"] == "planning" for s in steps
+    )
+    # IDs must differ so SDK clients can dedupe across re-polls.
+    assert steps[0]["id"] != steps[1]["id"]
+    # Sorted by started_at -> first pair before second.
+    assert steps[0]["started_at"] < steps[1]["started_at"]
+
+
 def test_tool_execution_pair_becomes_tool_call_with_args_and_result():
     events = [
         _ev(

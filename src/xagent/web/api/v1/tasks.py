@@ -259,20 +259,37 @@ async def append_message_to_task(
 
     # Concurrency guard: appending a message while the prior turn is
     # still running would race the background coroutine's read of
-    # ``task_chat_messages``. Return 409 so the SDK can poll status
-    # and retry once we're past RUNNING.
-    if task.status == TaskStatus.RUNNING:
+    # ``task_chat_messages``. Two concurrent POSTs could both pass a
+    # plain ``if task.status == RUNNING`` check, so we claim the slot
+    # via an atomic single-statement UPDATE: only the request whose
+    # row currently has status != RUNNING wins. Loser sees rowcount=0
+    # and gets 409. Behavior change vs naive read-then-check: after
+    # success, ``task.status`` is RUNNING (the bg coroutine will set
+    # RUNNING again idempotently when it picks up).
+    claimed = (
+        db.query(Task)
+        .filter(Task.id == task.id, Task.status != TaskStatus.RUNNING)
+        .update(
+            {
+                Task.status: TaskStatus.RUNNING,
+                Task.input: request.message.content,
+            },
+            synchronize_session=False,
+        )
+    )
+    db.commit()
+    if claimed == 0:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
 
-    # Persist the new user message + update task.input to reflect the
-    # latest turn (matches POST /v1/chat/tasks' write to task.input).
+    # We own the slot now. Persist the new user message to the
+    # transcript so the bg coroutine's read of task_chat_messages sees
+    # it (matches POST /v1/chat/tasks' first-turn persistence).
     persist_user_message(
         db=db,
         task_id=int(task.id),
         user_id=int(agent.user_id),
         content=request.message.content,
     )
-    task.input = request.message.content  # type: ignore[assignment]
     db.commit()
     db.refresh(task)
 

@@ -127,6 +127,15 @@ def map_trace_events_to_public_steps(
     # end event matching a pending start, or by a one-shot event like
     # ``user_message`` / ``ai_message`` which has no separate end.
     finished: List[Dict[str, Any]] = []
+    # ``dag_plan_*`` has no per-plan identifier in the event data, so
+    # we synthesize one by counting starts and remembering the
+    # currently-open key. Replan in a single task (rare but legal)
+    # produces N >= 2 pairs; without this counter the second
+    # dag_plan_start would silently overwrite the first's pending
+    # entry. We assume plans don't nest (only one in flight at a
+    # time); nesting would require a stack, which DAG doesn't emit.
+    plan_counter = 0
+    open_plan_key: Optional[str] = None
 
     for event in events:
         event_type = _safe_get(event, "event_type")
@@ -143,7 +152,36 @@ def map_trace_events_to_public_steps(
 
         # ===== thinking: paired start/end =====
         thinking_phase = _thinking_phase_for(event_type)
+        if thinking_phase == "planning":
+            # Special-cased because plan events have no per-plan id;
+            # we generate one from a counter and remember the open
+            # key so the next dag_plan_end pairs with the latest start.
+            if event_type.endswith("_start"):
+                plan_counter += 1
+                task_ref = (
+                    _safe_get(event, "task_id")
+                    or _safe_get(event, "event_id")
+                    or "anon"
+                )
+                open_plan_key = f"plan:{task_ref}:{plan_counter}"
+                pending[("thinking", open_plan_key)] = _build_thinking_start(
+                    event, phase="planning", key=open_plan_key
+                )
+            elif event_type.endswith("_end") and open_plan_key is not None:
+                _finalize_pending(
+                    pending,
+                    finished,
+                    ("thinking", open_plan_key),
+                    end_event=event,
+                    status="completed",
+                )
+                open_plan_key = None
+            # Orphan end with no open plan: drop silently (same policy
+            # as orphan tool_execution_end).
+            continue
+
         if thinking_phase is not None:
+            # action / step branch -- step_id is the natural pair key.
             key = _thinking_pair_key(event, thinking_phase)
             if event_type.endswith("_start"):
                 pending[("thinking", key)] = _build_thinking_start(
@@ -283,14 +321,13 @@ def _thinking_phase_for(event_type: str) -> Optional[str]:
 
 
 def _thinking_pair_key(event: Any, phase: str) -> str:
-    """Pairing key for a thinking start/end event.
+    """Pairing key for a non-planning thinking start/end event.
 
-    ``dag_plan_*`` has no step_id (it's task-level), so we fall back
-    to task_id. ``react_action_*`` and ``dag_step_*`` always carry a
-    step_id which is the natural pairing key.
+    ``react_action_*`` and ``dag_step_*`` always carry a step_id
+    which is the natural pairing key. Planning events are handled
+    inline in :func:`map_trace_events_to_public_steps` because they
+    lack a per-plan identifier and need a synthesized counter.
     """
-    if phase == "planning":
-        return f"plan:{_safe_get(event, 'task_id') or _safe_get(event, 'event_id')}"
     return str(_safe_get(event, "step_id") or _safe_get(event, "event_id") or "")
 
 

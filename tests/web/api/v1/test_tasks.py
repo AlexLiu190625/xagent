@@ -350,6 +350,51 @@ def test_append_message_to_running_task_returns_409(mock_start_task):
     assert mock_start_task.await_count == 0
 
 
+def test_append_message_claims_slot_atomically(mock_start_task):
+    """Successful append flips task.status to RUNNING in the same
+    transaction as the input write, so a concurrent POST can't pass
+    the busy check and both kick off background tasks.
+
+    We verify the post-state directly: after one successful append,
+    task.status == RUNNING and a second POST to the same task gets
+    409 even though the bg coroutine hasn't run yet (mocked out).
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="t1")
+    mock_start_task.reset_mock()
+
+    # First append succeeds and atomically claims the slot.
+    r1 = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "t2"}},
+    )
+    assert r1.status_code == 202
+
+    # task.status was flipped to RUNNING inside the endpoint, even
+    # though the (mocked) bg coroutine never ran. This is the
+    # mechanism that defeats the TOCTOU race.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        assert task.status == TaskStatus.RUNNING
+    finally:
+        db.close()
+
+    # Second append (the would-be losing concurrent request) hits the
+    # claim filter and 409s.
+    r2 = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "t3"}},
+    )
+    assert r2.status_code == 409
+    assert r2.json()["error"]["code"] == "task_busy"
+    # Only one bg kickoff total (from the winning first append).
+    assert mock_start_task.await_count == 1
+
+
 def test_append_message_to_missing_task_returns_404(mock_start_task):
     """Appending to a task that doesn't exist -> 404 task_not_found."""
     agent_id, full_key = _create_agent_with_key()
