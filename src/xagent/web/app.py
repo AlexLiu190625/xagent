@@ -32,6 +32,8 @@ from .api.system import system_router
 from .api.templates import router as templates_router
 from .api.text2sql import text2sql_router
 from .api.tools import tools_router
+from .api.v1 import v1_router
+from .api.v1.errors import V1ApiError, v1_api_error_handler
 from .api.websocket import ws_router
 from .api.widget import widget_router
 from .dynamic_memory_store import get_memory_store
@@ -123,6 +125,12 @@ async def global_exception_handler(request: Request, exc: Exception) -> None:
     raise exc
 
 
+# /v1/* SDK surface uses a stable {"error": {"code", "message"}} envelope
+# distinct from FastAPI's default {"detail": "..."} shape used by /api/*.
+# See web/api/v1/errors.py for the contract.
+app.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
+
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -167,6 +175,9 @@ app.include_router(templates_router)
 app.include_router(agents_router)
 app.include_router(channel_router, prefix="/api/channels", tags=["Channels"])
 app.include_router(widget_router)
+# Public SDK surface, mounted under /v1. Auth via xag_* API key,
+# error envelope {"error": {"code", "message"}}. See web/api/v1/.
+app.include_router(v1_router)
 
 
 # initial database and skill manager
