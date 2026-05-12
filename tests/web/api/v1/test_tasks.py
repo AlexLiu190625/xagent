@@ -60,11 +60,20 @@ def _bearer(full_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {full_key}"}
 
 
-# ``start_task_in_background`` does real work (spawns an asyncio.Task that
-# calls the AgentService coroutine). The D-level tests don't want to
-# exercise the agent execution itself -- that's covered separately --
-# so every test patches the helper to a no-op AsyncMock and asserts on
-# the call args.
+# ``start_task_in_background`` does real work: opens its own DB session,
+# spawns an asyncio.Task that calls execute_task_background -> the full
+# AgentService coroutine. Across the whole D+E+F endpoint surface
+# (POST /v1/chat/tasks, POST /v1/chat/tasks/{id}/messages, GET steps
+# read-paths that don't trigger bg work) these tests want to assert on
+# HTTP shape + DB writes + which kickoff arguments were passed -- not on
+# the agent execution itself.
+#
+# Scope: file-local. ``autouse=True`` means every test in this module
+# gets the mock automatically. GET-only tests (which never call the
+# helper) are unaffected; POST tests assert on ``await_count`` /
+# ``await_args``. Other test files (e.g. test_steps_mapping.py,
+# test_auth.py) are NOT affected because pytest fixture scoping is
+# per-module.
 @pytest.fixture(autouse=True)
 def mock_start_task():
     with patch(

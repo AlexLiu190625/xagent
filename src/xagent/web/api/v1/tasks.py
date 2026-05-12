@@ -1,11 +1,11 @@
 """SDK task endpoints: ``/v1/chat/tasks/*`` family.
 
-Phase 1 surface (this module owns):
+Phase 1 surface this module owns:
 
-  - POST /v1/chat/tasks                (commit D, this commit)
-  - POST /v1/chat/tasks/{id}/messages  (commit E)
-  - GET  /v1/chat/tasks/{id}           (commit E)
-  - GET  /v1/chat/tasks/{id}/steps     (commit F)
+  - POST /v1/chat/tasks
+  - POST /v1/chat/tasks/{id}/messages
+  - GET  /v1/chat/tasks/{id}
+  - GET  /v1/chat/tasks/{id}/steps
 
 All endpoints authenticate via ``get_agent_from_api_key`` and use the
 stable ``V1ApiError`` envelope. Background execution is started via
@@ -14,7 +14,6 @@ the same coroutine the WebSocket handler uses without modifying the
 WS path.
 """
 
-from datetime import datetime, timezone
 from typing import Tuple
 
 from fastapi import APIRouter, Depends
@@ -302,11 +301,16 @@ async def append_message_to_task(
         user_message=request.message.content,
     )
 
+    # accepted_at uses the DB row's ``updated_at`` (set by ``onupdate=
+    # func.now()`` on the atomic UPDATE) instead of a fresh
+    # ``datetime.now(...)``. That way SDK clients reading this field
+    # see a value that matches what they'd read from the DB directly
+    # via GET /v1/chat/tasks/{id}, with no clock-skew between the two.
     return AppendMessageResponse(
         task_id=int(task.id),
         agent_id=int(agent.id),
         status="pending",
-        accepted_at=datetime.now(timezone.utc),
+        accepted_at=task.updated_at,
     )
 
 
