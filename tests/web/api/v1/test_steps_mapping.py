@@ -124,6 +124,9 @@ def test_tool_execution_pair_becomes_tool_call_with_args_and_result():
     assert s["data"]["args"] == {"code": "print(1)"}
     assert s["data"]["result"] == {"output": "1\n"}
     assert "error" not in s["data"]
+    # Contract: tool_call uses ``result``, not ``output``. Only
+    # agent_delegation steps rename it to ``output``.
+    assert "output" not in s["data"]
 
 
 def test_tool_execution_call_agent_becomes_agent_delegation():
@@ -157,15 +160,13 @@ def test_tool_execution_call_agent_becomes_agent_delegation():
     assert s["type"] == "agent_delegation"
     assert s["data"]["sub_agent_name"] == "translator"
     assert s["data"]["input"] == {"text": "hello"}
-    # end event's result is patched in -- but the mapping function
-    # currently only writes ``result`` on tool_call; for agent
-    # delegation we *do* still patch the end event payload onto
-    # ``data`` via extra_data_fn. The contract is: clients should
-    # expect either ``output`` OR ``result``. We assert one of them
-    # is present so a future tightening of the contract doesn't
-    # silently break this test.
-    end_payload = s["data"].get("result") or s["data"].get("output")
-    assert end_payload == {"translated": "你好"}
+    # Contract: agent_delegation uses ``output`` on the public surface
+    # (mirrors ``input`` on the start side). The internal field is
+    # still ``data['result']`` on the end event, but the mapping
+    # function renames it to ``output`` for this public type.
+    # ``result`` must NOT appear on agent_delegation steps.
+    assert s["data"]["output"] == {"translated": "你好"}
+    assert "result" not in s["data"]
 
 
 def test_tool_execution_failure_marks_failed_with_error():

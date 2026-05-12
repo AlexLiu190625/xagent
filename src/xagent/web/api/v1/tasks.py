@@ -144,14 +144,15 @@ async def create_chat_task(
         content=request.message.content,
     )
 
-    # Kick off the background coroutine. The helper handles
-    # registration with ``background_task_manager`` so a follow-up
-    # POST on the same task waits for this turn to finish.
+    # Kick off the background coroutine. The helper opens its own
+    # session and re-queries ``task`` / ``user`` rows on it, so the
+    # bg coroutine doesn't share lifetime with this request's ``db``
+    # (which FastAPI closes once we return). It also registers the
+    # bg task with ``background_task_manager`` so a follow-up POST
+    # on the same task waits for this turn to finish.
     await start_task_in_background(
         task=task,
         user_message=request.message.content,
-        user=task.user,
-        db=db,
     )
 
     return CreateTaskResponse(
@@ -277,12 +278,11 @@ async def append_message_to_task(
 
     # Kick off the next background turn. Uses the same helper as
     # POST /v1/chat/tasks; background_task_manager ensures we wait
-    # for any in-flight task before the new one starts.
+    # for any in-flight task before the new one starts. Helper owns
+    # its own session for the bg coroutine -- see service docstring.
     await start_task_in_background(
         task=task,
         user_message=request.message.content,
-        user=task.user,
-        db=db,
     )
 
     return AppendMessageResponse(

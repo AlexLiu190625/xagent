@@ -189,14 +189,24 @@ def map_trace_events_to_public_steps(
             else:  # tool_execution_end
                 success = _data_get(event, "success", default=True)
                 status = "completed" if success else "failed"
+                # ``tool_call`` and ``agent_delegation`` use different keys
+                # on the public schema: tool_call exposes ``result``
+                # (generic tool return), agent_delegation exposes
+                # ``output`` (mirroring ``input`` on the start side). The
+                # underlying internal field is still ``data['result']`` --
+                # we only rename on the public surface. ``error`` is the
+                # same on both for failures.
+                success_key = (
+                    "output" if public_type == "agent_delegation" else "result"
+                )
                 _finalize_pending(
                     pending,
                     finished,
                     (public_type, str(key)),
                     end_event=event,
                     status=status,
-                    extra_data_fn=lambda ev, succ=success: (
-                        {"result": _data_get(ev, "result")}
+                    extra_data_fn=lambda ev, succ=success, k=success_key: (
+                        {k: _data_get(ev, "result")}
                         if succ
                         else {
                             "error": _data_get(ev, "error") or "Tool execution failed"
