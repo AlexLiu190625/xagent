@@ -3,88 +3,28 @@
 Drives /v1/me (which only does auth + return identity) to verify each
 failure path returns the stable ``{"error": {"code": "invalid_api_key",
 ...}}`` envelope. Also asserts timing-oracle symmetry: prefix-miss
-should not be measurably faster than secret-wrong.
+should not be measurably faster than secret-wrong, and that unhandled
+internal exceptions on the /v1/* surface still respond in the SDK
+envelope rather than FastAPI's default ``{"detail": ...}``.
 
-Tests share the SQLite-fixture pattern from
-``tests/web/api/test_agent_api_keys.py``.
+Test plumbing (client, _test_db fixture, auth helpers) is shared via
+``tests/web/api/conftest.py``.
 """
 
-import os
-import shutil
-import tempfile
 import time
+from unittest.mock import patch
 
 import bcrypt
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from sqlalchemy.orm import Session
 
 from xagent.core.utils.api_key import BCRYPT_COST
-from xagent.web.api.agents import router as agents_router
-from xagent.web.api.auth import auth_router
-from xagent.web.api.v1 import v1_router
-from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
-from xagent.web.models.database import Base, get_db, get_engine
 
+from ..conftest import _admin_headers, client
 
-def _override_get_db():
-    db = None
-    try:
-        db = next(get_db())
-        yield db
-    finally:
-        if db is not None:
-            db.close()
-
-
-app_for_tests = FastAPI()
-app_for_tests.include_router(auth_router)
-app_for_tests.include_router(agents_router)
-app_for_tests.include_router(v1_router)
-app_for_tests.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
-app_for_tests.dependency_overrides[get_db] = _override_get_db
-client = TestClient(app_for_tests)
-
-
-@pytest.fixture(autouse=True)
-def _test_db():
-    from xagent.web.models.database import init_db
-
-    temp_dir = tempfile.mkdtemp()
-    temp_db_path = os.path.join(temp_dir, "test.db")
-    db_url = f"sqlite:///{temp_db_path}"
-    init_db(db_url=db_url)
-    yield
-    Base.metadata.drop_all(bind=get_engine())
-    try:
-        shutil.rmtree(temp_dir)
-    except OSError:
-        pass
-
-
-# ===== helpers =====
-
-
-def _setup_admin() -> None:
-    status = client.get("/api/auth/setup-status")
-    if status.json().get("needs_setup", True):
-        client.post(
-            "/api/auth/setup-admin",
-            json={"username": "admin", "password": "admin123"},
-        )
-
-
-def _login() -> dict[str, str]:
-    resp = client.post(
-        "/api/auth/login", json={"username": "admin", "password": "admin123"}
-    )
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
-
-
-def _admin_headers() -> dict[str, str]:
-    _setup_admin()
-    return _login()
+# Opt this file into the shared conftest ``_test_db`` fixture. See the
+# note in test_agent_api_keys.py for why we use ``usefixtures`` with a
+# string name rather than importing the fixture directly.
+pytestmark = pytest.mark.usefixtures("_test_db")
 
 
 def _create_agent_and_key() -> tuple[int, str, str]:
@@ -110,10 +50,6 @@ def _create_agent_and_key() -> tuple[int, str, str]:
     assert key_resp.status_code == 200, key_resp.text
     body = key_resp.json()
     return agent_id, body["full_key"], body["key_prefix"]
-
-
-def _direct_db() -> Session:
-    return next(get_db())
 
 
 # ===== happy path =====
@@ -240,3 +176,45 @@ def test_unknown_prefix_takes_similar_time_to_wrong_secret():
         f"timing asymmetry too large: real={real_t * 1000:.1f}ms, "
         f"dummy={dummy_t * 1000:.1f}ms, ratio={ratio:.2f}"
     )
+
+
+# ===== /v1/* internal_error envelope (catch-all) =====
+
+
+def test_internal_exception_returns_v1_envelope_not_fastapi_detail():
+    """Non-V1ApiError exceptions on /v1/* must still match SDK contract.
+
+    If an upstream layer (db.query, bcrypt, dependency) raises an
+    unexpected exception, the response MUST be the stable
+    ``{"error": {"code": "internal_error", "message": ...}}`` shape --
+    not FastAPI's default ``{"detail": "Internal Server Error"}``,
+    which would break SDK clients that key off ``body.error.code``.
+
+    We force the failure by patching ``parse_api_key`` (called inside
+    the auth dep) to raise a RuntimeError. That gets the request past
+    the FastAPI routing layer but blows up inside our handler chain
+    BEFORE V1ApiError is raised, exercising the generic Exception
+    branch of the global handler.
+    """
+    secret_internal_msg = "secret-internal-detail-do-not-leak"
+    with patch(
+        "xagent.web.api.v1.deps.parse_api_key",
+        side_effect=RuntimeError(secret_internal_msg),
+    ):
+        resp = client.get(
+            "/v1/me", headers={"Authorization": "Bearer xag_ABCDEF_" + "x" * 32}
+        )
+
+    # Must be 500 in the V1 envelope, not 500 with FastAPI's detail key.
+    assert resp.status_code == 500, resp.text
+    body = resp.json()
+    assert body == {
+        "error": {
+            "code": "internal_error",
+            "message": "Internal server error.",
+        }
+    }
+    # Sanity: no internal exception message leaks into the response
+    assert secret_internal_msg not in resp.text
+    # Sanity: NOT the default FastAPI {"detail": ...} shape
+    assert "detail" not in body

@@ -7,115 +7,34 @@ Covers the three endpoints at ``/api/agents/{agent_id}/api-key``:
   - DELETE: idempotent revoke (active -> revoked / no-active -> no-op /
             double-call true idempotency)
 
-Each test uses a fresh SQLite database via the ``_test_db`` fixture
-(matching ``test_agents_kb_tool_validation.py``); admin user is set up
-via ``setup-admin`` and an optional second user is registered via the
-public ``/register`` endpoint to exercise cross-user 404 paths.
+Test plumbing (TestClient, _test_db fixture, auth helpers) is shared
+via ``tests/web/api/conftest.py``.
 """
 
-import os
-import shutil
-import tempfile
 from unittest.mock import patch
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from xagent.web.api.agents import router as agents_router
-from xagent.web.api.auth import auth_router
 from xagent.web.models.agent_api_key import AgentApiKey
-from xagent.web.models.database import Base, get_db, get_engine
 
-# ===== App + DB plumbing =====
+from .conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _register_second_user,
+    client,
+)
 
-
-def _override_get_db():
-    """Yield the default DB session; required so dependency_overrides has a callable."""
-    db = None
-    try:
-        db = next(get_db())
-        yield db
-    finally:
-        if db is not None:
-            db.close()
-
-
-app_for_tests = FastAPI()
-app_for_tests.include_router(auth_router)
-app_for_tests.include_router(agents_router)
-app_for_tests.dependency_overrides[get_db] = _override_get_db
-client = TestClient(app_for_tests)
+# Opt this file into the shared conftest ``_test_db`` fixture without
+# making it autouse globally (sibling test_tools_api.py defines its own
+# DB fixture and would double-init). ``usefixtures`` takes the name as
+# a string so we don't import the fixture (which would trip ruff F811).
+pytestmark = pytest.mark.usefixtures("_test_db")
 
 
-@pytest.fixture(autouse=True)
-def _test_db():
-    """Per-test SQLite DB so tables come up empty.
-
-    Matches the pattern in ``test_agents_kb_tool_validation.py``: tmp
-    sqlite file, ``init_db`` lays out the schema, drop all on teardown.
-    """
-    from xagent.web.models.database import init_db
-
-    temp_dir = tempfile.mkdtemp()
-    temp_db_path = os.path.join(temp_dir, "test.db")
-    db_url = f"sqlite:///{temp_db_path}"
-    init_db(db_url=db_url)
-
-    yield
-
-    Base.metadata.drop_all(bind=get_engine())
-    try:
-        shutil.rmtree(temp_dir)
-    except OSError:
-        pass
-
-
-# ===== Auth helpers =====
-
-
-def _setup_admin() -> None:
-    """Idempotent admin bootstrap; mirrors ``test_agents_kb_tool_validation``."""
-    status = client.get("/api/auth/setup-status")
-    assert status.status_code == 200
-    if status.json().get("needs_setup", True):
-        resp = client.post(
-            "/api/auth/setup-admin",
-            json={"username": "admin", "password": "admin123"},
-        )
-        assert resp.status_code == 200
-
-
-def _login(username: str = "admin", password: str = "admin123") -> dict[str, str]:
-    """Log in and return the bearer header dict ready to splat into a request."""
-    resp = client.post(
-        "/api/auth/login", json={"username": username, "password": password}
-    )
-    assert resp.status_code == 200
-    return {"Authorization": f"Bearer {resp.json()['access_token']}"}
-
-
-def _headers() -> dict[str, str]:
-    """Setup admin if needed and return the admin's auth header."""
-    _setup_admin()
-    return _login()
-
-
-def _register_second_user(
-    username: str = "bob", password: str = "bobpass1"
-) -> dict[str, str]:
-    """Register a second user via the public endpoint and return their auth header."""
-    resp = client.post(
-        "/api/auth/register",
-        json={"username": username, "password": password},
-    )
-    assert resp.status_code == 200, resp.text
-    return _login(username, password)
-
-
-# ===== Domain helpers =====
+# Keep the prior local helper name so existing test bodies stay readable.
+_headers = _admin_headers
 
 
 def _create_agent(headers: dict[str, str], name: str = "Test Agent") -> int:
@@ -132,16 +51,6 @@ def _create_agent(headers: dict[str, str], name: str = "Test Agent") -> int:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["id"]
-
-
-def _direct_db_session() -> Session:
-    """Open a session against the same test DB FastAPI is using.
-
-    Used in a couple of tests that need to inspect rows directly (e.g.
-    confirm an active key was inserted) rather than only via the HTTP
-    surface.
-    """
-    return next(get_db())
 
 
 # ===== POST /{agent_id}/api-key =====

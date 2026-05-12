@@ -3,6 +3,7 @@ import json
 import logging
 import os
 from contextlib import suppress
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -115,18 +116,50 @@ async def validation_exception_handler(
 
 
 @app.exception_handler(Exception)
-async def global_exception_handler(request: Request, exc: Exception) -> None:
-    """Global exception handler, ensuring all errors are recorded"""
+async def global_exception_handler(request: Request, exc: Exception) -> Any:
+    """Global exception handler.
+
+    For ``/v1/*`` paths (the SDK surface) we MUST return the stable
+    ``{"error": {"code", "message"}}`` envelope -- anything else
+    violates the contract documented in web/api/v1/errors.py and would
+    confuse SDK clients that key off ``body.error.code``.
+
+    For non-``/v1/*`` paths the original behavior is preserved: log
+    the traceback and re-raise so FastAPI's default ``{"detail": ...}``
+    handler runs (matching what /api/* callers and the web UI already
+    expect).
+    """
     import traceback
 
-    logger.error(f"Unhandled exception in {request.url}: {str(exc)}")
+    logger.error(f"Unhandled exception in {request.url}: {exc}")
     logger.error(f"Traceback: {traceback.format_exc()}")
-    # Re-raise the exception, let FastAPI handle it
+
+    if request.url.path.startswith("/v1/"):
+        # Sanitize: never echo str(exc) -- it can leak SQL error
+        # wording, table names, or storage backend identity. The full
+        # traceback already went to the server log above.
+        from fastapi.responses import JSONResponse
+
+        return JSONResponse(
+            status_code=500,
+            content={
+                "error": {
+                    "code": "internal_error",
+                    "message": "Internal server error.",
+                }
+            },
+        )
+
+    # Non-/v1/* paths: original behavior unchanged. Re-raise so
+    # FastAPI's default exception handling produces the {"detail": ...}
+    # response the web UI / legacy clients depend on.
     raise exc
 
 
 # /v1/* SDK surface uses a stable {"error": {"code", "message"}} envelope
 # distinct from FastAPI's default {"detail": "..."} shape used by /api/*.
+# Typed V1ApiError raises pass through this handler so endpoints can
+# choose their own HTTP status (401 / 404 / 409 / 429).
 # See web/api/v1/errors.py for the contract.
 app.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 

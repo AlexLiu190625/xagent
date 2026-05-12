@@ -155,10 +155,21 @@ class Task(Base):  # type: ignore
     # Call origin classifier: 'internal' (web UI / WS / legacy),
     # 'sdk' (POST /v1/chat/tasks), 'widget' (embedded chat widget).
     # Default 'internal' so legacy code paths -- which never specify
-    # this field on Task(...) -- are auto-classified correctly.
-    # Indexed for adoption metrics queries
+    # this field on Task(...) -- are auto-classified correctly. Both
+    # ``default`` (Python-level, fires on ORM INSERT) and
+    # ``server_default`` (DB-level DDL, fires for raw SQL INSERT and
+    # for any future ALTER ADD COLUMN against this Column) are set so
+    # the schema produced by ``Base.metadata.create_all()`` (used by
+    # dev/test init_db) stays identical to what alembic produces in
+    # production. Indexed for adoption-metrics queries
     # (SELECT count(*) FROM tasks WHERE source='sdk' AND created_at>...).
-    source = Column(String(20), default="internal", nullable=True, index=True)
+    source = Column(
+        String(20),
+        default="internal",
+        server_default="internal",
+        nullable=True,
+        index=True,
+    )
 
     @property
     def execution_mode_enum(self) -> ExecutionMode:
