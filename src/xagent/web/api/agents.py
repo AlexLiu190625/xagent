@@ -3,11 +3,12 @@
 import logging
 import os
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
@@ -15,12 +16,19 @@ from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
+from ...core.utils.api_key import generate_api_key
 from ...core.utils.type_check import ensure_list
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, AgentStatus
+from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.user import User
+from ..schemas.agent_api_key import (
+    APIKeyGenerateResponse,
+    APIKeyMetadataResponse,
+    APIKeyRevokeResponse,
+)
 from ..services.llm_utils import UserAwareModelStorage
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
@@ -284,6 +292,55 @@ def _agent_to_response(agent: Agent, db: Session) -> AgentResponse:
         widget_enabled=agent.widget_enabled,
         allowed_domains=ensure_list(agent.allowed_domains) or [],
     )
+
+
+def _get_owned_agent_or_404(agent_id: int, current_user: User, db: Session) -> Agent:
+    """Resolve an agent_id against the caller's ownership, raising 404 otherwise.
+
+    Why 404 instead of 403 when ownership doesn't match:
+        Returning 403 ("forbidden") would leak that an agent with this id
+        exists, just owned by somebody else. The /v1/* surface design (and
+        general best practice for multi-tenant resources) is to fold
+        "missing" and "not yours" into the same 404 response so callers
+        cannot enumerate other users' agent ids.
+
+    Args:
+        agent_id: Path parameter from the route.
+        current_user: Authenticated user from ``Depends(get_current_user)``.
+        db: SQLAlchemy session.
+
+    Returns:
+        The :class:`Agent` row, guaranteed to belong to ``current_user``.
+
+    Raises:
+        HTTPException 404: agent does not exist, or exists but belongs to
+            another user.
+    """
+    agent = (
+        db.query(Agent)
+        .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+        .first()
+    )
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return agent
+
+
+def _mask_key(key_prefix: str) -> str:
+    """Render the display form ``xag_<prefix>_••••••••`` for read-only views.
+
+    The bullet count is fixed at eight on purpose. The actual secret is 32
+    characters; reflecting the real length in the UI would leak length
+    metadata in screenshots and screenshares. Eight bullets is short
+    enough to render compactly and long enough to read as "redacted".
+
+    Args:
+        key_prefix: The public-safe lookup handle (6 chars).
+
+    Returns:
+        Display string suitable for the web UI's "API Key" card.
+    """
+    return f"xag_{key_prefix}_••••••••"
 
 
 # ===== Endpoints =====
@@ -728,6 +785,257 @@ async def upload_agent_logo(
     except Exception as e:
         logger.error(f"Failed to upload logo for agent {agent_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ===== API Key Endpoints =====
+#
+# Three sibling endpoints (POST/GET/DELETE) at /api/agents/{agent_id}/api-key
+# let the agent owner manage the SDK key. All three share JWT auth via
+# ``get_current_user`` and gate ownership through ``_get_owned_agent_or_404``;
+# the unsuccessful-ownership path returns 404 (not 403) so the existence of
+# another user's agent is not leaked. See the SDK design doc §5 for the
+# product-level contract and §10 for the security rationale.
+
+
+@router.post("/{agent_id}/api-key", response_model=APIKeyGenerateResponse)
+async def generate_agent_api_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIKeyGenerateResponse:
+    """Generate or rotate the SDK API key for an agent.
+
+    If an active (non-revoked) key already exists for the agent, this
+    endpoint revokes it and inserts a new active row in a single
+    transaction. The new ``full_key`` is returned exactly once in the
+    response; the plaintext secret is never persisted server-side, only
+    its bcrypt hash.
+
+    Args:
+        agent_id: Path parameter; the target agent's primary key.
+        current_user: Resolved from the ``Authorization: Bearer <JWT>``
+            header by ``get_current_user``.
+        db: SQLAlchemy session injected by FastAPI.
+
+    Returns:
+        :class:`APIKeyGenerateResponse` containing ``full_key`` (one-shot
+        plaintext), ``key_prefix``, and ``created_at``.
+
+    Raises:
+        HTTPException 401: missing or invalid JWT.
+        HTTPException 404: agent does not exist or does not belong to the
+            caller (deliberate to avoid leaking agent existence).
+        HTTPException 500: any unexpected error; transaction rolled back.
+            The most plausible internal failure is a partial-unique index
+            violation from a concurrent POST race, which the DB enforces.
+
+    Notes:
+        - Transactional shape mirrors ``auth.setup_admin`` and
+          ``custom_api.create_custom_api`` -- we collect all writes in the
+          session and commit once. There is no ``SELECT ... FOR UPDATE``;
+          concurrent rotations are caught by the
+          ``uq_agent_api_keys_agent_active`` partial unique index and
+          surfaced as a 500. Two clients racing to rotate the same key is
+          a corner case; a 500 is acceptable.
+        - Logs include the ``key_prefix`` only -- never the ``full_key``,
+          the secret half, or the bcrypt hash.
+    """
+    try:
+        # Ownership gate. Raises 404 on miss; never reveals "exists but
+        # not yours" vs "does not exist".
+        _get_owned_agent_or_404(agent_id, current_user, db)
+
+        # Revoke any existing active key for this agent. We touch
+        # ``updated_at`` so audit queries can see the rotation moment on
+        # the old row as well as the new row.
+        now = datetime.now(timezone.utc)
+        existing = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.revoked_at = now  # type: ignore[assignment]
+            existing.updated_at = now  # type: ignore[assignment]
+
+        # Generate a fresh prefix+secret+hash. ``generate_api_key`` does
+        # its own prefix-collision probe against ``agent_api_keys`` so
+        # we don't have to.
+        full_key, key_prefix, key_hash = generate_api_key(db)
+
+        new_row = AgentApiKey(
+            agent_id=agent_id,
+            key_prefix=key_prefix,
+            key_hash=key_hash,
+        )
+        db.add(new_row)
+
+        # Single commit: revoke + insert are atomic. If a concurrent
+        # POST snuck in between our SELECT and INSERT, the partial
+        # unique index raises IntegrityError here and the outer except
+        # rolls back. The losing client sees 500, which the UI can retry.
+        db.commit()
+        db.refresh(new_row)
+
+        # ``key_prefix`` is the only safe field to log. Do NOT log
+        # full_key / secret / key_hash even in DEBUG.
+        logger.info(
+            f"Generated API key for agent {agent_id} "
+            f"(prefix={key_prefix}, rotated={existing is not None})"
+        )
+
+        return APIKeyGenerateResponse(
+            full_key=full_key,
+            key_prefix=key_prefix,
+            created_at=new_row.created_at,
+        )
+
+    except HTTPException:
+        raise
+    except IntegrityError as e:
+        # Partial unique constraint hit -- another POST won the race
+        # between our SELECT and our COMMIT. Surface this as 409 rather
+        # than a generic 500 so the client can retry without alarm.
+        # Internal SQL message stays in the log only.
+        db.rollback()
+        logger.warning(f"Concurrent API key rotation race for agent {agent_id}: {e}")
+        raise HTTPException(status_code=409, detail="rotation_conflict")
+    except Exception as e:
+        # Sanitize: do NOT echo str(e) to the client -- it could leak
+        # internal table names, SQL error wording, or storage backend
+        # identity. Full diagnostic stays in the server log.
+        logger.error(f"Failed to generate API key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.get("/{agent_id}/api-key", response_model=APIKeyMetadataResponse)
+async def get_agent_api_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIKeyMetadataResponse:
+    """Return metadata for the agent's currently active API key.
+
+    Returns the public-safe prefix and a display-only ``masked_key``.
+    The plaintext secret is unrecoverable by design -- if the owner has
+    lost it, they must POST to rotate.
+
+    Args:
+        agent_id: Path parameter.
+        current_user: Resolved from JWT.
+        db: SQLAlchemy session.
+
+    Returns:
+        :class:`APIKeyMetadataResponse` with ``key_prefix``, ``masked_key``,
+        and ``created_at``.
+
+    Raises:
+        HTTPException 401: missing or invalid JWT.
+        HTTPException 404: agent missing / not owned; or owned but has no
+            active key. Both shapes use the same status code so the
+            caller cannot distinguish "agent doesn't exist" from "no key
+            generated yet". The ``detail`` differentiates so the UI can
+            render "未生成" instead of "agent not found".
+    """
+    try:
+        _get_owned_agent_or_404(agent_id, current_user, db)
+
+        row = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .first()
+        )
+        if row is None:
+            # "Has the owner generated a key yet?" answered with 404 so
+            # the UI catches and renders the empty state.
+            raise HTTPException(status_code=404, detail="no_active_key")
+
+        return APIKeyMetadataResponse(
+            key_prefix=row.key_prefix,
+            masked_key=_mask_key(row.key_prefix),  # type: ignore[arg-type]
+            created_at=row.created_at,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Sanitize: do NOT echo str(e) to the client (see POST handler note).
+        logger.error(f"Failed to read API key for agent {agent_id}: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@router.delete("/{agent_id}/api-key", response_model=APIKeyRevokeResponse)
+async def revoke_agent_api_key(
+    agent_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> APIKeyRevokeResponse:
+    """Soft-revoke the agent's active API key.
+
+    Idempotent: calling DELETE on an agent with no active key still
+    returns HTTP 200 with ``revoked=false``. This lets clients call
+    DELETE blindly without first getting it to check existence.
+
+    Args:
+        agent_id: Path parameter.
+        current_user: Resolved from JWT.
+        db: SQLAlchemy session.
+
+    Returns:
+        :class:`APIKeyRevokeResponse` with:
+          - ``revoked=true, revoked_at=<now>`` if an active key was just revoked.
+          - ``revoked=false, revoked_at=null`` if no active key existed.
+
+    Raises:
+        HTTPException 401: missing or invalid JWT.
+        HTTPException 404: agent missing / not owned.
+
+    Notes:
+        Revoked rows stay in the table forever (we only flip ``revoked_at``).
+        The audit trail of "when was a key created and when was it
+        revoked" is the entire point of soft-delete here; hard-deleting
+        would also lose the ability to answer "is this old hash one
+        we issued?" during incident response.
+    """
+    try:
+        _get_owned_agent_or_404(agent_id, current_user, db)
+
+        now = datetime.now(timezone.utc)
+        row = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .first()
+        )
+        if row is None:
+            # Idempotent no-op path; same HTTP shape as "yes we revoked".
+            logger.info(f"Revoke API key for agent {agent_id}: no active key (no-op)")
+            return APIKeyRevokeResponse(revoked=False, revoked_at=None)
+
+        row.revoked_at = now  # type: ignore[assignment]
+        row.updated_at = now  # type: ignore[assignment]
+        db.commit()
+        db.refresh(row)
+
+        logger.info(f"Revoked API key for agent {agent_id} (prefix={row.key_prefix})")
+        return APIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        # Sanitize: do NOT echo str(e) to the client (see POST handler note).
+        logger.error(f"Failed to revoke API key for agent {agent_id}: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Internal server error")
 
 
 # ===== Preview Models =====
