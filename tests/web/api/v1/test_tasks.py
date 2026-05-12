@@ -258,3 +258,260 @@ def test_create_task_cross_user_agent_returns_404(mock_start_task):
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "agent_not_found"
     assert mock_start_task.await_count == 0
+
+
+# ===== Shared helper for E tests: create a task via POST then return its id =====
+
+
+def _create_task(full_key: str, agent_id: int, content: str = "hello") -> int:
+    """Drive POST /v1/chat/tasks and return the resulting task_id."""
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": content}},
+    )
+    assert resp.status_code == 202, resp.text
+    return resp.json()["task_id"]
+
+
+# ===== POST /v1/chat/tasks/{task_id}/messages =====
+
+
+def test_append_message_happy_path(mock_start_task):
+    """Returns 202 + accepted_at, persists new user message, kicks off bg."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+    mock_start_task.reset_mock()  # discard the create-task call so we count just the append
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+        },
+    )
+    assert resp.status_code == 202, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    assert body["status"] == "pending"
+    assert "accepted_at" in body
+
+    # Two user messages now exist for this task; task.input is the latest
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        msgs = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert len(msgs) == 2
+        assert [m.content for m in msgs] == ["first turn", "second turn"]
+        task = db.query(Task).filter(Task.id == task_id).first()
+        assert task is not None
+        assert task.input == "second turn"
+    finally:
+        db.close()
+
+    assert mock_start_task.await_count == 1
+
+
+def test_append_message_to_running_task_returns_409(mock_start_task):
+    """Appending to a RUNNING task is rejected as task_busy."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    mock_start_task.reset_mock()
+
+    # Flip status to RUNNING directly so we don't have to actually run
+    # the agent service in tests.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.RUNNING
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hello"}},
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_busy"
+    # No new background kickoff happened
+    assert mock_start_task.await_count == 0
+
+
+def test_append_message_to_missing_task_returns_404(mock_start_task):
+    """Appending to a task that doesn't exist -> 404 task_not_found."""
+    agent_id, full_key = _create_agent_with_key()
+    resp = client.post(
+        "/v1/chat/tasks/9999999/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+    assert mock_start_task.await_count == 0
+
+
+def test_append_message_to_other_agents_task_returns_404(mock_start_task):
+    """Bob can't append to Alice's task even if he knows the id."""
+    alice_agent_id, alice_key = _create_agent_with_key()
+    alice_task_id = _create_task(alice_key, alice_agent_id)
+    mock_start_task.reset_mock()
+
+    from ..conftest import _register_second_user
+
+    bob_headers = _register_second_user()
+    bob_agent = client.post(
+        "/api/agents",
+        headers=bob_headers,
+        json={
+            "name": "bob agent",
+            "description": "test",
+            "instructions": "test",
+            "execution_mode": "balanced",
+        },
+    ).json()
+    bob_agent_id = bob_agent["id"]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
+
+    resp = client.post(
+        f"/v1/chat/tasks/{alice_task_id}/messages",
+        headers=_bearer(bob_key),
+        json={"agent_id": bob_agent_id, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+    assert mock_start_task.await_count == 0
+
+
+def test_append_message_body_agent_id_mismatch_returns_404(mock_start_task):
+    """body.agent_id != authed agent.id -> 404 agent_not_found.
+
+    Distinct from cross-agent task ownership (which is task_not_found) --
+    here the task IS the caller's, but the body claims a different
+    agent_id; consistent with POST /v1/chat/tasks behavior.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": 999999, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "agent_not_found"
+    assert mock_start_task.await_count == 0
+
+
+# ===== GET /v1/chat/tasks/{task_id} =====
+
+
+def test_get_task_pending(mock_start_task):
+    """Fresh task: status='pending', input set, output/error null, completed_at null."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="seed input")
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    assert body["status"] == "pending"
+    assert body["input"] == "seed input"
+    assert body["output"] is None
+    assert body["error"] is None
+    assert "created_at" in body
+    assert body["completed_at"] is None
+
+
+def test_get_task_completed_returns_output(mock_start_task):
+    """Completed task: output populated, completed_at set."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    # Flip status + write output to simulate completed background turn
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.COMPLETED
+        task.output = "final answer"
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "completed"
+    assert body["output"] == "final answer"
+    assert body["completed_at"] is not None
+
+
+def test_get_task_failed_returns_error(mock_start_task):
+    """Failed task: error populated, completed_at set."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.FAILED
+        task.error_message = "agent crashed"
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert body["error"] == "agent crashed"
+    assert body["output"] is None
+    assert body["completed_at"] is not None
+
+
+def test_get_missing_task_returns_404(mock_start_task):
+    _agent_id, full_key = _create_agent_with_key()
+    resp = client.get("/v1/chat/tasks/9999999", headers=_bearer(full_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_get_other_agents_task_returns_404(mock_start_task):
+    """Cross-agent task access -> 404 (not leaking existence)."""
+    alice_agent_id, alice_key = _create_agent_with_key()
+    alice_task_id = _create_task(alice_key, alice_agent_id)
+
+    from ..conftest import _register_second_user
+
+    bob_headers = _register_second_user()
+    bob_agent = client.post(
+        "/api/agents",
+        headers=bob_headers,
+        json={
+            "name": "bob agent",
+            "description": "test",
+            "instructions": "test",
+            "execution_mode": "balanced",
+        },
+    ).json()
+    bob_agent_id = bob_agent["id"]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
+
+    resp = client.get(f"/v1/chat/tasks/{alice_task_id}", headers=_bearer(bob_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
