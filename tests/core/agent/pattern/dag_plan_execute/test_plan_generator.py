@@ -193,8 +193,8 @@ class TestPlanGenerator:
         assert steps[0]["id"] == "step1"
         assert steps[0]["name"] == "Valid Step"
 
-    def test_parse_auto_generate_id(self, plan_generator):
-        """测试自动生成步骤ID"""
+    def test_parse_preserves_missing_id(self, plan_generator):
+        """测试解析阶段保留缺失步骤ID，由后续校验触发重试"""
         response_without_ids = """
         {
             "plan": {
@@ -221,8 +221,8 @@ class TestPlanGenerator:
         steps = parsed_data["steps"]
 
         assert len(steps) == 2
-        assert steps[0]["id"] == "step_1"
-        assert steps[1]["id"] == "step_2"
+        assert "id" not in steps[0]
+        assert "id" not in steps[1]
 
     def test_parse_auto_generate_dependencies(self, plan_generator):
         """测试自动生成依赖数组"""

@@ -2,6 +2,7 @@
 Plan generation logic for DAG plan-execute pattern.
 """
 
+import copy
 import json
 import logging
 from datetime import datetime
@@ -71,6 +72,280 @@ class PlanGenerator:
         self.skill_manager = skill_manager
         self.allowed_skills = allowed_skills
 
+    def _collect_forbidden_step_ids(
+        self,
+        history: List[Dict[str, Any]],
+        current_plan: Optional[ExecutionPlan] = None,
+    ) -> List[str]:
+        """Collect task-scoped step IDs that newly generated steps must not reuse."""
+        forbidden_ids: List[str] = []
+        seen: set[str] = set()
+
+        def add_step_id(step_id: Any) -> None:
+            if step_id is None:
+                return
+            normalized = str(step_id).strip()
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                forbidden_ids.append(normalized)
+
+        def collect_from_plan(plan_data: Any) -> None:
+            if isinstance(plan_data, ExecutionPlan):
+                for step in plan_data.steps:
+                    add_step_id(step.id)
+                return
+
+            if not isinstance(plan_data, dict):
+                return
+
+            steps = plan_data.get("steps")
+            if not isinstance(steps, list):
+                return
+
+            for step_data in steps:
+                if isinstance(step_data, PlanStep):
+                    add_step_id(step_data.id)
+                elif isinstance(step_data, dict):
+                    add_step_id(step_data.get("id"))
+
+        if current_plan:
+            collect_from_plan(current_plan)
+
+        for item in history or []:
+            if not isinstance(item, dict):
+                continue
+
+            collect_from_plan(item.get("plan"))
+            collect_from_plan(item)
+
+            content = item.get("content")
+            if isinstance(content, str):
+                content = content.strip()
+                if content.startswith("{"):
+                    json_str = content
+                elif "```" in content:
+                    json_str = extract_json_from_markdown(content)
+                    if not isinstance(
+                        json_str, str
+                    ) or not json_str.lstrip().startswith("{"):
+                        continue
+                else:
+                    continue
+                try:
+                    parsed_content = json.loads(json_str)
+                except (TypeError, ValueError):
+                    continue
+                if isinstance(parsed_content, dict):
+                    collect_from_plan(parsed_content.get("plan"))
+                    collect_from_plan(parsed_content)
+
+        return forbidden_ids
+
+    def _format_forbidden_step_ids_block(self, forbidden_step_ids: List[str]) -> str:
+        """Build a prompt block that makes task-scoped step ID constraints explicit."""
+        forbidden_json = json.dumps(forbidden_step_ids, ensure_ascii=False, indent=2)
+        return (
+            "STEP ID UNIQUENESS RULES:\n"
+            f"FORBIDDEN_STEP_IDS:\n{forbidden_json}\n\n"
+            "- Every new step id MUST be a non-empty string.\n"
+            "- Do NOT use any id listed in FORBIDDEN_STEP_IDS.\n"
+            "- No two steps in your returned steps array may share the same id.\n"
+            "- Step names are display labels and do NOT need to be unique.\n"
+            "- If you need a similar step, create a new id such as "
+            "`analyze_data_2` or `iteration3_analyze_data`.\n\n"
+        )
+
+    def _format_step_id_retry_guidance(
+        self, error_context: Optional[Dict[str, Any]]
+    ) -> str:
+        """Build retry guidance for step ID validation failures."""
+        if not error_context or not error_context.get("step_id_errors"):
+            return ""
+
+        return (
+            "STEP ID VALIDATION ERRORS:\n"
+            f"Missing ID step indices: {error_context.get('missing_step_id_indices', [])}\n"
+            "Reserved step IDs used:\n"
+            f"{json.dumps(error_context.get('reserved_step_ids', []), ensure_ascii=False)}\n"
+            "Duplicate step IDs in this response:\n"
+            f"{json.dumps(error_context.get('duplicate_step_ids', []), ensure_ascii=False)}\n"
+            "Forbidden step IDs for this task:\n"
+            f"{json.dumps(error_context.get('forbidden_step_ids', []), ensure_ascii=False)}\n\n"
+            "Please regenerate the plan with non-empty step IDs that are unique within "
+            "this response and not present in FORBIDDEN_STEP_IDS. Step names may repeat.\n\n"
+        )
+
+    def _prepare_steps_data(
+        self,
+        steps_data: List[Dict[str, Any]],
+        forbidden_step_ids: List[str],
+        rewrite_conflicts: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Validate or rewrite raw step dictionaries before creating PlanStep objects."""
+        prepared_steps = [copy.deepcopy(step) for step in steps_data]
+        forbidden_set = set(forbidden_step_ids)
+        self._normalize_raw_step_references(prepared_steps)
+
+        if rewrite_conflicts:
+            try:
+                self._validate_raw_step_ids(prepared_steps, forbidden_set)
+                return prepared_steps
+            except DAGPlanGenerationError as e:
+                if e.context and (
+                    e.context.get("missing_step_id_indices")
+                    or e.context.get("reserved_step_ids")
+                ):
+                    raise
+
+            rewritten_steps = self._rewrite_conflicting_step_ids(
+                prepared_steps, forbidden_set
+            )
+            logger.warning(
+                "Rewrote duplicate step IDs after validation retries were exhausted"
+            )
+            return rewritten_steps
+
+        self._validate_raw_step_ids(prepared_steps, forbidden_set)
+        return prepared_steps
+
+    def _normalize_step_id_value(self, step_id: Any) -> str:
+        """Normalize an LLM-provided step id to a string for validation."""
+        if step_id is None:
+            return ""
+        return str(step_id).strip()
+
+    def _normalize_raw_step_references(self, steps_data: List[Dict[str, Any]]) -> None:
+        """Normalize raw step IDs and references before validation."""
+        for step_data in steps_data:
+            if "id" in step_data:
+                step_data["id"] = self._normalize_step_id_value(step_data.get("id"))
+
+            dependencies = step_data.get("dependencies")
+            if isinstance(dependencies, list):
+                step_data["dependencies"] = [
+                    self._normalize_step_id_value(dep) for dep in dependencies
+                ]
+
+            conditional_branches = step_data.get("conditional_branches")
+            if isinstance(conditional_branches, dict):
+                step_data["conditional_branches"] = {
+                    branch_key: self._normalize_step_id_value(target_step_id)
+                    for branch_key, target_step_id in conditional_branches.items()
+                }
+
+    def _validate_raw_step_ids(
+        self,
+        steps_data: List[Dict[str, Any]],
+        forbidden_step_ids: set[str],
+    ) -> None:
+        """Reject empty, duplicate, or task-reserved step IDs in raw LLM output."""
+        missing_indices: List[int] = []
+        reserved_matches: List[Dict[str, Any]] = []
+        positions_by_id: Dict[str, List[int]] = {}
+
+        for index, step_data in enumerate(steps_data):
+            step_id = self._normalize_step_id_value(step_data.get("id"))
+            if not step_id:
+                missing_indices.append(index)
+                continue
+
+            step_data["id"] = step_id
+            if step_id in forbidden_step_ids:
+                reserved_matches.append({"id": step_id, "index": index})
+
+            positions_by_id.setdefault(step_id, []).append(index)
+
+        duplicates = [
+            {"id": step_id, "indices": indices}
+            for step_id, indices in positions_by_id.items()
+            if len(indices) > 1
+        ]
+
+        if not missing_indices and not reserved_matches and not duplicates:
+            return
+
+        raise DAGPlanGenerationError(
+            "Generated plan contains duplicate, empty, or reserved step IDs",
+            goal="",
+            iteration=1,
+            llm_response=None,
+            context={
+                "step_id_errors": True,
+                "missing_step_id_indices": missing_indices,
+                "reserved_step_ids": reserved_matches,
+                "duplicate_step_ids": duplicates,
+                "forbidden_step_ids": sorted(forbidden_step_ids),
+            },
+        )
+
+    def _rewrite_conflicting_step_ids(
+        self,
+        steps_data: List[Dict[str, Any]],
+        forbidden_step_ids: set[str],
+    ) -> List[Dict[str, Any]]:
+        """Deterministically rewrite only new step IDs that conflict or repeat."""
+        used_ids = set(forbidden_step_ids)
+        first_generated_id_by_original: Dict[str, str] = {}
+
+        for index, step_data in enumerate(steps_data):
+            original_id = self._normalize_step_id_value(step_data.get("id"))
+
+            final_id = original_id
+            if final_id in used_ids:
+                final_id = self._make_unique_step_id(original_id, used_ids)
+
+            step_data["id"] = final_id
+            used_ids.add(final_id)
+
+            first_generated_id_by_original.setdefault(original_id, final_id)
+
+        for step_data in steps_data:
+            dependencies = step_data.get("dependencies", [])
+            if not isinstance(dependencies, list):
+                dependencies = []
+            step_data["dependencies"] = [
+                self._rewrite_step_reference(
+                    dep, forbidden_step_ids, first_generated_id_by_original
+                )
+                for dep in dependencies
+            ]
+
+            conditional_branches = step_data.get("conditional_branches", {})
+            if isinstance(conditional_branches, dict):
+                step_data["conditional_branches"] = {
+                    branch_key: self._rewrite_step_reference(
+                        target_step_id,
+                        forbidden_step_ids,
+                        first_generated_id_by_original,
+                    )
+                    for branch_key, target_step_id in conditional_branches.items()
+                }
+
+        self._validate_raw_step_ids(steps_data, forbidden_step_ids)
+        return steps_data
+
+    def _make_unique_step_id(self, base_id: str, used_ids: set[str]) -> str:
+        """Create a deterministic suffixed step ID that is not already used."""
+        base = base_id or "step"
+        counter = 2
+        candidate = f"{base}_{counter}"
+        while candidate in used_ids:
+            counter += 1
+            candidate = f"{base}_{counter}"
+        return candidate
+
+    def _rewrite_step_reference(
+        self,
+        step_ref: Any,
+        forbidden_step_ids: set[str],
+        first_generated_id_by_original: Dict[str, str],
+    ) -> str:
+        """Rewrite dependency/branch references to the first generated final ID."""
+        normalized_ref = self._normalize_step_id_value(step_ref)
+        if normalized_ref in forbidden_step_ids:
+            return normalized_ref
+        return first_generated_id_by_original.get(normalized_ref, normalized_ref)
+
     async def _generate_plan_with_flow(
         self,
         tracer: Any,
@@ -94,6 +369,8 @@ class PlanGenerator:
                 For generation: execution_plan contains all steps, additional_steps is empty
                 For extension: execution_plan is None, additional_steps contains new steps
         """
+        forbidden_step_ids = self._collect_forbidden_step_ids(history, current_plan)
+
         # Send plan start event
         trace_task_id = (
             f"plan_extension_{uuid4()}" if is_extension else f"plan_{uuid4()}"
@@ -136,10 +413,17 @@ class PlanGenerator:
                     user_input_context,
                     tools,
                     context,
+                    forbidden_step_ids=forbidden_step_ids,
                 )
             else:
                 prompt = prompt_builder_func(
-                    goal, iteration, history, tools, context, skill_context
+                    goal,
+                    iteration,
+                    history,
+                    tools,
+                    context,
+                    skill_context,
+                    forbidden_step_ids=forbidden_step_ids,
                 )
 
             # Call LLM
@@ -185,24 +469,19 @@ class PlanGenerator:
                             )
 
                     # Create PlanStep objects and validate for first attempt
+                    prepared_steps_data = self._prepare_steps_data(
+                        steps_data,
+                        forbidden_step_ids=forbidden_step_ids,
+                        rewrite_conflicts=validation_attempt >= max_validation_retries,
+                    )
+
                     if is_extension:
                         # For extension, we need to handle existing step IDs
-                        existing_step_ids = (
-                            {step.id for step in current_plan.steps}
-                            if current_plan
-                            else set()
-                        )
                         additional_steps = []
 
-                        for step_data in steps_data:
-                            step_id = step_data.get("id", str(uuid4()))
-                            # Ensure unique step ID
-                            while step_id in existing_step_ids:
-                                step_id = str(uuid4())
-                            existing_step_ids.add(step_id)
-
+                        for step_data in prepared_steps_data:
                             step = PlanStep(
-                                id=step_id,
+                                id=step_data["id"],
                                 name=step_data["name"],
                                 description=step_data["description"],
                                 tool_names=step_data.get("tool_names", []),
@@ -216,9 +495,9 @@ class PlanGenerator:
                             additional_steps.append(step)
 
                         # Validate dependencies (both existing and new steps)
-                        all_step_ids = existing_step_ids.copy()
-                        for step in additional_steps:
-                            all_step_ids.add(step.id)
+                        all_step_ids = set(forbidden_step_ids) | {
+                            step.id for step in additional_steps
+                        }
 
                         for step in additional_steps:
                             invalid_deps = [
@@ -238,6 +517,18 @@ class PlanGenerator:
 
                         # Validate tool references for the new steps
                         self._validate_steps_tools(additional_steps, tools)
+                        if current_plan:
+                            all_steps = current_plan.steps + additional_steps
+                            self._validate_unique_step_ids(
+                                all_steps,
+                                goal=current_plan.goal,
+                                iteration=current_plan.iteration,
+                            )
+                            self._validate_conditional_branch_targets(
+                                all_steps,
+                                goal=current_plan.goal,
+                                iteration=current_plan.iteration,
+                            )
 
                         # Send trace event for extension
                         plan_data = {
@@ -280,14 +571,10 @@ class PlanGenerator:
                     else:
                         # For generation, create all steps
                         steps = []
-                        step_ids = set()
 
-                        for step_data in steps_data:
-                            step_id = step_data.get("id", str(uuid4()))
-                            step_ids.add(step_id)
-
+                        for step_data in prepared_steps_data:
                             step = PlanStep(
-                                id=step_id,
+                                id=step_data["id"],
                                 name=step_data["name"],
                                 description=step_data["description"],
                                 tool_names=step_data.get("tool_names", []),
@@ -301,16 +588,21 @@ class PlanGenerator:
                             steps.append(step)
 
                         # Validate dependencies
+                        allowed_dependency_ids = {step.id for step in steps}
                         for step in steps:
                             invalid_deps = [
-                                dep for dep in step.dependencies if dep not in step_ids
+                                dep
+                                for dep in step.dependencies
+                                if dep not in allowed_dependency_ids
                             ]
                             if invalid_deps:
                                 logger.warning(
                                     f"Step {step.id} has invalid dependencies: {invalid_deps}"
                                 )
                                 step.dependencies = [
-                                    dep for dep in step.dependencies if dep in step_ids
+                                    dep
+                                    for dep in step.dependencies
+                                    if dep in allowed_dependency_ids
                                 ]
 
                         # Create execution plan
@@ -392,12 +684,57 @@ class PlanGenerator:
                             else [],
                             "available_tools": available_tools_list,
                         }
+                        if e.context:
+                            error_context.update(
+                                {
+                                    "step_id_errors": e.context.get(
+                                        "step_id_errors", False
+                                    ),
+                                    "missing_step_id_indices": e.context.get(
+                                        "missing_step_id_indices", []
+                                    ),
+                                    "reserved_step_ids": e.context.get(
+                                        "reserved_step_ids", []
+                                    ),
+                                    "duplicate_step_ids": e.context.get(
+                                        "duplicate_step_ids", []
+                                    ),
+                                    "forbidden_step_ids": e.context.get(
+                                        "forbidden_step_ids", []
+                                    ),
+                                    "invalid_branches": e.context.get(
+                                        "invalid_branches", []
+                                    ),
+                                    "available_step_ids": e.context.get(
+                                        "available_step_ids", []
+                                    ),
+                                }
+                            )
 
                         # Need to regenerate content with error context, so call LLM again
                         # Add error context to the messages for retry
                         missing_tools = (
                             e.context.get("missing_tools", []) if e.context else []
                         )
+                        invalid_branches = (
+                            e.context.get("invalid_branches", []) if e.context else []
+                        )
+                        available_step_ids = (
+                            e.context.get("available_step_ids", []) if e.context else []
+                        )
+                        step_id_guidance = self._format_step_id_retry_guidance(
+                            e.context
+                        )
+                        branch_guidance = ""
+                        if invalid_branches:
+                            branch_guidance = (
+                                "INVALID CONDITIONAL BRANCH TARGETS:\n"
+                                f"{json.dumps(invalid_branches, ensure_ascii=False)}\n"
+                                "Available step IDs:\n"
+                                f"{json.dumps(available_step_ids, ensure_ascii=False)}\n\n"
+                                "Please update conditional_branches so every target "
+                                "points to an existing step ID in the plan context.\n\n"
+                            )
                         retry_messages = clean_messages(prompt) + [
                             {
                                 "role": "user",
@@ -407,6 +744,8 @@ class PlanGenerator:
                                 f"Missing Tools: {', '.join(missing_tools)}\n\n"
                                 f"Available Tools:\n"
                                 f"{', '.join(available_tools_list)}\n\n"
+                                f"{step_id_guidance}"
+                                f"{branch_guidance}"
                                 f"COMMON TOOL NAMING MISTAKES TO AVOID:\n"
                                 f"- Use 'write_file' NOT 'write__file' (single underscore, not double)\n"
                                 f"- Use 'read_file' NOT 'read__file'\n"
@@ -918,6 +1257,7 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
         user_input_context: Optional[Dict[str, Any]] = None,
         tools: Optional[List[Tool]] = None,
         context: Optional[AgentContext] = None,
+        forbidden_step_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, str]]:
         """Build prompt for extending existing plan with additional steps"""
 
@@ -1004,6 +1344,7 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
             f"Iteration: {iteration}\n"
             f"Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"{current_plan_context}\n"
+            f"{self._format_forbidden_step_ids_block(forbidden_step_ids or [])}"
             f"{history_context}"
         )
 
@@ -1037,7 +1378,7 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
 
         user_prompt += (
             "Create additional steps as a JSON object with a 'plan' field containing a 'steps' array. Each step must have:\n"
-            "- id: unique identifier (string, different from existing step IDs)\n"
+            "- id: unique identifier (string, must obey STEP ID UNIQUENESS RULES above)\n"
             "- name: step name (string)\n"
             "- description: what this step does (string)\n"
             "- tool_names: list of tools available for this step (array of strings, can be empty)\n"
@@ -1081,6 +1422,7 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
         tools: List[Tool],
         context: Optional[AgentContext] = None,
         skill_context: Optional[str] = None,
+        forbidden_step_ids: Optional[List[str]] = None,
     ) -> List[Dict[str, str]]:
         """Build prompt for plan generation"""
 
@@ -1202,7 +1544,15 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
         messages.append(
             {
                 "role": "user",
-                "content": f"Goal: {goal}\nIteration: {iteration}\nCurrent Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\nCreate a step-by-step execution plan as a JSON object.",
+                "content": (
+                    f"Goal: {goal}\n"
+                    f"Iteration: {iteration}\n"
+                    f"Current Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+                    f"{self._format_forbidden_step_ids_block(forbidden_step_ids or [])}"
+                    "Create a step-by-step execution plan as a JSON object. "
+                    "Dependencies in this fresh plan must reference only step IDs "
+                    "returned in this same response."
+                ),
             }
         )
 
@@ -1221,7 +1571,7 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
             f"- task_name: A concise title for this task (REQUIRED, 3-10 words, meaningful for display in task lists, **MUST USE THE SAME LANGUAGE AS THE GOAL**)\n"
             f"- steps: array of execution steps\n\n"
             f"Each step must have:\n"
-            f"- id: unique identifier (string)\n"
+            f"- id: unique identifier (string, must obey STEP ID UNIQUENESS RULES above)\n"
             f"- name: step name (string)\n"
             f"- description: what this step does (string)\n"
             f"- tool_names: list of tools available for this step (array of strings, can be empty)\n"
@@ -1409,10 +1759,6 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
                 if not all(field in step for field in required_fields):
                     logger.warning(f"Step {i} missing required fields: {step}")
                     continue
-
-                # Set default ID if not provided
-                if "id" not in step:
-                    step["id"] = f"step_{i + 1}"
 
                 # Set default dependencies if not provided
                 if "dependencies" not in step:
@@ -1674,6 +2020,75 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
                 },
             )
 
+    def _validate_unique_step_ids(
+        self,
+        steps: List[PlanStep],
+        goal: str = "",
+        iteration: int = 1,
+    ) -> None:
+        """Validate that a set of plan steps has non-empty unique IDs."""
+        missing_step_id_indices: List[int] = []
+        positions_by_id: Dict[str, List[int]] = {}
+        for index, step in enumerate(steps):
+            step_id = self._normalize_step_id_value(step.id)
+            if not step_id:
+                missing_step_id_indices.append(index)
+                continue
+            step.id = step_id
+            positions_by_id.setdefault(step_id, []).append(index)
+
+        duplicate_step_ids = [
+            {"id": step_id, "indices": indices}
+            for step_id, indices in positions_by_id.items()
+            if len(indices) > 1
+        ]
+        if missing_step_id_indices or duplicate_step_ids:
+            logger.error("Plan validation failed: duplicate or empty step IDs detected")
+            raise DAGPlanGenerationError(
+                "Generated plan contains duplicate or empty step IDs",
+                goal=goal,
+                iteration=iteration,
+                llm_response=None,
+                context={
+                    "step_id_errors": True,
+                    "missing_step_id_indices": missing_step_id_indices,
+                    "duplicate_step_ids": duplicate_step_ids,
+                },
+            )
+
+    def _validate_conditional_branch_targets(
+        self,
+        steps: List[PlanStep],
+        goal: str = "",
+        iteration: int = 1,
+    ) -> None:
+        """Validate that conditional branches point to steps in the same plan view."""
+        available_step_ids = {step.id for step in steps}
+        invalid_branches = []
+        for step in steps:
+            if step.conditional_branches:
+                for branch_key, target_step_id in step.conditional_branches.items():
+                    if target_step_id not in available_step_ids:
+                        invalid_branches.append(
+                            f"{step.id}.{branch_key} -> {target_step_id}"
+                        )
+                        logger.warning(
+                            f"Step {step.id} branch '{branch_key}' points to non-existent step: {target_step_id}"
+                        )
+
+        if invalid_branches:
+            logger.error(f"Plan validation failed: invalid branches {invalid_branches}")
+            raise DAGPlanGenerationError(
+                "Generated plan has conditional branches pointing to non-existent steps",
+                goal=goal,
+                iteration=iteration,
+                llm_response=None,
+                context={
+                    "invalid_branches": invalid_branches,
+                    "available_step_ids": list(available_step_ids),
+                },
+            )
+
     def _validate_plan(self, plan: ExecutionPlan, tools: List[Tool]) -> None:
         """
         Validate the generated plan for tool existence
@@ -1686,6 +2101,12 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
             DAGPlanGenerationError: If validation fails
         """
         logger.info(f"Validating plan {plan.id} with {len(plan.steps)} steps")
+
+        self._validate_unique_step_ids(
+            plan.steps,
+            goal=plan.goal,
+            iteration=getattr(plan, "iteration", 1),
+        )
 
         # Build tool name map for validation
         available_tools = set()
@@ -1721,31 +2142,10 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
                 },
             )
 
-        # Validate conditional branches
-        available_step_ids = {step.id for step in plan.steps}
-        invalid_branches = []
-        for step in plan.steps:
-            if step.conditional_branches:
-                for branch_key, target_step_id in step.conditional_branches.items():
-                    if target_step_id not in available_step_ids:
-                        invalid_branches.append(
-                            f"{step.id}.{branch_key} -> {target_step_id}"
-                        )
-                        logger.warning(
-                            f"Step {step.id} branch '{branch_key}' points to non-existent step: {target_step_id}"
-                        )
-
-        if invalid_branches:
-            logger.error(f"Plan validation failed: invalid branches {invalid_branches}")
-            raise DAGPlanGenerationError(
-                "Generated plan has conditional branches pointing to non-existent steps",
-                goal=plan.goal,
-                iteration=getattr(plan, "iteration", 1),
-                llm_response=None,
-                context={
-                    "invalid_branches": invalid_branches,
-                    "available_step_ids": list(available_step_ids),
-                },
-            )
+        self._validate_conditional_branch_targets(
+            plan.steps,
+            goal=plan.goal,
+            iteration=getattr(plan, "iteration", 1),
+        )
 
         logger.info(f"Plan {plan.id} validation passed successfully")

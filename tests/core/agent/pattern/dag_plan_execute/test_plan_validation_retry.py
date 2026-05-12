@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from xagent.core.agent.exceptions import DAGPlanGenerationError
+from xagent.core.agent.pattern.dag_plan_execute.models import ExecutionPlan, PlanStep
 from xagent.core.agent.pattern.dag_plan_execute.plan_generator import PlanGenerator
 
 
@@ -239,11 +240,6 @@ async def test_plan_extension_retry_success(mock_llm, mock_tracer, mock_tool):
     """Test retry mechanism for plan extension"""
 
     # Create current plan
-    from xagent.core.agent.pattern.dag_plan_execute.models import (
-        ExecutionPlan,
-        PlanStep,
-    )
-
     current_step = PlanStep(
         id="existing_step",
         name="Existing Step",
@@ -414,3 +410,598 @@ async def test_plan_validation_multiple_missing_tools(mock_llm, mock_tracer):
     assert "missing_tool_1" in retry_user_message
     assert "missing_tool_2" in retry_user_message
     assert "write_file, read_file" in retry_user_message
+
+
+@pytest.mark.asyncio
+async def test_duplicate_step_ids_retry_success(mock_llm, mock_tracer, mock_tool):
+    """Duplicate IDs in one generated plan should trigger retry before execution."""
+
+    duplicate_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "step1",
+                    "name": "Repeated Name",
+                    "description": "First duplicated id",
+                    "tool_names": ["write_file"],
+                    "dependencies": [],
+                    "difficulty": "easy"
+                },
+                {
+                    "id": "step1",
+                    "name": "Repeated Name",
+                    "description": "Second duplicated id",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["step1"],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    valid_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "step1",
+                    "name": "Repeated Name",
+                    "description": "First unique id",
+                    "tool_names": ["write_file"],
+                    "dependencies": [],
+                    "difficulty": "easy"
+                },
+                {
+                    "id": "step2",
+                    "name": "Repeated Name",
+                    "description": "Second unique id",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["step1"],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.side_effect = [
+        {"content": duplicate_response},
+        {"content": valid_response},
+    ]
+
+    plan_generator = PlanGenerator(mock_llm)
+    plan = await plan_generator.generate_plan(
+        goal="Test duplicate ids",
+        tools=[mock_tool],
+        iteration=1,
+        history=[],
+        tracer=mock_tracer,
+        context=None,
+    )
+
+    assert [step.id for step in plan.steps] == ["step1", "step2"]
+    assert [step.name for step in plan.steps] == ["Repeated Name", "Repeated Name"]
+    assert mock_llm.chat.call_count == 2
+
+    retry_user_message = mock_llm.chat.call_args_list[1][1]["messages"][-1]["content"]
+    assert "STEP ID VALIDATION ERRORS" in retry_user_message
+    assert "step1" in retry_user_message
+
+
+@pytest.mark.asyncio
+async def test_missing_step_id_retries_instead_of_defaulting(
+    mock_llm, mock_tracer, mock_tool
+):
+    """Missing step IDs should be rejected and surfaced to the retry prompt."""
+
+    missing_id_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "name": "Missing ID",
+                    "description": "The model omitted the required id",
+                    "tool_names": ["write_file"],
+                    "dependencies": [],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    valid_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "step1",
+                    "name": "Valid ID",
+                    "description": "The retry includes the required id",
+                    "tool_names": ["write_file"],
+                    "dependencies": [],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.side_effect = [
+        {"content": missing_id_response},
+        {"content": valid_response},
+    ]
+
+    plan_generator = PlanGenerator(mock_llm)
+    plan = await plan_generator.generate_plan(
+        goal="Test missing ids",
+        tools=[mock_tool],
+        iteration=1,
+        history=[],
+        tracer=mock_tracer,
+        context=None,
+    )
+
+    assert [step.id for step in plan.steps] == ["step1"]
+    assert mock_llm.chat.call_count == 2
+
+    retry_user_message = mock_llm.chat.call_args_list[1][1]["messages"][-1]["content"]
+    assert "Missing ID step indices: [0]" in retry_user_message
+
+
+@pytest.mark.asyncio
+async def test_step_references_are_normalized_before_dependency_validation(
+    mock_llm, mock_tracer, mock_tool
+):
+    """Whitespace-padded step IDs, dependencies, and branch targets should match."""
+
+    response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": " step1 ",
+                    "name": "Branch",
+                    "description": "Branches to the second step",
+                    "tool_names": ["write_file"],
+                    "dependencies": [],
+                    "difficulty": "easy",
+                    "conditional_branches": {"continue": " step2 "}
+                },
+                {
+                    "id": " step2 ",
+                    "name": "Dependent",
+                    "description": "Depends on the first step",
+                    "tool_names": ["write_file"],
+                    "dependencies": [" step1 "],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.return_value = {"content": response}
+
+    plan_generator = PlanGenerator(mock_llm)
+    plan = await plan_generator.generate_plan(
+        goal="Test normalized refs",
+        tools=[mock_tool],
+        iteration=1,
+        history=[],
+        tracer=mock_tracer,
+        context=None,
+    )
+
+    assert [step.id for step in plan.steps] == ["step1", "step2"]
+    assert plan.steps[0].conditional_branches == {"continue": "step2"}
+    assert plan.steps[1].dependencies == ["step1"]
+    assert mock_llm.chat.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extension_reserved_step_id_retry_success(
+    mock_llm, mock_tracer, mock_tool
+):
+    """Extension steps must not reuse IDs from the current task plan."""
+
+    current_plan = ExecutionPlan(
+        id=str(uuid4()),
+        goal="Existing goal",
+        steps=[
+            PlanStep(
+                id="existing_step",
+                name="Existing Step",
+                description="Already exposed step",
+                tool_names=[],
+                dependencies=[],
+                difficulty="easy",
+            )
+        ],
+        iteration=1,
+    )
+
+    reserved_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "existing_step",
+                    "name": "New Work",
+                    "description": "Incorrectly reuses an existing id",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["existing_step"],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    valid_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "new_step",
+                    "name": "New Work",
+                    "description": "Uses a unique id",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["existing_step"],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.side_effect = [
+        {"content": reserved_response},
+        {"content": valid_response},
+    ]
+
+    plan_generator = PlanGenerator(mock_llm)
+    additional_steps = await plan_generator.extend_plan(
+        goal="Test extension",
+        tools=[mock_tool],
+        iteration=2,
+        history=[],
+        current_plan=current_plan,
+        tracer=mock_tracer,
+        context=None,
+    )
+
+    assert [step.id for step in additional_steps] == ["new_step"]
+    assert additional_steps[0].dependencies == ["existing_step"]
+    assert mock_llm.chat.call_count == 2
+
+    initial_messages = mock_llm.chat.call_args_list[0][1]["messages"]
+    initial_prompt = "\n".join(message["content"] for message in initial_messages)
+    assert "FORBIDDEN_STEP_IDS" in initial_prompt
+    assert "existing_step" in initial_prompt
+
+    retry_user_message = mock_llm.chat.call_args_list[1][1]["messages"][-1]["content"]
+    assert "Reserved step IDs used" in retry_user_message
+    assert "existing_step" in retry_user_message
+
+
+@pytest.mark.asyncio
+async def test_extension_does_not_revalidate_historical_step_tools(
+    mock_llm, mock_tracer, mock_tool
+):
+    """Extension uniqueness checks should not revalidate old step tool availability."""
+
+    current_plan = ExecutionPlan(
+        id=str(uuid4()),
+        goal="Existing goal",
+        steps=[
+            PlanStep(
+                id="existing_step",
+                name="Existing Step",
+                description="Already planned with a tool unavailable now",
+                tool_names=["old_tool"],
+                dependencies=[],
+                difficulty="easy",
+            )
+        ],
+        iteration=1,
+    )
+
+    valid_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "new_step",
+                    "name": "New Work",
+                    "description": "Uses a currently available tool",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["existing_step"],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.return_value = {"content": valid_response}
+
+    plan_generator = PlanGenerator(mock_llm)
+    additional_steps = await plan_generator.extend_plan(
+        goal="Test extension",
+        tools=[mock_tool],
+        iteration=2,
+        history=[],
+        current_plan=current_plan,
+        tracer=mock_tracer,
+        context=None,
+    )
+
+    assert [step.id for step in additional_steps] == ["new_step"]
+    assert additional_steps[0].dependencies == ["existing_step"]
+    assert mock_llm.chat.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_extension_invalid_conditional_branch_target_retries(
+    mock_llm, mock_tracer, mock_tool
+):
+    """Extension branch targets must resolve against historical and new steps."""
+
+    current_plan = ExecutionPlan(
+        id=str(uuid4()),
+        goal="Existing goal",
+        steps=[
+            PlanStep(
+                id="existing_step",
+                name="Existing Step",
+                description="Already exposed step",
+                tool_names=[],
+                dependencies=[],
+                difficulty="easy",
+            )
+        ],
+        iteration=1,
+    )
+
+    invalid_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "branch_step",
+                    "name": "Branch Work",
+                    "description": "Branches to a missing step",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["existing_step"],
+                    "difficulty": "easy",
+                    "conditional_branches": {"continue": "missing_step"}
+                }
+            ]
+        }
+    }"""
+
+    valid_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "branch_step",
+                    "name": "Branch Work",
+                    "description": "Branches to a valid new step",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["existing_step"],
+                    "difficulty": "easy",
+                    "conditional_branches": {"continue": "followup_step"}
+                },
+                {
+                    "id": "followup_step",
+                    "name": "Follow Up",
+                    "description": "Handles the branch",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["branch_step"],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.side_effect = [
+        {"content": invalid_response},
+        {"content": valid_response},
+    ]
+
+    plan_generator = PlanGenerator(mock_llm)
+    additional_steps = await plan_generator.extend_plan(
+        goal="Test extension",
+        tools=[mock_tool],
+        iteration=2,
+        history=[],
+        current_plan=current_plan,
+        tracer=mock_tracer,
+        context=None,
+    )
+
+    assert [step.id for step in additional_steps] == ["branch_step", "followup_step"]
+    assert additional_steps[0].conditional_branches == {"continue": "followup_step"}
+    assert mock_llm.chat.call_count == 2
+
+    retry_user_message = mock_llm.chat.call_args_list[1][1]["messages"][-1]["content"]
+    assert "conditional branches pointing to non-existent steps" in retry_user_message
+    assert "missing_step" in retry_user_message
+
+
+@pytest.mark.asyncio
+async def test_step_id_conflicts_fallback_rewrite_after_retries(
+    mock_llm, mock_tracer, mock_tool
+):
+    """After retries are exhausted, duplicate step IDs are deterministically rewritten."""
+
+    conflicting_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "analyze",
+                    "name": "Analyze",
+                    "description": "First analyze step",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["existing_step"],
+                    "difficulty": "easy",
+                    "conditional_branches": {"continue": "analyze"}
+                },
+                {
+                    "id": "analyze",
+                    "name": "Analyze",
+                    "description": "Second analyze step",
+                    "tool_names": ["write_file"],
+                    "dependencies": ["analyze"],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.return_value = {"content": conflicting_response}
+
+    plan_generator = PlanGenerator(mock_llm)
+    plan = await plan_generator.generate_plan(
+        goal="Test fallback",
+        tools=[mock_tool],
+        iteration=1,
+        history=[],
+        tracer=mock_tracer,
+        context=None,
+    )
+
+    assert [step.id for step in plan.steps] == ["analyze", "analyze_2"]
+    assert plan.steps[0].dependencies == []
+    assert plan.steps[0].conditional_branches == {"continue": "analyze"}
+    assert plan.steps[1].dependencies == ["analyze"]
+    assert mock_llm.chat.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_reserved_step_id_conflicts_fail_after_retries(
+    mock_llm, mock_tracer, mock_tool
+):
+    """Reserved step IDs are not rewritten because references are ambiguous."""
+
+    conflicting_response = """{
+        "plan": {
+            "steps": [
+                {
+                    "id": "existing_step",
+                    "name": "Existing Conflict",
+                    "description": "Conflicts with historical id",
+                    "tool_names": ["write_file"],
+                    "dependencies": [],
+                    "difficulty": "easy"
+                }
+            ]
+        }
+    }"""
+
+    mock_llm.chat.return_value = {"content": conflicting_response}
+
+    history = [
+        {
+            "role": "user",
+            "content": '{"plan": {"steps": [{"id": "existing_step"}]}}',
+        }
+    ]
+    plan_generator = PlanGenerator(mock_llm)
+    with pytest.raises(DAGPlanGenerationError) as exc_info:
+        await plan_generator.generate_plan(
+            goal="Test reserved fallback failure",
+            tools=[mock_tool],
+            iteration=1,
+            history=history,
+            tracer=mock_tracer,
+            context=None,
+        )
+
+    assert "reserved step IDs" in str(exc_info.value)
+    assert exc_info.value.context["reserved_step_ids"] == [
+        {"id": "existing_step", "index": 0}
+    ]
+    assert mock_llm.chat.call_count == 3
+
+
+def test_collect_forbidden_step_ids_skips_non_json_history_content(mock_llm):
+    """Plain conversation history should not be parsed as JSON while collecting IDs."""
+
+    plan_generator = PlanGenerator(mock_llm)
+    forbidden_step_ids = plan_generator._collect_forbidden_step_ids(
+        [
+            {"role": "user", "content": "please analyze the dataset"},
+            {
+                "role": "assistant",
+                "content": '{"plan": {"steps": [{"id": "historical_step"}]}}',
+            },
+        ]
+    )
+
+    assert forbidden_step_ids == ["historical_step"]
+
+
+def test_collect_forbidden_step_ids_reads_markdown_json_history_content(mock_llm):
+    """Markdown-wrapped JSON history should still contribute forbidden step IDs."""
+
+    plan_generator = PlanGenerator(mock_llm)
+    forbidden_step_ids = plan_generator._collect_forbidden_step_ids(
+        [
+            {
+                "role": "assistant",
+                "content": """Here is the plan:
+```json
+{"plan": {"steps": [{"id": "markdown_step"}]}}
+```
+""",
+            }
+        ]
+    )
+
+    assert forbidden_step_ids == ["markdown_step"]
+
+
+def test_validate_plan_rejects_duplicate_step_ids(mock_llm):
+    """Plan validation should reject duplicate step IDs even when called directly."""
+
+    plan = ExecutionPlan(
+        id=str(uuid4()),
+        goal="Duplicate validation",
+        steps=[
+            PlanStep(
+                id="dup",
+                name="First",
+                description="First step",
+                tool_names=[],
+                dependencies=[],
+            ),
+            PlanStep(
+                id="dup",
+                name="Second",
+                description="Second step",
+                tool_names=[],
+                dependencies=[],
+            ),
+        ],
+    )
+
+    plan_generator = PlanGenerator(mock_llm)
+    with pytest.raises(DAGPlanGenerationError) as exc_info:
+        plan_generator._validate_plan(plan, tools=[])
+
+    assert "duplicate or empty step IDs" in str(exc_info.value)
+
+
+def test_validate_plan_allows_duplicate_names(mock_llm):
+    """Step names are display labels and may repeat when IDs are unique."""
+
+    plan = ExecutionPlan(
+        id=str(uuid4()),
+        goal="Repeated names",
+        steps=[
+            PlanStep(
+                id="step_a",
+                name="Analyze",
+                description="First analysis",
+                tool_names=[],
+                dependencies=[],
+            ),
+            PlanStep(
+                id="step_b",
+                name="Analyze",
+                description="Second analysis",
+                tool_names=[],
+                dependencies=["step_a"],
+            ),
+        ],
+    )
+
+    plan_generator = PlanGenerator(mock_llm)
+    plan_generator._validate_plan(plan, tools=[])
