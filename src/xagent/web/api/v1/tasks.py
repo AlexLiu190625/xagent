@@ -23,16 +23,19 @@ from sqlalchemy.orm import Session
 from ...models.agent import Agent
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
-from ...models.task import Task, TaskStatus
+from ...models.task import Task, TaskStatus, TraceEvent
 from ...schemas.v1 import (
     AppendMessageRequest,
     AppendMessageResponse,
     CreateTaskRequest,
     CreateTaskResponse,
+    PublicStep,
+    StepsResponse,
     TaskInfoResponse,
 )
 from ...services.chat_history_service import persist_user_message
 from ...services.task_execution import start_task_in_background
+from ._step_mapping import map_trace_events_to_public_steps
 from .deps import get_agent_from_api_key
 from .errors import V1ApiError, V1ErrorCode
 
@@ -336,4 +339,66 @@ async def get_chat_task(
         error=task.error_message,
         created_at=task.created_at,
         completed_at=completed_at,
+    )
+
+
+@router.get("/chat/tasks/{task_id}/steps", response_model=StepsResponse)
+async def get_chat_task_steps(
+    task_id: int,
+    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    db: Session = Depends(get_db),
+) -> StepsResponse:
+    """Return the public-timeline steps for a task.
+
+    Pulls all :class:`TraceEvent` rows for the task in DB order, then
+    collapses them via :func:`map_trace_events_to_public_steps` into
+    the 4 stable public step types: ``thinking``, ``tool_call``,
+    ``agent_delegation``, ``message``.
+
+    The internal trace event taxonomy has ~32 ``event_type`` strings
+    today; SDK callers see only the 4 types listed above. Internal
+    events not on the public allow-list (LLM calls, memory ops,
+    visualization ticks, DAG bookkeeping) are silently dropped --
+    intentionally, so internal trace evolution doesn't break the SDK
+    contract.
+
+    Args:
+        task_id: Path parameter; the target task's primary key.
+        authed: ``(Agent, AgentApiKey)`` tuple resolved by the auth
+            dependency. The agent here is the key-bound agent.
+        db: SQLAlchemy session.
+
+    Returns:
+        :class:`StepsResponse` with ``task_id``, ``agent_id``, and the
+        steps array in ``started_at`` ascending order. In-flight steps
+        appear with ``status='running'`` and ``completed_at=null`` so
+        SDK clients can poll this endpoint and observe progress.
+
+    Raises:
+        V1ApiError 401: missing / invalid / revoked key.
+        V1ApiError 404: task missing or not owned by the calling agent.
+    """
+    agent, _key = authed
+    task = _resolve_task_or_404(task_id, agent, db)
+
+    # Ordered ASC by ``id`` -- the trace_events PK is monotonically
+    # increasing per write, so ordering by it gives us the same
+    # temporal ordering as ``timestamp`` but without depending on
+    # clock-skew within a single task's write fan-out.
+    events = (
+        db.query(TraceEvent)
+        .filter(TraceEvent.task_id == task_id)
+        .order_by(TraceEvent.id.asc())
+        .all()
+    )
+
+    # Pure mapping -- testable in isolation via
+    # tests/web/api/v1/test_steps_mapping.py without spinning up a
+    # FastAPI app or DB session.
+    public_steps_data = map_trace_events_to_public_steps(events)
+
+    return StepsResponse(
+        task_id=int(task.id),
+        agent_id=int(task.agent_id),
+        steps=[PublicStep(**step) for step in public_steps_data],
     )

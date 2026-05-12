@@ -1,0 +1,436 @@
+"""Pure mapping from internal trace events to public SDK step types.
+
+Background:
+
+    Internally the agent runtime emits a rich tree of ~32 ``event_type``
+    strings (see ``ws_trace_handlers.get_event_type_mapping``) that
+    capture every phase, sub-phase, tool call, LLM call, memory op,
+    visualization tick, etc. That granularity is useful for the web
+    UI's live trace view and for internal debugging, but it's far too
+    much surface area to commit to in a stable public SDK contract.
+
+    This module collapses those 32 internal types into the **4 public
+    step types** the SDK promises:
+
+      - ``thinking``         (reasoning phases: planning / step / action)
+      - ``tool_call``        (tool invocations or skill selections)
+      - ``agent_delegation`` (a sub-agent invocation -- surfaced
+                              separately because the call shape is
+                              meaningfully different from a flat tool)
+      - ``message``          (one user or assistant message)
+
+    Everything else (llm_call_*, memory_*, dag_execute_*, react_task_*,
+    react_step_*, visualization_update, task_completion, trace_error,
+    action_*_compact) is **intentionally not exposed** so the SDK
+    surface can evolve without breaking clients.
+
+Pure-function design:
+
+    ``map_trace_events_to_public_steps`` takes a list of DB
+    ``TraceEvent`` rows and returns a list of :class:`PublicStep`
+    dicts. It has no DB / FastAPI / async dependencies so it's
+    independently unit-testable against synthetic events and the only
+    place SDK clients can observe a behavior change is through this
+    one function's output -- which makes regressions easy to gate.
+
+Pairing rule:
+
+    Start / end events are paired by a stable ``key``:
+
+      - ``tool_execution_*`` events pair on ``data['tool_execution_id']``
+        when present, falling back to ``step_id``. The tool execution
+        id is generated per-invocation and is the only safe key when
+        the same tool is called twice in the same step.
+      - ``react_action_*`` events pair on ``step_id``.
+      - ``dag_step_*`` events pair on ``step_id``.
+      - ``dag_plan_*`` events pair on ``task_id`` (single planning
+        phase per task; no per-plan identifier available).
+      - ``skill_select_*`` events pair on ``task_id`` (single skill
+        selection phase per task).
+
+    Orphan ends (end with no matching start) are dropped -- they
+    represent malformed data and the SDK contract is "every step has
+    a start"; emitting an orphan would make ``started_at`` synthetic
+    and confusing.
+
+    Orphan starts (start with no matching end) are emitted with
+    ``status='running'`` and ``completed_at=None``. This naturally
+    handles the case where the SDK polls ``/steps`` mid-task.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+
+# Tool name prefix used by the runtime when one agent invokes another
+# as a tool. Calls matching this prefix are routed to the public
+# ``agent_delegation`` type instead of ``tool_call`` so SDK consumers
+# can render them differently (e.g. nested timeline) without having
+# to pattern-match tool names client-side.
+_AGENT_DELEGATION_PREFIX = "call_agent_"
+
+
+def map_trace_events_to_public_steps(
+    events: List[Any],
+) -> List[Dict[str, Any]]:
+    """Collapse internal trace events into the 4 public SDK step types.
+
+    Args:
+        events: List of ``TraceEvent`` ORM rows (or any objects with
+            ``event_type``, ``data``, ``step_id``, ``timestamp``, and
+            ``event_id`` attributes). Caller is responsible for
+            filtering by ``task_id`` and ordering by ``id`` ASC; this
+            function preserves the input order in its output.
+
+    Returns:
+        List of public-step dicts in the order their **start** events
+        first appeared. Each dict has the shape:
+
+            {
+                "id": str,
+                "type": "thinking" | "tool_call" | "agent_delegation" | "message",
+                "status": "running" | "completed" | "failed",
+                "started_at": datetime,
+                "completed_at": Optional[datetime],
+                "data": dict (type-specific fields, see below)
+            }
+
+        Type-specific ``data`` fields:
+
+          - ``thinking``: ``{"phase": "planning" | "step" | "action"}``
+          - ``tool_call``: ``{"name", "args", "result"?, "error"?}``
+            (``result`` populated on success, ``error`` on failure)
+          - ``agent_delegation``: ``{"sub_agent_name", "input"?, "output"?}``
+            (``sub_agent_name`` is extracted from
+            ``call_agent_<name>``; ``input`` from ``tool_args`` if
+            available, ``output`` from end event's ``result``)
+          - ``message``: ``{"role": "user"|"assistant", "content": str}``
+
+    Notes:
+        - This function is pure (no I/O, no global state). All test
+          cases live in ``tests/web/api/v1/test_steps_mapping.py``.
+        - Unknown event types (anything not listed in the mapping
+          tables in this module) are silently dropped. Adding a new
+          public type is a deliberate per-type opt-in.
+    """
+    # In-progress (start seen, end not yet seen) steps keyed by
+    # (public_type, pairing_key). Order of insertion is preserved by
+    # Python 3.7+ dict semantics, which is what we use to emit final
+    # output in the order steps were started.
+    pending: Dict[Tuple[str, str], Dict[str, Any]] = {}
+    # Completed-or-emitted-immediately steps. Filled in either by an
+    # end event matching a pending start, or by a one-shot event like
+    # ``user_message`` / ``ai_message`` which has no separate end.
+    finished: List[Dict[str, Any]] = []
+
+    for event in events:
+        event_type = _safe_get(event, "event_type")
+        if not event_type:
+            continue
+
+        # ===== messages: one event per message, no pairing =====
+        if event_type == "user_message":
+            finished.append(_build_message_step(event, role="user"))
+            continue
+        if event_type == "ai_message":
+            finished.append(_build_message_step(event, role="assistant"))
+            continue
+
+        # ===== thinking: paired start/end =====
+        thinking_phase = _thinking_phase_for(event_type)
+        if thinking_phase is not None:
+            key = _thinking_pair_key(event, thinking_phase)
+            if event_type.endswith("_start"):
+                pending[("thinking", key)] = _build_thinking_start(
+                    event, phase=thinking_phase, key=key
+                )
+            elif event_type.endswith("_end"):
+                _finalize_pending(
+                    pending,
+                    finished,
+                    ("thinking", key),
+                    end_event=event,
+                    status="completed",
+                )
+            # other actions (e.g. dag_execution UPDATE) for these
+            # categories are not exposed.
+            continue
+
+        # ===== tool_call / agent_delegation: paired start/end =====
+        if event_type in ("tool_execution_start", "tool_execution_end"):
+            tool_name = _data_get(event, "tool_name")
+            is_delegation = isinstance(tool_name, str) and tool_name.startswith(
+                _AGENT_DELEGATION_PREFIX
+            )
+            public_type = "agent_delegation" if is_delegation else "tool_call"
+            # Pair on tool_execution_id (always unique per invocation)
+            # falling back to step_id. step_id alone is unsafe because
+            # one step may invoke the same tool twice.
+            key = (
+                _data_get(event, "tool_execution_id")
+                or _safe_get(event, "step_id")
+                or _safe_get(event, "event_id")
+            )
+            if not key:
+                continue
+
+            if event_type == "tool_execution_start":
+                pending[(public_type, str(key))] = _build_tool_start(
+                    event,
+                    public_type=public_type,
+                    tool_name=tool_name,
+                    key=str(key),
+                )
+            else:  # tool_execution_end
+                success = _data_get(event, "success", default=True)
+                status = "completed" if success else "failed"
+                _finalize_pending(
+                    pending,
+                    finished,
+                    (public_type, str(key)),
+                    end_event=event,
+                    status=status,
+                    extra_data_fn=lambda ev, succ=success: (
+                        {"result": _data_get(ev, "result")}
+                        if succ
+                        else {
+                            "error": _data_get(ev, "error") or "Tool execution failed"
+                        }
+                    ),
+                )
+            continue
+
+        # ===== skill_select_*: surface as tool_call with skill name =====
+        if event_type in ("skill_select_start", "skill_select_end"):
+            key = (
+                _data_get(event, "skill_name")
+                or _safe_get(event, "step_id")
+                or str(_safe_get(event, "task_id") or "skill")
+            )
+            if event_type == "skill_select_start":
+                pending[("tool_call", str(key))] = _build_tool_start(
+                    event,
+                    public_type="tool_call",
+                    tool_name=_data_get(event, "skill_name") or "skill_select",
+                    key=str(key),
+                )
+            else:
+                _finalize_pending(
+                    pending,
+                    finished,
+                    ("tool_call", str(key)),
+                    end_event=event,
+                    status="completed",
+                    extra_data_fn=lambda ev: {"result": _data_get(ev, "result")},
+                )
+            continue
+
+        # Everything else (llm_call_*, memory_*, dag_execute_*,
+        # react_task_*, react_step_*, visualization_update,
+        # task_completion, trace_error, action_*_compact) -- not
+        # exposed in the SDK contract. Silently drop.
+
+    # Emit pending starts as ``running`` steps. The insertion order in
+    # ``pending`` plus the iteration order of ``finished`` gives us a
+    # stable public ordering: ``finished`` are sorted by completion
+    # (which is the order they fired), and any still-running steps
+    # come after in started-at order.
+    output = list(finished)
+    output.extend(pending.values())
+    # Final sort by ``started_at`` so output is monotonic regardless of
+    # whether a step finishes before the next one starts. Stable sort
+    # preserves insertion order for ties.
+    output.sort(key=lambda s: s["started_at"])
+    return output
+
+
+# ===== thinking helpers =====
+
+
+_THINKING_PHASE_BY_PREFIX: Tuple[Tuple[str, str], ...] = (
+    # Order matters: longer / more-specific prefixes first so
+    # ``react_action_*`` doesn't accidentally match a future
+    # ``react_*`` general rule.
+    ("react_action_", "action"),
+    ("dag_step_", "step"),
+    ("dag_plan_", "planning"),
+)
+
+
+def _thinking_phase_for(event_type: str) -> Optional[str]:
+    """Return the public ``thinking.phase`` value for an internal event,
+    or ``None`` if this event is not a thinking event.
+    """
+    for prefix, phase in _THINKING_PHASE_BY_PREFIX:
+        if event_type.startswith(prefix):
+            return phase
+    return None
+
+
+def _thinking_pair_key(event: Any, phase: str) -> str:
+    """Pairing key for a thinking start/end event.
+
+    ``dag_plan_*`` has no step_id (it's task-level), so we fall back
+    to task_id. ``react_action_*`` and ``dag_step_*`` always carry a
+    step_id which is the natural pairing key.
+    """
+    if phase == "planning":
+        return f"plan:{_safe_get(event, 'task_id') or _safe_get(event, 'event_id')}"
+    return str(_safe_get(event, "step_id") or _safe_get(event, "event_id") or "")
+
+
+def _build_thinking_start(event: Any, *, phase: str, key: str) -> Dict[str, Any]:
+    return {
+        "id": f"thinking:{key}",
+        "type": "thinking",
+        "status": "running",
+        "started_at": _ts(event),
+        "completed_at": None,
+        "data": {"phase": phase},
+    }
+
+
+# ===== tool_call / agent_delegation helpers =====
+
+
+def _build_tool_start(
+    event: Any,
+    *,
+    public_type: str,
+    tool_name: Optional[str],
+    key: str,
+) -> Dict[str, Any]:
+    """Build the start side of a tool_call or agent_delegation step.
+
+    For ``agent_delegation`` we extract ``sub_agent_name`` from the
+    ``call_agent_<name>`` prefix so SDK consumers don't have to do
+    the string surgery themselves. ``tool_args`` from the start event
+    becomes ``input`` on the public step.
+    """
+    if public_type == "agent_delegation" and isinstance(tool_name, str):
+        sub_agent_name = tool_name[len(_AGENT_DELEGATION_PREFIX) :] or tool_name
+        return {
+            "id": f"agent_delegation:{key}",
+            "type": "agent_delegation",
+            "status": "running",
+            "started_at": _ts(event),
+            "completed_at": None,
+            "data": {
+                "sub_agent_name": sub_agent_name,
+                "input": _data_get(event, "tool_args"),
+            },
+        }
+    return {
+        "id": f"tool_call:{key}",
+        "type": "tool_call",
+        "status": "running",
+        "started_at": _ts(event),
+        "completed_at": None,
+        "data": {
+            "name": tool_name,
+            "args": _data_get(event, "tool_args"),
+        },
+    }
+
+
+# ===== message helpers =====
+
+
+def _build_message_step(event: Any, *, role: str) -> Dict[str, Any]:
+    """One-shot message step (no pairing).
+
+    user_message stores its text in ``data['message']`` (see
+    ``trace_user_message``); ai_message uses ``data['content']`` (see
+    ``trace_ai_message``). We normalize both into ``content`` here so
+    SDK consumers don't have to know about the asymmetry.
+    """
+    content = _data_get(event, "content")
+    if content is None:
+        content = _data_get(event, "message")
+    ts = _ts(event)
+    return {
+        "id": f"message:{_safe_get(event, 'event_id') or _safe_get(event, 'id')}",
+        "type": "message",
+        "status": "completed",
+        "started_at": ts,
+        "completed_at": ts,
+        "data": {
+            "role": role,
+            "content": content or "",
+        },
+    }
+
+
+# ===== shared finalization =====
+
+
+def _finalize_pending(
+    pending: Dict[Tuple[str, str], Dict[str, Any]],
+    finished: List[Dict[str, Any]],
+    key: Tuple[str, str],
+    *,
+    end_event: Any,
+    status: str,
+    extra_data_fn: Optional[Any] = None,
+) -> None:
+    """Move ``pending[key]`` to ``finished`` and patch with end metadata.
+
+    Orphan end (no matching start in ``pending``) is dropped on
+    purpose -- see module docstring.
+    """
+    step = pending.pop(key, None)
+    if step is None:
+        # Orphan end event; skip.
+        return
+    step["status"] = status
+    step["completed_at"] = _ts(end_event)
+    if extra_data_fn is not None:
+        try:
+            extra = extra_data_fn(end_event) or {}
+            step["data"].update(extra)
+        except Exception as exc:  # defensive; data shape is external
+            logger.debug("step extra_data_fn failed: %s", exc)
+    finished.append(step)
+
+
+# ===== attribute / data accessors =====
+
+
+def _safe_get(event: Any, name: str, default: Any = None) -> Any:
+    """Read an attribute that may exist on the ORM row OR in event.data.
+
+    Handles both real ``TraceEvent`` rows and the lightweight dict-like
+    stubs used in unit tests, without forcing either to mimic the other.
+    """
+    if hasattr(event, name):
+        return getattr(event, name)
+    if isinstance(event, dict):
+        return event.get(name, default)
+    return default
+
+
+def _data_get(event: Any, name: str, default: Any = None) -> Any:
+    """Read a field from ``event.data`` regardless of whether ``data``
+    is a JSON column dict or already-deserialized dict on a stub.
+    """
+    data = _safe_get(event, "data")
+    if isinstance(data, dict):
+        return data.get(name, default)
+    return default
+
+
+def _ts(event: Any) -> datetime:
+    """Coerce the event's timestamp into a tz-aware datetime."""
+    ts = _safe_get(event, "timestamp")
+    if isinstance(ts, datetime):
+        if ts.tzinfo is None:
+            return ts.replace(tzinfo=timezone.utc)
+        return ts
+    if isinstance(ts, (int, float)):
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+    return datetime.now(timezone.utc)

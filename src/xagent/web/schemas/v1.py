@@ -25,7 +25,7 @@ Design notes:
 """
 
 from datetime import datetime
-from typing import Any, Dict, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -185,4 +185,94 @@ class TaskInfoResponse(BaseModel):
             "UTC timestamp when the task reached a terminal state "
             "(completed or failed). Null while still running."
         ),
+    )
+
+
+# ``PublicStep.type`` is the public surface for what was internally one
+# of ~32 trace event types. Restricted to four stable values so SDK
+# clients can switch on the type without keeping up with internal
+# trace-event churn. See ``web/api/v1/_step_mapping.py`` for the full
+# internal->public mapping table.
+PublicStepType = Literal["thinking", "tool_call", "agent_delegation", "message"]
+
+# ``running`` means a start event was seen with no matching end (the
+# task is still mid-step at the time of the GET). ``completed`` /
+# ``failed`` reflect the end event's success flag.
+PublicStepStatus = Literal["running", "completed", "failed"]
+
+
+class PublicStep(BaseModel):
+    """One step on the public SDK timeline.
+
+    Type-specific shape of the ``data`` dict:
+
+      - ``thinking``: ``{"phase": "planning" | "step" | "action"}``
+      - ``tool_call``: ``{"name": str, "args": Any,
+                          "result"?: Any, "error"?: str}``
+      - ``agent_delegation``: ``{"sub_agent_name": str,
+                                  "input"?: Any, "output"?: Any}``
+      - ``message``: ``{"role": "user" | "assistant", "content": str}``
+
+    The exact keys are documented but the values are intentionally
+    typed as ``Any`` because tools and agents can return arbitrary
+    JSON. SDK clients should treat unknown keys as forward-compat
+    extensions and ignore them.
+    """
+
+    id: str = Field(
+        ...,
+        description=(
+            "Stable identifier for this step within the task. Includes "
+            "a type prefix (e.g. 'tool_call:abc123') so SDK clients "
+            "can dedupe across re-polls."
+        ),
+    )
+    type: PublicStepType = Field(
+        ...,
+        description=(
+            "One of: thinking, tool_call, agent_delegation, message. "
+            "Other internal event types are not surfaced on this "
+            "endpoint."
+        ),
+    )
+    status: PublicStepStatus = Field(
+        ...,
+        description=(
+            "running while the corresponding end event has not yet "
+            "fired (i.e. the SDK polled mid-step), completed on a "
+            "normal end event, failed when the end event carries "
+            "success=false."
+        ),
+    )
+    started_at: datetime = Field(
+        ...,
+        description="UTC timestamp of the start event for this step.",
+    )
+    completed_at: Optional[datetime] = Field(
+        None,
+        description=("UTC timestamp of the end event. Null while status is 'running'."),
+    )
+    data: Dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Type-specific payload. See class docstring for the keys "
+            "expected per step type."
+        ),
+    )
+
+
+class StepsResponse(BaseModel):
+    """``GET /v1/chat/tasks/{task_id}/steps`` response body.
+
+    Steps are returned in monotonic ``started_at`` order. The endpoint
+    is a polling primitive: each call returns the full known history
+    so far (including any still-running steps as ``status='running'``)
+    so SDK clients can resume after a network blip without state.
+    """
+
+    task_id: int = Field(..., description="The task these steps belong to.")
+    agent_id: int = Field(..., description="The task's agent.")
+    steps: List[PublicStep] = Field(
+        default_factory=list,
+        description="Public-timeline steps in started_at ascending order.",
     )

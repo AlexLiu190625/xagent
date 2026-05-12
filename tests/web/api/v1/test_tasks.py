@@ -1,22 +1,25 @@
 """Integration tests for /v1/chat/tasks/* endpoints.
 
 Phase 1 surface tested here:
-  - D: POST /v1/chat/tasks  (this commit)
-  - E: POST /v1/chat/tasks/{id}/messages, GET /v1/chat/tasks/{id}  (next)
-  - F: GET /v1/chat/tasks/{id}/steps  (after E)
+  - D: POST /v1/chat/tasks
+  - E: POST /v1/chat/tasks/{id}/messages, GET /v1/chat/tasks/{id}
+  - F: GET /v1/chat/tasks/{id}/steps  (this commit)
 
-D tests mock the background-execution kickoff so the suite doesn't
-need to spin up an actual AgentService / LLM. The behaviors under
-test are HTTP shape + DB rows + which background helper was called
-with which arguments -- not the LLM call itself.
+D / E / F tests mock the background-execution kickoff so the suite
+doesn't need to spin up an actual AgentService / LLM. The behaviors
+under test are HTTP shape + DB rows + which background helper was
+called with which arguments -- not the LLM call itself. F's steps
+endpoint exercises real :class:`TraceEvent` rows inserted directly
+into the test DB to drive the mapping.
 """
 
+from datetime import datetime, timezone
 from typing import Tuple
 from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 
 from ..conftest import _admin_headers, _direct_db_session, client
 
@@ -515,3 +518,191 @@ def test_get_other_agents_task_returns_404(mock_start_task):
     resp = client.get(f"/v1/chat/tasks/{alice_task_id}", headers=_bearer(bob_key))
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "task_not_found"
+
+
+# ===== F: GET /v1/chat/tasks/{task_id}/steps =====
+
+
+def _insert_trace_event(
+    *,
+    task_id: int,
+    event_type: str,
+    event_id: str,
+    timestamp: datetime,
+    data: dict,
+    step_id: str | None = None,
+) -> None:
+    """Insert one TraceEvent row directly via the test DB.
+
+    Bypasses the production trace handler (which runs through asyncio
+    + thread pool) so tests can assert on the GET /steps surface
+    without spinning up the agent runtime.
+    """
+    db = _direct_db_session()
+    try:
+        ev = TraceEvent(
+            task_id=task_id,
+            event_id=event_id,
+            event_type=event_type,
+            timestamp=timestamp,
+            step_id=step_id,
+            data=data,
+        )
+        db.add(ev)
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_get_steps_returns_mapped_steps_in_order(mock_start_task):
+    """Insert react_action + tool_execution + ai_message + filtered
+    llm_call events, GET /steps, assert 3 public steps in started_at
+    order with correct types and statuses.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    # Public step 1: thinking phase=action (react_action_start/end)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="react_action_start",
+        event_id="evt-1",
+        timestamp=base.replace(second=1),
+        step_id="step-A",
+        data={},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="react_action_end",
+        event_id="evt-2",
+        timestamp=base.replace(second=2),
+        step_id="step-A",
+        data={},
+    )
+
+    # Filtered: llm_call_start / end -- must not appear
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="llm_call_start",
+        event_id="evt-3",
+        timestamp=base.replace(second=3),
+        step_id="step-A",
+        data={},
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="llm_call_end",
+        event_id="evt-4",
+        timestamp=base.replace(second=4),
+        step_id="step-A",
+        data={},
+    )
+
+    # Public step 2: tool_call (execute_python)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="evt-5",
+        timestamp=base.replace(second=5),
+        step_id="step-A",
+        data={
+            "tool_name": "execute_python",
+            "tool_args": {"code": "print(1)"},
+            "tool_execution_id": "tx-1",
+        },
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_end",
+        event_id="evt-6",
+        timestamp=base.replace(second=6),
+        step_id="step-A",
+        data={
+            "tool_name": "execute_python",
+            "tool_args": {"code": "print(1)"},
+            "tool_execution_id": "tx-1",
+            "result": {"output": "1\n"},
+            "success": True,
+        },
+    )
+
+    # Public step 3: message role=assistant (ai_message)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="ai_message",
+        event_id="evt-7",
+        timestamp=base.replace(second=7),
+        data={"content": "Here's the result"},
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    steps = body["steps"]
+    assert len(steps) == 3
+
+    # Assert ordering and types
+    assert steps[0]["type"] == "thinking"
+    assert steps[0]["data"]["phase"] == "action"
+    assert steps[0]["status"] == "completed"
+
+    assert steps[1]["type"] == "tool_call"
+    assert steps[1]["data"]["name"] == "execute_python"
+    assert steps[1]["data"]["args"] == {"code": "print(1)"}
+    assert steps[1]["data"]["result"] == {"output": "1\n"}
+
+    assert steps[2]["type"] == "message"
+    assert steps[2]["data"] == {"role": "assistant", "content": "Here's the result"}
+
+
+def test_get_steps_task_not_found_returns_404(mock_start_task):
+    """Non-existent task_id -> 404 task_not_found."""
+    _agent_id, full_key = _create_agent_with_key()
+    resp = client.get("/v1/chat/tasks/9999999/steps", headers=_bearer(full_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_get_steps_other_agents_task_returns_404(mock_start_task):
+    """Cross-agent steps access -> 404 (not leaking existence)."""
+    alice_agent_id, alice_key = _create_agent_with_key()
+    alice_task_id = _create_task(alice_key, alice_agent_id)
+
+    from ..conftest import _register_second_user
+
+    bob_headers = _register_second_user()
+    bob_agent = client.post(
+        "/api/agents",
+        headers=bob_headers,
+        json={
+            "name": "bob agent steps",
+            "description": "test",
+            "instructions": "test",
+            "execution_mode": "balanced",
+        },
+    ).json()
+    bob_agent_id = bob_agent["id"]
+    bob_key = client.post(
+        f"/api/agents/{bob_agent_id}/api-key", headers=bob_headers
+    ).json()["full_key"]
+
+    resp = client.get(f"/v1/chat/tasks/{alice_task_id}/steps", headers=_bearer(bob_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_get_steps_empty_task_returns_empty_array(mock_start_task):
+    """Task with no trace events yet -> 200 + empty steps array."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["task_id"] == task_id
+    assert body["agent_id"] == agent_id
+    assert body["steps"] == []
