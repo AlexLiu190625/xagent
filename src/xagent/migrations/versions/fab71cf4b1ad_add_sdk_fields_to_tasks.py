@@ -42,6 +42,18 @@ depends_on: Union[str, Sequence[str], None] = None
 def upgrade() -> None:
     bind = op.get_bind()
     inspector = inspect(bind)
+
+    # ``tasks`` is created by SQLAlchemy's ``Base.metadata.create_all()``
+    # in production, not by a migration in this repo. The migration test
+    # CLI (tests/migrations/test_migration_integration.py) runs migrations
+    # against an empty database WITHOUT first calling create_all(), so
+    # ``tasks`` may not exist here. Matches the same guard used by
+    # 20260509_add_delegate_agent_ids_to_tasks.py and other
+    # tasks-touching migrations -- they all no-op when the table is
+    # absent so the from-scratch migration test stays green.
+    if "tasks" not in inspector.get_table_names():
+        return
+
     existing_columns = {col["name"] for col in inspector.get_columns("tasks")}
 
     # ADD COLUMN steps are individually guarded so a re-run after a
@@ -83,6 +95,13 @@ def upgrade() -> None:
 def downgrade() -> None:
     bind = op.get_bind()
     inspector = inspect(bind)
+
+    # Same no-op guard as upgrade(): tasks may not exist when downgrade
+    # runs after an upgrade against an empty database in the migration
+    # test suite.
+    if "tasks" not in inspector.get_table_names():
+        return
+
     existing_columns = {col["name"] for col in inspector.get_columns("tasks")}
     existing_indexes = {idx["name"] for idx in inspector.get_indexes("tasks")}
 
