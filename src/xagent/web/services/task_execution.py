@@ -147,6 +147,20 @@ async def start_task_in_background(
                 db=bg_db,
                 force_fresh_execution=force_fresh_execution,
             )
+            # SDK column sync: fill task.output / task.error_message
+            # after the WS handler returns. See _sync_sdk_columns
+            # docstring for why this lives here and not inside
+            # execute_task_background. Wrap in try/except because this
+            # coroutine runs inside asyncio.create_task() -- without
+            # the wrapper any exception would be silently captured in
+            # the Task's exception slot with no log.
+            try:
+                _sync_sdk_columns(bg_db, task_id)
+            except Exception as sync_err:
+                logger.error(
+                    f"SDK column sync failed for task {task_id}: {sync_err}",
+                    exc_info=True,
+                )
         finally:
             bg_db.close()
 
@@ -166,3 +180,101 @@ def _get_agent_manager() -> Any:
     from ..api.chat import get_agent_manager
 
     return get_agent_manager()
+
+
+def _sync_sdk_columns(bg_db: Any, task_id: int) -> None:
+    """Populate the SDK-only ``task.output`` / ``task.error_message`` columns
+    after ``execute_task_background`` returns.
+
+    Why this lives in the helper, not in ``execute_task_background``:
+
+        ``task.output`` and ``task.error_message`` are SDK-only columns
+        added in commit be5f453. The legacy WS UI never reads them; it
+        consumes the assistant response via the live WebSocket
+        ``task_completed`` event broadcast. The WS handler is kept
+        byte-frozen (extract-not-refactor for legacy paths); this
+        helper -- the SDK kickoff entry point -- is the natural place
+        to write columns the SDK GET endpoint reads.
+
+    Behavior matrix (after ``execute_task_background`` returns):
+
+        - status == COMPLETED: read latest assistant row from
+          ``task_chat_messages`` and write to ``task.output``. Clear
+          stale ``error_message``.
+        - status == FAILED (WS handler's ``result.success=False``):
+          ``task.output`` stays whatever it was; ``error_message``
+          gets a generic placeholder if not already set. Detailed
+          exception text requires WS handler changes (Phase 2).
+        - status == RUNNING: WS handler swallowed an exception in
+          its ``except Exception`` block without flipping status.
+          Flip to FAILED here with a placeholder so SDK pollers
+          exit the running state instead of waiting forever.
+        - status == PAUSED / other: leave alone (semantics unclear,
+          avoid touching).
+    """
+    from ..models.chat_message import TaskChatMessage
+    from ..models.task import TaskStatus
+
+    # CRITICAL: ``execute_task_background`` writes via its own
+    # ``db_new`` session (websocket.py ~L565). Our ``bg_db`` session
+    # has the row cached in its identity map from before the WS run;
+    # a naive ``bg_db.query(Task).filter(...).first()`` would return
+    # the stale PENDING snapshot, not the committed COMPLETED state.
+    # ``expire_all()`` discards all cached state so the next query
+    # goes to the DB.
+    bg_db.expire_all()
+
+    fresh_task = bg_db.query(Task).filter(Task.id == task_id).first()
+    if fresh_task is None:
+        logger.warning(
+            "SDK column sync skipped: task %s vanished after bg run", task_id
+        )
+        return
+
+    status = fresh_task.status
+
+    if status == TaskStatus.COMPLETED:
+        latest_assistant = (
+            bg_db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+            )
+            .order_by(TaskChatMessage.id.desc())
+            .first()
+        )
+        if latest_assistant is not None:
+            fresh_task.output = latest_assistant.content
+            fresh_task.error_message = None
+            bg_db.commit()
+            logger.info(
+                f"SDK column sync: task {task_id} output written "
+                f"({len(latest_assistant.content)} chars)"
+            )
+        else:
+            logger.warning(
+                f"SDK column sync: task {task_id} completed but "
+                "no assistant message found in task_chat_messages"
+            )
+    elif status == TaskStatus.FAILED:
+        if not fresh_task.error_message:
+            fresh_task.error_message = "Task execution failed (see /steps for details)"
+            bg_db.commit()
+            logger.info(
+                f"SDK column sync: task {task_id} marked failed "
+                "with placeholder error_message"
+            )
+    elif status == TaskStatus.RUNNING:
+        # The WS handler returned without updating status. This happens
+        # when an exception is raised inside execute_task_background
+        # and swallowed by its except block (websocket.py ~L628).
+        # Without this flip the task would poll as 'running' forever.
+        fresh_task.status = TaskStatus.FAILED
+        fresh_task.error_message = (
+            "Task execution failed without status update; see /steps."
+        )
+        bg_db.commit()
+        logger.warning(
+            f"SDK column sync: task {task_id} bg coroutine returned "
+            "with status=RUNNING; flipping to FAILED"
+        )
