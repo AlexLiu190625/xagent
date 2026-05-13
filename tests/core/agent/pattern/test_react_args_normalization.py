@@ -43,12 +43,12 @@ class MockUpdateAgentTool(Tool):
         return True
 
     async def run_json_async(self, args: dict[str, Any]) -> Any:
-        # Simulate failure for PUBLISHED agent
+        # Simulate a tool-level business failure returned without raising.
         if args.get("agent_id") == 100:
             return {
                 "agent_id": 100,
                 "status": "error",
-                "message": "Error: Only DRAFT agents can be updated",
+                "message": "Error: downstream validation failed",
             }
         return {"agent_id": args.get("agent_id"), "status": "success", "message": "OK"}
 
@@ -152,11 +152,12 @@ async def test_react_tool_args_normalization(patch_traces):
     )
     assert end_trace["kwargs"]["data"]["tool_args"]["tool_categories"] == ["vision"]
     assert end_trace["kwargs"]["data"]["result"]["status"] == "success"
+    assert end_trace["kwargs"]["data"]["success"] is True
 
 
 @pytest.mark.asyncio
-async def test_react_tool_execution_failure_not_mutating_config(patch_traces):
-    """Test that a failed tool execution (like updating PUBLISHED agent) is correctly traced as error."""
+async def test_react_critical_tool_business_failure_becomes_failed_result(patch_traces):
+    """Critical tool business failures should trace success=false and fail the step."""
     registry = ToolRegistry()
     tool = MockUpdateAgentTool()
     registry.register(tool)
@@ -171,10 +172,9 @@ async def test_react_tool_execution_failure_not_mutating_config(patch_traces):
 
     pattern = MockReAct()
 
-    # 2. Test failure case (e.g. published agent)
     action = Action(
         type="tool_call",
-        reasoning="test published",
+        reasoning="test business failure",
         tool_name="update_agent",
         tool_args={
             "agent_id": 100,
@@ -187,11 +187,12 @@ async def test_react_tool_execution_failure_not_mutating_config(patch_traces):
     # Tool args should still be normalized
     assert res["tool_args"]["tool_categories"] == ["vision"]
 
-    # The result should contain the error status
+    # Critical business failures become a failed final result so DAG can mark the step failed.
+    assert res["type"] == "final_answer"
+    assert res["success"] is False
     assert res["result"]["status"] == "error"
+    assert res["error"] == "Error: downstream validation failed"
 
-    # The frontend uses data.result.status === "success" to decide whether to update the config.
-    # We verify that the trace contains the error status in the result.
     end_trace = next(
         t
         for t in tracer.traces
@@ -199,3 +200,4 @@ async def test_react_tool_execution_failure_not_mutating_config(patch_traces):
         and t["kwargs"]["data"].get("result", {}).get("agent_id") == 100
     )
     assert end_trace["kwargs"]["data"]["result"]["status"] == "error"
+    assert end_trace["kwargs"]["data"]["success"] is False

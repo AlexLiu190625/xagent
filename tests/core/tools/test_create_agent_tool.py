@@ -414,8 +414,8 @@ class TestUpdateAgentTool:
                 pass
 
     @pytest.mark.asyncio
-    async def test_update_published_agent_rejected(self) -> None:
-        """Test that published agents cannot be updated."""
+    async def test_update_published_agent_success_preserves_status(self) -> None:
+        """Test that published agents can be updated and remain published."""
         db, db_path = _create_session()
         try:
             user = User(
@@ -442,11 +442,19 @@ class TestUpdateAgentTool:
                 {
                     "agent_id": published_agent.id,
                     "name": "trying_to_rename",
+                    "instructions": "Updated published instructions",
                 }
             )
 
-            assert result["status"] == "error"
-            assert "only draft" in result["message"].lower()
+            assert result["status"] == "success"
+            assert result["agent_id"] == published_agent.id
+            assert result["agent_name"] == "trying_to_rename"
+            assert "Status: PUBLISHED" in result["message"]
+
+            db.refresh(published_agent)
+            assert published_agent.name == "trying_to_rename"
+            assert published_agent.instructions == "Updated published instructions"
+            assert published_agent.status == AgentStatus.PUBLISHED
 
         finally:
             db.close()

@@ -36,6 +36,32 @@ from .step_agent_factory import StepAgentFactory
 
 logger = logging.getLogger(__name__)
 
+AGENT_BUILDER_TOOL_CLOSURE = (
+    "list_knowledge_bases",
+    "ask_user_question",
+    "create_knowledge_base_from_file",
+    "create_knowledge_base_from_url",
+    "create_agent",
+    "update_agent",
+)
+
+AGENT_BUILDER_STEP_KEYWORDS = (
+    "agent",
+    "knowledge base",
+    "kb",
+    "upload",
+    "file",
+    "url",
+    "website",
+    "reference",
+    "智能体",
+    "知识库",
+    "上传",
+    "文件",
+    "网址",
+    "链接",
+)
+
 
 class PlanExecutor:
     """Handles plan execution with dependency resolution and deadlock detection"""
@@ -85,6 +111,37 @@ class PlanExecutor:
         self._execution_interrupted = False
         if self._pause_event.is_set():
             self._pause_event.clear()
+
+    @staticmethod
+    def _resolve_step_tool_names(
+        step: PlanStep, tool_map: Dict[str, Tool]
+    ) -> List[str]:
+        """Resolve step tool names while preserving legacy None-as-all behavior."""
+        if step.tool_names is None:
+            return list(tool_map.keys())
+        return step.get_available_tools() or []
+
+    @staticmethod
+    def _should_extend_builder_tool_names(
+        step: PlanStep, tool_names: List[str]
+    ) -> bool:
+        """Return whether a builder step needs the agent/KB tool closure."""
+        if any(name in AGENT_BUILDER_TOOL_CLOSURE for name in tool_names):
+            return True
+
+        step_text = f"{step.name}\n{step.description}".lower()
+        return any(keyword in step_text for keyword in AGENT_BUILDER_STEP_KEYWORDS)
+
+    @staticmethod
+    def _extend_builder_tool_names(
+        tool_names: List[str], tool_map: Dict[str, Tool]
+    ) -> List[str]:
+        """Add the agent-builder tool closure while preserving order."""
+        extended_tool_names = list(tool_names or [])
+        for tool_name in AGENT_BUILDER_TOOL_CLOSURE:
+            if tool_name in tool_map and tool_name not in extended_tool_names:
+                extended_tool_names.append(tool_name)
+        return extended_tool_names
 
     async def execute_plan(
         self,
@@ -569,6 +626,24 @@ class PlanExecutor:
         """
         logger.info(f"Executing step {step.id}: {step.name}")
 
+        original_tool_names = step.tool_names
+        tool_names = self._resolve_step_tool_names(step, tool_map)
+
+        if is_builder_context and self._should_extend_builder_tool_names(
+            step, tool_names
+        ):
+            tool_names = self._extend_builder_tool_names(tool_names, tool_map)
+            if tool_names != original_tool_names:
+                logger.info(
+                    "Extending agent-builder tools for step %s: %s -> %s",
+                    step.id,
+                    original_tool_names,
+                    tool_names,
+                )
+
+        # Normalize once so tracing and later execution use the same concrete list.
+        step.tool_names = tool_names
+
         # Trace step start with detailed context
         trace_step_id = f"step_{step.id}"
         step_start_data = {
@@ -593,7 +668,6 @@ class PlanExecutor:
 
         try:
             # Get tools for this step (handle steps with no tools)
-            tool_names = step.get_available_tools()
             tools: List[Tool] = []
 
             if tool_names:
@@ -701,8 +775,6 @@ class PlanExecutor:
             )
 
             # Add the current step task, with tool info and original goal context
-            tool_names = step.get_available_tools()
-
             # Get original goal for context
             original_goal = (
                 getattr(self.parent_pattern, "_original_goal", None)

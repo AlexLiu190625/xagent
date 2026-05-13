@@ -14,7 +14,7 @@ from xagent.web.models.user import User
 @pytest.mark.asyncio
 async def test_handle_builder_chat_basic():
     """
-    Test that handle_builder_chat creates an agent with only create_agent tool.
+    Test that handle_builder_chat creates the agent-builder ReAct service.
     """
     # Arrange
     mock_websocket = AsyncMock()

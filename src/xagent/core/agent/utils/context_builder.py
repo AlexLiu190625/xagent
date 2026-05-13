@@ -115,14 +115,17 @@ class ContextBuilder:
                 and len(uploaded_files) == len(file_info)
             ):
                 for f, fpath in zip(file_info, uploaded_files):
-                    file_list_lines.append(
-                        f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})\n  Absolute Path: {fpath}"
-                    )
+                    details = f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})"
+                    if f.get("file_id"):
+                        details += f"\n  File ID: {f.get('file_id')}"
+                    details += f"\n  Absolute Path: {fpath}"
+                    file_list_lines.append(details)
             else:
                 for f in file_info:
-                    file_list_lines.append(
-                        f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})"
-                    )
+                    details = f"- {f.get('name', 'unknown')} ({f.get('size', 0)} bytes, {f.get('type', 'unknown')})"
+                    if f.get("file_id"):
+                        details += f"\n  File ID: {f.get('file_id')}"
+                    file_list_lines.append(details)
 
             file_list_str = "\n".join(file_list_lines)
 

@@ -1371,8 +1371,13 @@ async def handle_chat_message(
                         context["uploaded_files"] = uploaded_file_paths
                         context["file_info"] = file_info_list
                         file_ids = [f["file_id"] for f in file_info_list]
-                        file_names = [f["name"] for f in file_info_list]
                         file_id_list_str = ", ".join(f'"{fid}"' for fid in file_ids)
+                        file_summary = "\n".join(
+                            [
+                                f"- {f['name']} (File ID: {f['file_id']}, {f['size']} bytes, {f['type']})"
+                                for f in file_info_list
+                            ]
+                        )
 
                         # Check if this task is an agent-builder task to inject KB instructions
                         is_agent_builder = False
@@ -1397,7 +1402,8 @@ async def handle_chat_message(
 
                         file_prompt = (
                             "## UPLOADED FILES\n"
-                            f"The user has uploaded {len(file_info_list)} file(s): {file_names}\n\n"
+                            f"The user has uploaded {len(file_info_list)} file(s):\n"
+                            f"{file_summary}\n\n"
                         )
 
                         if is_agent_builder:
@@ -1413,6 +1419,7 @@ async def handle_chat_message(
                         else:
                             file_prompt += (
                                 "These files have been successfully uploaded to the workspace and are ready for processing.\n"
+                                "Use the File ID values above when a tool requires a file_id. "
                                 "You can use standard workspace tools to read, analyze, or process them."
                             )
 
@@ -2526,8 +2533,8 @@ async def handle_builder_chat(
 ) -> None:
     """Handle individual builder chat requests via WebSocket using an in-memory ReAct agent.
 
-    This creates an agent that only has access to the 'create_agent' tool, allowing
-    dynamic agent creation during the conversation.
+    This creates an agent with the agent-builder tool closure, allowing dynamic
+    agent creation/update and knowledge-base clarification/import during the conversation.
 
     Sends messages in the format expected by the frontend:
     - message_delta: Streaming text chunks
@@ -2536,7 +2543,7 @@ async def handle_builder_chat(
 
     Performance optimizations:
     - Reuses AgentService across messages (only creates on first message)
-    - Pre-creates CreateAgentTool directly without full tool loading
+    - Pre-creates the builder tool closure directly without full tool loading
     - Caches LLM configuration in websocket state
     """
     import uuid
@@ -2581,6 +2588,7 @@ async def handle_builder_chat(
             from ..models.uploaded_file import UploadedFile as _UploadedFile
 
             file_ids = []
+            uploaded_file_lines = []
             for file_info in files:
                 file_id = file_info.get("file_id")
                 if not file_id:
@@ -2595,11 +2603,17 @@ async def handle_builder_chat(
                 )
                 if record:
                     file_ids.append(file_id)
+                    uploaded_file_lines.append(
+                        f"- {record.filename} (File ID: {record.file_id})"
+                    )
 
             if file_ids:
+                uploaded_files_summary = "\n".join(uploaded_file_lines)
                 user_message += (
-                    f"\n\n[Uploaded file_ids: {file_ids}. "
+                    f"\n\n[Uploaded files:\n{uploaded_files_summary}\n"
+                    f"Use these exact file_ids: {file_ids}. "
                     "Please call `create_knowledge_base_from_file` with these file_ids immediately, "
+                    "do not use filenames or paths as file_ids, "
                     "then create or update the agent with the resulting collection_name.]"
                 )
 
@@ -3435,7 +3449,7 @@ async def handle_build_preview_execution(
                 if file_info_list:
                     file_summary = "\n".join(
                         [
-                            f"- {f['name']} (ID: {f['file_id']}, {f['size']} bytes, {f['type']}, Path: {f['path']})"
+                            f"- {f['name']} (File ID: {f['file_id']}, {f['size']} bytes, {f['type']}, Path: {f['path']})"
                             for f in file_info_list
                         ]
                     )

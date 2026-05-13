@@ -58,6 +58,15 @@ logger = logging.getLogger(__name__)
 CONTEXT_KEY_FILE_INFO = "file_info"
 CONTEXT_KEY_UPLOADED_FILES = "uploaded_files"
 
+CRITICAL_BUSINESS_FAILURE_TOOLS = frozenset(
+    {
+        "create_agent",
+        "update_agent",
+        "create_knowledge_base_from_file",
+        "create_knowledge_base_from_url",
+    }
+)
+
 
 class ReActStepType(Enum):
     """Types of steps in ReAct execution"""
@@ -149,6 +158,37 @@ class ReActPattern(AgentPattern):
             threshold=compact_threshold or CompactConfig().threshold,
         )
         self._compact_stats = {"total_compacts": 0, "tokens_saved": 0}
+
+    @staticmethod
+    def _normalize_tool_result(result: Any) -> Any:
+        """Return a JSON-like value for checking tool business status."""
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        return result
+
+    @classmethod
+    def _tool_result_is_business_failure(cls, result: Any) -> bool:
+        """Detect tool-level business failures encoded in successful returns."""
+        normalized_result = cls._normalize_tool_result(result)
+        if not isinstance(normalized_result, dict):
+            return False
+
+        if normalized_result.get("success") is False:
+            return True
+
+        status = normalized_result.get("status")
+        return isinstance(status, str) and status.lower() == "error"
+
+    @classmethod
+    def _tool_business_failure_message(cls, result: Any) -> str:
+        """Extract the original business failure message from a tool result."""
+        normalized_result = cls._normalize_tool_result(result)
+        if isinstance(normalized_result, dict):
+            for key in ("message", "error", "detail"):
+                value = normalized_result.get(key)
+                if value:
+                    return str(value)
+        return str(normalized_result)
 
     def _estimate_message_tokens(self, messages: List[Dict[str, str]]) -> int:
         """
@@ -2190,6 +2230,15 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                     )
 
                 result = await tool.run_json_async(tool_args)
+                normalized_result = self._normalize_tool_result(result)
+                business_failed = self._tool_result_is_business_failure(
+                    normalized_result
+                )
+                business_failure_message = (
+                    self._tool_business_failure_message(normalized_result)
+                    if business_failed
+                    else ""
+                )
 
                 # Trace tool execution end
                 if task_id is not None and step_id is not None:
@@ -2202,20 +2251,54 @@ Remember: Return ONLY ONE JSON object. No additional text, no multiple objects.
                             "tool_name": action.tool_name,
                             "tool_args": tool_args,
                             "tool_execution_id": tool_execution_id,
-                            "result": result,
-                            "success": True,
+                            "result": normalized_result,
+                            "success": not business_failed,
                             "step_id": step_id,
                             "step_name": getattr(self, "_current_step_name", "main"),
                             "sandboxed": is_sandboxed,
                         },
                     )
 
+                if business_failed:
+                    failure_content = (
+                        f"Tool '{action.tool_name}' reported failure. "
+                        f"Result: {normalized_result}"
+                    )
+                    if action.tool_name in CRITICAL_BUSINESS_FAILURE_TOOLS:
+                        logger.warning(
+                            "Critical tool %s reported business failure: %s",
+                            action.tool_name,
+                            business_failure_message,
+                        )
+                        return {
+                            "type": "final_answer",
+                            "content": failure_content,
+                            "reasoning": action.reasoning,
+                            "success": False,
+                            "error": business_failure_message,
+                            "tool_name": action.tool_name,
+                            "tool_args": tool_args,
+                            "result": normalized_result,
+                            "tool_execution_id": tool_execution_id,
+                        }
+
+                    return {
+                        "type": "observation",
+                        "content": failure_content,
+                        "tool_name": action.tool_name,
+                        "tool_args": tool_args,
+                        "result": normalized_result,
+                        "success": False,
+                        "error": business_failure_message,
+                        "tool_execution_id": tool_execution_id,
+                    }
+
                 return {
                     "type": "observation",
-                    "content": f"Tool '{action.tool_name}' executed successfully. Result: {result}",
+                    "content": f"Tool '{action.tool_name}' executed successfully. Result: {normalized_result}",
                     "tool_name": action.tool_name,
                     "tool_args": tool_args,
-                    "result": result,
+                    "result": normalized_result,
                     "tool_execution_id": tool_execution_id,
                 }
 

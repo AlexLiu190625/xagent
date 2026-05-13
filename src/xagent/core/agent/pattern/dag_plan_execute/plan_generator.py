@@ -730,7 +730,9 @@ class PlanGenerator:
                 "The user has uploaded files (file_ids are present in the context above). "
                 'You MUST return `{"type": "plan"}` immediately. '
                 'Do NOT return type="chat". Do NOT ask the user to upload files again. '
+                "Do NOT create `get_file_id`, `list_files`, `wait_for_upload`, or `wait_for_file` steps. "
                 "Do NOT create a 'wait for upload' or 'wait for file' step — the files are already available. "
+                "Do NOT use filenames or paths as file_ids. "
                 "The plan must start directly with `create_knowledge_base_from_file` using the provided file_ids.\n\n"
             )
 
@@ -1022,13 +1024,33 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
             if "uploaded_files" in user_input_context:
                 uploaded_files = user_input_context["uploaded_files"]
                 file_info = user_input_context.get("file_info", [])
+                uploaded_file_ids = [
+                    str(f.get("file_id"))
+                    for f in file_info
+                    if isinstance(f, dict) and f.get("file_id")
+                ]
+                file_ids_str = ", ".join(f'"{fid}"' for fid in uploaded_file_ids)
                 user_prompt += f"\nUPLOADED FILES: {len(uploaded_files)} files available for processing:\n"
                 for f in file_info:
                     file_name = f.get("name", "unknown")
                     file_size = f.get("size", 0)
                     file_type = f.get("type", "unknown")
-                    user_prompt += f"- {file_name} ({file_size} bytes, {file_type})\n"
+                    file_id = f.get("file_id")
+                    user_prompt += f"- {file_name} ({file_size} bytes, {file_type})"
+                    if file_id:
+                        user_prompt += f"\n  File ID: {file_id}"
+                    user_prompt += "\n"
                 user_prompt += "These files have been uploaded and are available in the workspace.\n"
+                if uploaded_file_ids:
+                    user_prompt += (
+                        f"Use these exact file_ids (UUIDs): [{file_ids_str}].\n"
+                    )
+                user_prompt += (
+                    "Do NOT create `get_file_id`, `list_files`, `wait_for_upload`, or `wait_for_file` steps. "
+                    "Do NOT use filenames or paths as file_ids. "
+                    "For agent/knowledge-base goals, the next added step should call "
+                    "`create_knowledge_base_from_file` with the UUID file_ids above.\n"
+                )
                 user_prompt += (
                     "You should consider these files when planning additional steps.\n"
                 )
@@ -1095,7 +1117,11 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
                 use_custom_role = True
             if context.state.get("file_info"):
                 has_uploaded_files = True
-                uploaded_file_ids = [f["file_id"] for f in context.state["file_info"]]
+                uploaded_file_ids = [
+                    str(f["file_id"])
+                    for f in context.state["file_info"]
+                    if isinstance(f, dict) and f.get("file_id")
+                ]
 
         # Build tools context with new format
         tools_context = ""
@@ -1141,6 +1167,8 @@ When you return type="chat" (direct answer mode), you are providing a TEXT RESPO
             system_prompt += (
                 "\n\n## CRITICAL OVERRIDE: Files Have Been Uploaded\n"
                 f"The user has already uploaded files. Their exact UUIDs are: [{file_ids_str}]\n"
+                "Use only these UUIDs as file_ids. Do NOT use filenames or paths as file_ids.\n"
+                "You MUST NOT create `get_file_id`, `list_files`, `wait_for_upload`, or `wait_for_file` steps in your plan.\n"
                 "You MUST NOT create a 'wait for upload' or 'wait for file' step in your plan.\n"
                 "The plan MUST start immediately with processing these files. "
                 "If the goal is to build an agent/knowledge base, start directly with `create_knowledge_base_from_file` using the file_ids listed above.\n\n"

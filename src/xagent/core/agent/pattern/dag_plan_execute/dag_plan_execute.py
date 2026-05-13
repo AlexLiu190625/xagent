@@ -155,6 +155,7 @@ class DAGPlanExecutePattern(AgentPattern):
             None  # Store skill context for execution phase
         )
         self._selected_skill_name: Optional[str] = None
+        self._builder_context_active: bool = False
 
         # Pause/resume control
         self._pause_event = asyncio.Event()
@@ -264,6 +265,19 @@ class DAGPlanExecutePattern(AgentPattern):
     def set_recovered_skill_context(self, skill_context: Optional[str]) -> None:
         """Load a recovered skill context from prior rounds."""
         self._recovered_skill_context = skill_context
+        if skill_context and "agent-builder" in skill_context:
+            self._builder_context_active = True
+
+    def _is_builder_context_active(self) -> bool:
+        """Return whether the current task/continuation is in agent-builder mode."""
+        return (
+            self._builder_context_active
+            or self._selected_skill_name == "agent-builder"
+            or bool(
+                self._recovered_skill_context
+                and "agent-builder" in self._recovered_skill_context
+            )
+        )
 
     def _get_messages_for_llm(self) -> List[Dict[str, str]]:
         """Get conversation history in standard format for LLM.
@@ -652,6 +666,8 @@ class DAGPlanExecutePattern(AgentPattern):
                             )
                             self._recovered_skill_context = skill_context
                             self._selected_skill_name = skill["name"]
+                            if skill["name"] == "agent-builder":
+                                self._builder_context_active = True
                             logger.info(f"Using skill: {skill['name']}")
                         else:
                             logger.info("No relevant skill found")
@@ -929,7 +945,7 @@ class DAGPlanExecutePattern(AgentPattern):
                     plan,
                     tool_map,
                     self._skill_context,
-                    is_builder_context=self._selected_skill_name == "agent-builder",
+                    is_builder_context=self._is_builder_context_active(),
                 )
 
                 # Send final dag_plan_end event with updated step statuses (including skipped steps)
@@ -1726,6 +1742,7 @@ class DAGPlanExecutePattern(AgentPattern):
         self._context = None
         self._skill_context = None
         self._selected_skill_name = None
+        self._builder_context_active = False
 
         # Reset execution flags
         self._execution_interrupted = False
