@@ -562,7 +562,7 @@ class CreateAgentTool(AbstractBaseTool):
 
 class UpdateAgentTool(AbstractBaseTool):
     """
-    Tool for updating an existing draft agent during task execution.
+    Tool for updating an existing agent during task execution.
 
     This allows agents to dynamically update agents with specific capabilities
     by modifying their name, description, instructions, and allowed tools/skills.
@@ -626,7 +626,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
         return (
             "Update an existing agent with specific capabilities during task execution. "
-            "Only DRAFT agents can be updated - PUBLISHED agents must be edited through the web interface.\n\n"
+            "DRAFT and PUBLISHED agents can both be updated; the agent keeps its current status.\n\n"
             "Parameters:\n"
             "- agent_id: The ID of the agent to update (required)\n"
             "- name (optional): New name for the agent\n"
@@ -645,8 +645,8 @@ class UpdateAgentTool(AbstractBaseTool):
             "- markdown_link: Markdown link in format [Agent Name](agent://agent_id)\n"
             "- status: 'success' or 'error'\n"
             "- message: Detailed information about the updated agent\n\n"
-            "IMPORTANT: Only agents in DRAFT status can be updated. "
-            "If you need to modify a PUBLISHED agent, create a new one or edit it through the web interface."
+            "IMPORTANT: Updating a PUBLISHED agent does not unpublish it. "
+            "It remains PUBLISHED with the updated configuration."
         )
 
     @property
@@ -700,16 +700,17 @@ class UpdateAgentTool(AbstractBaseTool):
                     message=f"Error: Agent with ID {agent_id} not found",
                 ).model_dump()
 
-            # Check if agent is in DRAFT status
-            if agent.status != AgentStatus.DRAFT:
+            if agent.status == AgentStatus.ARCHIVED:
                 return UpdateAgentToolResult(
                     agent_id=agent_id,
                     agent_name=agent.name,
                     tool_name=gen_agent_tool_name(agent.name),
                     markdown_link=f"[{agent.name}](agent://{agent.id})",
                     status="error",
-                    message=f"Error: Only DRAFT agents can be updated. This agent is {agent.status.value.upper()}. "
-                    f"To modify a published agent, please edit it through the web interface or create a new one.",
+                    message=(
+                        "Error: Archived agents cannot be updated. "
+                        f"This agent is {agent.status.value.upper()}."
+                    ),
                 ).model_dump()
 
             # Track changes
@@ -791,6 +792,7 @@ class UpdateAgentTool(AbstractBaseTool):
                     markdown_link=f"[{agent.name}](agent://{agent.id})",
                     status="success",
                     message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
+                    f"Status: {agent.status.value.upper()}. "
                     f"All fields were the same or no values were provided.",
                 ).model_dump()
 
@@ -803,7 +805,7 @@ class UpdateAgentTool(AbstractBaseTool):
             markdown_link = f"[{agent.name}](agent://{agent.id})"
 
             logger.info(
-                f"Updated DRAFT agent '{agent.name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
+                f"Updated {agent.status.value.upper()} agent '{agent.name}' (ID: {agent.id}) for user {self._user_id}: {', '.join(changes)}"
             )
 
             return UpdateAgentToolResult(
@@ -818,13 +820,13 @@ class UpdateAgentTool(AbstractBaseTool):
                     f"- Agent ID: {agent.id}\n"
                     f"- Agent Name: {agent.name}\n"
                     f"- Tool Name: {tool_name}\n"
-                    f"- Status: DRAFT\n\n"
+                    f"- Status: {agent.status.value.upper()}\n\n"
                     f"**Changes Applied:**\n"
                     + "\n".join(f"- {change}" for change in changes)
                     + f"\n\n**How to use this agent:**\n"
                     f"Include this link in your response: {markdown_link}\n"
                     f"Or use the tool: {tool_name}\n\n"
-                    f"*The agent will reflect the updated changes on next execution.*"
+                    f"*The agent keeps its current publication status and will reflect the updated changes on next execution.*"
                 ),
             ).model_dump()
 
@@ -986,7 +988,7 @@ class ListAgentsTool(AbstractBaseTool):
                 status="success",
                 message=(
                     f"✅ Found {total_count} agent(s){filter_msg}\n\n"
-                    f"*Only DRAFT agents can be updated using update_agent tool. "
+                    f"*DRAFT and PUBLISHED agents can be updated using update_agent. "
                     f"All agents can be called using their tool_name.*"
                 ),
             ).model_dump()
