@@ -307,7 +307,10 @@ def test_append_message_happy_path(mock_start_task):
     body = resp.json()
     assert body["task_id"] == task_id
     assert body["agent_id"] == agent_id
-    assert body["status"] == "pending"
+    # The atomic claim in the endpoint already flipped the row to
+    # RUNNING; the response must mirror that so back-to-back POST+GET
+    # don't show contradictory statuses to SDK clients.
+    assert body["status"] == "running"
     assert "accepted_at" in body
 
     # Two user messages now exist for this task; task.input is the latest

@@ -306,10 +306,17 @@ async def append_message_to_task(
     # ``datetime.now(...)``. That way SDK clients reading this field
     # see a value that matches what they'd read from the DB directly
     # via GET /v1/chat/tasks/{id}, with no clock-skew between the two.
+    #
+    # ``status='running'`` (not 'pending') because the atomic UPDATE
+    # above already flipped the row to RUNNING in the same transaction.
+    # Returning 'pending' here would lie to the SDK client: an
+    # immediately-following GET would see 'running' and the client
+    # would have to reconcile two contradictory values from
+    # back-to-back calls.
     return AppendMessageResponse(
         task_id=int(task.id),
         agent_id=int(agent.id),
-        status="pending",
+        status="running",
         accepted_at=task.updated_at,
     )
 
