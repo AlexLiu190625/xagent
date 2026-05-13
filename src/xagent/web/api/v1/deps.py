@@ -25,7 +25,7 @@ from typing import Tuple
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 
 from ....core.utils.api_key import parse_api_key, verify_api_key, verify_dummy
 from ...models.agent import Agent
@@ -78,9 +78,14 @@ async def get_agent_from_api_key(
     prefix, _secret = parsed
 
     # Index lookup is O(1) on ix_agent_api_keys_key_prefix and excludes
-    # revoked rows via the partial unique index path.
+    # revoked rows via the partial unique index path. ``joinedload``
+    # pulls the bound Agent row in the same SELECT so we don't pay a
+    # second round-trip on the success path (the relationship defaults
+    # to lazy='select', which would otherwise emit a separate query
+    # when we access ``key_row.agent`` below).
     key_row = (
         db.query(AgentApiKey)
+        .options(joinedload(AgentApiKey.agent))
         .filter(
             AgentApiKey.key_prefix == prefix,
             AgentApiKey.revoked_at.is_(None),
@@ -102,10 +107,11 @@ async def get_agent_from_api_key(
 
     # Bound agent. Should always exist (CASCADE on agents -> api_keys),
     # but defend against an out-of-band DELETE that somehow leaves a
-    # dangling key row. Treat as invalid_api_key rather than 404 so the
-    # client retries with a fresh key instead of investigating an
-    # imaginary agent.
-    agent = db.query(Agent).filter(Agent.id == key_row.agent_id).first()
+    # dangling key row. The relationship was eagerly loaded above, so
+    # this is a memory access, not another query. Treat as
+    # invalid_api_key rather than 404 so the client retries with a
+    # fresh key instead of investigating an imaginary agent.
+    agent = key_row.agent
     if agent is None:
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
