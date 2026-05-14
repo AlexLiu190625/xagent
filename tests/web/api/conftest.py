@@ -27,6 +27,7 @@ from typing import Iterator
 
 import pytest
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
@@ -82,6 +83,28 @@ async def _v1_internal_error_handler(request: Request, exc: Exception):
             },
         )
     raise exc
+
+
+# Same path-aware rewrite for Pydantic / FastAPI request-body validation
+# (422). FastAPI raises ``RequestValidationError`` before the endpoint
+# runs, so the v1 endpoints can't translate it themselves -- the global
+# handler is the only place. /v1/* gets ``{"error":{"code":"invalid_input"}}``,
+# /api/* falls through to FastAPI's default {"detail": [...]}.
+@app_for_tests.exception_handler(RequestValidationError)
+async def _v1_validation_error_handler(request: Request, exc: RequestValidationError):
+    if request.url.path.startswith("/v1/"):
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        msg = first.get("msg") or "Invalid request body"
+        loc = ".".join(str(p) for p in first.get("loc", []) if p not in (None, "body"))
+        if loc:
+            msg = f"{msg} ({loc})"
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "invalid_input", "message": msg}},
+        )
+    # /api/* uses FastAPI's default shape
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 app_for_tests.dependency_overrides[get_db] = _override_get_db

@@ -75,11 +75,40 @@ async def health_check() -> dict[str, str]:
 async def validation_exception_handler(
     request: Request, exc: RequestValidationError
 ) -> JSONResponse:
-    """Handle request validation errors, especially those containing binary data"""
+    """Handle request validation errors, especially those containing binary data.
+
+    Path-aware response shape so the SDK envelope contract holds:
+
+      - ``/v1/*``: rewrite to ``{"error": {"code": "invalid_input",
+        "message": "..."}}`` so SDK clients can switch on
+        ``body.error.code`` for 422 the same way they do for 401/404/409.
+        FastAPI raises ``RequestValidationError`` before the endpoint
+        runs, so the v1 endpoints themselves never see this -- the
+        handler is the only place to translate.
+      - ``/api/*`` and other paths: keep the existing
+        ``{"detail": [sanitized_errors]}`` shape that the web UI and
+        in-house clients already parse.
+    """
     import traceback
 
     logger.error(f"Validation error in {request.url}: {str(exc)}")
     logger.error(f"Traceback: {traceback.format_exc()}")
+
+    if request.url.path.startswith("/v1/"):
+        # Take the first validation error as the human message; full
+        # list isn't echoed to keep the response surface small and
+        # avoid leaking internal field path patterns. Server log above
+        # has the full detail for debugging.
+        errors = exc.errors()
+        first = errors[0] if errors else {}
+        msg = first.get("msg") or "Invalid request body"
+        loc = ".".join(str(p) for p in first.get("loc", []) if p not in (None, "body"))
+        if loc:
+            msg = f"{msg} ({loc})"
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": "invalid_input", "message": msg}},
+        )
 
     # Sanitize error details to remove binary data and non-serializable objects
     sanitized_errors = []

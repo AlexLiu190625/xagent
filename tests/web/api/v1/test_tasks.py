@@ -177,7 +177,13 @@ def test_create_task_agent_id_mismatch_returns_404(mock_start_task):
 
 
 def test_create_task_empty_message_returns_422(mock_start_task):
-    """Empty message.content fails Pydantic min_length=1 -> 422."""
+    """Empty message.content fails Pydantic min_length=1.
+
+    The /v1/* path rewrites the FastAPI default
+    ``{"detail": [...]}`` shape into the SDK envelope so clients can
+    pin against ``body.error.code == 'invalid_input'`` for 422 just
+    like they do for the other error codes.
+    """
     agent_id, full_key = _create_agent_with_key()
 
     resp = client.post(
@@ -189,11 +195,15 @@ def test_create_task_empty_message_returns_422(mock_start_task):
         },
     )
     assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
+    assert "detail" not in body  # legacy FastAPI shape must not leak
     assert mock_start_task.await_count == 0
 
 
 def test_create_task_wrong_role_returns_422(mock_start_task):
-    """role != 'user' fails Pydantic Literal check -> 422."""
+    """role != 'user' fails Pydantic Literal check -> 422 with the
+    SDK envelope shape, not FastAPI's default ``{"detail": [...]}``."""
     agent_id, full_key = _create_agent_with_key()
 
     resp = client.post(
@@ -205,6 +215,9 @@ def test_create_task_wrong_role_returns_422(mock_start_task):
         },
     )
     assert resp.status_code == 422
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_input"
+    assert "detail" not in body
     assert mock_start_task.await_count == 0
 
 

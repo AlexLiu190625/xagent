@@ -56,6 +56,12 @@ class V1ErrorCode(str, Enum):
     # 409 Conflict. Client should retry after polling task status.
     TASK_BUSY = "task_busy"
 
+    # Request body failed Pydantic validation (empty content, wrong role,
+    # missing required field, etc.). 422. The default ``{"detail": [...]}``
+    # FastAPI shape is rewritten to this enum on the /v1/* path so SDK
+    # clients always switch on ``body.error.code``.
+    INVALID_INPUT = "invalid_input"
+
     # Phase 2 feature; reserved here so SDK clients can already encode
     # the mapping. Phase 1 never emits this.
     RATE_LIMITED = "rate_limited"
@@ -73,6 +79,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.AGENT_NOT_FOUND: "Agent not found or not accessible with this key.",
     V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
+    V1ErrorCode.INVALID_INPUT: "Request body failed validation.",
     V1ErrorCode.RATE_LIMITED: "Rate limit exceeded; retry later.",
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
 }
