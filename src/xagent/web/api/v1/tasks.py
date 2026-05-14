@@ -8,10 +8,10 @@ Phase 1 surface this module owns:
   - GET  /v1/chat/tasks/{id}/steps
 
 All endpoints authenticate via ``get_agent_from_api_key`` and use the
-stable ``V1ApiError`` envelope. Background execution is started via
-``web/services/task_execution.start_task_in_background``, which wraps
-the same coroutine the WebSocket handler uses without modifying the
-WS path.
+stable ``V1ApiError`` envelope. Task turn lifecycle (claim RUNNING,
+persist messages, schedule bg, sync output) is delegated to
+``services.task_orchestrator.TaskTurnOrchestrator``, which is also used
+by the WebSocket UI path so both transports share one state machine.
 """
 
 from typing import Tuple
@@ -32,8 +32,7 @@ from ...schemas.v1 import (
     StepsResponse,
     TaskInfoResponse,
 )
-from ...services.chat_history_service import persist_user_message
-from ...services.task_execution import start_task_in_background
+from ...services.task_orchestrator import TaskTurnError, TaskTurnOrchestrator
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import get_agent_from_api_key
 from .errors import V1ApiError, V1ErrorCode
@@ -113,11 +112,10 @@ async def create_chat_task(
     # ``input`` / ``task_chat_messages``.
     title = request.message.content[:50] or "SDK task"
 
-    # Single transaction: create the Task row with SDK-specific
-    # fields populated. ``source='sdk'`` lets adoption metrics
-    # queries split SDK traffic from web/widget; ``input`` records
-    # this turn's user message so the GET endpoint can return it
-    # without going through ``task_chat_messages``.
+    # Create the Task row with SDK-specific fields populated.
+    # ``source='sdk'`` lets adoption metrics queries split SDK traffic
+    # from web/widget; ``input`` records this turn's user message so
+    # GET endpoint can return it without going through task_chat_messages.
     task = Task(
         user_id=agent.user_id,
         title=title,
@@ -131,28 +129,18 @@ async def create_chat_task(
     db.commit()
     db.refresh(task)
 
-    # Persist the first message to ``task_chat_messages`` so:
-    #   1. Background execution can build the conversation context
-    #      the same way the WS path does.
-    #   2. Future ``GET /v1/chat/tasks/{id}/steps`` includes it as a
-    #      ``message`` (role='user') step.
-    persist_user_message(
-        db=db,
-        task_id=int(task.id),
-        user_id=int(agent.user_id),
-        content=request.message.content,
-    )
-
-    # Kick off the background coroutine. The helper opens its own
-    # session and re-queries ``task`` / ``user`` rows on it, so the
-    # bg coroutine doesn't share lifetime with this request's ``db``
-    # (which FastAPI closes once we return). It also registers the
-    # bg task with ``background_task_manager`` so a follow-up POST
-    # on the same task waits for this turn to finish.
-    await start_task_in_background(
-        task=task,
-        user_message=request.message.content,
-    )
+    # Orchestrator handles persisting the first user message + bg
+    # scheduling (with single-flight guard). A brand-new task shouldn't
+    # ever hit the busy branch -- but we map it anyway for defense.
+    try:
+        await TaskTurnOrchestrator.start_new_turn(
+            task=task,
+            user_message=request.message.content,
+            user=task.user,
+            db=db,
+        )
+    except TaskTurnError:
+        raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
 
     return CreateTaskResponse(
         task_id=int(task.id),
@@ -256,50 +244,22 @@ async def append_message_to_task(
     if request.agent_id != agent.id:
         raise V1ApiError(V1ErrorCode.AGENT_NOT_FOUND, 404)
 
-    # Concurrency guard: appending a message while the prior turn is
-    # still running would race the background coroutine's read of
-    # ``task_chat_messages``. Two concurrent POSTs could both pass a
-    # plain ``if task.status == RUNNING`` check, so we claim the slot
-    # via an atomic single-statement UPDATE: only the request whose
-    # row currently has status != RUNNING wins. Loser sees rowcount=0
-    # and gets 409. Behavior change vs naive read-then-check: after
-    # success, ``task.status`` is RUNNING (the bg coroutine will set
-    # RUNNING again idempotently when it picks up).
-    claimed = (
-        db.query(Task)
-        .filter(Task.id == task.id, Task.status != TaskStatus.RUNNING)
-        .update(
-            {
-                Task.status: TaskStatus.RUNNING,
-                Task.input: request.message.content,
-            },
-            synchronize_session=False,
+    # Orchestrator does the atomic claim (status must be terminal --
+    # COMPLETED or FAILED -- to be appendable, so PENDING/RUNNING both
+    # 409), persists the new user message, and schedules the bg turn
+    # with a single-flight guard against concurrent kickoffs.
+    try:
+        await TaskTurnOrchestrator.append_turn(
+            task=task,
+            user_message=request.message.content,
+            user=task.user,
+            db=db,
         )
-    )
-    db.commit()
-    if claimed == 0:
+    except TaskTurnError:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
 
-    # We own the slot now. Persist the new user message to the
-    # transcript so the bg coroutine's read of task_chat_messages sees
-    # it (matches POST /v1/chat/tasks' first-turn persistence).
-    persist_user_message(
-        db=db,
-        task_id=int(task.id),
-        user_id=int(agent.user_id),
-        content=request.message.content,
-    )
-    db.commit()
+    # Pick up updated_at written by the orchestrator's UPDATE.
     db.refresh(task)
-
-    # Kick off the next background turn. Uses the same helper as
-    # POST /v1/chat/tasks; background_task_manager ensures we wait
-    # for any in-flight task before the new one starts. Helper owns
-    # its own session for the bg coroutine -- see service docstring.
-    await start_task_in_background(
-        task=task,
-        user_message=request.message.content,
-    )
 
     # accepted_at uses the DB row's ``updated_at`` (set by ``onupdate=
     # func.now()`` on the atomic UPDATE) instead of a fresh

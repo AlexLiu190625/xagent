@@ -60,24 +60,26 @@ def _bearer(full_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {full_key}"}
 
 
-# ``start_task_in_background`` does real work: opens its own DB session,
-# spawns an asyncio.Task that calls execute_task_background -> the full
-# AgentService coroutine. Across the whole D+E+F endpoint surface
-# (POST /v1/chat/tasks, POST /v1/chat/tasks/{id}/messages, GET steps
-# read-paths that don't trigger bg work) these tests want to assert on
-# HTTP shape + DB writes + which kickoff arguments were passed -- not on
-# the agent execution itself.
+# We mock ``TaskTurnOrchestrator._schedule_bg`` (the actual bg coroutine
+# spawn) rather than the public ``start_new_turn`` / ``append_turn`` so
+# the orchestrator's claim + persist logic still runs and tests can
+# verify DB writes (atomic claim flipped status, user messages got
+# persisted, etc.). Only the asyncio.create_task / agent execution is
+# stubbed.
 #
 # Scope: file-local. ``autouse=True`` means every test in this module
 # gets the mock automatically. GET-only tests (which never call the
-# helper) are unaffected; POST tests assert on ``await_count`` /
+# orchestrator) are unaffected; POST tests assert on ``await_count`` /
 # ``await_args``. Other test files (e.g. test_steps_mapping.py,
 # test_auth.py) are NOT affected because pytest fixture scoping is
 # per-module.
+#
+# Fixture name kept as ``mock_start_task`` to minimize churn across the
+# existing test surface; conceptually it now mocks "bg scheduling".
 @pytest.fixture(autouse=True)
 def mock_start_task():
     with patch(
-        "xagent.web.api.v1.tasks.start_task_in_background",
+        "xagent.web.services.task_orchestrator._schedule_bg",
         new=AsyncMock(),
     ) as mocked:
         yield mocked
@@ -289,10 +291,32 @@ def _create_task(full_key: str, agent_id: int, content: str = "hello") -> int:
 # ===== POST /v1/chat/tasks/{task_id}/messages =====
 
 
+def _force_task_status(task_id: int, status: TaskStatus) -> None:
+    """Bypass the bg coroutine and flip a task to a desired status.
+
+    Tests in this file mock out the bg scheduling so a freshly-created
+    task stays at PENDING forever. The orchestrator's ``append_turn``
+    only accepts terminal statuses (COMPLETED / FAILED) -- which is
+    correct production behavior -- so tests that exercise the
+    append-happy path need to push the task to COMPLETED first.
+    """
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = status
+        db.commit()
+    finally:
+        db.close()
+
+
 def test_append_message_happy_path(mock_start_task):
     """Returns 202 + accepted_at, persists new user message, kicks off bg."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="first turn")
+    # Mark the previous turn as COMPLETED so append_turn's atomic claim
+    # passes (PENDING is rejected as busy because it means the create's
+    # bg run hasn't finished yet).
+    _force_task_status(task_id, TaskStatus.COMPLETED)
     mock_start_task.reset_mock()  # discard the create-task call so we count just the append
 
     resp = client.post(
@@ -373,6 +397,8 @@ def test_append_message_claims_slot_atomically(mock_start_task):
     """
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="t1")
+    # Push to COMPLETED so the first append is allowed (PENDING is busy).
+    _force_task_status(task_id, TaskStatus.COMPLETED)
     mock_start_task.reset_mock()
 
     # First append succeeds and atomically claims the slot.
@@ -405,6 +431,38 @@ def test_append_message_claims_slot_atomically(mock_start_task):
     assert r2.json()["error"]["code"] == "task_busy"
     # Only one bg kickoff total (from the winning first append).
     assert mock_start_task.await_count == 1
+
+
+def test_create_then_append_race_returns_409(mock_start_task):
+    """Regression: create-then-immediate-append must 409, not race.
+
+    The old append_turn used ``status != RUNNING`` which let PENDING
+    slip through. A client could POST /v1/chat/tasks, get a PENDING
+    task back, and immediately POST /messages; both the create's bg
+    coroutine and the append's bg coroutine would then race to run
+    the same task. The orchestrator's terminal-state-only filter
+    closes this: PENDING (= "first turn scheduled but not started")
+    is treated as busy.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first")
+    # NOT calling _force_task_status here — task stays in PENDING
+    # exactly as it would right after the SDK's create response is
+    # returned but before the bg coroutine ran.
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second"},
+        },
+    )
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_busy"
+    # No second bg kickoff should have happened
+    assert mock_start_task.await_count == 0
 
 
 def test_append_message_to_missing_task_returns_404(mock_start_task):
