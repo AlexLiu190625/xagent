@@ -27,12 +27,11 @@ export interface Template {
   views: number;
   likes: number;
   used_count: number;
+  is_liked?: boolean;
 }
 
 export interface TemplateDetail extends Template {
   agent_config: AgentConfig;
 }
 
-export interface TemplateWithStats extends Template {
-  is_liked?: boolean;
-}
+export type TemplateWithStats = Template;

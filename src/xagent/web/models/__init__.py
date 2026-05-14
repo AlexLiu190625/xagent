@@ -9,7 +9,7 @@ from .public_mcp import PublicMCPApp
 from .sandbox import SandboxInfo, SandboxSnapshot
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task
-from .template_stats import TemplateStats
+from .template_stats import TemplateStats, UserTemplateRelation
 from .text2sql import Text2SQLDatabase
 from .tool_config import ToolConfig, ToolUsage
 from .uploaded_file import UploadedFile
@@ -35,6 +35,7 @@ __all__ = [
     "Task",
     "DAGExecution",
     "TemplateStats",
+    "UserTemplateRelation",
     "Text2SQLDatabase",
     "ToolConfig",
     "ToolUsage",

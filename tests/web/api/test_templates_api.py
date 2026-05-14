@@ -8,10 +8,16 @@ from unittest.mock import MagicMock, patch
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
-from xagent.web.api.auth import auth_router
+from xagent.web.api.auth import auth_router, hash_password
+from xagent.web.api.templates import (
+    increment_template_likes,
+)
 from xagent.web.api.templates import router as templates_router
 from xagent.web.models.database import Base, get_db, get_engine
+from xagent.web.models.template_stats import TemplateStats, UserTemplateRelation
+from xagent.web.models.user import User
 
 
 def override_get_db():
@@ -45,6 +51,23 @@ def ensure_system_initialized() -> None:
         )
         assert setup_response.status_code == 200
         assert setup_response.json().get("success") is True
+
+
+def create_user_headers(username: str, password: str = "user123") -> dict[str, str]:
+    db = next(get_db())
+    user = User(username=username, password_hash=hash_password(password))
+    db.add(user)
+    db.commit()
+    db.close()
+
+    response = client.post(
+        "/api/auth/login",
+        json={"username": username, "password": password},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("success") is True
+    return {"Authorization": f"Bearer {data['access_token']}"}
 
 
 @pytest.fixture(scope="function")
@@ -210,9 +233,26 @@ class TestTemplatesAPI:
             assert "views" in template
             assert "likes" in template
             assert "used_count" in template
+            assert "is_liked" in template
             assert template["views"] == 0
             assert template["likes"] == 0
             assert template["used_count"] == 0
+            assert template["is_liked"] is False
+
+            db = next(get_db())
+            try:
+                assert db.query(TemplateStats).count() == 2
+            finally:
+                db.close()
+
+            response = client.get("/api/templates/", headers=admin_headers)
+            assert response.status_code == 200
+
+            db = next(get_db())
+            try:
+                assert db.query(TemplateStats).count() == 2
+            finally:
+                db.close()
 
     def test_get_template_detail(self, mock_app_state, admin_headers):
         """测试获取模板详情"""
@@ -244,9 +284,19 @@ class TestTemplatesAPI:
             assert response.status_code == 404
 
     def test_like_template(self, mock_app_state, admin_headers):
-        """测试点赞模板"""
+        """测试同一用户重复点赞只计数一次"""
         with patch.object(client.app, "state", mock_app_state):
             # 第一次点赞
+            response = client.post(
+                "/api/templates/customer_support/like", headers=admin_headers
+            )
+
+            assert response.status_code == 200
+            result = response.json()
+            assert result["liked"] is True
+            assert result["likes"] == 1
+
+            # 同一用户重复点赞应幂等，不重复增加
             response = client.post(
                 "/api/templates/customer_support/like", headers=admin_headers
             )
@@ -260,7 +310,161 @@ class TestTemplatesAPI:
             response = client.get(
                 "/api/templates/customer_support", headers=admin_headers
             )
+            detail = response.json()
+            assert detail["likes"] == 1
+            assert detail["is_liked"] is True
+
+            # 获取模板列表验证当前用户点赞状态
+            response = client.get("/api/templates/", headers=admin_headers)
+            assert response.status_code == 200
+            templates = response.json()
+            liked_template = next(
+                template
+                for template in templates
+                if template["id"] == "customer_support"
+            )
+            assert liked_template["likes"] == 1
+            assert liked_template["is_liked"] is True
+
+    def test_like_template_from_different_users_counts_separately(
+        self, mock_app_state, admin_headers
+    ):
+        """测试不同用户点赞同一模板分别计数"""
+        user_headers = create_user_headers("template_like_user")
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.post(
+                "/api/templates/customer_support/like", headers=admin_headers
+            )
+            assert response.status_code == 200
             assert response.json()["likes"] == 1
+
+            response = client.post(
+                "/api/templates/customer_support/like", headers=user_headers
+            )
+            assert response.status_code == 200
+            assert response.json()["likes"] == 2
+
+    def test_like_template_not_found(self, mock_app_state, admin_headers):
+        """测试点赞不存在模板仍返回 404"""
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.post(
+                "/api/templates/nonexistent/like", headers=admin_headers
+            )
+            assert response.status_code == 404
+
+    def test_user_template_relation_unique_constraint(self, admin_user):
+        """测试同一用户同一模板同一关系类型只能有一条数据"""
+        db = next(get_db())
+        try:
+            relation = UserTemplateRelation(
+                user_id=admin_user["id"],
+                template_id="customer_support",
+                relation_type="like",
+                is_active=True,
+            )
+            duplicate = UserTemplateRelation(
+                user_id=admin_user["id"],
+                template_id="customer_support",
+                relation_type="like",
+                is_active=True,
+            )
+            db.add(relation)
+            db.commit()
+
+            db.add(duplicate)
+            with pytest.raises(IntegrityError):
+                db.commit()
+            db.rollback()
+        finally:
+            db.close()
+
+    def test_inactive_like_relation_reactivates(
+        self, mock_app_state, admin_headers, admin_user
+    ):
+        """测试 inactive 的点赞关系再次 like 会重新激活并增加计数"""
+        db = next(get_db())
+        try:
+            db.add(TemplateStats(template_id="customer_support", likes=0))
+            db.add(
+                UserTemplateRelation(
+                    user_id=admin_user["id"],
+                    template_id="customer_support",
+                    relation_type="like",
+                    is_active=False,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        with patch.object(client.app, "state", mock_app_state):
+            response = client.post(
+                "/api/templates/customer_support/like", headers=admin_headers
+            )
+            assert response.status_code == 200
+            assert response.json()["likes"] == 1
+
+        db = next(get_db())
+        try:
+            relation = (
+                db.query(UserTemplateRelation)
+                .filter(
+                    UserTemplateRelation.user_id == admin_user["id"],
+                    UserTemplateRelation.template_id == "customer_support",
+                    UserTemplateRelation.relation_type == "like",
+                )
+                .one()
+            )
+            assert relation.is_active is True
+        finally:
+            db.close()
+
+    def test_increment_template_likes_uses_database_atomic_update(self, test_db):
+        """测试点赞计数不会被 stale session 覆盖"""
+        db = next(get_db())
+        try:
+            db.add(TemplateStats(template_id="customer_support", likes=0))
+            db.commit()
+        finally:
+            db.close()
+
+        db1 = next(get_db())
+        db2 = next(get_db())
+        try:
+            stats1 = (
+                db1.query(TemplateStats)
+                .filter(TemplateStats.template_id == "customer_support")
+                .one()
+            )
+            stats2 = (
+                db2.query(TemplateStats)
+                .filter(TemplateStats.template_id == "customer_support")
+                .one()
+            )
+            assert stats1.likes == 0
+            assert stats2.likes == 0
+
+            increment_template_likes(db1, "customer_support")
+            db1.commit()
+            db1.refresh(stats1)
+            increment_template_likes(db2, "customer_support")
+            db2.commit()
+            db2.refresh(stats2)
+        finally:
+            db1.close()
+            db2.close()
+
+        db = next(get_db())
+        try:
+            stats = (
+                db.query(TemplateStats)
+                .filter(TemplateStats.template_id == "customer_support")
+                .one()
+            )
+            assert stats.likes == 2
+        finally:
+            db.close()
 
     def test_use_template(self, mock_app_state, admin_headers):
         """测试使用模板"""
@@ -329,6 +533,7 @@ class TestTemplatesAPI:
                 "views",
                 "likes",
                 "used_count",
+                "is_liked",
             ]
             for field in required_fields:
                 assert field in template, f"Missing field: {field}"

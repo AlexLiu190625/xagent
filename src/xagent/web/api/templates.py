@@ -9,14 +9,17 @@ from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ..auth_dependencies import get_current_user
 from ..models.database import get_db
-from ..models.template_stats import TemplateStats
+from ..models.template_stats import TemplateStats, UserTemplateRelation
 from ..models.user import User
 
 logger = logging.getLogger(__name__)
+
+TEMPLATE_RELATION_LIKE = "like"
 
 
 # ===== Helper Functions =====
@@ -93,6 +96,9 @@ class TemplateInfo(BaseModel):
     views: int = Field(default=0, description="Number of views")
     likes: int = Field(default=0, description="Number of likes")
     used_count: int = Field(default=0, description="Number of times used")
+    is_liked: bool = Field(
+        default=False, description="Whether the current user liked this template"
+    )
 
 
 class TemplateDetail(TemplateInfo):
@@ -129,6 +135,83 @@ def get_or_create_template_stats(db: Session, template_id: str) -> TemplateStats
     return stats
 
 
+def get_or_create_template_stats_map(
+    db: Session, template_ids: list[str]
+) -> dict[str, TemplateStats]:
+    """Get or create template stats records for a list of template IDs."""
+    unique_template_ids = list(dict.fromkeys(template_ids))
+    if not unique_template_ids:
+        return {}
+
+    stats_list = (
+        db.query(TemplateStats)
+        .filter(TemplateStats.template_id.in_(unique_template_ids))
+        .all()
+    )
+    stats_by_template_id = {stats.template_id: stats for stats in stats_list}
+    missing_template_ids = [
+        template_id
+        for template_id in unique_template_ids
+        if template_id not in stats_by_template_id
+    ]
+
+    if missing_template_ids:
+        new_stats = [
+            TemplateStats(template_id=template_id)
+            for template_id in missing_template_ids
+        ]
+        db.add_all(new_stats)
+        db.commit()
+        for stats in new_stats:
+            db.refresh(stats)
+            stats_by_template_id[stats.template_id] = stats
+
+    return stats_by_template_id
+
+
+def get_liked_template_ids(
+    db: Session, user_id: int, template_ids: list[str]
+) -> set[str]:
+    """Return template IDs liked by the given user."""
+    if not template_ids:
+        return set()
+
+    rows = (
+        db.query(UserTemplateRelation.template_id)
+        .filter(
+            UserTemplateRelation.user_id == user_id,
+            UserTemplateRelation.template_id.in_(template_ids),
+            UserTemplateRelation.relation_type == TEMPLATE_RELATION_LIKE,
+            UserTemplateRelation.is_active.is_(True),
+        )
+        .all()
+    )
+    return {row[0] for row in rows}
+
+
+def is_template_liked(db: Session, user_id: int, template_id: str) -> bool:
+    """Return whether the current user has an active like relation."""
+    return (
+        db.query(UserTemplateRelation.id)
+        .filter(
+            UserTemplateRelation.user_id == user_id,
+            UserTemplateRelation.template_id == template_id,
+            UserTemplateRelation.relation_type == TEMPLATE_RELATION_LIKE,
+            UserTemplateRelation.is_active.is_(True),
+        )
+        .first()
+        is not None
+    )
+
+
+def increment_template_likes(db: Session, template_id: str) -> None:
+    """Increment template likes atomically in the database."""
+    db.query(TemplateStats).filter(TemplateStats.template_id == template_id).update(
+        {TemplateStats.likes: TemplateStats.likes + 1},
+        synchronize_session=False,
+    )
+
+
 # ===== Endpoints =====
 
 
@@ -150,12 +233,16 @@ async def list_templates(
     """
     template_manager = request.app.state.template_manager
     templates = await template_manager.list_templates()
+    template_ids = [template["id"] for template in templates]
+    current_user_id = int(current_user.id)
+    liked_template_ids = get_liked_template_ids(db, current_user_id, template_ids)
+    stats_by_template_id = get_or_create_template_stats_map(db, template_ids)
 
     # Get statistics from database
     result = []
     for template in templates:
         template_id = template["id"]
-        stats = get_or_create_template_stats(db, template_id)
+        stats = stats_by_template_id[template_id]
 
         # Get localized values
         description = get_localized_value(template.get("descriptions", {}), lang, "")
@@ -182,6 +269,7 @@ async def list_templates(
                 views=stats.views,
                 likes=stats.likes,
                 used_count=stats.used_count,
+                is_liked=template_id in liked_template_ids,
             )
         )
 
@@ -246,6 +334,7 @@ async def get_template(
         views=stats.views,
         likes=stats.likes,
         used_count=stats.used_count,
+        is_liked=is_template_liked(db, int(current_user.id), template_id),
         agent_config={
             "instructions": template["agent_config"].get("instructions", ""),
             "skills": template["agent_config"].get("skills", []),
@@ -283,10 +372,44 @@ async def like_template(
         raise HTTPException(status_code=404, detail="Template not found")
 
     stats = get_or_create_template_stats(db, template_id)
+    current_user_id = int(current_user.id)
 
-    # Simple toggle like (in production, track user-specific likes)
-    stats.likes += 1
-    db.commit()
+    relation = (
+        db.query(UserTemplateRelation)
+        .filter(
+            UserTemplateRelation.user_id == current_user_id,
+            UserTemplateRelation.template_id == template_id,
+            UserTemplateRelation.relation_type == TEMPLATE_RELATION_LIKE,
+        )
+        .first()
+    )
+
+    if relation and relation.is_active:
+        return LikeResponse(liked=True, likes=stats.likes)
+
+    try:
+        if relation:
+            relation.is_active = True
+        else:
+            relation = UserTemplateRelation(
+                user_id=current_user_id,
+                template_id=template_id,
+                relation_type=TEMPLATE_RELATION_LIKE,
+                is_active=True,
+            )
+            db.add(relation)
+
+        increment_template_likes(db, template_id)
+        db.commit()
+        db.refresh(stats)
+    except IntegrityError:
+        db.rollback()
+        logger.info(
+            "Duplicate like relation detected for user_id=%s template_id=%s",
+            current_user_id,
+            template_id,
+        )
+        stats = get_or_create_template_stats(db, template_id)
 
     return LikeResponse(liked=True, likes=stats.likes)
 
