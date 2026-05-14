@@ -161,6 +161,37 @@ class TaskTurnOrchestrator:
         )
 
     @staticmethod
+    async def schedule_bg(
+        *,
+        task: Task,
+        user_message: str,
+        user: User,
+        force_fresh_execution: bool = False,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> "asyncio.Task[None]":
+        """Schedule a bg coroutine for a task that's already been set up.
+
+        Lower-level entry point than ``start_new_turn`` / ``append_turn``:
+        it does **not** persist the user message and does **not** run an
+        atomic claim. Caller is responsible for both. Used by the WS
+        handler, which already persists the message and flips status to
+        RUNNING inline with other UI-specific broadcast logic, but still
+        needs the single-flight guard + the SDK column sync hook around
+        the bg coroutine.
+
+        Raises ``TaskTurnError('bg_inflight')`` if a previous bg
+        coroutine for this task is still running.
+        """
+        _refuse_if_bg_inflight(int(task.id))
+        return await _schedule_bg(
+            task=task,
+            user=user,
+            user_message=user_message,
+            force_fresh_execution=force_fresh_execution,
+            context=context,
+        )
+
+    @staticmethod
     async def append_turn(
         *,
         task: Task,

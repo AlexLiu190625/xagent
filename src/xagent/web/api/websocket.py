@@ -2218,24 +2218,43 @@ async def handle_chat_message(
                             f"Confirmed: Task {task_id} was completed/failed, forcing fresh execution"
                         )
 
-                    # Create background task execution, don't block WebSocket message loop
-                    bg_task = asyncio.create_task(
-                        execute_task_background(
-                            task_id=task_id,
-                            user_message=user_message,
-                            context=context,
-                            agent_manager=get_agent_manager(),
-                            user=user,
-                            task=task,
-                            db=db,
-                            force_fresh_execution=force_fresh_execution,
-                        )
+                    # Route through the shared task-turn orchestrator so
+                    # both WS and /v1 SDK paths run the same single-flight
+                    # + SDK-column-sync logic around the bg coroutine. WS
+                    # has already persisted the user message at line 1434
+                    # and flipped status to RUNNING just above, so we use
+                    # the lower-level ``schedule_bg`` entry point that
+                    # only handles scheduling (not persist / claim).
+                    from ..services.task_orchestrator import (
+                        TaskTurnError,
+                        TaskTurnOrchestrator,
                     )
 
-                    # Register background task, ensure only one task executes at a time
-                    background_task_manager.register_task(task_id, bg_task)
-
-                    logger.info(f"Task {task_id} started in background")
+                    try:
+                        await TaskTurnOrchestrator.schedule_bg(
+                            task=task,
+                            user_message=user_message,
+                            user=user,
+                            force_fresh_execution=force_fresh_execution,
+                            context=context,
+                        )
+                        logger.info(f"Task {task_id} started in background")
+                    except TaskTurnError as busy_err:
+                        logger.warning(
+                            f"Refused to schedule bg for task {task_id}: {busy_err.reason}"
+                        )
+                        await manager.broadcast_to_task(
+                            {
+                                "type": "agent_error",
+                                "message": (
+                                    "Task is currently busy; please wait for "
+                                    "the previous turn to finish before sending "
+                                    "another message."
+                                ),
+                                "timestamp": datetime.now(timezone.utc).timestamp(),
+                            },
+                            task_id,
+                        )
 
             finally:
                 db.close()
