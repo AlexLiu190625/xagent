@@ -14,7 +14,11 @@ from sqlalchemy import inspect
 
 # revision identifiers, used by Alembic.
 revision: str = "a9dc5acb2a6b"
-down_revision: Union[str, None] = "20260509_add_delegate_agent_ids_to_tasks"
+# Re-chained on top of upstream's latest head (was
+# "20260509_add_delegate_agent_ids_to_tasks") after main merged the
+# delegate-agents drop + task-execution-lease branches; without this
+# alembic sees two heads and ``alembic-check`` pre-commit fails.
+down_revision: Union[str, None] = "20260514_drop_delegate_agent_ids_from_tasks"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
