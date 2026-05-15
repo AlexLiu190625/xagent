@@ -1757,11 +1757,7 @@ async def handle_chat_message(
         logger.info(f"Received chat message for task {task_id}")
         logger.info(f"👤 User: {user.id if user else 'unknown'}")
         logger.info(f"📄 Message: {user_message}")
-        logger.info(f"📁 Files received: {len(files)}")
-        for i, file_info in enumerate(files):
-            logger.info(
-                f"📄 File {i}: {file_info.get('name', 'unknown')} ({file_info.get('size', 0)} bytes)"
-            )
+        logger.info(f"📁 Files received from websocket/fallback: {len(files)}")
 
         # Call Agent to handle - use same agent manager as chat API
         try:
@@ -1908,6 +1904,12 @@ async def handle_chat_message(
                             f"📁 Recovered {len(files)} selected file(s) from task "
                             f"{task_id} for initial chat turn"
                         )
+
+                logger.info(f"📁 Files used for execution: {len(files)}")
+                for i, file_info in enumerate(files):
+                    logger.info(
+                        f"📄 File {i}: {file_info.get('name', 'unknown')} ({file_info.get('size', 0)} bytes)"
+                    )
 
                 # Handle file upload if files present
                 uploaded_file_paths = []

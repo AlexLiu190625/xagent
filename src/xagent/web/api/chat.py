@@ -1764,8 +1764,7 @@ async def create_task(
         # Set agent_type using the property to avoid Column type issues
         task.agent_type_enum = agent_type_enum
         db.add(task)
-        db.commit()
-        db.refresh(task)
+        db.flush()
 
         # Set LLM configuration for this task in agent manager
         task_llm_ids_to_set = [
@@ -1794,7 +1793,9 @@ async def create_task(
                     synchronize_session=False,
                 )
             )
-            db.commit()
+
+        db.commit()
+        db.refresh(task)
 
         return TaskCreateResponse(
             task_id=task.id,
