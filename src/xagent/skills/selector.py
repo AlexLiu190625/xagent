@@ -5,6 +5,13 @@ Skill Selector - Use LLM to select the most appropriate skill
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
+
+from xagent.core.agent.trace import (
+    TraceCategory,
+    trace_action_end,
+    trace_llm_call_start,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -70,13 +77,21 @@ If no skill is directly relevant, return selected: false."""
         """
         self.llm = llm
 
-    async def select(self, task: str, candidates: List[Dict]) -> Optional[Dict]:
+    async def select(
+        self,
+        task: str,
+        candidates: List[Dict],
+        tracer: Any = None,
+        task_id: Optional[str] = None,
+    ) -> Optional[Dict]:
         """
         Select the most appropriate skill, or return None
 
         Args:
             task: User task
             candidates: List of candidate skills
+            tracer: Optional Tracer for audit trace coverage
+            task_id: Real task id to attribute audit events to
 
         Returns:
             Selected skill, or None
@@ -89,26 +104,158 @@ If no skill is directly relevant, return selected: false."""
         logger.info(f"Available candidates: {len(candidates)} skills")
 
         prompt = self._build_prompt(task, candidates)
+        messages = [
+            {"role": "system", "content": self.SELECTOR_SYSTEM},
+            {"role": "user", "content": prompt},
+        ]
 
         logger.info("Calling LLM for skill selection...")
+
+        # Audit trace setup — virtual step_id outside dag_step_*/react_step_*.
+        # SkillManager.select_skill already emits trace_skill_select_start/end
+        # at the process level; this captures the LLM messages/response.
+        audit_task_id = task_id or f"dag_skill_selection_{uuid4().hex[:8]}"
+        audit_step_id = "dag_skill_selection"
+        audit_model_name = getattr(self.llm, "model_name", type(self.llm).__name__)
+        audit_attempt = 1
+        audit_trace_sent = False
+
+        if tracer is not None:
+            await trace_llm_call_start(
+                tracer,
+                audit_task_id,
+                audit_step_id,
+                data={
+                    "action": "LLM call started",
+                    "model_name": audit_model_name,
+                    "__audit_only__": True,
+                    "task_type": "dag_skill_selection",
+                    "attempt": audit_attempt,
+                    "messages_count": len(messages),
+                    "messages": messages,
+                    "candidates_count": len(candidates),
+                    "candidate_names": [c.get("name") for c in candidates],
+                    "has_tools": False,
+                    "step_id": audit_step_id,
+                    "step_name": "skill_selection",
+                },
+            )
 
         # First try JSON mode, fall back to normal mode if not supported
         try:
             response = await self.llm.chat(
-                messages=[
-                    {"role": "system", "content": self.SELECTOR_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ],
+                messages=messages,
                 response_format={"type": "json_object"},
             )
         except Exception as e:
             logger.warning(f"JSON mode not supported, falling back to normal mode: {e}")
-            response = await self.llm.chat(
-                messages=[
-                    {"role": "system", "content": self.SELECTOR_SYSTEM},
-                    {"role": "user", "content": prompt},
-                ]
+            # Close attempt=1 with an error end so start/end remain paired
+            # (mirrors the plan_generator retry pattern).
+            if tracer is not None:
+                await trace_action_end(
+                    tracer,
+                    audit_task_id,
+                    audit_step_id,
+                    TraceCategory.LLM,
+                    data={
+                        "action": "LLM call failed",
+                        "model_name": audit_model_name,
+                        "__audit_only__": True,
+                        "task_type": "dag_skill_selection",
+                        "attempt": audit_attempt,
+                        "error": str(e),
+                        "error_type": type(e).__name__,
+                        "llm_type": type(self.llm).__name__,
+                        "is_tool_call": False,
+                        "step_id": audit_step_id,
+                        "step_name": "skill_selection",
+                    },
+                )
+
+            audit_attempt = 2
+            if tracer is not None:
+                await trace_llm_call_start(
+                    tracer,
+                    audit_task_id,
+                    audit_step_id,
+                    data={
+                        "action": "LLM call started",
+                        "model_name": audit_model_name,
+                        "__audit_only__": True,
+                        "task_type": "dag_skill_selection",
+                        "attempt": audit_attempt,
+                        "messages_count": len(messages),
+                        "messages": messages,
+                        "candidates_count": len(candidates),
+                        "has_tools": False,
+                        "step_id": audit_step_id,
+                        "step_name": "skill_selection",
+                        "json_mode_failed": True,
+                    },
+                )
+            try:
+                response = await self.llm.chat(messages=messages)
+            except Exception as fallback_err:
+                # Close attempt=2 with an error end so start/end stay paired,
+                # then re-raise to let SkillManager's outer trace_error fire.
+                if tracer is not None:
+                    try:
+                        await trace_action_end(
+                            tracer,
+                            audit_task_id,
+                            audit_step_id,
+                            TraceCategory.LLM,
+                            data={
+                                "action": "LLM call failed",
+                                "model_name": audit_model_name,
+                                "__audit_only__": True,
+                                "task_type": "dag_skill_selection",
+                                "attempt": audit_attempt,
+                                "error": str(fallback_err),
+                                "error_type": type(fallback_err).__name__,
+                                "llm_type": type(self.llm).__name__,
+                                "is_tool_call": False,
+                                "step_id": audit_step_id,
+                                "step_name": "skill_selection",
+                            },
+                        )
+                        audit_trace_sent = True
+                    except Exception as trace_err:
+                        logger.warning(
+                            f"Failed to emit error trace for skill selection fallback: {trace_err}"
+                        )
+                raise
+
+        if tracer is not None and not audit_trace_sent:
+            if isinstance(response, str):
+                response_content: Any = response
+                response_usage: Any = None
+            elif isinstance(response, dict):
+                response_content = response.get("content", str(response))
+                response_usage = response.get("usage")
+            else:
+                response_content = str(response)
+                response_usage = None
+            await trace_action_end(
+                tracer,
+                audit_task_id,
+                audit_step_id,
+                TraceCategory.LLM,
+                data={
+                    "action": "LLM call completed",
+                    "model_name": audit_model_name,
+                    "__audit_only__": True,
+                    "task_type": "dag_skill_selection",
+                    "attempt": audit_attempt,
+                    "response_type": type(response).__name__,
+                    "is_tool_call": False,
+                    "response": response_content,
+                    "usage": response_usage,
+                    "step_id": audit_step_id,
+                    "step_name": "skill_selection",
+                },
             )
+            audit_trace_sent = True
 
         # Handle different return types
         if isinstance(response, str):

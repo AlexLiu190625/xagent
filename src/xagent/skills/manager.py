@@ -161,7 +161,12 @@ class SkillManager:
         selector = SkillSelector(llm)
 
         try:
-            selected_skill = await selector.select(task=task, candidates=candidates)
+            selected_skill = await selector.select(
+                task=task,
+                candidates=candidates,
+                tracer=tracer,
+                task_id=task_id,
+            )
 
             # Send skill selection end event if tracer is provided
             if tracer and task_id:
