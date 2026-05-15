@@ -451,19 +451,21 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             self._conn = get_connection_from_env()
         return self._conn
 
-    def _get_table(self, table_name: str) -> Any:
-        """Get cached table handle to avoid repeated open_table()."""
+    def _get_table(self, table_name: str, *, use_cache: bool = True) -> Any:
+        """Get a table handle, optionally reusing the per-process cache."""
         from ..LanceDB.schema_manager import _safe_close_table
 
-        cached = self._table_cache.get(table_name)
-        if cached is not None:
-            self._table_cache.move_to_end(table_name)
-            return cached
+        if use_cache:
+            cached = self._table_cache.get(table_name)
+            if cached is not None:
+                self._table_cache.move_to_end(table_name)
+                return cached
         table = self._get_connection().open_table(table_name)
-        self._table_cache[table_name] = table
-        if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
-            _evicted_name, _evicted_table = self._table_cache.popitem(last=False)
-            _safe_close_table(_evicted_table)
+        if use_cache:
+            self._table_cache[table_name] = table
+            if len(self._table_cache) > self._TABLE_CACHE_MAXSIZE:
+                _evicted_name, _evicted_table = self._table_cache.popitem(last=False)
+                _safe_close_table(_evicted_table)
         return table
 
     def invalidate_table_cache(self, table_name: str | None = None) -> None:
@@ -787,8 +789,11 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         Avoids iter_batches overhead and Python-level row iteration.
         """
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        table = None
         try:
-            table = self._get_table(table_name)
+            table = self._get_table(table_name, use_cache=False)
             combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
 
             if combined_filter:
@@ -818,6 +823,8 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                     stats[c][stat_key] = count.as_py()
         except Exception as exc:  # noqa: BLE001
             logger.debug("Failed to fast-count table '%s': %s", table_name, exc)
+        finally:
+            _safe_close_table(table)
 
     def aggregate_collection_stats(
         self,
@@ -1214,94 +1221,99 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         elif table_name == "chunks":
             ensure_chunks_table(conn)
 
+        from ..LanceDB.schema_manager import _safe_close_table
+
         table = None
         try:
-            table = self._get_table(table_name)
+            table = self._get_table(table_name, use_cache=False)
         except Exception as exc:
             logger.debug("Unable to open table '%s': %s", table_name, exc)
             return
 
-        # Build filter expression using common function (includes validation)
-        combined_filter = None
-        if filters:
-            filter_expr_obj = build_filter_from_dict(filters)
-            combined_filter = self.build_filter_expression(
-                filters=filter_expr_obj,
-                user_id=user_id,
-                is_admin=is_admin,
-            )
-        else:
-            # Just apply user filter
-            combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
-
-        # Helper method to select columns from a batch
-        def _select_columns(batch: Any, cols: Optional[Sequence[str]]) -> Any:
-            if cols is None:
-                return batch
-            arrays = []
-            names = []
-            for col_name in cols:
-                idx = batch.schema.get_field_index(col_name)
-                if idx != -1:
-                    arrays.append(batch.column(idx))
-                    names.append(col_name)
-            if not arrays:
-                return pa.RecordBatch.from_arrays([], [])
-            return pa.RecordBatch.from_arrays(arrays, names)
-
-        # Preferred path: streaming batches directly from LanceDB
         try:
-            if combined_filter:
-                for raw_batch in table.to_batches(
-                    filter=combined_filter, batch_size=batch_size
-                ):
-                    batch = raw_batch
-                    if columns is not None:
-                        batch = _select_columns(batch, columns)
-                    if batch.num_rows > 0:
-                        yield batch
+            # Build filter expression using common function (includes validation)
+            combined_filter = None
+            if filters:
+                filter_expr_obj = build_filter_from_dict(filters)
+                combined_filter = self.build_filter_expression(
+                    filters=filter_expr_obj,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                )
             else:
-                for raw_batch in table.to_batches(batch_size=batch_size):
-                    batch = raw_batch
-                    if columns is not None:
-                        batch = _select_columns(batch, columns)
-                    if batch.num_rows > 0:
-                        yield batch
-            return
-        except Exception as exc:
-            logger.debug(
-                "Batch streaming unavailable for table '%s': %s", table_name, exc
-            )
+                # Just apply user filter
+                combined_filter = UserPermissions.get_user_filter(user_id, is_admin)
 
-        # Arrow fallback: materialize table as Arrow then iterate
-        try:
-            # Note: LanceDB's to_arrow() doesn't accept filter parameter
-            # Use search().where().to_arrow() instead
-            if combined_filter:
-                arrow_table = table.search().where(combined_filter).to_arrow()
-            else:
-                arrow_table = table.to_arrow()
-        except Exception as exc:
-            logger.debug(
-                "Unable to read table '%s' via to_arrow(): %s", table_name, exc
-            )
-            return
+            # Helper method to select columns from a batch
+            def _select_columns(batch: Any, cols: Optional[Sequence[str]]) -> Any:
+                if cols is None:
+                    return batch
+                arrays = []
+                names = []
+                for col_name in cols:
+                    idx = batch.schema.get_field_index(col_name)
+                    if idx != -1:
+                        arrays.append(batch.column(idx))
+                        names.append(col_name)
+                if not arrays:
+                    return pa.RecordBatch.from_arrays([], [])
+                return pa.RecordBatch.from_arrays(arrays, names)
 
-        if columns is not None:
+            # Preferred path: streaming batches directly from LanceDB
             try:
-                arrow_table = arrow_table.select(columns)
+                if combined_filter:
+                    for raw_batch in table.to_batches(
+                        filter=combined_filter, batch_size=batch_size
+                    ):
+                        batch = raw_batch
+                        if columns is not None:
+                            batch = _select_columns(batch, columns)
+                        if batch.num_rows > 0:
+                            yield batch
+                else:
+                    for raw_batch in table.to_batches(batch_size=batch_size):
+                        batch = raw_batch
+                        if columns is not None:
+                            batch = _select_columns(batch, columns)
+                        if batch.num_rows > 0:
+                            yield batch
+                return
             except Exception as exc:
                 logger.debug(
-                    "Table '%s' missing expected columns %s: %s",
-                    table_name,
-                    columns,
-                    exc,
+                    "Batch streaming unavailable for table '%s': %s", table_name, exc
+                )
+
+            # Arrow fallback: materialize table as Arrow then iterate
+            try:
+                # Note: LanceDB's to_arrow() doesn't accept filter parameter
+                # Use search().where().to_arrow() instead
+                if combined_filter:
+                    arrow_table = table.search().where(combined_filter).to_arrow()
+                else:
+                    arrow_table = table.to_arrow()
+            except Exception as exc:
+                logger.debug(
+                    "Unable to read table '%s' via to_arrow(): %s", table_name, exc
                 )
                 return
 
-        for batch in arrow_table.to_batches(max_chunksize=batch_size):
-            if batch.num_rows > 0:
-                yield batch
+            if columns is not None:
+                try:
+                    arrow_table = arrow_table.select(columns)
+                except Exception as exc:
+                    logger.debug(
+                        "Table '%s' missing expected columns %s: %s",
+                        table_name,
+                        columns,
+                        exc,
+                    )
+                    return
+
+            for batch in arrow_table.to_batches(max_chunksize=batch_size):
+                if batch.num_rows > 0:
+                    yield batch
+        finally:
+            _safe_close_table(table)
 
     def count_rows(
         self,

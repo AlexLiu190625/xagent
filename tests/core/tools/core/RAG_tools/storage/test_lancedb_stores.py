@@ -2000,6 +2000,31 @@ def test_get_table_cache_multiple_tables(mock_get_connection: Mock) -> None:
     assert mock_conn.open_table.call_count == 2  # no additional call
 
 
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_get_table_cache_bypass_reopens_without_storing(
+    mock_get_connection: Mock,
+) -> None:
+    """_get_table(use_cache=False) should always open a fresh uncached handle."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    first = Mock()
+    second = Mock()
+    cached = Mock()
+    mock_conn.open_table.side_effect = [first, second, cached]
+
+    store = LanceDBVectorIndexStore()
+
+    assert store._get_table("documents", use_cache=False) is first
+    assert store._get_table("documents", use_cache=False) is second
+    assert "documents" not in store._table_cache
+
+    assert store._get_table("documents") is cached
+    assert store._get_table("documents") is cached
+    assert mock_conn.open_table.call_count == 3
+
+
 # --- invalidate_table_cache Tests ---
 
 
@@ -2256,6 +2281,52 @@ def test_count_collections_fast_with_user_filter(mock_get_connection: Mock) -> N
 
     # Verify that the where filter was applied
     chain.where.assert_called_once()
+
+
+def test_count_collections_fast_bypasses_table_cache() -> None:
+    """_count_collections_fast should fresh-open tables used by KB listings."""
+    import pyarrow as pa
+
+    tbl = pa.table({"collection": ["col_a"]})
+
+    chain = Mock()
+    chain.select.return_value = chain
+    chain.where.return_value = chain
+    chain.limit.return_value = chain
+    chain.to_arrow.return_value = tbl
+
+    mock_table = Mock()
+    mock_table.search.return_value = chain
+
+    store = LanceDBVectorIndexStore()
+    store._get_table = Mock(return_value=mock_table)  # type: ignore[method-assign]
+
+    stats: dict = {}
+    store._count_collections_fast(
+        "documents", "documents", stats, user_id=None, is_admin=True
+    )
+
+    store._get_table.assert_called_once_with("documents", use_cache=False)
+    assert stats["col_a"]["documents"] == 1
+
+
+def test_iter_batches_bypasses_table_cache() -> None:
+    """iter_batches should fresh-open tables so KB list reads do not use stale handles."""
+    import pyarrow as pa
+
+    batch = pa.record_batch([pa.array(["col_a"])], names=["collection"])
+
+    mock_table = Mock()
+    mock_table.to_batches.return_value = [batch]
+
+    store = LanceDBVectorIndexStore()
+    store._get_table = Mock(return_value=mock_table)  # type: ignore[method-assign]
+
+    batches = list(store.iter_batches("custom_table", is_admin=True))
+
+    store._get_table.assert_called_once_with("custom_table", use_cache=False)
+    assert len(batches) == 1
+    assert batches[0].num_rows == 1
 
 
 @patch(
