@@ -54,6 +54,22 @@ async def test_trace_callback_success_emits_user_assistant_and_completion() -> N
 
 
 @pytest.mark.asyncio
+async def test_trace_callback_uses_display_user_message_when_present() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-trace")
+    context.metadata["task"] = "Read file\n\n## UPLOADED FILES\nfile_id=file-123"
+    context.metadata["request_context"] = {
+        "display_user_message": "Read file",
+    }
+
+    await callback.on_run_start(runner=runner, context=context)
+
+    assert tracer.events[0]["data"]["message"] == "Read file"
+
+
+@pytest.mark.asyncio
 async def test_trace_callback_failed_run_emits_error() -> None:
     tracer = TraceRecorder()
     callback = TraceEventCallback()

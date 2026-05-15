@@ -193,6 +193,35 @@ def _append_uploaded_files_context_to_message(
     return f"{message.rstrip()}\n\n{uploaded_files_context}"
 
 
+def _display_message_for_user(user_message: str, has_files: bool) -> str:
+    """Return the user-visible message for chat history and trace events."""
+    if user_message.strip():
+        return user_message
+    if has_files:
+        return "Uploaded file(s)"
+    return user_message
+
+
+def _selected_file_refs_from_task(task: Any) -> list[dict[str, str]]:
+    """Return file refs stored during task creation for the initial turn."""
+    agent_config = getattr(task, "agent_config", None)
+    if not isinstance(agent_config, dict):
+        return []
+
+    raw_file_ids = agent_config.get("selected_file_ids")
+    if not isinstance(raw_file_ids, list):
+        return []
+
+    refs = []
+    for raw_file_id in raw_file_ids:
+        if not isinstance(raw_file_id, str):
+            continue
+        file_id = raw_file_id.strip()
+        if file_id:
+            refs.append({"file_id": file_id})
+    return refs
+
+
 def create_stream_event(
     event_type: str,
     task_id: Union[int, str],
@@ -695,6 +724,7 @@ async def execute_task_background(
     task: Any,
     db: Session,
     force_fresh_execution: bool = False,
+    llm_user_message: Optional[str] = None,
 ) -> None:
     """Execute task in background without blocking WebSocket message loop"""
     from ..models.task import Task, TaskStatus
@@ -721,9 +751,10 @@ async def execute_task_background(
 
             # Execute task with automatic token tracking
             actual_task_id = None if force_fresh_execution else str(task_id)
+            task_for_agent = llm_user_message or user_message
             result = await agent_manager.execute_task(
                 agent_service=agent_service,
-                task=user_message,
+                task=task_for_agent,
                 context=context,
                 task_id=actual_task_id,
                 tracking_task_id=str(task_id),
@@ -1870,6 +1901,14 @@ async def handle_chat_message(
                         await manager.broadcast_to_task(task_event, task_id)
                         logger.info(f"task_info event sent for task {task_id}")
 
+                if not files and task.status == TaskStatus.PENDING:
+                    files = _selected_file_refs_from_task(task)
+                    if files:
+                        logger.info(
+                            f"📁 Recovered {len(files)} selected file(s) from task "
+                            f"{task_id} for initial chat turn"
+                        )
+
                 # Handle file upload if files present
                 uploaded_file_paths = []
                 file_info_list = []
@@ -1947,6 +1986,10 @@ async def handle_chat_message(
                     user_message,
                     uploaded_files_context,
                 )
+                display_user_message = _display_message_for_user(
+                    user_message,
+                    bool(file_info_list),
+                )
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -1963,7 +2006,7 @@ async def handle_chat_message(
                     db,
                     task_id=task_id,
                     user_id=int(user.id),
-                    content=user_message_for_llm,
+                    content=display_user_message,
                 )
 
                 # Check if there's an old task running (PAUSED, WAITING_FOR_USER, or RUNNING status)
@@ -2006,7 +2049,7 @@ async def handle_chat_message(
                         await trace_user_message(
                             dag_pattern.tracer,
                             str(dag_pattern.task_id),
-                            user_message,
+                            display_user_message,
                             trace_data,
                         )
 
@@ -2200,6 +2243,7 @@ async def handle_chat_message(
                         logger.info(f"task_info event sent for existing task {task_id}")
 
                     # Build context with vibe mode information if available
+                    context["display_user_message"] = display_user_message
                     if hasattr(task, "execution_mode") and task.execution_mode:
                         context["execution_mode"] = task.execution_mode
                     if (
@@ -2222,13 +2266,14 @@ async def handle_chat_message(
                     bg_task = asyncio.create_task(
                         execute_task_background(
                             task_id=task_id,
-                            user_message=user_message,
+                            user_message=display_user_message,
                             context=context,
                             agent_manager=get_agent_manager(),
                             user=user,
                             task=task,
                             db=db,
                             force_fresh_execution=force_fresh_execution,
+                            llm_user_message=user_message_for_llm,
                         )
                     )
 

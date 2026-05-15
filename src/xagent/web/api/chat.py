@@ -1779,6 +1779,23 @@ async def create_task(
         )
         get_agent_manager(request).set_task_llms(int(task.id), task_llm_ids_to_set, db)
 
+        if selected_file_ids:
+            from ..models.uploaded_file import UploadedFile
+
+            (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.file_id.in_(selected_file_ids),
+                    UploadedFile.user_id == int(user.id),
+                    UploadedFile.task_id.is_(None),
+                )
+                .update(
+                    {UploadedFile.task_id: int(task.id)},
+                    synchronize_session=False,
+                )
+            )
+            db.commit()
+
         return TaskCreateResponse(
             task_id=task.id,
             title=task.title,

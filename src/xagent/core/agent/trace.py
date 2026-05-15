@@ -10,6 +10,33 @@ from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
+DISPLAY_USER_MESSAGE_KEY = "display_user_message"
+
+
+def get_display_user_message(context: Any, fallback: str) -> str:
+    """Return the user-visible message for trace/UI events."""
+    candidates: list[dict[str, Any]] = []
+    if isinstance(context, dict):
+        candidates.append(context)
+
+    state = getattr(context, "state", None)
+    if isinstance(state, dict):
+        candidates.append(state)
+
+    metadata = getattr(context, "metadata", None)
+    if isinstance(metadata, dict):
+        request_context = metadata.get("request_context")
+        if isinstance(request_context, dict):
+            candidates.append(request_context)
+        candidates.append(metadata)
+
+    for candidate in candidates:
+        display_message = candidate.get(DISPLAY_USER_MESSAGE_KEY)
+        if isinstance(display_message, str) and display_message.strip():
+            return display_message
+
+    return fallback
+
 
 class TraceScope(Enum):
     """Defines the scope of trace events for clear task/step attribution."""

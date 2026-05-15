@@ -5,6 +5,7 @@ from typing import Any
 
 from .result import extract_assistant_message
 from .trace import (
+    get_display_user_message,
     trace_ai_message,
     trace_error,
     trace_task_completion,
@@ -35,7 +36,7 @@ class TraceEventCallback:
             await trace_user_message(
                 tracer,
                 execution_id,
-                task,
+                get_display_user_message(context, task),
                 {"context": self._context_payload(context)},
             )
 
