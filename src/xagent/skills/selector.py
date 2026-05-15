@@ -117,28 +117,60 @@ If no skill is directly relevant, return selected: false."""
         audit_task_id = task_id or f"dag_skill_selection_{uuid4().hex[:8]}"
         audit_step_id = "dag_skill_selection"
         audit_model_name = getattr(self.llm, "model_name", type(self.llm).__name__)
-        audit_attempt = 1
-        audit_trace_sent = False
+        fallback_failure_emitted = False
+        used_attempt = 1
+        used_json_mode_failed = False
+
+        def _build_audit_data(
+            *,
+            action: str,
+            attempt: int,
+            json_mode_failed: bool,
+            include_input: bool = False,
+            response_type: Optional[str] = None,
+            response: Any = None,
+            response_usage: Any = None,
+            error: Optional[str] = None,
+            error_type: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            data: Dict[str, Any] = {
+                "action": action,
+                "model_name": audit_model_name,
+                "__audit_only__": True,
+                "task_type": "dag_skill_selection",
+                "attempt": attempt,
+                "json_mode_failed": json_mode_failed,
+                "is_tool_call": False,
+                "has_tools": False,
+                "step_id": audit_step_id,
+                "step_name": "skill_selection",
+            }
+            if include_input:
+                data["messages_count"] = len(messages)
+                data["messages"] = messages
+                data["candidates_count"] = len(candidates)
+                data["candidate_names"] = [c.get("name") for c in candidates]
+            if response_type is not None:
+                data["response_type"] = response_type
+                data["response"] = response
+                data["usage"] = response_usage
+            if error is not None:
+                data["error"] = error
+                data["error_type"] = error_type
+                data["llm_type"] = type(self.llm).__name__
+            return data
 
         if tracer is not None:
             await trace_llm_call_start(
                 tracer,
                 audit_task_id,
                 audit_step_id,
-                data={
-                    "action": "LLM call started",
-                    "model_name": audit_model_name,
-                    "__audit_only__": True,
-                    "task_type": "dag_skill_selection",
-                    "attempt": audit_attempt,
-                    "messages_count": len(messages),
-                    "messages": messages,
-                    "candidates_count": len(candidates),
-                    "candidate_names": [c.get("name") for c in candidates],
-                    "has_tools": False,
-                    "step_id": audit_step_id,
-                    "step_name": "skill_selection",
-                },
+                data=_build_audit_data(
+                    action="LLM call started",
+                    attempt=1,
+                    json_mode_failed=False,
+                    include_input=True,
+                ),
             )
 
         # First try JSON mode, fall back to normal mode if not supported
@@ -149,52 +181,42 @@ If no skill is directly relevant, return selected: false."""
             )
         except Exception as e:
             logger.warning(f"JSON mode not supported, falling back to normal mode: {e}")
-            # Close attempt=1 with an error end so start/end remain paired
-            # (mirrors the plan_generator retry pattern).
+            # Close attempt=1 with an error end so start/end remain paired.
+            # ``json_mode_failed=True`` on the attempt=1 close marks this
+            # event as the JSON-mode failure record; SQL queries can count
+            # ``attempt=1 AND action='LLM call failed' AND json_mode_failed=true``
+            # to get the JSON-mode-fallback rate.
             if tracer is not None:
                 await trace_action_end(
                     tracer,
                     audit_task_id,
                     audit_step_id,
                     TraceCategory.LLM,
-                    data={
-                        "action": "LLM call failed",
-                        "model_name": audit_model_name,
-                        "__audit_only__": True,
-                        "task_type": "dag_skill_selection",
-                        "attempt": audit_attempt,
-                        "error": str(e),
-                        "error_type": type(e).__name__,
-                        "llm_type": type(self.llm).__name__,
-                        "is_tool_call": False,
-                        "step_id": audit_step_id,
-                        "step_name": "skill_selection",
-                    },
+                    data=_build_audit_data(
+                        action="LLM call failed",
+                        attempt=1,
+                        json_mode_failed=True,
+                        error=str(e),
+                        error_type=type(e).__name__,
+                    ),
                 )
 
-            audit_attempt = 2
             if tracer is not None:
                 await trace_llm_call_start(
                     tracer,
                     audit_task_id,
                     audit_step_id,
-                    data={
-                        "action": "LLM call started",
-                        "model_name": audit_model_name,
-                        "__audit_only__": True,
-                        "task_type": "dag_skill_selection",
-                        "attempt": audit_attempt,
-                        "messages_count": len(messages),
-                        "messages": messages,
-                        "candidates_count": len(candidates),
-                        "has_tools": False,
-                        "step_id": audit_step_id,
-                        "step_name": "skill_selection",
-                        "json_mode_failed": True,
-                    },
+                    data=_build_audit_data(
+                        action="LLM call started",
+                        attempt=2,
+                        json_mode_failed=True,
+                        include_input=True,
+                    ),
                 )
             try:
                 response = await self.llm.chat(messages=messages)
+                used_attempt = 2
+                used_json_mode_failed = True
             except Exception as fallback_err:
                 # Close attempt=2 with an error end so start/end stay paired,
                 # then re-raise to let SkillManager's outer trace_error fire.
@@ -205,28 +227,22 @@ If no skill is directly relevant, return selected: false."""
                             audit_task_id,
                             audit_step_id,
                             TraceCategory.LLM,
-                            data={
-                                "action": "LLM call failed",
-                                "model_name": audit_model_name,
-                                "__audit_only__": True,
-                                "task_type": "dag_skill_selection",
-                                "attempt": audit_attempt,
-                                "error": str(fallback_err),
-                                "error_type": type(fallback_err).__name__,
-                                "llm_type": type(self.llm).__name__,
-                                "is_tool_call": False,
-                                "step_id": audit_step_id,
-                                "step_name": "skill_selection",
-                            },
+                            data=_build_audit_data(
+                                action="LLM call failed",
+                                attempt=2,
+                                json_mode_failed=True,
+                                error=str(fallback_err),
+                                error_type=type(fallback_err).__name__,
+                            ),
                         )
-                        audit_trace_sent = True
+                        fallback_failure_emitted = True
                     except Exception as trace_err:
                         logger.warning(
                             f"Failed to emit error trace for skill selection fallback: {trace_err}"
                         )
                 raise
 
-        if tracer is not None and not audit_trace_sent:
+        if tracer is not None and not fallback_failure_emitted:
             if isinstance(response, str):
                 response_content: Any = response
                 response_usage: Any = None
@@ -241,21 +257,15 @@ If no skill is directly relevant, return selected: false."""
                 audit_task_id,
                 audit_step_id,
                 TraceCategory.LLM,
-                data={
-                    "action": "LLM call completed",
-                    "model_name": audit_model_name,
-                    "__audit_only__": True,
-                    "task_type": "dag_skill_selection",
-                    "attempt": audit_attempt,
-                    "response_type": type(response).__name__,
-                    "is_tool_call": False,
-                    "response": response_content,
-                    "usage": response_usage,
-                    "step_id": audit_step_id,
-                    "step_name": "skill_selection",
-                },
+                data=_build_audit_data(
+                    action="LLM call completed",
+                    attempt=used_attempt,
+                    json_mode_failed=used_json_mode_failed,
+                    response_type=type(response).__name__,
+                    response=response_content,
+                    response_usage=response_usage,
+                ),
             )
-            audit_trace_sent = True
 
         # Handle different return types
         if isinstance(response, str):
