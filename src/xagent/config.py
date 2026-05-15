@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 from pathlib import Path
+from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +31,7 @@ UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
@@ -47,8 +49,28 @@ WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
 TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
+MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
+
+
+def get_agent_runtime() -> Literal["v1", "v2"]:
+    """Get the agent execution runtime version.
+
+    Priority:
+        1. XAGENT_AGENT_RUNTIME environment variable
+        2. "v1" default for compatibility
+
+    Returns:
+        "v1" or "v2"
+    """
+    runtime = os.getenv(AGENT_RUNTIME, "v1").strip().lower()
+    if runtime == "v1":
+        return "v1"
+    if runtime == "v2":
+        return "v2"
+    logger.warning("Invalid %s=%r; falling back to v1", AGENT_RUNTIME, runtime)
+    return "v1"
 
 
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
@@ -73,17 +95,23 @@ def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
 def get_default_task_execution_mode(
     *,
     agent_id: object | None = None,
+    agent_runtime: str | None = None,
 ) -> str:
     """Get the default UI execution mode for a newly-created task.
 
-    Standalone tasks default to auto so simple prompts can answer directly while
-    complex prompts can still route into ReAct or DAG. Agent Builder tasks keep
-    balanced because the agent's explicit tool/KB setup is usually better served
-    by ReAct.
+    Standalone v2 tasks default to auto so simple prompts can answer directly
+    while complex prompts can still route into ReAct or DAG. v1 keeps the legacy
+    standalone DAG default for compatibility. Agent Builder tasks keep balanced
+    in both runtimes because the agent's explicit tool/KB setup is usually
+    better served by ReAct.
     """
     if agent_id is not None:
         return "balanced"
-    return "auto"
+
+    runtime = (agent_runtime or get_agent_runtime()).strip().lower()
+    if runtime == "v2":
+        return "auto"
+    return "think"
 
 
 def get_task_lease_ttl_seconds() -> int:
@@ -613,3 +641,34 @@ def get_tool_max_field_count() -> int:
         except ValueError:
             logger.warning("Invalid TOOL_MAX_FIELDS value: {env_str}")
     return 1000
+
+
+def get_max_trace_payload_bytes() -> int:
+    """Max byte size for individual trace payload fields (e.g. data.messages,
+    data.response) before truncation.
+
+    Applies to the LLM I/O audit trace added in fix/llm-trace-coverage. A
+    long DAG task hitting all 9 audit sites can otherwise write multi-MB
+    rows into trace_events.
+
+    Priority:
+        1. XAGENT_MAX_TRACE_PAYLOAD_BYTES env var
+        2. Default 50_000 (~50KB, large enough for typical compacted
+           messages while bounding worst case)
+
+    Returns:
+        Maximum bytes per truncated trace field.
+    """
+    env_str = os.getenv(MAX_TRACE_PAYLOAD_BYTES)
+    if env_str:
+        try:
+            value = int(env_str)
+            if value < 0:
+                logger.warning(
+                    f"Invalid {MAX_TRACE_PAYLOAD_BYTES} value (negative): {env_str!r}"
+                )
+            else:
+                return value
+        except ValueError:
+            logger.warning(f"Invalid {MAX_TRACE_PAYLOAD_BYTES} value: {env_str!r}")
+    return 50_000

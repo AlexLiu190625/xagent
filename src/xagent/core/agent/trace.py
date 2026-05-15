@@ -1,6 +1,7 @@
 """Generic tracing module for tracking events in the xagent system."""
 
 import inspect
+import json
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -9,6 +10,106 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
+
+
+def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
+    """Truncate a trace payload so a single row in trace_events stays bounded.
+
+    Applies to LLM I/O audit trace fields (data.messages, data.response, ...).
+    Returns a value of the same shape with overly-long strings replaced by
+    ``"...[truncated N chars]"`` markers. Dicts/lists are walked recursively
+    and the result is then checked against ``max_bytes`` after JSON
+    serialization; if the per-child split plus suffix overhead still
+    overshoots the budget (e.g. a list of N strings each accruing a
+    ~25-byte ``...[truncated N chars]`` suffix), the entire container is
+    replaced with a single placeholder. This guarantees the documented
+    ``max_bytes`` cap is a hard upper bound on the serialized payload,
+    not just on scalar leaves.
+
+    Args:
+        value: Original value (str / list / dict / scalar).
+        max_bytes: Override the total byte budget for *this subtree*. When
+            None, reads XAGENT_MAX_TRACE_PAYLOAD_BYTES via xagent.config
+            (default 50_000).
+
+    Returns:
+        The original value or a truncated copy. Scalars (int/bool/None) pass
+        through unchanged. Containers that cannot be trimmed within budget
+        collapse to a string placeholder.
+    """
+    if max_bytes is None:
+        # Local import to avoid circular dependency at module load
+        from ...config import get_max_trace_payload_bytes
+
+        max_bytes = get_max_trace_payload_bytes()
+
+    if max_bytes <= 0:
+        return value
+
+    trimmed = _trim_subtree(value, max_bytes)
+
+    # Hard cap for containers: per-child budget splitting plus the
+    # ``...[truncated N chars]`` suffix can compound for large N (a list
+    # of 1000 strings with max_bytes=1000 still serializes to ~25KB).
+    # If the final JSON exceeds max_bytes, collapse to a placeholder so
+    # callers get a real upper bound.
+    #
+    # CRITICAL: preserve the container TYPE on collapse. Downstream
+    # trace pipeline code (``Tracer.trace_event`` logging
+    # ``list(data.keys())``, ``DatabaseTraceHandler._serialize_data_for_json``,
+    # ``WebSocketTraceHandler._serialize_data``) all assume the ``data``
+    # field is a dict / list, not a string. Returning a raw string would
+    # break those callers with ``AttributeError: 'str' has no .keys()``.
+    if isinstance(trimmed, (list, dict)):
+        try:
+            serialized = json.dumps(trimmed, ensure_ascii=False, default=str)
+            if len(serialized.encode("utf-8")) > max_bytes:
+                container_kind = "list" if isinstance(value, list) else "dict"
+                element_count = len(value) if isinstance(value, (list, dict)) else 0
+                placeholder = (
+                    f"...[truncated {container_kind} "
+                    f"({element_count} elements) exceeds {max_bytes}-byte cap]"
+                )
+                if isinstance(value, list):
+                    return [placeholder]
+                return {"__truncated__": placeholder}
+        except (TypeError, ValueError):
+            # Non-serializable subtree: let downstream trace handlers
+            # (DatabaseTraceHandler._serialize_data_for_json) deal with it.
+            pass
+
+    return trimmed
+
+
+def _trim_subtree(value: Any, max_bytes: int) -> Any:
+    """Recursive worker for :func:`truncate_for_trace`.
+
+    Handles scalar truncation and container recursion. Does NOT enforce
+    the final container size cap -- that's the outer function's job.
+    Keeping the recursive case in its own function avoids re-running the
+    expensive serialization-based check at every nesting level.
+    """
+    if isinstance(value, str):
+        encoded = value.encode("utf-8", errors="replace")
+        if len(encoded) <= max_bytes:
+            return value
+        # Slice on byte boundary, then decode with errors="ignore" so an
+        # incomplete trailing multi-byte char is dropped instead of producing
+        # U+FFFD replacement chars — otherwise len(head) inflates and the
+        # reported truncation count becomes inaccurate (can even go negative).
+        head = encoded[:max_bytes].decode("utf-8", errors="ignore")
+        return f"{head}...[truncated {len(value) - len(head)} chars]"
+
+    if isinstance(value, list):
+        per_item = max(1, max_bytes // max(1, len(value)))
+        return [_trim_subtree(item, per_item) for item in value]
+
+    if isinstance(value, dict):
+        per_value = max(1, max_bytes // max(1, len(value)))
+        return {k: _trim_subtree(v, per_value) for k, v in value.items()}
+
+    # Numbers, bools, None — pass through
+    return value
 
 
 class TraceScope(Enum):
@@ -504,8 +605,13 @@ async def trace_action_end(
 ) -> str:
     """Trace action end event."""
     event_type = TraceEventType(TraceScope.ACTION, TraceAction.END, category)
+    payload = data or {}
+    # Bound LLM I/O audit rows (messages / response can be tens of KB each).
+    # Other categories pass through unchanged.
+    if category == TraceCategory.LLM and payload:
+        payload = truncate_for_trace(payload)
     return await tracer.trace_event(
-        event_type, task_id=task_id, step_id=step_id, data=data or {}
+        event_type, task_id=task_id, step_id=step_id, data=payload
     )
 
 
@@ -707,7 +813,11 @@ async def trace_llm_call_start(
     tracer: Tracer, task_id: str, step_id: str, data: Optional[Dict[str, Any]] = None
 ) -> str:
     """Trace LLM call start event."""
-    return await trace_action_start(tracer, task_id, step_id, TraceCategory.LLM, data)
+    # Bound the payload — see truncate_for_trace docstring.
+    payload = truncate_for_trace(data) if data else data
+    return await trace_action_start(
+        tracer, task_id, step_id, TraceCategory.LLM, payload
+    )
 
 
 async def trace_task_llm_call_start(

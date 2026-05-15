@@ -6,11 +6,13 @@ from pathlib import Path
 import pytest
 
 from xagent.config import (
+    AGENT_RUNTIME,
     BOXLITE_HOME_DIR,
     DATABASE_URL,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
     LANCEDB_PATH,
+    MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
     SANDBOX_CPUS,
     SANDBOX_ENV,
@@ -23,6 +25,7 @@ from xagent.config import (
     WEB_SEARCH_PROVIDER,
     format_file_size,
     get_agent_pattern_for_execution_mode,
+    get_agent_runtime,
     get_boxlite_home_dir,
     get_database_url,
     get_default_sqlite_db_path,
@@ -30,6 +33,7 @@ from xagent.config import (
     get_external_skills_dirs,
     get_external_upload_dirs,
     get_lancedb_path,
+    get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
     get_sandbox_cpus,
     get_sandbox_env,
@@ -57,6 +61,9 @@ class TestEnvironmentVariableConstants:
 
     def test_external_skills_dirs_constant(self):
         assert EXTERNAL_SKILLS_LIBRARY_DIRS == "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+
+    def test_agent_runtime_constant(self):
+        assert AGENT_RUNTIME == "XAGENT_AGENT_RUNTIME"
 
     def test_storage_root_constant(self):
         assert STORAGE_ROOT == "XAGENT_STORAGE_ROOT"
@@ -180,6 +187,26 @@ class TestGetWebDir:
         assert result == Path("/custom/web")
 
 
+class TestGetAgentRuntime:
+    """Test get_agent_runtime() function."""
+
+    def test_default_agent_runtime(self, monkeypatch):
+        monkeypatch.delenv(AGENT_RUNTIME, raising=False)
+        assert get_agent_runtime() == "v1"
+
+    def test_agent_runtime_v2(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v2")
+        assert get_agent_runtime() == "v2"
+
+    def test_agent_runtime_normalizes_case_and_spaces(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, " V2 ")
+        assert get_agent_runtime() == "v2"
+
+    def test_invalid_agent_runtime_falls_back_to_v1(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "unknown")
+        assert get_agent_runtime() == "v1"
+
+
 class TestGetAgentPatternForExecutionMode:
     """Test get_agent_pattern_for_execution_mode() function."""
 
@@ -200,11 +227,20 @@ class TestGetAgentPatternForExecutionMode:
 class TestGetDefaultTaskExecutionMode:
     """Test default task execution mode selection."""
 
-    def test_standalone_defaults_to_auto(self):
+    def test_v1_standalone_defaults_to_think(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v1")
+        assert get_default_task_execution_mode() == "think"
+
+    def test_v2_standalone_defaults_to_auto(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v2")
         assert get_default_task_execution_mode() == "auto"
 
-    def test_agent_tasks_default_to_balanced(self):
+    def test_agent_tasks_default_to_balanced_in_v2(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v2")
         assert get_default_task_execution_mode(agent_id=123) == "balanced"
+
+    def test_explicit_runtime_can_be_passed(self):
+        assert get_default_task_execution_mode(agent_runtime="v2") == "auto"
 
 
 class TestGetExternalUploadDirs:
@@ -502,3 +538,28 @@ class TestGetBoxliteHomeDir:
         monkeypatch.setenv(BOXLITE_HOME_DIR, "/custom/boxlite")
         result = get_boxlite_home_dir()
         assert result == Path("/custom/boxlite")
+
+
+class TestGetMaxTracePayloadBytes:
+    """Test get_max_trace_payload_bytes() function."""
+
+    def test_default(self, monkeypatch):
+        monkeypatch.delenv(MAX_TRACE_PAYLOAD_BYTES, raising=False)
+        assert get_max_trace_payload_bytes() == 50_000
+
+    def test_env_override(self, monkeypatch):
+        monkeypatch.setenv(MAX_TRACE_PAYLOAD_BYTES, "1234")
+        assert get_max_trace_payload_bytes() == 1234
+
+    def test_zero_passes_through(self, monkeypatch):
+        """Zero disables truncation (handled by truncate_for_trace)."""
+        monkeypatch.setenv(MAX_TRACE_PAYLOAD_BYTES, "0")
+        assert get_max_trace_payload_bytes() == 0
+
+    def test_invalid_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(MAX_TRACE_PAYLOAD_BYTES, "not-a-number")
+        assert get_max_trace_payload_bytes() == 50_000
+
+    def test_negative_falls_back_to_default(self, monkeypatch):
+        monkeypatch.setenv(MAX_TRACE_PAYLOAD_BYTES, "-100")
+        assert get_max_trace_payload_bytes() == 50_000
