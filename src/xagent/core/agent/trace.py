@@ -81,7 +81,14 @@ def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
     return trimmed
 
 
-def _trim_subtree(value: Any, max_bytes: int) -> Any:
+# Bound on recursion depth inside `_trim_subtree`. LLM payloads we care
+# about (messages[*].content, tool_calls) nest at most 4-5 levels; 50 is
+# well above that and well below Python's default 1000-frame limit, so a
+# pathological payload can't blow the stack via this helper.
+_MAX_TRACE_DEPTH = 50
+
+
+def _trim_subtree(value: Any, max_bytes: int, _depth: int = 0) -> Any:
     """Recursive worker for :func:`truncate_for_trace`.
 
     Handles scalar truncation and container recursion. Does NOT enforce
@@ -89,6 +96,9 @@ def _trim_subtree(value: Any, max_bytes: int) -> Any:
     Keeping the recursive case in its own function avoids re-running the
     expensive serialization-based check at every nesting level.
     """
+    if _depth >= _MAX_TRACE_DEPTH:
+        return f"...[truncated: depth exceeds {_MAX_TRACE_DEPTH}]"
+
     if isinstance(value, str):
         encoded = value.encode("utf-8", errors="replace")
         if len(encoded) <= max_bytes:
@@ -102,11 +112,11 @@ def _trim_subtree(value: Any, max_bytes: int) -> Any:
 
     if isinstance(value, list):
         per_item = max(1, max_bytes // max(1, len(value)))
-        return [_trim_subtree(item, per_item) for item in value]
+        return [_trim_subtree(item, per_item, _depth + 1) for item in value]
 
     if isinstance(value, dict):
         per_value = max(1, max_bytes // max(1, len(value)))
-        return {k: _trim_subtree(v, per_value) for k, v in value.items()}
+        return {k: _trim_subtree(v, per_value, _depth + 1) for k, v in value.items()}
 
     # Numbers, bools, None — pass through
     return value

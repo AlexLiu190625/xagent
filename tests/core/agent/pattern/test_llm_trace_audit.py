@@ -126,6 +126,36 @@ def test_truncate_for_trace_zero_disables() -> None:
     assert truncate_for_trace(long, max_bytes=0) == long
 
 
+def test_truncate_for_trace_deep_nesting_collapses() -> None:
+    """Pathologically nested structures must not hit Python's recursion limit.
+
+    Builds a 100-deep dict (well above the 50-frame guard, well below
+    Python's default 1000-frame limit). Without the guard, sufficiently
+    deep + large payloads could still blow the stack since each level
+    eats a frame for both the dict comprehension and the recursive call.
+    """
+    from xagent.core.agent.trace import truncate_for_trace
+
+    deep: Any = "leaf"
+    for _ in range(100):
+        deep = {"nested": deep}
+
+    out = truncate_for_trace(deep, max_bytes=10_000)
+
+    cur: Any = out
+    depth = 0
+    while isinstance(cur, dict) and "nested" in cur:
+        cur = cur["nested"]
+        depth += 1
+        if depth > 200:
+            pytest.fail("recursion guard never collapsed deep payload")
+
+    assert isinstance(cur, str)
+    assert "depth exceeds" in cur, (
+        f"expected depth-guard placeholder at leaf, got {cur!r}"
+    )
+
+
 @pytest.mark.asyncio
 async def test_trace_action_end_truncates_llm_payload(
     monkeypatch: pytest.MonkeyPatch,
