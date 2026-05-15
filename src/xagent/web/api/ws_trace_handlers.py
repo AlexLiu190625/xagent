@@ -317,7 +317,29 @@ class WebSocketTraceHandler(TraceHandler):
     def _convert_trace_event_to_stream_event(
         self, event: TraceEvent
     ) -> Optional[Dict[str, Any]]:
-        """Convert trace event to unified stream format."""
+        """Convert trace event to unified stream format.
+
+        Returns ``None`` to skip the broadcast entirely. The caller
+        (``handle_event``) checks ``if stream_event:`` before sending,
+        so a ``None`` here means the event still reaches
+        ``DatabaseTraceHandler`` (audit row persisted) but never reaches
+        any WebSocket client. Two reasons we drop:
+
+          1. ``__audit_only__=True`` in ``event.data`` -- server-only
+             RCA payload (raw LLM messages / response) that must not
+             leak to clients.
+          2. Agent checkpoint data -- internal runtime state the
+             frontend doesn't render (checked after serialization).
+        """
+        # Server-only audit traces: drop early so we don't waste effort
+        # serializing payloads we're about to discard.
+        if isinstance(event.data, dict) and event.data.get("__audit_only__") is True:
+            logger.debug(
+                f"Dropping audit-only trace event from WS broadcast: "
+                f"step_id={event.step_id} task={self.task_id}"
+            )
+            return None
+
         event_type_str = get_event_type_mapping(event)
         logger.debug(
             f"Converting trace event to stream event: {event_type_str} for task {self.task_id}"
