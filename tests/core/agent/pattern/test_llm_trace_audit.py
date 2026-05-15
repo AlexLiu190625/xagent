@@ -156,6 +156,57 @@ def test_truncate_for_trace_deep_nesting_collapses() -> None:
     )
 
 
+def test_ws_handler_drops_audit_only_events() -> None:
+    """Server-only audit traces with ``__audit_only__: True`` must be
+    dropped before reaching WebSocket clients.
+
+    This is a security-critical assertion: the audit pipeline persists
+    raw LLM I/O (messages, response) via DatabaseTraceHandler, and the
+    drop in WebSocketTraceHandler is the only barrier preventing that
+    same payload from being broadcast to connected clients.
+    """
+    from xagent.core.agent.trace import ACTION_START_LLM, TraceEvent
+    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+
+    handler = WebSocketTraceHandler(task_id=1)
+
+    audit_event = TraceEvent(
+        event_type=ACTION_START_LLM,
+        task_id="t1",
+        step_id="dag_skill_selection",
+        data={
+            "__audit_only__": True,
+            "messages": [{"role": "user", "content": "raw prompt body"}],
+            "action": "LLM call started",
+        },
+    )
+
+    result = handler._convert_trace_event_to_stream_event(audit_event)
+    assert result is None, (
+        "audit_only event must be dropped before WS broadcast; "
+        "got non-None stream event"
+    )
+
+
+def test_ws_handler_passes_non_audit_events() -> None:
+    """Regression: dropping ``__audit_only__`` must not affect normal events."""
+    from xagent.core.agent.trace import ACTION_START_LLM, TraceEvent
+    from xagent.web.api.ws_trace_handlers import WebSocketTraceHandler
+
+    handler = WebSocketTraceHandler(task_id=1)
+
+    event = TraceEvent(
+        event_type=ACTION_START_LLM,
+        task_id="t1",
+        step_id="step1",
+        data={"action": "LLM call started", "step_name": "test_step"},
+    )
+
+    result = handler._convert_trace_event_to_stream_event(event)
+    assert result is not None, "non-audit event was incorrectly dropped"
+    assert result.get("step_id") == "step1"
+
+
 @pytest.mark.asyncio
 async def test_trace_action_end_truncates_llm_payload(
     monkeypatch: pytest.MonkeyPatch,
