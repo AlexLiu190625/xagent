@@ -199,18 +199,25 @@ def map_trace_events_to_public_steps(
             # categories are not exposed.
             continue
 
-        # ===== tool_call / agent_delegation: paired start/end =====
-        if event_type in ("tool_execution_start", "tool_execution_end"):
+        # ===== tool_call / agent_delegation: paired start/end + failure =====
+        if event_type in (
+            "tool_execution_start",
+            "tool_execution_end",
+            "tool_execution_failed",
+        ):
             tool_name = _data_get(event, "tool_name")
             is_delegation = isinstance(tool_name, str) and tool_name.startswith(
                 _AGENT_DELEGATION_PREFIX
             )
             public_type = "agent_delegation" if is_delegation else "tool_call"
-            # Pair on tool_execution_id (always unique per invocation)
-            # falling back to step_id. step_id alone is unsafe because
-            # one step may invoke the same tool twice.
+            # Pair on a per-invocation id (unique even when one step
+            # invokes the same tool twice). v1 emits
+            # ``tool_execution_id``; v2 emits ``tool_call_id``. Either
+            # is fine — the fallback chain accepts both. step_id alone
+            # is unsafe because one step may invoke multiple tools.
             key = (
                 _data_get(event, "tool_execution_id")
+                or _data_get(event, "tool_call_id")
                 or _safe_get(event, "step_id")
                 or _safe_get(event, "event_id")
             )
@@ -224,7 +231,7 @@ def map_trace_events_to_public_steps(
                     tool_name=tool_name,
                     key=str(key),
                 )
-            else:  # tool_execution_end
+            elif event_type == "tool_execution_end":
                 success = _data_get(event, "success", default=True)
                 status = "completed" if success else "failed"
                 # ``tool_call`` and ``agent_delegation`` use different keys
@@ -250,6 +257,24 @@ def map_trace_events_to_public_steps(
                             "error": _data_get(ev, "error") or "Tool execution failed"
                         }
                     ),
+                )
+            else:  # tool_execution_failed
+                # v2 runtime emits a dedicated failure event
+                # (TraceCategory.TOOL + TraceAction.ERROR) instead of
+                # tool_execution_end with success=False. Without this
+                # branch the pending start was never finalized and the
+                # public step stayed at status='running' indefinitely.
+                _finalize_pending(
+                    pending,
+                    finished,
+                    (public_type, str(key)),
+                    end_event=event,
+                    status="failed",
+                    extra_data_fn=lambda ev: {
+                        "error": _data_get(ev, "error")
+                        or _data_get(ev, "error_message")
+                        or "Tool execution failed"
+                    },
                 )
             continue
 
@@ -356,9 +381,16 @@ def _build_tool_start(
 
     For ``agent_delegation`` we extract ``sub_agent_name`` from the
     ``call_agent_<name>`` prefix so SDK consumers don't have to do
-    the string surgery themselves. ``tool_args`` from the start event
-    becomes ``input`` on the public step.
+    the string surgery themselves.
+
+    The args/input value lives under different keys depending on which
+    runtime emitted the event: v1 uses ``tool_args``, v2 uses
+    ``tool_params``. We read whichever is present so the public step
+    surface stays uniform across runtimes.
     """
+    args = _data_get(event, "tool_args")
+    if args is None:
+        args = _data_get(event, "tool_params")
     if public_type == "agent_delegation" and isinstance(tool_name, str):
         sub_agent_name = tool_name[len(_AGENT_DELEGATION_PREFIX) :] or tool_name
         return {
@@ -369,7 +401,7 @@ def _build_tool_start(
             "completed_at": None,
             "data": {
                 "sub_agent_name": sub_agent_name,
-                "input": _data_get(event, "tool_args"),
+                "input": args,
             },
         }
     return {
@@ -380,7 +412,7 @@ def _build_tool_start(
         "completed_at": None,
         "data": {
             "name": tool_name,
-            "args": _data_get(event, "tool_args"),
+            "args": args,
         },
     }
 

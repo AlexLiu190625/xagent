@@ -240,6 +240,151 @@ def test_tool_execution_failure_marks_failed_with_error():
     assert "result" not in steps[0]["data"]
 
 
+def test_tool_execution_failed_event_marks_step_failed():
+    """Regression for v2 runtime which emits a dedicated
+    ``tool_execution_failed`` event (TraceCategory.TOOL + ERROR action)
+    instead of ``tool_execution_end`` with ``success=False``.
+
+    Without explicit handling, the pending start was never finalized
+    and ``GET /steps`` would report the step as still ``running``
+    forever after a tool failure.
+    """
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="s_fail",
+            data={
+                "tool_name": "execute_python",
+                "tool_params": {"code": "1 / 0"},
+                "tool_call_id": "call-fail",
+            },
+        ),
+        _ev(
+            "tool_execution_failed",
+            step_id="s_fail",
+            data={
+                "tool_name": "execute_python",
+                "tool_call_id": "call-fail",
+                "error": "division by zero",
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 5, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    s = steps[0]
+    assert s["type"] == "tool_call"
+    assert s["status"] == "failed"
+    assert s["data"]["error"] == "division by zero"
+    assert s["completed_at"] > s["started_at"]
+
+
+def test_v2_tool_params_alias_reads_args():
+    """v2 runtime writes ``tool_params`` where v1 writes ``tool_args``.
+
+    Mapper should fall back to ``tool_params`` so the public step's
+    ``data.args`` field is populated regardless of which runtime ran.
+    """
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="s_v2",
+            data={
+                "tool_name": "web_search",
+                "tool_params": {"query": "xagent"},
+                "tool_call_id": "call-v2",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="s_v2",
+            data={
+                "tool_name": "web_search",
+                "tool_call_id": "call-v2",
+                "result": "search results",
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 1
+    s = steps[0]
+    assert s["status"] == "completed"
+    assert s["data"]["name"] == "web_search"
+    assert s["data"]["args"] == {"query": "xagent"}
+    assert s["data"]["result"] == "search results"
+
+
+def test_v2_tool_call_id_does_not_collide_within_same_step():
+    """Two v2 tool calls under the same ``step_id`` must each get their
+    own pending entry — pair key has to be the per-invocation
+    ``tool_call_id``, not the shared ``step_id``.
+
+    Without this, the second start overwrites the first pending and
+    the public timeline either loses the first call or pairs an end
+    event with the wrong pending entry.
+    """
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="shared_step",
+            event_id="evt-1",
+            data={
+                "tool_name": "tool_a",
+                "tool_params": {"q": "a"},
+                "tool_call_id": "call-a",
+            },
+        ),
+        _ev(
+            "tool_execution_start",
+            step_id="shared_step",
+            event_id="evt-2",
+            data={
+                "tool_name": "tool_b",
+                "tool_params": {"q": "b"},
+                "tool_call_id": "call-b",
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 1, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="shared_step",
+            event_id="evt-3",
+            data={
+                "tool_name": "tool_a",
+                "tool_call_id": "call-a",
+                "result": "result_a",
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 2, tzinfo=timezone.utc),
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="shared_step",
+            event_id="evt-4",
+            data={
+                "tool_name": "tool_b",
+                "tool_call_id": "call-b",
+                "result": "result_b",
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 3, tzinfo=timezone.utc),
+        ),
+    ]
+    steps = map_trace_events_to_public_steps(events)
+    assert len(steps) == 2, (
+        f"expected 2 distinct tool_call steps, got {len(steps)}; the second "
+        f"start likely overwrote the first pending entry"
+    )
+    by_name = {s["data"]["name"]: s for s in steps}
+    assert "tool_a" in by_name and "tool_b" in by_name
+    assert by_name["tool_a"]["data"]["args"] == {"q": "a"}
+    assert by_name["tool_a"]["data"]["result"] == "result_a"
+    assert by_name["tool_b"]["data"]["args"] == {"q": "b"}
+    assert by_name["tool_b"]["data"]["result"] == "result_b"
+
+
 def test_user_and_ai_messages_emit_two_message_steps_in_order():
     events = [
         _ev(
