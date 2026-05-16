@@ -1,7 +1,6 @@
 """Generic tracing module for tracking events in the xagent system."""
 
 import inspect
-import json
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
@@ -12,30 +11,82 @@ from uuid import uuid4
 logger = logging.getLogger(__name__)
 
 
-def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
-    """Truncate a trace payload so a single row in trace_events stays bounded.
+# Fields the trace pipeline reads as identifiers, routing flags, or metrics
+# (WS visibility filter, audit SQL queries, Langfuse observation naming,
+# frontend rendering). Must survive normalization untouched.
+_RESERVED_TRACE_FIELDS = frozenset(
+    {
+        # routing / visibility
+        "__audit_only__",
+        # call attribution
+        "model_name",
+        "llm_type",
+        "task_type",
+        "step_id",
+        "step_name",
+        "action",
+        "attempt",
+        "json_mode_failed",
+        # outcomes
+        "success",
+        "error_type",
+        "response_type",
+        # metrics
+        "usage",
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        # cardinality counters (not the values they count)
+        "messages_count",
+        "candidates_count",
+        "tools_count",
+        "is_tool_call",
+        "has_tools",
+    }
+)
 
-    Applies to LLM I/O audit trace fields (data.messages, data.response, ...).
-    Returns a value of the same shape with overly-long strings replaced by
-    ``"...[truncated N chars]"`` markers. Dicts/lists are walked recursively
-    and the result is then checked against ``max_bytes`` after JSON
-    serialization; if the per-child split plus suffix overhead still
-    overshoots the budget (e.g. a list of N strings each accruing a
-    ~25-byte ``...[truncated N chars]`` suffix), the entire container is
-    replaced with a single placeholder. This guarantees the documented
-    ``max_bytes`` cap is a hard upper bound on the serialized payload,
-    not just on scalar leaves.
+# Fields that carry the bulky LLM I/O payload we actually want to cap.
+# Each present field gets ``max_bytes // N_present`` budget; the rest pass
+# through unchanged.
+_TRUNCATABLE_CONTENT_FIELDS = frozenset(
+    {
+        "messages",
+        "context_preview",
+        "response",
+        "content",
+        "tool_calls",
+        "tools",
+        "error",
+        "error_message",
+        "traceback",
+        "candidate_names",
+    }
+)
+
+
+def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
+    """Recursive per-leaf truncation of a trace value.
+
+    Strings longer than ``max_bytes`` are sliced on a UTF-8 byte boundary
+    and suffixed with ``"...[truncated N chars]"``. Lists and dicts are
+    walked with the budget split evenly across children. Scalars
+    (int / bool / None) pass through unchanged.
+
+    Unlike :func:`normalize_llm_trace_payload`, this helper does NOT
+    distinguish reserved control fields from content fields and does NOT
+    enforce a total-size cap on the serialized result. The serialized
+    payload can exceed ``max_bytes`` once per-child suffix overhead is
+    accounted for. Callers that need a tracer-boundary cap on LLM event
+    payloads should use ``normalize_llm_trace_payload`` instead — this
+    function is the low-level worker.
 
     Args:
-        value: Original value (str / list / dict / scalar).
-        max_bytes: Override the total byte budget for *this subtree*. When
-            None, reads XAGENT_MAX_TRACE_PAYLOAD_BYTES via xagent.config
-            (default 50_000).
+        value: Original value.
+        max_bytes: Per-subtree byte budget. When ``None``, reads
+            ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default 50_000, 0 disables).
 
     Returns:
-        The original value or a truncated copy. Scalars (int/bool/None) pass
-        through unchanged. Containers that cannot be trimmed within budget
-        collapse to a string placeholder.
+        The original value or a recursively trimmed copy.
     """
     if max_bytes is None:
         # Local import to avoid circular dependency at module load
@@ -46,39 +97,69 @@ def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
     if max_bytes <= 0:
         return value
 
-    trimmed = _trim_subtree(value, max_bytes)
+    return _trim_subtree(value, max_bytes)
 
-    # Hard cap for containers: per-child budget splitting plus the
-    # ``...[truncated N chars]`` suffix can compound for large N (a list
-    # of 1000 strings with max_bytes=1000 still serializes to ~25KB).
-    # If the final JSON exceeds max_bytes, collapse to a placeholder so
-    # callers get a real upper bound.
-    #
-    # CRITICAL: preserve the container TYPE on collapse. Downstream
-    # trace pipeline code (``Tracer.trace_event`` logging
-    # ``list(data.keys())``, ``DatabaseTraceHandler._serialize_data_for_json``,
-    # ``WebSocketTraceHandler._serialize_data``) all assume the ``data``
-    # field is a dict / list, not a string. Returning a raw string would
-    # break those callers with ``AttributeError: 'str' has no .keys()``.
-    if isinstance(trimmed, (list, dict)):
-        try:
-            serialized = json.dumps(trimmed, ensure_ascii=False, default=str)
-            if len(serialized.encode("utf-8")) > max_bytes:
-                container_kind = "list" if isinstance(value, list) else "dict"
-                element_count = len(value) if isinstance(value, (list, dict)) else 0
-                placeholder = (
-                    f"...[truncated {container_kind} "
-                    f"({element_count} elements) exceeds {max_bytes}-byte cap]"
-                )
-                if isinstance(value, list):
-                    return [placeholder]
-                return {"__truncated__": placeholder}
-        except (TypeError, ValueError):
-            # Non-serializable subtree: let downstream trace handlers
-            # (DatabaseTraceHandler._serialize_data_for_json) deal with it.
-            pass
 
-    return trimmed
+def normalize_llm_trace_payload(
+    data: Any,
+    max_bytes: Optional[int] = None,
+) -> Any:
+    """Trace-boundary normalizer for LLM-category trace event payloads.
+
+    Truncates only the fields in :data:`_TRUNCATABLE_CONTENT_FIELDS` so
+    bulky LLM I/O doesn't write multi-MB rows to ``trace_events``.
+    Reserved control / routing / metrics fields
+    (:data:`_RESERVED_TRACE_FIELDS`) pass through unchanged so downstream
+    consumers (``WebSocketTraceHandler`` reading ``__audit_only__``,
+    audit SQL on ``model_name`` / ``task_type``, Langfuse observation
+    naming) keep working under truncation. Unknown fields also pass
+    through — conservative, so a future emit that adds a new routing
+    flag is not silently dropped.
+
+    Wired into :func:`PatternRuntime._emit_trace_event` for LLM-category
+    events so every v2-runtime LLM trace is capped, not just calls that
+    go through the convenience helpers :func:`trace_llm_call_start` /
+    :func:`trace_action_end`.
+
+    Args:
+        data: Event ``data`` dict for an LLM-category trace event.
+            Non-dict input is returned unchanged.
+        max_bytes: Total byte budget split across present truncatable
+            fields. When ``None``, reads
+            ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default 50_000, 0 disables).
+
+    Returns:
+        A new dict with reserved and unknown fields verbatim and
+        truncatable fields routed through :func:`_trim_subtree`.
+    """
+    if not isinstance(data, dict):
+        return data
+
+    if max_bytes is None:
+        from ...config import get_max_trace_payload_bytes
+
+        max_bytes = get_max_trace_payload_bytes()
+
+    if max_bytes <= 0:
+        return data
+
+    present_content = [k for k in data if k in _TRUNCATABLE_CONTENT_FIELDS]
+    if not present_content:
+        # Nothing to cap — all reserved or unknown scalars.
+        return data
+
+    per_field_budget = max(1, max_bytes // len(present_content))
+
+    out: Dict[str, Any] = {}
+    for k, v in data.items():
+        if k in _TRUNCATABLE_CONTENT_FIELDS:
+            out[k] = _trim_subtree(v, per_field_budget)
+        else:
+            # Reserved or unknown — pass through. Unknown-field
+            # passthrough is intentional: a future emit that adds a new
+            # routing flag must NOT be silently truncated.
+            out[k] = v
+    return out
 
 
 # Bound on recursion depth inside `_trim_subtree`. LLM payloads we care
@@ -616,10 +697,10 @@ async def trace_action_end(
     """Trace action end event."""
     event_type = TraceEventType(TraceScope.ACTION, TraceAction.END, category)
     payload = data or {}
-    # Bound LLM I/O audit rows (messages / response can be tens of KB each).
-    # Other categories pass through unchanged.
+    # Bound LLM I/O audit rows (messages / response can be tens of KB each)
+    # while preserving reserved control fields. Other categories pass through.
     if category == TraceCategory.LLM and payload:
-        payload = truncate_for_trace(payload)
+        payload = normalize_llm_trace_payload(payload)
     return await tracer.trace_event(
         event_type, task_id=task_id, step_id=step_id, data=payload
     )
@@ -823,8 +904,9 @@ async def trace_llm_call_start(
     tracer: Tracer, task_id: str, step_id: str, data: Optional[Dict[str, Any]] = None
 ) -> str:
     """Trace LLM call start event."""
-    # Bound the payload — see truncate_for_trace docstring.
-    payload = truncate_for_trace(data) if data else data
+    # Bound the payload via the tracer-boundary normalizer so reserved
+    # control fields survive even when content fields are truncated.
+    payload = normalize_llm_trace_payload(data) if data else data
     return await trace_action_start(
         tracer, task_id, step_id, TraceCategory.LLM, payload
     )

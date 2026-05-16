@@ -68,37 +68,28 @@ def test_truncate_for_trace_walks_dict_and_list() -> None:
     assert out["messages"][1]["content"] == "short"
 
 
-def test_truncate_for_trace_dict_total_bounded_by_max_bytes() -> None:
-    """A multi-field dict must not fan out to N*max_bytes total size.
+def test_truncate_for_trace_walks_dict_per_field() -> None:
+    """Multi-field dict: every oversized value gets the trim marker;
+    shape is preserved.
 
-    Two ways the cap is honored:
-
-      - Budget enough for per-field trim to fit: dict shape survives,
-        every value carries the ``[truncated N chars]`` marker.
-      - Budget too small for trimmed shape: the dict collapses to
-        ``{"__truncated__": "..."}`` (container TYPE preserved so
-        downstream ``data.keys()`` callers don't break).
+    Per-field budget is ``max_bytes // N_fields``, so a single field can
+    overshoot by its truncation-suffix overhead (~25 bytes). The overall
+    cap is enforced one level up by
+    :func:`normalize_llm_trace_payload`, which only routes the
+    truncatable subset of fields through this helper.
     """
-    import json
-
     from xagent.core.agent.trace import truncate_for_trace
 
     big = "z" * 5000
     payload = {"a": big, "b": big, "c": big, "d": big}
     out = truncate_for_trace(payload, max_bytes=200)
 
-    serialized = json.dumps(out)
-    assert len(serialized) < 800, (
-        f"dict fan-out broke the cap; serialized={len(serialized)} bytes"
-    )
     assert isinstance(out, dict)
-    if "__truncated__" in out:
-        # Hard-cap path: dict collapsed to placeholder marker.
-        assert "[truncated" in out["__truncated__"]
-    else:
-        # Per-field trim path: every value got truncated.
-        for key in ("a", "b", "c", "d"):
-            assert "[truncated" in out[key]
+    assert set(out.keys()) == {"a", "b", "c", "d"}
+    for key in ("a", "b", "c", "d"):
+        assert "[truncated" in out[key], (
+            f"expected per-field trim marker on {key!r}, got {out[key]!r}"
+        )
 
 
 def test_truncate_for_trace_multibyte_head_no_replacement_chars() -> None:
@@ -245,6 +236,218 @@ async def test_trace_action_end_truncates_llm_payload(
     assert len(captured) == 1
     assert "[truncated" in captured[0]["response"]
     assert captured[0]["model_name"] == "m"
+
+
+# ---------------------------------------------------------------------------
+# normalize_llm_trace_payload — reserved-field preservation
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_preserves_reserved_under_truncation() -> None:
+    """Reserved control / routing / metrics fields must pass through
+    untouched even when truncatable content fields are trimmed.
+
+    Regression for the bug rogercloud flagged: hard-cap collapse used
+    to drop ``__audit_only__`` and break WS visibility filtering.
+    """
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        # routing / metadata / metrics — must survive verbatim
+        "__audit_only__": True,
+        "model_name": "gpt-4",
+        "task_type": "dag_skill_selection",
+        "step_id": "step-1",
+        "step_name": "skill_selection",
+        "action": "LLM call completed",
+        "attempt": 1,
+        "json_mode_failed": False,
+        "success": True,
+        "usage": {"input_tokens": 12, "output_tokens": 34, "total_tokens": 46},
+        "messages_count": 2,
+        # bulky content — must be trimmed
+        "messages": [{"role": "user", "content": "x" * 200_000}],
+        "response": "y" * 200_000,
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=200)
+
+    assert isinstance(out, dict)
+    assert out["__audit_only__"] is True
+    assert out["model_name"] == "gpt-4"
+    assert out["task_type"] == "dag_skill_selection"
+    assert out["step_id"] == "step-1"
+    assert out["step_name"] == "skill_selection"
+    assert out["action"] == "LLM call completed"
+    assert out["attempt"] == 1
+    assert out["json_mode_failed"] is False
+    assert out["success"] is True
+    assert out["usage"] == {
+        "input_tokens": 12,
+        "output_tokens": 34,
+        "total_tokens": 46,
+    }
+    assert out["messages_count"] == 2
+    assert "[truncated" in str(out["messages"])
+    assert "[truncated" in out["response"]
+
+
+def test_normalize_passthrough_when_no_content_fields() -> None:
+    """All-reserved payload returns unchanged (no spurious trim).
+
+    Important so ``_emit_trace_event`` calling normalize on every LLM
+    event is cheap when the event only carries metadata.
+    """
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {"__audit_only__": True, "model_name": "gpt-4", "attempt": 2}
+    out = normalize_llm_trace_payload(payload, max_bytes=100)
+    assert out is payload or out == payload
+
+
+def test_normalize_passes_through_non_dict() -> None:
+    """Non-dict input returns as-is — defensive for unusual callers."""
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    assert normalize_llm_trace_payload("not a dict") == "not a dict"
+    assert normalize_llm_trace_payload(None) is None
+
+
+def test_normalize_zero_disables() -> None:
+    """``max_bytes=0`` (XAGENT_MAX_TRACE_PAYLOAD_BYTES=0) disables truncation."""
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    long_response = "x" * 10_000
+    payload = {"response": long_response, "model_name": "m"}
+    out = normalize_llm_trace_payload(payload, max_bytes=0)
+    assert out["response"] == long_response
+
+
+def test_normalize_unknown_fields_pass_through() -> None:
+    """Unknown fields (neither reserved nor truncatable) pass through.
+
+    Future-proofs against silently truncating a new routing flag added
+    by an audit emit that this list hasn't been updated for yet.
+    """
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        "future_routing_flag": True,
+        "future_metric": 42,
+        "response": "y" * 10_000,  # known truncatable
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=200)
+    assert out["future_routing_flag"] is True
+    assert out["future_metric"] == 42
+    assert "[truncated" in out["response"]
+
+
+# ---------------------------------------------------------------------------
+# PatternRuntime trace-boundary cap (Finding 3 regression)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_v2_runtime_emit_trace_caps_llm_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: PatternRuntime.on_llm_end with a 100 KB response gets
+    capped at the trace boundary. Previously the runtime bypassed
+    truncate_for_trace entirely and emitted the raw payload to the
+    tracer.
+    """
+    from xagent.core.agent.runtime import PatternRuntime
+
+    events: List[Dict[str, Any]] = []
+
+    class _CaptureTracer:
+        async def trace_event(
+            self,
+            event_type: Any,
+            task_id: Any = None,
+            step_id: Any = None,
+            data: Any = None,
+            parent_id: Any = None,
+        ) -> str:
+            events.append(
+                {
+                    "event_type": getattr(event_type, "value", str(event_type)),
+                    "task_id": task_id,
+                    "step_id": step_id,
+                    "data": dict(data or {}),
+                }
+            )
+            return "evt"
+
+    class _FakeContext:
+        execution_id = "task-x"
+        messages: List[Any] = []
+
+        def record_llm_usage(self, **_: Any) -> None:
+            pass
+
+    monkeypatch.setenv("XAGENT_MAX_TRACE_PAYLOAD_BYTES", "1000")
+    runtime = PatternRuntime(tracer=_CaptureTracer(), execution_id="task-x")
+
+    await runtime.on_llm_end(context=_FakeContext(), response="x" * 100_000)
+
+    assert events, "no trace event captured"
+    data = events[-1]["data"]
+    assert isinstance(data.get("response"), str)
+    assert len(data["response"]) < 5_000, (
+        f"response should be capped well under 100k, got {len(data['response'])}"
+    )
+    assert "[truncated" in data["response"]
+    # Reserved control field survives the boundary cap
+    assert data["success"] is True
+
+
+@pytest.mark.asyncio
+async def test_v2_runtime_emit_trace_does_not_cap_tool_events(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: only LLM-category events get normalized at the
+    boundary. TOOL / DAG / REACT / COMPACT / GENERAL events must pass
+    through their data unchanged so we don't silently truncate tool
+    output, DAG plans, etc.
+    """
+    from xagent.core.agent.runtime import PatternRuntime
+    from xagent.core.agent.trace import (
+        TraceAction,
+        TraceCategory,
+        TraceEventType,
+        TraceScope,
+    )
+
+    events: List[Dict[str, Any]] = []
+
+    class _CaptureTracer:
+        async def trace_event(
+            self,
+            event_type: Any,
+            task_id: Any = None,
+            step_id: Any = None,
+            data: Any = None,
+            parent_id: Any = None,
+        ) -> str:
+            events.append({"data": dict(data or {})})
+            return "evt"
+
+    monkeypatch.setenv("XAGENT_MAX_TRACE_PAYLOAD_BYTES", "1000")
+    runtime = PatternRuntime(tracer=_CaptureTracer(), execution_id="task-x")
+
+    tool_end_event = TraceEventType(
+        TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL
+    )
+    huge_tool_output = "z" * 100_000
+    await runtime._emit_trace_event(
+        tool_end_event,
+        task_id="task-x",
+        step_id="step-1",
+        data={"tool_output": huge_tool_output, "tool_name": "noop"},
+    )
+
+    assert len(events[-1]["data"]["tool_output"]) == 100_000
+    assert "[truncated" not in events[-1]["data"]["tool_output"]
 
 
 # ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@ from ..agent.trace import (
     TraceCategory,
     TraceEventType,
     TraceScope,
+    normalize_llm_trace_payload,
 )
 
 
@@ -638,6 +639,13 @@ class PatternRuntime:
         trace_event = getattr(self.tracer, "trace_event", None)
         if not callable(trace_event):
             return
+        # Cap LLM event payloads at the tracer boundary. The normalizer
+        # preserves reserved control / routing / metrics fields and only
+        # truncates bulky content (messages, response, tool_calls, ...).
+        # Non-LLM categories (TOOL / DAG / REACT / COMPACT / GENERAL)
+        # pass through unchanged.
+        if data and getattr(event_type, "category", None) == TraceCategory.LLM:
+            data = normalize_llm_trace_payload(data)
         try:
             await self._maybe_await(
                 trace_event(
