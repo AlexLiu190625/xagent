@@ -2241,8 +2241,33 @@ async def handle_chat_message(
                         logger.info(f"Task {task_id} started in background")
                     except TaskTurnError as busy_err:
                         logger.warning(
-                            f"Refused to schedule bg for task {task_id}: {busy_err.reason}"
+                            f"Refused to schedule bg for task {task_id}: {busy_err.reason}; "
+                            "removing the rejected user message from transcript"
                         )
+                        # The user message was persisted up-front (above,
+                        # via ``persist_user_message``) before we knew
+                        # whether scheduling would be accepted. Drop the
+                        # row from ``task_chat_messages`` so the next
+                        # transcript load (which the client is likely to
+                        # trigger by retrying) doesn't replay a turn that
+                        # never actually ran — otherwise the LLM sees an
+                        # orphan user prompt with no assistant response
+                        # and may hallucinate a continuation for it.
+                        #
+                        # Failure here is best-effort cleanup: the agent
+                        # is already getting a "task busy" error, and
+                        # leaving the orphan message is the same behavior
+                        # we had before this fix.
+                        if persisted_user_message is not None:
+                            try:
+                                db.delete(persisted_user_message)
+                                db.commit()
+                            except Exception as cleanup_err:
+                                logger.warning(
+                                    f"Failed to remove rejected user message "
+                                    f"for task {task_id}: {cleanup_err}"
+                                )
+                                db.rollback()
                         await manager.broadcast_to_task(
                             {
                                 "type": "agent_error",
