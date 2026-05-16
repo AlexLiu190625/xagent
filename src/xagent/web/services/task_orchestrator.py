@@ -225,6 +225,29 @@ class TaskTurnOrchestrator:
                 is PENDING / RUNNING / PAUSED), or a bg coroutine is
                 already in flight for this task_id.
         """
+        # Check the bg manager BEFORE the durable UPDATE so a rejected
+        # append never corrupts task.status / task.input. The bg manager's
+        # running_tasks dict and the DB row are two separate sources of
+        # truth — refusing here keeps the DB unchanged on rejection so
+        # the previous turn's COMPLETED/FAILED state survives.
+        #
+        # A late check (post-UPDATE) corrupts the row in this scenario:
+        # previous bg coroutine finished its run loop and flipped status
+        # to COMPLETED but is still doing tail cleanup (_sync_sdk_columns
+        # hasn't returned yet). A new append passes the atomic claim,
+        # flips status back to RUNNING, then this guard refuses. The
+        # endpoint returns 409, but the tail cleanup then sees RUNNING
+        # and treats it as a stuck task, flipping status to FAILED with
+        # a placeholder error_message. Net effect: a successful past
+        # turn shows up as FAILED.
+        #
+        # Note: between this check and the UPDATE below there's a tiny
+        # window for a fresh bg registration. _schedule_bg does its own
+        # _refuse_if_bg_inflight before register_task, which closes that
+        # window — the caller sees 409 at scheduling time instead of
+        # post-UPDATE, but the DB row is still correct either way.
+        _refuse_if_bg_inflight(int(task.id))
+
         # Atomic single-statement claim. The filter is "status is
         # terminal"; matches at most when the previous turn is fully
         # done. If two concurrent callers both run this UPDATE, only
@@ -247,11 +270,6 @@ class TaskTurnOrchestrator:
         db.commit()
         if claimed == 0:
             raise TaskTurnError("busy")
-
-        # Defense in depth: if the previous bg coroutine is somehow
-        # still running even though status reached terminal, refuse.
-        # Shouldn't happen given the atomic claim's filter, but cheap.
-        _refuse_if_bg_inflight(int(task.id))
 
         from .chat_history_service import persist_user_message
 

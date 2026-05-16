@@ -478,6 +478,89 @@ def test_create_then_append_race_returns_409(mock_start_task):
     assert mock_start_task.await_count == 0
 
 
+def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task):
+    """Regression: when ``append_turn`` refuses because a previous bg
+    coroutine is still in flight, the DB row must NOT have been mutated.
+
+    The bug scenario: previous turn flipped status to COMPLETED but the
+    bg coroutine is still in tail cleanup (``_sync_sdk_columns`` hasn't
+    returned), so ``background_task_manager.running_tasks[task_id]`` is
+    still a not-done asyncio.Task. A new append should be refused as
+    busy, and the DB row should still report COMPLETED + the original
+    input — not RUNNING + new input.
+
+    If the inflight check happened *after* the atomic UPDATE (the old
+    ordering), the row would be RUNNING + new_input even on 409
+    rejection. The old runner's _sync_sdk_columns would then see
+    RUNNING and flip the row to FAILED with a placeholder error
+    message, corrupting an otherwise successful past turn.
+    """
+    import asyncio
+
+    from xagent.web.api.websocket import background_task_manager
+
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    # Snapshot DB state right before the append attempt.
+    db_before = _direct_db_session()
+    try:
+        task_before = db_before.query(Task).filter(Task.id == task_id).first()
+        original_status = task_before.status
+        original_input = task_before.input
+    finally:
+        db_before.close()
+
+    # Plant a not-done asyncio.Task in the bg manager registry to
+    # simulate "previous runner is still cleaning up".
+    loop = asyncio.new_event_loop()
+    try:
+
+        async def _never_done() -> None:
+            await asyncio.sleep(3600)
+
+        fake_inflight = loop.create_task(_never_done())
+        background_task_manager.running_tasks[task_id] = fake_inflight
+
+        try:
+            resp = client.post(
+                f"/v1/chat/tasks/{task_id}/messages",
+                headers=_bearer(full_key),
+                json={
+                    "agent_id": agent_id,
+                    "message": {"role": "user", "content": "second"},
+                },
+            )
+            assert resp.status_code == 409
+            assert resp.json()["error"]["code"] == "task_busy"
+            assert mock_start_task.await_count == 0
+
+            # The critical assertion: DB row was NOT mutated by the
+            # refused append. status stays terminal, input unchanged.
+            db_after = _direct_db_session()
+            try:
+                task_after = db_after.query(Task).filter(Task.id == task_id).first()
+                assert task_after.status == original_status, (
+                    f"task.status was corrupted on refused append: "
+                    f"{original_status} -> {task_after.status}"
+                )
+                assert task_after.input == original_input, (
+                    f"task.input was overwritten on refused append: "
+                    f"{original_input!r} -> {task_after.input!r}"
+                )
+            finally:
+                db_after.close()
+        finally:
+            # Clean up the fake registry entry so other tests aren't
+            # affected.
+            background_task_manager.running_tasks.pop(task_id, None)
+            fake_inflight.cancel()
+    finally:
+        loop.close()
+
+
 def test_append_message_to_missing_task_returns_404(mock_start_task):
     """Appending to a task that doesn't exist -> 404 task_not_found."""
     agent_id, full_key = _create_agent_with_key()
