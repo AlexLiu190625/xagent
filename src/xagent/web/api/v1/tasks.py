@@ -159,13 +159,29 @@ _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
 
 
 def _resolve_task_or_404(task_id: int, agent: Agent, db: Session) -> Task:
-    """Resolve a task_id against the calling agent's ownership.
+    """Resolve a task_id against the calling agent's ownership AND
+    SDK-source scope.
 
-    Returns the :class:`Task` row when the task exists AND belongs to
-    ``agent``. Any other case (missing row, row belongs to a different
-    agent) raises :class:`V1ApiError` with ``task_not_found`` -- 404
-    not 403, so the existence of tasks under other agents isn't
-    observable through error code.
+    Returns the :class:`Task` row when the task:
+
+      1. Exists.
+      2. Belongs to ``agent``.
+      3. Was created by the SDK (``source == "sdk"``).
+
+    Any other case — missing row, row belongs to a different agent,
+    or row was created by the Web UI / internal paths — raises
+    :class:`V1ApiError` with ``task_not_found`` (404 not 403, so the
+    existence of tasks under other agents / other surfaces isn't
+    observable through error code).
+
+    The ``source == "sdk"`` filter exists because an SDK API key
+    binds to an agent, not to a particular product surface. Without
+    it, an SDK client could read or append to any task the Web UI
+    created under the same agent (the user's own historical Web UI
+    chats, for example). Whether that's intentional is a product
+    decision, but the safe default for a public SDK is to scope
+    lookups to tasks the SDK itself created — ``POST /v1/chat/tasks``
+    writes ``source="sdk"`` so this is well-defined.
 
     Args:
         task_id: Path parameter from the route.
@@ -174,11 +190,19 @@ def _resolve_task_or_404(task_id: int, agent: Agent, db: Session) -> Task:
         db: SQLAlchemy session.
 
     Raises:
-        V1ApiError(TASK_NOT_FOUND, 404): task missing OR not owned by
-            the calling agent.
+        V1ApiError(TASK_NOT_FOUND, 404): task missing, not owned by
+            the calling agent, or not created by the SDK.
     """
-    task = db.query(Task).filter(Task.id == task_id).first()
-    if task is None or task.agent_id != agent.id:
+    task = (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.agent_id == agent.id,
+            Task.source == "sdk",
+        )
+        .first()
+    )
+    if task is None:
         raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     return task
 

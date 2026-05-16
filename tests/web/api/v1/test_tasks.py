@@ -917,3 +917,90 @@ def test_get_steps_empty_task_returns_empty_array(mock_start_task):
     assert body["task_id"] == task_id
     assert body["agent_id"] == agent_id
     assert body["steps"] == []
+
+
+# ===== source filtering: SDK API surface only sees source="sdk" tasks =====
+
+
+def _insert_internal_task(agent_id: int) -> int:
+    """Manually INSERT a task under ``agent_id`` with source != "sdk".
+
+    Tests for the SDK source filter need a task that lives under the
+    same agent but was created by the Web UI / internal paths, not
+    via POST /v1/chat/tasks. Since the SDK create endpoint always
+    writes source="sdk", we bypass it and craft the row directly.
+    """
+    from xagent.web.models.agent import Agent
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None
+        # Reuse the agent's owner so user_id stays consistent.
+        user = db.query(User).filter(User.id == agent.user_id).first()
+        assert user is not None
+        task = Task(
+            user_id=user.id,
+            title="internal task",
+            description="created via web ui, not sdk",
+            status=TaskStatus.COMPLETED,
+            agent_id=agent.id,
+            input="internal user message",
+            source="internal",
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return int(task.id)
+    finally:
+        db.close()
+
+
+def test_get_task_returns_404_for_non_sdk_source(mock_start_task):
+    """A task created by the Web UI / internal path (source != "sdk")
+    under the same agent must NOT be readable through GET /v1/chat/tasks/{id}.
+
+    Without the source filter, an SDK API key could enumerate / read
+    the user's own Web UI conversations whenever they happen to live
+    under the same agent.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    internal_task_id = _insert_internal_task(agent_id)
+    mock_start_task.reset_mock()
+
+    resp = client.get(f"/v1/chat/tasks/{internal_task_id}", headers=_bearer(full_key))
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+
+
+def test_append_message_returns_404_for_non_sdk_source(mock_start_task):
+    """POST /v1/chat/tasks/{id}/messages on a non-SDK task must 404
+    with task_not_found — the SDK key shouldn't be able to mutate
+    Web UI conversations even if it knows the task id."""
+    agent_id, full_key = _create_agent_with_key()
+    internal_task_id = _insert_internal_task(agent_id)
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{internal_task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "hi"}},
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
+    assert mock_start_task.await_count == 0
+
+
+def test_get_steps_returns_404_for_non_sdk_source(mock_start_task):
+    """GET /v1/chat/tasks/{id}/steps on a non-SDK task must 404 so
+    the SDK can't enumerate Web UI step traces under the same agent."""
+    agent_id, full_key = _create_agent_with_key()
+    internal_task_id = _insert_internal_task(agent_id)
+
+    resp = client.get(
+        f"/v1/chat/tasks/{internal_task_id}/steps", headers=_bearer(full_key)
+    )
+    assert resp.status_code == 404
+    assert resp.json()["error"]["code"] == "task_not_found"
