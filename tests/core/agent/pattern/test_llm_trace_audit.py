@@ -223,17 +223,20 @@ async def test_trace_action_end_truncates_llm_payload(
             captured.append(data or {})
             return "evt"
 
-    monkeypatch.setenv("XAGENT_MAX_TRACE_PAYLOAD_BYTES", "200")
+    monkeypatch.setenv("XAGENT_MAX_TRACE_PAYLOAD_BYTES", "2000")
 
     await trace_action_end(
         _RecordingTracer(),
         "t",
         "s",
         TraceCategory.LLM,
-        data={"response": "x" * 1000, "model_name": "m"},
+        data={"response": "x" * 10_000, "model_name": "m"},
     )
 
     assert len(captured) == 1
+    # response is the only truncatable field; at 2000-byte cap it goes
+    # through _reduce_response → _reduce_text and emits the [truncated]
+    # marker. model_name (reserved) passes through verbatim.
     assert "[truncated" in captured[0]["response"]
     assert captured[0]["model_name"] == "m"
 
@@ -269,7 +272,7 @@ def test_normalize_preserves_reserved_under_truncation() -> None:
         "messages": [{"role": "user", "content": "x" * 200_000}],
         "response": "y" * 200_000,
     }
-    out = normalize_llm_trace_payload(payload, max_bytes=200)
+    out = normalize_llm_trace_payload(payload, max_bytes=4_000)
 
     assert isinstance(out, dict)
     assert out["__audit_only__"] is True
@@ -287,6 +290,9 @@ def test_normalize_preserves_reserved_under_truncation() -> None:
         "total_tokens": 46,
     }
     assert out["messages_count"] == 2
+    # Content fields hit the reducer at 4 KB; messages get the
+    # semantic-reducer treatment (role preserved, content trimmed)
+    # and response gets the text-reducer treatment.
     assert "[truncated" in str(out["messages"])
     assert "[truncated" in out["response"]
 
@@ -335,7 +341,7 @@ def test_normalize_unknown_fields_pass_through() -> None:
         "future_metric": 42,
         "response": "y" * 10_000,  # known truncatable
     }
-    out = normalize_llm_trace_payload(payload, max_bytes=200)
+    out = normalize_llm_trace_payload(payload, max_bytes=2_000)
     assert out["future_routing_flag"] is True
     assert out["future_metric"] == 42
     assert "[truncated" in out["response"]
@@ -448,6 +454,230 @@ async def test_v2_runtime_emit_trace_does_not_cap_tool_events(
 
     assert len(events[-1]["data"]["tool_output"]) == 100_000
     assert "[truncated" not in events[-1]["data"]["tool_output"]
+
+
+# ---------------------------------------------------------------------------
+# Per-field semantic reducers (Finding 4 — Roger 2026-05-16)
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_messages_keeps_head_tail_under_cap() -> None:
+    """Regression for Roger's exact example: 1000 messages × 5 KB at
+    50 KB cap. Old equal-split implementation produced ~83 KB output and
+    decayed every message to a 50-byte head + suffix. New semantic
+    reducer preserves head + tail with full role metadata and meaningful
+    content prefix, replaces middle with a single placeholder, and
+    keeps total serialized ≤ cap.
+    """
+    import json
+
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        "__audit_only__": True,
+        "model_name": "gpt-4o",
+        "task_type": "dag_skill_selection",
+        "messages": [{"role": "user", "content": "x" * 5000} for _ in range(1000)],
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=50_000)
+
+    total = len(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+    assert total <= 50_000, f"envelope cap broken: {total} bytes > 50000"
+
+    # Reserved metadata intact
+    assert out["__audit_only__"] is True
+    assert out["model_name"] == "gpt-4o"
+    assert out["task_type"] == "dag_skill_selection"
+
+    # messages: head + tail + middle placeholder, not 1000 broken entries
+    msgs = out["messages"]
+    assert len(msgs) < 10, f"expected head/tail summary, got {len(msgs)} entries"
+
+    # First and last messages keep their role
+    assert msgs[0]["role"] == "user"
+    assert msgs[-1]["role"] == "user"
+
+    # First/last messages keep substantial content prefix (not a 50-byte stub)
+    assert len(msgs[0]["content"]) > 1000, (
+        f"head message content too short: {len(msgs[0]['content'])}"
+    )
+
+    # Middle placeholder describes omitted count
+    middle = [m for m in msgs if isinstance(m, dict) and "__truncated__" in m]
+    assert middle, "expected middle placeholder for omitted messages"
+    assert "messages omitted" in middle[0]["__truncated__"]
+
+
+def test_normalize_messages_passthrough_when_small() -> None:
+    """Short messages list well under budget passes through unchanged."""
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        "model_name": "m",
+        "messages": [
+            {"role": "system", "content": "hi"},
+            {"role": "user", "content": "yo"},
+        ],
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=50_000)
+    assert out["messages"] == payload["messages"]
+
+
+def test_normalize_tools_keeps_name_description() -> None:
+    """tools: tool name + description preserved, only big parameters
+    schema gets trimmed/collapsed."""
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    huge_schema = {
+        "type": "object",
+        "properties": {
+            f"prop_{i}": {"type": "string", "description": "x" * 200}
+            for i in range(100)
+        },
+    }
+    payload = {
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "web_search",
+                    "description": "Search the web for information",
+                    "parameters": huge_schema,
+                },
+            },
+        ],
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=2_000)
+
+    tool = out["tools"][0]
+    assert tool["type"] == "function"
+    assert tool["function"]["name"] == "web_search"
+    assert tool["function"]["description"] == "Search the web for information"
+    # parameters schema got collapsed; name + description survive
+    assert isinstance(tool["function"]["parameters"], dict)
+
+
+def test_normalize_tool_calls_keeps_id_name() -> None:
+    """tool_calls: call id + function.name preserved, only arguments trimmed."""
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        "tool_calls": [
+            {
+                "id": "call_abc",
+                "type": "function",
+                "function": {
+                    "name": "search",
+                    "arguments": '{"query":"' + "x" * 5000 + '"}',
+                },
+            },
+        ],
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=2_000)
+
+    call = out["tool_calls"][0]
+    assert call["id"] == "call_abc"
+    assert call["type"] == "function"
+    assert call["function"]["name"] == "search"
+    # arguments truncated
+    assert "[truncated" in call["function"]["arguments"]
+
+
+def test_normalize_response_dict_truncates_content() -> None:
+    """response: dict shape preserved (e.g. _short_response output);
+    text fields (content/answer/output) trimmed, scalars unchanged."""
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        "response": {
+            "content": "x" * 10_000,
+            "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "f"}}],
+        },
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=2_000)
+
+    resp = out["response"]
+    assert isinstance(resp, dict)
+    assert "[truncated" in resp["content"]
+    # tool_calls scalar metadata preserved
+    assert resp["tool_calls"][0]["id"] == "c1"
+
+
+def test_normalize_envelope_bounded_under_mixed_oversized_fields() -> None:
+    """All four heavy field types present and oversized — total
+    serialized envelope still <= max_bytes."""
+    import json
+
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        "__audit_only__": True,
+        "model_name": "gpt-4o",
+        "messages": [{"role": "user", "content": "x" * 5000}] * 500,
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": f"tool_{i}",
+                    "description": "d" * 200,
+                    "parameters": {"big": "y" * 1000},
+                },
+            }
+            for i in range(50)
+        ],
+        "tool_calls": [
+            {
+                "id": f"call_{i}",
+                "type": "function",
+                "function": {"name": "f", "arguments": "z" * 1000},
+            }
+            for i in range(50)
+        ],
+        "response": {"content": "r" * 20_000},
+    }
+    out = normalize_llm_trace_payload(payload, max_bytes=50_000)
+    total = len(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+    assert total <= 50_000, f"envelope cap broken under mixed payload: {total}"
+    # Reserved metadata always survives
+    assert out["__audit_only__"] is True
+    assert out["model_name"] == "gpt-4o"
+
+
+def test_normalize_extreme_payload_collapses_largest_field() -> None:
+    """Pathological budget where even semantic reducers can't fit —
+    envelope-level guard collapses the largest remaining truncatable
+    field to placeholder. Reserved metadata still survives.
+    """
+    import json
+
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {
+        "__audit_only__": True,
+        "model_name": "gpt-4o",
+        "messages": [{"role": "user", "content": "x" * 5000}] * 1000,
+    }
+    # Very small cap: reducer's per-field budget already too small
+    out = normalize_llm_trace_payload(payload, max_bytes=500)
+
+    total = len(json.dumps(out, ensure_ascii=False).encode("utf-8"))
+    assert total <= 500 + 200, (  # small slack for edge case
+        f"envelope cap broken under extreme cap: {total}"
+    )
+    # Reserved metadata still survives
+    assert out["__audit_only__"] is True
+    assert out["model_name"] == "gpt-4o"
+
+
+def test_normalize_response_string_falls_back_to_text_reducer() -> None:
+    """response can be a raw string (not dict) — should go through
+    _reduce_text and emit the truncated marker."""
+    from xagent.core.agent.trace import normalize_llm_trace_payload
+
+    payload = {"model_name": "m", "response": "y" * 10_000}
+    out = normalize_llm_trace_payload(payload, max_bytes=2_000)
+    assert isinstance(out["response"], str)
+    assert "[truncated" in out["response"]
 
 
 # ---------------------------------------------------------------------------

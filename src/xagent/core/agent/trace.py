@@ -1,11 +1,12 @@
 """Generic tracing module for tracking events in the xagent system."""
 
 import inspect
+import json
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 from uuid import uuid4
 
 logger = logging.getLogger(__name__)
@@ -100,37 +101,376 @@ def truncate_for_trace(value: Any, max_bytes: Optional[int] = None) -> Any:
     return _trim_subtree(value, max_bytes)
 
 
+# Short per-message metadata kept verbatim by ``_reduce_messages``. These
+# fields (typically 4-12 bytes each) are essential for RCA grouping —
+# losing ``role`` makes a trace event impossible to interpret.
+_MESSAGE_METADATA_KEYS = frozenset({"role", "name", "type", "tool_call_id"})
+
+
+def _serialized_size(value: Any) -> int:
+    """UTF-8 byte length of ``json.dumps`` output, used for size budgeting."""
+    try:
+        return len(json.dumps(value, default=str, ensure_ascii=False).encode("utf-8"))
+    except (TypeError, ValueError):
+        return len(str(value).encode("utf-8"))
+
+
+def _truncate_string(value: str, budget: int) -> str:
+    """Byte-boundary string truncate with multi-byte UTF-8 safety.
+
+    Reserves a small slack (~30 bytes) for the trailing
+    ``...[truncated N chars]`` marker so the post-marker length still
+    fits ``budget``.
+    """
+    if budget <= 0:
+        return ""
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= budget:
+        return value
+    slack = min(30, max(8, budget // 4))
+    head_budget = max(1, budget - slack)
+    head = encoded[:head_budget].decode("utf-8", errors="ignore")
+    return f"{head}...[truncated {len(value) - len(head)} chars]"
+
+
+def _placeholder(message: str) -> Dict[str, str]:
+    return {"__truncated__": message}
+
+
+def _reduce_text(value: Any, budget: int) -> Any:
+    """Reducer for plain text fields (``content``, ``error``, ``traceback``)."""
+    if not isinstance(value, str):
+        value = str(value)
+    return _truncate_string(value, budget)
+
+
+def _reduce_text_list(value: Any, budget: int) -> Any:
+    """Reducer for ``candidate_names`` and similar list-of-string fields.
+
+    Preserves head + tail entries with a middle-omitted marker.
+    """
+    if not isinstance(value, list):
+        return value
+    if _serialized_size(value) <= budget:
+        return value
+
+    for keep_head, keep_tail in [(3, 3), (2, 2), (1, 1), (1, 0)]:
+        if keep_head + keep_tail >= len(value):
+            continue
+        per_item = max(8, (budget - 64) // (keep_head + keep_tail))
+        head = [_reduce_text(v, per_item) for v in value[:keep_head]]
+        tail = (
+            [_reduce_text(v, per_item) for v in value[-keep_tail:]] if keep_tail else []
+        )
+        omitted = len(value) - keep_head - keep_tail
+        marker = f"...[truncated {omitted} middle items]"
+        candidate: List[Any] = head + [marker] + tail
+        if _serialized_size(candidate) <= budget:
+            return candidate
+
+    return [_placeholder(f"{len(value)} list items exceed {budget}-byte budget")]
+
+
+def _shrink_message(msg: Any, msg_budget: int) -> Any:
+    """Preserve short metadata keys verbatim, reduce large content keys."""
+    if not isinstance(msg, dict):
+        return _reduce_text(msg, msg_budget)
+
+    out: Dict[str, Any] = {}
+    for k in _MESSAGE_METADATA_KEYS:
+        if k in msg:
+            out[k] = msg[k]
+
+    # Reserve ~40 bytes for JSON braces / commas / quotes around content keys.
+    content_keys = [k for k in msg if k not in _MESSAGE_METADATA_KEYS]
+    if not content_keys:
+        return out
+    remaining = max(64, msg_budget - _serialized_size(out) - 40)
+    per_content = max(32, remaining // len(content_keys))
+
+    for k in content_keys:
+        v = msg[k]
+        if k == "tool_calls" and isinstance(v, list):
+            out[k] = _reduce_tool_calls(v, per_content)
+        elif isinstance(v, str):
+            out[k] = _reduce_text(v, per_content)
+        elif isinstance(v, (dict, list)):
+            out[k] = _reduce_text(
+                json.dumps(v, default=str, ensure_ascii=False), per_content
+            )
+        else:
+            out[k] = v
+    return out
+
+
+def _reduce_messages(value: Any, budget: int) -> Any:
+    """Reducer for ``messages`` / ``context_preview``.
+
+    Keeps head + tail entries (system / recent prompts have the highest
+    RCA value) with their ``role`` / ``name`` / ``type`` metadata intact;
+    each kept message's content is text-reduced. Middle entries become a
+    single ``{"__truncated__": "K messages omitted ..."}`` placeholder.
+    Iteratively shrinks the kept-count if budget still overshoots.
+    """
+    if not isinstance(value, list):
+        return value
+    if _serialized_size(value) <= budget:
+        return value
+
+    # If the list is already short, no middle to omit — just shrink each
+    # entry to a per-msg budget.
+    if len(value) <= 4:
+        per_msg = max(128, (budget - 16) // len(value))
+        shrunk = [_shrink_message(m, per_msg) for m in value]
+        if _serialized_size(shrunk) <= budget:
+            return shrunk
+        return [_placeholder(f"{len(value)} messages exceed {budget}-byte budget")]
+
+    for keep_head, keep_tail in [(2, 2), (1, 2), (1, 1), (1, 0)]:
+        if keep_head + keep_tail >= len(value):
+            continue
+        omitted = len(value) - keep_head - keep_tail
+        marker = _placeholder(
+            f"{omitted} middle messages omitted to fit {budget}-byte budget"
+        )
+        marker_size = _serialized_size(marker)
+        per_msg = max(128, (budget - marker_size - 16) // (keep_head + keep_tail))
+        head = [_shrink_message(m, per_msg) for m in value[:keep_head]]
+        tail = (
+            [_shrink_message(m, per_msg) for m in value[-keep_tail:]]
+            if keep_tail
+            else []
+        )
+        candidate: List[Any] = head + [marker] + tail
+        if _serialized_size(candidate) <= budget:
+            return candidate
+
+    # Even (1 head, 0 tail) overshoots — collapse the whole list.
+    return [_placeholder(f"{len(value)} messages exceed {budget}-byte budget")]
+
+
+def _shrink_tool(tool: Any, tool_budget: int) -> Any:
+    """Per-tool: keep type/function.name/function.description; truncate parameters schema."""
+    if not isinstance(tool, dict):
+        return _reduce_text(tool, tool_budget)
+    out: Dict[str, Any] = {"type": tool.get("type", "function")}
+    func = tool.get("function")
+    if isinstance(func, dict):
+        shrunk_func: Dict[str, Any] = {}
+        if "name" in func:
+            shrunk_func["name"] = func["name"]
+        if "description" in func and isinstance(func["description"], str):
+            desc_budget = max(64, (tool_budget - _serialized_size(shrunk_func)) // 2)
+            shrunk_func["description"] = _reduce_text(func["description"], desc_budget)
+        if "parameters" in func:
+            remaining = max(
+                32,
+                tool_budget
+                - _serialized_size({"type": out["type"], "function": shrunk_func})
+                - 30,
+            )
+            if _serialized_size(func["parameters"]) <= remaining:
+                shrunk_func["parameters"] = func["parameters"]
+            else:
+                shrunk_func["parameters"] = _placeholder(
+                    f"schema exceeds {remaining}-byte budget"
+                )
+        out["function"] = shrunk_func
+    return out
+
+
+def _reduce_tools(value: Any, budget: int) -> Any:
+    """Reducer for ``tools``. Keeps tool names + descriptions, truncates schemas."""
+    if not isinstance(value, list):
+        return value
+    if _serialized_size(value) <= budget:
+        return value
+
+    # Short list: no middle to omit — shrink each tool to per-tool budget.
+    if len(value) <= 3:
+        per_tool = max(128, (budget - 16) // len(value))
+        shrunk = [_shrink_tool(t, per_tool) for t in value]
+        if _serialized_size(shrunk) <= budget:
+            return shrunk
+        return [_placeholder(f"{len(value)} tools exceed {budget}-byte budget")]
+
+    for keep_head in (3, 2, 1):
+        omitted = len(value) - keep_head
+        marker = _placeholder(f"{omitted} tools omitted to fit {budget}-byte budget")
+        per_tool = max(128, (budget - _serialized_size(marker) - 16) // keep_head)
+        head = [_shrink_tool(t, per_tool) for t in value[:keep_head]]
+        candidate: List[Any] = head + [marker]
+        if _serialized_size(candidate) <= budget:
+            return candidate
+
+    return [_placeholder(f"{len(value)} tools exceed {budget}-byte budget")]
+
+
+def _shrink_tool_call(call: Any, call_budget: int) -> Any:
+    """Per-call: keep id/type/function.name; truncate function.arguments."""
+    if not isinstance(call, dict):
+        return _reduce_text(call, call_budget)
+    out: Dict[str, Any] = {}
+    for k in ("id", "type"):
+        if k in call:
+            out[k] = call[k]
+    func = call.get("function")
+    if isinstance(func, dict):
+        shrunk_func: Dict[str, Any] = {}
+        if "name" in func:
+            shrunk_func["name"] = func["name"]
+        if "arguments" in func:
+            args = func["arguments"]
+            args_str = (
+                args
+                if isinstance(args, str)
+                else json.dumps(args, default=str, ensure_ascii=False)
+            )
+            arg_budget = max(
+                64,
+                call_budget - _serialized_size({**out, "function": shrunk_func}) - 30,
+            )
+            shrunk_func["arguments"] = _reduce_text(args_str, arg_budget)
+        out["function"] = shrunk_func
+    return out
+
+
+def _reduce_tool_calls(value: Any, budget: int) -> Any:
+    """Reducer for ``tool_calls``. Keeps id + name per call, truncates arguments."""
+    if not isinstance(value, list):
+        return value
+    if _serialized_size(value) <= budget:
+        return value
+
+    # Short list: no middle to omit — shrink each call to per-call budget.
+    if len(value) <= 3:
+        per_call = max(128, (budget - 16) // len(value))
+        shrunk = [_shrink_tool_call(c, per_call) for c in value]
+        if _serialized_size(shrunk) <= budget:
+            return shrunk
+        return [_placeholder(f"{len(value)} tool_calls exceed {budget}-byte budget")]
+
+    for keep_head in (3, 2, 1):
+        omitted = len(value) - keep_head
+        marker = _placeholder(
+            f"{omitted} tool_calls omitted to fit {budget}-byte budget"
+        )
+        per_call = max(128, (budget - _serialized_size(marker) - 16) // keep_head)
+        head = [_shrink_tool_call(c, per_call) for c in value[:keep_head]]
+        candidate: List[Any] = head + [marker]
+        if _serialized_size(candidate) <= budget:
+            return candidate
+
+    return [_placeholder(f"{len(value)} tool_calls exceed {budget}-byte budget")]
+
+
+def _reduce_response(value: Any, budget: int) -> Any:
+    """Reducer for ``response``. String → text trim; dict → trim text sub-fields,
+    preserve scalars verbatim (e.g. usage / token counts coming back from
+    ``_short_response``).
+    """
+    if isinstance(value, str):
+        return _reduce_text(value, budget)
+    if not isinstance(value, dict):
+        return _reduce_text(str(value), budget)
+    if _serialized_size(value) <= budget:
+        return value
+
+    text_keys = ("content", "answer", "output", "message")
+    out: Dict[str, Any] = {}
+    other_keys = [k for k in value if k not in text_keys]
+    for k in other_keys:
+        out[k] = value[k]
+
+    content_keys = [k for k in value if k in text_keys]
+    if content_keys:
+        remaining = max(64, budget - _serialized_size(out) - 30)
+        per_content = max(64, remaining // len(content_keys))
+        for k in content_keys:
+            v = value[k]
+            if k == "tool_calls" and isinstance(v, list):
+                out[k] = _reduce_tool_calls(v, per_content)
+            elif isinstance(v, str):
+                out[k] = _reduce_text(v, per_content)
+            else:
+                out[k] = _reduce_text(str(v), per_content)
+
+    if _serialized_size(out) > budget:
+        return _placeholder(f"response exceeds {budget}-byte budget after reduction")
+    return out
+
+
+# Dispatch table: field name -> reducer. ``normalize_llm_trace_payload``
+# routes each present truncatable field to its reducer. Fields not in this
+# table but in ``_TRUNCATABLE_CONTENT_FIELDS`` fall back to ``_reduce_text``.
+_FIELD_REDUCERS: Dict[str, Callable[[Any, int], Any]] = {
+    "messages": _reduce_messages,
+    "context_preview": _reduce_messages,
+    "tools": _reduce_tools,
+    "tool_calls": _reduce_tool_calls,
+    "response": _reduce_response,
+    "content": _reduce_text,
+    "error": _reduce_text,
+    "error_message": _reduce_text,
+    "traceback": _reduce_text,
+    "candidate_names": _reduce_text_list,
+}
+
+
 def normalize_llm_trace_payload(
     data: Any,
     max_bytes: Optional[int] = None,
 ) -> Any:
     """Trace-boundary normalizer for LLM-category trace event payloads.
 
-    Truncates only the fields in :data:`_TRUNCATABLE_CONTENT_FIELDS` so
-    bulky LLM I/O doesn't write multi-MB rows to ``trace_events``.
-    Reserved control / routing / metrics fields
-    (:data:`_RESERVED_TRACE_FIELDS`) pass through unchanged so downstream
-    consumers (``WebSocketTraceHandler`` reading ``__audit_only__``,
-    audit SQL on ``model_name`` / ``task_type``, Langfuse observation
-    naming) keep working under truncation. Unknown fields also pass
-    through — conservative, so a future emit that adds a new routing
-    flag is not silently dropped.
+    Three layers:
+
+      1. **Reserved + unknown fields pass through verbatim.** Routing /
+         control / metrics fields (:data:`_RESERVED_TRACE_FIELDS`) and
+         fields not in :data:`_TRUNCATABLE_CONTENT_FIELDS` are copied
+         as-is so downstream consumers (WS visibility filter, audit SQL,
+         Langfuse) keep working under truncation. Unknown-field
+         passthrough is intentional — a future emit that adds a new
+         routing flag must not be silently dropped.
+
+      2. **Per-field semantic reducers.** Each present truncatable
+         field is routed to its reducer in :data:`_FIELD_REDUCERS`:
+
+           - ``messages`` / ``context_preview``: keep head + tail with
+             role/name/type metadata intact, truncate kept content
+           - ``tools``: keep tool name + description, truncate
+             parameters schema
+           - ``tool_calls``: keep id + function.name, truncate
+             function.arguments
+           - ``response``: dict-shape-preserving for ``_short_response``
+             output; string → byte slice with truncation marker
+           - ``content`` / ``error`` / ``error_message`` / ``traceback``:
+             direct text truncation
+           - ``candidate_names``: head + tail list slice
+
+         Reducers self-verify their output (post-reduce serialized size
+         ≤ budget) and fall back to a single placeholder dict if even
+         the smallest preservation overshoots.
+
+      3. **Envelope-level hard cap.** After all reducers, if the
+         serialized total still exceeds ``max_bytes`` (extreme case —
+         e.g. reserved metadata itself oversized), collapse the
+         currently-largest truncatable field to a single placeholder
+         and re-check. Outer reserved metadata always survives.
 
     Wired into :func:`PatternRuntime._emit_trace_event` for LLM-category
     events so every v2-runtime LLM trace is capped, not just calls that
-    go through the convenience helpers :func:`trace_llm_call_start` /
-    :func:`trace_action_end`.
+    go through :func:`trace_llm_call_start` / :func:`trace_action_end`.
 
     Args:
         data: Event ``data`` dict for an LLM-category trace event.
             Non-dict input is returned unchanged.
-        max_bytes: Total byte budget split across present truncatable
-            fields. When ``None``, reads
-            ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default 50_000, 0 disables).
+        max_bytes: Total byte budget for the serialized result. When
+            ``None``, reads ``XAGENT_MAX_TRACE_PAYLOAD_BYTES`` (default
+            50_000, ``0`` disables).
 
     Returns:
-        A new dict with reserved and unknown fields verbatim and
-        truncatable fields routed through :func:`_trim_subtree`.
+        A new dict honoring the cap with reserved metadata intact.
     """
     if not isinstance(data, dict):
         return data
@@ -145,20 +485,48 @@ def normalize_llm_trace_payload(
 
     present_content = [k for k in data if k in _TRUNCATABLE_CONTENT_FIELDS]
     if not present_content:
-        # Nothing to cap — all reserved or unknown scalars.
+        # Nothing to cap — all reserved or unknown. Even if reserved
+        # itself overshoots, we don't touch it (that would defeat the
+        # routing contract).
         return data
 
-    per_field_budget = max(1, max_bytes // len(present_content))
+    # Reserve envelope budget for non-truncatable fields + JSON separators.
+    reserved_part = {
+        k: v for k, v in data.items() if k not in _TRUNCATABLE_CONTENT_FIELDS
+    }
+    reserved_overhead = _serialized_size(reserved_part)
+    content_budget = max(256, max_bytes - reserved_overhead - 64)
+    per_field_budget = max(128, content_budget // len(present_content))
 
     out: Dict[str, Any] = {}
     for k, v in data.items():
         if k in _TRUNCATABLE_CONTENT_FIELDS:
-            out[k] = _trim_subtree(v, per_field_budget)
+            reducer = _FIELD_REDUCERS.get(k, _reduce_text)
+            out[k] = reducer(v, per_field_budget)
         else:
-            # Reserved or unknown — pass through. Unknown-field
-            # passthrough is intentional: a future emit that adds a new
-            # routing flag must NOT be silently truncated.
             out[k] = v
+
+    # Final envelope hard cap. Collapse the largest remaining truncatable
+    # field iteratively until under cap. Stops if all collapsed (already
+    # placeholders) — at that point we can't shrink any further without
+    # touching reserved metadata, which is contractually off-limits.
+    while _serialized_size(out) > max_bytes:
+        largest = None
+        largest_size = -1
+        for k in present_content:
+            v = out.get(k)
+            if isinstance(v, dict) and "__truncated__" in v:
+                continue  # already collapsed
+            size = _serialized_size(v)
+            if size > largest_size:
+                largest_size = size
+                largest = k
+        if largest is None or largest_size < 100:
+            break
+        out[largest] = _placeholder(
+            f"{largest} exceeded total {max_bytes}-byte envelope cap"
+        )
+
     return out
 
 
