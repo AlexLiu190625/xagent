@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Callable, Dict, List, Optional
 
@@ -8,6 +9,8 @@ from ..utils.token_utils import (
     get_token_counter,
     split_text_by_tokens,
 )
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SEPARATORS: List[str] = ["\n\n", "\n", "。", "！", "？", ". ", ", ", " "]
 
@@ -399,6 +402,23 @@ def apply_recursive_strategy(
         windows = _window_with_overlap_and_metadata(
             all_chunk_records, chunk_size, chunk_overlap
         )
+
+    units_total_chars = sum(len(r.get("text", "")) for r in all_chunk_records)
+    out_lens = [len(w.get("text", "")) for w in windows]
+    logger.info(
+        "[RAG][chunk] apply_recursive_strategy: semantic_units=%s units_total_chars=%s "
+        "chunk_size=%r use_token_count=%s overlap=%s -> windows=%s "
+        "window_char_min=%s max=%s sum=%s",
+        len(all_chunk_records),
+        units_total_chars,
+        chunk_size_param,
+        use_token_count,
+        chunk_overlap,
+        len(windows),
+        min(out_lens, default=0),
+        max(out_lens, default=0),
+        sum(out_lens),
+    )
 
     # Create final chunk records with preserved metadata
     return [

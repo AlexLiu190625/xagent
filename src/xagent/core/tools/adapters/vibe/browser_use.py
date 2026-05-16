@@ -31,6 +31,16 @@ from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 logger = logging.getLogger(__name__)
 
 
+class BrowserTaskSessionMixin:
+    """Keeps browser tool default sessions aligned during task setup."""
+
+    _task_id: Optional[str] = None
+
+    async def setup(self, task_id: Optional[str] = None) -> None:
+        if task_id:
+            self._task_id = task_id
+
+
 # ============== Input/Output Schemas ==============
 
 
@@ -238,7 +248,7 @@ class BrowserPdfResult(BaseModel):
 # ============== Tool Implementations ==============
 
 
-class BrowserNavigateTool(AbstractBaseTool):
+class BrowserNavigateTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Navigate to a URL in a browser session."""
 
@@ -256,6 +266,14 @@ class BrowserNavigateTool(AbstractBaseTool):
     @property
     def description(self) -> str:
         return """Navigate to URL. Browser session auto-created.
+
+        This tool only opens a page and reports navigation success. It does not inspect
+        page content, validate visual rendering, take screenshots, export images, or
+        prove that a page meets the user's request. After a successful navigation to the
+        intended URL, do not call browser_navigate again for the same URL unless the
+        previous navigation failed or the URL changed. Use browser_screenshot when visual
+        inspection or rendered output is required, and use browser_extract_text when page
+        text is required.
 
         Workspace files: Use filename (e.g., "poster.html") - auto-searches input/output/temp dirs.
 
@@ -415,7 +433,7 @@ class BrowserNavigateTool(AbstractBaseTool):
                     )
 
 
-class BrowserClickTool(AbstractBaseTool):
+class BrowserClickTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Click an element on the current page."""
 
@@ -466,7 +484,7 @@ class BrowserClickTool(AbstractBaseTool):
         return BrowserClickResult(**result).model_dump()
 
 
-class BrowserFillTool(AbstractBaseTool):
+class BrowserFillTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Fill an input field with text."""
 
@@ -517,7 +535,7 @@ class BrowserFillTool(AbstractBaseTool):
         return BrowserFillResult(**result).model_dump()
 
 
-class BrowserScreenshotTool(AbstractBaseTool):
+class BrowserScreenshotTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Take a screenshot of the current page."""
 
@@ -630,7 +648,7 @@ class BrowserScreenshotTool(AbstractBaseTool):
         return BrowserScreenshotResult(**result).model_dump()
 
 
-class BrowserExtractTextTool(AbstractBaseTool):
+class BrowserExtractTextTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Extract text content from the page."""
 
@@ -680,7 +698,7 @@ class BrowserExtractTextTool(AbstractBaseTool):
         return BrowserExtractTextResult(**result).model_dump()
 
 
-class BrowserEvaluateTool(AbstractBaseTool):
+class BrowserEvaluateTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Execute JavaScript code in the browser."""
 
@@ -790,7 +808,7 @@ class BrowserListSessionsTool(AbstractBaseTool):
         return result
 
 
-class BrowserSelectOptionTool(AbstractBaseTool):
+class BrowserSelectOptionTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Select an option from a dropdown."""
 
@@ -842,7 +860,7 @@ class BrowserSelectOptionTool(AbstractBaseTool):
         return BrowserSelectOptionResult(**result).model_dump()
 
 
-class BrowserWaitForSelectorTool(AbstractBaseTool):
+class BrowserWaitForSelectorTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Wait for an element to appear on the page."""
 
@@ -893,7 +911,7 @@ class BrowserWaitForSelectorTool(AbstractBaseTool):
         return BrowserWaitForSelectorResult(**result).model_dump()
 
 
-class BrowserCloseTool(AbstractBaseTool):
+class BrowserCloseTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Close a browser session and free resources."""
 
@@ -939,7 +957,7 @@ class BrowserCloseTool(AbstractBaseTool):
         return BrowserCloseResult(**result).model_dump()
 
 
-class BrowserPdfTool(AbstractBaseTool):
+class BrowserPdfTool(BrowserTaskSessionMixin, AbstractBaseTool):
     category = ToolCategory.BROWSER
     """Save current page as PDF."""
 

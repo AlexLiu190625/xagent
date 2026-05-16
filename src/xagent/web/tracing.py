@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from ..core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
 from ..core.agent.trace import (
     BaseTraceHandler,
     ConsoleTraceHandler,
@@ -13,7 +14,6 @@ from ..core.agent.trace import (
     TraceHandler,
     Tracer,
 )
-from ..core.agent_v2.checkpoint import CHECKPOINT_TYPE
 from ..core.tracing import create_agent_tracer
 from .api.trace_handlers import DatabaseTraceHandler
 from .models.user import User
@@ -28,7 +28,7 @@ class EphemeralCheckpointTraceHandler(BaseTraceHandler):
 
     async def _handle_system_event(self, event: CoreTraceEvent) -> None:
         data = event.data if isinstance(event.data, dict) else {}
-        if data.get("checkpoint_type") != CHECKPOINT_TYPE:
+        if data.get("checkpoint_type") not in READABLE_CHECKPOINT_TYPES:
             return
 
         raw_id = (

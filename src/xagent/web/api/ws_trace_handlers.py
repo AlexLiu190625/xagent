@@ -201,8 +201,8 @@ def get_event_type_mapping(event: TraceEvent) -> str:
 logger = logging.getLogger(__name__)
 
 
-def is_agent_v2_checkpoint_data(data: Any) -> bool:
-    """Return True for internal agent_v2 checkpoint payloads.
+def is_agent_checkpoint_data(data: Any) -> bool:
+    """Return True for internal agent checkpoint payloads.
 
     These events are persisted for resume/recovery, but they are too large and
     too low-level for the user-facing execution log stream.
@@ -210,10 +210,12 @@ def is_agent_v2_checkpoint_data(data: Any) -> bool:
     if not isinstance(data, dict):
         return False
     try:
-        from ...core.agent_v2.checkpoint import CHECKPOINT_TYPE
+        from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
     except Exception:
-        CHECKPOINT_TYPE = "agent_v2_execution_checkpoint"
-    return data.get("checkpoint_type") == CHECKPOINT_TYPE or (
+        READABLE_CHECKPOINT_TYPES = frozenset(
+            {"agent_execution_checkpoint", "agent_v2_execution_checkpoint"}
+        )
+    return data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES or (
         data.get("type") == "checkpoint"
         and isinstance(data.get("pattern_state"), dict)
         and isinstance(data.get("context"), dict)
@@ -323,7 +325,7 @@ class WebSocketTraceHandler(TraceHandler):
 
         # Make a deep copy of data and serialize non-JSON-serializable objects
         data = self._serialize_data(event.data)
-        if is_agent_v2_checkpoint_data(data):
+        if is_agent_checkpoint_data(data):
             return None
 
         # Create the base stream event

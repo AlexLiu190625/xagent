@@ -154,16 +154,6 @@ def test_task_create_does_not_persist_inaccessible_model_ids(
     assert data2["model_id"] != other_user_model_id
 
 
-def test_standalone_task_create_defaults_to_think(test_db, user1_headers):
-    resp = client.post(
-        "/api/chat/task/create",
-        json={"title": "test", "description": "desc"},
-        headers=user1_headers,
-    )
-    assert resp.status_code == 200
-    assert resp.json()["execution_mode"] == "think"
-
-
 def test_task_create_allows_shared_model_ids(
     test_db, user1_headers, user2_headers, sample_model_data
 ):
@@ -200,11 +190,7 @@ def test_task_create_allows_shared_model_ids(
     assert data["model_id"] == shared_model_id
 
 
-def test_standalone_task_create_defaults_to_auto_in_v2(
-    test_db, user1_headers, monkeypatch
-):
-    monkeypatch.setenv("XAGENT_AGENT_RUNTIME", "v2")
-
+def test_standalone_task_create_defaults_to_auto(test_db, user1_headers):
     resp = client.post(
         "/api/chat/task/create",
         json={"title": "test", "description": "desc"},

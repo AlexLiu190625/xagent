@@ -132,7 +132,14 @@ def chunk_document(
     }
 
     logger.info(
-        "Starting document chunking: doc_id=%s, strategy=%s", doc_id, chunk_strategy
+        "[RAG][chunk] starting doc_id=%s strategy=%s chunk_size=%s chunk_overlap=%s "
+        "use_token_count=%s enable_protected_content=%s",
+        doc_id,
+        chunk_strategy,
+        chunk_size,
+        chunk_overlap,
+        use_token_count,
+        enable_protected_content,
     )
 
     # Validate chunk parameters
@@ -174,6 +181,14 @@ def chunk_document(
         raise DocumentNotFoundError(
             f"No parsed content found for doc_id={doc_id}, parse_hash={parse_hash}"
         )
+    _para_chars = sum(len(p.get("text") or "") for p in paragraphs)
+    logger.info(
+        "[RAG][chunk] loaded parsed paragraphs doc_id=%s paragraph_count=%s "
+        "total_chars=%s",
+        doc_id,
+        len(paragraphs),
+        _para_chars,
+    )
 
     # Spreadsheet row data benefits from deterministic one-row-per-chunk output
     # for retrieval quality; bypass generic recursive merge when parse metadata
@@ -232,6 +247,23 @@ def chunk_document(
         logger.error("Failed to write chunks to database: %s", e)
         raise DatabaseOperationError(f"Database write failed: {e}") from e
 
+    _lengths = [len(c.get("text") or "") for c in indexed_chunks]
+    if _lengths:
+        logger.info(
+            "[RAG][chunk] completed doc_id=%s chunk_count=%s char_len min=%s max=%s "
+            "sum=%s avg=%.1f",
+            doc_id,
+            len(_lengths),
+            min(_lengths),
+            max(_lengths),
+            sum(_lengths),
+            sum(_lengths) / len(_lengths),
+        )
+    else:
+        logger.info(
+            "[RAG][chunk] completed doc_id=%s chunk_count=0 (no chunk texts)",
+            doc_id,
+        )
     logger.info(
         "Document chunking completed: doc_id=%s, chunks=%s", doc_id, len(indexed_chunks)
     )

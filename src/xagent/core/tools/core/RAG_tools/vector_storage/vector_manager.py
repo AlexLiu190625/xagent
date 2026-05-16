@@ -364,6 +364,17 @@ def read_chunks_for_embedding(
             pending_count,
             model,
         )
+        if pending_chunks:
+            _lens = [len(c.text) for c in pending_chunks]
+            logger.info(
+                "[RAG][embedding] read_chunks_for_embedding pending text stats: "
+                "count=%s char_len min=%s max=%s sum=%s avg=%.1f",
+                len(_lens),
+                min(_lens),
+                max(_lens),
+                sum(_lens),
+                sum(_lens) / len(_lens),
+            )
 
         return EmbeddingReadResponse(
             chunks=pending_chunks, total_count=total_count, pending_count=pending_count

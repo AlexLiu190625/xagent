@@ -55,17 +55,13 @@ class ExecutionMode(enum.Enum):
     FLASH = "flash"  # Simple, quick tasks (single_call pattern)
     BALANCED = "balanced"  # Most everyday tasks (react pattern)
     THINK = "think"  # Complex, multi-step tasks (dag_plan_execute pattern)
-    AUTO = "auto"  # Let agent_v2 choose final answer, ReAct, or DAG
+    AUTO = "auto"  # Let agent choose final answer, ReAct, or DAG
 
 
 class AgentType(enum.Enum):
     """Agent type enumeration"""
 
     STANDARD = "standard"  # Standard purpose agent
-    TEXT2SQL = "text2sql"  # Text2SQL agent
-    # Future agent types can be added here
-    # CODE_ASSISTANT = "code_assistant"
-    # DATA_ANALYSIS = "data_analysis"
 
 
 class Task(Base):  # type: ignore

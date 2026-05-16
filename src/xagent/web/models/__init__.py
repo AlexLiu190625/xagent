@@ -11,7 +11,6 @@ from .sandbox import SandboxInfo, SandboxSnapshot
 from .system_setting import SystemSetting
 from .task import DAGExecution, Task
 from .template_stats import TemplateStats, UserTemplateRelation
-from .text2sql import Text2SQLDatabase
 from .tool_config import ToolConfig, ToolUsage
 from .uploaded_file import UploadedFile
 from .user import User, UserDefaultModel, UserModel
@@ -37,7 +36,6 @@ __all__ = [
     "DAGExecution",
     "TemplateStats",
     "UserTemplateRelation",
-    "Text2SQLDatabase",
     "ToolConfig",
     "ToolUsage",
     "SystemSetting",

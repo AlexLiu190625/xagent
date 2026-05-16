@@ -1,34 +1,32 @@
-"""
-Agent Pattern system with ReAct, DAG Plan Execute, and Single Call patterns.
-"""
-
-from .base import Action, AgentPattern, ToolRegistry
-from .dag_plan_execute import (
-    DAGPlanExecutePattern,
-    ExecutionPhase,
+from .auto import AutoAction, AutoDecision, AutoPattern
+from .base import AgentPattern, PatternResult
+from .dag import (
+    CallablePlanGenerator,
+    DAGPattern,
     ExecutionPlan,
+    LLMPlanGenerator,
+    PlanGenerationRequest,
+    PlanGenerator,
     PlanStep,
-    StepInjection,
-    StepStatus,
+    PlanValidationError,
 )
-
-# Import ReAct components
-from .react import ReActPattern, ReActStepType
-
-# Import SingleCall components
-from .single_call import SingleCallPattern
+from .react import ReActPattern, ReActReasoningMode, ToolCallRecord
 
 __all__ = [
     "AgentPattern",
-    "Action",
-    "ToolRegistry",
-    "ReActPattern",
-    "ReActStepType",
-    "DAGPlanExecutePattern",
-    "PlanStep",
+    "AutoAction",
+    "AutoDecision",
+    "AutoPattern",
+    "CallablePlanGenerator",
+    "DAGPattern",
     "ExecutionPlan",
-    "StepStatus",
-    "ExecutionPhase",
-    "StepInjection",
-    "SingleCallPattern",
+    "LLMPlanGenerator",
+    "PlanGenerationRequest",
+    "PlanGenerator",
+    "PlanValidationError",
+    "PlanStep",
+    "PatternResult",
+    "ReActPattern",
+    "ReActReasoningMode",
+    "ToolCallRecord",
 ]

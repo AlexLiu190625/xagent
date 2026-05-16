@@ -1,516 +1,720 @@
-"""
-Comprehensive unit tests for the AgentRunner class.
+from __future__ import annotations
 
-This module tests the AgentRunner functionality including:
-- Pattern execution with success and failure scenarios
-- Precondition resolution
-- Exception handling and error reporting
-- User input handling during execution
-- Multiple pattern execution strategies
-"""
-
-from typing import Any, Dict, List, Optional
-from unittest.mock import patch
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import pytest
 
-from xagent.core.agent.agent import Agent
-from xagent.core.agent.context import AgentContext
-from xagent.core.agent.exceptions import AgentException
-from xagent.core.agent.pattern.base import AgentPattern
-from xagent.core.agent.precondition import PreconditionResolver
+from xagent.core.agent import (
+    Agent,
+    ContextManager,
+    ExecutionContext,
+    PatternRuntime,
+    TraceEventCallback,
+)
 from xagent.core.agent.runner import AgentRunner
-from xagent.core.memory import MemoryStore
-from xagent.core.memory.in_memory import InMemoryMemoryStore
-from xagent.core.tools.adapters.vibe import Tool
+from xagent.core.agent.runtime import LLMCallInterrupted
 
 
-class MockPattern(AgentPattern):
-    """Mock pattern for testing purposes."""
+@pytest.fixture(autouse=True)
+def reset_context_manager() -> None:
+    manager = ContextManager()
+    manager._contexts.clear()  # type: ignore[attr-defined]
+    yield
+    manager._contexts.clear()  # type: ignore[attr-defined]
 
-    def __init__(self, name: str, result: Dict[str, Any], should_fail: bool = False):
-        self.name = name
+
+@dataclass
+class FakeWorkspace:
+    id: str
+    workspace_dir: Path
+    input_dir: Path
+    output_dir: Path
+    temp_dir: Path
+    allowed_external_dirs: list[Path]
+
+
+class FakeWorkspaceManager:
+    def __init__(self, tmp_path: Path) -> None:
+        self.tmp_path = tmp_path
+        self.calls: list[dict[str, Any]] = []
+
+    def get_or_create_workspace(
+        self,
+        base_dir: str,
+        task_id: str,
+        allowed_external_dirs: list[str] | None = None,
+    ) -> FakeWorkspace:
+        self.calls.append(
+            {
+                "base_dir": base_dir,
+                "task_id": task_id,
+                "allowed_external_dirs": allowed_external_dirs,
+            }
+        )
+        workspace_dir = self.tmp_path / task_id
+        return FakeWorkspace(
+            id=task_id,
+            workspace_dir=workspace_dir,
+            input_dir=workspace_dir / "input",
+            output_dir=workspace_dir / "output",
+            temp_dir=workspace_dir / "temp",
+            allowed_external_dirs=[Path(path) for path in allowed_external_dirs or []],
+        )
+
+
+class FakeMemoryManager:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+    def get_or_create_session(
+        self,
+        *,
+        execution_id: str,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        self.calls.append(
+            {
+                "execution_id": execution_id,
+                "user_id": user_id,
+                "session_id": session_id,
+            }
+        )
+        return {
+            "session_id": session_id or f"memory-{execution_id}",
+            "snapshot": {"summary": f"resume {execution_id}"},
+        }
+
+
+class AsyncMemoryManager(FakeMemoryManager):
+    async def get_or_create_session(
+        self,
+        *,
+        execution_id: str,
+        user_id: str | None = None,
+        session_id: str | None = None,
+    ) -> dict[str, Any]:
+        return super().get_or_create_session(
+            execution_id=execution_id,
+            user_id=user_id,
+            session_id=session_id,
+        )
+
+
+class FakePattern:
+    def __init__(self, result: dict[str, Any]) -> None:
         self.result = result
-        self.should_fail = should_fail
-        self.call_count = 0
-        self._pattern_name = name  # Store the original name for error reporting
+        self.calls: list[dict[str, Any]] = []
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return dict(self.result)
+
+
+class FailingPattern:
+    def __init__(self, error: str) -> None:
+        self.error = error
+
+    async def run(self, **_: Any) -> dict[str, Any]:
+        return {"success": False, "error": self.error}
+
+
+class LLMInterruptedPattern:
+    async def run(self, **_: Any) -> dict[str, Any]:
+        raise LLMCallInterrupted("paused during LLM call")
+
+
+class StatefulPattern:
+    def __init__(self) -> None:
+        self.state: dict[str, Any] = {}
+        self.calls: list[dict[str, Any]] = []
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        self.state = state
+
+    async def run(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "success": True,
+            "output": self.state["output"],
+            "message_count": len(kwargs["context"].messages),
+        }
+
+
+class InjectingPattern:
+    def __init__(self, runner: AgentRunner, execution_id: str) -> None:
+        self.runner = runner
+        self.execution_id = execution_id
+
+    async def run(self, *, context: ExecutionContext, **_: Any) -> dict[str, Any]:
+        injected = await self.runner.inject_user_message(
+            self.execution_id,
+            "Injected while resumed.",
+            request_interrupt=False,
+        )
+        return {
+            "success": True,
+            "same_context": injected is context,
+            "messages": [message.content for message in context.messages],
+        }
+
+
+class TrackingCallback:
+    def __init__(self) -> None:
+        self.events: list[tuple[str, str]] = []
+
+    async def on_run_start(self, **payload: Any) -> None:
+        context = payload["context"]
+        self.events.append(("start", context.execution_id))
+
+    async def on_run_end(self, **payload: Any) -> None:
+        context = payload["context"]
+        self.events.append(("end", context.execution_id))
+
+
+class RecordingTraceEventTracer:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def trace_event(
+        self,
+        event_type: Any,
+        *,
+        task_id: str | None = None,
+        step_id: str | None = None,
+        data: dict[str, Any] | None = None,
+    ) -> str:
+        self.events.append(
+            {
+                "event_type": getattr(event_type, "value", str(event_type)),
+                "task_id": task_id,
+                "step_id": step_id,
+                "data": data or {},
+            }
+        )
+        return str(len(self.events))
+
+
+class InterruptingPattern:
+    def __init__(
+        self,
+        runner: AgentRunner,
+        execution_id: str,
+        *,
+        before_interrupt_check: Any | None = None,
+    ) -> None:
+        self.runner = runner
+        self.execution_id = execution_id
+        self.before_interrupt_check = before_interrupt_check
 
     async def run(
         self,
-        task: str,
-        memory: MemoryStore,
-        tools: List[Tool],
-        context: Optional[AgentContext] = None,
-    ) -> Dict[str, Any]:
-        """Mock run method."""
-        self.call_count += 1
+        *,
+        context: ExecutionContext,
+        runtime: PatternRuntime,
+        **_: Any,
+    ) -> dict[str, Any]:
+        if callable(self.before_interrupt_check):
+            maybe_result = self.before_interrupt_check()
+            if maybe_result is not None:
+                await maybe_result
+        else:
+            self.runner.pause(self.execution_id, reason="pause before step")
 
-        if self.should_fail:
-            if self.result.get("exception_type") == "AgentException":
-                raise AgentException(
-                    self.result.get("error", "Mock AgentException"),
-                    context={"test": "context"},
-                )
-            else:
-                raise Exception(self.result.get("error", "Mock exception"))
-
-        # If this is a user input pattern and we've already been called once,
-        # return a successful result instead of requesting more input
-        if (
-            self.result.get("need_user_input")
-            and self.call_count > 1
-            and context
-            and self.result.get("field") in context.state
-        ):
-            return {"success": True, "message": "Task completed with user input"}
-
-        return self.result
-
-
-class MockTool(Tool):
-    """Mock tool for testing."""
-
-    def __init__(self, name: str):
-        super().__init__(name=name)
-
-    async def execute(self, **kwargs) -> Any:
-        return {"mock_tool_result": True}
-
-
-class MockMemoryStore(InMemoryMemoryStore):
-    """Mock memory store for testing."""
-
-    def __init__(self):
-        super().__init__()
-
-    async def store(self, key: str, value: Any) -> None:
-        # Create a MemoryNote for simple key-value storage
-        from xagent.core.memory.core import MemoryNote
-
-        note = MemoryNote(content=str(value), metadata={"key": key})
-        self.add(note)
-
-    async def retrieve(self, key: str) -> Optional[Any]:
-        # Search for notes with this key
-        results = self.search(key)
-        for note in results:
-            if note.metadata.get("key") == key:
-                return note.content
-        return None
-
-
-class TestAgentRunner:
-    """Test cases for AgentRunner class."""
-
-    @pytest.fixture
-    def mock_memory(self):
-        """Create a mock memory store."""
-        return MockMemoryStore()
-
-    @pytest.fixture
-    def mock_tools(self):
-        """Create mock tools."""
-        return [MockTool("test_tool")]
-
-    @pytest.fixture
-    def successful_pattern(self):
-        """Create a successful mock pattern."""
-        return MockPattern(
-            name="successful_pattern",
-            result={"success": True, "message": "Task completed successfully"},
-        )
-
-    @pytest.fixture
-    def failing_pattern(self):
-        """Create a failing mock pattern."""
-        return MockPattern(
-            name="failing_pattern",
-            result={"success": False, "error": "Pattern failed"},
-            should_fail=True,
-        )
-
-    @pytest.fixture
-    def user_input_pattern(self):
-        """Create a pattern that requests user input."""
-        return MockPattern(
-            name="user_input_pattern",
-            result={
-                "need_user_input": True,
-                "field": "test_field",
-                "question": "Please provide test_field value:",
-            },
-        )
-
-    @pytest.fixture
-    def precondition_resolver(self):
-        """Create a precondition resolver."""
-        return PreconditionResolver(
-            required_fields=["required_field"],
-            questions={"required_field": "Please enter the required field:"},
-        )
-
-    @pytest.fixture
-    def agent(self, successful_pattern, mock_memory, mock_tools):
-        """Create a test agent."""
-        return Agent(
-            name="test_agent",
-            patterns=[successful_pattern],
-            memory=mock_memory,
-            tools=mock_tools,
-        )
-
-    @pytest.fixture
-    def agent_with_precondition(
-        self, successful_pattern, mock_memory, mock_tools, precondition_resolver
-    ):
-        """Create an agent with precondition resolver."""
-        return Agent(
-            name="test_agent_with_precondition",
-            patterns=[successful_pattern],
-            memory=mock_memory,
-            tools=mock_tools,
-        )
-
-    @pytest.fixture
-    def runner(self, agent):
-        """Create an AgentRunner instance."""
-        return AgentRunner(agent=agent)
-
-    @pytest.fixture
-    def runner_with_precondition(self, agent_with_precondition, precondition_resolver):
-        """Create an AgentRunner with precondition resolver."""
-        return AgentRunner(
-            agent=agent_with_precondition, precondition=precondition_resolver
-        )
-
-    def test_agent_runner_initialization(self, runner, agent):
-        """Test AgentRunner initialization."""
-        assert runner.agent == agent
-        assert runner.context is not None
-        assert isinstance(runner.context, AgentContext)
-        assert runner.precondition is None
-
-    def test_agent_runner_with_precondition(
-        self, runner_with_precondition, precondition_resolver
-    ):
-        """Test AgentRunner initialization with precondition."""
-        assert runner_with_precondition.precondition == precondition_resolver
-
-    @pytest.mark.asyncio
-    async def test_successful_pattern_execution(self, runner):
-        """Test successful execution of a single pattern."""
-        result = await runner.run("test task")
-
-        assert result["success"] is True
-        assert result["message"] == "Task completed successfully"
-        assert runner.agent.patterns[0].call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_precondition_resolution_success(self, runner_with_precondition):
-        """Test successful precondition resolution."""
-        # Set the required field in context
-        runner_with_precondition.context.state["required_field"] = "test_value"
-
-        result = await runner_with_precondition.run("test task")
-
-        assert result["success"] is True
-        assert "required_field" in runner_with_precondition.context.state
-        assert runner_with_precondition.context.state["required_field"] == "test_value"
-
-    @pytest.mark.asyncio
-    async def test_precondition_resolution_with_user_input(
-        self, runner_with_precondition, capsys
-    ):
-        """Test precondition resolution requiring user input."""
-        # Mock user input
-        with patch("builtins.input", return_value="user_provided_value"):
-            result = await runner_with_precondition.run("test task")
-
-        assert result["success"] is True
-        assert (
-            runner_with_precondition.context.state["required_field"]
-            == "user_provided_value"
-        )
-
-        # Check that the user was prompted
-        captured = capsys.readouterr()
-        assert "[Agent asks] Please enter the required field:" in captured.out
-
-    @pytest.mark.asyncio
-    async def test_multiple_patterns_first_succeeds(self, mock_memory, mock_tools):
-        """Test multiple patterns where the first one succeeds."""
-        patterns = [
-            MockPattern(
-                "pattern1", {"success": True, "message": "First pattern succeeded"}
-            ),
-            MockPattern(
-                "pattern2", {"success": True, "message": "Second pattern would succeed"}
-            ),
-        ]
-
-        agent = Agent(
-            name="test_agent", patterns=patterns, memory=mock_memory, tools=mock_tools
-        )
-
-        runner = AgentRunner(agent=agent)
-        result = await runner.run("test task")
-
-        assert result["success"] is True
-        assert result["message"] == "First pattern succeeded"
-        assert patterns[0].call_count == 1
-        assert patterns[1].call_count == 0  # Second pattern should not be called
-
-    @pytest.mark.asyncio
-    async def test_multiple_patterns_first_fails_second_succeeds(
-        self, mock_memory, mock_tools
-    ):
-        """Test multiple patterns where the first fails and the second succeeds."""
-        patterns = [
-            MockPattern(
-                "failing_pattern",
-                {"success": False, "error": "First failed"},
-                should_fail=True,
-            ),
-            MockPattern(
-                "successful_pattern", {"success": True, "message": "Second succeeded"}
-            ),
-        ]
-
-        agent = Agent(
-            name="test_agent", patterns=patterns, memory=mock_memory, tools=mock_tools
-        )
-
-        runner = AgentRunner(agent=agent)
-        result = await runner.run("test task")
-
-        assert result["success"] is True
-        assert result["message"] == "Second succeeded"
-        assert patterns[0].call_count == 1
-        assert patterns[1].call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_all_patterns_fail(self, mock_memory, mock_tools):
-        """Test scenario where all patterns fail."""
-        patterns = [
-            MockPattern(
-                "failing_pattern1",
-                {"success": False, "error": "First failed"},
-                should_fail=True,
-            ),
-            MockPattern(
-                "failing_pattern2",
-                {"success": False, "error": "Second failed"},
-                should_fail=True,
-            ),
-        ]
-
-        agent = Agent(
-            name="test_agent", patterns=patterns, memory=mock_memory, tools=mock_tools
-        )
-
-        runner = AgentRunner(agent=agent)
-        result = await runner.run("test task")
-
-        assert result["success"] is False
-        assert "All 2 patterns failed" in result["error"]
-        assert "pattern_errors" in result
-        assert len(result["pattern_errors"]) == 2
-        assert result["patterns_attempted"] == 2
-
-    @pytest.mark.asyncio
-    @pytest.mark.slow
-    async def test_pattern_with_user_input_request(self, mock_memory, mock_tools):
-        """Test pattern that requests user input during execution."""
-        patterns = [
-            MockPattern(
-                "user_input_pattern",
-                result={
-                    "need_user_input": True,
-                    "field": "dynamic_field",
-                    "question": "Please provide dynamic_field value:",
-                },
+        if await runtime.should_interrupt():
+            await runtime.checkpoint(
+                "interrupted",
+                context=context,
+                pattern=self,
+                status="interrupted",
+                metadata={"safe_point": "during_pattern"},
             )
-        ]
+            return {
+                "success": False,
+                "status": "interrupted",
+                "error": runtime.interrupt_reason or "interrupted",
+            }
 
-        agent = Agent(
-            name="test_agent", patterns=patterns, memory=mock_memory, tools=mock_tools
-        )
+        return {"success": True, "output": "continued"}
 
-        runner = AgentRunner(agent=agent)
 
-        # Mock user input
-        with patch("builtins.input", return_value="dynamic_value"):
-            await runner.run("test task")
+class TracerCheckpointStore:
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
 
-        # The pattern should be called twice - once to request input, once with input
-        assert patterns[0].call_count == 2
-        assert runner.context.state["dynamic_field"] == "dynamic_value"
+    async def checkpoint(self, **payload: Any) -> None:
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
 
-    @pytest.mark.asyncio
-    async def test_agent_exception_handling(self, mock_memory, mock_tools):
-        """Test handling of AgentException."""
-        patterns = [
-            MockPattern(
-                "agent_exception_pattern",
-                result={
-                    "exception_type": "AgentException",
-                    "error": "Agent-specific error occurred",
-                },
-                should_fail=True,
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+@pytest.mark.asyncio
+async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None:
+    workspace_manager = FakeWorkspaceManager(tmp_path)
+    memory_manager = FakeMemoryManager()
+    callback = TrackingCallback()
+    pattern = FakePattern({"success": True, "output": "done"})
+    agent = Agent(
+        name="writer",
+        patterns=[pattern],
+        tools=["local-tool"],
+        llm="fake-llm",
+        system_prompt="System prompt",
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=workspace_manager,
+        memory_manager=memory_manager,
+        callbacks=[callback],
+        workspace_base_dir=str(tmp_path / "workspaces"),
+    )
+
+    result = await runner.run(
+        task="Write a summary",
+        execution_id="exec-1",
+        user_id="user-1",
+        session_id="session-1",
+        allowed_external_dirs=[str(tmp_path / "kb")],
+        extra_tools=["extra-tool"],
+        metadata={"source": "test"},
+    )
+
+    assert result["success"] is True
+    assert result["execution_id"] == "exec-1"
+    context = result["context"]
+    assert isinstance(context, ExecutionContext)
+    assert context.system_prompt == "System prompt"
+    assert context.user_id == "user-1"
+    assert context.session_id == "session-1"
+    assert context.workspace_id == "exec-1"
+    assert context.memory_session_id == "session-1"
+    assert context.memory_snapshot == {"summary": "resume exec-1"}
+    assert context.metadata["task"] == "Write a summary"
+    assert context.metadata["source"] == "test"
+    assert [message.role for message in context.messages] == ["user", "assistant"]
+    assert context.messages[0].content == "Write a summary"
+    assert context.messages[1].content == "done"
+    assert ContextManager().get_context("exec-1") is context
+
+    pattern_call = pattern.calls[0]
+    assert pattern_call["task"] == "Write a summary"
+    assert pattern_call["context"] is context
+    assert pattern_call["tools"] == ["local-tool", "extra-tool"]
+    assert pattern_call["llm"] == "fake-llm"
+    assert isinstance(pattern_call["runtime"], PatternRuntime)
+    assert workspace_manager.calls[0]["task_id"] == "exec-1"
+    assert callback.events == [("start", "exec-1"), ("end", "exec-1")]
+
+
+@pytest.mark.asyncio
+async def test_runner_awaits_async_memory_manager(tmp_path: Path) -> None:
+    memory_manager = AsyncMemoryManager()
+    pattern = FakePattern({"success": True, "output": "done"})
+    agent = Agent(name="writer", patterns=[pattern])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+        memory_manager=memory_manager,
+    )
+
+    result = await runner.run(
+        task="Write a summary",
+        execution_id="exec-async-memory",
+        session_id="session-async",
+    )
+
+    assert result["success"] is True
+    assert result["context"].memory_session_id == "session-async"
+    assert result["context"].memory_snapshot == {"summary": "resume exec-async-memory"}
+
+
+@pytest.mark.asyncio
+async def test_runner_tries_multiple_patterns_and_collects_failures(
+    tmp_path: Path,
+) -> None:
+    first = FailingPattern("first failed")
+    second = FakePattern({"success": True, "message": "second worked"})
+    agent = Agent(name="writer", patterns=[first, second])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Recover", execution_id="exec-2")
+
+    assert result["success"] is True
+    assert result["pattern"] == "FakePattern"
+    context = result["context"]
+    assert [message.content for message in context.messages] == [
+        "Recover",
+        "second worked",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_returns_aggregate_error_when_all_patterns_fail(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[FailingPattern("first failed"), FailingPattern("second failed")],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Impossible", execution_id="exec-3")
+
+    assert result["success"] is False
+    assert result["patterns_attempted"] == 2
+    assert len(result["pattern_errors"]) == 2
+    assert result["context"].messages[0].content == "Impossible"
+
+
+@pytest.mark.asyncio
+async def test_runner_returns_single_pattern_failure_result(tmp_path: Path) -> None:
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {
+                    "success": False,
+                    "status": "failed",
+                    "failure_reason": "structured_failure",
+                    "error": "failed with details",
+                }
             )
-        ]
+        ],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
 
-        agent = Agent(
-            name="test_agent", patterns=patterns, memory=mock_memory, tools=mock_tools
+    result = await runner.run(task="Impossible", execution_id="exec-single-fail")
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "structured_failure"
+    assert result["error"] == "failed with details"
+    assert "pattern_errors" not in result
+
+
+@pytest.mark.asyncio
+async def test_runner_does_not_add_empty_user_message_for_missing_task(
+    tmp_path: Path,
+) -> None:
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task=None, execution_id="exec-empty-task")
+
+    assert result["success"] is True
+    assert result["context"].messages == []
+
+
+@pytest.mark.asyncio
+async def test_runner_stops_on_llm_call_interrupt(tmp_path: Path) -> None:
+    fallback = FakePattern({"success": True, "output": "should not run"})
+    agent = Agent(name="writer", patterns=[LLMInterruptedPattern(), fallback])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Pause me", execution_id="exec-llm-interrupt")
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert result["error"] == "paused during LLM call"
+    assert result["pattern"] == "LLMInterruptedPattern"
+    assert fallback.calls == []
+
+
+@pytest.mark.asyncio
+async def test_runner_restores_context_and_pattern_from_checkpoint(
+    tmp_path: Path,
+) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-resume")
+    checkpoint_context.add_user_message("Original task")
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "StatefulPattern",
+        "pattern_state": {"output": "restored"},
+    }
+    pattern = StatefulPattern()
+    agent = Agent(name="writer", patterns=[pattern])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(
+        task="Should not be appended",
+        execution_id="exec-resume",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "restored"
+    assert result["message_count"] == 1
+    assert pattern.state == {"output": "restored"}
+    assert [message.content for message in result["context"].messages] == [
+        "Original task",
+        "restored",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runner_registers_restored_context_for_live_message_injection(
+    tmp_path: Path,
+) -> None:
+    checkpoint_context = ExecutionContext(execution_id="exec-restore-inject")
+    checkpoint_context.add_user_message("Original task")
+    checkpoint = {
+        "context": checkpoint_context.to_dict(),
+        "pattern": "InjectingPattern",
+        "pattern_state": {},
+    }
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InjectingPattern(runner, "exec-restore-inject")]
+
+    result = await runner.run(
+        task=None,
+        execution_id="exec-restore-inject",
+        checkpoint=checkpoint,
+    )
+
+    assert result["success"] is True
+    assert result["same_context"] is True
+    assert result["messages"] == ["Original task", "Injected while resumed."]
+
+
+@pytest.mark.asyncio
+async def test_runner_pause_requests_interrupt_for_active_execution(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [InterruptingPattern(runner, "exec-pause")]
+
+    result = await runner.run(task="Calculate 6*7", execution_id="exec-pause")
+
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    assert tracer.by_execution_id["exec-pause"]["label"] == "interrupted"
+    assert (
+        tracer.by_execution_id["exec-pause"]["metadata"]["safe_point"]
+        == "during_pattern"
+    )
+
+
+@pytest.mark.asyncio
+async def test_runner_inject_user_message_updates_live_context_and_requests_interrupt(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="writer", patterns=[])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    agent.patterns = [
+        InterruptingPattern(
+            runner,
+            "exec-inject",
+            before_interrupt_check=lambda: runner.inject_user_message(
+                "exec-inject",
+                "Use metric units.",
+                reason="new user message",
+            ),
         )
+    ]
 
-        runner = AgentRunner(agent=agent)
-        result = await runner.run("test task")
+    result = await runner.run(task="Calculate 6*7", execution_id="exec-inject")
+    context = result["context"]
 
-        assert result["success"] is False
-        assert "pattern_errors" in result
-        assert len(result["pattern_errors"]) == 1
-        error_info = result["pattern_errors"][0]
-        assert error_info["pattern"] == "MockPattern"
-        assert error_info["error"] == "Agent-specific error occurred"
-        assert error_info["exception_type"] == "AgentException"
-        assert "exception_context" in error_info
-        assert "full_traceback" in error_info
+    assert result["success"] is False
+    assert result["status"] == "interrupted"
+    user_messages = [msg.content for msg in context.messages if msg.role == "user"]
+    assert user_messages == ["Calculate 6*7", "Use metric units."]
+    checkpoint_messages = tracer.by_execution_id["exec-inject"]["context"]["messages"]
+    assert any(
+        message["role"] == "user" and message["content"] == "Use metric units."
+        for message in checkpoint_messages
+    )
 
-    @pytest.mark.asyncio
-    async def test_general_exception_handling(self, mock_memory, mock_tools):
-        """Test handling of general exceptions."""
-        patterns = [
-            MockPattern(
-                "general_exception_pattern",
-                result={"error": "General error occurred"},
-                should_fail=True,
+
+@pytest.mark.asyncio
+async def test_runner_resume_restores_from_latest_checkpoint_after_restart(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    execution_id = "exec-restart"
+    first_agent = Agent(name="writer", patterns=[])
+    first_runner = AgentRunner(
+        agent=first_agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    first_agent.patterns = [InterruptingPattern(first_runner, execution_id)]
+
+    interrupted = await first_runner.run(
+        task="Calculate 6*7",
+        execution_id=execution_id,
+    )
+
+    assert interrupted["status"] == "interrupted"
+    await first_runner.inject_user_message(
+        execution_id,
+        "Reply with only the number.",
+        request_interrupt=False,
+    )
+
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "response": "42"})],
+    )
+    resumed_runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    resumed = await resumed_runner.resume(execution_id)
+
+    assert resumed["success"] is True
+    assert resumed["response"] == "42"
+    resumed_contents = [message.content for message in resumed["context"].messages]
+    assert "Reply with only the number." in resumed_contents
+    assert resumed_contents.index(
+        "Reply with only the number."
+    ) < resumed_contents.index("42")
+
+
+@pytest.mark.asyncio
+async def test_runner_post_user_message_alias_matches_inject_behavior(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    checkpoint_context = ExecutionContext(execution_id="exec-alias")
+    checkpoint_context.add_user_message("Original task")
+    await tracer.checkpoint(
+        type="checkpoint",
+        execution_id="exec-alias",
+        pattern="FakePattern",
+        label="before_llm",
+        status="interrupted",
+        context=checkpoint_context.to_dict(),
+        pattern_state={},
+        metadata={},
+    )
+
+    context = await runner.post_user_message(
+        "exec-alias",
+        "Follow-up from user.",
+        request_interrupt=False,
+    )
+
+    assert context is not None
+    user_messages = [
+        message.content for message in context.messages if message.role == "user"
+    ]
+    assert user_messages == ["Original task", "Follow-up from user."]
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_does_not_emit_completion_for_interrupted_run(
+    tmp_path: Path,
+) -> None:
+    tracer = RecordingTraceEventTracer()
+    agent = Agent(
+        name="paused",
+        patterns=[
+            FakePattern(
+                {
+                    "success": False,
+                    "status": "interrupted",
+                    "error": "Paused by user.",
+                }
             )
-        ]
+        ],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
 
-        agent = Agent(
-            name="test_agent", patterns=patterns, memory=mock_memory, tools=mock_tools
-        )
+    result = await runner.run(task="Pause this", execution_id="exec-paused")
 
-        runner = AgentRunner(agent=agent)
-        result = await runner.run("test task")
-
-        assert result["success"] is False
-        assert "pattern_errors" in result
-        assert len(result["pattern_errors"]) == 1
-        error_info = result["pattern_errors"][0]
-        assert error_info["pattern"] == "MockPattern"
-        assert "General error occurred" in error_info["error"]
-        assert "exception_type" in error_info
-        assert "exception_category" in error_info
-        assert error_info["exception_category"] == "unexpected_error"
-
-    @pytest.mark.asyncio
-    async def test_context_task_id_generation(self, runner):
-        """Test that task_id is properly generated in context."""
-        await runner.run("test task")
-
-        assert runner.context.task_id is not None
-        assert isinstance(runner.context.task_id, str)
-        assert len(runner.context.task_id) > 0
-
-    @pytest.mark.asyncio
-    async def test_context_start_time_set(self, runner):
-        """Test that start_time is properly set in context."""
-        from datetime import datetime, timezone
-
-        await runner.run("test task")
-
-        assert runner.context.start_time is not None
-        # The start_time should be set during the run, just check it's not in the future
-        assert runner.context.start_time <= datetime.now(timezone.utc)
-
-    @pytest.mark.asyncio
-    async def test_context_history_tracking(self, runner):
-        """Test that context history is tracked."""
-        await runner.run("test task")
-
-        assert isinstance(runner.context.history, list)
-        # History tracking depends on implementation details
-
-    @pytest.mark.asyncio
-    async def test_pattern_execution_with_context(self, mock_memory, mock_tools):
-        """Test that patterns receive the correct context."""
-        context_received = []
-
-        class ContextTrackingPattern(AgentPattern):
-            async def run(
-                self,
-                task: str,
-                memory: MemoryStore,
-                tools: List[Tool],
-                context: Optional[AgentContext] = None,
-            ) -> Dict[str, Any]:
-                context_received.append(context)
-                return {"success": True}
-
-        patterns = [ContextTrackingPattern()]
-
-        agent = Agent(
-            name="test_agent", patterns=patterns, memory=mock_memory, tools=mock_tools
-        )
-
-        runner = AgentRunner(agent=agent)
-        await runner.run("test task")
-
-        assert len(context_received) == 1
-        assert context_received[0] == runner.context
-
-    def test_get_full_traceback_with_chained_exceptions(self, runner):
-        """Test _get_full_traceback method with chained exceptions."""
-        # Create a chained exception
-        try:
-            try:
-                raise ValueError("Original error")
-            except ValueError as e:
-                raise RuntimeError("Chained error") from e
-        except Exception as e:
-            traceback = runner._get_full_traceback(e)
-
-            assert "ValueError: Original error" in traceback
-            assert "RuntimeError: Chained error" in traceback
-            assert "Caused by:" in traceback
-
-    def test_get_full_traceback_with_single_exception(self, runner):
-        """Test _get_full_traceback method with single exception."""
-        try:
-            raise ValueError("Single error")
-        except Exception as e:
-            traceback = runner._get_full_traceback(e)
-
-            assert "ValueError: Single error" in traceback
-            assert "Caused by:" not in traceback
-
-    def test_get_full_traceback_with_non_exception(self, runner):
-        """Test _get_full_traceback method with non-exception."""
-        # Test with a real exception to verify the method works
-        try:
-            raise ValueError("Test exception")
-        except Exception as e:
-            traceback = runner._get_full_traceback(e)
-            assert isinstance(traceback, str)
-            assert len(traceback) > 0
-            assert "ValueError: Test exception" in traceback
-
-    @pytest.mark.asyncio
-    async def test_empty_patterns_list(self, mock_memory, mock_tools):
-        """Test AgentRunner with no patterns."""
-        agent = Agent(
-            name="test_agent", patterns=[], memory=mock_memory, tools=mock_tools
-        )
-
-        runner = AgentRunner(agent=agent)
-        result = await runner.run("test task")
-
-        assert result["success"] is False
-        assert "All 0 patterns failed" in result["error"]
-        assert result["patterns_attempted"] == 0
+    assert result["status"] == "interrupted"
+    event_types = [event["event_type"] for event in tracer.events]
+    assert event_types == ["task_start_message"]
+    assert "task_end_general" not in event_types
 
 
-if __name__ == "__main__":
-    pytest.main([__file__])
+@pytest.mark.asyncio
+async def test_trace_callback_unwraps_final_answer_and_omits_success_context(
+    tmp_path: Path,
+) -> None:
+    tracer = RecordingTraceEventTracer()
+    agent = Agent(
+        name="writer",
+        patterns=[
+            FakePattern(
+                {
+                    "success": True,
+                    "output": (
+                        '```json\n{"action":"final_answer",'
+                        '"action_input":"Done cleanly."}\n```'
+                    ),
+                    "message": (
+                        '```json\n{"action":"final_answer",'
+                        '"action_input":"Done cleanly."}\n```'
+                    ),
+                }
+            )
+        ],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    result = await runner.run(task="Finish", execution_id="exec-success")
+
+    assert result["output"] == "Done cleanly."
+    assert result["message"] == "Done cleanly."
+    ai_event = next(
+        event for event in tracer.events if event["event_type"] == "task_end_message"
+    )
+    assert ai_event["data"]["content"] == "Done cleanly."
+    assert "context" not in ai_event["data"]

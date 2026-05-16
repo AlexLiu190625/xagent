@@ -1,11 +1,28 @@
-"""
-Enhanced Agent system with nested agent support and improved patterns.
-"""
+"""Agent execution system and service facade."""
 
 from .agent import Agent
-from .context import AgentContext
-
-# Exceptions
+from .checkpoint import (
+    CHECKPOINT_EVENT_TYPE,
+    CHECKPOINT_SCHEMA_VERSION,
+    CHECKPOINT_TYPE,
+    CheckpointPersistenceError,
+    TraceCheckpointStore,
+)
+from .context import (
+    COMPONENT_LOADERS,
+    CompactConfig,
+    CompactResult,
+    ContextManager,
+    ExecutionComponent,
+    ExecutionContext,
+    GenericComponent,
+    LLMCallRecord,
+    MemoryComponent,
+    MergeStrategy,
+    Message,
+    WorkspaceComponent,
+    clone_component,
+)
 from .exceptions import (
     AgentConfigurationError,
     AgentException,
@@ -30,48 +47,82 @@ from .exceptions import (
     ToolNotFoundError,
     create_execution_error,
 )
-
-# Patterns
-from .pattern.base import AgentPattern
-from .pattern.dag_plan_execute import (
-    DAGPlanExecutePattern,
-    ExecutionPhase,
+from .execution_adapter import AgentExecutionAdapter, AgentExecutionConfig
+from .frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from .pattern import (
+    AgentPattern,
+    AutoAction,
+    AutoDecision,
+    AutoPattern,
+    CallablePlanGenerator,
+    DAGPattern,
     ExecutionPlan,
+    LLMPlanGenerator,
+    PatternResult,
+    PlanGenerationRequest,
+    PlanGenerator,
     PlanStep,
-    StepInjection,
-    StepStatus,
+    PlanValidationError,
+    ReActPattern,
+    ReActReasoningMode,
+    ToolCallRecord,
 )
-
-# Import ReAct components
-from .pattern.react import ReActPattern, ReActStepType
-from .precondition import PreconditionResolver
+from .registry import ExecutionHandle, ExecutionLifecycleStatus, ExecutionRegistry
 from .runner import AgentRunner
-
-# Utilities
-from .utils.context_builder import ContextBuilder, StepExecutionResult
+from .runtime import LLMCallInterrupted, PatternRuntime, load_pattern_checkpoint
+from .service import AgentService
+from .tracing import TraceEventCallback
 
 __all__ = [
-    # Core agent components
     "Agent",
-    "AgentContext",
-    "AgentRunner",
-    "PreconditionResolver",
-    # Base patterns
+    "AgentExecutionAdapter",
+    "AgentExecutionConfig",
+    "AgentService",
     "AgentPattern",
-    # ReAct pattern
-    "ReActPattern",
-    "ReActStepType",
-    # DAG Plan Execute pattern
-    "DAGPlanExecutePattern",
-    "PlanStep",
+    "AgentRunner",
+    "AutoAction",
+    "AutoDecision",
+    "AutoPattern",
+    "CHECKPOINT_EVENT_TYPE",
+    "CHECKPOINT_SCHEMA_VERSION",
+    "CHECKPOINT_TYPE",
+    "COMPONENT_LOADERS",
+    "CallablePlanGenerator",
+    "CheckpointPersistenceError",
+    "CompactConfig",
+    "CompactResult",
+    "ContextManager",
+    "DAGPattern",
+    "ExecutionComponent",
+    "ExecutionFrame",
+    "ExecutionHandle",
+    "ExecutionLifecycleStatus",
     "ExecutionPlan",
-    "StepStatus",
-    "ExecutionPhase",
-    "StepInjection",
-    # Utilities
-    "ContextBuilder",
-    "StepExecutionResult",
-    # Exception hierarchy
+    "ExecutionRegistry",
+    "ExecutionSnapshot",
+    "ExecutionStatus",
+    "ExecutionContext",
+    "GenericComponent",
+    "LLMCallInterrupted",
+    "LLMCallRecord",
+    "LLMPlanGenerator",
+    "MemoryComponent",
+    "MergeStrategy",
+    "Message",
+    "PatternResult",
+    "PatternRuntime",
+    "PlanGenerationRequest",
+    "PlanGenerator",
+    "PlanStep",
+    "PlanValidationError",
+    "ReActPattern",
+    "ReActReasoningMode",
+    "ToolCallRecord",
+    "TraceCheckpointStore",
+    "TraceEventCallback",
+    "WorkspaceComponent",
+    "clone_component",
+    "load_pattern_checkpoint",
     "AgentException",
     "AgentConfigurationError",
     "LLMError",

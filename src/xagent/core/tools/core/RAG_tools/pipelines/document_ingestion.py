@@ -139,6 +139,49 @@ def _validate_spreadsheet_chunk_token_budget(
             )
 
 
+def _log_embedding_text_batch_stats(
+    label: str,
+    texts: List[str],
+    *,
+    batch_index: Optional[int] = None,
+) -> None:
+    """Log character-length stats for texts about to be sent to the embedding API."""
+    if not texts:
+        logger.info("[RAG][embedding] %s: empty batch", label)
+        return
+    lengths = [len(t) for t in texts]
+    suffix = f" batch_index={batch_index}" if batch_index is not None else ""
+    logger.info(
+        "[RAG][embedding] %s%s: batch_count=%s char_len min=%s max=%s sum=%s",
+        label,
+        suffix,
+        len(texts),
+        min(lengths),
+        max(lengths),
+        sum(lengths),
+    )
+
+
+def _log_pending_chunks_text_stats(label: str, chunks: List[ChunkForEmbedding]) -> None:
+    """Log stats for chunk texts loaded for embedding (pending only)."""
+    if not chunks:
+        logger.info("[RAG][embedding] %s: no pending chunks", label)
+        return
+    lengths = [len(c.text) for c in chunks]
+    ids_sample = [c.chunk_id for c in chunks[:8]]
+    logger.info(
+        "[RAG][embedding] %s: pending=%s char_len min=%s max=%s sum=%s "
+        "avg=%.1f chunk_id_sample=%s",
+        label,
+        len(chunks),
+        min(lengths),
+        max(lengths),
+        sum(lengths),
+        sum(lengths) / len(lengths),
+        ids_sample,
+    )
+
+
 def run_document_ingestion(
     collection: str,
     source_path: str,
@@ -284,6 +327,15 @@ async def _compute_embeddings_async(
                 try:
                     # Use asyncio.to_thread to execute synchronous encode call in thread pool
                     # Since v4 doesn't support batch processing, must process individually
+                    tlen = len(chunk.text)
+                    logger.info(
+                        "[RAG][embedding] async encode_single: chunk_id=%s char_len=%s "
+                        "retry=%s/%s",
+                        chunk.chunk_id,
+                        tlen,
+                        retry_attempt + 1,
+                        max_retries,
+                    )
                     raw_vector = await asyncio.to_thread(
                         embedding_adapter.encode, chunk.text
                     )
@@ -785,6 +837,18 @@ def process_document(
             )
         )
         logger.info(
+            "[RAG][chunk] step=chunk_document completed doc_id=%s chunk_count=%s "
+            "stats=%s config_hash_fields chunk_size=%s overlap=%s use_token_count=%s "
+            "protected=%s",
+            doc_id,
+            chunk_count,
+            chunk_response.get("stats"),
+            cfg.chunk_size,
+            cfg.chunk_overlap,
+            getattr(cfg, "use_token_count", False),
+            getattr(cfg, "enable_protected_content", True),
+        )
+        logger.info(
             "Step chunk_document completed",
             extra={
                 "collection": collection,
@@ -852,6 +916,9 @@ def process_document(
                 "pending_count": pending_count,
                 "elapsed_ms": read_elapsed,
             },
+        )
+        _log_pending_chunks_text_stats(
+            f"read_chunks_for_embedding doc_id={doc_id}", chunks
         )
 
         if pending_count == 0:
@@ -1010,6 +1077,11 @@ def process_document(
                             batch_start : batch_start + cfg.embedding_batch_size
                         ]
                         batch_texts = [chunk.text for chunk in batch_chunks]
+                        _log_embedding_text_batch_stats(
+                            f"compute_embeddings(batch) doc_id={doc_id}",
+                            batch_texts,
+                            batch_index=processed_batches,
+                        )
                         raw_vectors = embedding_adapter.encode(batch_texts)
                         vectors = normalize_raw_embedding_to_vectors(raw_vectors)
 

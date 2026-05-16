@@ -304,7 +304,7 @@ def generate_deterministic_doc_id(collection: str, source_path: str) -> str:
     return f"{sanitized}_{h}"
 
 
-# Security validation patterns
+# Security validation patterns (aligned with ``ALLOWED_NAME_PATTERN`` in web config)
 _COLLECTION_NAME_PATTERN: re.Pattern[str] = re.compile(r"^[\w -]+$")
 _DOC_ID_PATTERN: re.Pattern[str] = re.compile(r"^[a-zA-Z0-9_.-]+$")
 
