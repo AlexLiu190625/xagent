@@ -202,6 +202,57 @@ class TestAgentServiceManagerReconstruction:
         assert agent_manager._agents[1] == mock_agent_service
 
     @pytest.mark.asyncio
+    async def test_admin_task_uses_task_owner_workspace_dirs(
+        self, agent_manager, mock_db, tmp_path
+    ):
+        """Admin executing another user's task should use the task owner's workspace."""
+        owner_task = Task(
+            id=1,
+            user_id=7,
+            title="Owner Task",
+            description="Task owned by another user",
+            status=TaskStatus.PENDING,
+            agent_type="standard",
+        )
+        admin_user = User(
+            id=1,
+            username="admin",
+            password_hash="hashed_password",
+            is_admin=True,
+        )
+        uploads_dir = tmp_path / "uploads"
+
+        with (
+            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
+            patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
+            patch("xagent.web.api.chat.get_uploads_dir", return_value=uploads_dir),
+            patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolFactory"
+            ) as mock_tool_factory,
+        ):
+            mock_resolve_llms.return_value = (MagicMock(), None, None, None)
+            mock_get_memory.return_value = MagicMock()
+            mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
+            mock_agent_service = MagicMock()
+            mock_agent_service_class.return_value = mock_agent_service
+
+            mock_task_query = MagicMock()
+            mock_task_query.filter.return_value = mock_task_query
+            mock_task_query.first.return_value = owner_task
+            mock_db.query.return_value = mock_task_query
+
+            await agent_manager.get_agent_for_task(1, mock_db, user=admin_user)
+
+        kwargs = mock_agent_service_class.call_args.kwargs
+        assert kwargs["workspace_base_dir"] == str(uploads_dir / "user_7")
+        assert str(uploads_dir / "user_7") in kwargs["allowed_external_dirs"]
+        tool_config = kwargs["tool_config"]
+        workspace_config = tool_config.get_workspace_config()
+        assert workspace_config["base_dir"] == str(uploads_dir / "user_7")
+        assert str(uploads_dir / "user_7") in workspace_config["allowed_external_dirs"]
+
+    @pytest.mark.asyncio
     async def test_get_agent_for_task_existing_task_with_reconstruction(
         self,
         agent_manager,

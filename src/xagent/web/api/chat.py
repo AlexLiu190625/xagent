@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -54,6 +55,20 @@ logger = logging.getLogger(__name__)
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+
+def _build_task_agent_config(
+    request_agent_config: Optional[Dict[str, Any]],
+    selected_file_ids: list[str],
+) -> Optional[Dict[str, Any]]:
+    """Build task agent_config with server-owned selected file ids."""
+    task_agent_config: Dict[str, Any] = {}
+    if isinstance(request_agent_config, dict):
+        task_agent_config.update(request_agent_config)
+        task_agent_config.pop("selected_file_ids", None)
+    if selected_file_ids:
+        task_agent_config["selected_file_ids"] = selected_file_ids
+    return task_agent_config or None
 
 
 def create_default_llm() -> Optional[BaseLLM]:
@@ -177,6 +192,7 @@ async def create_default_tools(
     request: Any = None,
     user: Optional[User] = None,
     task_id: Optional[str] = None,
+    workspace_owner_id: Optional[int] = None,
     allowed_collections: Optional[List[str]] = None,
     allowed_skills: Optional[List[str]] = None,
     allowed_tools: Optional[List[str]] = None,
@@ -194,9 +210,13 @@ async def create_default_tools(
     # Create a WebToolConfig to properly initialize tools
     from ..tools.config import WebToolConfig
 
-    # Build allowed external directories so file tools can reach the user's
+    owner_id = (
+        int(workspace_owner_id) if workspace_owner_id is not None else int(user.id)
+    )
+
+    # Build allowed external directories so file tools can reach the task owner's
     # uploads (see _build_allowed_external_dirs docstring).
-    allowed_external_dirs = _build_allowed_external_dirs(int(user.id))
+    allowed_external_dirs = _build_allowed_external_dirs(owner_id)
 
     tool_config = WebToolConfig(
         db=db,
@@ -206,7 +226,7 @@ async def create_default_tools(
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
         workspace_config={
-            "base_dir": str(get_uploads_dir() / f"user_{user.id}"),
+            "base_dir": str(get_uploads_dir() / f"user_{owner_id}"),
             "task_id": task_id,
             "allowed_external_dirs": allowed_external_dirs,
         },
@@ -587,6 +607,7 @@ class AgentServiceManager:
             request=self.request,
             user=user,
             task_id=f"web_task_{task_id}",
+            workspace_owner_id=int(task.user_id),
             allowed_collections=agent_config["knowledge_bases"]
             if agent_config
             else None,
@@ -901,12 +922,19 @@ class AgentServiceManager:
                         f"Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
                     )
 
+                workspace_owner_id = (
+                    int(task.user_id)
+                    if task and task.user_id is not None
+                    else int(user.id)
+                )
+
                 # Create tools using ToolFactory
                 tools = await create_default_tools(
                     db,
                     request=self.request,
                     user=user,
                     task_id=f"web_task_{task_id}",
+                    workspace_owner_id=workspace_owner_id,
                     allowed_collections=agent_config["knowledge_bases"]
                     if agent_config
                     else None,
@@ -945,9 +973,9 @@ class AgentServiceManager:
                     # disabled until the product exposes an explicit opt-in.
                     agent_builder_memory_enabled = not bool(task and task.agent_id)
 
-                    # Build allowed external directories (user's upload directory for knowledge base files)
+                    # Build allowed external directories for the task owner's uploads.
                     allowed_external_dirs = _build_allowed_external_dirs(
-                        int(user.id) if user and user.id else None
+                        workspace_owner_id,
                     )
 
                     # Create AgentService first (this creates the workspace)
@@ -965,7 +993,7 @@ class AgentServiceManager:
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
                         workspace_base_dir=str(
-                            get_uploads_dir() / f"user_{user.id}"
+                            get_uploads_dir() / f"user_{workspace_owner_id}"
                         ),  # Use user-isolated base directory
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
                         task_id=str(task_id),  # Pass task_id for proper tracing
@@ -991,11 +1019,16 @@ class AgentServiceManager:
                         from ..models.uploaded_file import UploadedFile
 
                         for selected_file_id in selected_file_ids:
+                            task_owner_id = int(task.user_id) if task else int(user.id)
                             uploaded_file = (
                                 db.query(UploadedFile)
                                 .filter(
                                     UploadedFile.file_id == selected_file_id,
-                                    UploadedFile.user_id == int(user.id),
+                                    UploadedFile.user_id == task_owner_id,
+                                    or_(
+                                        UploadedFile.task_id == int(task_id),
+                                        UploadedFile.task_id.is_(None),
+                                    ),
                                 )
                                 .first()
                             )
@@ -1005,6 +1038,10 @@ class AgentServiceManager:
                             source_path = Path(str(uploaded_file.storage_path))
                             if not source_path.exists() or not source_path.is_file():
                                 continue
+
+                            if uploaded_file.task_id is None:
+                                uploaded_file.task_id = int(task_id)
+                                db.flush()
 
                             # Use the source file directly (user's upload directory) instead of copying
                             # This avoids duplicate files across the system.
@@ -1498,6 +1535,7 @@ async def create_task(
                     .filter(
                         UploadedFile.file_id == file_id,
                         UploadedFile.user_id == int(user.id),
+                        UploadedFile.task_id.is_(None),
                     )
                     .first()
                 )
@@ -1724,11 +1762,10 @@ async def create_task(
                 {"input": ex.input, "output": ex.output} for ex in request.examples
             ]
 
-        task_agent_config: Dict[str, Any] = {}
-        if isinstance(request.agent_config, dict):
-            task_agent_config.update(request.agent_config)
-        if selected_file_ids:
-            task_agent_config["selected_file_ids"] = selected_file_ids
+        task_agent_config = _build_task_agent_config(
+            request.agent_config,
+            selected_file_ids,
+        )
 
         task_execution_mode = request.execution_mode
         if not task_execution_mode:
@@ -1754,7 +1791,7 @@ async def create_task(
             small_fast_model_name=fast_model_name,
             visual_model_name=visual_model_name,
             compact_model_name=compact_model_name,
-            agent_config=task_agent_config or None,
+            agent_config=task_agent_config,
             execution_mode=task_execution_mode,
             process_description=request.process_description,
             examples=examples_data,
