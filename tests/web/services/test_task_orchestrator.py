@@ -89,10 +89,16 @@ def mock_schedule_bg():
     """Stub the bg coroutine spawn so begin_turn tests don't actually run
     an agent. Opt-in: tests that drive ``_schedule_bg`` directly skip
     this fixture and patch deeper layers themselves.
+
+    Uses ``AsyncMock()`` without an explicit ``return_value`` —
+    instantiating ``asyncio.Future()`` at fixture-setup time needs a
+    running event loop, which pytest-asyncio doesn't provide during
+    fixture collection in CI. The default ``AsyncMock`` return is a
+    plain ``MagicMock``, which begin_turn ignores anyway.
     """
     with patch(
         "xagent.web.services.task_orchestrator._schedule_bg",
-        new=AsyncMock(return_value=asyncio.Future()),
+        new=AsyncMock(),
     ) as mocked:
         yield mocked
 
@@ -314,16 +320,16 @@ async def test_begin_turn_refuses_when_bg_inflight(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.COMPLETED)
 
-    # Plant a not-done asyncio.Task in the bg manager registry
-    loop = asyncio.new_event_loop()
+    # Plant a fake "still-running" entry in the bg manager registry.
+    # ``_refuse_if_bg_inflight`` only checks ``.done() is False``, so a
+    # MagicMock with that one attribute is enough — we don't need a
+    # real asyncio.Task (and creating one would require an extra event
+    # loop, which trips up pytest-asyncio's fixture machinery in CI).
+    fake_inflight = MagicMock(spec=asyncio.Task)
+    fake_inflight.done.return_value = False
+    background_task_manager.running_tasks[int(task.id)] = fake_inflight
+
     try:
-
-        async def _never_done() -> None:
-            await asyncio.sleep(3600)
-
-        fake_inflight = loop.create_task(_never_done())
-        background_task_manager.running_tasks[int(task.id)] = fake_inflight
-
         with pytest.raises(TaskTurnError) as excinfo:
             await TaskTurnOrchestrator.begin_turn(
                 task=task,
@@ -338,10 +344,8 @@ async def test_begin_turn_refuses_when_bg_inflight(
         db_session.refresh(task)
         assert task.status == TaskStatus.COMPLETED  # unchanged
         assert task.input is None  # unchanged
-
-        fake_inflight.cancel()
     finally:
-        loop.close()
+        background_task_manager.running_tasks.pop(int(task.id), None)
 
 
 @pytest.mark.asyncio
