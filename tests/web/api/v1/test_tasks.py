@@ -78,8 +78,14 @@ def _bearer(full_key: str) -> dict[str, str]:
 # existing test surface; conceptually it now mocks "bg scheduling".
 @pytest.fixture(autouse=True)
 def mock_start_task():
+    # After the begin_turn migration, the SDK endpoints schedule the bg
+    # coroutine via ``_schedule_bg_v2`` (lease-aware), not the
+    # deprecated ``_schedule_bg``. Tests in this file mock the new
+    # entry point so the orchestrator's atomic claim + persist logic
+    # still runs against a real DB; only the asyncio.create_task /
+    # agent execution is stubbed.
     with patch(
-        "xagent.web.services.task_orchestrator._schedule_bg",
+        "xagent.web.services.task_orchestrator._schedule_bg_v2",
         new=AsyncMock(),
     ) as mocked:
         yield mocked
@@ -111,7 +117,12 @@ def test_create_task_happy_path(mock_start_task):
     task_id = body["task_id"]
 
     # DB: Task row exists, owned by admin user, source='sdk', input set,
-    # status PENDING
+    # After begin_turn the row is RUNNING (atomic transition committed
+    # before the response returns). Prior to the begin_turn migration
+    # this assertion read PENDING; that reflected start_new_turn's
+    # behavior of only persisting + scheduling without flipping status.
+    # The new architectural contract is "row is RUNNING from the moment
+    # the endpoint returns 202".
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -119,7 +130,7 @@ def test_create_task_happy_path(mock_start_task):
         assert task.agent_id == agent_id
         assert task.source == "sdk"
         assert task.input == "first user message"
-        assert task.status == TaskStatus.PENDING
+        assert task.status == TaskStatus.RUNNING
 
         # task_chat_messages: one user-role message written
         from xagent.web.models.chat_message import TaskChatMessage
@@ -133,11 +144,13 @@ def test_create_task_happy_path(mock_start_task):
     finally:
         db.close()
 
-    # Background kickoff was called exactly once for this task
+    # Background kickoff was called exactly once for this task.
+    # After the begin_turn migration the bg scheduler receives a
+    # ``TaskTurnPayload`` rather than a raw ``user_message`` string.
     assert mock_start_task.await_count == 1
     kwargs = mock_start_task.await_args.kwargs
     assert kwargs["task"].id == task_id
-    assert kwargs["user_message"] == "first user message"
+    assert kwargs["payload"].transcript_message == "first user message"
 
 
 def test_create_task_missing_authorization_returns_401(mock_start_task):
@@ -632,8 +645,16 @@ def test_append_message_body_agent_id_mismatch_returns_404(mock_start_task):
 # ===== GET /v1/chat/tasks/{task_id} =====
 
 
-def test_get_task_pending(mock_start_task):
-    """Fresh task: status='pending', input set, output/error null, completed_at null."""
+def test_get_task_running_right_after_create(mock_start_task):
+    """Fresh task after begin_turn migration: status='running' (atomic
+    transition is committed inside POST /v1/chat/tasks), input set,
+    output/error null, completed_at null.
+
+    Before the begin_turn refactor this test asserted ``status='pending'``
+    because the deprecated ``start_new_turn`` deferred the status flip
+    to the bg coroutine. The new architectural contract is that the
+    row is RUNNING from the moment the create endpoint returns 202.
+    """
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="seed input")
 
@@ -642,7 +663,7 @@ def test_get_task_pending(mock_start_task):
     body = resp.json()
     assert body["task_id"] == task_id
     assert body["agent_id"] == agent_id
-    assert body["status"] == "pending"
+    assert body["status"] == "running"
     assert body["input"] == "seed input"
     assert body["output"] is None
     assert body["error"] is None
@@ -1004,3 +1025,58 @@ def test_get_steps_returns_404_for_non_sdk_source(mock_start_task):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "task_not_found"
+
+
+# ===== F7 regression: stale-output reset on SDK append =====
+
+
+def test_append_message_clears_stale_output_for_sdk_caller(mock_start_task):
+    """After the begin_turn migration, an SDK append on a previously
+    completed task immediately clears the stored ``output`` and
+    ``error_message`` so GET right after the append sees a clean
+    latest-turn snapshot (Roger F7).
+
+    Before the refactor, append_turn only flipped status + input and
+    left output untouched, so the GET response could mix the new turn's
+    status / input with the previous turn's output — a contradictory
+    snapshot to SDK consumers.
+    """
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first")
+
+    # Plant a completed-state row with prior output / error_message
+    # populated, as if the first turn had finished successfully.
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        task.status = TaskStatus.COMPLETED
+        task.output = "first answer"
+        task.error_message = "stale error from prior failure"
+        db.commit()
+    finally:
+        db.close()
+
+    mock_start_task.reset_mock()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={"agent_id": agent_id, "message": {"role": "user", "content": "second"}},
+    )
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.await_count == 1
+
+    # After the response returns, an immediate GET must see:
+    #   - status = running (atomic transition committed)
+    #   - input = the new turn's message
+    #   - output = NULL (F7 — stale prior-turn output cleared)
+    #   - error_message = NULL (F7 — stale prior error cleared)
+    db = _direct_db_session()
+    try:
+        task_after = db.query(Task).filter(Task.id == task_id).first()
+        assert task_after.status == TaskStatus.RUNNING
+        assert task_after.input == "second"
+        assert task_after.output is None
+        assert task_after.error_message is None
+    finally:
+        db.close()

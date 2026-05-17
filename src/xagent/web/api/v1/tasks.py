@@ -32,7 +32,12 @@ from ...schemas.v1 import (
     StepsResponse,
     TaskInfoResponse,
 )
-from ...services.task_orchestrator import TaskTurnError, TaskTurnOrchestrator
+from ...services.task_orchestrator import (
+    TaskTurnError,
+    TaskTurnOrchestrator,
+    TaskTurnPayload,
+    TurnKind,
+)
 from ._step_mapping import map_trace_events_to_public_steps
 from .deps import get_agent_from_api_key
 from .errors import V1ApiError, V1ErrorCode
@@ -129,15 +134,19 @@ async def create_chat_task(
     db.commit()
     db.refresh(task)
 
-    # Orchestrator handles persisting the first user message + bg
-    # scheduling (with single-flight guard). A brand-new task shouldn't
-    # ever hit the busy branch -- but we map it anyway for defense.
+    # Orchestrator's begin_turn handles the full new-turn transition:
+    # bg-inflight guard, atomic status flip + transcript persist in one
+    # commit, and bg coroutine scheduling under a lease lifecycle.
+    # A brand-new task shouldn't ever hit busy -- but we map it
+    # anyway for defense.
     try:
-        await TaskTurnOrchestrator.start_new_turn(
+        await TaskTurnOrchestrator.begin_turn(
             task=task,
-            user_message=request.message.content,
+            payload=TaskTurnPayload(transcript_message=request.message.content),
             user=task.user,
             db=db,
+            kind=TurnKind.CREATE,
+            force_fresh=False,
         )
     except TaskTurnError:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
@@ -273,11 +282,13 @@ async def append_message_to_task(
     # 409), persists the new user message, and schedules the bg turn
     # with a single-flight guard against concurrent kickoffs.
     try:
-        await TaskTurnOrchestrator.append_turn(
+        await TaskTurnOrchestrator.begin_turn(
             task=task,
-            user_message=request.message.content,
+            payload=TaskTurnPayload(transcript_message=request.message.content),
             user=task.user,
             db=db,
+            kind=TurnKind.APPEND,
+            force_fresh=False,
         )
     except TaskTurnError:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
