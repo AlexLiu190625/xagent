@@ -601,3 +601,76 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
             pass
 
     mock_release.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_forwards_execution_message_to_execute_task_background(
+    db_session,
+) -> None:
+    """F9 end-to-end (orchestrator side): the dual-channel
+    ``TaskTurnPayload`` propagates all the way down — ``_schedule_bg``
+    must pass ``payload.execution_message`` to
+    ``execute_task_background``'s ``llm_user_message=`` parameter.
+
+    This is the final link in the chain that prevents the WS
+    file-context-dropped regression from coming back. begin_turn tests
+    above cover that begin_turn → _schedule_bg forwards the payload;
+    this test covers that _schedule_bg → execute_task_background
+    forwards the execution_message (the LLM-facing variant).
+    """
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_service import TaskLease
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(),
+        ) as mock_exec,
+        patch(
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.finish_turn",
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        payload = TaskTurnPayload(
+            transcript_message="summarize this",
+            execution_message="summarize this\n\n[uploaded file: secret.txt]",
+        )
+        bg_task = await _schedule_bg(
+            task=task,
+            user=user,
+            payload=payload,
+            force_fresh=False,
+            context=None,
+        )
+        await bg_task
+
+    mock_exec.assert_awaited_once()
+    kwargs = mock_exec.await_args.kwargs
+    # F9 contract: transcript and LLM-facing channels are both
+    # forwarded explicitly so execute_task_background can pick the
+    # right one for the agent input.
+    assert kwargs["user_message"] == "summarize this", (
+        "transcript_message must reach execute_task_background.user_message"
+    )
+    assert (
+        kwargs["llm_user_message"] == "summarize this\n\n[uploaded file: secret.txt]"
+    ), "execution_message must reach execute_task_background.llm_user_message"
