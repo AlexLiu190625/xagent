@@ -79,13 +79,13 @@ def _bearer(full_key: str) -> dict[str, str]:
 @pytest.fixture(autouse=True)
 def mock_start_task():
     # After the begin_turn migration, the SDK endpoints schedule the bg
-    # coroutine via ``_schedule_bg_v2`` (lease-aware), not the
+    # coroutine via ``_schedule_bg`` (lease-aware), not the
     # deprecated ``_schedule_bg``. Tests in this file mock the new
     # entry point so the orchestrator's atomic claim + persist logic
     # still runs against a real DB; only the asyncio.create_task /
     # agent execution is stubbed.
     with patch(
-        "xagent.web.services.task_orchestrator._schedule_bg_v2",
+        "xagent.web.services.task_orchestrator._schedule_bg",
         new=AsyncMock(),
     ) as mocked:
         yield mocked

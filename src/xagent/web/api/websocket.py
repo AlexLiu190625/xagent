@@ -856,7 +856,7 @@ async def execute_task_background(
             if task_updated:
                 # Caller is responsible for the lease lifecycle (acquire +
                 # release); this function only writes ``status``. The
-                # orchestrator's ``_schedule_bg_v2`` wraps the call in
+                # orchestrator's ``_schedule_bg`` wraps the call in
                 # acquire/release; chat.py and WS continuation paths
                 # acquire and release the lease directly themselves.
                 #

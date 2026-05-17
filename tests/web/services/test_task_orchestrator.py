@@ -7,7 +7,7 @@ review (PR #384):
   - ``TurnKind`` + ``force_fresh`` orthogonal kind/flag
   - ``begin_turn`` atomic claim + persist + bg schedule
   - ``finish_turn`` symmetric terminal-field writer + lease ownership guard
-  - ``_schedule_bg_v2`` lease lifecycle wrapper
+  - ``_schedule_bg`` lease lifecycle wrapper
 
 Tests use SQLite in-memory + direct ORM, mocking only the bits that
 require an actual agent runtime (``execute_task_background``).
@@ -30,7 +30,7 @@ from xagent.web.services.task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
-    _schedule_bg_v2,
+    _schedule_bg,
     finish_turn,
 )
 
@@ -85,13 +85,13 @@ def _create_task(
 
 
 @pytest.fixture()
-def mock_schedule_bg_v2():
+def mock_schedule_bg():
     """Stub the bg coroutine spawn so begin_turn tests don't actually run
-    an agent. Opt-in: tests that drive ``_schedule_bg_v2`` directly skip
+    an agent. Opt-in: tests that drive ``_schedule_bg`` directly skip
     this fixture and patch deeper layers themselves.
     """
     with patch(
-        "xagent.web.services.task_orchestrator._schedule_bg_v2",
+        "xagent.web.services.task_orchestrator._schedule_bg",
         new=AsyncMock(return_value=asyncio.Future()),
     ) as mocked:
         yield mocked
@@ -134,7 +134,7 @@ def test_payload_uses_execution_when_provided() -> None:
 @pytest.mark.asyncio
 async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
@@ -158,7 +158,7 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
 @pytest.mark.asyncio
 async def test_begin_turn_append_clears_stale_output_and_error(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     """F7 regression: appending a new turn must reset output / error_message
     from the previous turn so GET returns a coherent latest-turn snapshot.
@@ -192,7 +192,7 @@ async def test_begin_turn_append_clears_stale_output_and_error(
 @pytest.mark.asyncio
 async def test_begin_turn_append_clears_stale_error_message(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     """Symmetric F7: appending after a FAILED turn must clear the error too."""
     user = _create_user(db_session)
@@ -224,10 +224,10 @@ async def test_begin_turn_append_clears_stale_error_message(
 @pytest.mark.asyncio
 async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     """F9 + force_fresh: begin_turn forwards the payload and force_fresh
-    to ``_schedule_bg_v2``."""
+    to ``_schedule_bg``."""
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.COMPLETED)
 
@@ -244,8 +244,8 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
         force_fresh=True,
     )
 
-    mock_schedule_bg_v2.assert_awaited_once()
-    kwargs = mock_schedule_bg_v2.await_args.kwargs
+    mock_schedule_bg.assert_awaited_once()
+    kwargs = mock_schedule_bg.await_args.kwargs
     assert kwargs["payload"] is payload
     assert kwargs["force_fresh"] is True
 
@@ -258,7 +258,7 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
 @pytest.mark.asyncio
 async def test_begin_turn_rejects_create_with_force_fresh(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     """Invalid kind + flag combo: CREATE + force_fresh has no meaning."""
     user = _create_user(db_session)
@@ -278,7 +278,7 @@ async def test_begin_turn_rejects_create_with_force_fresh(
 @pytest.mark.asyncio
 async def test_begin_turn_asserts_session_clean_precondition(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     """Caller contract: db session must be clean of uncommitted state."""
     user = _create_user(db_session)
@@ -303,7 +303,7 @@ async def test_begin_turn_asserts_session_clean_precondition(
 @pytest.mark.asyncio
 async def test_begin_turn_refuses_when_bg_inflight(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     from xagent.web.api.websocket import background_task_manager
 
@@ -343,7 +343,7 @@ async def test_begin_turn_refuses_when_bg_inflight(
 @pytest.mark.asyncio
 async def test_begin_turn_refuses_create_against_terminal_task(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     """kind=CREATE filters status==PENDING; a COMPLETED task must reject."""
     user = _create_user(db_session)
@@ -363,7 +363,7 @@ async def test_begin_turn_refuses_create_against_terminal_task(
 @pytest.mark.asyncio
 async def test_begin_turn_refuses_append_against_pending_task(
     db_session,
-    mock_schedule_bg_v2,
+    mock_schedule_bg,
 ) -> None:
     """kind=APPEND filters status IN TERMINAL; a PENDING task must reject."""
     user = _create_user(db_session)
@@ -502,12 +502,12 @@ def test_finish_turn_running_flips_failed_when_we_own_lease(db_session) -> None:
 
 
 # ---------------------------------------------------------------------------
-# _schedule_bg_v2 lease lifecycle
+# _schedule_bg lease lifecycle
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.asyncio
-async def test_schedule_bg_v2_skips_finish_turn_when_lease_acquire_fails(
+async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
     db_session,
 ) -> None:
     """F8 early short-circuit: lease taken by another worker → never call
@@ -531,10 +531,10 @@ async def test_schedule_bg_v2_skips_finish_turn_when_lease_acquire_fails(
         ) as mock_finish,
         patch.object(background_task_manager, "register_task"),
     ):
-        # Note: this test does NOT use the mock_schedule_bg_v2 fixture
-        # because we're testing _schedule_bg_v2 itself. The real
+        # Note: this test does NOT use the mock_schedule_bg fixture
+        # because we're testing _schedule_bg itself. The real
         # function runs with the deeper layers patched.
-        bg_task = await _schedule_bg_v2(
+        bg_task = await _schedule_bg(
             task=task,
             user=user,
             payload=TaskTurnPayload("x"),
@@ -548,7 +548,7 @@ async def test_schedule_bg_v2_skips_finish_turn_when_lease_acquire_fails(
 
 
 @pytest.mark.asyncio
-async def test_schedule_bg_v2_releases_lease_on_execute_task_background_exception(
+async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
     db_session,
 ) -> None:
     """Lease must not leak when execute_task_background raises — _runner.finally
@@ -585,7 +585,7 @@ async def test_schedule_bg_v2_releases_lease_on_execute_task_background_exceptio
             return_value=MagicMock(),
         ),
     ):
-        bg_task = await _schedule_bg_v2(
+        bg_task = await _schedule_bg(
             task=task,
             user=user,
             payload=TaskTurnPayload("x"),
