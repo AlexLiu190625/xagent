@@ -1847,7 +1847,6 @@ async def handle_chat_message(
         try:
             from ..services.chat_history_service import (
                 load_task_transcript,
-                persist_user_message,
             )
             from ..services.task_execution_context_service import (
                 load_task_execution_recovery_state,
@@ -2092,12 +2091,17 @@ async def handle_chat_message(
                         make_agent_outbound_handler(task_id)
                     )
 
-                persisted_user_message = persist_user_message(
-                    db,
-                    task_id=task_id,
-                    user_id=int(user.id),
-                    content=display_user_message,
-                )
+                # NOTE: the user message is persisted inside
+                # ``TaskTurnOrchestrator.begin_turn`` below as part of
+                # the atomic transition (claim + persist + schedule
+                # commit together). We previously persisted it inline
+                # here and had to best-effort-delete on schedule
+                # rejection; that's now handled by begin_turn's
+                # transactional rollback. ``persisted_user_message`` is
+                # populated after begin_turn returns by reading back
+                # the latest user-role message — needed for the
+                # transcript-history slice below.
+                persisted_user_message = None
 
                 # Check if there's an old task running (PAUSED, WAITING_FOR_USER, or RUNNING status)
                 # If so, use continuation mechanism; otherwise execute normally
@@ -2359,49 +2363,84 @@ async def handle_chat_message(
                     # and flipped status to RUNNING just above, so we use
                     # the lower-level ``schedule_bg`` entry point that
                     # only handles scheduling (not persist / claim).
+                    from ..models.chat_message import TaskChatMessage
                     from ..services.task_orchestrator import (
                         TaskTurnError,
                         TaskTurnOrchestrator,
+                        TaskTurnPayload,
+                        TurnKind,
                     )
 
+                    payload = TaskTurnPayload(
+                        transcript_message=display_user_message,
+                        execution_message=user_message_for_llm,
+                    )
+                    # WS path only has two legal entries into begin_turn:
+                    #   PENDING                  → CREATE, no force_fresh
+                    #   COMPLETED / FAILED       → APPEND, force_fresh=True
+                    # PAUSED / WAITING_FOR_USER / RUNNING should have been
+                    # intercepted by the continuation path above. Reaching
+                    # this branch with any of them is an upstream-dispatch
+                    # bug; surface it as an agent_error rather than
+                    # silently letting begin_turn 409 on the wrong status.
+                    if task.status == TaskStatus.PENDING:
+                        turn_kind = TurnKind.CREATE
+                        turn_force_fresh = False
+                    elif task.status in (
+                        TaskStatus.COMPLETED,
+                        TaskStatus.FAILED,
+                    ):
+                        turn_kind = TurnKind.APPEND
+                        turn_force_fresh = True  # WS always re-engages fresh
+                    else:
+                        logger.error(
+                            f"WS schedule reached for task {task_id} with "
+                            f"unexpected status={task.status}; expected "
+                            "PENDING or terminal. Continuation path should "
+                            "have intercepted."
+                        )
+                        await manager.broadcast_to_task(
+                            {
+                                "type": "agent_error",
+                                "message": ("Internal dispatch error; please retry."),
+                                "timestamp": datetime.now(timezone.utc).timestamp(),
+                            },
+                            task_id,
+                        )
+                        return
+
                     try:
-                        await TaskTurnOrchestrator.schedule_bg(
+                        await TaskTurnOrchestrator.begin_turn(
                             task=task,
-                            user_message=user_message,
+                            payload=payload,
                             user=user,
-                            force_fresh_execution=force_fresh_execution,
+                            db=db,
+                            kind=turn_kind,
+                            force_fresh=turn_force_fresh,
                             context=context,
                         )
                         logger.info(f"Task {task_id} started in background")
-                    except TaskTurnError as busy_err:
-                        logger.warning(
-                            f"Refused to schedule bg for task {task_id}: {busy_err.reason}; "
-                            "removing the rejected user message from transcript"
+                        # Fetch the message begin_turn just persisted so the
+                        # transcript-history slice below can use its id.
+                        persisted_user_message = (
+                            db.query(TaskChatMessage)
+                            .filter(
+                                TaskChatMessage.task_id == task_id,
+                                TaskChatMessage.role == "user",
+                            )
+                            .order_by(TaskChatMessage.id.desc())
+                            .first()
                         )
-                        # The user message was persisted up-front (above,
-                        # via ``persist_user_message``) before we knew
-                        # whether scheduling would be accepted. Drop the
-                        # row from ``task_chat_messages`` so the next
-                        # transcript load (which the client is likely to
-                        # trigger by retrying) doesn't replay a turn that
-                        # never actually ran — otherwise the LLM sees an
-                        # orphan user prompt with no assistant response
-                        # and may hallucinate a continuation for it.
-                        #
-                        # Failure here is best-effort cleanup: the agent
-                        # is already getting a "task busy" error, and
-                        # leaving the orphan message is the same behavior
-                        # we had before this fix.
-                        if persisted_user_message is not None:
-                            try:
-                                db.delete(persisted_user_message)
-                                db.commit()
-                            except Exception as cleanup_err:
-                                logger.warning(
-                                    f"Failed to remove rejected user message "
-                                    f"for task {task_id}: {cleanup_err}"
-                                )
-                                db.rollback()
+                    except TaskTurnError as busy_err:
+                        # begin_turn's atomic transaction rolls back on
+                        # bg_inflight / busy — neither the status flip
+                        # nor the user message persists. No transcript
+                        # cleanup needed (review F3 architectural fix
+                        # replaces the best-effort delete we used to do).
+                        logger.warning(
+                            f"Refused to schedule bg for task {task_id}: "
+                            f"{busy_err.reason}"
+                        )
                         await manager.broadcast_to_task(
                             {
                                 "type": "agent_error",
