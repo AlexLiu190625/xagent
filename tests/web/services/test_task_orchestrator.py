@@ -160,8 +160,9 @@ async def test_begin_turn_append_clears_stale_output_and_error(
     db_session,
     mock_schedule_bg,
 ) -> None:
-    """F7 regression: appending a new turn must reset output / error_message
-    from the previous turn so GET returns a coherent latest-turn snapshot.
+    """Latest-turn snapshot invariant: appending a new turn must reset
+    output / error_message from the previous turn so GET returns a
+    coherent latest-turn snapshot.
     """
     user = _create_user(db_session)
     task = _create_task(
@@ -194,7 +195,8 @@ async def test_begin_turn_append_clears_stale_error_message(
     db_session,
     mock_schedule_bg,
 ) -> None:
-    """Symmetric F7: appending after a FAILED turn must clear the error too."""
+    """Latest-turn snapshot invariant (FAILED side): appending after a
+    failed turn must also clear the prior turn's error_message."""
     user = _create_user(db_session)
     task = _create_task(
         db_session,
@@ -226,8 +228,10 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
     db_session,
     mock_schedule_bg,
 ) -> None:
-    """F9 + force_fresh: begin_turn forwards the payload and force_fresh
-    to ``_schedule_bg``."""
+    """Dual-channel payload + force_fresh forwarding: begin_turn forwards
+    the full ``TaskTurnPayload`` and ``force_fresh`` flag to
+    ``_schedule_bg`` so the execution side receives both message
+    channels and the right reconstruct-state mode."""
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.COMPLETED)
 
@@ -413,7 +417,9 @@ def test_finish_turn_completed_writes_output_clears_error(db_session) -> None:
 
 
 def test_finish_turn_failed_writes_error_clears_stale_output(db_session) -> None:
-    """F7 symmetric: FAILED turn must clear stale output too."""
+    """Latest-turn snapshot invariant (FAILED side): a FAILED turn
+    must clear the prior turn's stale ``output`` so the GET response
+    doesn't show ``status='failed' + output='prior answer'``."""
     user = _create_user(db_session)
     task = _create_task(
         db_session,
@@ -428,13 +434,15 @@ def test_finish_turn_failed_writes_error_clears_stale_output(db_session) -> None
     db_session.refresh(task)
     assert task.error_message is not None
     assert "Task execution failed" in task.error_message
-    assert task.output is None  # F7 symmetric
+    assert task.output is None  # latest-turn snapshot invariant
 
 
 def test_finish_turn_running_skips_when_other_worker_holds_live_lease(
     db_session,
 ) -> None:
-    """F8 hard guard: leave the row alone when another worker actively owns it."""
+    """Lease ownership guard: when another worker actively holds the
+    lease, finish_turn must leave the row alone and not flip RUNNING
+    to FAILED."""
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     # Plant a live lease held by a different runner
@@ -470,7 +478,7 @@ def test_finish_turn_running_flips_failed_when_no_live_lease(db_session) -> None
     db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert task.error_message is not None
-    assert task.output is None  # F7 symmetric
+    assert task.output is None  # latest-turn snapshot invariant
 
 
 def test_finish_turn_running_flips_failed_when_lease_expired(db_session) -> None:
@@ -510,8 +518,9 @@ def test_finish_turn_running_flips_failed_when_we_own_lease(db_session) -> None:
 async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
     db_session,
 ) -> None:
-    """F8 early short-circuit: lease taken by another worker → never call
-    execute_task_background or finish_turn; bg coroutine returns clean."""
+    """Running-elsewhere short-circuit: lease taken by another worker
+    → never call execute_task_background or finish_turn; bg coroutine
+    returns clean."""
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
 
@@ -607,16 +616,17 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
 async def test_schedule_bg_forwards_execution_message_to_execute_task_background(
     db_session,
 ) -> None:
-    """F9 end-to-end (orchestrator side): the dual-channel
-    ``TaskTurnPayload`` propagates all the way down — ``_schedule_bg``
-    must pass ``payload.execution_message`` to
-    ``execute_task_background``'s ``llm_user_message=`` parameter.
+    """Dual-channel payload propagation through the scheduler:
+    ``_schedule_bg`` must pass ``payload.execution_message`` to
+    ``execute_task_background``'s ``llm_user_message=`` parameter so
+    the LLM-facing variant of the turn input survives the orchestrator
+    boundary.
 
-    This is the final link in the chain that prevents the WS
-    file-context-dropped regression from coming back. begin_turn tests
-    above cover that begin_turn → _schedule_bg forwards the payload;
-    this test covers that _schedule_bg → execute_task_background
-    forwards the execution_message (the LLM-facing variant).
+    Together with the ``begin_turn → _schedule_bg`` test above this
+    locks in the full payload chain
+    (begin_turn → _schedule_bg → execute_task_background) at the
+    type-signature level, so a future refactor can't silently collapse
+    transcript and execution into a single string.
     """
     from xagent.web.api.websocket import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
@@ -665,7 +675,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
 
     mock_exec.assert_awaited_once()
     kwargs = mock_exec.await_args.kwargs
-    # F9 contract: transcript and LLM-facing channels are both
+    # Dual-channel payload contract: transcript and LLM-facing channels are both
     # forwarded explicitly so execute_task_background can pick the
     # right one for the agent input.
     assert kwargs["user_message"] == "summarize this", (

@@ -73,9 +73,9 @@ _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
 class TaskTurnPayload:
     """Both message representations a single turn carries.
 
-    A turn has two distinct message channels and conflating them was the
-    root cause of the "WS file context dropped" regression
-    (PR #384 review F9):
+    A turn has two distinct message channels, and collapsing them into
+    a single string loses the WS file-context input on its way to the
+    LLM:
 
     - ``transcript_message`` — what gets persisted to
       ``task_chat_messages`` and shown back to the user / GET endpoint
@@ -160,16 +160,14 @@ class TaskTurnOrchestrator:
 
           1. Refuse if a bg coroutine is still in flight for this task
              (``TaskTurnError("bg_inflight")``). Checked before any DB
-             write so a rejected turn never mutates the row — fixes the
-             F2 corruption-on-bg-inflight regression at the
-             architectural layer rather than as a patch on the late
-             check.
-          2. Atomic UPDATE in one statement on the caller's session:
+             write so a rejected turn never mutates the row.
+          2. Atomic UPDATE in one statement on the caller's session
+             — the latest-turn snapshot invariant:
 
              - ``status = RUNNING``
              - ``input = payload.transcript_message``
-             - ``output = NULL``          (F7 — clear stale terminal)
-             - ``error_message = NULL``   (F7 — clear stale terminal)
+             - ``output = NULL``          (clear prior-turn terminal field)
+             - ``error_message = NULL``   (clear prior-turn terminal field)
 
              with filter:
 
@@ -179,14 +177,14 @@ class TaskTurnOrchestrator:
              rowcount 0 → ``TaskTurnError("busy")``.
           3. ``persist_user_message(payload.transcript_message)`` in the
              same session (no commit yet).
-          4. ``db.commit()`` ONCE for steps 2 + 3 together. If any step
-             above raises, the session is rolled back and neither the
-             status flip nor the message persists — fixes F3 (WS
-             rejected message left in transcript) at the architectural
-             layer.
-          5. Schedule the bg coroutine via ``_schedule_bg`` with the
-             full payload (so the execution side gets
-             ``execution_message``, not just transcript — fixes F9).
+          4. ``db.commit()`` ONCE for steps 2 + 3 together — the
+             single-transaction turn-start contract. If any step above
+             raises, the session is rolled back and neither the status
+             flip nor the message persists, so a rejected turn never
+             leaves an orphan user message in the transcript.
+          5. Schedule the bg coroutine via ``_schedule_bg``, passing
+             the full payload so the execution side receives the
+             execution-only message channel, not just the transcript.
 
         Preconditions (caller contract — assert on entry):
 
@@ -260,7 +258,8 @@ class TaskTurnOrchestrator:
 
         # Step 2 + 3 + 4: atomic claim + persist + single commit. We
         # don't commit between 2 and 3, so a failure at step 3 rolls
-        # back step 2 cleanly — that's the F3 architectural fix.
+        # back step 2 cleanly — the rejected-turn-leaves-no-side-effect
+        # contract.
         try:
             if kind == TurnKind.CREATE:
                 status_filter = Task.status == TaskStatus.PENDING
@@ -359,26 +358,31 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
     Called from ``_schedule_bg._runner`` after ``execute_task_background``
     returns. Two key properties:
 
-      - symmetric handling of FAILED / RUNNING-fallback (clears stale
-        ``task.output`` matching the COMPLETED branch's clearing of
-        ``error_message`` — F7 from review)
-      - lease-aware RUNNING fallback that refuses to flip the row to
-        FAILED while another worker still holds a live lease (F8)
+      - latest-turn snapshot invariant: COMPLETED, FAILED, and the
+        RUNNING-fallback branch all leave the row in a state where the
+        terminal field that *doesn't* apply to the current turn is
+        cleared (COMPLETED clears ``error_message``; FAILED clears
+        stale ``output``). SDK consumers reading ``/v1/chat/tasks/{id}``
+        therefore never see a contradictory snapshot like
+        ``status='failed' + output='prior successful answer'``.
+      - lease ownership guard: the RUNNING-fallback branch refuses to
+        flip the row to FAILED while another worker still holds a live
+        lease, so a slow scheduler in this process can't overwrite the
+        in-flight execution result of a different process.
 
     Uses :func:`get_runner_id` internally rather than accepting
-    runner_id as a parameter — matches Roger's review wording verbatim
-    (``runner_id != get_runner_id()``) and avoids the footgun of a
-    separately-captured lease.runner_id drifting from the canonical
-    process identity.
+    runner_id as a parameter so the comparison always reads the
+    canonical process runner id and a separately-captured
+    ``lease.runner_id`` can't drift from it.
 
     Branches:
 
       - ``status == COMPLETED``: set ``output`` from latest assistant
         message, clear ``error_message``
       - ``status == FAILED``: set ``error_message`` placeholder if
-        absent, clear stale ``output`` (F7 symmetric)
+        absent, clear stale ``output``
       - ``status == RUNNING`` + other worker holds live lease: skip
-        entirely (F8 hard guard)
+        entirely (ownership guard)
       - ``status == RUNNING`` + we own lease or it's expired: flip to
         FAILED, set placeholder ``error_message``, clear stale
         ``output``
@@ -427,7 +431,8 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             fresh.error_message = "Task execution failed (see /steps for details)"
             changed = True
         if fresh.output is not None:
-            # F7 symmetric: failed turn must not carry forward prior
+            # Latest-turn snapshot invariant: a failed turn must not
+            # carry forward prior
             # successful output. SDK consumers reading the row otherwise
             # see a contradiction (status=failed + output populated).
             fresh.output = None
@@ -441,7 +446,9 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         return
 
     if status == TaskStatus.RUNNING:
-        # F8: live lease held by another worker → not ours to mark failed.
+        # Lease ownership guard: a live lease held by another worker
+        # means that worker is actively executing this task; we must
+        # not overwrite its in-flight result with a FAILED snapshot.
         # ``lease_expires_at`` comes back tz-naive from SQLite (the column is
         # DateTime(timezone=True) but SQLite stores only the naked timestamp);
         # normalize to UTC so the comparison stays dialect-agnostic.
@@ -466,7 +473,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         # Genuinely stuck: our bg coroutine returned, no live lease elsewhere.
         fresh.status = TaskStatus.FAILED
         fresh.error_message = "Task execution failed without status update; see /steps."
-        fresh.output = None  # F7 symmetric
+        fresh.output = None  # latest-turn snapshot invariant
         bg_db.commit()
         logger.warning(
             "finish_turn: task %s bg coroutine returned with status=RUNNING; "
@@ -486,21 +493,23 @@ async def _schedule_bg(
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
 ) -> "asyncio.Task[None]":
-    """Lease-aware bg scheduler. Replaces ``_schedule_bg`` for the new
-    ``begin_turn`` API.
+    """Lease-aware bg scheduler.
 
-    Owns the full lease lifecycle for the bg run (Roger F8):
+    Owns the full lease lifecycle for the bg run:
 
-      - acquire at ``_runner`` entry; if another worker already holds
-        the lease, return immediately without invoking
-        ``execute_task_background`` or ``finish_turn`` (first guard for
-        F8 "running_elsewhere" — the moral equivalent of Roger's
-        suggested early short-circuit, hoisted one frame outward)
-      - heartbeat alongside the run
-      - release in ``finally``, single owner of the release call,
-        regardless of whether ``execute_task_background`` returned
-        normally or raised. This requires ``execute_task_background``
-        to NOT release the lease internally (configured in Commit J).
+      - acquire at ``_runner`` entry. If another worker already holds
+        the lease the scheduler returns immediately without invoking
+        ``execute_task_background`` or ``finish_turn`` — the
+        running-elsewhere short-circuit. ``finish_turn``'s ownership
+        guard would catch the same situation a level deeper, but
+        skipping at the entry means we never even attempt local work
+        on a task another worker is executing.
+      - heartbeat alongside the run.
+      - release in ``finally`` as the single owner of the release
+        call, regardless of whether ``execute_task_background``
+        returned normally or raised. ``execute_task_background`` only
+        writes ``task.status`` and never touches the lease columns;
+        the scheduler is responsible for the whole lease lifecycle.
     """
     from ..api.websocket import background_task_manager, execute_task_background
 
@@ -515,9 +524,9 @@ async def _schedule_bg(
         bg_db = SessionLocal()
         lease = None
         try:
-            # F8 first guard: acquire lease before doing anything else.
-            # If another worker owns it, skip execution entirely — we
-            # never want finish_turn to touch this row.
+            # Running-elsewhere short-circuit: acquire lease before
+            # doing anything else. If another worker owns it, skip
+            # execution entirely so finish_turn never touches the row.
             lease = acquire_task_lease(bg_db, task_id)
             if lease is None:
                 logger.info(

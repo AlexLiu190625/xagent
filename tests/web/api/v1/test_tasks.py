@@ -1027,19 +1027,16 @@ def test_get_steps_returns_404_for_non_sdk_source(mock_start_task):
     assert resp.json()["error"]["code"] == "task_not_found"
 
 
-# ===== F7 regression: stale-output reset on SDK append =====
+# ===== Latest-turn snapshot invariant on SDK append =====
 
 
 def test_append_message_clears_stale_output_for_sdk_caller(mock_start_task):
-    """After the begin_turn migration, an SDK append on a previously
-    completed task immediately clears the stored ``output`` and
-    ``error_message`` so GET right after the append sees a clean
-    latest-turn snapshot (Roger F7).
-
-    Before the refactor, append_turn only flipped status + input and
-    left output untouched, so the GET response could mix the new turn's
-    status / input with the previous turn's output — a contradictory
-    snapshot to SDK consumers.
+    """An SDK append on a previously completed task immediately clears
+    the stored ``output`` and ``error_message`` so a GET right after
+    the append sees a clean latest-turn snapshot. Without this clearing,
+    the response would mix the new turn's status / input with the
+    previous turn's output — an internally contradictory snapshot for
+    SDK consumers polling the task.
     """
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="first")
@@ -1069,8 +1066,8 @@ def test_append_message_clears_stale_output_for_sdk_caller(mock_start_task):
     # After the response returns, an immediate GET must see:
     #   - status = running (atomic transition committed)
     #   - input = the new turn's message
-    #   - output = NULL (F7 — stale prior-turn output cleared)
-    #   - error_message = NULL (F7 — stale prior error cleared)
+    #   - output = NULL (stale prior-turn output cleared)
+    #   - error_message = NULL (stale prior error cleared)
     db = _direct_db_session()
     try:
         task_after = db.query(Task).filter(Task.id == task_id).first()

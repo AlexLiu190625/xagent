@@ -2434,9 +2434,10 @@ async def handle_chat_message(
                     except TaskTurnError as busy_err:
                         # begin_turn's atomic transaction rolls back on
                         # bg_inflight / busy — neither the status flip
-                        # nor the user message persists. No transcript
-                        # cleanup needed (review F3 architectural fix
-                        # replaces the best-effort delete we used to do).
+                        # nor the user message persists, so no transcript
+                        # cleanup is needed here. The rejected-turn-leaves-
+                        # no-side-effect contract makes the previous
+                        # best-effort delete unnecessary.
                         logger.warning(
                             f"Refused to schedule bg for task {task_id}: "
                             f"{busy_err.reason}"
