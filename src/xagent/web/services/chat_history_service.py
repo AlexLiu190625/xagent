@@ -32,6 +32,38 @@ def persist_user_message(
     )
 
 
+def persist_user_message_no_commit(
+    db: Session,
+    task_id: int,
+    user_id: int,
+    content: str,
+) -> Optional[TaskChatMessage]:
+    """``persist_user_message`` variant that stages the row but does NOT commit.
+
+    Used by ``TaskTurnOrchestrator.begin_turn`` so the atomic claim
+    UPDATE and the message insert land in the same commit — if the
+    insert fails, the status flip is rolled back too. Caller is
+    responsible for calling ``db.commit()`` (or ``db.rollback()`` on
+    failure).
+
+    Returns ``None`` when content is whitespace-only, same as the
+    regular ``persist_user_message``.
+    """
+    normalized_content = content.strip()
+    if not normalized_content:
+        return None
+    message = TaskChatMessage(
+        task_id=task_id,
+        user_id=user_id,
+        role="user",
+        content=normalized_content,
+        message_type="user_message",
+        interactions=None,
+    )
+    db.add(message)
+    return message
+
+
 def persist_assistant_message(
     db: Session,
     task_id: int,

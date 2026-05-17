@@ -43,11 +43,20 @@ funnel both transports through this single chokepoint.
 from __future__ import annotations
 
 import asyncio
+import enum
 import logging
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
 from ..models.task import Task, TaskStatus
 from ..models.user import User
+from .task_lease_service import (
+    acquire_task_lease,
+    get_runner_id,
+    release_current_runner_task_lease,
+    run_task_lease_heartbeat,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +67,66 @@ logger = logging.getLogger(__name__)
 # is intentionally excluded for now (semantics unclear; revisit when
 # pause/resume becomes a first-class SDK feature).
 _TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+
+
+# ===== New turn-lifecycle API (begin_turn / finish_turn) =====
+#
+# This block introduces the explicit lifecycle abstraction described in
+# the architectural review (see PR #384 review thread, 2026-05-17):
+# orchestrator becomes the single owner of turn-start and turn-finish
+# state transitions, not just scheduling. The older ``start_new_turn`` /
+# ``append_turn`` / ``schedule_bg`` / ``_sync_sdk_columns`` API stays
+# below as deprecated until callers migrate.
+
+
+@dataclass(frozen=True)
+class TaskTurnPayload:
+    """Both message representations a single turn carries.
+
+    A turn has two distinct message channels and conflating them was the
+    root cause of the "WS file context dropped" regression
+    (PR #384 review F9):
+
+    - ``transcript_message`` — what gets persisted to
+      ``task_chat_messages`` and shown back to the user / GET endpoint
+    - ``execution_message`` — what the agent / LLM actually consumes;
+      may be file-enriched, system-prefix-augmented, etc.
+
+    When ``execution_message`` is ``None``, ``for_agent`` falls back to
+    ``transcript_message`` (typical for SDK callers which only have one
+    representation). WS callers pass both because the file-context
+    append for the LLM input is intentionally not shown verbatim in the
+    transcript.
+    """
+
+    transcript_message: str
+    execution_message: Optional[str] = None
+
+    @property
+    def for_agent(self) -> str:
+        return self.execution_message or self.transcript_message
+
+
+class TurnKind(str, enum.Enum):
+    """Which transition the turn represents.
+
+    ``kind`` answers "which status filter does the atomic claim use".
+    Orthogonal to ``force_fresh`` (passed alongside to ``begin_turn``),
+    which answers "does the agent reconstruct prior execution state or
+    start fresh". The two cover four logical combinations; only three
+    are reachable in practice (CREATE + force_fresh has no meaning
+    because a brand-new task has no prior state to discard — see the
+    assert in ``begin_turn``).
+
+    Continuation paths (PAUSED / WAITING_FOR_USER resumed onto the same
+    turn) are deliberately not modeled here: they go through
+    ``dag_pattern.request_continuation`` instead, because continuation
+    is the *same* turn picking up where it paused — terminal-field reset
+    would be wrong.
+    """
+
+    CREATE = "create"  # PENDING → RUNNING; new task's first turn
+    APPEND = "append"  # TERMINAL → RUNNING; new turn on an existing task
 
 
 class TaskTurnError(Exception):
@@ -82,6 +151,175 @@ class TaskTurnOrchestrator:
     State lives in the database and in the global
     ``background_task_manager``.
     """
+
+    @staticmethod
+    async def begin_turn(
+        *,
+        task: Task,
+        payload: TaskTurnPayload,
+        user: User,
+        db: Any,
+        kind: TurnKind,
+        force_fresh: bool = False,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> "asyncio.Task[None]":
+        """Single entry for any new-turn transition (CREATE / APPEND).
+
+        Replaces ``start_new_turn`` + ``append_turn`` + ``schedule_bg``
+        (the lifecycle-bearing entry points) with one transactional
+        primitive that owns the full turn-start contract:
+
+          1. Refuse if a bg coroutine is still in flight for this task
+             (``TaskTurnError("bg_inflight")``). Checked before any DB
+             write so a rejected turn never mutates the row — fixes the
+             F2 corruption-on-bg-inflight regression at the
+             architectural layer rather than as a patch on the late
+             check.
+          2. Atomic UPDATE in one statement on the caller's session:
+
+             - ``status = RUNNING``
+             - ``input = payload.transcript_message``
+             - ``output = NULL``          (F7 — clear stale terminal)
+             - ``error_message = NULL``   (F7 — clear stale terminal)
+
+             with filter:
+
+             - ``kind == CREATE`` → ``status == PENDING``
+             - ``kind == APPEND`` → ``status IN TERMINAL_STATUSES``
+
+             rowcount 0 → ``TaskTurnError("busy")``.
+          3. ``persist_user_message(payload.transcript_message)`` in the
+             same session (no commit yet).
+          4. ``db.commit()`` ONCE for steps 2 + 3 together. If any step
+             above raises, the session is rolled back and neither the
+             status flip nor the message persists — fixes F3 (WS
+             rejected message left in transcript) at the architectural
+             layer.
+          5. Schedule the bg coroutine via ``_schedule_bg_v2`` with the
+             full payload (so the execution side gets
+             ``execution_message``, not just transcript — fixes F9).
+
+        Preconditions (caller contract — assert on entry):
+
+          - ``db`` is a clean session: no uncommitted ``new`` /
+            ``dirty`` / ``deleted`` instances. ``begin_turn`` commits
+            the atomic UPDATE + message persist together; a dirty
+            caller session would have its pending changes committed
+            alongside, which is rarely the caller's intent. All current
+            callers (SDK ``create_chat_task``, SDK
+            ``append_message_to_task``, WS path) satisfy this; the
+            assert is defensive against future callers.
+          - ``kind == CREATE and force_fresh`` is invalid — a new task
+            has no prior execution state to discard. Raises
+            ``ValueError``.
+
+        Args:
+            task: The committed Task row. ``status`` should be PENDING
+                for ``kind=CREATE`` or terminal for ``kind=APPEND``.
+            payload: Two-channel message (transcript + execution); see
+                :class:`TaskTurnPayload`.
+            user: Task owner; passed through to the bg coroutine's
+                ``UserContext``.
+            db: Caller's request-scoped session. Used for steps 2-4
+                (atomic claim + persist + commit). The bg coroutine
+                opens its own independent session inside
+                ``_schedule_bg_v2``.
+            kind: Which status filter the atomic claim uses; see
+                :class:`TurnKind`.
+            force_fresh: When True, the bg coroutine ignores any
+                reconstructible prior execution state and starts a
+                fresh agent run. WS terminal-task re-engage passes
+                True; SDK callers pass False.
+            context: Optional execution-context dict
+                (execution_mode / process_description / examples)
+                merged into the bg run.
+
+        Returns:
+            The ``asyncio.Task`` wrapping the bg coroutine. Callers
+            usually fire-and-forget; the handle is returned for tests.
+
+        Raises:
+            ValueError: invalid ``kind`` / ``force_fresh`` combination,
+                or caller session not clean.
+            TaskTurnError("bg_inflight"): a previous bg coroutine for
+                this task is still running.
+            TaskTurnError("busy"): atomic claim filter mismatched the
+                current row status (e.g. ``kind=APPEND`` against a
+                non-terminal row).
+        """
+        if kind == TurnKind.CREATE and force_fresh:
+            raise ValueError(
+                "force_fresh has no meaning for kind=CREATE — a new task "
+                "has no prior execution state to discard"
+            )
+
+        # Session-clean precondition. Catching this up-front prevents the
+        # commit at step 4 from accidentally persisting unrelated
+        # caller-staged objects.
+        if db.new or db.dirty or db.deleted:
+            raise ValueError(
+                "begin_turn requires a clean db session "
+                f"(new={len(db.new)}, dirty={len(db.dirty)}, "
+                f"deleted={len(db.deleted)}); caller must commit or "
+                "rollback its pending changes before calling begin_turn"
+            )
+
+        task_id = int(task.id)
+
+        # Step 1: bg-inflight guard before any DB write.
+        _refuse_if_bg_inflight(task_id)
+
+        # Step 2 + 3 + 4: atomic claim + persist + single commit. We
+        # don't commit between 2 and 3, so a failure at step 3 rolls
+        # back step 2 cleanly — that's the F3 architectural fix.
+        try:
+            if kind == TurnKind.CREATE:
+                status_filter = Task.status == TaskStatus.PENDING
+            else:  # APPEND
+                status_filter = Task.status.in_(_TERMINAL_STATUSES)
+
+            claimed = (
+                db.query(Task)
+                .filter(Task.id == task_id, status_filter)
+                .update(
+                    {
+                        Task.status: TaskStatus.RUNNING,
+                        Task.input: payload.transcript_message,
+                        Task.output: None,
+                        Task.error_message: None,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if claimed == 0:
+                db.rollback()
+                raise TaskTurnError("busy")
+
+            from .chat_history_service import persist_user_message_no_commit
+
+            persist_user_message_no_commit(
+                db=db,
+                task_id=task_id,
+                user_id=int(user.id),
+                content=payload.transcript_message,
+            )
+            db.commit()
+        except TaskTurnError:
+            raise
+        except Exception:
+            db.rollback()
+            raise
+
+        db.refresh(task)
+
+        # Step 5: hand off to lease-aware scheduler.
+        return await _schedule_bg_v2(
+            task=task,
+            user=user,
+            payload=payload,
+            force_fresh=force_fresh,
+            context=context,
+        )
 
     @staticmethod
     async def start_new_turn(
@@ -493,3 +731,266 @@ def _sync_sdk_columns(bg_db: Any, task_id: int) -> None:
             f"SDK column sync: task {task_id} bg coroutine returned "
             "with status=RUNNING; flipping to FAILED"
         )
+
+
+# ===== finish_turn / _schedule_bg_v2 (new lifecycle API) =====
+
+
+def finish_turn(bg_db: Any, task_id: int) -> None:
+    """Symmetric terminal-field writer with lease ownership guard.
+
+    Called from ``_schedule_bg_v2._runner`` after ``execute_task_background``
+    returns. Replaces ``_sync_sdk_columns`` with:
+
+      - symmetric handling of FAILED / RUNNING-fallback (also clears
+        stale ``task.output``, F7 from review)
+      - lease-aware RUNNING fallback that refuses to flip the row to
+        FAILED while another worker still holds a live lease (F8)
+
+    Uses :func:`get_runner_id` internally rather than accepting
+    runner_id as a parameter — matches Roger's review wording verbatim
+    (``runner_id != get_runner_id()``) and avoids the footgun of a
+    separately-captured lease.runner_id drifting from the canonical
+    process identity.
+
+    Branches:
+
+      - ``status == COMPLETED``: set ``output`` from latest assistant
+        message, clear ``error_message``
+      - ``status == FAILED``: set ``error_message`` placeholder if
+        absent, clear stale ``output`` (F7 symmetric)
+      - ``status == RUNNING`` + other worker holds live lease: skip
+        entirely (F8 hard guard)
+      - ``status == RUNNING`` + we own lease or it's expired: flip to
+        FAILED, set placeholder ``error_message``, clear stale
+        ``output``
+      - other statuses (PAUSED / WAITING_FOR_USER): leave alone
+    """
+    from ..models.chat_message import TaskChatMessage
+
+    bg_db.expire_all()
+
+    fresh = bg_db.query(Task).filter(Task.id == task_id).first()
+    if fresh is None:
+        logger.warning("finish_turn: task %s vanished after bg run", task_id)
+        return
+
+    status = fresh.status
+
+    if status == TaskStatus.COMPLETED:
+        latest_assistant = (
+            bg_db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+            )
+            .order_by(TaskChatMessage.id.desc())
+            .first()
+        )
+        if latest_assistant is not None:
+            fresh.output = latest_assistant.content
+            fresh.error_message = None
+            bg_db.commit()
+            logger.info(
+                "finish_turn: task %s output written (%d chars)",
+                task_id,
+                len(latest_assistant.content),
+            )
+        else:
+            logger.warning(
+                "finish_turn: task %s completed but no assistant message found",
+                task_id,
+            )
+        return
+
+    if status == TaskStatus.FAILED:
+        changed = False
+        if not fresh.error_message:
+            fresh.error_message = "Task execution failed (see /steps for details)"
+            changed = True
+        if fresh.output is not None:
+            # F7 symmetric: failed turn must not carry forward prior
+            # successful output. SDK consumers reading the row otherwise
+            # see a contradiction (status=failed + output populated).
+            fresh.output = None
+            changed = True
+        if changed:
+            bg_db.commit()
+            logger.info(
+                "finish_turn: task %s marked failed (cleared stale output)",
+                task_id,
+            )
+        return
+
+    if status == TaskStatus.RUNNING:
+        # F8: live lease held by another worker → not ours to mark failed.
+        # ``lease_expires_at`` comes back tz-naive from SQLite (the column is
+        # DateTime(timezone=True) but SQLite stores only the naked timestamp);
+        # normalize to UTC so the comparison stays dialect-agnostic.
+        expires_at = fresh.lease_expires_at
+        if expires_at is not None and expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        live_other_owner = (
+            fresh.runner_id is not None
+            and fresh.runner_id != get_runner_id()
+            and expires_at is not None
+            and expires_at > datetime.now(timezone.utc)
+        )
+        if live_other_owner:
+            logger.info(
+                "finish_turn: task %s owned by runner %s, lease alive "
+                "until %s; skipping RUNNING fallback",
+                task_id,
+                fresh.runner_id,
+                fresh.lease_expires_at,
+            )
+            return
+        # Genuinely stuck: our bg coroutine returned, no live lease elsewhere.
+        fresh.status = TaskStatus.FAILED
+        fresh.error_message = "Task execution failed without status update; see /steps."
+        fresh.output = None  # F7 symmetric
+        bg_db.commit()
+        logger.warning(
+            "finish_turn: task %s bg coroutine returned with status=RUNNING; "
+            "flipping to FAILED",
+            task_id,
+        )
+        return
+
+    # PAUSED / WAITING_FOR_USER / other: leave alone.
+
+
+async def _schedule_bg_v2(
+    *,
+    task: Task,
+    user: User,
+    payload: TaskTurnPayload,
+    force_fresh: bool,
+    context: Optional[Dict[str, Any]],
+) -> "asyncio.Task[None]":
+    """Lease-aware bg scheduler. Replaces ``_schedule_bg`` for the new
+    ``begin_turn`` API.
+
+    Owns the full lease lifecycle for the bg run (Roger F8):
+
+      - acquire at ``_runner`` entry; if another worker already holds
+        the lease, return immediately without invoking
+        ``execute_task_background`` or ``finish_turn`` (first guard for
+        F8 "running_elsewhere" — the moral equivalent of Roger's
+        suggested early short-circuit, hoisted one frame outward)
+      - heartbeat alongside the run
+      - release in ``finally``, single owner of the release call,
+        regardless of whether ``execute_task_background`` returned
+        normally or raised. This requires ``execute_task_background``
+        to NOT release the lease internally (configured in Commit J).
+    """
+    from ..api.websocket import background_task_manager, execute_task_background
+
+    task_id = int(task.id)
+    task_source = getattr(task, "source", None)
+    user_id = int(user.id)
+
+    async def _runner() -> None:
+        from ..models.database import get_session_local
+
+        SessionLocal = get_session_local()
+        bg_db = SessionLocal()
+        lease = None
+        try:
+            # F8 first guard: acquire lease before doing anything else.
+            # If another worker owns it, skip execution entirely — we
+            # never want finish_turn to touch this row.
+            lease = acquire_task_lease(bg_db, task_id)
+            if lease is None:
+                logger.info(
+                    "task %s acquired by another worker; skipping "
+                    "execution and finish_turn",
+                    task_id,
+                )
+                return
+
+            stop_event = asyncio.Event()
+            hb_task = asyncio.create_task(run_task_lease_heartbeat(lease, stop_event))
+            try:
+                bg_task_row = bg_db.query(Task).filter(Task.id == task_id).first()
+                bg_user_row = bg_db.query(User).filter(User.id == user_id).first()
+                if bg_task_row is None or bg_user_row is None:
+                    logger.warning(
+                        "bg task %s aborted: task or user vanished (task=%s, user=%s)",
+                        task_id,
+                        bg_task_row,
+                        bg_user_row,
+                    )
+                    return
+
+                await execute_task_background(
+                    task_id=task_id,
+                    user_message=payload.transcript_message,
+                    context=context or {},
+                    agent_manager=_get_agent_manager(),
+                    user=bg_user_row,
+                    task=bg_task_row,
+                    db=bg_db,
+                    force_fresh_execution=force_fresh,
+                    llm_user_message=payload.execution_message,
+                )
+                try:
+                    finish_turn(bg_db, task_id)
+                except Exception as e:
+                    logger.error(
+                        "finish_turn failed for task %s: %s",
+                        task_id,
+                        e,
+                        exc_info=True,
+                    )
+            finally:
+                stop_event.set()
+                try:
+                    await hb_task
+                except Exception:
+                    pass
+        finally:
+            if lease is not None:
+                # Single owner of release. Defensive: if the session is
+                # invalid (e.g. execute_task_background aborted a
+                # transaction), the fresh-status read would also raise;
+                # rollback + default to FAILED so the lease still gets
+                # released instead of stuck-until-TTL.
+                final_status: TaskStatus = TaskStatus.FAILED
+                try:
+                    fresh = bg_db.query(Task).filter(Task.id == task_id).first()
+                    if fresh is not None:
+                        final_status = fresh.status
+                except Exception as query_err:
+                    logger.warning(
+                        "task %s status read failed during lease release "
+                        "(%s); rolling session back and defaulting to FAILED",
+                        task_id,
+                        query_err,
+                    )
+                    try:
+                        bg_db.rollback()
+                    except Exception:
+                        pass
+                try:
+                    release_current_runner_task_lease(
+                        bg_db, task_id, status=final_status
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "lease release failed for task %s: %s; "
+                        "TTL expiry will reclaim it",
+                        task_id,
+                        e,
+                    )
+            bg_db.close()
+
+    bg_task = asyncio.create_task(_runner())
+    background_task_manager.register_task(task_id, bg_task)
+    logger.info(
+        "task %s scheduled in background v2 (source=%s, force_fresh=%s)",
+        task_id,
+        task_source,
+        force_fresh,
+    )
+    return bg_task

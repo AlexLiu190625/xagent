@@ -854,21 +854,29 @@ async def execute_task_background(
         try:
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
-                # If task current status is PAUSED, don't overwrite
+                # Caller is responsible for the lease lifecycle (acquire +
+                # release); this function only writes ``status``. The
+                # orchestrator's ``_schedule_bg_v2`` wraps the call in
+                # acquire/release; chat.py and WS continuation paths
+                # acquire and release the lease directly themselves.
+                #
+                # Previously this branch called
+                # ``release_current_runner_task_lease(status=...)``, which
+                # bundled status update with lease release in one UPDATE
+                # filtered on ``runner_id == get_runner_id()``. That hid a
+                # bug for callers that never acquired the lease: the
+                # filter didn't match, so status was silently never
+                # written either (a quiet "stuck RUNNING" outcome).
                 if result.get("status") == "waiting_for_user":
-                    release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.WAITING_FOR_USER
-                    )
-                    db_new.refresh(task_updated)
+                    task_updated.status = TaskStatus.WAITING_FOR_USER
+                    db_new.commit()
                     waiting_for_control = True
                     logger.info(
                         f"Updated task {task_id} status to WAITING_FOR_USER for v2 control state"
                     )
                 elif result.get("status") == "interrupted":
-                    release_current_runner_task_lease(
-                        db_new, task_id, status=TaskStatus.PAUSED
-                    )
-                    db_new.refresh(task_updated)
+                    task_updated.status = TaskStatus.PAUSED
+                    db_new.commit()
                     waiting_for_control = True
                     logger.info(
                         f"Updated task {task_id} status to PAUSED for v2 interrupt state"
@@ -878,14 +886,10 @@ async def execute_task_background(
                     TaskStatus.WAITING_FOR_USER,
                 }:
                     if result.get("success", False):
-                        release_current_runner_task_lease(
-                            db_new, task_id, status=TaskStatus.COMPLETED
-                        )
+                        task_updated.status = TaskStatus.COMPLETED
                     else:
-                        release_current_runner_task_lease(
-                            db_new, task_id, status=TaskStatus.FAILED
-                        )
-                    db_new.refresh(task_updated)
+                        task_updated.status = TaskStatus.FAILED
+                    db_new.commit()
                     logger.info(
                         f"Updated task {task_id} status to {task_updated.status.value}"
                     )
