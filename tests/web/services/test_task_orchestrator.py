@@ -1,7 +1,6 @@
 """Tests for the turn-lifecycle API in ``task_orchestrator``.
 
-Covers the new explicit lifecycle introduced after the architectural
-review (PR #384):
+Covers:
 
   - ``TaskTurnPayload`` dual-message channel
   - ``TurnKind`` + ``force_fresh`` orthogonal kind/flag

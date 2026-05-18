@@ -1,16 +1,17 @@
 """Integration tests for /v1/chat/tasks/* endpoints.
 
-Phase 1 surface tested here:
-  - D: POST /v1/chat/tasks
-  - E: POST /v1/chat/tasks/{id}/messages, GET /v1/chat/tasks/{id}
-  - F: GET /v1/chat/tasks/{id}/steps  (this commit)
+Endpoints covered:
+  - POST /v1/chat/tasks
+  - POST /v1/chat/tasks/{id}/messages
+  - GET  /v1/chat/tasks/{id}
+  - GET  /v1/chat/tasks/{id}/steps
 
-D / E / F tests mock the background-execution kickoff so the suite
-doesn't need to spin up an actual AgentService / LLM. The behaviors
-under test are HTTP shape + DB rows + which background helper was
-called with which arguments -- not the LLM call itself. F's steps
-endpoint exercises real :class:`TraceEvent` rows inserted directly
-into the test DB to drive the mapping.
+Tests mock the background-execution kickoff so the suite doesn't need
+to spin up an actual AgentService / LLM. The behaviors under test are
+HTTP shape + DB rows + which background helper was called with which
+arguments -- not the LLM call itself. The steps endpoint exercises
+real :class:`TraceEvent` rows inserted directly into the test DB to
+drive the mapping.
 """
 
 from datetime import datetime, timezone
@@ -78,12 +79,9 @@ def _bearer(full_key: str) -> dict[str, str]:
 # existing test surface; conceptually it now mocks "bg scheduling".
 @pytest.fixture(autouse=True)
 def mock_start_task():
-    # After the begin_turn migration, the SDK endpoints schedule the bg
-    # coroutine via ``_schedule_bg`` (lease-aware), not the
-    # deprecated ``_schedule_bg``. Tests in this file mock the new
-    # entry point so the orchestrator's atomic claim + persist logic
-    # still runs against a real DB; only the asyncio.create_task /
-    # agent execution is stubbed.
+    # Patch the lease-aware bg scheduler so the orchestrator's atomic
+    # claim + transcript persist logic still runs against a real DB;
+    # only the asyncio.create_task / agent execution is stubbed.
     with patch(
         "xagent.web.services.task_orchestrator._schedule_bg",
         new=AsyncMock(),
@@ -116,13 +114,9 @@ def test_create_task_happy_path(mock_start_task):
     assert "created_at" in body
     task_id = body["task_id"]
 
-    # DB: Task row exists, owned by admin user, source='sdk', input set,
-    # After begin_turn the row is RUNNING (atomic transition committed
-    # before the response returns). Prior to the begin_turn migration
-    # this assertion read PENDING; that reflected start_new_turn's
-    # behavior of only persisting + scheduling without flipping status.
-    # The new architectural contract is "row is RUNNING from the moment
-    # the endpoint returns 202".
+    # DB: Task row exists, owned by admin user, source='sdk', input set.
+    # POST atomically claims RUNNING before returning 202, so the row
+    # is already RUNNING from the moment the response lands.
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).first()
@@ -144,9 +138,9 @@ def test_create_task_happy_path(mock_start_task):
     finally:
         db.close()
 
-    # Background kickoff was called exactly once for this task.
-    # After the begin_turn migration the bg scheduler receives a
-    # ``TaskTurnPayload`` rather than a raw ``user_message`` string.
+    # Background kickoff was called exactly once for this task. The
+    # scheduler receives a ``TaskTurnPayload`` carrying both transcript
+    # and execution channels.
     assert mock_start_task.await_count == 1
     kwargs = mock_start_task.await_args.kwargs
     assert kwargs["task"].id == task_id
@@ -646,14 +640,10 @@ def test_append_message_body_agent_id_mismatch_returns_404(mock_start_task):
 
 
 def test_get_task_running_right_after_create(mock_start_task):
-    """Fresh task after begin_turn migration: status='running' (atomic
-    transition is committed inside POST /v1/chat/tasks), input set,
-    output/error null, completed_at null.
-
-    Before the begin_turn refactor this test asserted ``status='pending'``
-    because the deprecated ``start_new_turn`` deferred the status flip
-    to the bg coroutine. The new architectural contract is that the
-    row is RUNNING from the moment the create endpoint returns 202.
+    """A fresh SDK task is visible as ``status='running'`` immediately
+    after POST returns: the atomic claim commits the status flip before
+    202, so an immediate GET sees RUNNING + input set + output/error
+    null + completed_at null.
     """
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="seed input")

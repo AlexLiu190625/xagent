@@ -2356,13 +2356,14 @@ async def handle_chat_message(
                             f"Confirmed: Task {task_id} was completed/failed, forcing fresh execution"
                         )
 
-                    # Route through the shared task-turn orchestrator so
-                    # both WS and /v1 SDK paths run the same single-flight
-                    # + SDK-column-sync logic around the bg coroutine. WS
-                    # has already persisted the user message at line 1434
-                    # and flipped status to RUNNING just above, so we use
-                    # the lower-level ``schedule_bg`` entry point that
-                    # only handles scheduling (not persist / claim).
+                    # WS builds the display/execution payload here and
+                    # delegates the full new-turn transition to the
+                    # shared orchestrator. ``begin_turn`` owns the
+                    # atomic claim (status flip + input set + terminal-
+                    # field reset), the transcript persist, the
+                    # single-commit transaction, and the lease-aware bg
+                    # schedule -- so WS and /v1 SDK use one turn-
+                    # lifecycle state machine.
                     from ..models.chat_message import TaskChatMessage
                     from ..services.task_orchestrator import (
                         TaskTurnError,

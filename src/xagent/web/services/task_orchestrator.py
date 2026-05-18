@@ -36,8 +36,10 @@ helper with this orchestrator:
     and skip waiting. The orchestrator's ``_refuse_if_bg_inflight``
     closes this from the caller side.
 
-These were both real races identified by code review; the fix is to
-funnel both transports through this single chokepoint.
+Both races are prevented by funneling the WebSocket and /v1 transports
+through this single turn-lifecycle chokepoint -- the atomic claim
+filter and ``_refuse_if_bg_inflight`` guard close them at the
+orchestrator boundary.
 """
 
 from __future__ import annotations
