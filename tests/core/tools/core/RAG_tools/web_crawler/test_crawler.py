@@ -231,6 +231,86 @@ class TestWebCrawler:
         assert len([r for r in results if r.status == "success"]) == 0
 
     @pytest.mark.asyncio
+    async def test_rejects_unreadable_replacement_content(self, crawl_config):
+        """2xx responses with heavy replacement characters must not enter KB."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "<html><body>" + ("\ufffd" * 120) + "</body></html>"
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            crawler = WebCrawler(crawl_config)
+            results = await crawler.crawl()
+
+        assert results == []
+        assert "https://example.com" in crawler.failed_urls
+        assert "replacement_ratio" in crawler.failed_urls["https://example.com"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_null_byte_content(self, crawl_config):
+        """2xx responses with null bytes are binary/undecodable enough to fail."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "<html><body>hello\x00world with more text</body></html>"
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            crawler = WebCrawler(crawl_config)
+            results = await crawler.crawl()
+
+        assert results == []
+        assert "https://example.com" in crawler.failed_urls
+        assert "null bytes" in crawler.failed_urls["https://example.com"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_high_control_character_content(self, crawl_config):
+        """Control-character-heavy pages should be rejected as unreadable."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "<html><body>" + ("\x01" * 20) + ("readable text " * 20)
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            crawler = WebCrawler(crawl_config)
+            results = await crawler.crawl()
+
+        assert results == []
+        assert "https://example.com" in crawler.failed_urls
+        assert "control_ratio" in crawler.failed_urls["https://example.com"]
+
+    @pytest.mark.asyncio
+    async def test_rejects_extracted_content_that_is_too_short(self, crawl_config):
+        """A page must produce enough extracted text to be useful."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "<html><body><p>tiny page</p></body></html>"
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            crawler = WebCrawler(crawl_config)
+            results = await crawler.crawl()
+
+        assert results == []
+        assert "https://example.com" in crawler.failed_urls
+        assert "too short" in crawler.failed_urls["https://example.com"]
+
+    @pytest.mark.asyncio
     async def test_same_domain_filtering(self, sample_html):
         """Test same domain filtering."""
         config = WebCrawlConfig(
@@ -516,6 +596,42 @@ class TestWebCrawler:
             results = await crawler.crawl()
 
         # chain[0] returned a 200 challenge -> fallback to chain[1]
+        assert call_log[0] == "chrome116"
+        assert call_log[1] == "safari17_0"
+        assert len(results) == 1
+        assert results[0].status == "success"
+
+    @pytest.mark.asyncio
+    async def test_unreadable_200_advances_tls_auto_chain(
+        self, sample_html, monkeypatch
+    ):
+        """A 200 response with unreadable text should not short-circuit auto TLS."""
+        config = WebCrawlConfig(
+            start_url="https://example.com",
+            max_pages=1,
+            request_delay=0,
+            tls_impersonate="auto",
+        )
+        call_log = []
+        cffi_requests = self._install_fake_cffi(monkeypatch)
+
+        def response_for(impersonate):
+            resp = MagicMock()
+            resp.status_code = 200
+            if impersonate == "chrome116":
+                resp.text = "<html><body>" + ("\ufffd" * 120) + "</body></html>"
+            else:
+                resp.text = sample_html
+            return resp
+
+        with patch.object(
+            cffi_requests,
+            "AsyncSession",
+            side_effect=self._make_cffi_session_factory(call_log, response_for),
+        ):
+            crawler = WebCrawler(config)
+            results = await crawler.crawl()
+
         assert call_log[0] == "chrome116"
         assert call_log[1] == "safari17_0"
         assert len(results) == 1

@@ -6,6 +6,7 @@ import logging
 import time
 from collections import deque
 from contextlib import AsyncExitStack, asynccontextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Set, Tuple
 
@@ -61,12 +62,25 @@ _WAF_RETRY_STATUSES: frozenset = frozenset(
 # These pages return HTTP 200 but the body is a "Just a moment..." stub --
 # accepting them as successful crawls would pollute the KB with garbage.
 _CHALLENGE_PAGE_MARKERS: Tuple[str, ...] = (
+    "403 forbidden",
+    "access denied",
     "checking your browser",
     "cf-challenge",
+    "cf-mitigated",
     "just a moment",
+    "please enable cookies",
     "cf-please-wait",
     "needs to review the security",
+    "security check",
+    "you have been blocked",
+    "your request has been blocked",
 )
+
+_MIN_RAW_TEXT_LENGTH = 20
+_MIN_MARKDOWN_TEXT_LENGTH = 50
+_MAX_REPLACEMENT_CHAR_RATIO = 0.01
+_MAX_CONTROL_CHAR_RATIO = 0.005
+_MIN_READABLE_CHAR_RATIO = 0.85
 
 
 def _looks_like_challenge_page(body: str) -> bool:
@@ -75,6 +89,80 @@ def _looks_like_challenge_page(body: str) -> bool:
         return False
     lowered = body[:3000].lower()
     return any(marker in lowered for marker in _CHALLENGE_PAGE_MARKERS)
+
+
+@dataclass(frozen=True)
+class _ContentQualityReport:
+    ok: bool
+    reason: str
+    text_length: int
+    replacement_ratio: float
+    control_ratio: float
+    readable_ratio: float
+    null_count: int
+
+
+def _format_ratio(value: float) -> str:
+    return f"{value:.3f}"
+
+
+def _assess_text_quality(
+    text: str,
+    *,
+    min_length: int,
+    label: str,
+) -> _ContentQualityReport:
+    """Detect obviously unreadable crawl content before it enters the KB."""
+    text_length = len(text or "")
+    if text_length == 0:
+        return _ContentQualityReport(
+            ok=False,
+            reason=f"{label} is empty",
+            text_length=0,
+            replacement_ratio=0.0,
+            control_ratio=0.0,
+            readable_ratio=0.0,
+            null_count=0,
+        )
+
+    null_count = text.count("\x00")
+    replacement_ratio = text.count("\ufffd") / text_length
+    control_count = sum(1 for ch in text if ord(ch) < 32 and ch not in "\n\r\t")
+    control_ratio = control_count / text_length
+    readable_count = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
+    readable_ratio = readable_count / text_length
+
+    reason = ""
+    if text_length < min_length:
+        reason = f"{label} too short: length={text_length}"
+    elif _looks_like_challenge_page(text):
+        reason = f"{label} challenge page detected"
+    elif null_count:
+        reason = f"{label} contains null bytes: count={null_count}"
+    elif replacement_ratio > _MAX_REPLACEMENT_CHAR_RATIO:
+        reason = (
+            f"{label} unreadable content: "
+            f"replacement_ratio={_format_ratio(replacement_ratio)}"
+        )
+    elif control_ratio > _MAX_CONTROL_CHAR_RATIO:
+        reason = (
+            f"{label} unreadable content: control_ratio={_format_ratio(control_ratio)}"
+        )
+    elif readable_ratio < _MIN_READABLE_CHAR_RATIO:
+        reason = (
+            f"{label} unreadable content: "
+            f"readable_ratio={_format_ratio(readable_ratio)}"
+        )
+
+    return _ContentQualityReport(
+        ok=not reason,
+        reason=reason,
+        text_length=text_length,
+        replacement_ratio=replacement_ratio,
+        control_ratio=control_ratio,
+        readable_ratio=readable_ratio,
+        null_count=null_count,
+    )
 
 
 def _ensure_curl_cffi_available() -> None:
@@ -366,6 +454,22 @@ class WebCrawler:
                             url,
                         )
                         continue
+                    raw_quality = _assess_text_quality(
+                        body_preview,
+                        min_length=_MIN_RAW_TEXT_LENGTH,
+                        label="raw content",
+                    )
+                    if self.config.tls_impersonate == "auto" and not raw_quality.ok:
+                        last_response = response
+                        last_status = response.status_code
+                        logger.debug(
+                            "TLS fp=%s got 200 unreadable content for %s "
+                            "(%s), trying next",
+                            fp_label,
+                            url,
+                            raw_quality.reason,
+                        )
+                        continue
                     if i > 0:
                         logger.info(
                             "TLS fallback hit: url=%s fp=%s pos=%d/%d",
@@ -531,7 +635,20 @@ class WebCrawler:
                     return None, set()
 
                 if fingerprint_used is None and 200 <= response.status_code < 300:
-                    error_msg = "TLS fallback exhausted with challenge page"
+                    html = response.text or ""
+                    if _looks_like_challenge_page(html):
+                        error_msg = "TLS fallback exhausted with challenge page"
+                    else:
+                        raw_quality = _assess_text_quality(
+                            html,
+                            min_length=_MIN_RAW_TEXT_LENGTH,
+                            label="raw content",
+                        )
+                        error_msg = (
+                            raw_quality.reason
+                            if not raw_quality.ok
+                            else "TLS fallback exhausted with challenge page"
+                        )
                     logger.error("Failed to crawl %s: %s", url, error_msg)
                     self.failed_urls[url] = error_msg
                     return None, set()
@@ -546,12 +663,39 @@ class WebCrawler:
                     return None, set()
 
                 html = response.text
+                raw_quality = _assess_text_quality(
+                    html,
+                    min_length=_MIN_RAW_TEXT_LENGTH,
+                    label="raw content",
+                )
+                if not raw_quality.ok:
+                    logger.warning(
+                        "Rejected crawl content at %s: %s",
+                        url,
+                        raw_quality.reason,
+                    )
+                    self.failed_urls[url] = raw_quality.reason
+                    return None, set()
 
                 # Clean and convert content
                 cleaned = self.content_cleaner.clean_and_convert(html, url)
 
                 # Validate content
                 content = cleaned["content_markdown"]
+                markdown_quality = _assess_text_quality(
+                    content,
+                    min_length=_MIN_MARKDOWN_TEXT_LENGTH,
+                    label="extracted content",
+                )
+                if not markdown_quality.ok:
+                    logger.warning(
+                        "Rejected extracted crawl content at %s: %s",
+                        url,
+                        markdown_quality.reason,
+                    )
+                    self.failed_urls[url] = markdown_quality.reason
+                    return None, set()
+
                 if not self.content_cleaner.is_valid_content(content, min_length=10):
                     logger.warning("Insufficient content at %s", url)
                     self.failed_urls[url] = "Insufficient content"

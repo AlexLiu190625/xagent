@@ -43,6 +43,7 @@ SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
+WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -577,6 +578,28 @@ def get_web_search_provider() -> str:
         provider,
     )
     return "auto"
+
+
+def get_web_crawl_tls_impersonate() -> str | None:
+    """Get the optional TLS impersonation spec for website crawling.
+
+    Priority:
+        1. XAGENT_WEB_CRAWL_TLS_IMPERSONATE environment variable
+        2. None (plain httpx)
+
+    Values:
+        - unset, empty, "none", or "null": None
+        - "auto": built-in crawler fallback chain
+        - any other non-empty value: curl_cffi impersonate spec
+    """
+    value = os.getenv(WEB_CRAWL_TLS_IMPERSONATE)
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"none", "null"}:
+        return None
+    return normalized
 
 
 def get_tool_max_recursion_depth() -> int:

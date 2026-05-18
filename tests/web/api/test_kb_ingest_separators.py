@@ -10,6 +10,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from xagent.config import WEB_CRAWL_TLS_IMPERSONATE
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionConfig,
     IngestionResult,
@@ -512,6 +513,9 @@ async def _fake_run_web_ingestion(
     """Async fake that captures ingestion_config and returns WebIngestionResult."""
     captured_config: list = _fake_run_web_ingestion.captured  # type: ignore[attr-defined]
     captured_config.append(ingestion_config)
+    captured_crawl_config = getattr(_fake_run_web_ingestion, "captured_crawl", None)
+    if captured_crawl_config is not None:
+        captured_crawl_config.append(crawl_config)
     return WebIngestionResult(
         status="success",
         collection=collection,
@@ -526,10 +530,13 @@ async def _fake_run_web_ingestion(
     )
 
 
-def test_ingest_web_separators_valid_json_passed_to_config(app_with_kb):
+def test_ingest_web_separators_valid_json_passed_to_config(app_with_kb, monkeypatch):
     """POST /api/kb/ingest-web with valid separators passes list to IngestionConfig."""
+    monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, "auto")
     captured_config: list[IngestionConfig] = []
     _fake_run_web_ingestion.captured = captured_config  # type: ignore[attr-defined]
+    captured_crawl_config: list = []
+    _fake_run_web_ingestion.captured_crawl = captured_crawl_config  # type: ignore[attr-defined]
 
     with patch(
         "xagent.web.api.kb.run_web_ingestion", side_effect=_fake_run_web_ingestion
@@ -550,6 +557,8 @@ def test_ingest_web_separators_valid_json_passed_to_config(app_with_kb):
     assert response.status_code == 200
     assert len(captured_config) == 1
     assert captured_config[0].separators == ["\n", " "]
+    assert len(captured_crawl_config) == 1
+    assert captured_crawl_config[0].tls_impersonate == "auto"
 
 
 def test_ingest_web_separators_invalid_json_request_succeeds(app_with_kb):

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from xagent.config import WEB_CRAWL_TLS_IMPERSONATE
 from xagent.core.tools.adapters.vibe.agent_kb_service import (
     AgentKnowledgeBaseError,
     AgentKnowledgeBaseService,
@@ -119,7 +120,9 @@ async def test_agent_kb_service_refresh_collection_metadata_raises_on_failure():
 
 
 @pytest.mark.asyncio
-async def test_create_kb_from_url_uses_shared_service():
+async def test_create_kb_from_url_uses_shared_service(monkeypatch):
+    monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, "auto")
+
     ingest_result = WebIngestionResult(
         status="success",
         collection="agent_url_kb",
@@ -138,6 +141,7 @@ async def test_create_kb_from_url_uses_shared_service():
     service = MagicMock()
     service.prepare_collection = AsyncMock(return_value="agent_url_kb")
     service.refresh_collection_metadata = AsyncMock()
+    run_web_ingestion_mock = AsyncMock(return_value=ingest_result)
 
     with (
         patch(
@@ -146,7 +150,7 @@ async def test_create_kb_from_url_uses_shared_service():
         ),
         patch(
             "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.run_web_ingestion",
-            new=AsyncMock(return_value=ingest_result),
+            new=run_web_ingestion_mock,
         ),
     ):
         tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
@@ -163,6 +167,9 @@ async def test_create_kb_from_url_uses_shared_service():
         == DEFAULT_EMBEDDING_MODEL_ID
     )
     service.refresh_collection_metadata.assert_awaited_once_with("agent_url_kb")
+    run_web_ingestion_mock.assert_awaited_once()
+    _, run_kwargs = run_web_ingestion_mock.await_args
+    assert run_kwargs["crawl_config"].tls_impersonate == "auto"
 
 
 @pytest.mark.asyncio
