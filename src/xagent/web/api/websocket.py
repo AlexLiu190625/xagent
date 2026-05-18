@@ -1086,6 +1086,38 @@ async def execute_task_background(
 
     except Exception as e:
         logger.error(f"Background task {task_id} execution failed: {e}", exc_info=True)
+        # Persist the real exception text to ``task.error_message`` and
+        # mark the row FAILED here so SDK/web clients reading
+        # ``GET /v1/chat/tasks/{id}`` (or the equivalent web endpoint)
+        # see the actual failure cause instead of the generic placeholder
+        # ``finish_turn``'s fallback writes when ``error_message`` is
+        # empty.
+        #
+        # Status must move to FAILED in the same commit: otherwise
+        # ``finish_turn``'s RUNNING-fallback branch overwrites
+        # ``error_message`` unconditionally with its own generic string.
+        # The FAILED branch, by contrast, only writes a placeholder when
+        # ``error_message`` is empty -- which is what we want.
+        #
+        # Uses a fresh session because the original ``db`` may be in a
+        # failed-transaction state after the exception.
+        err_db_gen = get_db()
+        try:
+            err_db = next(err_db_gen)
+            err_task = err_db.query(Task).filter(Task.id == task_id).first()
+            if err_task is not None:
+                err_task.error_message = str(e)[:4000]  # type: ignore[assignment]
+                err_task.status = TaskStatus.FAILED
+                err_db.commit()
+        except Exception as persist_err:
+            logger.warning(
+                f"Failed to persist error_message for task {task_id}: {persist_err}"
+            )
+        finally:
+            try:
+                next(err_db_gen)
+            except StopIteration:
+                pass
         # Send error event
         try:
             await manager.broadcast_to_task(
