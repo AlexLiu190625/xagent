@@ -291,11 +291,13 @@ class TestWebCrawler:
         assert "control_ratio" in crawler.failed_urls["https://example.com"]
 
     @pytest.mark.asyncio
-    async def test_rejects_extracted_content_that_is_too_short(self, crawl_config):
-        """A page must produce enough extracted text to be useful."""
+    async def test_accepts_short_readable_extracted_content(self, crawl_config):
+        """Short but readable pages should keep the previous 10-char behavior."""
         mock_response = MagicMock()
         mock_response.status_code = 200
-        mock_response.text = "<html><body><p>tiny page</p></body></html>"
+        mock_response.text = (
+            "<html><body><h1>Contact</h1><p>Email support@example.com</p></body></html>"
+        )
 
         mock_client = AsyncMock()
         mock_client.get.return_value = mock_response
@@ -306,9 +308,9 @@ class TestWebCrawler:
             crawler = WebCrawler(crawl_config)
             results = await crawler.crawl()
 
-        assert results == []
-        assert "https://example.com" in crawler.failed_urls
-        assert "too short" in crawler.failed_urls["https://example.com"]
+        assert len(results) == 1
+        assert results[0].content_markdown == "# Contact\n\nEmail support@example.com"
+        assert "https://example.com" not in crawler.failed_urls
 
     @pytest.mark.asyncio
     async def test_same_domain_filtering(self, sample_html):
