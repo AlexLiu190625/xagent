@@ -151,10 +151,18 @@ async def create_chat_task(
     except TaskTurnError:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
 
+    # ``status=task.status.value`` (i.e. 'running'), not 'pending':
+    # ``begin_turn`` ran an atomic UPDATE that flipped the row to
+    # RUNNING and ``db.refresh(task)``'d the in-memory object before
+    # returning. Returning 'pending' would lie to the SDK client --
+    # an immediately-following GET would see 'running' and the caller
+    # would have to reconcile two contradictory values from
+    # back-to-back calls. This matches the AppendMessageResponse
+    # contract below.
     return CreateTaskResponse(
         task_id=int(task.id),
         agent_id=int(agent.id),
-        status="pending",
+        status=task.status.value,
         created_at=task.created_at,
     )
 

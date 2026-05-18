@@ -109,7 +109,9 @@ def test_create_task_happy_path(mock_start_task):
     assert resp.status_code == 202, resp.text
     body = resp.json()
     assert body["agent_id"] == agent_id
-    assert body["status"] == "pending"
+    # POST atomically claims RUNNING before returning 202, so the
+    # response body reports the post-claim state, not 'pending'.
+    assert body["status"] == "running"
     assert "task_id" in body
     assert "created_at" in body
     task_id = body["task_id"]

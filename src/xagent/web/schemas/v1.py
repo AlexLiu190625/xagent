@@ -83,9 +83,10 @@ class CreateTaskRequest(BaseModel):
 class CreateTaskResponse(BaseModel):
     """``POST /v1/chat/tasks`` -> 202 Accepted response.
 
-    The task has been persisted and queued for background execution;
-    callers poll ``GET /v1/chat/tasks/{task_id}`` to observe the
-    transition pending -> running -> completed/failed.
+    The task has been persisted, claimed as RUNNING in the same
+    transaction, and queued for background execution; callers poll
+    ``GET /v1/chat/tasks/{task_id}`` to observe the transition
+    running -> completed/failed.
     """
 
     task_id: int = Field(..., description="Newly created task primary key.")
@@ -93,8 +94,10 @@ class CreateTaskResponse(BaseModel):
     status: str = Field(
         ...,
         description=(
-            "Initial status, always 'pending' in the 202 response. "
-            "Use GET /v1/chat/tasks/{task_id} to observe later transitions."
+            "Initial status, 'running' in the 202 response (the atomic "
+            "claim inside POST commits the status flip before the "
+            "response is sent). Use GET /v1/chat/tasks/{task_id} to "
+            "observe later transitions."
         ),
     )
     created_at: datetime = Field(..., description="UTC creation timestamp.")
@@ -136,7 +139,11 @@ class AppendMessageResponse(BaseModel):
     agent_id: int = Field(..., description="Agent the task is bound to.")
     status: str = Field(
         ...,
-        description="Initial status of the new turn, always 'pending'.",
+        description=(
+            "Initial status of the new turn, 'running' in the 202 "
+            "response (the atomic claim inside POST commits the status "
+            "flip before the response is sent)."
+        ),
     )
     accepted_at: datetime = Field(
         ...,
