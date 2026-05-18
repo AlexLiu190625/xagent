@@ -125,11 +125,24 @@ def _assess_text_quality(
             null_count=0,
         )
 
-    null_count = text.count("\x00")
-    replacement_ratio = text.count("\ufffd") / text_length
-    control_count = sum(1 for ch in text if ord(ch) < 32 and ch not in "\n\r\t")
+    null_count = 0
+    replacement_count = 0
+    control_count = 0
+    readable_count = 0
+    for ch in text:
+        if ch == "\x00":
+            null_count += 1
+        if ch == "\ufffd":
+            replacement_count += 1
+
+        is_allowed_whitespace = ch in "\n\r\t"
+        if not is_allowed_whitespace and ord(ch) < 32:
+            control_count += 1
+        if is_allowed_whitespace or ch.isprintable():
+            readable_count += 1
+
+    replacement_ratio = replacement_count / text_length
     control_ratio = control_count / text_length
-    readable_count = sum(1 for ch in text if ch.isprintable() or ch in "\n\r\t")
     readable_ratio = readable_count / text_length
 
     reason = ""
@@ -454,22 +467,23 @@ class WebCrawler:
                             url,
                         )
                         continue
-                    raw_quality = _assess_text_quality(
-                        body_preview,
-                        min_length=_MIN_RAW_TEXT_LENGTH,
-                        label="raw content",
-                    )
-                    if self.config.tls_impersonate == "auto" and not raw_quality.ok:
-                        last_response = response
-                        last_status = response.status_code
-                        logger.debug(
-                            "TLS fp=%s got 200 unreadable content for %s "
-                            "(%s), trying next",
-                            fp_label,
-                            url,
-                            raw_quality.reason,
+                    if self.config.tls_impersonate == "auto":
+                        raw_quality = _assess_text_quality(
+                            body_preview,
+                            min_length=_MIN_RAW_TEXT_LENGTH,
+                            label="raw content",
                         )
-                        continue
+                        if not raw_quality.ok:
+                            last_response = response
+                            last_status = response.status_code
+                            logger.debug(
+                                "TLS fp=%s got 200 unreadable content for %s "
+                                "(%s), trying next",
+                                fp_label,
+                                url,
+                                raw_quality.reason,
+                            )
+                            continue
                     if i > 0:
                         logger.info(
                             "TLS fallback hit: url=%s fp=%s pos=%d/%d",
