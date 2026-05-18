@@ -86,8 +86,10 @@ async def create_chat_task(
 
     Returns:
         :class:`CreateTaskResponse` with the new ``task_id``,
-        ``agent_id``, ``status='pending'``, and ``created_at`` for the
-        caller to start polling from.
+        ``agent_id``, ``status='running'`` (the atomic claim inside
+        the handler flips the row from PENDING to RUNNING before the
+        response is sent), and ``created_at`` for the caller to
+        start polling from.
 
     Raises:
         V1ApiError 401: missing/invalid/revoked key (raised inside
@@ -310,16 +312,18 @@ async def append_message_to_task(
     # see a value that matches what they'd read from the DB directly
     # via GET /v1/chat/tasks/{id}, with no clock-skew between the two.
     #
-    # ``status='running'`` (not 'pending') because the atomic UPDATE
-    # above already flipped the row to RUNNING in the same transaction.
-    # Returning 'pending' here would lie to the SDK client: an
-    # immediately-following GET would see 'running' and the client
-    # would have to reconcile two contradictory values from
-    # back-to-back calls.
+    # ``status=task.status.value`` (i.e. 'running'), read from the
+    # refreshed in-memory row rather than hardcoded, mirrors the
+    # CreateTaskResponse contract above: the atomic UPDATE inside
+    # ``begin_turn`` flipped the row to RUNNING in the same
+    # transaction. Returning 'pending' here would lie to the SDK
+    # client -- an immediately-following GET would see 'running' and
+    # the caller would have to reconcile two contradictory values
+    # from back-to-back calls.
     return AppendMessageResponse(
         task_id=int(task.id),
         agent_id=int(agent.id),
-        status="running",
+        status=task.status.value,
         accepted_at=task.updated_at,
     )
 
