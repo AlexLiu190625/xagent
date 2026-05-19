@@ -70,11 +70,12 @@ _CHALLENGE_PAGE_MARKERS: Tuple[str, ...] = (
     "needs to review the security",
 )
 
-_MIN_RAW_TEXT_LENGTH = 0
 _MIN_MARKDOWN_TEXT_LENGTH = 10
 _MAX_REPLACEMENT_CHAR_RATIO = 0.01
 _MAX_CONTROL_CHAR_RATIO = 0.005
 _MIN_READABLE_CHAR_RATIO = 0.85
+_RAW_EMPTY_REASON = "raw content is empty"
+_RAW_CHALLENGE_REASON = "raw content challenge page detected"
 
 
 def _looks_like_challenge_page(body: str) -> bool:
@@ -96,8 +97,53 @@ class _ContentQualityReport:
     null_count: int
 
 
+@dataclass(frozen=True)
+class _FetchResult:
+    response: Optional[Any]
+    fingerprint_used: Optional[str]
+    cleaned: Optional[Dict[str, Any]] = None
+    raw_quality: Optional[_ContentQualityReport] = None
+    markdown_quality: Optional[_ContentQualityReport] = None
+
+
 def _format_ratio(value: float) -> str:
     return f"{value:.3f}"
+
+
+def _assess_raw_crawl_response(body: str) -> _ContentQualityReport:
+    """Detect raw responses that should not enter content cleaning."""
+    text_length = len(body or "")
+    if text_length == 0:
+        return _ContentQualityReport(
+            ok=False,
+            reason=_RAW_EMPTY_REASON,
+            text_length=0,
+            replacement_ratio=0.0,
+            control_ratio=0.0,
+            readable_ratio=0.0,
+            null_count=0,
+        )
+
+    if _looks_like_challenge_page(body):
+        return _ContentQualityReport(
+            ok=False,
+            reason=_RAW_CHALLENGE_REASON,
+            text_length=text_length,
+            replacement_ratio=0.0,
+            control_ratio=0.0,
+            readable_ratio=1.0,
+            null_count=0,
+        )
+
+    return _ContentQualityReport(
+        ok=True,
+        reason="",
+        text_length=text_length,
+        replacement_ratio=0.0,
+        control_ratio=0.0,
+        readable_ratio=1.0,
+        null_count=0,
+    )
 
 
 def _assess_text_quality(
@@ -169,6 +215,22 @@ def _assess_text_quality(
         control_ratio=control_ratio,
         readable_ratio=readable_ratio,
         null_count=null_count,
+    )
+
+
+def _should_retry_cleaned_quality_failure(report: _ContentQualityReport) -> bool:
+    """Return whether a cleaned-content failure might recover with another TLS fp."""
+    if report.ok:
+        return False
+    return any(
+        marker in report.reason
+        for marker in (
+            "challenge page detected",
+            "contains null bytes",
+            "replacement_ratio=",
+            "control_ratio=",
+            "readable_ratio=",
+        )
     )
 
 
@@ -410,16 +472,16 @@ class WebCrawler:
         self,
         sessions: Dict[Optional[str], Any],
         url: str,
-    ) -> Tuple[Optional[Any], Optional[str]]:
+    ) -> _FetchResult:
         """Fetch a URL by trying each TLS fingerprint in self._tls_chain.
 
         Behavior on each response status:
 
           * 2xx + body looks like real content
               -> return (response, fp_used).
-          * 2xx + body looks like a JS challenge wrapper
+          * 2xx + empty body / JS challenge wrapper
               (Cloudflare "Just a moment...", etc.)
-              -> treat as a WAF block, advance to the next fingerprint.
+              -> treat as unusable raw content, advance to the next fingerprint.
           * Status in _WAF_RETRY_STATUSES (403, 429, 503, 520-526)
               -> advance to next fingerprint.
           * Any other non-2xx (404, 401, 500, ...)
@@ -428,13 +490,13 @@ class WebCrawler:
                  retrying just wastes the rest of the chain.
 
         Returns:
-            (response, fingerprint_used) on first real 2xx success.
-            (last_response, None) if the chain was exhausted or returned
+            _FetchResult(response, fingerprint_used, ...) on first real 2xx success.
+            _FetchResult(last_response, None, ...) if the chain was exhausted or returned
                 fast on a non-WAF non-2xx -- fingerprint_used=None signals
                 "this response is a failure, not a success".
-            (None, None) only if every attempt raised an exception.
+            _FetchResult(None, None) only if every attempt raised an exception.
         """
-        last_response = None
+        last_result = _FetchResult(response=None, fingerprint_used=None)
         last_status: Optional[int] = None
         exception_log: List[str] = []
 
@@ -452,32 +514,50 @@ class WebCrawler:
 
                 if 200 <= response.status_code < 300:
                     body_preview = response.text or ""
-                    if _looks_like_challenge_page(body_preview):
-                        last_response = response
+                    raw_quality = _assess_raw_crawl_response(body_preview)
+                    if not raw_quality.ok:
+                        last_result = _FetchResult(
+                            response=response,
+                            fingerprint_used=None,
+                            raw_quality=raw_quality,
+                        )
                         last_status = response.status_code
                         logger.debug(
-                            "TLS fp=%s got 200 challenge page for %s, trying next",
+                            "TLS fp=%s got 200 unusable raw content for %s "
+                            "(%s), trying next",
                             fp_label,
                             url,
+                            raw_quality.reason,
                         )
                         continue
-                    if self.config.tls_impersonate == "auto":
-                        raw_quality = _assess_text_quality(
-                            body_preview,
-                            min_length=_MIN_RAW_TEXT_LENGTH,
-                            label="raw content",
+
+                    cleaned = self.content_cleaner.clean_and_convert(body_preview, url)
+                    markdown_quality = _assess_text_quality(
+                        cleaned["content_markdown"],
+                        min_length=_MIN_MARKDOWN_TEXT_LENGTH,
+                        label="extracted content",
+                    )
+                    if (
+                        self.config.tls_impersonate == "auto"
+                        and _should_retry_cleaned_quality_failure(markdown_quality)
+                    ):
+                        last_result = _FetchResult(
+                            response=response,
+                            fingerprint_used=None,
+                            cleaned=cleaned,
+                            raw_quality=raw_quality,
+                            markdown_quality=markdown_quality,
                         )
-                        if not raw_quality.ok:
-                            last_response = response
-                            last_status = response.status_code
-                            logger.debug(
-                                "TLS fp=%s got 200 unreadable content for %s "
-                                "(%s), trying next",
-                                fp_label,
-                                url,
-                                raw_quality.reason,
-                            )
-                            continue
+                        last_status = response.status_code
+                        logger.debug(
+                            "TLS fp=%s got 200 unusable extracted content for %s "
+                            "(%s), trying next",
+                            fp_label,
+                            url,
+                            markdown_quality.reason,
+                        )
+                        continue
+
                     if i > 0:
                         logger.info(
                             "TLS fallback hit: url=%s fp=%s pos=%d/%d",
@@ -486,10 +566,19 @@ class WebCrawler:
                             i + 1,
                             len(self._tls_chain),
                         )
-                    return response, fp_label
+                    return _FetchResult(
+                        response=response,
+                        fingerprint_used=fp_label,
+                        cleaned=cleaned,
+                        raw_quality=raw_quality,
+                        markdown_quality=markdown_quality,
+                    )
 
                 if response.status_code in _WAF_RETRY_STATUSES:
-                    last_response = response
+                    last_result = _FetchResult(
+                        response=response,
+                        fingerprint_used=None,
+                    )
                     last_status = response.status_code
                     logger.debug(
                         "TLS fp=%s returned %d (WAF-like) for %s, trying next",
@@ -507,7 +596,7 @@ class WebCrawler:
                     response.status_code,
                     url,
                 )
-                return response, None
+                return _FetchResult(response=response, fingerprint_used=None)
             except Exception as e:
                 exception_log.append(f"{fp_label}:{type(e).__name__}: {e}")
                 logger.debug(
@@ -517,14 +606,14 @@ class WebCrawler:
                     url,
                 )
 
-        if last_response is not None:
+        if last_result.response is not None:
             logger.warning(
                 "TLS fallback exhausted: url=%s last_status=%s chain=%s",
                 url,
                 last_status,
                 [f or "httpx" for f in self._tls_chain],
             )
-            return last_response, None
+            return last_result
 
         if exception_log:
             logger.warning(
@@ -533,7 +622,7 @@ class WebCrawler:
                 exception_log,
             )
 
-        return None, None
+        return _FetchResult(response=None, fingerprint_used=None)
 
     async def _crawl_loop(self, sessions: Dict[Optional[str], Any]) -> None:
         """Main crawl loop with concurrency control.
@@ -633,9 +722,9 @@ class WebCrawler:
                 logger.debug("Crawling %s (depth: %s)", url, depth)
 
                 # Fetch page (with TLS fingerprint fallback chain)
-                response, fingerprint_used = await self._fetch_with_fallback(
-                    sessions, url
-                )
+                fetch_result = await self._fetch_with_fallback(sessions, url)
+                response = fetch_result.response
+                fingerprint_used = fetch_result.fingerprint_used
                 if response is None:
                     error_msg = "All TLS fingerprints raised exceptions"
                     logger.error("Failed to crawl %s: %s", url, error_msg)
@@ -644,19 +733,18 @@ class WebCrawler:
 
                 if fingerprint_used is None and 200 <= response.status_code < 300:
                     html = response.text or ""
-                    if _looks_like_challenge_page(html):
+                    raw_quality = (
+                        fetch_result.raw_quality or _assess_raw_crawl_response(html)
+                    )
+                    if raw_quality.reason == _RAW_CHALLENGE_REASON:
                         error_msg = "TLS fallback exhausted with challenge page"
+                    elif (
+                        fetch_result.markdown_quality
+                        and not fetch_result.markdown_quality.ok
+                    ):
+                        error_msg = fetch_result.markdown_quality.reason
                     else:
-                        raw_quality = _assess_text_quality(
-                            html,
-                            min_length=_MIN_RAW_TEXT_LENGTH,
-                            label="raw content",
-                        )
-                        error_msg = (
-                            raw_quality.reason
-                            if not raw_quality.ok
-                            else "TLS fallback exhausted with challenge page"
-                        )
+                        error_msg = raw_quality.reason or "TLS fallback exhausted"
                     logger.error("Failed to crawl %s: %s", url, error_msg)
                     self.failed_urls[url] = error_msg
                     return None, set()
@@ -671,10 +759,8 @@ class WebCrawler:
                     return None, set()
 
                 html = response.text
-                raw_quality = _assess_text_quality(
-                    html,
-                    min_length=_MIN_RAW_TEXT_LENGTH,
-                    label="raw content",
+                raw_quality = fetch_result.raw_quality or _assess_raw_crawl_response(
+                    html
                 )
                 if not raw_quality.ok:
                     logger.warning(
@@ -686,14 +772,20 @@ class WebCrawler:
                     return None, set()
 
                 # Clean and convert content
-                cleaned = self.content_cleaner.clean_and_convert(html, url)
+                cleaned = (
+                    fetch_result.cleaned
+                    or self.content_cleaner.clean_and_convert(html, url)
+                )
 
                 # Validate content
                 content = cleaned["content_markdown"]
-                markdown_quality = _assess_text_quality(
-                    content,
-                    min_length=_MIN_MARKDOWN_TEXT_LENGTH,
-                    label="extracted content",
+                markdown_quality = (
+                    fetch_result.markdown_quality
+                    or _assess_text_quality(
+                        content,
+                        min_length=_MIN_MARKDOWN_TEXT_LENGTH,
+                        label="extracted content",
+                    )
                 )
                 if not markdown_quality.ok:
                     logger.warning(

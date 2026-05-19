@@ -271,6 +271,31 @@ class TestWebCrawler:
         assert "null bytes" in crawler.failed_urls["https://example.com"]
 
     @pytest.mark.asyncio
+    async def test_accepts_dirty_script_when_cleaned_content_is_valid(
+        self, crawl_config
+    ):
+        """Raw script bytes should not fail if cleaned markdown is readable."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = (
+            "<html><body><p>Hello world with enough text.</p>"
+            "<script>const junk = '\x00\x01\ufffd';</script></body></html>"
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            crawler = WebCrawler(crawl_config)
+            results = await crawler.crawl()
+
+        assert len(results) == 1
+        assert results[0].content_markdown == "Hello world with enough text."
+        assert "https://example.com" not in crawler.failed_urls
+
+    @pytest.mark.asyncio
     async def test_rejects_high_control_character_content(self, crawl_config):
         """Control-character-heavy pages should be rejected as unreadable."""
         mock_response = MagicMock()
@@ -654,7 +679,7 @@ class TestWebCrawler:
     async def test_unreadable_200_advances_tls_auto_chain(
         self, sample_html, monkeypatch
     ):
-        """A 200 response with unreadable text should not short-circuit auto TLS."""
+        """Unreadable cleaned content should not short-circuit auto TLS."""
         config = WebCrawlConfig(
             start_url="https://example.com",
             max_pages=1,
