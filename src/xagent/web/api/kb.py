@@ -52,6 +52,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     WebIngestionResult,
 )
 from ...core.tools.core.RAG_tools.management.collection_manager import (
+    delete_collection_metadata_sync,
     get_collection_sync,
 )
 from ...core.tools.core.RAG_tools.management.collections import (
@@ -2729,6 +2730,13 @@ class ResolvedDocumentMatch(TypedDict):
     source_path: Optional[str]
 
 
+_DELETE_SHARED_COLLECTION_DETAIL = (
+    "Only admin users can delete collections containing documents from other users."
+)
+
+_CONFIG_ONLY_SENTINEL_KEY = "__config_only__"
+
+
 def _http_detail_to_str(detail: Any) -> str:
     """Normalize FastAPI/Starlette ``HTTPException.detail`` to a string."""
     if isinstance(detail, str):
@@ -2739,16 +2747,14 @@ def _http_detail_to_str(detail: Any) -> str:
         return str(detail)
 
 
-def _check_can_delete_collection(
+def _get_collection_document_counts(
     collection_name: str,
     user_id: int,
     is_admin: bool,
-) -> None:
-    """Validate collection name and non-admin delete permission."""
+) -> tuple[int, int]:
+    """Return total and caller-owned document counts for a collection."""
     if not collection_name or not collection_name.strip():
         raise HTTPException(status_code=422, detail="Collection name cannot be empty")
-    if is_admin:
-        return
     try:
         vector_store = get_vector_index_store()
         total_count = int(
@@ -2767,24 +2773,175 @@ def _check_can_delete_collection(
             detail="Failed to verify collection delete permission (documents table).",
         ) from exc
 
+    return total_count, own_count
+
+
+def _check_can_delete_collection(
+    collection_name: str,
+    user_id: int,
+    is_admin: bool,
+) -> None:
+    """Validate collection name and non-admin full-delete permission."""
+    if not collection_name or not collection_name.strip():
+        raise HTTPException(status_code=422, detail="Collection name cannot be empty")
+    if is_admin:
+        return
+
+    total_count, own_count = _get_collection_document_counts(
+        collection_name, user_id, is_admin=False
+    )
     if total_count > 0 and own_count < total_count:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Only admin users can delete collections containing documents "
-                "from other users."
-            ),
+        raise HTTPException(status_code=403, detail=_DELETE_SHARED_COLLECTION_DETAIL)
+
+
+def _resolve_delete_mode_from_counts(
+    total_count: int,
+    own_count: int,
+    is_admin: bool,
+) -> str:
+    """Decide full|config_only|forbidden from precomputed total/own counts."""
+    if is_admin:
+        return "full"
+    if total_count > 0 and own_count == 0:
+        return "config_only"
+    if total_count > 0 and own_count < total_count:
+        return "forbidden"
+    return "full"
+
+
+def _get_collection_delete_mode(
+    collection_name: str,
+    user_id: int,
+    is_admin: bool,
+) -> str:
+    """Return full|config_only|forbidden for collection delete."""
+    if not collection_name or not collection_name.strip():
+        raise HTTPException(status_code=422, detail="Collection name cannot be empty")
+    if is_admin:
+        return "full"
+
+    total_count, own_count = _get_collection_document_counts(
+        collection_name, user_id, is_admin=False
+    )
+    return _resolve_delete_mode_from_counts(total_count, own_count, is_admin=False)
+
+
+def _remove_user_collection_config(
+    collection_name: str,
+    user_id: int,
+    *,
+    delete_orphaned_metadata: bool = False,
+) -> dict[str, int]:
+    """Remove only the caller's collection config entry.
+
+    Returns the number of rows removed so the caller can distinguish a real
+    stale-list cleanup from a delete request for a collection the user never
+    had in their KB list.
+    """
+    try:
+        cleanup_counts = delete_collection_metadata_sync(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=False,
+            delete_orphaned_metadata=delete_orphaned_metadata,
         )
+    except Exception as exc:
+        logger.exception(
+            "Failed to delete collection config for %s/user_%s",
+            collection_name,
+            user_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete collection configuration: {exc}",
+        ) from exc
+
+    return cleanup_counts
+
+
+def _cleanup_collection_config_if_no_owned_documents(
+    collection_name: str,
+    user_id: int,
+) -> dict[str, int]:
+    """Clear user's config once they no longer own documents in the collection."""
+    total_count, own_count = _get_collection_document_counts(
+        collection_name, user_id, is_admin=False
+    )
+    if own_count > 0:
+        return {}
+
+    try:
+        cleanup_counts = delete_collection_metadata_sync(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=False,
+            delete_orphaned_metadata=total_count == 0,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to delete collection config after document deletion for %s/user_%s",
+            collection_name,
+            user_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete collection configuration: {exc}",
+        ) from exc
+    if int(cleanup_counts.get("config_rows", 0)) <= 0:
+        return {}
+
+    logger.info(
+        "Removed collection config for %s/user_%s after last owned document deletion: %s",
+        collection_name,
+        user_id,
+        cleanup_counts,
+    )
+    return cleanup_counts
+
+
+def _is_config_only_delete_result(result: CollectionOperationResult) -> bool:
+    """Return True when collection delete only removed user visibility config."""
+    return bool((result.deleted_counts or {}).get(_CONFIG_ONLY_SENTINEL_KEY))
+
+
+def _strip_config_only_sentinel(
+    result: CollectionOperationResult,
+) -> CollectionOperationResult:
+    """Return ``result`` without the internal config-only sentinel key."""
+    deleted_counts = dict(result.deleted_counts or {})
+    if _CONFIG_ONLY_SENTINEL_KEY not in deleted_counts:
+        return result
+    deleted_counts.pop(_CONFIG_ONLY_SENTINEL_KEY, None)
+    return CollectionOperationResult(
+        status=result.status,
+        collection=result.collection,
+        message=result.message,
+        warnings=list(result.warnings or []),
+        affected_documents=list(result.affected_documents or []),
+        deleted_counts=deleted_counts,
+    )
 
 
 def _preflight_batch_delete_permissions(
     unique_names: List[str],
     user_id: int,
     is_admin: bool,
-) -> tuple[List[str], List[BatchDeleteFailureItem]]:
-    """Preflight validation for batch delete permissions and empty names."""
+) -> tuple[
+    List[str],
+    List[BatchDeleteFailureItem],
+    Dict[str, tuple[int, int]],
+]:
+    """Preflight validation for batch delete permissions and empty names.
+
+    Returns ``(allowed_names, failed_items, counts_by_name)``. For non-admin
+    callers ``counts_by_name`` maps the trimmed collection name to its
+    ``(total, own)`` document counts so callers can reuse them when invoking
+    ``_perform_kb_collection_delete`` (avoids redundant LanceDB scans).
+    Admin callers receive an empty dict because counts are not needed.
+    """
     failed: List[BatchDeleteFailureItem] = []
     allowed: List[str] = []
+    counts_by_name: Dict[str, tuple[int, int]] = {}
 
     if is_admin:
         for name in unique_names:
@@ -2797,7 +2954,7 @@ def _preflight_batch_delete_permissions(
                 )
             else:
                 allowed.append(name)
-        return allowed, failed
+        return allowed, failed, counts_by_name
 
     non_empty: List[str] = []
     for name in unique_names:
@@ -2812,7 +2969,7 @@ def _preflight_batch_delete_permissions(
             non_empty.append(name)
 
     if not non_empty:
-        return [], failed
+        return [], failed, counts_by_name
 
     vector_store = get_vector_index_store()
     try:
@@ -2833,21 +2990,55 @@ def _preflight_batch_delete_permissions(
             detail="Failed to scan documents table for batch delete permission.",
         ) from exc
 
-    forbidden_detail = (
-        "Only admin users can delete collections containing documents from other users."
-    )
-    for name in unique_names:
-        if not name or not name.strip():
-            continue
+    for name in non_empty:
         key = str(name).strip()
         total = int(totals.get(key, 0))
         own = int(owns.get(key, 0))
-        if total > 0 and own < total:
-            failed.append(BatchDeleteFailureItem(name=name, error=forbidden_detail))
+        if total > 0 and 0 < own < total:
+            failed.append(
+                BatchDeleteFailureItem(
+                    name=name, error=_DELETE_SHARED_COLLECTION_DETAIL
+                )
+            )
         else:
             allowed.append(name)
+            counts_by_name[key] = (total, own)
 
-    return allowed, failed
+    return allowed, failed, counts_by_name
+
+
+def _build_config_only_delete_result(
+    safe_collection: str,
+    cleanup_counts: dict[str, int],
+) -> CollectionOperationResult:
+    """Construct a CollectionOperationResult for config-only delete paths."""
+    removed_rows = int(cleanup_counts.get("config_rows", 0))
+    if removed_rows > 0:
+        message = (
+            f"Removed collection '{safe_collection}' from your knowledge base list."
+        )
+    else:
+        message = f"Collection '{safe_collection}' is not in your knowledge base list."
+    return CollectionOperationResult(
+        status="success",
+        collection=safe_collection,
+        message=message,
+        deleted_counts={**cleanup_counts, _CONFIG_ONLY_SENTINEL_KEY: 1},
+    )
+
+
+def _perform_config_only_collection_delete(
+    safe_collection: str,
+    user_id: int,
+) -> CollectionOperationResult:
+    """Remove a stale user KB-list entry without touching collection documents."""
+    cleanup_counts = _remove_user_collection_config(safe_collection, user_id)
+    if int(cleanup_counts.get("config_rows", 0)) <= 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Collection '{safe_collection}' is not in your knowledge base list.",
+        )
+    return _build_config_only_delete_result(safe_collection, cleanup_counts)
 
 
 def _perform_kb_collection_delete(
@@ -2855,8 +3046,15 @@ def _perform_kb_collection_delete(
     user_id: int,
     is_admin: bool,
     db: Session,
+    *,
+    preflight_counts: Optional[tuple[int, int]] = None,
 ) -> CollectionOperationResult:
-    """Delete one KB collection (same pipeline as single-delete API)."""
+    """Delete one KB collection (same pipeline as single-delete API).
+
+    ``preflight_counts`` is an optional ``(total, own)`` pair already computed
+    by an upstream batch preflight. It is used only as a stale-preflight hint;
+    non-admin callers always get a live delete-mode recheck before mutation.
+    """
     try:
         try:
             safe_collection = sanitize_path_component(collection_name, "collection")
@@ -2865,11 +3063,42 @@ def _perform_kb_collection_delete(
                 status_code=422, detail=f"Invalid collection name: {str(e)}"
             ) from e
 
-        _check_can_delete_collection(safe_collection, user_id, is_admin)
+        preflight_delete_mode: Optional[str] = None
+        if preflight_counts is not None:
+            total_count, own_count = preflight_counts
+            preflight_delete_mode = _resolve_delete_mode_from_counts(
+                int(total_count), int(own_count), is_admin
+            )
+        elif not is_admin:
+            preflight_delete_mode = _get_collection_delete_mode(
+                safe_collection, user_id, is_admin=False
+            )
 
-        collection_dir = get_upload_path(
-            "", user_id=user_id, collection=safe_collection
-        )
+        if is_admin:
+            delete_mode = "full"
+        else:
+            delete_mode = _get_collection_delete_mode(
+                safe_collection, user_id, is_admin=False
+            )
+            if (
+                preflight_delete_mode is not None
+                and preflight_delete_mode != delete_mode
+            ):
+                logger.info(
+                    "Collection delete mode changed after preflight for %s/user_%s: "
+                    "preflight=%s live=%s",
+                    safe_collection,
+                    user_id,
+                    preflight_delete_mode,
+                    delete_mode,
+                )
+
+        if delete_mode == "forbidden":
+            raise HTTPException(
+                status_code=403, detail=_DELETE_SHARED_COLLECTION_DETAIL
+            )
+        if delete_mode == "config_only":
+            return _perform_config_only_collection_delete(safe_collection, user_id)
 
         vector_store = get_vector_index_store()
         collection_records = vector_store.list_document_records(
@@ -2885,8 +3114,10 @@ def _perform_kb_collection_delete(
             if file_id
         }
 
-        # Re-check right before vector deletion to reduce TOCTTOU window.
-        _check_can_delete_collection(safe_collection, user_id, is_admin)
+        collection_dir = get_upload_path(
+            "", user_id=user_id, collection=safe_collection
+        )
+
         result = delete_collection(safe_collection, user_id, is_admin)
 
         physical_cleanup = delete_collection_physical_dir(
@@ -2912,7 +3143,7 @@ def _perform_kb_collection_delete(
 
             return CollectionOperationResult(
                 status="error",
-                collection=result.collection,
+                collection=safe_collection,
                 message=result.message,
                 warnings=cleanup_warnings,
                 affected_documents=result.affected_documents,
@@ -2993,7 +3224,7 @@ def _perform_kb_collection_delete(
 
         updated_result = CollectionOperationResult(
             status=final_status,
-            collection=result.collection,
+            collection=safe_collection,
             message=updated_message,
             warnings=cleanup_warnings,
             affected_documents=result.affected_documents,
@@ -3043,7 +3274,7 @@ async def delete_collection_api(
         bool(_user.is_admin),
         db,
     )
-    return result
+    return _strip_config_only_sentinel(result)
 
 
 @kb_router.post(
@@ -3079,14 +3310,21 @@ async def batch_delete_collections_api(
         seen.add(key)
         unique_names.append(raw_name)
 
-    allowed, failed = _preflight_batch_delete_permissions(
+    allowed, failed, counts_by_name = _preflight_batch_delete_permissions(
         unique_names, user_id, is_admin
     )
 
     try:
         for name in allowed:
             try:
-                result = _perform_kb_collection_delete(name, user_id, is_admin, db)
+                preflight_counts = counts_by_name.get(str(name).strip())
+                result = _perform_kb_collection_delete(
+                    name,
+                    user_id,
+                    is_admin,
+                    db,
+                    preflight_counts=preflight_counts,
+                )
                 if result.status in ("success", "partial_success"):
                     deleted.append(name)
                 else:
@@ -3747,6 +3985,8 @@ async def delete_document_api(
     deleted_doc_ids = []
     deletion_errors = []
     cleanup_candidate_file_ids: set[str] = set()
+    config_cleanup_counts: dict[str, int] = {}
+    config_cleanup_error: Optional[str] = None
 
     for doc_info in matching_docs:
         resolved_doc_id = doc_info["doc_id"]
@@ -3820,6 +4060,22 @@ async def delete_document_api(
                     remaining_file_ids=remaining_file_ids,
                 )
 
+    if deleted_doc_ids:
+        try:
+            config_cleanup_counts = _cleanup_collection_config_if_no_owned_documents(
+                safe_collection_name,
+                user_id_int,
+            )
+        except HTTPException as exc:
+            config_cleanup_error = _http_detail_to_str(exc.detail)
+            logger.warning(
+                "Failed to clean collection config after deleting document(s) "
+                "(collection=%s, user_id=%s): %s",
+                safe_collection_name,
+                user_id_int,
+                exc.detail,
+            )
+
     # Commit all orphan file cleanups in a single batch after the loop
     try:
         db.commit()
@@ -3833,7 +4089,7 @@ async def delete_document_api(
         )
 
     if deletion_errors:
-        return {
+        partial_response: dict[str, Any] = {
             "status": "partial_success" if deleted_doc_ids else "failed",
             "message": f"Deleted {len(deleted_doc_ids)} of {len(matching_docs)} documents",
             "collection": safe_collection_name,
@@ -3841,14 +4097,24 @@ async def delete_document_api(
             "deleted_doc_ids": deleted_doc_ids,
             "errors": deletion_errors,
         }
+        if config_cleanup_counts:
+            partial_response["collection_config_cleanup"] = config_cleanup_counts
+        if config_cleanup_error:
+            partial_response["collection_config_cleanup_error"] = config_cleanup_error
+        return partial_response
 
-    return {
+    response: dict[str, Any] = {
         "status": "success",
         "message": f"Successfully deleted {len(deleted_doc_ids)} document(s)",
         "collection": safe_collection_name,
         "filename": filename,
         "deleted_doc_ids": deleted_doc_ids,
     }
+    if config_cleanup_counts:
+        response["collection_config_cleanup"] = config_cleanup_counts
+    if config_cleanup_error:
+        response["collection_config_cleanup_error"] = config_cleanup_error
+    return response
 
 
 @kb_router.put(

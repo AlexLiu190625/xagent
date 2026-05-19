@@ -11,6 +11,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from xagent.core.tools.core.RAG_tools.core.schemas import (
+    CollectionOperationResult,
     IngestionConfig,
     IngestionResult,
     WebIngestionResult,
@@ -178,6 +179,8 @@ def test_delete_collection_forbidden_for_non_admin_with_other_users_docs(
         mock_store.count_documents_grouped_by_collection.side_effect = [
             {"test_collection": 5},
             {"test_collection": 3},
+            {"test_collection": 5},
+            {"test_collection": 3},
         ]
 
         client = TestClient(app_with_kb)
@@ -190,6 +193,340 @@ def test_delete_collection_forbidden_for_non_admin_with_other_users_docs(
         in detail
     )
     mock_delete_collection.assert_not_called()
+
+
+def test_delete_collection_rechecks_permission_before_full_delete(
+    app_with_kb, mock_user
+):
+    """Single delete must not use stale ownership state for destructive delete."""
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 1},
+            {"test_collection": 2},
+            {"test_collection": 1},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.delete("/api/kb/collections/test_collection")
+
+    assert resp.status_code == 403
+    assert "Only admin users can delete collections" in resp.json()["detail"]
+    mock_delete_collection.assert_not_called()
+    mock_physical.assert_not_called()
+
+
+def test_delete_collection_removes_stale_config_without_deleting_other_users_docs(
+    app_with_kb, mock_user
+):
+    """Config-only stale entries should be removable without touching documents."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 0},
+        ) as mock_delete_config,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.delete("/api/kb/collections/test_collection")
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert "knowledge base list" in data["message"]
+    assert data["deleted_counts"] == {"config_rows": 1, "metadata_rows": 0}
+    mock_delete_config.assert_called_once_with(
+        collection_name="test_collection",
+        user_id=mock_user.id,
+        is_admin=False,
+        delete_orphaned_metadata=False,
+    )
+    mock_delete_collection.assert_not_called()
+    mock_physical.assert_not_called()
+    # config_only path must not delete global metadata used by other users.
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_allows_config_only_stale_collection(app_with_kb, mock_user):
+    """Batch preflight should pass own_count=0 stale config entries to cleanup."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 0},
+        ),
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        # Preflight makes a single batched call per filter (totals/owns), then
+        # the delete path rechecks live mode before mutating config.
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == ["test_collection"]
+    assert resp.json()["failed"] == []
+    mock_delete_collection.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_config_only_preflight_can_become_full_delete(app_with_kb, mock_user):
+    """A stale config-only preflight must not hide a newly owned collection."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync"
+        ) as mock_delete_config,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 1},
+        ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == ["test_collection"]
+    mock_delete_config.assert_not_called()
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
+    )
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_rechecks_permission_before_full_delete(app_with_kb, mock_user):
+    """A stale batch preflight must not authorize a now mixed-owner delete."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 1},
+            {"test_collection": 2},
+            {"test_collection": 1},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == []
+    assert len(body["failed"]) == 1
+    assert body["failed"][0]["name"] == "test_collection"
+    assert "Only admin users can delete collections" in body["failed"][0]["error"]
+    mock_delete_collection.assert_not_called()
+    mock_physical.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_delete_collection_returns_not_found_when_user_config_already_cleaned(
+    app_with_kb, mock_user
+):
+    """Config-only cleanup must require a real user config row."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 0, "metadata_rows": 0},
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.delete("/api/kb/collections/test_collection")
+
+    assert resp.status_code == 404
+    assert "not in your knowledge base list" in resp.json()["detail"]
+    mock_delete_collection.assert_not_called()
+    mock_physical.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_fails_when_config_only_row_is_absent(app_with_kb, mock_user):
+    """Batch config-only cleanup should not report success without user config."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 0, "metadata_rows": 0},
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == []
+    assert len(body["failed"]) == 1
+    assert body["failed"][0]["name"] == "test_collection"
+    assert "not in your knowledge base list" in body["failed"][0]["error"]
+    mock_delete_collection.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_marks_config_cleanup_failure_as_failed(app_with_kb, mock_user):
+    """When _remove_user_collection_config raises in config_only path, item should fail."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            side_effect=RuntimeError("metadata store down"),
+        ),
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == []
+    assert len(body["failed"]) == 1
+    failed_item = body["failed"][0]
+    assert failed_item["name"] == "test_collection"
+    assert "Failed to delete collection configuration" in failed_item["error"]
+    mock_delete_collection.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
 
 
 def test_delete_collection_allowed_for_admin_with_other_users_docs(
@@ -226,6 +563,70 @@ def test_delete_collection_allowed_for_admin_with_other_users_docs(
 
     assert resp.status_code == 200
     mock_delete_collection.assert_called_once()
+
+
+def test_document_delete_cleanup_removes_config_after_last_owned_doc():
+    """Last owned document deletion should clear only the current user's config."""
+    from xagent.web.api import kb
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 0},
+        ) as mock_delete_config,
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        result = kb._cleanup_collection_config_if_no_owned_documents(
+            "test_collection",
+            user_id=(mock_user_id := 1),
+        )
+
+    assert result == {"config_rows": 1, "metadata_rows": 0}
+    mock_delete_config.assert_called_once_with(
+        collection_name="test_collection",
+        user_id=mock_user_id,
+        is_admin=False,
+        delete_orphaned_metadata=False,
+    )
+
+
+def test_document_delete_cleanup_deletes_orphaned_metadata_when_collection_empty():
+    """If no documents remain globally, orphan metadata can be removed too."""
+    from xagent.web.api import kb
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 1},
+        ) as mock_delete_config,
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 0},
+            {"test_collection": 0},
+        ]
+
+        result = kb._cleanup_collection_config_if_no_owned_documents(
+            "test_collection",
+            user_id=1,
+        )
+
+    assert result == {"config_rows": 1, "metadata_rows": 1}
+    mock_delete_config.assert_called_once_with(
+        collection_name="test_collection",
+        user_id=1,
+        is_admin=False,
+        delete_orphaned_metadata=True,
+    )
 
 
 def test_delete_document_forbidden_for_non_admin_other_users_doc(
@@ -269,6 +670,53 @@ def test_delete_document_forbidden_for_non_admin_other_users_doc(
     assert "Access denied for collection" in body.get("detail", "")
     assert "test_collection" in body.get("detail", "")
     mock_delete_document.assert_not_called()
+
+
+def test_delete_document_keeps_success_when_config_cleanup_fails(
+    app_with_kb_admin, admin_user
+):
+    """Cleanup failures must not downgrade overall status from success."""
+    from fastapi import HTTPException as _HTTPException
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
+        ) as mock_delete_document,
+        patch(
+            "xagent.web.api.kb._cleanup_collection_config_if_no_owned_documents",
+            side_effect=_HTTPException(
+                status_code=500,
+                detail="Failed to delete collection configuration: boom",
+            ),
+        ) as mock_cleanup,
+    ):
+        mock_record = MagicMock()
+        mock_record.doc_id = "doc_123"
+        mock_record.source_path = "/tmp/doc.txt"
+        mock_record.metadata = {}
+        mock_get_vector_store.return_value.list_document_records.return_value = [
+            mock_record
+        ]
+        mock_delete_document.return_value = type(
+            "DeleteResult",
+            (),
+            {"status": "success", "message": "ok"},
+        )()
+
+        client = TestClient(app_with_kb_admin)
+        resp = client.delete(
+            "/api/kb/collections/test_collection/documents/doc.txt",
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    assert body["deleted_doc_ids"] == ["doc_123"]
+    assert "collection_config_cleanup_error" in body
+    assert "boom" in body["collection_config_cleanup_error"]
+    assert "errors" not in body
+    mock_cleanup.assert_called_once()
 
 
 def test_delete_document_allowed_for_admin_any_doc(app_with_kb_admin, admin_user):
