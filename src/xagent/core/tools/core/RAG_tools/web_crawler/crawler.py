@@ -62,21 +62,15 @@ _WAF_RETRY_STATUSES: frozenset = frozenset(
 # These pages return HTTP 200 but the body is a "Just a moment..." stub --
 # accepting them as successful crawls would pollute the KB with garbage.
 _CHALLENGE_PAGE_MARKERS: Tuple[str, ...] = (
-    "403 forbidden",
-    "access denied",
     "checking your browser",
     "cf-challenge",
     "cf-mitigated",
     "just a moment",
-    "please enable cookies",
     "cf-please-wait",
     "needs to review the security",
-    "security check",
-    "you have been blocked",
-    "your request has been blocked",
 )
 
-_MIN_RAW_TEXT_LENGTH = 20
+_MIN_RAW_TEXT_LENGTH = 0
 _MIN_MARKDOWN_TEXT_LENGTH = 10
 _MAX_REPLACEMENT_CHAR_RATIO = 0.01
 _MAX_CONTROL_CHAR_RATIO = 0.005

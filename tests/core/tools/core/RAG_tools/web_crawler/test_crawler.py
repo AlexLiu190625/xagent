@@ -313,6 +313,53 @@ class TestWebCrawler:
         assert "https://example.com" not in crawler.failed_urls
 
     @pytest.mark.asyncio
+    async def test_accepts_short_raw_html_when_cleaned_content_is_valid(
+        self, crawl_config
+    ):
+        """Raw HTML length should not reject concise readable pages."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = "<p>Hello world!</p>"
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            crawler = WebCrawler(crawl_config)
+            results = await crawler.crawl()
+
+        assert len(results) == 1
+        assert results[0].content_markdown == "Hello world!"
+        assert "https://example.com" not in crawler.failed_urls
+
+    @pytest.mark.asyncio
+    async def test_accepts_documentation_with_access_denied_phrase(self, crawl_config):
+        """Generic security phrases can be normal documentation content."""
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.text = (
+            "<html><head><title>How to fix Access denied errors</title></head>"
+            "<body><h1>How to fix Access denied errors</h1>"
+            "<p>This guide explains application authorization failures and "
+            "how to resolve them.</p></body></html>"
+        )
+
+        mock_client = AsyncMock()
+        mock_client.get.return_value = mock_response
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock()
+
+        with patch("httpx.AsyncClient", return_value=mock_client):
+            crawler = WebCrawler(crawl_config)
+            results = await crawler.crawl()
+
+        assert len(results) == 1
+        assert "Access denied" in results[0].content_markdown
+        assert "https://example.com" not in crawler.failed_urls
+
+    @pytest.mark.asyncio
     async def test_same_domain_filtering(self, sample_html):
         """Test same domain filtering."""
         config = WebCrawlConfig(
