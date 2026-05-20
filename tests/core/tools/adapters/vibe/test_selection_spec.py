@@ -464,3 +464,203 @@ async def test_allowed_tools_subset_filters_by_name(isolated_registry, monkeypat
     )
     assert len(tools) == 1
     assert tools[0].name == "tool_a"
+
+
+# ----- End-to-end: tool_categories → spec → factory dispatch -------------
+#
+# Reproduces the exact flow real Web/SDK chat traffic uses:
+#
+#   agents.tool_categories (DB column, list of strings written by the
+#   agent builder UI) → chat._build_selection_spec_from_categories →
+#   WebToolConfig.selection_spec → ToolFactory.create_all_tools →
+#   ToolRegistry registry-level skip + per-creator short-circuit.
+#
+# The unit tests above pin each layer in isolation; these tests pin the
+# composition. Real production agents (75 published, avg 3.9 categories,
+# 43% with mcp:<server> entries — see PR #461 discussion) carry exactly
+# the string shapes the cases below exercise.
+
+
+def _make_static_creator(name: str):
+    """Build a uniquely-named AsyncMock so post-hoc assertions can tell
+    them apart by ``mock.await_count``."""
+    fn = AsyncMock(return_value=[])
+    fn.__name__ = name
+    return fn
+
+
+@pytest.fixture
+def static_creators(isolated_registry, monkeypatch):
+    """Register one fake creator per static category that production
+    actually uses, with the same categories= annotations the real
+    creators carry. Returns the dict so individual tests can assert
+    on per-creator dispatch counts.
+
+    Also stubs ``ToolFactory._apply_output_filters`` to a passthrough,
+    matching the pattern the per-allowed_tools tests use -- the
+    fake creators return empty tool lists which the real output-
+    filter pass would attempt to read accessors from the test config
+    that the minimal ``_E2EConfig`` doesn't carry.
+    """
+    creators = {
+        "basic": _make_static_creator("basic_creator"),
+        "file": _make_static_creator("file_creator"),
+        "knowledge": _make_static_creator("knowledge_creator"),
+        "browser": _make_static_creator("browser_creator"),
+        "image": _make_static_creator("image_creator"),
+        "ppt": _make_static_creator("ppt_creator"),
+        "vision": _make_static_creator("vision_creator"),
+        "database": _make_static_creator("database_creator"),
+    }
+    for category, creator in creators.items():
+        isolated_registry.register(creator, categories={category})
+    monkeypatch.setattr(
+        ToolFactory, "_apply_output_filters", staticmethod(lambda tools, cfg: tools)
+    )
+    return creators
+
+
+class _E2EConfig:
+    """Mimics WebToolConfig's surface that the factory + creators read.
+    Carries the spec produced by chat.py's helper plus the minimal
+    accessors ToolFactory.create_all_tools touches."""
+
+    def __init__(self, selection_spec, allowed_tools=None):
+        self.selection_spec = selection_spec
+        self._allowed_tools = allowed_tools
+
+    def get_allowed_tools(self):
+        return self._allowed_tools
+
+    def get_sandbox(self):
+        return None
+
+    def get_workspace_config(self):
+        return None
+
+
+async def test_e2e_single_basic_category_skips_all_others(static_creators):
+    """The simplest real-prod shape (e.g. agent "Velvet Assistant" =
+    ['knowledge', 'basic']): with ``tool_categories=["basic"]`` the
+    chat helper produces a spec restricted to {"basic"}, and the
+    factory must dispatch *only* the basic creator. All seven other
+    static creators stay un-called.
+    """
+    from xagent.web.api.chat import _build_selection_spec_from_categories
+
+    spec = _build_selection_spec_from_categories(["basic"])
+    assert spec is not None
+    assert spec.categories == frozenset({"basic"})
+    assert spec.mcp_servers is None
+
+    await ToolFactory.create_all_tools(
+        _E2EConfig(spec), apply_user_override_filter=False
+    )
+
+    assert static_creators["basic"].await_count == 1
+    for cat in ("file", "knowledge", "browser", "image", "ppt", "vision", "database"):
+        assert static_creators[cat].await_count == 0, (
+            f"{cat} creator unexpectedly dispatched"
+        )
+
+
+async def test_e2e_multi_category_dispatches_matching_creators(static_creators):
+    """A multi-category prod shape (e.g. agent 258 "Testing" =
+    ['basic', 'browser', 'file', 'database', 'image', 'knowledge',
+    'vision']): the spec includes all of them, the factory dispatches
+    exactly those creators and skips the only category absent from
+    the agent's selection (``ppt``)."""
+    from xagent.web.api.chat import _build_selection_spec_from_categories
+
+    spec = _build_selection_spec_from_categories(
+        ["basic", "browser", "file", "database", "image", "knowledge", "vision"]
+    )
+
+    await ToolFactory.create_all_tools(
+        _E2EConfig(spec), apply_user_override_filter=False
+    )
+
+    for cat in ("basic", "browser", "file", "database", "image", "knowledge", "vision"):
+        assert static_creators[cat].await_count == 1, f"{cat} creator should have run"
+    assert static_creators["ppt"].await_count == 0, (
+        "ppt creator should have been skipped"
+    )
+
+
+async def test_e2e_mcp_server_form_extracts_servers_and_includes_mcp(static_creators):
+    """The ``mcp:<ServerName>`` form is dual-purposed: it both adds
+    ``"mcp"`` to ``spec.categories`` (so the MCP creator runs) and
+    populates ``spec.mcp_servers`` with the normalized server name
+    (so the MCP creator's per-server filter narrows the work). Mimics
+    agent 252 "Email Agent (Sales)_V2" = ['basic', 'file', 'knowledge',
+    'mcp:Gmail']."""
+    from xagent.web.api.chat import _build_selection_spec_from_categories
+
+    spec = _build_selection_spec_from_categories(
+        ["basic", "file", "knowledge", "mcp:Gmail"]
+    )
+
+    # ``"mcp"`` and ``"other"`` are added implicitly by the builder so the
+    # MCP creator AND the Custom-API-via-"other" legacy match path both
+    # remain reachable; "Gmail" lands normalized in mcp_servers.
+    assert "basic" in spec.categories
+    assert "file" in spec.categories
+    assert "knowledge" in spec.categories
+    assert "mcp" in spec.categories
+    assert "other" in spec.categories
+    assert spec.mcp_servers == frozenset({"Gmail"})
+    assert spec.includes_mcp() is True
+
+    # Static fakes only — actually dispatching the real MCP creator is
+    # covered by the per-server filter tests above.
+    await ToolFactory.create_all_tools(
+        _E2EConfig(spec), apply_user_override_filter=False
+    )
+    assert static_creators["basic"].await_count == 1
+    assert static_creators["file"].await_count == 1
+    assert static_creators["knowledge"].await_count == 1
+    assert static_creators["browser"].await_count == 0
+    assert static_creators["image"].await_count == 0
+
+
+async def test_e2e_mcp_server_name_normalization_matches_prod_shape(static_creators):
+    """Production has agents with multi-word and hyphenated MCP server
+    names — agent 260 "Inbound Agent" carries 'mcp:Google Calendar'
+    and 'mcp:Google Drive' simultaneously. The helper normalizes the
+    space-separated names to underscore-separated so the downstream
+    per-server filter in mcp_tools.create_mcp_tools (which applies the
+    same normalization to the server's stored ``name``) matches."""
+    from xagent.web.api.chat import _build_selection_spec_from_categories
+
+    spec = _build_selection_spec_from_categories(
+        ["mcp:Google Calendar", "mcp:Google Drive", "mcp:HubSpot"]
+    )
+
+    # All three server names normalized identically to the way
+    # mcp_tools.create_mcp_tools normalizes the prod ``mcp_configs[i]["name"]``
+    # field when applying the per-server filter.
+    assert spec.mcp_servers == frozenset({"Google_Calendar", "Google_Drive", "HubSpot"})
+
+
+async def test_e2e_empty_categories_yields_none_spec(static_creators):
+    """An agent with no ``tool_categories`` (or an empty list) is the
+    backward-compat path: the chat helper returns ``None``, the
+    factory falls through to "build everything", and every registered
+    creator is dispatched.
+
+    This is the property production code relies on to never
+    accidentally suppress tools for legacy agents that pre-date the
+    tool_categories field."""
+    from xagent.web.api.chat import _build_selection_spec_from_categories
+
+    assert _build_selection_spec_from_categories(None) is None
+    assert _build_selection_spec_from_categories([]) is None
+
+    await ToolFactory.create_all_tools(
+        _E2EConfig(None), apply_user_override_filter=False
+    )
+    # Every static creator runs.
+    for cat in static_creators:
+        assert static_creators[cat].await_count == 1, (
+            f"{cat} should run on the spec-less backward-compat path"
+        )
