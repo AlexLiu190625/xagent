@@ -13,9 +13,8 @@ from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .web_url_utils import validate_and_normalize_web_url
-
 from ......config import get_web_crawl_tls_impersonate
+from .web_url_utils import validate_and_normalize_web_url
 
 # Default configurable values (avoid scattering literals)
 DEFAULT_SEARCH_TOP_K: int = 5
