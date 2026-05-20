@@ -1,12 +1,15 @@
 """Regression tests for task model-id handling in chat API."""
 
+import logging
 import os
 import tempfile
+from unittest.mock import MagicMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.web.api.auth import auth_router
 from xagent.web.api.chat import AgentServiceManager, chat_router
 from xagent.web.api.model import model_router
@@ -113,6 +116,259 @@ def sample_model_data():
         "description": "User2 private model",
         "share_with_users": False,
     }
+
+
+class DummyLLM(BaseLLM):
+    def __init__(self, name: str):
+        self._name = name
+
+    @property
+    def abilities(self):
+        return ["chat"]
+
+    @property
+    def model_name(self):
+        return self._name
+
+    @property
+    def supports_thinking_mode(self):
+        return False
+
+    async def chat(self, messages, **kwargs):
+        return "ok"
+
+
+def test_agent_builder_llm_overlay_preserves_resolved_task_llms():
+    manager = AgentServiceManager()
+    task_llm = DummyLLM("task-qwen")
+    task_compact = DummyLLM("task-compact")
+
+    merged = manager._merge_agent_builder_llms(
+        (task_llm, None, task_llm, task_compact),
+        (None, None, None, None),
+    )
+
+    assert merged == (task_llm, None, task_llm, task_compact)
+
+
+def test_agent_builder_llm_overlay_uses_accessible_agent_llms():
+    manager = AgentServiceManager()
+    task_llm = DummyLLM("task-qwen")
+    agent_llm = DummyLLM("agent-model")
+
+    merged = manager._merge_agent_builder_llms(
+        (task_llm, None, task_llm, None),
+        (agent_llm, None, None, agent_llm),
+    )
+
+    assert merged == (agent_llm, None, task_llm, agent_llm)
+
+
+def test_runtime_config_preserves_task_llm_when_agent_model_is_unavailable():
+    manager = AgentServiceManager()
+    task_llm = DummyLLM("task-qwen")
+    task = MagicMock(
+        agent_type="assistant",
+        model_name="qwen3.6-plus",
+        compact_model_name=None,
+        execution_mode="balanced",
+        agent_id=9,
+        user_id=71,
+    )
+    user = MagicMock(id=71)
+    agent = MagicMock(id=9, name="Published Agent", execution_mode="balanced")
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = agent
+    manager._get_task_llm_ids = MagicMock(
+        return_value=["qwen3.6-plus", None, None, None]
+    )
+    manager._load_agent_builder_config = MagicMock(
+        return_value={
+            "llms": (None, None, None, None),
+            "saved_model_ids": {"general": 123},
+            "saved_model_descriptors": {
+                "general": {
+                    "pk": 123,
+                    "model_id": "glm4.6v",
+                    "model_name": "glm4.6v",
+                }
+            },
+            "execution_mode": "balanced",
+            "instructions": "",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": [],
+        }
+    )
+
+    with patch(
+        "xagent.web.api.chat.resolve_llms_from_names",
+        return_value=(task_llm, None, None, None),
+    ):
+        runtime_config = manager._resolve_task_runtime_config(
+            task_id=42,
+            task=task,
+            db=db,
+            user=user,
+        )
+
+    assert runtime_config["task_llm"] is task_llm
+    manager._load_agent_builder_config.assert_called_once_with(agent, db, 71)
+
+
+def test_runtime_config_uses_accessible_agent_model_over_task_baseline():
+    manager = AgentServiceManager()
+    task_llm = DummyLLM("task-qwen")
+    agent_llm = DummyLLM("agent-qwen")
+    task = MagicMock(
+        agent_type="assistant",
+        model_name="qwen3.6-plus",
+        compact_model_name=None,
+        execution_mode="balanced",
+        agent_id=9,
+        user_id=71,
+    )
+    user = MagicMock(id=71)
+    db = MagicMock()
+    db.query.return_value.filter.return_value.first.return_value = MagicMock(
+        id=9, name="Published Agent", execution_mode="balanced"
+    )
+    manager._get_task_llm_ids = MagicMock(
+        return_value=["qwen3.6-plus", None, None, None]
+    )
+    manager._load_agent_builder_config = MagicMock(
+        return_value={
+            "llms": (agent_llm, None, None, None),
+            "saved_model_ids": {"general": 123},
+            "saved_model_descriptors": {},
+            "execution_mode": "balanced",
+            "instructions": "",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": [],
+        }
+    )
+
+    with patch(
+        "xagent.web.api.chat.resolve_llms_from_names",
+        return_value=(task_llm, None, None, None),
+    ):
+        runtime_config = manager._resolve_task_runtime_config(
+            task_id=42,
+            task=task,
+            db=db,
+            user=user,
+        )
+
+    assert runtime_config["task_llm"] is agent_llm
+
+
+def test_pick_default_llm_warns_with_agent_context_when_builder_config_present(caplog):
+    """Agent builder fallback should log human-readable model identifiers."""
+    default_llm = DummyLLM("default-llm")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.chat"):
+        chosen = AgentServiceManager._pick_default_llm_with_warning(
+            default_llm,
+            task_id=42,
+            has_agent_builder_config=True,
+            agent_id=7,
+            saved_model_ids={"general": 11, "small_fast": None},
+            saved_model_descriptors={
+                "general": {
+                    "pk": 11,
+                    "model_id": "gpt-4o",
+                    "model_name": "gpt-4o-2024-08-06",
+                },
+            },
+            user_id=99,
+        )
+
+    assert chosen is default_llm
+    matched = [
+        rec
+        for rec in caplog.records
+        if "falling back to default LLM" in rec.getMessage()
+    ]
+    assert len(matched) == 1
+    message = matched[0].getMessage()
+    assert "task_id=42" in message
+    assert "agent_id=7" in message
+    assert "user_id=99" in message
+    # Descriptor fields are preferred over raw DB pks.
+    assert "gpt-4o" in message
+    assert "gpt-4o-2024-08-06" in message
+    assert "agent_saved_models=" in message
+    assert "fallback_model=default-llm" in message
+
+
+def test_pick_default_llm_falls_back_to_saved_model_ids_when_descriptors_missing(
+    caplog,
+):
+    """Without descriptors the warning falls back to raw saved_model_ids."""
+    default_llm = DummyLLM("default-llm")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.chat"):
+        AgentServiceManager._pick_default_llm_with_warning(
+            default_llm,
+            task_id=1,
+            has_agent_builder_config=True,
+            agent_id=2,
+            saved_model_ids={"general": 11},
+            user_id=3,
+        )
+
+    matched = [
+        rec
+        for rec in caplog.records
+        if "falling back to default LLM" in rec.getMessage()
+    ]
+    assert len(matched) == 1
+    message = matched[0].getMessage()
+    assert "agent_saved_models=" in message
+    assert "general" in message
+    assert "11" in message
+
+
+def test_pick_default_llm_warns_with_task_only_message_when_no_builder_config(caplog):
+    """Without agent builder config we still warn but skip agent-specific fields."""
+    default_llm = DummyLLM("default-llm")
+
+    with caplog.at_level(logging.WARNING, logger="xagent.web.api.chat"):
+        chosen = AgentServiceManager._pick_default_llm_with_warning(
+            default_llm,
+            task_id=42,
+            has_agent_builder_config=False,
+            agent_id=None,
+            saved_model_ids=None,
+            user_id=None,
+        )
+
+    assert chosen is default_llm
+    matched = [
+        rec
+        for rec in caplog.records
+        if "no valid LLM configuration" in rec.getMessage()
+    ]
+    assert len(matched) == 1
+    assert "Task 42" in matched[0].getMessage()
+    assert "default-llm" in matched[0].getMessage()
+
+
+def test_pick_default_llm_raises_when_no_default_available():
+    """If neither task/agent nor global default resolves, fail with a clear error."""
+    with pytest.raises(HTTPException) as exc_info:
+        AgentServiceManager._pick_default_llm_with_warning(
+            None,
+            task_id=42,
+            has_agent_builder_config=True,
+            agent_id=7,
+            saved_model_ids={"general": 11},
+            user_id=99,
+        )
+
+    assert exc_info.value.status_code == 500
+    assert "no global default model" in str(exc_info.value.detail)
 
 
 def test_task_create_does_not_persist_inaccessible_model_ids(

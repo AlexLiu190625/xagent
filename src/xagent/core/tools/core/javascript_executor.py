@@ -15,6 +15,135 @@ from typing import Any, Dict, Optional
 logger = logging.getLogger(__name__)
 
 
+# Known pptxgenjs API method names whose "methodName: <desc>" console.log
+# output indicates a validation failure that did NOT throw. Defined as a
+# tuple so additions are obvious in code review; the JS regex is built
+# from it so the two stay in sync. The list is intentionally narrow —
+# only real pptxgenjs methods that the library is known to emit
+# `<method>: <description>` warnings from. Generic-sounding names like
+# bare `write` or `stream` are deliberately excluded so unrelated user
+# logs (`console.log("write: complete")`) can't trip the detector.
+_PPTXGENJS_WARN_METHODS = (
+    "addText",
+    "addTable",
+    "addImage",
+    "addShape",
+    "addChart",
+    "addMedia",
+    "addNotes",
+    "addSlide",
+    "addSection",
+    "addBackgroundImage",
+    "writeFile",
+)
+_PPTXGENJS_WARN_JS_REGEX = f"/^(?:{'|'.join(_PPTXGENJS_WARN_METHODS)}): /"
+
+
+def _requests_pptxgenjs(packages: Optional[list[str]]) -> bool:
+    """True iff the caller asked for the pptxgenjs npm package.
+
+    The validation-error interception only runs when this is true —
+    otherwise a user script that happens to log a pptxgenjs-shaped
+    string (``console.log("addTable: oh no")``) would be misclassified
+    as a library warning, returning success=False against the agent's
+    expectation.
+    """
+    if not packages:
+        return False
+    return any((pkg or "").strip().lower() == "pptxgenjs" for pkg in packages)
+
+
+def _wrap_user_code(code: str, *, intercept_pptxgenjs: bool) -> str:
+    """Build the JS source actually fed to ``node`` for *code*.
+
+    Responsibilities:
+
+    1. Buffer ``console.log`` so it doesn't interleave with our own
+       diagnostic output. Logs are flushed back to stdout when the
+       script finishes normally.
+    2. (Only when ``intercept_pptxgenjs`` is true.) Intercept the
+       pptxgenjs "warn only, keep going" failure path — pptxgenjs
+       calls ``console.log("addTable: tableRows has a bad row...")``
+       and then continues, leaving a malformed ``.pptx`` on disk
+       while node still exits 0.
+
+       We record a wrapper-scoped flag the moment a matching message
+       is seen, AND throw inside the override so an unguarded pptxgenjs
+       call bails before ``writeFile`` runs. After the user-code
+       ``try`` block we re-check the flag — that way a user
+       ``try/catch`` around the pptxgenjs call can swallow the injected
+       throw and still not suppress the failure, because the flag check
+       runs outside user code's reach. Either path lands the failure
+       on the framework's normal hard-error path (non-zero exit,
+       populated stderr) so the agent gets a clear error signal and
+       can retry with corrected code.
+
+    The flag-after-try design comes directly from rogercloud's review
+    on PR #442: relying on the in-throw mechanism alone is unsafe —
+    user code can catch and continue past it.
+    """
+    intercept_flag = "true" if intercept_pptxgenjs else "false"
+    return f"""
+const __INTERCEPT_PPTXGENJS = {intercept_flag};
+const __PPTXGENJS_WARN_RE = {_PPTXGENJS_WARN_JS_REGEX};
+const __logs = [];
+let __pptxgenjsValidationFailure = null;
+const __originalLog = console.log;
+console.log = (...args) => {{
+    const __msg = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+    if (__INTERCEPT_PPTXGENJS && __PPTXGENJS_WARN_RE.test(__msg)) {{
+        if (__pptxgenjsValidationFailure === null) {{
+            __pptxgenjsValidationFailure = __msg;
+        }}
+        // Throw so an unguarded pptxgenjs call site bails before
+        // writeFile creates a malformed .pptx. If user code happens
+        // to wrap the call in try/catch, this throw gets swallowed —
+        // but the flag set just above still survives, and the
+        // wrapper-level check after the try block exits the process.
+        throw new Error(
+            'pptxgenjs reported a validation problem and the generated '
+            + 'output is likely malformed even though the call did not '
+            + 'throw. Fix the offending arguments and retry. Warning: '
+            + __msg
+        );
+    }}
+    __logs.push(__msg);
+}};
+
+let __userCodeError = null;
+try {{
+{code}
+}} catch (error) {{
+    // Don't exit yet: even if user code's own try/catch consumed our
+    // injected throw, the wrapper-scoped flag is the source of truth
+    // for pptxgenjs failures. Record any unrelated user-code error
+    // here and fall through to the post-try checks below.
+    __userCodeError = error;
+}}
+
+console.log = __originalLog;
+
+if (__pptxgenjsValidationFailure !== null) {{
+    // Wrapper-owned failure: runs outside user code's reach so a
+    // user-level try/catch cannot suppress it.
+    console.error(
+        'pptxgenjs reported a validation problem and the generated '
+        + 'output is likely malformed even though the call did not '
+        + 'throw. Fix the offending arguments and retry. Warning: '
+        + __pptxgenjsValidationFailure
+    );
+    process.exit(1);
+}}
+
+if (__userCodeError !== null) {{
+    console.error(__userCodeError.message);
+    process.exit(1);
+}}
+
+__logs.forEach(__line => console.log(__line));
+"""
+
+
 class JavaScriptExecutorCore:
     """JavaScript executor using Node.js"""
 
@@ -92,9 +221,16 @@ class JavaScriptExecutorCore:
                 json.dumps({"dependencies": deps}), encoding="utf-8"
             )
 
-        # Create the JS script
+        # Create the JS script — wrap user code so pptxgenjs warn-only
+        # failures get converted to throws (see _wrap_user_code). The
+        # interceptor only fires when the caller actually requested
+        # pptxgenjs so unrelated logs (`console.log("write: complete")`)
+        # don't trip the detector.
         script_file = temp_path / "script.js"
-        script_file.write_text(code, encoding="utf-8")
+        script_file.write_text(
+            _wrap_user_code(code, intercept_pptxgenjs=_requests_pptxgenjs(packages)),
+            encoding="utf-8",
+        )
 
         # Install dependencies if needed
         if deps:
@@ -151,30 +287,19 @@ class JavaScriptExecutorCore:
                 json.dumps({"dependencies": deps}), encoding="utf-8"
             )
 
-        # Create the JS script in execution directory (so files are created there)
+        # Create the JS script in execution directory (so files are created
+        # there). The wrapper buffers console.log AND, only when the caller
+        # requested pptxgenjs, converts its warn-only validation failures
+        # into thrown errors plus a wrapper-scoped flag check that user
+        # try/catch can't suppress (see _wrap_user_code). When
+        # capture_output is False the caller has opted out of buffering
+        # and gets the raw code.
         script_file = exec_dir / "script.js"
-
-        # Wrap code to capture output
-        wrapped_code = code
-        if capture_output:
-            wrapped_code = f"""
-const logs = [];
-const originalLog = console.log;
-console.log = (...args) => {{
-    logs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' '));
-}};
-
-try {{
-{code}
-}} catch (error) {{
-    console.error(error.message);
-    process.exit(1);
-}}
-
-console.log = originalLog;
-logs.forEach(log => console.log(log));
-"""
-
+        wrapped_code = (
+            _wrap_user_code(code, intercept_pptxgenjs=_requests_pptxgenjs(packages))
+            if capture_output
+            else code
+        )
         script_file.write_text(wrapped_code, encoding="utf-8")
 
         # Install dependencies in temp directory
