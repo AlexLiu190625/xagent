@@ -134,7 +134,7 @@ class AskUserQuestionTool(AbstractBaseTool):
         ).model_dump()
 
 
-@register_tool
+@register_tool(categories={"basic"})
 async def create_ask_user_tool(config: WebToolConfig) -> list[AbstractBaseTool]:
     """Create ask user tool."""
     return [AskUserQuestionTool()]

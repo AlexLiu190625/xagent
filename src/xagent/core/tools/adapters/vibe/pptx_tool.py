@@ -156,7 +156,7 @@ Returns:
         ]
 
 
-@register_tool
+@register_tool(categories={"ppt"})
 async def create_pptx_tool(config: "BaseToolConfig") -> list:
     """
     Create PPTX tools with workspace support.

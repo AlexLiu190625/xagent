@@ -144,9 +144,20 @@ if TYPE_CHECKING:
     from .config import BaseToolConfig
 
 
-@register_tool
+@register_tool(categories={"audio"})
 async def create_audio_tools_from_config(config: "BaseToolConfig") -> List[Any]:
-    """Create audio processing tools from configuration."""
+    """Create audio processing tools from configuration.
+
+    Internal short-circuit on ``ToolSelectionSpec.includes_category("audio")``
+    skips the ASR/TTS-model DB lookup
+    (``config.get_asr_models()`` / ``get_tts_models()``) when the spec
+    excludes the audio category. Registry-level skip via
+    ``categories={"audio"}`` handles the common case; the internal
+    check covers the legacy spec=None backward-compat path.
+    """
+    spec = getattr(config, "selection_spec", None)
+    if spec is not None and not spec.includes_category("audio"):
+        return []
     asr_models = config.get_asr_models()
     tts_models = config.get_tts_models()
 

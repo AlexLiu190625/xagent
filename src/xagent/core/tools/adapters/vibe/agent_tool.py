@@ -1542,9 +1542,21 @@ if TYPE_CHECKING:
     from xagent.web.tools.config import WebToolConfig
 
 
-@register_tool
+@register_tool(categories={"agent"})
 async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
-    """Create tools from published agents."""
+    """Create tools from published agents.
+
+    Internal short-circuit on
+    ``ToolSelectionSpec.includes_published_agent()`` skips the
+    ``get_published_agents_tools`` DB enumeration when the spec sets
+    ``published_agent_ids`` to an empty frozenset (explicit "no
+    delegation"). Registry-level skip via ``categories={"agent"}``
+    handles the case where the spec's category set doesn't include
+    ``"agent"`` at all.
+    """
+    spec = getattr(config, "selection_spec", None)
+    if spec is not None and not spec.includes_published_agent():
+        return []
     if not config.get_enable_agent_tools():
         return []
 
@@ -1569,7 +1581,7 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
         return []
 
 
-@register_tool
+@register_tool(categories={"agent"})
 async def create_create_agent_tool(config: "WebToolConfig") -> list[AbstractBaseTool]:
     """Create the CreateAgentTool for dynamically creating agents."""
     if not config.get_enable_agent_tools():
@@ -1611,7 +1623,7 @@ async def create_create_agent_tool(config: "WebToolConfig") -> list[AbstractBase
         return []
 
 
-@register_tool
+@register_tool(categories={"agent"})
 async def create_update_agent_tool(config: "WebToolConfig") -> list[AbstractBaseTool]:
     """Create the UpdateAgentTool for dynamically updating agents."""
     if not config.get_enable_agent_tools():
@@ -1636,7 +1648,7 @@ async def create_update_agent_tool(config: "WebToolConfig") -> list[AbstractBase
         return []
 
 
-@register_tool
+@register_tool(categories={"agent"})
 async def create_list_agents_tool(config: "WebToolConfig") -> list[AbstractBaseTool]:
     """Create the ListAgentsTool for listing user's agents."""
     if not config.get_enable_agent_tools():

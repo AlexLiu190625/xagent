@@ -138,7 +138,15 @@ class WebToolConfig(BaseToolConfig):
         allowed_skills: Optional[List[str]] = None,
         allowed_tools: Optional[List[str]] = None,
         sandbox: Optional[Any] = None,
+        selection_spec: Optional[Any] = None,
     ):
+        # ``selection_spec`` is :class:`ToolSelectionSpec` from the
+        # tools adapter package; typed as ``Any`` here to avoid an
+        # import cycle (web.tools → core.tools.adapters). The factory
+        # reads ``getattr(config, "selection_spec", None)`` so leaving
+        # this attribute unset preserves the original "build everything"
+        # behavior for callers that don't supply a spec.
+        self.selection_spec = selection_spec
         self.db = db
         self.request = request
         self._user_id = (

@@ -514,7 +514,7 @@ if TYPE_CHECKING:
     from .config import BaseToolConfig
 
 
-@register_tool
+@register_tool(categories={"vision"})
 async def create_vision_tools(config: "BaseToolConfig") -> List[Any]:
     """Create vision understanding tools."""
     vision_model = config.get_vision_model()

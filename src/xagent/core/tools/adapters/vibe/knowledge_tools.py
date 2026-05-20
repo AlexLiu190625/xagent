@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool
+@register_tool(categories={"knowledge"})
 async def create_knowledge_tools(config: "BaseToolConfig") -> List[Any]:
     """Create knowledge base search tools."""
     tools: List[Any] = []

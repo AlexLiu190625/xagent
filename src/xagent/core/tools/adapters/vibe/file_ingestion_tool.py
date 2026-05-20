@@ -192,7 +192,7 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
             ).model_dump()
 
 
-@register_tool
+@register_tool(categories={"knowledge"})
 async def create_file_ingestion_tools(config: WebToolConfig) -> list[AbstractBaseTool]:
     """Create file ingestion tools."""
     try:

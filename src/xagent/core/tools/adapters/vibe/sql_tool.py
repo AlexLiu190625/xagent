@@ -150,7 +150,7 @@ def get_sql_tool(info: Optional[dict[str, Any]] = None) -> list[FunctionTool]:
     return tool_instance.get_tools()
 
 
-@register_tool
+@register_tool(categories={"database"})
 async def create_sql_tools(config: "BaseToolConfig") -> list:
     """
     Create SQL query tools with workspace support.

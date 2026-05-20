@@ -274,7 +274,7 @@ if TYPE_CHECKING:
     from .config import BaseToolConfig
 
 
-@register_tool
+@register_tool(categories={"file"})
 async def create_file_tools(config: "BaseToolConfig") -> List[Any]:
     """Create workspace-bound file tools."""
     if not config.get_file_tools_enabled():
