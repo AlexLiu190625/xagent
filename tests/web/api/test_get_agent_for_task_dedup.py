@@ -1,22 +1,31 @@
-"""Regression test: ``get_agent_for_task`` must not double-query Task or Agent.
+"""Regression test: ``get_agent_for_task`` must not double-query Task or Agent
+on the request session.
 
 Background:
-    ``chat.py:get_agent_for_task`` previously ran ``db.query(Task)`` twice
-    on the new-agent setup path (once for the existence check around
-    line 690, once again at the top of the LLM-config block around line
-    757) and ``db.query(Agent)`` twice (once in the agent-builder branch
-    around line 791 to load configuration, once again in the tools-init
-    block around line 866 to read ``.status`` for the published-agent
-    exclusion list). Step 1 of the PR3 sequence (Codex-revised) reuses
-    the first result in both cases.
+    Originally, ``chat.py:get_agent_for_task`` ran ``db.query(Task)``
+    twice on the new-agent setup path (once for the existence check,
+    once at the top of the LLM-config block) and ``db.query(Agent)``
+    twice (once in the agent-builder branch to load configuration,
+    once again in the tools-init block to read ``.status`` for the
+    published-agent exclusion list). Step 1 of the PR3 sequence
+    (Codex-revised) reused the first result in both cases, dropping
+    each count to one.
 
-What this test pins:
-    For one full ``get_agent_for_task`` call on an existing task with
-    an associated agent, the number of ``db.query(Task)`` / ``db.query(Agent)``
-    calls drops to one each. The test counts query invocations by table
-    via a wrapped ``MagicMock`` so subsequent refactors that accidentally
-    reintroduce a duplicate query will fail here rather than only
-    showing up in production timing logs.
+    Step 3 of the same sequence then moved the entire LLM-config +
+    agent-builder DB chain (Task re-read, Agent lookup, DBModel
+    lookups, LLM access checks) into ``task_setup_snapshot``, which
+    runs off-loop via ``asyncio.to_thread`` and uses its own
+    ``SessionLocal``. The request session ``db`` is no longer
+    responsible for any Agent query in the setup path.
+
+What this test pins (post-Step-3 invariant):
+    * ``db.query(Task)`` fires at most once on the request session
+      (the existence check) -- the post-existence re-read is gone.
+    * ``db.query(Agent)`` fires zero times on the request session --
+      the snapshot owns that lookup now.
+
+Snapshot-internal query counts are not the responsibility of this
+file; those are covered by ``test_task_setup_snapshot.py``.
 """
 
 from __future__ import annotations
@@ -31,6 +40,11 @@ from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.task_setup_snapshot import (
+    TaskSetupSnapshot,
+    _AgentFields,
+    _TaskFields,
+)
 
 
 def _make_user() -> User:
@@ -101,7 +115,8 @@ class _QueryCounter:
 
 @pytest.mark.asyncio
 async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
-    """Existing task + agent path: Step 1's two dedups must hold.
+    """Existing task + agent path: post-Step-3 the request session
+    only handles the existence check.
 
     Pre-PR3 baseline:
       - ``db.query(Task)`` called >= 2 times (existence check + LLM-config
@@ -110,7 +125,16 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
         branch + tools-init published-status branch).
 
     After PR3 Step 1:
-      - Each query happens at most once.
+      - Each query happened at most once.
+
+    After PR3 Step 3 (current invariant):
+      - ``db.query(Task)`` happens at most once (existence check).
+        The LLM-config block calls ``task_setup_snapshot`` which uses
+        its own ``SessionLocal`` and is mocked out here -- so it
+        contributes nothing to the counter on ``db``.
+      - ``db.query(Agent)`` happens zero times. The snapshot loader
+        owns the Agent lookup now; the duplicated published-agent
+        status read is gone.
     """
     manager = AgentServiceManager()
     user = _make_user()
@@ -125,6 +149,45 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
     db = MagicMock()
     db.query = counter
 
+    # The snapshot loader uses its own SessionLocal (not the request
+    # ``db``), so we replace it with a stubbed return that mirrors a
+    # successful real load. The point of this test is the request
+    # session's query counts; the snapshot's internal counts are
+    # tested separately in ``test_task_setup_snapshot.py``.
+    snapshot_stub = TaskSetupSnapshot(
+        task=_TaskFields(
+            id=42,
+            user_id=1,
+            status=TaskStatus.PENDING,
+            agent_id=7,
+            agent_config=None,
+            model_name=None,
+            compact_model_name=None,
+            execution_mode="flash",
+            agent_type="standard",
+        ),
+        task_pattern="single_call",
+        task_llm=None,
+        task_fast_llm=None,
+        task_vision_llm=None,
+        task_compact_llm=None,
+        agent=_AgentFields(
+            id=7,
+            name="dedup agent",
+            status=AgentStatus.PUBLISHED,
+            instructions="be terse",
+        ),
+        agent_config={
+            "llms": (None, None, None, None),
+            "execution_mode": "flash",
+            "instructions": "be terse",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": ["basic"],
+        },
+        excluded_agent_id=7,
+    )
+
     # Make ``task.status not in [RUNNING, PAUSED, WAITING_FOR_USER]`` so the
     # reconstruct branch is skipped entirely; we want to count the
     # ``normal creation`` path's queries, not reconstruct internal ones.
@@ -133,26 +196,15 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
 
     # Stub the heavy work that ``get_agent_for_task`` performs after the
     # DB queries we care about, so the test focuses on query counts.
+    # ``load_task_setup_snapshot_sync`` is patched at the import site
+    # inside chat.py: get_agent_for_task imports it at module load, so
+    # patching the chat module's symbol intercepts the call. Returning
+    # the stub above lets the rest of the function consume snapshot
+    # fields without ever opening a real SessionLocal.
     with (
-        patch.object(
-            manager,
-            "_get_task_llm_ids",
-            return_value=[None, None, None, None],
-        ),
         patch(
-            "xagent.web.api.chat.resolve_llms_from_names",
-            return_value=(None, None, None, None),
-        ),
-        patch.object(
-            manager,
-            "_load_agent_builder_config",
-            return_value={
-                "llms": (None, None, None, None),
-                "execution_mode": "flash",
-                "knowledge_bases": [],
-                "skills": [],
-                "tool_categories": ["basic"],
-            },
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot_stub,
         ),
         patch.object(
             manager,
@@ -182,12 +234,16 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
             # they're recorded before the failure point.
             pass
 
-    # The two dedups Step 1 introduces:
     assert counter.calls_by_model[Task] == 1, (
-        f"Task queried {counter.calls_by_model[Task]} times -- expected 1. "
-        "If this drops back to 2+, the line 757 dedup regressed."
+        f"Task queried {counter.calls_by_model[Task]} times on the request "
+        "session -- expected 1 (the existence check). If this jumps to 2+, "
+        "either the dedup regressed or a new code path is re-reading Task "
+        "via ``db`` instead of going through the snapshot."
     )
-    assert counter.calls_by_model[Agent] == 1, (
-        f"Agent queried {counter.calls_by_model[Agent]} times -- expected 1. "
-        "If this drops back to 2+, the line 866 dedup regressed."
+    assert counter.calls_by_model[Agent] == 0, (
+        f"Agent queried {counter.calls_by_model[Agent]} times on the "
+        "request session -- expected 0. Step 3 moved the agent lookup "
+        "into ``task_setup_snapshot`` (its own SessionLocal). If this "
+        "becomes non-zero, something is bypassing the snapshot and "
+        "re-doing the agent lookup on the loop thread."
     )

@@ -46,6 +46,10 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
+from ..services.task_setup_snapshot import (
+    TaskSetupSnapshot,
+    load_task_setup_snapshot_sync,
+)
 from ..tools.config import WebToolConfig
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -684,7 +688,13 @@ class AgentServiceManager:
         if task_id not in self._agents:
             # Check if task exists in database
             task_exists = False
-            task = None
+            # ``task`` is widened to ``Task | _TaskFields | None`` because
+            # the LLM-config block below rebinds it from an ORM ``Task``
+            # to a frozen ``_TaskFields`` once the snapshot lands.
+            # Downstream consumers only read primitive attributes
+            # (``user_id``, ``agent_id``, ``agent_config``, ``status``)
+            # which both types expose identically.
+            task: Any = None
             if db is not None:
                 try:
                     task = db.query(Task).filter(Task.id == task_id).first()
@@ -766,95 +776,63 @@ class AgentServiceManager:
             # Create tracer with all necessary handlers
             tracer = create_task_tracer(task_id, user)
 
-            # Get LLM configuration from task database record
+            # Load the contiguous synchronous DB block (Task row,
+            # per-task LLM resolution, optional Agent Builder lookup
+            # with its 0-4 ``DBModel`` queries and 0-4 user-aware LLM
+            # access checks) on a worker thread so the main event
+            # loop stays responsive. Same set of reads the inline
+            # code used to do; see ``load_task_setup_snapshot_sync``
+            # for the strict no-ORM-leak invariant.
             logger.info(f"Loading LLM configuration for task {task_id} from database")
-            agent_config = None  # Initialize agent_config to use later
-            # ``agent`` is cached across the LLM-config block (queried below
-            # at the ``task.agent_id`` branch) and the tools-init block
-            # further down (which previously re-queried the same row only
-            # to read ``.status``). Initializing here keeps the variable
-            # in scope even if the LLM-config ``try`` raises before
-            # reaching the agent-builder branch.
-            agent: Optional[Agent] = None
-            # Default standalone tasks to DAG if no execution mode is available.
+            agent_config: Optional[dict] = None
             task_pattern = "dag_plan_execute"
             use_dag = True  # Default to DAG pattern (for backward compatibility)
+            excluded_agent_id: Optional[int] = None
+            snapshot: Optional[TaskSetupSnapshot] = None
             try:
                 if db is None:
                     raise ValueError("Database session is required")
 
-                # Reuse the ``task`` row already fetched at the existence
-                # check above (line ~690) when available. Re-querying only
-                # for the exception-fallback path (existence check raised)
-                # or the new-task creation path (existence check ran but
-                # task was None at the time).
-                if task is None:
-                    task = db.query(Task).filter(Task.id == task_id).first()
-                if task:
-                    # Log the actual task record for debugging
-                    logger.info(
-                        f"Task {task_id} record: agent_type={task.agent_type}, model_name={task.model_name}, compact_model_name={task.compact_model_name}"
-                    )
+                user_id_for_snapshot: Optional[int] = (
+                    int(user.id) if user and user.id is not None else None
+                )
+                snapshot = await asyncio.to_thread(
+                    load_task_setup_snapshot_sync,
+                    task_id,
+                    user_id_for_snapshot,
+                )
 
-                    # Get task's execution_mode and map to pattern.
-                    task_execution_mode = getattr(task, "execution_mode", None)
-                    if not task_execution_mode:
-                        task_execution_mode = get_default_task_execution_mode(
-                            agent_id=getattr(task, "agent_id", None),
+                if snapshot is not None:
+                    task = snapshot.task
+                    logger.info(
+                        f"Task {task_id} record: agent_type={task.agent_type}, "
+                        f"model_name={task.model_name}, "
+                        f"compact_model_name={task.compact_model_name}"
+                    )
+                    task_pattern = snapshot.task_pattern
+                    logger.info(
+                        f"Task {task_id} execution_mode={task.execution_mode} "
+                        f"-> pattern={task_pattern}"
+                    )
+                    task_llm = snapshot.task_llm
+                    task_fast_llm = snapshot.task_fast_llm
+                    task_vision_llm = snapshot.task_vision_llm
+                    task_compact_llm = snapshot.task_compact_llm
+                    agent_config = snapshot.agent_config
+                    excluded_agent_id = snapshot.excluded_agent_id
+
+                    if snapshot.agent is not None:
+                        logger.info(
+                            f"Task {task_id} using Agent Builder config: "
+                            f"{snapshot.agent.name}"
                         )
-                    task_pattern = get_agent_pattern_for_execution_mode(
-                        task_execution_mode
-                    )
-                    logger.info(
-                        f"Task {task_id} execution_mode={task_execution_mode} -> pattern={task_pattern}"
-                    )
-
-                    llm_ids = self._get_task_llm_ids(task, db)
-                    logger.info(
-                        f"Loading LLM configuration from task {task_id}: {llm_ids}"
-                    )
-                    # Use user_id for model resolution if available
-                    user_id_for_resolution: Optional[int] = (
-                        int(user.id) if user and user.id is not None else None
-                    )
-                    task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                        resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
-                    )
-
-                    # Override with Agent Builder configuration if task.agent_id exists
-                    if task and task.agent_id:
-                        agent = (
-                            db.query(Agent)
-                            .filter(
-                                Agent.id == task.agent_id, Agent.user_id == task.user_id
-                            )
-                            .first()
-                        )
-                        if agent:
+                        if agent_config is not None:
                             logger.info(
-                                f"Task {task_id} using Agent Builder config: {agent.name}"
-                            )
-                            agent_config = self._load_agent_builder_config(
-                                agent, db, int(task.user_id)
-                            )
-                            (
-                                task_llm,
-                                task_fast_llm,
-                                task_vision_llm,
-                                task_compact_llm,
-                            ) = agent_config["llms"]
-                            # Agent Builder execution_mode overrides task pattern.
-                            agent_execution_mode = agent_config.get(
-                                "execution_mode", "balanced"
-                            )
-                            task_pattern = get_agent_pattern_for_execution_mode(
-                                agent_execution_mode
-                            )
-                            logger.info(
-                                f"Task {task_id} using Agent Builder execution mode: {agent.execution_mode} -> pattern={task_pattern}"
+                                f"Task {task_id} using Agent Builder execution "
+                                f"mode: {agent_config.get('execution_mode')} "
+                                f"-> pattern={task_pattern}"
                             )
 
-                    # If no models were resolved, use defaults
                     if not task_llm:
                         logger.warning(
                             f"Task {task_id} has no valid LLM configuration, using defaults"
@@ -862,10 +840,14 @@ class AgentServiceManager:
                         task_llm = self._default_llm
 
                     logger.info(
-                        f"Successfully loaded LLM configuration for task {task_id}: compact_llm={task_compact_llm.model_name if task_compact_llm else None}"
+                        f"Successfully loaded LLM configuration for task {task_id}: "
+                        f"compact_llm="
+                        f"{task_compact_llm.model_name if task_compact_llm else None}"
                     )
                 else:
-                    # Task record not found
+                    # Task row vanished between the existence check and
+                    # the snapshot read. Fall back to the original
+                    # defaults so we still produce a usable AgentService.
                     logger.error(f"Task {task_id} not found in database!")
                     task_llm = self._default_llm
                     task_fast_llm = None
@@ -875,7 +857,6 @@ class AgentServiceManager:
                 logger.error(
                     f"Failed to load LLM configuration from task {task_id} database: {e}"
                 )
-                # Fallback to defaults
                 task_llm = self._default_llm
                 task_fast_llm = None
                 task_vision_llm = None
@@ -892,21 +873,21 @@ class AgentServiceManager:
                         "Database connection is required for agent creation"
                     )
 
-                # Check if task has an associated published agent that should
-                # be excluded from agent tools. Reuse the ``agent`` ORM row
-                # already fetched in the LLM-config block above (around line
-                # 791) -- same SELECT filter (``Agent.id == task.agent_id
-                # AND Agent.user_id == task.user_id``), same row -- instead
-                # of running an identical query a second time per task setup.
-                excluded_agent_id = None
-                if agent is not None:
-                    from ..models.agent import AgentStatus
-
-                    if agent.status == AgentStatus.PUBLISHED:
-                        excluded_agent_id = int(agent.id)
-                        logger.info(
-                            f"Task {task_id} is associated with published agent {agent.id} ({agent.name}), will exclude from agent tools"
-                        )
+                # ``excluded_agent_id`` is set by the snapshot loader
+                # (it already filtered the published-agent case in the
+                # same SELECT used for LLM resolution). Surface the log
+                # line here so on-call still sees the published-agent
+                # exclusion in production logs.
+                if (
+                    excluded_agent_id is not None
+                    and snapshot is not None
+                    and snapshot.agent is not None
+                ):
+                    logger.info(
+                        f"Task {task_id} is associated with published agent "
+                        f"{snapshot.agent.id} ({snapshot.agent.name}), "
+                        "will exclude from agent tools"
+                    )
 
                 # Get or create user sandbox for run task tools
                 user_id = int(user.id)
