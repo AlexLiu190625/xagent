@@ -162,6 +162,51 @@ def create_default_llm() -> Optional[BaseLLM]:
         return None
 
 
+def _build_selection_spec_from_categories(
+    tool_categories: Optional[List[str]],
+) -> Optional[Any]:
+    """Convert the agent builder ``tool_categories`` list into a
+    :class:`ToolSelectionSpec`.
+
+    The agent builder UI stores tool selection as a flat list of
+    strings: plain category names (``"basic"``, ``"file"``, ``"mcp"``)
+    plus a special ``"mcp:<server-name>"`` form that selects a specific
+    MCP server. We translate that representation into a structured
+    spec the factory and creators can act on:
+
+      - plain entries → ``spec.categories``
+      - ``mcp:<name>`` entries → both add ``"mcp"`` to ``categories``
+        (so the MCP creator runs) and ``<name>`` to ``mcp_servers``
+        (so per-server filtering in the MCP creator can take effect).
+      - Because the legacy chat path also routed ``mcp:<name>`` to
+        match a Custom API named ``api_<name>_call`` (category
+        ``"other"``), we conservatively include ``"other"`` in
+        ``categories`` whenever any ``mcp:`` entry is present, so we
+        don't change that behavior.
+
+    Returns ``None`` if ``tool_categories`` is missing/empty/None,
+    which preserves "no restriction = build everything" backward compat.
+    """
+    if not tool_categories:
+        return None
+    from ...core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+
+    cats: set[str] = set()
+    mcp_servers: set[str] = set()
+    for entry in tool_categories:
+        if entry.startswith("mcp:"):
+            server_name = entry.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+            cats.add("mcp")
+            cats.add("other")  # Custom API name-match path lives under "other"
+            mcp_servers.add(server_name)
+        else:
+            cats.add(entry)
+    return ToolSelectionSpec(
+        categories=frozenset(cats),
+        mcp_servers=frozenset(mcp_servers) if mcp_servers else None,
+    )
+
+
 def _build_allowed_external_dirs(
     user_id: Optional[int], *, only_existing: bool = False
 ) -> list[str]:
@@ -200,8 +245,16 @@ async def create_default_tools(
     vision_model: Optional[Any] = None,
     sandbox: Optional[Any] = None,
     llm: Optional[Any] = None,
+    selection_spec: Optional[Any] = None,
 ) -> tuple[list[Any], Any]:
-    """Create default tools and tool_config for AgentService using ToolFactory"""
+    """Create default tools and tool_config for AgentService using ToolFactory.
+
+    ``selection_spec`` (a :class:`ToolSelectionSpec` or ``None``) is
+    propagated into the ``WebToolConfig`` so :func:`ToolFactory.create_all_tools`
+    can skip creators (and their internal DB / network I/O) for tool
+    categories / MCP servers the agent does not need. ``None`` preserves
+    the original "build everything" behavior for backward compat.
+    """
     if not user:
         raise ValueError("User is required for tool creation")
     if not task_id:
@@ -240,6 +293,7 @@ async def create_default_tools(
         allowed_skills=allowed_skills,  # Agent Builder skills
         allowed_tools=allowed_tools,  # Agent Builder tool categories
         vision_model=vision_model,  # Pass task-specific vision model
+        selection_spec=selection_spec,  # Category/server-level skip in factory
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -845,6 +899,15 @@ class AgentServiceManager:
                 # Filter tools by tool category using tool metadata
                 # Note: Tool names are stable, defined in code, no database storage needed
                 allowed_tools = None
+                # Spec passed into the temp build so the factory skips
+                # creators (and their internal DB / MCP-discovery I/O)
+                # for categories this agent doesn't use. Same spec is
+                # also passed into the real build below; both calls
+                # therefore enumerate only the relevant subset rather
+                # than the full ~52-tool default set (see issue #427).
+                selection_spec = _build_selection_spec_from_categories(
+                    agent_config.get("tool_categories") if agent_config else None
+                )
                 if agent_config and "tool_categories" in agent_config:
                     tool_categories = agent_config["tool_categories"]
 
@@ -866,6 +929,7 @@ class AgentServiceManager:
                         allowed_collections=agent_config.get("knowledge_bases"),
                         allowed_skills=agent_config.get("skills"),
                         sandbox=sandbox,
+                        selection_spec=selection_spec,
                     )
 
                     # Get all tools and filter by category
@@ -929,7 +993,10 @@ class AgentServiceManager:
                     else int(user.id)
                 )
 
-                # Create tools using ToolFactory
+                # Create tools using ToolFactory. ``selection_spec`` is
+                # the same one used by the temp build above; passing it
+                # here too keeps both factory calls aligned on which
+                # creators to dispatch and skip.
                 tools = await create_default_tools(
                     db,
                     request=self.request,
@@ -945,6 +1012,7 @@ class AgentServiceManager:
                     vision_model=task_vision_llm,  # Pass task-specific vision model
                     sandbox=sandbox,
                     llm=task_llm,  # Pass task-specific LLM
+                    selection_spec=selection_spec,
                 )
 
                 with UserContext(int(user.id)):
