@@ -1,10 +1,11 @@
 "use client"
 
+import React from "react"
 import { useState, useEffect, useRef } from "react"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
 import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
-import { apiRequest, getUploadErrorMessage, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { apiRequest, getApiErrorMessage, getUploadErrorMessage, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { StandaloneFilePreviewDialog } from "@/components/file/standalone-file-preview-dialog"
 import { SearchInput } from "@/components/ui/search-input"
@@ -328,10 +329,15 @@ export function FilesPage() {
           setFiles(prev => prev.filter(f => f.file_id !== file.file_id))
           setSelectedFiles(prev => prev.filter(f => f !== file.file_id))
         } else {
-          toast.error(t('common.deleteFailed') || "Failed to delete file")
+          const parsed = await parseApiResponse(response)
+          toast.error(getApiErrorMessage(
+            response,
+            parsed,
+            t('common.deleteFailed') || "Failed to delete file",
+          ))
         }
       } else if (confirmDialog.type === 'multiple') {
-        let hasError = false
+        let errorMessage: string | null = null
         for (const fileId of selectedFiles) {
           const fileToDelete = files.find(f => f.file_id === fileId)
           if (fileToDelete) {
@@ -341,18 +347,23 @@ export function FilesPage() {
             if (response.ok) {
               setFiles(prev => prev.filter(f => f.file_id !== fileToDelete.file_id))
             } else {
-              hasError = true
+              const parsed = await parseApiResponse(response)
+              errorMessage = errorMessage || getApiErrorMessage(
+                response,
+                parsed,
+                t('common.deleteFailed'),
+              )
             }
           }
         }
         setSelectedFiles([])
-        if (hasError) {
-          toast.error(t('common.deleteFailed'))
+        if (errorMessage) {
+          toast.error(errorMessage)
         }
       }
     } catch (error) {
       console.error('Failed to delete file(s):', error)
-      toast.error(t('common.deleteFailed'))
+      toast.error(error instanceof Error ? error.message : t('common.deleteFailed'))
     } finally {
       setIsDeletingFile(false)
       setConfirmDialog({ isOpen: false, type: 'single' })

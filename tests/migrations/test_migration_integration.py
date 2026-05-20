@@ -187,6 +187,15 @@ class TestMigrations:
             "_api_key_encrypted column should exist"
         )
 
+    def test_sqlite_stamp_head_creates_wide_alembic_version_table(self, sqlite_tester):
+        """Stamping a fresh database must support long revision IDs."""
+        command.stamp(sqlite_tester.alembic_cfg, "head")
+
+        columns = inspect(sqlite_tester.engine).get_columns("alembic_version")
+        version_num = next(col for col in columns if col["name"] == "version_num")
+
+        assert version_num["type"].length == 255
+
     @pytest.mark.postgresql
     def test_postgresql_upgrade(self, postgresql_tester):
         """Test full migration upgrade on PostgreSQL from empty database.

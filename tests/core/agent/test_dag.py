@@ -1171,6 +1171,14 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "Few-shot examples" in system_prompt
     assert "must be concrete and action-specific" in system_prompt
     assert "suggested execution tool scope" in system_prompt
+    assert "Plan language rules" in system_prompt
+    assert (
+        "Write every plan step task, description, termination_condition, "
+        "and completion_evidence in the same natural language as the current "
+        "user request"
+    ) in system_prompt
+    assert "Any final synthesis or final result produced from the plan" in system_prompt
+    assert "completed step results" in system_prompt
     assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[0]["thinking"] == {"type": "disabled", "enable": False}
     assert "response_format" not in llm.calls[0]

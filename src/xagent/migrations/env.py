@@ -4,7 +4,9 @@ from logging.config import fileConfig
 
 from alembic import context
 from dotenv import load_dotenv
-from sqlalchemy import engine_from_config, pool
+from sqlalchemy import engine_from_config
+from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy import pool, text
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,6 +33,75 @@ if config.config_file_name is not None:
 
 # Use our models' MetaData for autogenerate support
 target_metadata = Base.metadata
+
+
+ALEMBIC_VERSION_TABLE = "alembic_version"
+ALEMBIC_VERSION_LENGTH = 255
+
+
+def ensure_wide_alembic_version_table(connection, *, commit: bool = False) -> None:
+    """Ensure Alembic can store this project's long revision identifiers."""
+    changed = False
+    inspector = sqlalchemy_inspect(connection)
+    tables = inspector.get_table_names()
+
+    if ALEMBIC_VERSION_TABLE not in tables:
+        connection.execute(
+            text(
+                "CREATE TABLE alembic_version "
+                "(version_num VARCHAR(255) NOT NULL, "
+                "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+            )
+        )
+        changed = True
+        if commit:
+            connection.commit()
+        return
+
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns(ALEMBIC_VERSION_TABLE)
+    }
+    version_num = columns.get("version_num")
+    if version_num is None:
+        return
+
+    current_length = getattr(version_num["type"], "length", None)
+    if current_length is None or current_length >= ALEMBIC_VERSION_LENGTH:
+        return
+
+    if connection.dialect.name == "postgresql":
+        connection.execute(
+            text(
+                "ALTER TABLE alembic_version ALTER COLUMN version_num TYPE varchar(255)"
+            )
+        )
+        changed = True
+    elif connection.dialect.name == "sqlite":
+        connection.execute(text("PRAGMA foreign_keys=OFF"))
+        connection.execute(
+            text(
+                "CREATE TABLE alembic_version_wide "
+                "(version_num VARCHAR(255) NOT NULL, "
+                "CONSTRAINT alembic_version_pkc PRIMARY KEY (version_num))"
+            )
+        )
+        connection.execute(
+            text(
+                "INSERT INTO alembic_version_wide (version_num) "
+                "SELECT version_num FROM alembic_version"
+            )
+        )
+        connection.execute(text("DROP TABLE alembic_version"))
+        connection.execute(
+            text("ALTER TABLE alembic_version_wide RENAME TO alembic_version")
+        )
+        connection.execute(text("PRAGMA foreign_keys=ON"))
+        changed = True
+
+    if changed and commit:
+        connection.commit()
+
 
 # other values from the config, defined by the needs of env.py,
 # can be acquired:
@@ -80,6 +151,7 @@ def run_migrations_online() -> None:
 
     if connection is not None:
         # Use provided connection
+        ensure_wide_alembic_version_table(connection)
         context.configure(connection=connection, target_metadata=target_metadata)
         with context.begin_transaction():
             context.run_migrations()
@@ -100,6 +172,9 @@ def run_migrations_online() -> None:
         )
 
         with connectable.connect() as connection:
+            ensure_wide_alembic_version_table(connection, commit=True)
+
+        with connectable.begin() as connection:
             context.configure(connection=connection, target_metadata=target_metadata)
 
             with context.begin_transaction():

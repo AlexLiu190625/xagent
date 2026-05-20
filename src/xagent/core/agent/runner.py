@@ -97,7 +97,10 @@ class AgentRunner:
                 if role and content:
                     context.add_message(role, content)
             if task:
-                context.add_user_message(task)
+                context.add_user_message(
+                    task,
+                    metadata=self._initial_user_message_metadata(context),
+                )
 
         runtime = runtime or PatternRuntime(
             tracer=self.tracer,
@@ -289,8 +292,11 @@ class AgentRunner:
     async def inject_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -305,7 +311,26 @@ class AgentRunner:
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
 
-        context.add_user_message(message)
+        resolved_execution_message = (
+            execution_message if execution_message is not None else message
+        )
+        if resolved_execution_message is None:
+            raise ValueError(
+                "inject_user_message requires message or execution_message"
+            )
+        if display_message is None and message is None:
+            raise ValueError(
+                "inject_user_message requires display_message when "
+                "execution_message is provided without legacy message"
+            )
+        resolved_display_message = (
+            display_message if display_message is not None else message
+        )
+        metadata: dict[str, Any] = {"display_message": resolved_display_message}
+        if files is not None:
+            metadata["files"] = files
+
+        context.add_user_message(resolved_execution_message, metadata=metadata)
         await self._persist_injected_context(
             execution_id=execution_id,
             context=context,
@@ -318,8 +343,11 @@ class AgentRunner:
     async def post_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -331,6 +359,9 @@ class AgentRunner:
         return await self.inject_user_message(
             execution_id,
             message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
             request_interrupt=request_interrupt,
             reason=reason,
         )
@@ -384,6 +415,46 @@ class AgentRunner:
             context.attach_memory_session(memory_id, snapshot)
 
         return context
+
+    def _initial_user_message_metadata(
+        self, context: ExecutionContext
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        context_metadata = (
+            context.metadata if isinstance(context.metadata, dict) else {}
+        )
+        request_context = context_metadata.get("request_context")
+
+        candidates = []
+        if isinstance(request_context, dict):
+            candidates.append(request_context)
+        candidates.append(context_metadata)
+
+        for candidate in candidates:
+            if "display_message" in candidate:
+                display_message = candidate.get("display_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+            if "display_user_message" in candidate:
+                display_message = candidate.get("display_user_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+
+        for candidate in candidates:
+            files = candidate.get("files")
+            if isinstance(files, list):
+                metadata["files"] = files
+                break
+            attachments = candidate.get("attachments")
+            if isinstance(attachments, list):
+                metadata["files"] = attachments
+                break
+
+        return metadata
 
     def _apply_request_context(
         self,

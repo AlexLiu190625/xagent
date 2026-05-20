@@ -17,6 +17,7 @@ from ..config import get_upload_path
 from ..kb_physical_sync import collection_physical_lock, move_collection_dir_to_trash
 from ..models.uploaded_file import UploadedFile
 from .kb_file_service import delete_uploaded_file_if_orphaned
+from .uploaded_file_store import UploadedFileStore
 
 logger = logging.getLogger(__name__)
 
@@ -139,8 +140,10 @@ def delete_collection_uploaded_files(
         # Exclude file_ids already deleted in the first pass to avoid double-count
         if deleted_file_ids:
             query = query.filter(UploadedFile.file_id.notin_(deleted_file_ids))
-        deleted = query.delete(synchronize_session=False)
-        deleted_uploaded_files += int(deleted or 0)
+        store = UploadedFileStore(db)
+        for file_record in query.all():
+            store.delete(file_record, delete_local=False)
+            deleted_uploaded_files += 1
 
     if deleted_uploaded_files:
         db.commit()

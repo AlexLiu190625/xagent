@@ -734,6 +734,9 @@ async def test_startup_event_skips_when_auto_migrate_disabled(
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
         "xagent.skills.utils.create_skill_manager",
@@ -839,6 +842,9 @@ async def test_startup_event_triggers_background_auto_migration(
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
         "xagent.skills.utils.create_skill_manager",
@@ -945,6 +951,9 @@ async def test_startup_event_no_task_when_no_table_needs_migration(
 
     monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "true")
     monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
     monkeypatch.setattr(web_app_module, "_migration_task", None)
     monkeypatch.setattr(
         "xagent.skills.utils.create_skill_manager",

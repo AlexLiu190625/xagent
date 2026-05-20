@@ -35,6 +35,7 @@ from ..services.chat_history_service import (
     load_task_transcript,
 )
 from ..services.llm_utils import resolve_llms_from_names
+from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
@@ -1036,7 +1037,7 @@ class AgentServiceManager:
                             if uploaded_file is None:
                                 continue
 
-                            source_path = Path(str(uploaded_file.storage_path))
+                            source_path = ensure_uploaded_file_local_path(uploaded_file)
                             if not source_path.exists() or not source_path.is_file():
                                 continue
 
@@ -1546,7 +1547,7 @@ async def create_task(
 
                 selected_file_ids.append(str(file_id))
 
-                file_path = Path(str(uploaded_file.storage_path))
+                file_path = ensure_uploaded_file_local_path(uploaded_file)
                 file_paths.append(str(file_path))
 
                 if file_path.exists():

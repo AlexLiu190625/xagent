@@ -419,6 +419,80 @@ def test_reconcile_uploaded_files_does_not_commit_caller_session(
     db.close()
 
 
+def test_reconcile_uploaded_files_preserves_record_when_durable_delete_fails(
+    reconcile_env, monkeypatch: pytest.MonkeyPatch
+):
+    docs_table, session_local, uploads_dir = reconcile_env
+    _create_user(session_local, user_id=1)
+    db = session_local()
+
+    failed_path = uploads_dir / "user_1" / "kb" / "failed-durable.md"
+    failed_path.parent.mkdir(parents=True, exist_ok=True)
+    failed_path.write_text("failed", encoding="utf-8")
+    old_time = datetime.now(timezone.utc) - timedelta(days=10)
+    failed_file = UploadedFile(
+        user_id=1,
+        filename="failed-durable.md",
+        storage_path=str(failed_path),
+        storage_backend="s3",
+        storage_key="users/1/uploads/file-1/failed-durable.md",
+        storage_status="available",
+        mime_type="text/markdown",
+        file_size=failed_path.stat().st_size,
+        created_at=old_time,
+    )
+    db.add(failed_file)
+    db.commit()
+    db.refresh(failed_file)
+
+    docs_table.add(
+        [
+            {
+                "collection": "kb",
+                "doc_id": "doc-durable-delete",
+                "file_id": failed_file.file_id,
+                "source_path": str(failed_path),
+                "user_id": 1,
+            }
+        ]
+    )
+    write_ingestion_status(
+        "kb",
+        "doc-durable-delete",
+        status="failed",
+        message="failed",
+        parse_hash="",
+        user_id=1,
+    )
+
+    def fail_durable_delete(self):
+        raise RuntimeError("remote delete failed")
+
+    monkeypatch.setattr(
+        "xagent.web.services.managed_file_ref.ManagedFileRef.delete_durable",
+        fail_durable_delete,
+    )
+
+    result = reconcile_uploaded_files(
+        db,
+        user_id=1,
+        is_admin=False,
+        stale_ttl_hours=24,
+        delete_stale=True,
+    )
+
+    assert result["cleanup_errors"] == 1
+    assert result["deleted"] == 0
+    assert failed_path.exists()
+    still_exists = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.file_id == failed_file.file_id)
+        .first()
+    )
+    assert still_exists is not None
+    db.close()
+
+
 def test_reconcile_uploaded_files_records_cleanup_error_when_documents_delete_fails(
     reconcile_env, monkeypatch: pytest.MonkeyPatch
 ):

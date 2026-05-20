@@ -23,6 +23,7 @@ from xagent.core.agent.context.enrichment import (
     enrich_context_with_skill,
     generate_and_store_react_memory,
 )
+from xagent.core.agent.language import response_language_rules
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.web.user_isolated_memory import current_user_id
 
@@ -107,6 +108,92 @@ def test_format_tool_result_uses_shared_image_artifact_observation() -> None:
     )
     assert "file preview service" in content
     assert "/api/files/public/preview/" not in content
+
+
+def test_system_context_preserves_current_request_language_over_memory() -> None:
+    ctx = ExecutionContext(execution_id="exec-language")
+    ctx.metadata["task"] = "Can you analyze this GitHub project?"
+    ctx.metadata[MEMORY_CONTEXT_METADATA_KEY] = (
+        "Relevant memory:\n- Task: 怎么样进入 github trending？\n"
+        "Result: 使用中文总结增长策略。"
+    )
+    ctx.add_user_message("Can you analyze this GitHub project?")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Current user request:" in system_message
+    assert "Can you analyze this GitHub project?" in system_message
+    assert "Response language rules" in system_message
+    assert "Use the same natural language as the current user request" in system_message
+    assert "Do not let retrieved memories" in system_message
+
+
+def test_response_language_rules_uses_custom_subject_throughout() -> None:
+    rules = response_language_rules(subject="current DAG step")
+
+    assert "If the current DAG step explicitly asks" in rules
+    assert "unless the current DAG step explicitly asks" in rules
+    assert "unless the current user request explicitly asks" not in rules
+
+
+def test_system_context_uses_latest_user_message_as_current_request() -> None:
+    ctx = ExecutionContext(execution_id="exec-follow-up-language")
+    ctx.metadata["task"] = "Can you analyze this GitHub project?"
+    ctx.add_user_message("Can you analyze this GitHub project?")
+    ctx.add_assistant_message("Sure, here is the analysis.")
+    ctx.add_user_message("请继续用中文总结")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Current user request:\n请继续用中文总结" in system_message
+    assert "Current user request:\nCan you analyze this GitHub project?" not in (
+        system_message
+    )
+
+
+def test_system_context_ignores_waiting_for_user_answer_as_current_request() -> None:
+    ctx = ExecutionContext(execution_id="exec-waiting-for-user-language")
+    ctx.metadata["task"] = "Book a trip"
+    ctx.add_user_message("Book a trip")
+    ctx.add_assistant_message("What city?")
+    ctx.add_user_message(
+        "北京",
+        metadata={
+            "response_to_waiting_for_user": {
+                "question": "What city?",
+            },
+        },
+    )
+
+    messages = ctx.get_messages_for_llm()
+    system_message = messages[0]["content"]
+    waiting_answer_message = messages[-1]["content"]
+
+    assert "Current user request:\nBook a trip" in system_message
+    assert "Current user request:\n北京" not in system_message
+    assert "answer to a pending agent question" in waiting_answer_message
+    assert "User answer: 北京" in waiting_answer_message
+
+
+def test_dag_step_system_context_preserves_step_language_for_final_answer() -> None:
+    ctx = ExecutionContext(
+        execution_id="exec-dag-language",
+        metadata={
+            "dag_step_id": "research",
+            "dag_step_name": "Research best practices",
+            "dag_step_description": "Find lessons from the repository",
+        },
+    )
+    ctx.add_user_message("Dependency results: {'prior': '中文内容'}")
+
+    system_message = ctx.get_messages_for_llm()[0]["content"]
+
+    assert "Step language rules" in system_message
+    assert (
+        "Use the same natural language as the current DAG step title and "
+        "description for all user-facing prose and for this step's final_answer"
+    ) in system_message
+    assert "Do not let dependency results, tool results" in system_message
 
 
 def test_memory_enrichment_uses_web_user_context(

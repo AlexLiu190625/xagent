@@ -220,7 +220,6 @@ class FeishuBotInstance:
                     .first()
                 )
 
-            was_completed_or_failed = False
             if not task:
                 is_new_task = True
 
@@ -243,10 +242,6 @@ class FeishuBotInstance:
                 self._save_active_tasks()
             else:
                 is_new_task = False
-                was_completed_or_failed = task.status in [
-                    TaskStatus.COMPLETED,
-                    TaskStatus.FAILED,
-                ]
                 task.status = TaskStatus.PENDING
                 db.commit()
 
@@ -308,8 +303,7 @@ class FeishuBotInstance:
 
             from ...user_isolated_memory import UserContext
 
-            force_fresh_execution = not is_new_task and was_completed_or_failed
-            actual_task_id = None if force_fresh_execution else str(task.id)
+            actual_task_id = str(task.id)
 
             with UserContext(int(user.id)):
                 result = await agent_manager.execute_task(
@@ -397,7 +391,7 @@ class FeishuBotInstance:
 
         from lark_oapi.api.im.v1 import GetMessageResourceRequest
 
-        from ...models.uploaded_file import UploadedFile
+        from ...services.uploaded_file_store import UploadedFileStore
 
         uploaded_files_info: list[dict] = []
 
@@ -474,15 +468,14 @@ class FeishuBotInstance:
 
                 file_size = target_path.stat().st_size
 
-                file_record = UploadedFile(
+                file_record = UploadedFileStore(db).create_from_local_path(
+                    local_path=target_path,
                     user_id=user_id,
                     task_id=task_id,
                     filename=normalized_file_name,
-                    storage_path=str(target_path),
                     mime_type=mime_type,
-                    file_size=file_size,
                 )
-                db.add(file_record)
+                file_record.file_size = file_size
                 db.flush()
 
                 agent_service.workspace.register_file(

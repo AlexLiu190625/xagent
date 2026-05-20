@@ -1,11 +1,33 @@
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
+from alembic.script import ScriptDirectory
+from sqlalchemy import create_engine, inspect, text
 
 from xagent.db import try_upgrade_db
+from xagent.db.config import create_alembic_config
 
 
 class TestTryUpgradeDb:
+    def test_stamps_new_database_with_persistent_wide_version_table(self):
+        engine = create_engine("sqlite:///:memory:")
+
+        try_upgrade_db(engine)
+
+        columns = inspect(engine).get_columns("alembic_version")
+        version_num = next(
+            column for column in columns if column["name"] == "version_num"
+        )
+        assert version_num["type"].length == 255
+
+        with engine.begin() as conn:
+            version = conn.execute(
+                text("SELECT version_num FROM alembic_version")
+            ).scalar()
+
+        script = ScriptDirectory.from_config(create_alembic_config(engine))
+        assert version == script.get_current_head()
+
     @patch("xagent.db.migration.command.upgrade")
     @patch("xagent.db.migration.create_alembic_config")
     @patch("xagent.db.migration.get_alembic_revision")
@@ -19,7 +41,7 @@ class TestTryUpgradeDb:
 
         # Mock connection context manager
         connection = Mock()
-        engine.connect.return_value.__enter__.return_value = connection
+        engine.begin.return_value.__enter__.return_value = connection
 
         try_upgrade_db(engine)
 
@@ -41,7 +63,7 @@ class TestTryUpgradeDb:
         mock_config.attributes = {}
 
         connection = Mock()
-        engine.connect.return_value.__enter__.return_value = connection
+        engine.begin.return_value.__enter__.return_value = connection
 
         try_upgrade_db(engine)
 

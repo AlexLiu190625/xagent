@@ -7,9 +7,11 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, TypedDict, TypeVar, cast
@@ -82,6 +84,7 @@ from ...core.tools.core.RAG_tools.utils.string_utils import (
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from ..auth_dependencies import get_current_user
 from ..config import (
+    MAX_COLLECTION_NAME_LENGTH,
     MAX_FILE_SIZE,
     MAX_FILE_SIZE_LABEL,
     get_upload_path,
@@ -114,6 +117,8 @@ from ..services.kb_file_service import (
 from ..services.kb_file_service import (
     upsert_uploaded_file_record as _upsert_uploaded_file_record,
 )
+from ..services.managed_file_ref import DurableObjectMissingError, ManagedFileRef
+from ..services.uploaded_file_store import UploadedFileStore
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -128,6 +133,12 @@ _PDF_ONLY_PARSE_METHODS = {
 # lock_key -> (lock, active waiter/holder count)
 _WEB_FILE_LOCKS: Dict[str, tuple[threading.Lock, int]] = {}
 _WEB_FILE_LOCKS_GUARD = threading.Lock()
+_WEB_FILENAME_HASH_LENGTH = 16
+_WEB_FILENAME_SUFFIX = ".md"
+_MAX_FILESYSTEM_FILENAME_BYTES = 255
+_MAX_WEB_TITLE_FILENAME_BYTES = _MAX_FILESYSTEM_FILENAME_BYTES - len(
+    f"{'0' * _WEB_FILENAME_HASH_LENGTH}_{_WEB_FILENAME_SUFFIX}".encode("utf-8")
+)
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -153,6 +164,28 @@ def _normalize_parse_method_for_filename(
         )
         return ParseMethod.DEFAULT
     return normalized
+
+
+def _normalize_web_title_for_filename(title: str) -> str:
+    """Convert arbitrary web page titles into filesystem-safe filename parts."""
+    normalized = unicodedata.normalize("NFKC", title).strip()
+    if not normalized:
+        return "untitled"
+
+    # Replace separators and punctuation-heavy runs with underscores so
+    # ordinary article titles ("How to edit a completed job?") remain usable.
+    normalized = normalized.replace("/", " ").replace("\\", " ")
+    normalized = re.sub(r"[^\w.-]", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("._-")
+
+    if not normalized:
+        return "untitled"
+
+    trimmed = normalized[:MAX_COLLECTION_NAME_LENGTH]
+    while trimmed and len(trimmed.encode("utf-8")) > _MAX_WEB_TITLE_FILENAME_BYTES:
+        trimmed = trimmed[:-1]
+    trimmed = trimmed.rstrip("._-")
+    return trimmed or "untitled"
 
 
 def _validate_parser_for_file(
@@ -358,7 +391,9 @@ async def _rollback_failed_ingestion(
                     .first()
                 )
                 if refreshed_file_record is not None:
-                    db.delete(refreshed_file_record)
+                    UploadedFileStore(db).delete(
+                        refreshed_file_record, delete_local=False
+                    )
             await _cleanup_failed_new_collection_metadata(
                 collection_name=collection_name,
                 user=user,
@@ -410,7 +445,7 @@ async def _rollback_failed_ingestion(
                     is_admin=bool(user.is_admin),
                 )
             if not uploaded_file_existed_before:
-                db.delete(file_record)
+                UploadedFileStore(db).delete(file_record, delete_local=False)
                 db.commit()
 
         _restore_ingest_file_backup(
@@ -756,7 +791,20 @@ def _refresh_existing_file_if_changed(
     """
     existing_path = Path(str(existing_record.storage_path))
     if not existing_path.exists():
-        return None
+        try:
+            existing_path = ManagedFileRef(existing_record).ensure_local()
+        except DurableObjectMissingError:
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to restore durable web-ingestion file before refresh: "
+                "url=%s, file_id=%s, context=%s, error=%s",
+                url,
+                existing_record.file_id,
+                context,
+                exc,
+            )
+            return None
 
     old_hash = _get_file_sha256(existing_path)
     new_hash = _get_file_sha256(temp_file_path)
@@ -784,15 +832,30 @@ def _refresh_existing_file_if_changed(
         )
 
     # Mark succeeded - now atomically replace the file
-    _atomic_replace_file(temp_file_path, existing_path)
-    file_record = _upsert_uploaded_file_record(
-        db_session,
-        user_id=user_id,
-        filename=filename,
-        storage_path=existing_path,
-        mime_type="text/markdown",
-        file_size=existing_path.stat().st_size,
+    backup_path = existing_path.with_name(
+        f"{existing_path.name}.rollback-{uuid.uuid4().hex}"
     )
+    shutil.copy2(existing_path, backup_path)
+    try:
+        _atomic_replace_file(temp_file_path, existing_path)
+        file_record = _upsert_uploaded_file_record(
+            db_session,
+            user_id=user_id,
+            filename=filename,
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+    except Exception:
+        _restore_ingest_file_backup(
+            file_path=existing_path,
+            backup_path=backup_path,
+            had_existing_file=True,
+        )
+        raise
+    finally:
+        if backup_path.exists():
+            backup_path.unlink()
     processed_urls[url_hash] = str(file_record.file_id)
 
     logger.info(
@@ -802,6 +865,54 @@ def _refresh_existing_file_if_changed(
         context,
     )
 
+    return FileHandlerResult(
+        file_path=str(existing_record.storage_path),
+        file_id=str(existing_record.file_id),
+    )
+
+
+def _recreate_missing_existing_file(
+    *,
+    existing_record: Any,
+    temp_file_path: Path,
+    db_session: Session,
+    user_id: int,
+    filename: str,
+    url_hash: str,
+    processed_urls: Dict[str, str],
+) -> FileHandlerResult:
+    existing_path = Path(str(existing_record.storage_path))
+    backup_path: Optional[Path] = None
+    had_existing_file = existing_path.exists()
+    if had_existing_file:
+        backup_path = existing_path.with_name(
+            f"{existing_path.name}.rollback-{uuid.uuid4().hex}"
+        )
+        shutil.copy2(existing_path, backup_path)
+
+    try:
+        _atomic_replace_file(temp_file_path, existing_path)
+        file_record = _upsert_uploaded_file_record(
+            db_session,
+            user_id=user_id,
+            filename=filename,
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+    except Exception:
+        db_session.rollback()
+        _restore_ingest_file_backup(
+            file_path=existing_path,
+            backup_path=backup_path,
+            had_existing_file=had_existing_file,
+        )
+        raise
+    finally:
+        if backup_path is not None and backup_path.exists():
+            backup_path.unlink()
+
+    processed_urls[url_hash] = str(file_record.file_id)
     return FileHandlerResult(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
@@ -2468,9 +2579,7 @@ async def ingest_web(
             url_hash = hashlib.sha256(f"{collection_name}:{url}".encode()).hexdigest()[
                 :16
             ]
-            safe_title = (
-                sanitize_path_component(title, "filename") if title else "untitled"
-            )
+            safe_title = _normalize_web_title_for_filename(title)
             filename = f"{url_hash}_{safe_title}.md"
             lock_key = f"{int(_user.id)}:{url_hash}"
 
@@ -2542,27 +2651,21 @@ async def ingest_web(
                         return result
 
                     # result is None means file doesn't exist - recreate it
-                    existing_path = Path(str(existing_record.storage_path))
-                    existing_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(temp_file_path, existing_path)
-                    file_record = _upsert_uploaded_file_record(
-                        db_session,
+                    result = _recreate_missing_existing_file(
+                        existing_record=existing_record,
+                        temp_file_path=temp_file_path,
+                        db_session=db_session,
                         user_id=int(_user.id),
                         filename=filename,
-                        storage_path=existing_path,
-                        mime_type="text/markdown",
-                        file_size=existing_path.stat().st_size,
+                        url_hash=url_hash,
+                        processed_urls=_processed_urls,
                     )
-                    _processed_urls[url_hash] = str(file_record.file_id)
                     logger.info(
                         "Recreated missing persistent file for existing UploadedFile record: url=%s, file_id=%s",
                         url,
-                        file_record.file_id,
+                        existing_record.file_id,
                     )
-                    return FileHandlerResult(
-                        file_path=str(existing_record.storage_path),
-                        file_id=str(existing_record.file_id),
-                    )
+                    return result
 
                 persistent_file = get_upload_path(
                     filename,

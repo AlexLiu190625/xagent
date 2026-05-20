@@ -8,6 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from ...artifact_refs.observation import format_tool_result_for_observation
+from ..language import dag_step_language_rules, response_language_rules
 from .components import (
     COMPONENT_LOADERS,
     ExecutionComponent,
@@ -336,10 +337,21 @@ class ExecutionContext:
             "latest, yesterday, and tomorrow."
         )
 
+    def _current_user_request_text(self) -> str:
+        for message in reversed(self.messages):
+            if message.hidden or message.role != "user":
+                continue
+            if message.metadata.get("response_to_waiting_for_user"):
+                continue
+            content = str(message.content or "").strip()
+            if content:
+                return content
+        return str(self.metadata.get("task") or "").strip()
+
     def _system_context(self) -> str:
         parts = [self._current_time_context()]
         dag_step_id = self.metadata.get("dag_step_id")
-        current_task = str(self.metadata.get("task") or "").strip()
+        current_task = self._current_user_request_text()
         if current_task and not dag_step_id:
             parts.append(
                 "Current user request:\n"
@@ -349,7 +361,8 @@ class ExecutionContext:
                 "resolve references and preserve continuity, but do not re-answer "
                 "previous requests or repeat previous final answers unless the "
                 "current user request explicitly asks to revise, continue, compare, "
-                "or summarize them."
+                "or summarize them.\n\n"
+                f"{response_language_rules()}"
             )
         process_description = str(
             self.metadata.get("process_description") or ""
@@ -403,7 +416,8 @@ class ExecutionContext:
                 f"- Current step dependencies: {dag_dependencies}\n"
                 f"- Suggested tools for this step: {suggested_tools}\n\n"
                 "Only execute the current DAG step. Detailed step boundary rules are "
-                "provided in the latest DAG step instruction message."
+                "provided in the latest DAG step instruction message.\n\n"
+                f"{dag_step_language_rules()}"
             )
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:

@@ -70,6 +70,10 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
 
             from .....web.models.database import get_db
             from .....web.models.uploaded_file import UploadedFile
+            from .....web.services.managed_file_ref import (
+                DurableStorageOperationError,
+                ensure_uploaded_file_local_path,
+            )
             from ...core.RAG_tools.core.schemas import (
                 DEFAULT_EMBEDDING_MODEL_ID,
                 IngestionConfig,
@@ -124,7 +128,13 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
                 errors = []
 
                 for record in file_records:
-                    source_path = Path(str(record.storage_path))
+                    try:
+                        source_path = ensure_uploaded_file_local_path(record)
+                    except DurableStorageOperationError as exc:
+                        errors.append(
+                            f"Failed to restore {record.filename} from durable storage: {exc}"
+                        )
+                        continue
                     if not source_path.exists():
                         errors.append(
                             f"File not found on disk: {record.filename} (file_id={record.file_id})"

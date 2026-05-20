@@ -92,6 +92,17 @@ slide2.addText("Content", { color: theme.content.primary });
    - NEVER use only `w` or only `h` without the other - image may overflow
    - Keep images within content area: x: 0-10, y: 0-7.5 inches
 
+10. **Handle Execution Failures Honestly**: `execute_javascript_code` returns
+    `{ success, output, error }`. When `success` is `false` (or `error` is
+    non-empty), the script aborted before `writeFile` and **no .pptx was
+    created**. You MUST:
+    - Tell the user the generation failed and quote the `error` message.
+    - NOT claim the presentation was generated. NOT emit a `[name.pptx]()`
+      link to a file that does not exist.
+    - Fix the JavaScript and retry (most failures are validation errors from
+      pptxgenjs — `addTable` row shape, missing slide handle, malformed
+      options object — see "Data Table" below for the table pattern).
+
 ## Layout Zones
 
 For consistent slide layouts:
@@ -499,6 +510,103 @@ slide3.addText('Growth: 150%', { x: 5, y: 2.5, fontSize: 28, color: theme.highli
 
 pres.writeFile({ fileName: 'strategy.pptx' });
 ```
+
+### Data Table (NOVA - Case Breakdown)
+
+**`slide.addTable(rows, options)`** — `rows` MUST be an array of *rows*, and each
+row MUST be an array of *cells*. A cell is either a plain string OR
+`{ text, options }`. Anything else triggers
+`addTable: 'rows' should be an array of cells!`, the script aborts before
+`writeFile`, and **no .pptx is produced**.
+
+To add a table you need a slide handle. Capture the slide returned by
+`pres.addSlide()` so you can call `slide.addTable(...)` on it.
+
+```javascript
+const PptxGenJS = require('pptxgenjs');
+const pres = new PptxGenJS();
+
+const theme = {
+  cover: { background: '#0A0F1C', title: '#FFFFFF', subtitle: '#94A3B8', accent: '#7C3AED' },
+  content: { background: '#F6F7FB', primary: '#0A0F1C', secondary: '#5B6475', accent: '#7C3AED', text: '#0A0F1C' }
+};
+
+// Slide 0: Cover — capture the slide handle, then call slide.* methods
+// (pres.addText / pres.background do not exist; only slide objects have these).
+const cover = pres.addSlide();
+cover.background = { color: theme.cover.background };
+cover.addText('Outbreak Report', { x: 1, y: 3, fontSize: 60, bold: true, color: theme.cover.title });
+
+// Slide 1: Content with table — capture another slide handle
+const slide = pres.addSlide();
+slide.background = { color: theme.content.background };
+slide.addText('Case Breakdown', { x: 0.5, y: 0.4, fontSize: 32, bold: true, color: theme.content.primary });
+
+// Header cells use { text, options }; body cells are plain strings.
+// Colors are routed through the theme: light text on the accent fill — no
+// hardcoded hex values.
+const headerStyle = {
+  bold: true,
+  color: theme.content.background,
+  fill: { color: theme.content.accent },
+};
+const rows = [
+  [
+    { text: 'Case', options: headerStyle },
+    { text: 'Status', options: headerStyle },
+    { text: 'Outcome', options: headerStyle },
+    { text: 'Location', options: headerStyle },
+  ],
+  ['Case 1', 'Probable',  'Deceased 11 Apr',    'Argentina'],
+  ['Case 2', 'Confirmed', 'Deceased 26 Apr',    'South Africa'],
+  ['Case 3', 'Confirmed', 'Hospitalised (ICU)', 'South Africa'],
+];
+
+slide.addTable(rows, {
+  x: 0.5, y: 1.2, w: 9,
+  colW: [1.5, 1.8, 3.0, 2.7],
+  fontSize: 12,
+  color: theme.content.text,
+  border: { type: 'solid', pt: 1, color: theme.content.secondary },
+});
+
+pres.writeFile({ fileName: 'case_breakdown.pptx' });
+```
+
+**Wrong shapes that hard-error and abort the script** (raise
+`'rows' should be an array of cells!`; no `.pptx` is produced; the tool
+returns `success: false`):
+
+```javascript
+// ❌ Flat array of strings — pptxgenjs expects rows[i] to be an array.
+slide.addTable(['A', 'B', 'C'], opts);
+
+// ❌ Building rows by appending cell objects without wrapping each row in [...].
+const flat = [];
+for (const r of data) flat.push({ text: r.name }, { text: r.value });
+slide.addTable(flat, opts);
+```
+
+**Wrong shapes that only WARN and still produce a (broken) `.pptx`** — these are
+more dangerous because the script finishes, `writeFile` succeeds, and the tool
+returns `success: true`, but the table content is malformed. pptxgenjs prints
+the warning to stdout/stderr without throwing:
+
+```javascript
+// ⚠️ A row position holds something that isn't a row array — e.g. a bare cell
+//   object mixed in with proper row arrays. pptxgenjs logs:
+//     "addTable: tableRows has a bad row. A row should be an array of cells.
+//      You provided: { text: 'C' }"
+//   The malformed row is dropped from the rendered table, but no error is
+//   raised and writeFile completes.
+slide.addTable([['ok'], { text: 'C' }], opts);
+```
+
+After every `execute_javascript_code` call that uses `addTable`, you MUST scan
+the tool's `output` for any line starting with `addTable:`. If one is present,
+treat the table as broken even when `success: true` — re-run with the row
+shape corrected (every row wrapped in `[...]`) instead of telling the user the
+deck rendered cleanly.
 
 ## Working with Images
 
