@@ -131,48 +131,11 @@ def _resolve_task_llm_ids_sync(task_row: Task, session: Session) -> List[Optiona
     ]
 
 
-def _load_agent_builder_config_sync(
-    agent_row: Agent, session: Session, user_id: int
-) -> dict:
-    """Eagerly load Agent Builder configuration into a primitive dict
-    inside the snapshot's session. Mirrors
-    ``AgentServiceManager._load_agent_builder_config`` but is kept here
-    so the snapshot loader does not depend on the manager class.
-    """
-    from .llm_utils import UserAwareModelStorage
-
-    storage = UserAwareModelStorage(session)
-
-    default_llm: Optional[BaseLLM] = None
-    fast_llm: Optional[BaseLLM] = None
-    vision_llm: Optional[BaseLLM] = None
-    compact_llm: Optional[BaseLLM] = None
-
-    raw_models: Any = agent_row.models or {}
-    models: dict[str, Any] = dict(raw_models) if isinstance(raw_models, dict) else {}
-
-    def _resolve(slot: str) -> Optional[BaseLLM]:
-        db_row_id = models.get(slot)
-        if not db_row_id:
-            return None
-        db_model = session.query(DBModel).filter(DBModel.id == db_row_id).first()
-        if not db_model:
-            return None
-        return storage.get_llm_by_name_with_access(str(db_model.model_id), user_id)
-
-    default_llm = _resolve("general")
-    fast_llm = _resolve("small_fast")
-    vision_llm = _resolve("visual")
-    compact_llm = _resolve("compact")
-
-    return {
-        "llms": (default_llm, fast_llm, vision_llm, compact_llm),
-        "execution_mode": agent_row.execution_mode,
-        "instructions": agent_row.instructions,
-        "skills": list(agent_row.skills or []),
-        "knowledge_bases": list(agent_row.knowledge_bases or []),
-        "tool_categories": list(agent_row.tool_categories or []),
-    }
+# NOTE: Agent Builder config loading lives in
+# ``llm_utils.load_agent_builder_config`` so this off-loop snapshot
+# loader and ``AgentServiceManager._load_agent_builder_config`` (the
+# legacy in-method caller) share a single source of truth on LLM
+# resolution semantics. The snapshot loader below calls it directly.
 
 
 def load_task_setup_snapshot_sync(
@@ -191,7 +154,7 @@ def load_task_setup_snapshot_sync(
     to whatever behaviour the legacy in-line code already implements
     for that case (default LLM, no agent-builder override).
     """
-    from .llm_utils import resolve_llms_from_names
+    from .llm_utils import load_agent_builder_config, resolve_llms_from_names
 
     session_factory = get_session_local()
     session: Session = session_factory()
@@ -266,7 +229,7 @@ def load_task_setup_snapshot_sync(
                 if agent_row.status == AgentStatus.PUBLISHED:
                     excluded_agent_id = agent_fields.id
 
-                agent_config = _load_agent_builder_config_sync(
+                agent_config = load_agent_builder_config(
                     agent_row, session, int(task_fields.user_id)
                 )
                 (

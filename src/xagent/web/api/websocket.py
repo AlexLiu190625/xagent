@@ -1057,10 +1057,23 @@ async def execute_task_background(
                 final_task_status = task_updated.status.value
 
                 if not waiting_for_control:
+                    # ``persist_assistant_message`` requires a real
+                    # user_id (FK into ``users.id``). Prefer
+                    # ``effective_user_id`` -- it already folded the
+                    # function-parameter ``user_id`` and the
+                    # snapshot/legacy ``task_user_id`` together earlier.
+                    # If both were None we cannot persist; fail loudly
+                    # rather than writing an orphan row with user_id=0.
+                    if effective_user_id is None:
+                        raise ValueError(
+                            f"Task {task_id}: cannot persist assistant "
+                            "message without a resolved user_id "
+                            "(both function param and task.user_id were None)"
+                        )
                     persist_assistant_message(
                         db_new,
                         task_id=task_id,
-                        user_id=int(task_user_id) if task_user_id is not None else 0,
+                        user_id=int(effective_user_id),
                         content=str(
                             chat_response.get("message", ai_response)
                             if isinstance(chat_response, dict)
@@ -1087,6 +1100,16 @@ async def execute_task_background(
         # description / execution_mode are immutable across a turn, so
         # legacy callers get identical values.
         broadcast_row = task_updated
+        if broadcast_row is None:
+            # Task row deleted between turn start and finalize. The
+            # broadcasts below will emit nulls for title / description;
+            # log here so the gap is visible in incident triage instead
+            # of having to reconstruct it from the silent-null payload.
+            logger.warning(
+                "Task %s row missing at finalize; broadcasting partial "
+                "task metadata (title/description/execution_mode null)",
+                task_id,
+            )
         if waiting_for_control:
             await manager.broadcast_to_task(
                 create_stream_event(

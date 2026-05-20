@@ -948,3 +948,63 @@ def make_normalize_model_id(core_storage: CoreStorage) -> Callable:
         return None
 
     return normalize_model_id
+
+
+def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:
+    """Eagerly load Agent Builder configuration into a primitive dict.
+
+    Single source of truth shared by:
+
+      - ``AgentServiceManager._load_agent_builder_config`` (the
+        legacy in-method caller in ``chat.py``)
+      - ``load_task_setup_snapshot_sync._load_agent_builder_config_sync``
+        (the off-loop snapshot loader)
+
+    The two used to keep nearly-identical copies of this logic, which
+    risked drift -- e.g. the snapshot version had a defensive non-
+    dict ``agent.models`` guard the in-method copy lacked. Centralizing
+    here keeps the LLM-resolution contract in one place.
+
+    Returns:
+        dict with keys: ``llms`` (tuple of 4 BaseLLM | None for
+        ``general`` / ``small_fast`` / ``visual`` / ``compact``),
+        ``execution_mode``, ``instructions``, ``skills``,
+        ``knowledge_bases``, ``tool_categories``.
+    """
+    storage = UserAwareModelStorage(db)
+
+    raw_models: Any = agent.models or {}
+    if raw_models and not isinstance(raw_models, dict):
+        # JSON column with a dict-shaped contract (slot -> DBModel.id).
+        # A non-dict here means upstream data corruption or hand-edit;
+        # log loudly so on-call can trace it back instead of seeing a
+        # silent "no LLMs resolved" downstream.
+        logger.warning(
+            "Agent %s has non-dict models field (%s); treating as empty",
+            agent.id,
+            type(raw_models).__name__,
+        )
+    models: dict[str, Any] = dict(raw_models) if isinstance(raw_models, dict) else {}
+
+    def _resolve(slot: str) -> Optional[BaseLLM]:
+        db_row_id = models.get(slot)
+        if not db_row_id:
+            return None
+        db_model = db.query(Model).filter(Model.id == db_row_id).first()
+        if not db_model:
+            return None
+        return storage.get_llm_by_name_with_access(str(db_model.model_id), user_id)
+
+    return {
+        "llms": (
+            _resolve("general"),
+            _resolve("small_fast"),
+            _resolve("visual"),
+            _resolve("compact"),
+        ),
+        "execution_mode": agent.execution_mode,
+        "instructions": agent.instructions,
+        "skills": list(agent.skills or []),
+        "knowledge_bases": list(agent.knowledge_bases or []),
+        "tool_categories": list(agent.tool_categories or []),
+    }

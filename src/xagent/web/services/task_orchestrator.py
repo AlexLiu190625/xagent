@@ -47,7 +47,6 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -559,10 +558,15 @@ async def _schedule_bg(
                 )
                 return
 
-            # Heartbeat must start before any further work that can
-            # block or stall. The lease has a bounded TTL and nothing
-            # downstream of acquire (snapshot load, agent setup) may
-            # ride bare past it.
+            # INVARIANT: ``asyncio.create_task(run_task_lease_heartbeat(...))``
+            # MUST be scheduled before any ``await`` that yields the
+            # loop (snapshot to_thread, agent setup, execute_task_background).
+            # The lease has a bounded TTL; nothing downstream of acquire
+            # may ride bare past this point. If a future refactor moves
+            # the heartbeat creation below the snapshot load, a
+            # contended worker could drop the lease while snapshot is
+            # in-flight, hand the task to another runner mid-setup, and
+            # double-run the same turn. Do not reorder.
             stop_event = asyncio.Event()
             hb_task = asyncio.create_task(run_task_lease_heartbeat(lease, stop_event))
             try:
@@ -599,7 +603,7 @@ async def _schedule_bg(
                 # reads / updates the task row once; opening here keeps
                 # the pool slot freed for the entire agent run above.
                 SessionLocal = get_session_local()
-                with closing(SessionLocal()) as finalize_db:
+                with SessionLocal() as finalize_db:
                     try:
                         finish_turn(finalize_db, task_id)
                     except Exception as e:
@@ -624,7 +628,7 @@ async def _schedule_bg(
                 # default to FAILED so the lease still gets released
                 # instead of stuck-until-TTL.
                 SessionLocal = get_session_local()
-                with closing(SessionLocal()) as release_db:
+                with SessionLocal() as release_db:
                     final_status: TaskStatus = TaskStatus.FAILED
                     try:
                         fresh = (

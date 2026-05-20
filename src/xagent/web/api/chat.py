@@ -488,6 +488,11 @@ class AgentServiceManager:
     ) -> dict:
         """Load all Agent Builder configuration.
 
+        Thin delegate to the shared
+        ``llm_utils.load_agent_builder_config`` so this in-method
+        caller and the off-loop snapshot loader stay byte-for-byte
+        consistent on LLM resolution semantics.
+
         Returns dict with:
         - llms: (default_llm, fast_llm, vision_llm, compact_llm)
         - execution_mode: str
@@ -496,68 +501,9 @@ class AgentServiceManager:
         - knowledge_bases: List[str]
         - tool_categories: List[str]
         """
-        from ..services.llm_utils import UserAwareModelStorage
+        from ..services.llm_utils import load_agent_builder_config
 
-        storage = UserAwareModelStorage(db)
-
-        default_llm = None
-        fast_llm = None
-        vision_llm = None
-        compact_llm = None
-
-        if agent.models:
-            if agent.models.get("general"):
-                general_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["general"])
-                    .first()
-                )
-                if general_model:
-                    default_llm = storage.get_llm_by_name_with_access(
-                        str(general_model.model_id), user_id
-                    )
-
-            if agent.models.get("small_fast"):
-                fast_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["small_fast"])
-                    .first()
-                )
-                if fast_model:
-                    fast_llm = storage.get_llm_by_name_with_access(
-                        str(fast_model.model_id), user_id
-                    )
-
-            if agent.models.get("visual"):
-                visual_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["visual"])
-                    .first()
-                )
-                if visual_model:
-                    vision_llm = storage.get_llm_by_name_with_access(
-                        str(visual_model.model_id), user_id
-                    )
-
-            if agent.models.get("compact"):
-                compact_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["compact"])
-                    .first()
-                )
-                if compact_model:
-                    compact_llm = storage.get_llm_by_name_with_access(
-                        str(compact_model.model_id), user_id
-                    )
-
-        return {
-            "llms": (default_llm, fast_llm, vision_llm, compact_llm),
-            "execution_mode": agent.execution_mode,
-            "instructions": agent.instructions,  # System prompt
-            "skills": agent.skills or [],
-            "knowledge_bases": agent.knowledge_bases or [],
-            "tool_categories": agent.tool_categories or [],
-        }
+        return load_agent_builder_config(agent, db, user_id)
 
     async def _build_tools_for_task(
         self,
