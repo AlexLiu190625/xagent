@@ -94,10 +94,9 @@ class TestEnvironmentVariableConstants:
     def test_web_search_provider_constant(self):
         assert WEB_SEARCH_PROVIDER == "XAGENT_WEB_SEARCH_PROVIDER"
 
-<<<<<<< fix/kb-web-crawl-quality-gate
     def test_web_crawl_tls_impersonate_constant(self):
         assert WEB_CRAWL_TLS_IMPERSONATE == "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
-=======
+
     def test_file_storage_uri_constant(self):
         assert FILE_STORAGE_URI == "XAGENT_FILE_STORAGE_URI"
 
@@ -112,7 +111,6 @@ class TestEnvironmentVariableConstants:
             FILE_STORAGE_STARTUP_SYNC_ENABLED
             == "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
         )
->>>>>>> main
 
 
 class TestGetWebSearchProvider:
