@@ -747,6 +747,13 @@ class AgentServiceManager:
             # Get LLM configuration from task database record
             logger.info(f"Loading LLM configuration for task {task_id} from database")
             agent_config = None  # Initialize agent_config to use later
+            # ``agent`` is cached across the LLM-config block (queried below
+            # at the ``task.agent_id`` branch) and the tools-init block
+            # further down (which previously re-queried the same row only
+            # to read ``.status``). Initializing here keeps the variable
+            # in scope even if the LLM-config ``try`` raises before
+            # reaching the agent-builder branch.
+            agent: Optional[Agent] = None
             # Default standalone tasks to DAG if no execution mode is available.
             task_pattern = "dag_plan_execute"
             use_dag = True  # Default to DAG pattern (for backward compatibility)
@@ -754,7 +761,13 @@ class AgentServiceManager:
                 if db is None:
                     raise ValueError("Database session is required")
 
-                task = db.query(Task).filter(Task.id == task_id).first()
+                # Reuse the ``task`` row already fetched at the existence
+                # check above (line ~690) when available. Re-querying only
+                # for the exception-fallback path (existence check raised)
+                # or the new-task creation path (existence check ran but
+                # task was None at the time).
+                if task is None:
+                    task = db.query(Task).filter(Task.id == task_id).first()
                 if task:
                     # Log the actual task record for debugging
                     logger.info(
@@ -857,23 +870,20 @@ class AgentServiceManager:
                         "Database connection is required for agent creation"
                     )
 
-                # Check if task has an associated published agent that should be excluded from agent tools
+                # Check if task has an associated published agent that should
+                # be excluded from agent tools. Reuse the ``agent`` ORM row
+                # already fetched in the LLM-config block above (around line
+                # 791) -- same SELECT filter (``Agent.id == task.agent_id
+                # AND Agent.user_id == task.user_id``), same row -- instead
+                # of running an identical query a second time per task setup.
                 excluded_agent_id = None
-                if task and task.agent_id:
-                    # Get the current agent to check if it's published
+                if agent is not None:
                     from ..models.agent import AgentStatus
 
-                    current_agent = (
-                        db.query(Agent)
-                        .filter(
-                            Agent.id == task.agent_id, Agent.user_id == task.user_id
-                        )
-                        .first()
-                    )
-                    if current_agent and current_agent.status == AgentStatus.PUBLISHED:
-                        excluded_agent_id = int(current_agent.id)
+                    if agent.status == AgentStatus.PUBLISHED:
+                        excluded_agent_id = int(agent.id)
                         logger.info(
-                            f"Task {task_id} is associated with published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
+                            f"Task {task_id} is associated with published agent {agent.id} ({agent.name}), will exclude from agent tools"
                         )
 
                 # Get or create user sandbox for run task tools
