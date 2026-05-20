@@ -531,7 +531,7 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
 
     with (
         patch(
-            "xagent.web.services.task_orchestrator.acquire_task_lease",
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
             return_value=None,
         ),
         patch(
@@ -574,7 +574,7 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
 
     with (
         patch(
-            "xagent.web.services.task_orchestrator.acquire_task_lease",
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
             return_value=fake_lease,
         ),
         patch(
@@ -640,7 +640,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
 
     with (
         patch(
-            "xagent.web.services.task_orchestrator.acquire_task_lease",
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
             return_value=fake_lease,
         ),
         patch(

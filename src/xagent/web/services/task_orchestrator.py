@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+from contextlib import closing
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
@@ -54,11 +55,12 @@ from typing import Any, Dict, Optional
 from ..models.task import Task, TaskStatus
 from ..models.user import User
 from .task_lease_service import (
-    acquire_task_lease,
+    acquire_task_lease_isolated,
     get_runner_id,
     release_current_runner_task_lease,
     run_task_lease_heartbeat,
 )
+from .task_setup_snapshot import load_task_setup_snapshot_sync
 
 logger = logging.getLogger(__name__)
 
@@ -527,16 +529,28 @@ async def _schedule_bg(
     user_id = int(user.id)
 
     async def _runner() -> None:
+        # ``bg_db`` is opened lazily inside the post-run finalize block
+        # only. We no longer keep a SessionLocal open across the entire
+        # agent run -- that previously held an idle connection-pool
+        # slot for tens of seconds to minutes (long-running agents)
+        # without doing any work. The lease acquire / heartbeat /
+        # snapshot load all open their own short-lived sessions, and
+        # ``finish_turn`` + release run inside a single ``with`` block
+        # below.
         from ..models.database import get_session_local
 
-        SessionLocal = get_session_local()
-        bg_db = SessionLocal()
         lease = None
         try:
             # Running-elsewhere short-circuit: acquire lease before
             # doing anything else. If another worker owns it, skip
             # execution entirely so finish_turn never touches the row.
-            lease = acquire_task_lease(bg_db, task_id)
+            #
+            # The acquire is a conditional UPDATE + commit that
+            # measured 3.75s of synchronous DB write on the main
+            # event loop (issue #427). ``acquire_task_lease_isolated``
+            # wraps the existing helper with its own SessionLocal so
+            # the work runs on a worker thread.
+            lease = await asyncio.to_thread(acquire_task_lease_isolated, task_id)
             if lease is None:
                 logger.info(
                     "task %s acquired by another worker; skipping "
@@ -545,17 +559,29 @@ async def _schedule_bg(
                 )
                 return
 
+            # Heartbeat must start before any further work that can
+            # block or stall. The lease has a bounded TTL and nothing
+            # downstream of acquire (snapshot load, agent setup) may
+            # ride bare past it.
             stop_event = asyncio.Event()
             hb_task = asyncio.create_task(run_task_lease_heartbeat(lease, stop_event))
             try:
-                bg_task_row = bg_db.query(Task).filter(Task.id == task_id).first()
-                bg_user_row = bg_db.query(User).filter(User.id == user_id).first()
-                if bg_task_row is None or bg_user_row is None:
+                # Load the synchronous DB block on a worker thread so
+                # the main loop stays responsive. The loader opens
+                # and closes its own SessionLocal (no ORM leak), and
+                # the snapshot is passed straight through to
+                # execute_task_background → get_agent_for_task. That
+                # turns the previous chain of three redundant Task
+                # queries (here, in execute_task_background, and
+                # inside get_agent_for_task) into a single off-loop
+                # read.
+                snapshot = await asyncio.to_thread(
+                    load_task_setup_snapshot_sync, task_id, user_id
+                )
+                if snapshot is None:
                     logger.warning(
-                        "bg task %s aborted: task or user vanished (task=%s, user=%s)",
+                        "bg task %s aborted: task vanished before snapshot load",
                         task_id,
-                        bg_task_row,
-                        bg_user_row,
                     )
                     return
 
@@ -564,19 +590,25 @@ async def _schedule_bg(
                     user_message=payload.transcript_message,
                     context=context or {},
                     agent_manager=_get_agent_manager(),
-                    user_id=int(bg_user_row.id),
+                    user_id=user_id,
                     before_message_id=before_message_id,
                     llm_user_message=payload.execution_message,
+                    task_setup_snapshot=snapshot,
                 )
-                try:
-                    finish_turn(bg_db, task_id)
-                except Exception as e:
-                    logger.error(
-                        "finish_turn failed for task %s: %s",
-                        task_id,
-                        e,
-                        exc_info=True,
-                    )
+                # Short-lived finalize session. ``finish_turn`` only
+                # reads / updates the task row once; opening here keeps
+                # the pool slot freed for the entire agent run above.
+                SessionLocal = get_session_local()
+                with closing(SessionLocal()) as finalize_db:
+                    try:
+                        finish_turn(finalize_db, task_id)
+                    except Exception as e:
+                        logger.error(
+                            "finish_turn failed for task %s: %s",
+                            task_id,
+                            e,
+                            exc_info=True,
+                        )
             finally:
                 stop_event.set()
                 try:
@@ -585,39 +617,43 @@ async def _schedule_bg(
                     pass
         finally:
             if lease is not None:
-                # Single owner of release. Defensive: if the session is
-                # invalid (e.g. execute_task_background aborted a
-                # transaction), the fresh-status read would also raise;
-                # rollback + default to FAILED so the lease still gets
-                # released instead of stuck-until-TTL.
-                final_status: TaskStatus = TaskStatus.FAILED
-                try:
-                    fresh = bg_db.query(Task).filter(Task.id == task_id).first()
-                    if fresh is not None:
-                        final_status = fresh.status
-                except Exception as query_err:
-                    logger.warning(
-                        "task %s status read failed during lease release "
-                        "(%s); rolling session back and defaulting to FAILED",
-                        task_id,
-                        query_err,
-                    )
+                # Single owner of release. Open a fresh short-lived
+                # session for both the status read and the release UPDATE
+                # so we don't hold a connection across the agent run.
+                # Defensive: if the read raises (DB connectivity issue),
+                # default to FAILED so the lease still gets released
+                # instead of stuck-until-TTL.
+                SessionLocal = get_session_local()
+                with closing(SessionLocal()) as release_db:
+                    final_status: TaskStatus = TaskStatus.FAILED
                     try:
-                        bg_db.rollback()
-                    except Exception:
-                        pass
-                try:
-                    release_current_runner_task_lease(
-                        bg_db, task_id, status=final_status
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "lease release failed for task %s: %s; "
-                        "TTL expiry will reclaim it",
-                        task_id,
-                        e,
-                    )
-            bg_db.close()
+                        fresh = (
+                            release_db.query(Task).filter(Task.id == task_id).first()
+                        )
+                        if fresh is not None:
+                            final_status = fresh.status
+                    except Exception as query_err:
+                        logger.warning(
+                            "task %s status read failed during lease release "
+                            "(%s); rolling session back and defaulting to FAILED",
+                            task_id,
+                            query_err,
+                        )
+                        try:
+                            release_db.rollback()
+                        except Exception:
+                            pass
+                    try:
+                        release_current_runner_task_lease(
+                            release_db, task_id, status=final_status
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "lease release failed for task %s: %s; "
+                            "TTL expiry will reclaim it",
+                            task_id,
+                            e,
+                        )
 
     bg_task = asyncio.create_task(_runner())
     background_task_manager.register_task(task_id, bg_task)

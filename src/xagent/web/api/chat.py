@@ -683,8 +683,18 @@ class AgentServiceManager:
         task_id: int,
         db: Optional[Session] = None,
         user: Optional[User] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
     ) -> AgentService:
-        """Get or create AgentService instance for specific task"""
+        """Get or create AgentService instance for specific task.
+
+        ``task_setup_snapshot`` is an off-loop snapshot loaded by the
+        upstream caller (``_schedule_bg._runner``). When provided, the
+        in-method ``asyncio.to_thread(load_task_setup_snapshot_sync,
+        ...)`` is skipped -- the snapshot is reused directly. WS
+        callers and any caller that hasn't adopted the snapshot
+        plumbing pass ``None`` and the Step-3 in-method thread call
+        runs as before.
+        """
         if task_id not in self._agents:
             # Check if task exists in database
             task_exists = False
@@ -793,14 +803,20 @@ class AgentServiceManager:
                 if db is None:
                     raise ValueError("Database session is required")
 
-                user_id_for_snapshot: Optional[int] = (
-                    int(user.id) if user and user.id is not None else None
-                )
-                snapshot = await asyncio.to_thread(
-                    load_task_setup_snapshot_sync,
-                    task_id,
-                    user_id_for_snapshot,
-                )
+                if task_setup_snapshot is not None:
+                    # Caller already loaded the snapshot off-loop
+                    # (typically ``_schedule_bg._runner`` → Step 4).
+                    # Reuse it instead of re-spinning a worker thread.
+                    snapshot = task_setup_snapshot
+                else:
+                    user_id_for_snapshot: Optional[int] = (
+                        int(user.id) if user and user.id is not None else None
+                    )
+                    snapshot = await asyncio.to_thread(
+                        load_task_setup_snapshot_sync,
+                        task_id,
+                        user_id_for_snapshot,
+                    )
 
                 if snapshot is not None:
                     task = snapshot.task

@@ -115,6 +115,30 @@ def acquire_task_lease(
     return TaskLease(task_id=task_id, runner_id=runner)
 
 
+def acquire_task_lease_isolated(
+    task_id: int,
+    *,
+    runner_id: str | None = None,
+) -> TaskLease | None:
+    """Same semantics as :func:`acquire_task_lease` but opens, commits,
+    and closes its own ``SessionLocal``.
+
+    Safe to call from ``asyncio.to_thread`` -- the inline call in
+    ``_runner`` measured 3.75s of synchronous DB write on the main
+    event loop (issue #427). Wrapping the existing helper preserves
+    every transactional detail (the conditional UPDATE + rowcount
+    guard) while letting the loop continue.
+    """
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        return acquire_task_lease(db, task_id, runner_id=runner_id)
+    finally:
+        db.close()
+
+
 def refresh_task_lease(db: Session, lease: TaskLease) -> bool:
     """Refresh a live task lease owned by this runner."""
     now = utc_now()

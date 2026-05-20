@@ -10,7 +10,7 @@ import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, cast
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 from urllib.parse import unquote
 
 from fastapi import (
@@ -38,6 +38,9 @@ from ..models.database import get_db
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+
+if TYPE_CHECKING:
+    from ..services.task_setup_snapshot import TaskSetupSnapshot
 from ..services.chat_history_service import get_latest_waiting_question
 from ..services.task_lease_service import (
     acquire_task_lease,
@@ -863,8 +866,24 @@ async def execute_task_background(
     user_id: int | None,
     before_message_id: int | None = None,
     llm_user_message: Optional[str] = None,
+    task_setup_snapshot: Optional["TaskSetupSnapshot"] = None,
 ) -> None:
-    """Execute task in background without blocking WebSocket message loop"""
+    """Execute task in background without blocking WebSocket message loop.
+
+    ``task_setup_snapshot`` is the off-loop snapshot loaded by
+    ``_schedule_bg._runner``. When provided, the Task SELECT is
+    skipped (saves a synchronous DB read measured at 3.33s on the
+    main event loop under contention, issue #427) and downstream
+    consumers pull task fields from the snapshot. The User SELECT is
+    kept because ``get_user_tool_overrides`` is a hook
+    (``Callable[[Session, Any], dict]``, ``services/tool_credentials.py``)
+    that may read arbitrary ORM fields off the user object;
+    constructing a primitive shim there would be a quiet BC break.
+
+    WS callers (and any caller that has not yet adopted the snapshot
+    plumbing) pass ``None`` and the legacy Task SELECT runs as
+    before.
+    """
     from ..models.database import get_db
     from ..models.task import Task, TaskStatus
     from ..models.user import User
@@ -884,11 +903,17 @@ async def execute_task_background(
         db = next(db_gen)
         logger.info(f"Background task execution started for task {task_id}")
 
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if task is None:
-            raise ValueError(f"Task {task_id} not found")
+        task_user_id: Optional[int]
+        if task_setup_snapshot is not None:
+            # Snapshot path: skip the Task SELECT.
+            task_user_id = task_setup_snapshot.task.user_id
+            task = None
+        else:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if task is None:
+                raise ValueError(f"Task {task_id} not found")
+            task_user_id = _task_user_id(task)
 
-        task_user_id = _task_user_id(task)
         effective_user_id = user_id if user_id is not None else task_user_id
         user = (
             db.query(User).filter(User.id == effective_user_id).first()
@@ -899,7 +924,10 @@ async def execute_task_background(
         with UserContext(effective_user_id):
             # Get agent service
             agent_service = await agent_manager.get_agent_for_task(
-                task_id, db, user=user
+                task_id,
+                db,
+                user=user,
+                task_setup_snapshot=task_setup_snapshot,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
@@ -969,7 +997,18 @@ async def execute_task_background(
         try:
             db_new = next(db_new_gen)
             waiting_for_control = False
-            final_task_status = task.status.value
+            # ``task`` is ``None`` on the snapshot path; pull the
+            # pre-run status from the snapshot in that case. The
+            # ``task_updated`` query just below normally overwrites
+            # this with the post-run value, but we still need a
+            # sensible default for the rare case where the row went
+            # missing between snapshot load and finalize.
+            if task is not None:
+                final_task_status = task.status.value
+            elif task_setup_snapshot is not None:
+                final_task_status = task_setup_snapshot.task.status.value
+            else:
+                final_task_status = TaskStatus.PENDING.value
             task_updated = db_new.query(Task).filter(Task.id == task_id).first()
             if task_updated:
                 # Caller is responsible for the lease lifecycle (acquire +
@@ -1021,7 +1060,7 @@ async def execute_task_background(
                     persist_assistant_message(
                         db_new,
                         task_id=task_id,
-                        user_id=int(task.user_id),
+                        user_id=int(task_user_id) if task_user_id is not None else 0,
                         content=str(
                             chat_response.get("message", ai_response)
                             if isinstance(chat_response, dict)
@@ -1042,19 +1081,35 @@ async def execute_task_background(
 
         # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
 
+        # ``task_updated`` is the freshly-queried row used for broadcast
+        # event metadata. On the snapshot path ``task`` is ``None``, so
+        # we prefer the freshly-loaded row regardless of path. Title /
+        # description / execution_mode are immutable across a turn, so
+        # legacy callers get identical values.
+        broadcast_row = task_updated
         if waiting_for_control:
             await manager.broadcast_to_task(
                 create_stream_event(
                     "task_info",
                     task_id,
                     {
-                        "id": task.id,
-                        "title": task.title,
-                        "description": task.description,
+                        "id": broadcast_row.id
+                        if broadcast_row is not None
+                        else task_id,
+                        "title": broadcast_row.title
+                        if broadcast_row is not None
+                        else None,
+                        "description": broadcast_row.description
+                        if broadcast_row is not None
+                        else None,
                         "status": final_task_status,
-                        "execution_mode": task.execution_mode,
+                        "execution_mode": broadcast_row.execution_mode
+                        if broadcast_row is not None
+                        else None,
                     },
-                    task.updated_at if task.updated_at else None,
+                    broadcast_row.updated_at
+                    if broadcast_row is not None and broadcast_row.updated_at
+                    else None,
                 ),
                 task_id,
             )
@@ -1066,10 +1121,12 @@ async def execute_task_background(
             {
                 "type": "task_completed",
                 "task": {
-                    "id": task.id,
-                    "title": task.title,
+                    "id": broadcast_row.id if broadcast_row is not None else task_id,
+                    "title": broadcast_row.title if broadcast_row is not None else None,
                     "status": final_task_status,
-                    "description": task.description,
+                    "description": broadcast_row.description
+                    if broadcast_row is not None
+                    else None,
                 },
                 "result": ai_response,
                 "output": ai_response,
