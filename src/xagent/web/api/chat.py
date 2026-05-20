@@ -722,6 +722,28 @@ class AgentServiceManager:
                     TaskStatus.PAUSED,
                     TaskStatus.WAITING_FOR_USER,
                 ]
+                # Brand-new SDK task pre-check: ``begin_turn`` flips the
+                # task to RUNNING before this code runs, but a freshly
+                # created task has no trace events or DAG plan to
+                # recover -- ``_reconstruct_agent_from_history`` would
+                # run two queries, find nothing, and log a misleading
+                # "Failed to reconstruct" warning. Short-circuit the
+                # wasted path here. ``PAUSED`` / ``WAITING_FOR_USER``
+                # always have prior state by definition; only gate on
+                # ``RUNNING``.
+                if (
+                    should_reconstruct
+                    and task is not None
+                    and task.status == TaskStatus.RUNNING
+                    and db is not None
+                    and not self._has_reconstructable_history(task_id, db)
+                ):
+                    logger.info(
+                        f"Task {task_id} is RUNNING but has no reconstructable "
+                        "history (no trace events, no DAG plan); skipping "
+                        "reconstruct and going to normal creation."
+                    )
+                    should_reconstruct = False
                 # Task exists in database, try to reconstruct from history only for active executions
                 if db is not None and should_reconstruct:
                     try:
@@ -1319,6 +1341,52 @@ class AgentServiceManager:
             logger.info(
                 f"No workspace directory found for task {task_id} (user {user_id})"
             )
+
+    def _has_reconstructable_history(self, task_id: int, db: Session) -> bool:
+        """Cheap pre-check: does the task have prior state that
+        ``_reconstruct_agent_from_history`` could actually recover?
+
+        Reconstruct depends on either:
+
+        * trace events from prior tool / LLM runs (``TraceEvent`` rows
+          for the task with ``build_id IS NULL`` -- VIBE phase only,
+          matches the same filter ``_reconstruct_agent_from_history``
+          uses)
+        * a ``DAGExecution.current_plan`` blob for the task
+
+        A brand-new SDK task whose status was just flipped to RUNNING
+        by ``begin_turn`` has neither -- ``_reconstruct_agent_from_history``
+        would run the same two queries, return empty, log a warning,
+        and fall through to normal creation. The check here saves the
+        wasted-work cost plus the noisy ``Failed to reconstruct agent
+        from history`` log line that misleads post-incident triage
+        into thinking something actually failed.
+
+        ``PAUSED`` / ``WAITING_FOR_USER`` tasks always have prior state
+        by definition; the caller in ``get_agent_for_task`` should only
+        gate on this check for ``RUNNING`` status.
+
+        Two ``.first()`` queries: trace short-circuits the plan check
+        when present (typical case for any agent that has run a step).
+        """
+        from ..models.task import DAGExecution, TraceEvent
+
+        has_trace = (
+            db.query(TraceEvent)
+            .filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.build_id.is_(None),
+            )
+            .first()
+            is not None
+        )
+        if has_trace:
+            return True
+        has_plan = (
+            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
+            is not None
+        )
+        return has_plan
 
     async def _reconstruct_agent_from_history(self, task_id: int, db: Session) -> None:
         """Reconstruct agent from historical data"""
