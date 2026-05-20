@@ -48,11 +48,15 @@ class AgentService:
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
+        tools_initialized: bool | None = None,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
         self.memory = memory or InMemoryMemoryStore()
-        self.tools = tools or []
+        # ``tools is not None`` (not ``bool(tools)``) — an explicitly empty
+        # list is a legitimate "no tools allowed" result from the caller's
+        # build path, distinct from "caller did not build tools yet".
+        self.tools = list(tools) if tools is not None else []
         self.llm = llm
         self.fast_llm = fast_llm
         self.vision_llm = vision_llm
@@ -62,7 +66,17 @@ class AgentService:
         self.memory_enabled = memory_enabled
         self.tool_config = tool_config
         self.tracer = tracer or Tracer()
-        self._tools_initialized = False
+        # Default infer: if the caller passed ``tools`` (even ``[]``) the
+        # constructed AgentService already has its final tool list, so
+        # subsequent ``execute_task`` calls must not trigger a redundant
+        # ``_ensure_tools_initialized`` rebuild against ``tool_config``.
+        # Passing ``tools_initialized`` explicitly overrides the default
+        # — only needed by tests / specialized callers that want to
+        # retain the lazy-supplement path while also pre-supplying tools.
+        if tools_initialized is None:
+            self._tools_initialized = tools is not None
+        else:
+            self._tools_initialized = tools_initialized
         self._is_paused = False
         self._pause_event = None
         self._current_runner = None
