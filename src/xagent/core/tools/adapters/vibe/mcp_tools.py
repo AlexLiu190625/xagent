@@ -37,6 +37,24 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     if not mcp_configs:
         return []
 
+    # Per-server filter: when the spec restricts which MCP servers the
+    # agent wants, drop configs for any server outside that set BEFORE
+    # ``_create_mcp_tools_from_configs`` runs -- the latter performs the
+    # actual session initialization (network I/O), which is the real
+    # cost we want to avoid. Server names are normalized the same way
+    # ``chat.py._build_selection_spec_from_categories`` and
+    # ``mcp_adapter.py`` normalize them (spaces and hyphens -> underscore)
+    # so the comparison matches across both sides.
+    if spec is not None and spec.mcp_servers is not None:
+        mcp_configs = [
+            cfg
+            for cfg in mcp_configs
+            if cfg.get("name", "").replace(" ", "_").replace("-", "_")
+            in spec.mcp_servers
+        ]
+        if not mcp_configs:
+            return []
+
     try:
         from .factory import ToolFactory
 

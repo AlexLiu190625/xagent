@@ -243,15 +243,22 @@ class ToolFactory:
         # leaving the full set in place -- the original behavior could
         # silently leak the full toolset when a caller wanted explicit
         # exclusion.
+        #
+        # ``allowed_set`` materialises the list into a set so the
+        # per-tool membership test below is O(1); this path runs
+        # multiple times per agent setup, so even small constant-factor
+        # wins matter and the set conversion is cheaper than the
+        # repeated linear scans on a list.
         allowed_tools = config.get_allowed_tools()
         if allowed_tools is not None:
-            if len(allowed_tools) == 0:
+            allowed_set = set(allowed_tools)
+            if not allowed_set:
                 logger.warning(
                     "allowed_tools is an empty list — returning empty tool set. "
                     "Pass None instead if you want all tools."
                 )
-            tools = [tool for tool in tools if tool.name in allowed_tools]
-            if len(allowed_tools) > 0:
+            tools = [tool for tool in tools if tool.name in allowed_set]
+            if allowed_set:
                 logger.info(
                     f"Filtered tools to {len(tools)} allowed tools: {[t.name for t in tools]}"
                 )

@@ -203,6 +203,174 @@ async def test_registry_always_runs_creator_without_declared_categories(
     assert dyn.await_count == 1
 
 
+# ----- MCP per-server filter (creator-internal short-circuit) ------------
+
+
+class _MCPConfig:
+    """Config returning a fixed list of MCP server config dicts so the
+    creator's filter path is exercised against a known input. Matches
+    the production shape (list of ``{"name": ..., "transport": ..., ...}``)
+    closely enough for the per-server filter check."""
+
+    def __init__(
+        self,
+        servers: List[dict],
+        selection_spec: ToolSelectionSpec | None = None,
+    ):
+        self._servers = servers
+        self.selection_spec = selection_spec
+
+    async def get_mcp_server_configs(self):
+        return self._servers
+
+    def get_sandbox(self):
+        return None
+
+
+async def test_mcp_per_server_filter_skips_non_matching_configs(monkeypatch):
+    """The MCP creator must filter ``mcp_configs`` by
+    ``spec.mcp_servers`` BEFORE handing them to
+    ``_create_mcp_tools_from_configs`` -- the latter does the network
+    session-initialize work whose cost we want to avoid.
+
+    The factory call inside the creator is patched so we can assert
+    the filtered config list it actually receives, without spinning up
+    real MCP sessions.
+    """
+    from xagent.core.tools.adapters.vibe import mcp_tools
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    received = []
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        received.append(mcp_configs)
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+
+    servers = [
+        {"name": "Gmail"},
+        {"name": "Google Drive"},
+        {"name": "Slack"},
+    ]
+    spec = ToolSelectionSpec(
+        categories=frozenset({"mcp"}),
+        mcp_servers=frozenset({"Gmail"}),
+    )
+    cfg = _MCPConfig(servers, selection_spec=spec)
+
+    await mcp_tools.create_mcp_tools(cfg)
+
+    assert len(received) == 1
+    assert [c["name"] for c in received[0]] == ["Gmail"]
+
+
+async def test_mcp_per_server_filter_normalizes_whitespace(monkeypatch):
+    """Server names with spaces or hyphens are normalized to underscores
+    on both sides (chat.py's spec builder, mcp_adapter's tool naming).
+    The per-server filter must apply the same normalization so a
+    ``mcp:Google Drive`` user selection matches a server config whose
+    actual stored name is ``Google Drive``."""
+    from xagent.core.tools.adapters.vibe import mcp_tools
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    received = []
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        received.append(mcp_configs)
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+
+    servers = [
+        {"name": "Google Drive"},
+        {"name": "Slack"},
+    ]
+    # Spec contains the normalized form (matches how
+    # _build_selection_spec_from_categories assembles it).
+    spec = ToolSelectionSpec(
+        categories=frozenset({"mcp"}),
+        mcp_servers=frozenset({"Google_Drive"}),
+    )
+    cfg = _MCPConfig(servers, selection_spec=spec)
+
+    await mcp_tools.create_mcp_tools(cfg)
+
+    assert len(received) == 1
+    assert [c["name"] for c in received[0]] == ["Google Drive"]
+
+
+async def test_mcp_per_server_filter_empty_match_short_circuits(monkeypatch):
+    """If the spec's ``mcp_servers`` set has no overlap with the active
+    server list, the creator must return early WITHOUT calling
+    ``_create_mcp_tools_from_configs`` -- otherwise we'd still pay the
+    network-init cost for an empty filtered set."""
+    from xagent.core.tools.adapters.vibe import mcp_tools
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    call_count = 0
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        nonlocal call_count
+        call_count += 1
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+
+    servers = [{"name": "Slack"}]
+    spec = ToolSelectionSpec(
+        categories=frozenset({"mcp"}),
+        mcp_servers=frozenset({"Gmail"}),
+    )
+    cfg = _MCPConfig(servers, selection_spec=spec)
+
+    result = await mcp_tools.create_mcp_tools(cfg)
+
+    assert result == []
+    assert call_count == 0  # short-circuit, no factory call
+
+
+async def test_mcp_no_per_server_filter_when_spec_lacks_servers(monkeypatch):
+    """``spec.mcp_servers is None`` means "no per-server restriction";
+    the creator must hand every active server's config through
+    unfiltered to preserve the backward-compat "all MCP servers" path."""
+    from xagent.core.tools.adapters.vibe import mcp_tools
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    received = []
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        received.append(mcp_configs)
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+
+    servers = [{"name": "Gmail"}, {"name": "Slack"}]
+    spec = ToolSelectionSpec(categories=frozenset({"mcp"}), mcp_servers=None)
+    cfg = _MCPConfig(servers, selection_spec=spec)
+
+    await mcp_tools.create_mcp_tools(cfg)
+
+    assert len(received) == 1
+    assert [c["name"] for c in received[0]] == ["Gmail", "Slack"]
+
+
 # ----- factory.py:194 allowed_tools=[] semantic fix ----------------------
 
 
