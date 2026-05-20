@@ -139,7 +139,9 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
             captured["skill_context"] = skill_context
 
     class AgentManager:
-        async def get_agent_for_task(self, task_id, db, user=None):
+        async def get_agent_for_task(
+            self, task_id, db, user=None, task_setup_snapshot=None
+        ):
             captured["agent_db"] = db
             return AgentService()
 

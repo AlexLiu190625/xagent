@@ -1086,6 +1086,40 @@ async def execute_task_background(
                         if isinstance(chat_response, dict)
                         else None,
                     )
+
+            # Materialize broadcast metadata into primitives BEFORE the
+            # ``finally`` block closes ``db_new``. ``task_updated`` is
+            # bound to that session; accessing its attributes after
+            # close raises ``DetachedInstanceError``. Title /
+            # description / execution_mode / updated_at don't change
+            # during a turn, so this snapshot is consistent with what
+            # the legacy code emitted.
+            if task_updated is not None:
+                broadcast_meta = {
+                    "id": int(task_updated.id),
+                    "title": task_updated.title,
+                    "description": task_updated.description,
+                    "execution_mode": getattr(task_updated, "execution_mode", None),
+                    "updated_at": task_updated.updated_at,
+                }
+            else:
+                # Task row deleted between turn start and finalize.
+                # Broadcasts below will emit nulls for title /
+                # description; log here so the gap is visible in
+                # incident triage instead of having to reconstruct it
+                # from the silent-null payload.
+                logger.warning(
+                    "Task %s row missing at finalize; broadcasting partial "
+                    "task metadata (title/description/execution_mode null)",
+                    task_id,
+                )
+                broadcast_meta = {
+                    "id": task_id,
+                    "title": None,
+                    "description": None,
+                    "execution_mode": None,
+                    "updated_at": None,
+                }
         finally:
             try:
                 next(db_new_gen)
@@ -1094,45 +1128,19 @@ async def execute_task_background(
 
         # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
 
-        # ``task_updated`` is the freshly-queried row used for broadcast
-        # event metadata. On the snapshot path ``task`` is ``None``, so
-        # we prefer the freshly-loaded row regardless of path. Title /
-        # description / execution_mode are immutable across a turn, so
-        # legacy callers get identical values.
-        broadcast_row = task_updated
-        if broadcast_row is None:
-            # Task row deleted between turn start and finalize. The
-            # broadcasts below will emit nulls for title / description;
-            # log here so the gap is visible in incident triage instead
-            # of having to reconstruct it from the silent-null payload.
-            logger.warning(
-                "Task %s row missing at finalize; broadcasting partial "
-                "task metadata (title/description/execution_mode null)",
-                task_id,
-            )
         if waiting_for_control:
             await manager.broadcast_to_task(
                 create_stream_event(
                     "task_info",
                     task_id,
                     {
-                        "id": broadcast_row.id
-                        if broadcast_row is not None
-                        else task_id,
-                        "title": broadcast_row.title
-                        if broadcast_row is not None
-                        else None,
-                        "description": broadcast_row.description
-                        if broadcast_row is not None
-                        else None,
+                        "id": broadcast_meta["id"],
+                        "title": broadcast_meta["title"],
+                        "description": broadcast_meta["description"],
                         "status": final_task_status,
-                        "execution_mode": broadcast_row.execution_mode
-                        if broadcast_row is not None
-                        else None,
+                        "execution_mode": broadcast_meta["execution_mode"],
                     },
-                    broadcast_row.updated_at
-                    if broadcast_row is not None and broadcast_row.updated_at
-                    else None,
+                    broadcast_meta["updated_at"] or None,
                 ),
                 task_id,
             )
@@ -1144,12 +1152,10 @@ async def execute_task_background(
             {
                 "type": "task_completed",
                 "task": {
-                    "id": broadcast_row.id if broadcast_row is not None else task_id,
-                    "title": broadcast_row.title if broadcast_row is not None else None,
+                    "id": broadcast_meta["id"],
+                    "title": broadcast_meta["title"],
                     "status": final_task_status,
-                    "description": broadcast_row.description
-                    if broadcast_row is not None
-                    else None,
+                    "description": broadcast_meta["description"],
                 },
                 "result": ai_response,
                 "output": ai_response,
