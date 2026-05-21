@@ -11,7 +11,6 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...config import (
-    get_agent_pattern_for_execution_mode,
     get_default_task_execution_mode,
     get_external_upload_dirs,
     get_uploads_dir,
@@ -35,6 +34,7 @@ from ..services.chat_history_service import (
     load_task_transcript,
 )
 from ..services.llm_utils import resolve_llms_from_names
+from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
@@ -505,6 +505,210 @@ class AgentServiceManager:
 
         return load_agent_builder_config(agent, db, user_id)
 
+    @staticmethod
+    def _pick_default_llm_with_warning(
+        default_llm: Optional[BaseLLM],
+        *,
+        task_id: int,
+        has_agent_builder_config: bool,
+        agent_id: Optional[int],
+        saved_model_ids: Optional[dict],
+        user_id: Optional[int],
+        saved_model_descriptors: Optional[dict] = None,
+    ) -> BaseLLM:
+        """Return the default LLM and log a context-rich WARNING.
+
+        Used when no per-task / per-agent LLM could be resolved (e.g. the
+        agent's saved model is unavailable or the caller has no access).
+
+        ``saved_model_descriptors`` (when provided) carries human-readable
+        ``model_id`` / ``model_name`` per slot, which is more useful in logs
+        than the bare ``DBModel.id`` pks recorded in ``saved_model_ids``.
+        """
+        if default_llm is None:
+            if has_agent_builder_config:
+                saved_models_for_log = saved_model_descriptors or saved_model_ids or {}
+                logger.error(
+                    "Agent builder model unavailable and no global default LLM is configured. "
+                    "task_id=%s agent_id=%s agent_saved_models=%s user_id=%s",
+                    task_id,
+                    agent_id,
+                    saved_models_for_log,
+                    user_id,
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Agent model configuration is unavailable and no global "
+                        "default model is configured."
+                    ),
+                )
+            logger.error(
+                "Task %s has no valid LLM configuration and no default LLM", task_id
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="No valid LLM configuration is available for this task.",
+            )
+
+        fallback_model = (
+            getattr(default_llm, "model_name", None) or type(default_llm).__name__
+        )
+        if has_agent_builder_config:
+            saved_models_for_log = saved_model_descriptors or saved_model_ids or {}
+            logger.warning(
+                "Agent builder model unavailable, falling back to default LLM. "
+                "task_id=%s agent_id=%s agent_saved_models=%s user_id=%s fallback_model=%s",
+                task_id,
+                agent_id,
+                saved_models_for_log,
+                user_id,
+                fallback_model,
+            )
+        else:
+            logger.warning(
+                "Task %s has no valid LLM configuration, using default LLM %s",
+                task_id,
+                fallback_model,
+            )
+        return default_llm
+
+    @staticmethod
+    def _merge_agent_builder_llms(
+        baseline_llms: tuple[
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+        ],
+        agent_llms: tuple[
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+        ],
+    ) -> tuple[
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+    ]:
+        """Overlay agent LLMs without discarding already resolved task LLMs."""
+        return cast(
+            tuple[
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+            ],
+            tuple(
+                agent_llm or baseline_llm
+                for baseline_llm, agent_llm in zip(baseline_llms, agent_llms)
+            ),
+        )
+
+    def _resolve_task_runtime_config(
+        self,
+        *,
+        task_id: int,
+        task: Task,
+        db: Session,
+        user: Optional[User],
+    ) -> dict[str, Any]:
+        """Resolve task / agent-builder LLMs and execution pattern.
+
+        Thin main-loop wrapper around
+        ``llm_utils.resolve_task_runtime_config_core``. Adds the
+        diagnostic logging and the
+        ``_pick_default_llm_with_warning`` fallback that the worker-
+        thread snapshot loader cannot run (the fallback raises
+        ``HTTPException``, which would propagate badly out of a
+        thread).
+
+        Used by ``_reconstruct_agent_from_history`` on the
+        main-loop reconstruct path. The normal-creation path
+        (``get_agent_for_task``) consumes a ``TaskSetupSnapshot``
+        which goes through the same core helper off-loop.
+        """
+        from ..services.llm_utils import resolve_task_runtime_config_core
+
+        logger.info(
+            "Task %s record: agent_type=%s, model_name=%s, compact_model_name=%s",
+            task_id,
+            task.agent_type,
+            task.model_name,
+            task.compact_model_name,
+        )
+
+        user_id_for_resolution: Optional[int] = (
+            int(user.id)
+            if user and user.id is not None
+            else int(task.user_id)
+            if task.user_id is not None
+            else None
+        )
+        core = resolve_task_runtime_config_core(
+            task, db, user_id=user_id_for_resolution
+        )
+
+        (
+            task_llm,
+            task_fast_llm,
+            task_vision_llm,
+            task_compact_llm,
+        ) = core["llms"]
+        task_pattern = core["task_pattern"]
+        agent_config = core["agent_config"]
+        has_agent_builder_config = core["has_agent_builder_config"]
+        agent_fields = core["agent_fields"]
+
+        logger.info(
+            "Task %s execution_mode=%s -> pattern=%s",
+            task_id,
+            getattr(task, "execution_mode", None),
+            task_pattern,
+        )
+        if agent_fields is not None:
+            logger.info(
+                "Task %s using Agent Builder config: %s",
+                task_id,
+                agent_fields["name"],
+            )
+            logger.info(
+                "Task %s using Agent Builder execution mode: %s -> pattern=%s",
+                task_id,
+                (agent_config or {}).get("execution_mode"),
+                task_pattern,
+            )
+
+        if not task_llm:
+            task_llm = self._pick_default_llm_with_warning(
+                self._default_llm,
+                task_id=task_id,
+                has_agent_builder_config=has_agent_builder_config,
+                agent_id=getattr(task, "agent_id", None),
+                saved_model_ids=(agent_config or {}).get("saved_model_ids"),
+                saved_model_descriptors=(agent_config or {}).get(
+                    "saved_model_descriptors"
+                ),
+                user_id=user_id_for_resolution,
+            )
+
+        logger.info(
+            "Successfully loaded LLM configuration for task %s: compact_llm=%s",
+            task_id,
+            task_compact_llm.model_name if task_compact_llm else None,
+        )
+        return {
+            "agent_config": agent_config,
+            "task_llm": task_llm,
+            "task_fast_llm": task_fast_llm,
+            "task_vision_llm": task_vision_llm,
+            "task_compact_llm": task_compact_llm,
+            "task_pattern": task_pattern,
+            "has_agent_builder_config": has_agent_builder_config,
+        }
+
     async def _build_tools_for_task(
         self,
         *,
@@ -717,6 +921,8 @@ class AgentServiceManager:
                         self._load_persisted_conversation_history(task_id, db)
                         await self._load_persisted_execution_context(task_id, db)
                         return self._agents[task_id]
+                    except HTTPException:
+                        raise
                     except Exception as e:
                         logger.warning(
                             f"Failed to reconstruct agent from history for task {task_id}: {e}"
@@ -782,6 +988,7 @@ class AgentServiceManager:
                     task_compact_llm = snapshot.task_compact_llm
                     agent_config = snapshot.agent_config
                     excluded_agent_id = snapshot.excluded_agent_id
+                    has_agent_builder_config = snapshot.agent is not None
 
                     if snapshot.agent is not None:
                         logger.info(
@@ -796,10 +1003,31 @@ class AgentServiceManager:
                             )
 
                     if not task_llm:
-                        logger.warning(
-                            f"Task {task_id} has no valid LLM configuration, using defaults"
+                        # Hand off to the upstream diagnostics helper so
+                        # the snapshot path produces the same context-
+                        # rich WARNING / 500 as the legacy
+                        # ``_resolve_task_runtime_config`` branch when
+                        # neither the agent-builder LLMs nor the
+                        # default LLM resolve. ``saved_model_ids`` /
+                        # ``saved_model_descriptors`` are carried by
+                        # ``snapshot.agent_config`` (set inside
+                        # ``load_agent_builder_config``).
+                        user_id_for_fallback: Optional[int] = (
+                            int(user.id)
+                            if user and user.id is not None
+                            else task.user_id
                         )
-                        task_llm = self._default_llm
+                        task_llm = self._pick_default_llm_with_warning(
+                            self._default_llm,
+                            task_id=task_id,
+                            has_agent_builder_config=has_agent_builder_config,
+                            agent_id=task.agent_id,
+                            saved_model_ids=(agent_config or {}).get("saved_model_ids"),
+                            saved_model_descriptors=(agent_config or {}).get(
+                                "saved_model_descriptors"
+                            ),
+                            user_id=user_id_for_fallback,
+                        )
 
                     logger.info(
                         f"Successfully loaded LLM configuration for task {task_id}: "
@@ -815,6 +1043,8 @@ class AgentServiceManager:
                     task_fast_llm = None
                     task_vision_llm = None
                     task_compact_llm = None
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(
                     f"Failed to load LLM configuration from task {task_id} database: {e}"
@@ -1079,7 +1309,7 @@ class AgentServiceManager:
                             if uploaded_file is None:
                                 continue
 
-                            source_path = Path(str(uploaded_file.storage_path))
+                            source_path = ensure_uploaded_file_local_path(uploaded_file)
                             if not source_path.exists() or not source_path.is_file():
                                 continue
 
@@ -1401,53 +1631,18 @@ class AgentServiceManager:
                                 "User context is required for agent reconstruction"
                             )
 
-                        task_execution_mode = getattr(task, "execution_mode", None)
-                        if not task_execution_mode:
-                            task_execution_mode = get_default_task_execution_mode(
-                                agent_id=getattr(task, "agent_id", None),
-                            )
-                        task_pattern = get_agent_pattern_for_execution_mode(
-                            task_execution_mode
+                        runtime_config = self._resolve_task_runtime_config(
+                            task_id=task_id,
+                            task=task,
+                            db=db,
+                            user=user,
                         )
-                        llm_ids = self._get_task_llm_ids(task, db)
-                        # Use user_id for model resolution if available
-                        user_id_for_resolution = (
-                            int(task.user_id) if task.user_id else None
-                        )
-                        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                            resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
-                        )
-
-                        agent_config = None
-                        if task.agent_id:
-                            agent = (
-                                db.query(Agent)
-                                .filter(
-                                    Agent.id == task.agent_id,
-                                    Agent.user_id == task.user_id,
-                                )
-                                .first()
-                            )
-                            if agent:
-                                agent_config = self._load_agent_builder_config(
-                                    agent, db, int(user.id)
-                                )
-                                (
-                                    task_llm,
-                                    task_fast_llm,
-                                    task_vision_llm,
-                                    task_compact_llm,
-                                ) = agent_config["llms"]
-                                agent_execution_mode = agent_config.get(
-                                    "execution_mode", "balanced"
-                                )
-                                task_pattern = get_agent_pattern_for_execution_mode(
-                                    agent_execution_mode
-                                )
-
-                        # If no models were resolved, use defaults
-                        if not task_llm:
-                            task_llm = self._default_llm
+                        agent_config = runtime_config["agent_config"]
+                        task_llm = runtime_config["task_llm"]
+                        task_fast_llm = runtime_config["task_fast_llm"]
+                        task_vision_llm = runtime_config["task_vision_llm"]
+                        task_compact_llm = runtime_config["task_compact_llm"]
+                        task_pattern = runtime_config["task_pattern"]
 
                         tools_list, tool_config = await self._build_tools_for_task(
                             task_id=task_id,
@@ -1635,7 +1830,7 @@ async def create_task(
 
                 selected_file_ids.append(str(file_id))
 
-                file_path = Path(str(uploaded_file.storage_path))
+                file_path = ensure_uploaded_file_local_path(uploaded_file)
                 file_paths.append(str(file_path))
 
                 if file_path.exists():

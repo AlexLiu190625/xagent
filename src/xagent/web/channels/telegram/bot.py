@@ -181,7 +181,7 @@ class TelegramBotInstance:
         import mimetypes
         from pathlib import Path
 
-        from ...models.uploaded_file import UploadedFile
+        from ...services.uploaded_file_store import UploadedFileStore
 
         uploaded_files_info: list[dict] = []
 
@@ -234,15 +234,14 @@ class TelegramBotInstance:
 
                 file_size = getattr(f, "file_size", target_path.stat().st_size)
 
-                file_record = UploadedFile(
+                file_record = UploadedFileStore(db).create_from_local_path(
+                    local_path=target_path,
                     user_id=user_id,
                     task_id=task_id,
                     filename=normalized_file_name,
-                    storage_path=str(target_path),
                     mime_type=mime_type,
-                    file_size=file_size,
                 )
-                db.add(file_record)
+                setattr(file_record, "file_size", int(file_size))
                 db.flush()
 
                 agent_service.workspace.register_file(

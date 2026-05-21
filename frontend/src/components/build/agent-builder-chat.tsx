@@ -5,7 +5,7 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
@@ -150,11 +150,15 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
           method: 'POST',
           body: formData,
         });
+        const parsed = await parseApiResponse(uploadResponse);
         if (!uploadResponse.ok) {
-          throw new Error(`Upload failed: ${uploadResponse.statusText}`);
+          throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
+            generic: "Failed to upload files",
+            ...UPLOAD_ERROR_MESSAGES,
+          }));
         }
-        const uploadData = await uploadResponse.json();
-        if (uploadData.success && Array.isArray(uploadData.files)) {
+        const uploadData = parsed.data;
+        if (isJsonRecord(uploadData) && uploadData.success && Array.isArray(uploadData.files)) {
           uploadedFileIds = uploadData.files.map((f: any) => ({
             file_id: f.file_id,
             name: f.filename || '',
@@ -164,7 +168,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
         }
       } catch (err) {
         console.error("Failed to upload files", err);
-        toast.error("Failed to upload files");
+        toast.error(err instanceof Error ? err.message : "Failed to upload files");
         setIsLoading(false);
         setMessages(prev => prev.slice(0, -1));
         return;

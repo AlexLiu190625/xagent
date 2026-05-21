@@ -33,6 +33,7 @@ from .task_execution_context_service import (
     load_task_execution_recovery_state,
     summarize_tool_event,
 )
+from .uploaded_file_store import UploadedFileStore
 
 __all__ = [
     "load_task_transcript",
@@ -56,4 +57,5 @@ __all__ = [
     "get_default_vision_model",
     "get_default_image_generate_model",
     "get_default_image_edit_model",
+    "UploadedFileStore",
 ]

@@ -10,6 +10,7 @@ from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
     _append_uploaded_files_context_to_message,
     _build_uploaded_files_context,
+    _display_file_refs_from_file_info,
     _display_message_for_user,
     _normalize_file_outputs,
     _register_uploaded_files_for_agent,
@@ -557,9 +558,93 @@ def test_get_display_user_message_reads_agent_context_state():
     )
 
 
+def test_get_display_user_message_prefers_latest_message_metadata():
+    context = SimpleNamespace(
+        metadata={
+            "display_user_message": "First turn",
+        },
+        messages=[
+            SimpleNamespace(
+                role="user",
+                content="First turn",
+                metadata={"display_message": "First turn"},
+            ),
+            SimpleNamespace(
+                role="user",
+                content="Second turn\n\n## UPLOADED FILES\nfile_id=file-123",
+                metadata={"display_message": "Second turn"},
+            ),
+        ],
+    )
+
+    assert get_display_user_message(context, "fallback") == "Second turn"
+
+
+def test_get_display_user_message_does_not_reuse_stale_context_display():
+    context = SimpleNamespace(
+        metadata={
+            "display_user_message": "First turn",
+        },
+        messages=[
+            SimpleNamespace(
+                role="user",
+                content="First turn",
+                metadata={"display_message": "First turn"},
+            ),
+            SimpleNamespace(
+                role="user",
+                content="Second turn",
+                metadata={},
+            ),
+        ],
+    )
+
+    assert get_display_user_message(context, "fallback") == "Second turn"
+
+
+def test_get_display_user_message_respects_empty_display_metadata():
+    context = SimpleNamespace(
+        messages=[
+            SimpleNamespace(
+                role="user",
+                content="Internal prompt\n\n## UPLOADED FILES\nfile_id=file-123",
+                metadata={"display_message": ""},
+            ),
+        ],
+    )
+
+    assert get_display_user_message(context, "fallback") == ""
+
+
 def test_display_message_for_file_only_turn_uses_placeholder():
     assert _display_message_for_user("", has_files=True) == "Uploaded file(s)"
     assert (
         _display_message_for_user("Summarize this document", has_files=True)
         == "Summarize this document"
     )
+
+
+def test_display_file_refs_from_file_info_omits_runtime_paths():
+    refs = _display_file_refs_from_file_info(
+        [
+            {
+                "file_id": 123,
+                "name": "notes.txt",
+                "size": 42,
+                "type": "text/plain",
+                "path": "/internal/uploads/notes.txt",
+                "workspace_path": "/workspace/input/notes.txt",
+            }
+        ]
+    )
+
+    assert refs == [
+        {
+            "file_id": "123",
+            "name": "notes.txt",
+            "size": 42,
+            "type": "text/plain",
+        }
+    ]
+    assert "path" not in refs[0]
+    assert "workspace_path" not in refs[0]

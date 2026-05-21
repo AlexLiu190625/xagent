@@ -31,7 +31,7 @@ from ...config import (
     get_external_upload_dirs,
     get_uploads_dir,
 )
-from ...core.agent.trace import TraceEvent, TraceHandler
+from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
 from ..models.database import get_db
@@ -42,6 +42,11 @@ from ..models.user import User
 if TYPE_CHECKING:
     from ..services.task_setup_snapshot import TaskSetupSnapshot
 from ..services.chat_history_service import get_latest_waiting_question
+from ..services.managed_file_ref import (
+    DurableStorageOperationError,
+    build_task_output_storage_key,
+    ensure_uploaded_file_local_path,
+)
 from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
@@ -50,6 +55,7 @@ from ..services.task_lease_service import (
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
+from ..services.uploaded_file_store import UploadedFileStore
 from ..tools.config import WebToolConfig
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
@@ -207,6 +213,29 @@ def _display_message_for_user(user_message: str, has_files: bool) -> str:
     if has_files:
         return "Uploaded file(s)"
     return user_message
+
+
+def _display_file_refs_from_file_info(
+    file_info_list: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return display-safe file refs without runtime paths."""
+    refs: list[dict[str, Any]] = []
+    for file_info in file_info_list:
+        file_id = str(file_info.get("file_id") or "").strip()
+        if not file_id:
+            continue
+        ref: dict[str, Any] = {"file_id": file_id}
+        name = file_info.get("name") or file_info.get("original_name")
+        if name is not None:
+            ref["name"] = str(name)
+        size = file_info.get("size")
+        if size is not None:
+            ref["size"] = size
+        file_type = file_info.get("type")
+        if file_type is not None:
+            ref["type"] = str(file_type)
+        refs.append(ref)
+    return refs
 
 
 def _selected_file_ids_from_task_config(task: Any) -> list[str]:
@@ -682,6 +711,28 @@ def _output_path_in_current_task_scope(
     return len(parts) >= 3 and parts[0] in task_dirs and parts[1] == "output"
 
 
+def _normalize_workspace_relative_path(relative_path: str) -> str:
+    normalized = relative_path.strip().lstrip("/")
+    path_parts = [part for part in Path(normalized).parts if part not in ("", ".")]
+    if not path_parts or ".." in path_parts:
+        return Path(normalized).name or "output"
+
+    if path_parts[0].startswith("user_"):
+        path_parts = path_parts[1:]
+
+    if path_parts and (
+        path_parts[0].startswith("web_task_") or path_parts[0].startswith("task_")
+    ):
+        path_parts = path_parts[1:]
+
+    return "/".join(path_parts) if path_parts else "output"
+
+
+def _workspace_category_from_relative_path(relative_path: str) -> str:
+    path_parts = Path(relative_path).parts
+    return path_parts[0] if path_parts else "output"
+
+
 def _normalize_file_outputs(
     db: Session,
     task_id: int,
@@ -702,6 +753,7 @@ def _normalize_file_outputs(
     for item in file_outputs:
         item_file_id = ""
         item_filename = ""
+        item_relative_path = ""
         raw_paths: list[str] = []
 
         if isinstance(item, str):
@@ -715,6 +767,8 @@ def _normalize_file_outputs(
                 value = item.get(key)
                 if isinstance(value, str) and value.strip():
                     raw_paths.append(value)
+                    if key == "relative_path":
+                        item_relative_path = value
         else:
             continue
 
@@ -765,8 +819,14 @@ def _normalize_file_outputs(
             )
             continue
 
+        workspace_relative_path = _normalize_workspace_relative_path(
+            item_relative_path or normalized_relative_path
+        )
+        workspace_category = _workspace_category_from_relative_path(
+            workspace_relative_path
+        )
         expected_file_id = item_file_id or _build_output_file_id(
-            normalized_relative_path
+            workspace_relative_path
         )
 
         file_record = (
@@ -797,18 +857,51 @@ def _normalize_file_outputs(
             )
 
         if file_record is None:
-            file_record = UploadedFile(
-                file_id=expected_file_id,
-                user_id=task_user_id,
-                task_id=task_id,
-                filename=item_filename or resolved_path.name,
-                storage_path=str(resolved_path),
-                mime_type=None,
-                file_size=int(resolved_path.stat().st_size),
-            )
-            db.add(file_record)
-            db.flush()
-            changed = True
+            try:
+                file_record = UploadedFileStore(db).create_from_local_path(
+                    local_path=resolved_path,
+                    user_id=task_user_id,
+                    file_id=expected_file_id,
+                    task_id=task_id,
+                    filename=item_filename or resolved_path.name,
+                    mime_type=None,
+                    storage_key=build_task_output_storage_key(
+                        task_user_id,
+                        task_id,
+                        expected_file_id,
+                        workspace_relative_path,
+                    ),
+                    workspace_relative_path=workspace_relative_path,
+                    workspace_category=workspace_category,
+                )
+                db.flush()
+                changed = True
+            except DurableStorageOperationError:
+                db.rollback()
+                raise
+
+        else:
+            try:
+                file_record = UploadedFileStore(db).upsert_by_storage_path(
+                    user_id=task_user_id,
+                    filename=item_filename or resolved_path.name,
+                    storage_path=resolved_path,
+                    mime_type=None,
+                    file_size=resolved_path.stat().st_size,
+                    storage_key=build_task_output_storage_key(
+                        task_user_id,
+                        task_id,
+                        str(file_record.file_id),
+                        workspace_relative_path,
+                    ),
+                    task_id=task_id,
+                    workspace_relative_path=workspace_relative_path,
+                    workspace_category=workspace_category,
+                )
+                changed = True
+            except DurableStorageOperationError:
+                db.rollback()
+                raise
 
         final_file_id = str(file_record.file_id)
         final_filename = item_filename or str(file_record.filename)
@@ -831,6 +924,14 @@ def _normalize_file_outputs(
                 path_to_file_id[stripped] = final_file_id
                 path_to_file_id[stripped.lstrip("/")] = final_file_id
         _add_file_link_aliases(path_to_file_id, normalized_relative_path, final_file_id)
+
+        if workspace_relative_path != normalized_relative_path:
+            path_to_file_id[workspace_relative_path] = final_file_id
+            path_to_file_id[f"/{workspace_relative_path}"] = final_file_id
+            path_to_file_id[f"preview/{workspace_relative_path}"] = final_file_id
+            path_to_file_id[f"/preview/{workspace_relative_path}"] = final_file_id
+            path_to_file_id[f"uploads/{workspace_relative_path}"] = final_file_id
+            path_to_file_id[f"/uploads/{workspace_relative_path}"] = final_file_id
 
     if changed:
         db.commit()
@@ -1559,16 +1660,21 @@ async def redirect_legacy_preview(
             )
 
         owner_user_id, task_id = owner_info
-        file_record = UploadedFile(
-            file_id=_build_output_file_id(relative_path),
+        generated_file_id = _build_output_file_id(relative_path)
+        file_record = UploadedFileStore(db).create_from_local_path(
+            local_path=resolved_path,
             user_id=owner_user_id,
+            file_id=generated_file_id,
             task_id=task_id,
             filename=resolved_path.name,
-            storage_path=str(resolved_path),
             mime_type=None,
-            file_size=int(resolved_path.stat().st_size),
+            storage_key=build_task_output_storage_key(
+                owner_user_id,
+                cast(int, task_id),
+                generated_file_id,
+                relative_path,
+            ),
         )
-        db.add(file_record)
         db.commit()
         db.refresh(file_record)
 
@@ -1699,7 +1805,7 @@ async def handle_file_upload_for_task(
             file_name = file_record.filename
             file_size = file_record.file_size
             file_type = file_record.mime_type
-            source_path = Path(str(file_record.storage_path))
+            source_path = ensure_uploaded_file_local_path(file_record)
 
             if not source_path.exists():
                 logger.warning(f"Physical file not found: {source_path}")
@@ -2142,6 +2248,9 @@ async def handle_chat_message(
                     user_message,
                     bool(file_info_list),
                 )
+                display_file_refs = _display_file_refs_from_file_info(file_info_list)
+                context["display_message"] = display_user_message
+                context["files"] = display_file_refs
 
                 # DAG plan-execute will automatically send user_message trace event
 
@@ -2190,12 +2299,11 @@ async def handle_chat_message(
                     if hasattr(dag_pattern, "tracer") and hasattr(
                         dag_pattern, "task_id"
                     ):
-                        from ...core.agent.trace import trace_user_message
-
                         trace_data = {
                             "context": context,
                             "pattern": "DAG Plan-Execute Continuation",
                             "continuation": "true",
+                            "files": display_file_refs,
                         }
                         await trace_user_message(
                             dag_pattern.tracer,
@@ -2265,13 +2373,27 @@ async def handle_chat_message(
                     assert agent_service is not None
                     posted = await agent_service.post_user_message(
                         str(task_id),
-                        user_message_for_llm,
+                        execution_message=user_message_for_llm,
+                        display_message=display_user_message,
+                        files=display_file_refs,
                         request_interrupt=task.status == TaskStatus.RUNNING,
                         reason="new websocket user message",
                     )
                     if not posted:
                         logger.warning(
                             f"agent execution {task_id} was not live; attempting resume from checkpoint"
+                        )
+                    else:
+                        await trace_user_message(
+                            agent_service.tracer,
+                            str(task_id),
+                            display_user_message,
+                            {
+                                "context": context,
+                                "pattern": "Agent Live Control",
+                                "continuation": "true",
+                                "files": display_file_refs,
+                            },
                         )
 
                     previous_task = background_task_manager.running_tasks.get(task_id)
@@ -2366,7 +2488,6 @@ async def handle_chat_message(
                         logger.info(f"task_info event sent for existing task {task_id}")
 
                     # Build context with vibe mode information if available
-                    context["display_user_message"] = display_user_message
                     if hasattr(task, "execution_mode") and task.execution_mode:
                         context["execution_mode"] = task.execution_mode
                     if (
@@ -4525,7 +4646,7 @@ async def handle_build_preview_execution(
                     file_name = file_record.filename
                     file_size = file_record.file_size
                     file_type = file_record.mime_type
-                    source_path = Path(str(file_record.storage_path))
+                    source_path = ensure_uploaded_file_local_path(file_record)
 
                     if not source_path.exists():
                         logger.warning(f"Physical file not found: {source_path}")

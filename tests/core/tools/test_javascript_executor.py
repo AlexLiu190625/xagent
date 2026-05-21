@@ -3,6 +3,8 @@
 import tempfile
 from pathlib import Path
 
+import pytest
+
 from xagent.core.tools.core.javascript_executor import (
     JavaScriptExecutorCore,
     execute_javascript,
@@ -86,6 +88,238 @@ console.log('Sum:', sum);
 
         assert result["success"] is True
         assert "15" in result["output"]
+
+
+class TestPptxgenjsWarningInterception:
+    """The JS wrapper converts pptxgenjs warn-only failures into hard fails.
+
+    pptxgenjs's ``addTable``/``addImage``/etc. log to stdout with
+    ``"<method>: <description>"`` when an argument is malformed, then
+    keep going — leaving a broken ``.pptx`` on disk while node still
+    exits 0. When the caller requested ``pptxgenjs`` we intercept
+    ``console.log`` in the wrapper: set a wrapper-scoped flag, throw,
+    and after the user-code ``try`` block re-check the flag and
+    ``process.exit(1)`` so a user-level ``try/catch`` around the
+    pptxgenjs call cannot suppress the failure.
+
+    The interceptor is GATED on `packages` containing pptxgenjs so a
+    script that doesn't request it can't be misclassified by a
+    pptxgenjs-shaped log line.
+    """
+
+    def test_pptxgenjs_warning_in_user_code_triggers_failure(self):
+        """A script that just ``console.log``s the warning text is enough —
+        the wrapper turns it into a throw without needing real pptxgenjs."""
+        executor = JavaScriptExecutorCore()
+        code = (
+            "console.log("
+            "'addTable: tableRows has a bad row. "
+            "A row should be an array of cells.'"
+            ");"
+        )
+        result = executor.execute_code(code, packages=["pptxgenjs"])
+
+        assert result["success"] is False
+        assert "pptxgenjs reported a validation problem" in result["error"]
+        assert "addTable: tableRows has a bad row" in result["error"]
+
+    def test_other_pptxgenjs_method_prefixes_also_trigger_failure(self):
+        """addText/addImage/addShape/writeFile prefixes all match."""
+        for prefix in ("addText", "addImage", "addShape", "writeFile"):
+            executor = JavaScriptExecutorCore()
+            result = executor.execute_code(
+                f"console.log('{prefix}: something wrong');",
+                packages=["pptxgenjs"],
+            )
+            assert result["success"] is False, prefix
+            assert prefix in result["error"], prefix
+
+    def test_generic_prefixes_no_longer_trigger_failure(self):
+        """rogercloud comment 1: bare ``write:``/``stream:`` are off the
+        allow-list now — ordinary user logs must not collide."""
+        for line in ("write: complete", "stream: ready"):
+            executor = JavaScriptExecutorCore()
+            result = executor.execute_code(
+                f"console.log('{line}');", packages=["pptxgenjs"]
+            )
+            assert result["success"] is True, line
+            assert line in result["output"], line
+
+    def test_unrelated_colon_lines_do_not_trigger_failure(self):
+        """User code logging `foo: bar` style strings stays a clean success."""
+        for line in (
+            "Sum: 42",
+            "error: oops in my data",
+            "DEBUG: starting",
+            "info: 200 OK",
+        ):
+            executor = JavaScriptExecutorCore()
+            result = executor.execute_code(f"console.log('{line}');")
+            assert result["success"] is True, line
+            assert line in result["output"], line
+
+    def test_method_prefix_requires_colon_space_separator(self):
+        """`addTable:nodescription` (no space) is not matched."""
+        executor = JavaScriptExecutorCore()
+        result = executor.execute_code(
+            "console.log('addTable:no-space');", packages=["pptxgenjs"]
+        )
+        assert result["success"] is True
+        assert "addTable:no-space" in result["output"]
+
+    def test_clean_run_unchanged(self):
+        """Sanity: code with no pptxgenjs-shaped logs still succeeds."""
+        executor = JavaScriptExecutorCore()
+        result = executor.execute_code("console.log('all good');")
+        assert result["success"] is True
+        assert "all good" in result["output"]
+        assert result["error"] == ""
+
+    def test_interception_gated_on_pptxgenjs_request(self):
+        """rogercloud comment 1: when the caller didn't ask for pptxgenjs,
+        even an exact ``addTable: ...`` line must NOT be flagged. The
+        detector belongs only to executions that actually load the library.
+        """
+        executor = JavaScriptExecutorCore()
+        result = executor.execute_code(
+            "console.log('addTable: tableRows has a bad row.');"
+        )
+        assert result["success"] is True
+        assert "addTable: tableRows has a bad row." in result["output"]
+
+    def test_user_try_catch_cannot_suppress_failure(self):
+        """rogercloud comment 2: a user-level try/catch around the
+        pptxgenjs call must NOT be able to swallow the validation
+        failure. The wrapper-scoped flag check runs after the user try
+        block and exits the process from outside user code's reach.
+        """
+        executor = JavaScriptExecutorCore()
+        # Simulate pptxgenjs's behaviour: the offending method only
+        # ``console.log``s and returns normally. Wrap the call in a
+        # broad try/catch so the injected throw is consumed.
+        code = (
+            "try {"
+            "  console.log('addTable: tableRows has a bad row.');"
+            "  console.log('about to write the malformed pptx');"
+            "} catch (e) {"
+            "  console.log('user swallowed the throw and kept going');"
+            "}"
+        )
+        result = executor.execute_code(code, packages=["pptxgenjs"])
+
+        # The wrapper-level flag check still fires after the user try
+        # block returns, so the tool reports failure even though user
+        # code didn't propagate the throw.
+        assert result["success"] is False
+        assert "pptxgenjs reported a validation problem" in result["error"]
+        assert "addTable: tableRows has a bad row" in result["error"]
+
+
+# Parametrized end-to-end coverage of every failure mode the executor is
+# expected to surface, plus a positive control and a false-positive guard.
+# Each case is a real subprocess run; the pptxgenjs cases install the npm
+# package on first run and are therefore slow (~10s each on a cold cache).
+_ERROR_SIGNAL_CASES = [
+    pytest.param(
+        'console.log("unterminated;',
+        None,
+        False,
+        None,  # node's wrapped error.message varies by version; presence of
+        # *any* error is enough
+        id="syntax_error",
+    ),
+    pytest.param(
+        'throw new Error("boom");',
+        None,
+        False,
+        "boom",
+        id="explicit_throw",
+    ),
+    pytest.param(
+        "console.log(somethingUndefined);",
+        None,
+        False,
+        "not defined",
+        id="undefined_reference",
+    ),
+    pytest.param(
+        # Reproduces demo task/1100: pptxgenjs prints "addTable: tableRows
+        # has a bad row..." to stdout and continues. Node exits 0, but the
+        # generated .pptx is malformed. The executor must convert this
+        # warning into success=False so the agent retries.
+        'const P=require("pptxgenjs");'
+        "const p=new P();"
+        'p.addSlide().addTable([["ok"],{text:"C"}],{x:1,y:1,w:5});'
+        'p.writeFile({fileName:"t.pptx"});'
+        'console.log("done");',
+        ["pptxgenjs"],
+        False,
+        "tableRows has a bad",
+        id="pptxgenjs_warn_only_demo_bug",
+    ),
+    pytest.param(
+        # Hard-error path: pptxgenjs rejects a flat row array immediately.
+        'const P=require("pptxgenjs");'
+        "const p=new P();"
+        'p.addSlide().addTable(["A","B"],{x:1,y:1,w:5});'
+        'p.writeFile({fileName:"t.pptx"});',
+        ["pptxgenjs"],
+        False,
+        "'rows' should be",
+        id="pptxgenjs_hard_fail_flat_rows",
+    ),
+    pytest.param(
+        # Positive control: a normal pptxgenjs run produces a .pptx and
+        # the executor reports success=True with no error.
+        'const P=require("pptxgenjs");'
+        "const p=new P();"
+        'p.addSlide().addText("Hi",{x:1,y:1,fontSize:32});'
+        'p.writeFile({fileName:"good.pptx"});'
+        'console.log("all good");',
+        ["pptxgenjs"],
+        True,
+        None,
+        id="pptxgenjs_clean_run",
+    ),
+    pytest.param(
+        # False-positive guard: user code that happens to log strings
+        # containing colons must NOT be misclassified as a library warning.
+        'console.log("Sum: 42");'
+        'console.log("error: oops in my data");'
+        'console.log("DEBUG: starting");',
+        None,
+        True,
+        None,
+        id="user_log_with_colon_no_false_positive",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "code,packages,expected_success,error_marker", _ERROR_SIGNAL_CASES
+)
+def test_error_signal_reaches_agent(code, packages, expected_success, error_marker):
+    """Every kind of JS failure must surface to the agent as success=False
+    with a useful error message; the executor must not silently mask a
+    library warning that left malformed output behind, and must not flag
+    a clean run as failure.
+
+    Mirrors the manual verification matrix written up in the PR
+    description for fix(js_executor): surface pptxgenjs validation
+    warnings as soft failures.
+    """
+    executor = JavaScriptExecutorCore()
+    result = executor.execute_code(code, packages=packages)
+
+    assert result["success"] is expected_success, (
+        f"expected success={expected_success}, got {result['success']!r}; "
+        f"error={result.get('error')!r}, output={result.get('output')!r}"
+    )
+    if error_marker is not None:
+        err = (result.get("error") or "").lower()
+        assert error_marker.lower() in err, (
+            f"error marker {error_marker!r} not in error={result.get('error')!r}"
+        )
 
 
 class TestJavaScriptWithNpmPackages:

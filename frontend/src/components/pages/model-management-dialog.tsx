@@ -12,7 +12,13 @@ import { Switch } from "@/components/ui/switch"
 import { getApiUrl } from "@/lib/utils"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest } from "@/lib/api-wrapper"
-import { getProviderModels, ProviderModel } from "@/lib/models"
+import {
+  DefaultModelType,
+  getProviderModels,
+  ProviderModel,
+  removeUserDefaultModel,
+  setUserDefaultModel
+} from "@/lib/models"
 import {
   ArrowLeft,
   Plus,
@@ -63,11 +69,12 @@ export function ModelManagementDialog({
   defaultModels,
   onSuccess
 }: ModelManagementDialogProps) {
-  const { user } = useAuth()
+  const { user, token } = useAuth()
   const { t } = useI18n()
 
-  const [viewMode, setViewMode] = useState<'list' | 'connect' | 'form'>(initialViewMode)
+  const [viewMode, setViewMode] = useState<'list' | 'connect' | 'form' | 'defaults'>(initialViewMode)
   const [editingModel, setEditingModel] = useState<Model | null>(initialEditingModel || null)
+  const [defaultTargetModel, setDefaultTargetModel] = useState<Model | null>(null)
   const managingProviderId = initialProviderId || null
   const [loading, setLoading] = useState(false)
 
@@ -83,6 +90,7 @@ export function ModelManagementDialog({
   const [modelToDelete, setModelToDelete] = useState<string | null>(null)
   const [isDeletingModel, setIsDeletingModel] = useState(false)
   const [hasInitializedDefaults, setHasInitializedDefaults] = useState(false)
+  const [selectedDefaultConfigTypes, setSelectedDefaultConfigTypes] = useState<string[]>([])
 
   const getDefaultAbilitiesForCategory = (category: string): string[] => {
     if (category === 'llm') return ['chat']
@@ -97,6 +105,28 @@ export function ModelManagementDialog({
       return ['chat', 'tool_calling', 'thinking_mode']
     }
     return getDefaultAbilitiesForCategory(category)
+  }
+
+  const getDefaultOptionsForModel = (category: string, abilities?: string[]) => {
+    return [
+      ...(category === 'llm' ? [
+        { value: "general", label: t('models.defaults.general') },
+        { value: "small_fast", label: t('models.defaults.fast') },
+        ...(abilities?.includes('vision') ? [{ value: "visual", label: t('models.defaults.visual') }] : []),
+        { value: "compact", label: t('models.defaults.compact') }
+      ] : []),
+      ...(category === 'embedding' ? [
+        { value: "embedding", label: t('models.defaults.embedding') }
+      ] : []),
+      ...(category === 'image' ? [
+        { value: "image", label: t('models.defaults.image') },
+        ...(abilities?.includes('edit') ? [{ value: "image_edit", label: t('models.defaults.image_edit') }] : [])
+      ] : []),
+      ...(category === 'speech' ? [
+        ...(abilities?.includes('asr') ? [{ value: "asr", label: t('models.defaults.asr') }] : []),
+        ...(abilities?.includes('tts') ? [{ value: "tts", label: t('models.defaults.tts') }] : [])
+      ] : [])
+    ]
   }
 
   const resetConnectionState = () => {
@@ -205,10 +235,20 @@ export function ModelManagementDialog({
   }
 
   const closeDialog = () => {
+    setEditingModel(null)
+    setDefaultTargetModel(null)
+    setSelectedDefaultConfigTypes([])
     onOpenChange(false)
   }
 
+  const handleCancelDefaultsView = () => {
+    setDefaultTargetModel(null)
+    setSelectedDefaultConfigTypes([])
+    setViewMode('list')
+  }
+
   const handleEdit = (model: Model) => {
+    setDefaultTargetModel(null)
     setEditingModel(model)
     const currentDefaults = getModelDefaultTypes(model.id)
     setFormData({
@@ -227,10 +267,18 @@ export function ModelManagementDialog({
     setViewMode('form')
   }
 
+  const handleManageDefaults = (model: Model) => {
+    setEditingModel(null)
+    setDefaultTargetModel(model)
+    setSelectedDefaultConfigTypes(getModelDefaultTypes(model.id))
+    setViewMode('defaults')
+  }
+
   const handleAddFromList = () => {
     if (!managingProviderId) return
     const providerConfig = providers.find(p => p.id === managingProviderId)
     resetConnectionState()
+    setDefaultTargetModel(null)
     setFormData({
       model_id: "",
       category: activeTab,
@@ -410,6 +458,31 @@ export function ModelManagementDialog({
     }
   }
 
+  const submitDefaultConfigTypes = async (model: Model, nextDefaultTypes: string[]) => {
+    try {
+      setLoading(true)
+
+      const currentDefaults = getModelDefaultTypes(model.id)
+
+      const deleteRequests = currentDefaults
+        .filter(configType => !nextDefaultTypes.includes(configType))
+        .map((configType) => removeUserDefaultModel(token || '', configType as DefaultModelType))
+
+      const addRequests = nextDefaultTypes
+        .filter(configType => !currentDefaults.includes(configType))
+        .map((configType) => setUserDefaultModel(token || '', configType as DefaultModelType, model.id))
+
+      await Promise.all([...deleteRequests, ...addRequests])
+
+      await onSuccess()
+      handleCancelDefaultsView()
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : t('models.errors.setDefaultFailed'))
+    } finally {
+      setLoading(false)
+    }
+  }
+
   return (
     <>
       <Dialog open={isOpen} onOpenChange={onOpenChange}>
@@ -467,6 +540,17 @@ export function ModelManagementDialog({
                           </div>
                         </div>
                         <div className="flex items-center gap-1">
+                          {!model.is_owner && getDefaultOptionsForModel(model.category, model.abilities).length > 0 && (
+                            <Button
+                              variant={defaultTypes.length > 0 ? "secondary" : "outline"}
+                              size="sm"
+                              onClick={() => handleManageDefaults(model)}
+                              title={t('models.card.actions.setDefault')}
+                              className="h-8"
+                            >
+                              {t('models.card.actions.setDefault')}
+                            </Button>
+                          )}
                           {model.can_edit && (
                             <Button variant="ghost" size="icon" onClick={() => handleEdit(model)}>
                               <Edit className="w-4 h-4" />
@@ -917,6 +1001,110 @@ export function ModelManagementDialog({
               className="mt-0 px-4 sm:px-6 py-4 flex-1 min-h-0 overflow-hidden"
             />
           </DialogContent>
+        ) : viewMode === 'defaults' ? (
+          <DialogContent showCloseButton={false} className="max-w-2xl max-h-[90vh] overflow-y-auto">
+            <DialogHeader>
+              <div className="flex items-center gap-2">
+                {managingProviderId && (
+                  <Button
+                    variant="ghost"
+                    size="icon"
+                    className="-ml-2 h-8 w-8"
+                    onClick={handleCancelDefaultsView}
+                  >
+                    <ArrowLeft className="w-4 h-4" />
+                  </Button>
+                )}
+                <div>
+                  <DialogTitle>{t('models.form.setDefault')}</DialogTitle>
+                  <DialogDescription>
+                    {t('models.dialog.connect.defaultModelsDesc')}
+                  </DialogDescription>
+                </div>
+              </div>
+            </DialogHeader>
+
+            {defaultTargetModel && (
+              <>
+                <div className="flex flex-col gap-4 mt-4">
+                  <div className="border rounded-md p-4 bg-muted/20">
+                    <div className="font-medium flex items-center gap-2 flex-wrap">
+                      <span>{defaultTargetModel.model_name}</span>
+                      {!defaultTargetModel.is_owner && (
+                        <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
+                          {t('models.defaults.shared_from_others')}
+                        </Badge>
+                      )}
+                      {defaultTargetModel.is_shared && defaultTargetModel.is_owner && (
+                        <Badge variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-orange-500">
+                          {t('models.defaults.shared')}
+                        </Badge>
+                      )}
+                    </div>
+                    <div className="text-sm text-muted-foreground mt-2">
+                      {providers.find(p => p.id === defaultTargetModel.model_provider)?.name || defaultTargetModel.model_provider}
+                    </div>
+                  </div>
+
+                  <div>
+                    <div className="flex items-center gap-2 mb-2">
+                      <Star className="w-4 h-4 text-yellow-500" />
+                      <Label className="text-sm font-medium">{t('models.form.setDefault')}</Label>
+                    </div>
+                    <MultiSelect
+                      values={selectedDefaultConfigTypes}
+                      onValuesChange={setSelectedDefaultConfigTypes}
+                      options={getDefaultOptionsForModel(defaultTargetModel.category, defaultTargetModel.abilities)}
+                      placeholder={t('models.form.defaultPlaceholder')}
+                    />
+                  </div>
+
+                  {(() => {
+                    const defaultOptions = getDefaultOptionsForModel(defaultTargetModel.category, defaultTargetModel.abilities)
+                    const existingDefaults = defaultOptions
+                      .map(option => ({ type: option.value, model: (defaultModels as any)[option.value] }))
+                      .filter(item => item.model)
+
+                    if (existingDefaults.length === 0) return null
+
+                    return (
+                      <div className="mt-2 p-4 border rounded-md bg-muted/20">
+                        <h4 className="text-sm font-medium mb-3 text-foreground">{t('models.dialog.connect.currentDefaults')}</h4>
+                        <div className="space-y-2">
+                          {existingDefaults.map(({ type, model }) => {
+                            let labelKey = `models.defaults.${type}`
+                            if (type === 'small_fast') labelKey = 'models.defaults.fast'
+
+                            return (
+                              <div key={type} className="flex justify-between items-center text-sm gap-4">
+                                <span className="text-muted-foreground shrink-0">{t(labelKey)}</span>
+                                <span className="font-medium truncate" title={model.model_name}>
+                                  {model.model_name}
+                                </span>
+                              </div>
+                            )
+                          })}
+                        </div>
+                      </div>
+                    )
+                  })()}
+                </div>
+
+                <div className="flex justify-end gap-2 mt-6">
+                  <Button variant="outline" onClick={handleCancelDefaultsView}>
+                    {t('models.dialog.cancel')}
+                  </Button>
+                  <Button
+                    onClick={() => submitDefaultConfigTypes(defaultTargetModel, selectedDefaultConfigTypes)}
+                    disabled={loading}
+                  >
+                    {loading && <Loader2 className="w-4 h-4 mr-2 animate-spin" />}
+                    {t('common.save')}
+                  </Button>
+                </div>
+              </>
+            )}
+          </DialogContent>
         ) : (
           <DialogContent showCloseButton={false} className="max-w-2xl max-h-[90vh] overflow-y-auto">
             <DialogHeader>
@@ -1122,25 +1310,7 @@ export function ModelManagementDialog({
                     <MultiSelect
                       values={formData.default_config_types || []}
                       onValuesChange={(values) => setFormData({ ...formData, default_config_types: values })}
-                      options={[
-                        ...(formData.category === 'llm' ? [
-                          { value: "general", label: t('models.defaults.general') },
-                          { value: "small_fast", label: t('models.defaults.fast') },
-                          ...(formData.abilities?.includes('vision') ? [{ value: "visual", label: t('models.defaults.visual') }] : []),
-                          { value: "compact", label: t('models.defaults.compact') }
-                        ] : []),
-                        ...(formData.category === 'embedding' ? [
-                          { value: "embedding", label: t('models.defaults.embedding') }
-                        ] : []),
-                        ...(formData.category === 'image' ? [
-                          { value: "image", label: t('models.defaults.image') },
-                          ...(formData.abilities?.includes('edit') ? [{ value: "image_edit", label: t('models.defaults.image_edit') }] : [])
-                        ] : []),
-                        ...(formData.category === 'speech' ? [
-                          ...(formData.abilities?.includes('asr') ? [{ value: "asr", label: t('models.defaults.asr') }] : []),
-                          ...(formData.abilities?.includes('tts') ? [{ value: "tts", label: t('models.defaults.tts') }] : [])
-                        ] : [])
-                      ]}
+                      options={getDefaultOptionsForModel(formData.category, formData.abilities)}
                       placeholder={t('models.form.defaultPlaceholder')}
                     />
                   </div>

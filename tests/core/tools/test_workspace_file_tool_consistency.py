@@ -350,6 +350,109 @@ class TestWorkspaceFileToolConsistency:
 
         assert workspace.resolve_file_id("foreign-file") is None
 
+    def test_resolve_file_id_rejects_durable_only_other_user_records(
+        self, tmp_path, mocker
+    ):
+        """Test durable-only DB file_id lookup is scoped to the workspace owner."""
+        missing_local = tmp_path / "missing-other-user.txt"
+        workspace = TaskWorkspace("web_task_10", str(tmp_path))
+        workspace.owner_user_id = 1
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return SimpleNamespace(
+                    file_id="foreign-file",
+                    user_id=2,
+                    task_id=None,
+                    storage_path=str(missing_local),
+                    storage_key="users/2/uploads/foreign-file/private.txt",
+                    storage_status="available",
+                )
+
+        class FakeSession:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def close(self):
+                pass
+
+        materialize_calls = []
+
+        class SpyManagedFileRef:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def materialize(self):
+                materialize_calls.append(None)
+                return missing_local
+
+        mocker.patch(
+            "xagent.core.storage.manager.create_db_session",
+            return_value=FakeSession(),
+        )
+        mocker.patch(
+            "xagent.web.services.managed_file_ref.ManagedFileRef",
+            SpyManagedFileRef,
+        )
+
+        assert workspace.resolve_file_id("foreign-file") is None
+        assert materialize_calls == []
+
+    def test_resolve_file_id_rejects_durable_only_other_user_inside_workspace_path(
+        self, tmp_path, mocker
+    ):
+        """Test durable-only authorization does not trust stale workspace paths."""
+        workspace = TaskWorkspace("web_task_10", str(tmp_path))
+        workspace.owner_user_id = 1
+        missing_local = workspace.output_dir / "private.txt"
+        assert not missing_local.exists()
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return SimpleNamespace(
+                    file_id="foreign-file",
+                    user_id=2,
+                    task_id=None,
+                    storage_path=str(missing_local),
+                    storage_key="users/2/uploads/foreign-file/private.txt",
+                    storage_status="available",
+                )
+
+        class FakeSession:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def close(self):
+                pass
+
+        materialize_calls = []
+
+        class SpyManagedFileRef:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def materialize(self):
+                materialize_calls.append(None)
+                return missing_local
+
+        mocker.patch(
+            "xagent.core.storage.manager.create_db_session",
+            return_value=FakeSession(),
+        )
+        mocker.patch(
+            "xagent.web.services.managed_file_ref.ManagedFileRef",
+            SpyManagedFileRef,
+        )
+
+        assert workspace.resolve_file_id("foreign-file") is None
+        assert materialize_calls == []
+
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

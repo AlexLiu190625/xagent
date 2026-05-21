@@ -950,6 +950,138 @@ def make_normalize_model_id(core_storage: CoreStorage) -> Callable:
     return normalize_model_id
 
 
+def resolve_task_runtime_config_core(
+    task_row: Any,
+    session: Session,
+    *,
+    user_id: Optional[int],
+) -> dict[str, Any]:
+    """Resolve a task's LLM tuple, agent-builder overlay, and execution
+    pattern in one shot. Pure function over an open SQLAlchemy session
+    -- no event loop, no logging, no fallback.
+
+    Single source of truth shared by both paths that need to bootstrap
+    a task's runtime configuration:
+
+      - ``AgentServiceManager._resolve_task_runtime_config`` (main
+        loop, used by ``_reconstruct_agent_from_history``) -- wraps
+        this with logging + the ``_pick_default_llm_with_warning``
+        fallback.
+      - ``load_task_setup_snapshot_sync`` (worker thread, used by
+        ``_schedule_bg._runner`` on the normal-creation path) --
+        wraps this with primitive ``_TaskFields`` / ``_AgentFields``
+        snapshotting so no ORM rows escape the loader's session.
+
+    Returns dict with: ``llms`` (tuple of 4 ``Optional[BaseLLM]`` --
+    default / fast / vision / compact), ``task_pattern``,
+    ``agent_config`` (``dict | None``), ``has_agent_builder_config``,
+    ``excluded_agent_id``, ``agent_fields`` (primitive subset of the
+    ``Agent`` row when present; used by the snapshot loader to build
+    its frozen ``_AgentFields``).
+
+    Does NOT apply the ``_pick_default_llm_with_warning`` fallback --
+    that helper raises ``HTTPException``, which is unsafe to call from
+    a worker thread. Callers handle the fallback step.
+    """
+    from ...config import (
+        get_agent_pattern_for_execution_mode,
+        get_default_task_execution_mode,
+    )
+    from ..models.agent import Agent, AgentStatus
+
+    task_execution_mode = getattr(task_row, "execution_mode", None)
+    if not task_execution_mode:
+        task_execution_mode = get_default_task_execution_mode(
+            agent_id=getattr(task_row, "agent_id", None),
+        )
+    task_pattern = get_agent_pattern_for_execution_mode(task_execution_mode)
+
+    # Inline LLM-id normalization (the legacy
+    # ``AgentServiceManager._get_task_llm_ids`` body).
+    core_storage = CoreStorage(session, Model)
+    normalize = make_normalize_model_id(core_storage)
+    llm_ids = [
+        normalize(
+            getattr(task_row, "model_id", None),
+            getattr(task_row, "model_name", None),
+        ),
+        normalize(
+            getattr(task_row, "small_fast_model_id", None),
+            getattr(task_row, "small_fast_model_name", None),
+        ),
+        normalize(
+            getattr(task_row, "visual_model_id", None),
+            getattr(task_row, "visual_model_name", None),
+        ),
+        normalize(
+            getattr(task_row, "compact_model_id", None),
+            getattr(task_row, "compact_model_name", None),
+        ),
+    ]
+    storage = UserAwareModelStorage(session)
+    task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
+        storage.resolve_llms_from_names(llm_ids, user_id)
+    )
+
+    agent_config: Optional[dict] = None
+    has_agent_builder_config = False
+    excluded_agent_id: Optional[int] = None
+    agent_fields: Optional[dict] = None
+
+    if task_row.agent_id is not None:
+        agent_row = (
+            session.query(Agent)
+            .filter(
+                Agent.id == task_row.agent_id,
+                Agent.user_id == task_row.user_id,
+            )
+            .first()
+        )
+        if agent_row is not None:
+            agent_config = load_agent_builder_config(
+                agent_row, session, int(task_row.user_id)
+            )
+            has_agent_builder_config = True
+            # Slot-wise overlay -- an agent slot wins when set,
+            # otherwise the task's own LLM stays. Mirrors the legacy
+            # ``_merge_agent_builder_llms``.
+            baseline_llms = (
+                task_llm,
+                task_fast_llm,
+                task_vision_llm,
+                task_compact_llm,
+            )
+            task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
+                agent_llm or baseline
+                for baseline, agent_llm in zip(baseline_llms, agent_config["llms"])
+            )
+            agent_execution_mode = agent_config.get("execution_mode", "balanced")
+            task_pattern = get_agent_pattern_for_execution_mode(agent_execution_mode)
+
+            if agent_row.status == AgentStatus.PUBLISHED:
+                excluded_agent_id = int(agent_row.id)
+
+            agent_fields = {
+                "id": int(agent_row.id),
+                "name": str(agent_row.name),
+                "status": agent_row.status,
+                "instructions": (
+                    str(agent_row.instructions)
+                    if agent_row.instructions is not None
+                    else None
+                ),
+            }
+
+    return {
+        "llms": (task_llm, task_fast_llm, task_vision_llm, task_compact_llm),
+        "task_pattern": task_pattern,
+        "agent_config": agent_config,
+        "has_agent_builder_config": has_agent_builder_config,
+        "excluded_agent_id": excluded_agent_id,
+        "agent_fields": agent_fields,
+    }
+
+
 def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:
     """Eagerly load Agent Builder configuration into a primitive dict.
 
@@ -986,6 +1118,11 @@ def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:
         )
     models: dict[str, Any] = dict(raw_models) if isinstance(raw_models, dict) else {}
 
+    # Captures the resolved ``DBModel`` row per slot so downstream
+    # fallback diagnostics (``_pick_default_llm_with_warning``) can log
+    # human-readable model identifiers instead of opaque PKs.
+    saved_model_descriptors: dict[str, dict[str, Any]] = {}
+
     def _resolve(slot: str) -> Optional[BaseLLM]:
         db_row_id = models.get(slot)
         if not db_row_id:
@@ -993,15 +1130,24 @@ def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:
         db_model = db.query(Model).filter(Model.id == db_row_id).first()
         if not db_model:
             return None
+        saved_model_descriptors[slot] = {
+            "pk": db_model.id,
+            "model_id": str(db_model.model_id),
+            "model_name": getattr(db_model, "model_name", None),
+        }
         return storage.get_llm_by_name_with_access(str(db_model.model_id), user_id)
 
+    llms = (
+        _resolve("general"),
+        _resolve("small_fast"),
+        _resolve("visual"),
+        _resolve("compact"),
+    )
+
     return {
-        "llms": (
-            _resolve("general"),
-            _resolve("small_fast"),
-            _resolve("visual"),
-            _resolve("compact"),
-        ),
+        "llms": llms,
+        "saved_model_ids": dict(models),
+        "saved_model_descriptors": saved_model_descriptors,
         "execution_mode": agent.execution_mode,
         "instructions": agent.instructions,
         "skills": list(agent.skills or []),

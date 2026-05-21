@@ -36,18 +36,13 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 from sqlalchemy.orm import Session
 
-from ...config import (
-    get_agent_pattern_for_execution_mode,
-    get_default_task_execution_mode,
-)
 from ...core.model.chat.basic.base import BaseLLM
-from ..models.agent import Agent, AgentStatus
+from ..models.agent import AgentStatus
 from ..models.database import get_session_local
-from ..models.model import Model as DBModel
 from ..models.task import Task
 
 logger = logging.getLogger(__name__)
@@ -103,39 +98,17 @@ class TaskSetupSnapshot:
     excluded_agent_id: Optional[int]
 
 
-def _resolve_task_llm_ids_sync(task_row: Task, session: Session) -> List[Optional[str]]:
-    """Normalize the four task LLM identifiers using the snapshot's
-    own session. Mirrors ``AgentServiceManager._get_task_llm_ids``.
-    """
-    from .llm_utils import CoreStorage, make_normalize_model_id
-
-    core_storage = CoreStorage(session, DBModel)
-    normalize = make_normalize_model_id(core_storage)
-    return [
-        normalize(
-            getattr(task_row, "model_id", None),
-            getattr(task_row, "model_name", None),
-        ),
-        normalize(
-            getattr(task_row, "small_fast_model_id", None),
-            getattr(task_row, "small_fast_model_name", None),
-        ),
-        normalize(
-            getattr(task_row, "visual_model_id", None),
-            getattr(task_row, "visual_model_name", None),
-        ),
-        normalize(
-            getattr(task_row, "compact_model_id", None),
-            getattr(task_row, "compact_model_name", None),
-        ),
-    ]
-
-
-# NOTE: Agent Builder config loading lives in
-# ``llm_utils.load_agent_builder_config`` so this off-loop snapshot
-# loader and ``AgentServiceManager._load_agent_builder_config`` (the
-# legacy in-method caller) share a single source of truth on LLM
-# resolution semantics. The snapshot loader below calls it directly.
+# NOTE: All LLM resolution + agent-builder merge + execution-mode →
+# pattern logic lives in ``llm_utils.resolve_task_runtime_config_core``.
+# This loader is the off-loop wrapper that:
+#   1. opens its own ``SessionLocal``,
+#   2. calls the shared core to do the actual resolution,
+#   3. converts the ORM ``Task`` / ``Agent`` rows it pulls into frozen
+#      primitive ``_TaskFields`` / ``_AgentFields`` so nothing escapes
+#      the loader's session.
+# The main-loop reconstruct path (``_resolve_task_runtime_config`` in
+# chat.py) calls the same core directly, since it doesn't need the
+# primitive wrapping and runs inside the request session's lifetime.
 
 
 def load_task_setup_snapshot_sync(
@@ -154,7 +127,7 @@ def load_task_setup_snapshot_sync(
     to whatever behaviour the legacy in-line code already implements
     for that case (default LLM, no agent-builder override).
     """
-    from .llm_utils import load_agent_builder_config, resolve_llms_from_names
+    from .llm_utils import resolve_task_runtime_config_core
 
     session_factory = get_session_local()
     session: Session = session_factory()
@@ -187,68 +160,29 @@ def load_task_setup_snapshot_sync(
             ),
         )
 
-        task_execution_mode = task_fields.execution_mode
-        if not task_execution_mode:
-            task_execution_mode = get_default_task_execution_mode(
-                agent_id=task_fields.agent_id,
-            )
-        task_pattern = get_agent_pattern_for_execution_mode(task_execution_mode)
-
-        llm_ids = _resolve_task_llm_ids_sync(task_row, session)
-        (
-            task_llm,
-            task_fast_llm,
-            task_vision_llm,
-            task_compact_llm,
-        ) = resolve_llms_from_names(llm_ids, session, user_id)
+        core = resolve_task_runtime_config_core(task_row, session, user_id=user_id)
+        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core["llms"]
 
         agent_fields: Optional[_AgentFields] = None
-        agent_config: Optional[dict] = None
-        excluded_agent_id: Optional[int] = None
-
-        if task_fields.agent_id is not None:
-            agent_row = (
-                session.query(Agent)
-                .filter(
-                    Agent.id == task_fields.agent_id,
-                    Agent.user_id == task_fields.user_id,
-                )
-                .first()
+        if core["agent_fields"] is not None:
+            af = core["agent_fields"]
+            agent_fields = _AgentFields(
+                id=af["id"],
+                name=af["name"],
+                status=af["status"],
+                instructions=af["instructions"],
             )
-            if agent_row is not None:
-                agent_fields = _AgentFields(
-                    id=int(agent_row.id),
-                    name=str(agent_row.name),
-                    status=agent_row.status,
-                    instructions=(
-                        str(agent_row.instructions)
-                        if agent_row.instructions is not None
-                        else None
-                    ),
-                )
-                if agent_row.status == AgentStatus.PUBLISHED:
-                    excluded_agent_id = agent_fields.id
-
-                agent_config = load_agent_builder_config(
-                    agent_row, session, int(task_fields.user_id)
-                )
-                (
-                    task_llm,
-                    task_fast_llm,
-                    task_vision_llm,
-                    task_compact_llm,
-                ) = agent_config["llms"]
 
         return TaskSetupSnapshot(
             task=task_fields,
-            task_pattern=task_pattern,
+            task_pattern=core["task_pattern"],
             task_llm=task_llm,
             task_fast_llm=task_fast_llm,
             task_vision_llm=task_vision_llm,
             task_compact_llm=task_compact_llm,
             agent=agent_fields,
-            agent_config=agent_config,
-            excluded_agent_id=excluded_agent_id,
+            agent_config=core["agent_config"],
+            excluded_agent_id=core["excluded_agent_id"],
         )
     finally:
         session.close()

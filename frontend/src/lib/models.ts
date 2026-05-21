@@ -5,16 +5,32 @@
 import { getApiUrl } from './utils';
 import { apiRequest } from './api-wrapper';
 
+export type DefaultModelType =
+  | 'general'
+  | 'small_fast'
+  | 'visual'
+  | 'compact'
+  | 'embedding'
+  | 'image'
+  | 'image_edit'
+  | 'asr'
+  | 'tts'
+  | 'speech';
+
 export interface Model {
   id: number;
   name: string;
   model_id: string;
+  model_name?: string;
   provider: string;
-  model_provider: 'llm' | 'embedding' | 'image';
+  model_provider: string;
+  category?: 'llm' | 'embedding' | 'image' | 'speech';
   api_key?: string;
   base_url?: string;
   max_tokens?: number;
   temperature?: number;
+  dimension?: number;
+  abilities?: string[];
   is_shared: boolean;
   created_by?: number;
   created_at: string;
@@ -24,7 +40,7 @@ export interface Model {
 export interface UserDefaultModel {
   id: number;
   user_id: number;
-  config_type: 'general' | 'small_fast' | 'visual' | 'compact' | 'embedding';
+  config_type: DefaultModelType;
   model_id: number;
   created_at: string;
   updated_at: string;
@@ -41,12 +57,17 @@ export interface DefaultModelConfig {
   visual?: ModelConfig;
   compact?: ModelConfig;
   embedding?: ModelConfig;
+  image?: ModelConfig;
+  image_edit?: ModelConfig;
+  asr?: ModelConfig;
+  tts?: ModelConfig;
+  speech?: ModelConfig;
 }
 
 /**
  * Get all models for current user
  */
-export async function getUserModels(token: string): Promise<Model[]> {
+export async function getUserModels(_token: string): Promise<Model[]> {
   const apiUrl = getApiUrl()
   const response = await apiRequest(`${apiUrl}/api/models/`);
 
@@ -60,7 +81,7 @@ export async function getUserModels(token: string): Promise<Model[]> {
 /**
  * Get user's default model configuration
  */
-export async function getUserDefaultModels(token: string): Promise<DefaultModelConfig> {
+export async function getUserDefaultModels(_token: string): Promise<DefaultModelConfig> {
   const apiUrl = getApiUrl()
   const response = await apiRequest(`${apiUrl}/api/models/user-default`);
 
@@ -75,8 +96,8 @@ export async function getUserDefaultModels(token: string): Promise<DefaultModelC
  * Set user's default model for a specific type
  */
 export async function setUserDefaultModel(
-  token: string,
-  configType: 'general' | 'small_fast' | 'visual' | 'compact' | 'embedding',
+  _token: string,
+  configType: DefaultModelType,
   modelId: number
 ): Promise<void> {
   const apiUrl = getApiUrl()
@@ -100,8 +121,8 @@ export async function setUserDefaultModel(
  * Remove user's default model for a specific type
  */
 export async function removeUserDefaultModel(
-  token: string,
-  configType: 'general' | 'small_fast' | 'visual' | 'compact' | 'embedding'
+  _token: string,
+  configType: DefaultModelType
 ): Promise<void> {
   const apiUrl = getApiUrl()
   const response = await apiRequest(`${apiUrl}/api/models/user-default/${configType}`, {
@@ -116,7 +137,7 @@ export async function removeUserDefaultModel(
 /**
  * Get system default models (fallback)
  */
-export async function getSystemDefaultModels(token: string): Promise<DefaultModelConfig> {
+export async function getSystemDefaultModels(_token: string): Promise<DefaultModelConfig> {
   const apiUrl = getApiUrl()
   const [general, smallFast, visual, compact, embedding] = await Promise.all([
     apiRequest(`${apiUrl}/api/models/default/general`)

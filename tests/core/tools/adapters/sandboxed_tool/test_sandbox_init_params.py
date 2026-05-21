@@ -6,7 +6,7 @@ import base64
 import json
 import threading
 from typing import Any, Optional
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import cloudpickle
 import pytest
@@ -246,13 +246,17 @@ class TestBuildExecutionEnv:
         env = wrapper._build_execution_env()
         assert env["MY_API_KEY"] == "secret"
 
-    def test_missing_env_var_warns(self, monkeypatch, caplog):
+    def test_missing_env_var_warns(self, monkeypatch):
         monkeypatch.delenv("NONEXISTENT_VAR", raising=False)
         wrapper = _create_test_wrapper(_FakeToolNoParams())
         wrapper._env_vars = ["NONEXISTENT_VAR"]
-        import logging
 
-        with caplog.at_level(logging.WARNING):
+        with patch(
+            "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper."
+            "logger.warning"
+        ) as mock_warning:
             env = wrapper._build_execution_env()
+
         assert "NONEXISTENT_VAR" not in env
-        assert "NONEXISTENT_VAR" in caplog.text
+        mock_warning.assert_called_once()
+        assert "NONEXISTENT_VAR" in mock_warning.call_args.args[0]

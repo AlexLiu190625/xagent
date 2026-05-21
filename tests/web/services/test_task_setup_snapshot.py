@@ -306,20 +306,22 @@ def test_session_closes_even_when_loader_raises(db_session) -> None:
     ``finally`` even when an inner query raises -- otherwise a leaked
     connection eventually exhausts the pool under load.
 
-    We simulate the failure by patching ``resolve_llms_from_names`` to
-    raise mid-load, then verify the snapshot session closed by
-    counting active connections on the SQLAlchemy engine before and
-    after. This is a structural test of the ``try/finally``, not of
-    the error message.
+    We simulate the failure by patching
+    ``resolve_task_runtime_config_core`` (the shared helper now
+    invoked by the snapshot loader) to raise mid-load, then verify
+    the snapshot session closed by issuing a fresh query against
+    ``db_session``. This is a structural test of the ``try/finally``,
+    not of the error message.
     """
     user = _create_user(db_session)
     task = _create_task(db_session, user_id=int(user.id))
 
     boom = RuntimeError("simulated llm-resolve failure")
+    # The snapshot loader does a lazy
+    # ``from .llm_utils import resolve_task_runtime_config_core``
+    # inside its body, so the patch must target the source module.
     with patch(
-        "xagent.web.services.task_setup_snapshot.resolve_llms_from_names"
-        if False
-        else "xagent.web.services.llm_utils.resolve_llms_from_names",
+        "xagent.web.services.llm_utils.resolve_task_runtime_config_core",
         side_effect=boom,
     ):
         with pytest.raises(RuntimeError, match="simulated llm-resolve failure"):

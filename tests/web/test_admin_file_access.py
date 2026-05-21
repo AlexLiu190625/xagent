@@ -9,6 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.file_storage.factory import get_file_storage
 from xagent.web.api.auth import hash_password
 from xagent.web.api.files import file_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -309,6 +310,74 @@ class TestAdminFileAccess:
 
         assert response.status_code == 200
         assert response.content == b"asset content"
+
+    def test_public_preview_restores_durable_relative_asset(
+        self, test_db, temp_uploads_dir, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+        get_file_storage.cache_clear()
+        admin_user, regular_user, test_app, session = test_db
+        del admin_user
+        regular_user_id = int(cast(Any, regular_user.id))
+        task = Task(
+            id=85,
+            user_id=regular_user_id,
+            title="Preview Task",
+            description="public durable preview test",
+        )
+        session.add(task)
+        session.commit()
+
+        uploaded_file = create_uploaded_file(
+            session,
+            temp_uploads_dir,
+            regular_user_id,
+            int(cast(Any, task.id)),
+            "index.html",
+            "<script src='assets/app.js'></script>",
+        )
+
+        asset_path = Path(str(uploaded_file.storage_path)).parent / "assets" / "app.js"
+        asset_path.parent.mkdir(parents=True, exist_ok=True)
+        asset_path.write_text("console.log('asset');", encoding="utf-8")
+        storage_key = (
+            f"users/{regular_user_id}/tasks/{task.id}/outputs/asset-file/"
+            "output/assets/app.js"
+        )
+        stored_object = get_file_storage().put_file(
+            asset_path,
+            storage_key,
+            "application/javascript",
+        )
+        asset_path.unlink()
+        asset_record = UploadedFile(
+            user_id=regular_user_id,
+            task_id=int(cast(Any, task.id)),
+            filename="app.js",
+            storage_path=str(asset_path),
+            storage_backend=stored_object.backend,
+            storage_key=stored_object.key,
+            storage_uri=stored_object.uri,
+            checksum=stored_object.checksum,
+            etag=stored_object.etag,
+            storage_status="available",
+            workspace_relative_path="output/assets/app.js",
+            workspace_category="output",
+            mime_type="application/javascript",
+            file_size=len("console.log('asset');".encode("utf-8")),
+        )
+        session.add(asset_record)
+        session.commit()
+
+        client = TestClient(test_app)
+        response = client.get(
+            f"/api/files/public/preview/{uploaded_file.file_id}",
+            params={"relative_path": "assets/app.js"},
+        )
+
+        assert response.status_code == 200
+        assert response.content == b"console.log('asset');"
+        assert asset_path.exists()
 
     def test_public_preview_blocks_parent_traversal(self, test_db, temp_uploads_dir):
         admin_user, regular_user, test_app, session = test_db

@@ -19,9 +19,12 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import tempfile
 from pathlib import Path
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +33,15 @@ UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
+FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
+FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
+FILE_MATERIALIZE_DIR = "XAGENT_FILE_MATERIALIZE_DIR"
+FILE_STORAGE_STARTUP_SYNC_ENABLED = "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 DATABASE_URL = "DATABASE_URL"
@@ -43,6 +51,7 @@ SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
+WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -50,6 +59,25 @@ TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
+
+
+def get_agent_runtime() -> Literal["v1", "v2"]:
+    """Get the agent execution runtime version.
+
+    Priority:
+        1. XAGENT_AGENT_RUNTIME environment variable
+        2. "v1" default for compatibility
+
+    Returns:
+        "v1" or "v2"
+    """
+    runtime = os.getenv(AGENT_RUNTIME, "v1").strip().lower()
+    if runtime == "v1":
+        return "v1"
+    if runtime == "v2":
+        return "v2"
+    logger.warning("Invalid %s=%r; falling back to v1", AGENT_RUNTIME, runtime)
+    return "v1"
 
 
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
@@ -74,16 +102,26 @@ def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
 def get_default_task_execution_mode(
     *,
     agent_id: object | None = None,
+    agent_runtime: str | None = None,
 ) -> str:
     """Get the default UI execution mode for a newly-created task.
 
     Standalone tasks default to auto so simple prompts can answer directly while
-    complex prompts can still route into ReAct or DAG. Agent Builder tasks keep
-    balanced because the agent's explicit tool/KB setup is usually better served
-    by ReAct.
+    complex prompts can still route into ReAct or DAG. Explicit v1 deployments
+    keep the legacy standalone DAG default for compatibility. Agent Builder
+    tasks keep balanced because the agent's explicit tool/KB setup is usually
+    better served by ReAct.
     """
     if agent_id is not None:
         return "balanced"
+
+    if agent_runtime is not None:
+        runtime = agent_runtime.strip().lower()
+    else:
+        runtime = (os.getenv(AGENT_RUNTIME) or "").strip().lower()
+
+    if runtime == "v1":
+        return "think"
     return "auto"
 
 
@@ -251,6 +289,74 @@ def get_max_upload_size_bytes() -> int:
         )
 
     return result
+
+
+def get_file_storage_uri() -> str:
+    """Get the durable file storage URI.
+
+    Priority:
+        1. XAGENT_FILE_STORAGE_URI environment variable
+        2. file://<storage-root>/files
+
+    Returns:
+        fsspec-compatible URI for durable user-visible file storage.
+    """
+    env_value = os.getenv(FILE_STORAGE_URI)
+    if env_value:
+        return env_value
+
+    return (get_storage_root().expanduser().resolve() / "files").as_uri()
+
+
+def get_file_storage_options() -> dict[str, Any]:
+    """Get fsspec provider options for durable file storage.
+
+    The value must be a JSON object. Provider-specific details such as S3
+    endpoint URL, region, or credentials profile live here to keep the config
+    surface small.
+    """
+    env_value = os.getenv(FILE_STORAGE_OPTIONS)
+    if not env_value:
+        return {}
+
+    try:
+        parsed = json.loads(env_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid {FILE_STORAGE_OPTIONS} value: {env_value!r}"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Invalid {FILE_STORAGE_OPTIONS} value: must be a JSON object")
+
+    return parsed
+
+
+def get_file_materialize_dir() -> Path:
+    """Get the local directory used for temporary durable-file materialization."""
+    env_value = os.getenv(FILE_MATERIALIZE_DIR)
+    if env_value:
+        return Path(env_value)
+
+    return Path(tempfile.gettempdir()) / "xagent-materialized"
+
+
+def get_file_storage_startup_sync_enabled() -> bool:
+    """Return whether registered local files should sync to durable storage at startup."""
+    env_value = os.getenv(FILE_STORAGE_STARTUP_SYNC_ENABLED)
+    if env_value is None or not env_value.strip():
+        return True
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_STORAGE_STARTUP_SYNC_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -577,6 +683,28 @@ def get_web_search_provider() -> str:
         provider,
     )
     return "auto"
+
+
+def get_web_crawl_tls_impersonate() -> str | None:
+    """Get the optional TLS impersonation spec for website crawling.
+
+    Priority:
+        1. XAGENT_WEB_CRAWL_TLS_IMPERSONATE environment variable
+        2. None (plain httpx)
+
+    Values:
+        - unset, empty, "none", or "null": None
+        - "auto": built-in crawler fallback chain
+        - any other non-empty value: curl_cffi impersonate spec
+    """
+    value = os.getenv(WEB_CRAWL_TLS_IMPERSONATE)
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"none", "null"}:
+        return None
+    return normalized
 
 
 def get_tool_max_recursion_depth() -> int:

@@ -34,6 +34,7 @@ from ...core.tools.core.RAG_tools.version_management.cascade_cleaner import (
 )
 from ...providers.vector_store.lancedb import get_connection_from_env
 from ..models.uploaded_file import UploadedFile
+from .uploaded_file_store import UploadedFileStore
 
 logger = logging.getLogger(__name__)
 
@@ -105,29 +106,13 @@ def upsert_uploaded_file_record(
     if scope.user_id is None:
         raise ValueError("user_id is required for UploadedFile upsert")
 
-    storage_path_str = str(storage_path)
-    existing = (
-        db.query(UploadedFile)
-        .filter(UploadedFile.storage_path == storage_path_str)
-        .first()
+    file_record = UploadedFileStore(db).upsert_by_storage_path(
+        user_id=scope.user_id,
+        filename=filename,
+        storage_path=storage_path,
+        mime_type=mime_type,
+        file_size=file_size,
     )
-    if existing:
-        existing.filename = filename  # type: ignore[assignment]
-        existing.file_size = int(file_size)  # type: ignore[assignment]
-        if mime_type is not None:
-            existing.mime_type = mime_type  # type: ignore[assignment]
-        db.flush()
-        file_record = existing
-    else:
-        file_record = UploadedFile(
-            user_id=scope.user_id,
-            filename=filename,
-            storage_path=storage_path_str,
-            mime_type=mime_type,
-            file_size=int(file_size),
-        )
-        db.add(file_record)
-        db.flush()
     db.commit()
     db.refresh(file_record)
 
@@ -297,12 +282,9 @@ def delete_uploaded_file_if_orphaned(
             resolved_path.unlink()
             logger.info("Deleted orphaned physical file: %s", resolved_path)
 
-    db.delete(file_record)
-    db.flush()
-
+    UploadedFileStore(db).delete(file_record, delete_local=False)
     # Invalidate cache for this user since file list changed
     _file_status_cache.invalidate_user(scope.user_id)
-
     return True
 
 
@@ -681,33 +663,20 @@ def reconcile_uploaded_files(
             )
             continue
 
-        # After relational/vector cleanup succeeds, delete physical file.
-        file_path = Path(str(record.storage_path))
-        uploads_root = get_uploads_dir().resolve()
         try:
-            resolved_path = file_path.resolve()
-            resolved_path.relative_to(uploads_root)
-        except ValueError:
-            logger.warning(
-                "Skipping stale file cleanup outside uploads root: %s",
-                file_path,
+            UploadedFileStore(db).delete(
+                record,
+                delete_local=True,
+                local_root=get_uploads_dir(),
             )
-        else:
-            if resolved_path.exists() and resolved_path.is_file():
-                try:
-                    resolved_path.unlink()
-                except OSError as exc:
-                    cleanup_errors += 1
-                    logger.error(
-                        "Failed to delete stale file %s for file_id=%s: %s",
-                        resolved_path,
-                        file_id,
-                        exc,
-                    )
-                    continue
-
-        # Finally delete the UploadedFile record
-        db.delete(record)
+        except Exception as exc:  # noqa: BLE001
+            cleanup_errors += 1
+            logger.error(
+                "Failed to delete stale UploadedFile storage for file_id=%s: %s",
+                file_id,
+                exc,
+            )
+            continue
         deleted += 1
         logger.info(
             "Deleted stale UploadedFile record: file_id=%s (cascade deleted %d related rows)",
