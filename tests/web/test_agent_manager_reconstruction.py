@@ -118,7 +118,9 @@ class TestAgentServiceManagerReconstruction:
         # 使用更高级的方法直接patch AgentService创建
         with (
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
-            patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
+            patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
+            ) as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
@@ -173,7 +175,9 @@ class TestAgentServiceManagerReconstruction:
         # 使用更高级的方法直接patch AgentService创建
         with (
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
-            patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
+            patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
+            ) as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
@@ -225,7 +229,9 @@ class TestAgentServiceManagerReconstruction:
 
         with (
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
-            patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
+            patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
+            ) as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
             patch("xagent.web.api.chat.get_uploads_dir", return_value=uploads_dir),
             patch(
@@ -268,7 +274,9 @@ class TestAgentServiceManagerReconstruction:
         # 使用更高级的方法直接patch AgentService创建
         with (
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
-            patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
+            patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names"
+            ) as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
@@ -367,7 +375,7 @@ class TestAgentServiceManagerReconstruction:
         runtime_llm.model_name = "task-qwen"
         with (
             patch(
-                "xagent.web.api.chat.resolve_llms_from_names",
+                "xagent.web.services.llm_utils.UserAwareModelStorage.resolve_llms_from_names",
                 return_value=(runtime_llm, None, None, None),
             ),
             patch(
