@@ -3,10 +3,12 @@
 import React, { createContext, useContext, useReducer, useCallback, useEffect, useState, useRef } from "react"
 import { FileText, Target, Zap, CheckCircle, XCircle, Clock, Wrench, Activity, Search, Lightbulb, AlertTriangle, Info, Brain, Bot, Sparkles } from "lucide-react"
 import { JsonRenderer } from "../components/ui/markdown-renderer"
-import { FileAttachment } from "@/components/file/file-attachment"
+import { buildUserMessageContent } from "@/components/chat/user-message-content"
 import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "../components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
+import { extractUserMessageFiles } from "@/lib/chat-files"
+import { upsertUserMessageAttachment } from "@/lib/chat-message-upsert"
 
 interface WebSocketMessage {
   type: string
@@ -23,6 +25,7 @@ import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
+import { normalizeTimestampMs } from "@/lib/time-utils"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -136,10 +139,12 @@ interface Message {
   id: string
   role: "user" | "assistant"
   content: string | React.ReactNode
+  rawContent?: string
   timestamp: string
   status?: "pending" | "running" | "completed" | "failed"
   isResult?: boolean
   isFileOutput?: boolean
+  hasFileAttachments?: boolean
   interactions?: unknown[]
 }
 
@@ -282,6 +287,7 @@ interface AppState {
 type AppAction =
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADD_MESSAGE"; payload: Message }
+  | { type: "UPSERT_USER_MESSAGE_ATTACHMENT"; payload: { matchText: string; message: Message } }
   | { type: "SET_CURRENT_TASK"; payload: Task }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: unknown[] } }
   | { type: "SET_DAG_EXECUTION"; payload: DAGExecution | null }
@@ -340,6 +346,14 @@ const initialState: AppState = {
   planMemoryInfo: null,
 }
 
+const normalizeMessagePayload = (message: Message): Message => ({
+  ...message,
+  rawContent:
+    message.rawContent ??
+    (typeof message.content === "string" ? message.content : undefined),
+  hasFileAttachments: message.hasFileAttachments ?? false,
+})
+
 function appReducer(state: AppState, action: AppAction): AppState {
   console.log('🔍 Reducer called with action:', action.type, action)
 
@@ -355,15 +369,29 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return newState
 
     case "ADD_MESSAGE":
-      const newMessage = action.payload
+      const newMessage = normalizeMessagePayload(action.payload)
       const updatedMessages = [...state.messages, newMessage]
       // Sort messages by timestamp
       updatedMessages.sort((a, b) => {
-        const timeA = typeof a.timestamp === 'number' ? a.timestamp : new Date(a.timestamp).getTime()
-        const timeB = typeof b.timestamp === 'number' ? b.timestamp : new Date(b.timestamp).getTime()
-        return timeA - timeB
+        return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
       })
       return { ...state, messages: updatedMessages }
+
+    case "UPSERT_USER_MESSAGE_ATTACHMENT": {
+      const messageToAdd = normalizeMessagePayload(action.payload.message)
+      const messages = upsertUserMessageAttachment(
+        state.messages,
+        action.payload.matchText,
+        messageToAdd,
+      )
+      if (messages === state.messages) {
+        return state
+      }
+      messages.sort((a, b) => {
+        return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
+      })
+      return { ...state, messages }
+    }
 
     case "SET_CURRENT_TASK":
       return { ...state, currentTask: action.payload }
@@ -848,30 +876,34 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
             if (isDuplicate) {
               console.log('⚠️ User message filtered as duplicate:', messageContent)
+              const files = extractUserMessageFiles(eventData)
+              if (files.length > 0) {
+                dispatch({
+                  type: "UPSERT_USER_MESSAGE_ATTACHMENT",
+                  payload: {
+                    matchText: messageContent,
+                    message: {
+                      id: generateMessageId("msg-user"),
+                      role: "user",
+                      content: buildUserMessageContent(messageContent, files),
+                      rawContent: messageContent,
+                      timestamp: message.timestamp,
+                      hasFileAttachments: true,
+                    },
+                  },
+                })
+              }
               return
             }
 
-            // Extract files from context.state.file_info (based on the actual WS event structure)
-            let files = eventData.files || []
-            if (eventData.context && eventData.context.state && eventData.context.state.file_info) {
-              files = eventData.context.state.file_info
-            }
+            const files = extractUserMessageFiles(eventData)
 
             console.log('📁 Files extracted:', files)
             console.log('🔍 Context structure:', eventData.context)
             console.log('🔍 State structure:', eventData.context?.state)
 
             // Create message content with file attachments
-            let content: React.ReactNode = messageContent
-
-            if (files.length > 0) {
-              content = (
-                <div className="space-y-2">
-                  <div>{messageContent}</div>
-                  <FileAttachment files={files} variant="user-message" />
-                </div>
-              )
-            }
+            const content = buildUserMessageContent(messageContent, files)
 
             console.log('📤 Dispatching user message:', {
               content,
@@ -884,7 +916,9 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               id: generateMessageId("msg-user"),
               role: "user" as const,
               content: content,
+              rawContent: messageContent,
               timestamp: message.timestamp,
+              hasFileAttachments: files.length > 0,
             }
 
             console.log('📤 Message payload:', messagePayload)

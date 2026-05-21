@@ -75,6 +75,25 @@ def _file_integrity_failed() -> HTTPException:
     )
 
 
+def _download_content_disposition(media_type: str) -> str:
+    return (
+        "inline"
+        if media_type.startswith(("image/", "video/", "audio/", "text/"))
+        else "attachment"
+    )
+
+
+def _download_file_response(
+    path: Path, file_name: str, media_type: str
+) -> FileResponse:
+    return FileResponse(
+        path=str(path),
+        filename=file_name,
+        media_type=media_type,
+        content_disposition_type=_download_content_disposition(media_type),
+    )
+
+
 async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path) -> int:
     """Persist an uploaded file while enforcing the configured size limit."""
     total_size = 0
@@ -820,35 +839,11 @@ async def download_file(
         media_type = guess_media_type(file_name)
         _ensure_under_uploads(full_path, owner_user_id)
         if full_path.exists() and full_path.is_file():
-            content_disposition = (
-                "inline"
-                if media_type.startswith(("image/", "video/", "audio/", "text/"))
-                else "attachment"
-            )
-            return FileResponse(
-                path=str(full_path),
-                filename=file_name,
-                media_type=media_type,
-                headers={
-                    "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
-                },
-            )
+            return _download_file_response(full_path, file_name, media_type)
         if file_ref.has_durable_object:
-            content_disposition = (
-                "inline"
-                if media_type.startswith(("image/", "video/", "audio/", "text/"))
-                else "attachment"
-            )
             try:
                 restored_path = file_ref.ensure_local()
-                return FileResponse(
-                    path=str(restored_path),
-                    filename=file_name,
-                    media_type=media_type,
-                    headers={
-                        "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
-                    },
-                )
+                return _download_file_response(restored_path, file_name, media_type)
             except DurableObjectIntegrityError as exc:
                 raise _file_integrity_failed() from exc
             except DurableStorageOperationError as exc:
@@ -865,22 +860,7 @@ async def download_file(
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    # For images and other viewable content, set Content-Disposition to inline
-    # to allow browser to display the file instead of downloading it
-    content_disposition = (
-        "inline"
-        if media_type.startswith(("image/", "video/", "audio/", "text/"))
-        else "attachment"
-    )
-
-    return FileResponse(
-        path=str(full_path),
-        filename=file_name,
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
-        },
-    )
+    return _download_file_response(full_path, file_name, media_type)
 
 
 @file_router.get("/preview/{file_id:path}", response_model=None)

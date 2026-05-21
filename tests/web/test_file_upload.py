@@ -816,6 +816,34 @@ class TestFileManagement:
             # If upload failed, skip download test
             pytest.skip("Upload failed, skipping download test")
 
+    def test_download_file_with_unicode_filename(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """Unicode filenames should produce an RFC 5987 content disposition."""
+        upload_response = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "中文 文件.docx",
+                    b"unicode filename content",
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload_response.status_code == 200
+        file_id = upload_response.json()["file_id"]
+
+        response = client.get(f"/api/files/download/{file_id}", headers=auth_headers)
+
+        assert response.status_code == 200
+        assert response.content == b"unicode filename content"
+        content_disposition = response.headers["content-disposition"]
+        assert content_disposition.startswith("attachment;")
+        assert "filename*=utf-8''" in content_disposition.lower()
+        assert "%E4%B8%AD%E6%96%87%20%E6%96%87%E4%BB%B6.docx" in content_disposition
+
     def test_download_file_not_found(self, client, test_db, auth_headers):
         """Test downloading non-existent file"""
         response = client.get(

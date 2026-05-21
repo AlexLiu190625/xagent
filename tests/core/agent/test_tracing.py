@@ -107,6 +107,168 @@ async def test_trace_callback_prefers_latest_message_display_metadata() -> None:
 
 
 @pytest.mark.asyncio
+async def test_trace_callback_emits_display_files_from_context_metadata() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-trace")
+    context.metadata["task"] = "Read file"
+    context.metadata["request_context"] = {
+        "file_info": [
+            {
+                "file_id": "file-123",
+                "name": "normalized.md",
+                "original_name": "brief.md",
+                "size": 42,
+                "type": "text/markdown",
+                "storage_path": "/tmp/secret/brief.md",
+            }
+        ]
+    }
+
+    await callback.on_run_start(runner=runner, context=context)
+
+    assert tracer.events[0]["data"]["files"] == [
+        {
+            "file_id": "file-123",
+            "name": "brief.md",
+            "size": 42,
+            "type": "text/markdown",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_emits_display_files_from_message_metadata() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-trace")
+    context.metadata["task"] = "Read file"
+    message = context.add_user_message(
+        "Read file\n\n## UPLOADED FILES\nfile_id=file-123",
+        metadata={
+            "display_message": "Read file",
+            "files": [
+                {
+                    "file_id": "file-123",
+                    "name": "brief.md",
+                    "size": 42,
+                    "type": "text/markdown",
+                    "storage_path": "/tmp/secret/brief.md",
+                }
+            ],
+        },
+    )
+
+    await callback.on_user_message_posted(
+        runner=runner,
+        context=context,
+        message=message,
+    )
+
+    assert tracer.events[0]["data"]["message"] == "Read file"
+    assert tracer.events[0]["data"]["files"] == [
+        {
+            "file_id": "file-123",
+            "name": "brief.md",
+            "size": 42,
+            "type": "text/markdown",
+        }
+    ]
+    assert "storage_path" not in tracer.events[0]["data"]["files"][0]
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_does_not_reuse_historical_message_files() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-trace")
+    context.metadata["task"] = "Summarize this"
+    context.add_user_message(
+        "Read file",
+        metadata={
+            "files": [
+                {
+                    "file_id": "old-file",
+                    "filename": "old.md",
+                    "file_size": 42,
+                    "mime_type": "text/markdown",
+                }
+            ]
+        },
+    )
+    context.add_user_message("Summarize this")
+
+    await callback.on_run_start(runner=runner, context=context)
+
+    assert "files" not in tracer.events[0]["data"]
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_uses_only_latest_message_files() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-trace")
+    context.metadata["task"] = "Read latest file"
+    old_message = context.add_user_message(
+        "Read old file",
+        metadata={
+            "files": [
+                {
+                    "file_id": "old-file",
+                    "name": "old.md",
+                    "size": 42,
+                    "type": "text/markdown",
+                }
+            ]
+        },
+    )
+    callback._mark_traced(context, old_message)
+    context.add_user_message(
+        "Read latest file",
+        metadata={
+            "files": [
+                {
+                    "file_id": "new-file",
+                    "name": "new.md",
+                    "size": 84,
+                    "type": "text/markdown",
+                    "storage_path": "/tmp/secret/new.md",
+                }
+            ]
+        },
+    )
+    _stamp_pending(context)
+
+    await callback.on_run_start(runner=runner, context=context, resume=True)
+
+    assert tracer.events[0]["data"]["files"] == [
+        {
+            "file_id": "new-file",
+            "name": "new.md",
+            "size": 84,
+            "type": "text/markdown",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_omits_files_when_context_has_no_files() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-trace")
+    context.metadata["task"] = "No files"
+
+    await callback.on_run_start(runner=runner, context=context)
+
+    assert "files" not in tracer.events[0]["data"]
+
+
+@pytest.mark.asyncio
 async def test_trace_callback_failed_run_emits_error() -> None:
     tracer = TraceRecorder()
     callback = TraceEventCallback()

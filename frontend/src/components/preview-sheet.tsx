@@ -17,11 +17,11 @@ export function PreviewSheet({ open, onOpenChange, title, actions, children }: P
   return (
     <div className="w-full border rounded-xl overflow-hidden bg-background flex flex-col h-[100%] shadow-lg">
       <div data-slot="sheet-header" className="flex flex-col gap-1.5 p-4 flex-shrink-0 bg-background/80 backdrop-blur-sm border-b">
-        <div className="flex items-center justify-between">
-          <h3 data-slot="sheet-title" className="text-foreground font-semibold flex items-center gap-2">
+        <div className="flex min-w-0 items-center justify-between gap-3">
+          <h3 data-slot="sheet-title" className="min-w-0 flex-1 truncate text-foreground font-semibold">
             {title}
           </h3>
-          <div className="flex items-center gap-2">
+          <div className="flex shrink-0 items-center gap-2">
             {actions}
             <Button
               variant="outline"
