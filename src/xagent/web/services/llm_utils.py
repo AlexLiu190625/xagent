@@ -956,12 +956,11 @@ class AgentRuntimeFields:
     """Primitive subset of the ``Agent`` row produced by
     ``resolve_task_runtime_config_core``.
 
-    Snapshot consumers (``load_task_setup_snapshot_sync``) can use
-    this directly as the frozen ``_AgentFields`` they expose;
-    main-loop consumers (``_reconstruct_agent_from_history``) read
-    these fields off the resolved ``RuntimeConfig`` and don't need
-    primitive isolation, but the same fields are convenient for log
-    lines etc.
+    Snapshot consumers (``load_task_setup_snapshot_sync``) expose
+    this directly on ``TaskSetupSnapshot.agent``; main-loop
+    consumers (``_reconstruct_agent_from_history``) read the same
+    fields off the resolved ``RuntimeConfig``. One dataclass, both
+    code paths -- no parallel definitions to drift.
     """
 
     id: int

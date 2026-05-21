@@ -40,9 +40,9 @@ from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     TaskSetupSnapshot,
-    _AgentFields,
     _TaskFields,
 )
 
@@ -171,7 +171,7 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
         task_fast_llm=None,
         task_vision_llm=None,
         task_compact_llm=None,
-        agent=_AgentFields(
+        agent=AgentRuntimeFields(
             id=7,
             name="dedup agent",
             status=AgentStatus.PUBLISHED,

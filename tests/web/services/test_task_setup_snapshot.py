@@ -32,9 +32,9 @@ from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.llm_utils import AgentRuntimeFields
 from xagent.web.services.task_setup_snapshot import (
     TaskSetupSnapshot,
-    _AgentFields,
     _TaskFields,
     load_task_setup_snapshot_sync,
 )
@@ -155,7 +155,7 @@ def test_agent_builder_published_sets_excluded_agent_id(db_session) -> None:
 
     assert snapshot is not None
     assert snapshot.agent is not None
-    assert isinstance(snapshot.agent, _AgentFields)
+    assert isinstance(snapshot.agent, AgentRuntimeFields)
     assert snapshot.agent.id == int(agent.id)
     assert snapshot.agent.name == "snap-agent"
     assert snapshot.agent.status == AgentStatus.PUBLISHED
@@ -250,8 +250,8 @@ def test_no_orm_leak_in_returned_fields(db_session) -> None:
         snapshot.task.agent_config, dict
     )
 
-    # _AgentFields (when present): same invariant.
-    assert isinstance(snapshot.agent, _AgentFields)
+    # AgentRuntimeFields (when present): same invariant.
+    assert isinstance(snapshot.agent, AgentRuntimeFields)
     assert isinstance(snapshot.agent.id, int)
     assert isinstance(snapshot.agent.name, str)
     assert isinstance(snapshot.agent.status, AgentStatus)

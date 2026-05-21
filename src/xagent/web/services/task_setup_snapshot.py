@@ -63,16 +63,6 @@ class _TaskFields:
     agent_type: Optional[str]
 
 
-# ``_AgentFields`` historically lived here as the snapshot's local
-# frozen subset of the ``Agent`` row. The same shape is produced by
-# ``llm_utils.resolve_task_runtime_config_core`` as
-# ``AgentRuntimeFields`` -- a single source of truth shared with the
-# main-loop reconstruct path. We re-export the alias here so the
-# field type on ``TaskSetupSnapshot.agent`` reads naturally at the
-# call site and existing imports keep working.
-_AgentFields = AgentRuntimeFields
-
-
 @dataclass(frozen=True)
 class TaskSetupSnapshot:
     """All synchronous DB state that ``get_agent_for_task`` needs to
@@ -92,8 +82,11 @@ class TaskSetupSnapshot:
     task_vision_llm: Optional[BaseLLM]
     task_compact_llm: Optional[BaseLLM]
     # Agent Builder configuration -- only populated when
-    # ``task.agent_id`` resolves to an existing ``Agent`` row.
-    agent: Optional[_AgentFields]
+    # ``task.agent_id`` resolves to an existing ``Agent`` row. The
+    # frozen dataclass lives in ``llm_utils`` because the same shape
+    # is also produced by ``resolve_task_runtime_config_core`` for
+    # the main-loop reconstruct path; one definition, one home.
+    agent: Optional[AgentRuntimeFields]
     agent_config: Optional[dict]
     excluded_agent_id: Optional[int]
 
@@ -103,9 +96,10 @@ class TaskSetupSnapshot:
 # This loader is the off-loop wrapper that:
 #   1. opens its own ``SessionLocal``,
 #   2. calls the shared core to do the actual resolution,
-#   3. converts the ORM ``Task`` / ``Agent`` rows it pulls into frozen
-#      primitive ``_TaskFields`` / ``_AgentFields`` so nothing escapes
-#      the loader's session.
+#   3. wraps the resulting ORM ``Task`` row in a frozen
+#      ``_TaskFields`` so nothing escapes the loader's session
+#      (``Agent`` primitives are already provided by the core as an
+#      ``AgentRuntimeFields`` instance).
 # The main-loop reconstruct path (``_resolve_task_runtime_config`` in
 # chat.py) calls the same core directly, since it doesn't need the
 # primitive wrapping and runs inside the request session's lifetime.
@@ -164,8 +158,7 @@ def load_task_setup_snapshot_sync(
         task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
 
         # ``core.agent_fields`` is already an ``AgentRuntimeFields``
-        # frozen dataclass; pass it through directly. (``_AgentFields``
-        # is an alias for that type — see top of file.)
+        # frozen dataclass; pass it through directly.
         return TaskSetupSnapshot(
             task=task_fields,
             task_pattern=core.task_pattern,
