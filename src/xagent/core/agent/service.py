@@ -77,6 +77,26 @@ class AgentService:
             self._tools_initialized = tools is not None
         else:
             self._tools_initialized = tools_initialized
+        # Upstream's ``_ensure_tools_initialized`` gates the rebuild on
+        # ``policy_signature == self._tool_policy_signature``. When the
+        # caller pre-supplies tools (the PR1 fast path above) we also
+        # need to capture the current signature, otherwise the very
+        # first ``execute_task`` would see ``None != current`` and
+        # rebuild anyway — re-introducing the duplicate factory call
+        # PR1 was meant to eliminate. Re-reading the hook here is
+        # cheap; the signature naturally invalidates when policy
+        # changes later, restoring upstream's rebuild semantics.
+        self._tool_policy_signature: Any | None = None
+        if self._tools_initialized and self.tool_config:
+            try:
+                self._tool_policy_signature = self._current_tool_policy_signature()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to capture initial tool policy signature for "
+                    "AgentService '%s': %s; first execute may rebuild tools",
+                    name,
+                    exc,
+                )
         self._is_paused = False
         self._pause_event = None
         self._current_runner = None
@@ -556,7 +576,7 @@ class AgentService:
             return None
 
     async def _ensure_tools_initialized(self) -> None:
-        if self.tool_config and not self._tools_initialized:
+        if self.tool_config:
             try:
                 from ..tools.adapters.vibe.factory import ToolFactory
 
@@ -566,16 +586,16 @@ class AgentService:
                 ):
                     self.tool_config._workspace_config["task_id"] = self.id
 
+                policy_signature = self._current_tool_policy_signature()
+                if (
+                    self._tools_initialized
+                    and policy_signature == self._tool_policy_signature
+                ):
+                    return
+
+                # Rebuild the tool list so disabled tools disappear from reused agents.
                 new_tools = await ToolFactory.create_all_tools(self.tool_config)
-                existing_tool_names = {
-                    tool.name for tool in self.tools if hasattr(tool, "name")
-                }
-                for tool in new_tools:
-                    if (
-                        not hasattr(tool, "name")
-                        or tool.name not in existing_tool_names
-                    ):
-                        self.tools.append(tool)
+                self.tools = list(new_tools)
 
                 if hasattr(self.tool_config, "get_allowed_tools"):
                     allowed_tools = self.tool_config.get_allowed_tools()
@@ -591,11 +611,48 @@ class AgentService:
                 if self._execution_adapter is not None:
                     self._execution_adapter.config.tools = self.tools
                 self._tools_initialized = True
+                self._tool_policy_signature = policy_signature
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)
                 raise RuntimeError(
                     f"Tool initialization failed for AgentService '{self.name}': {exc}"
                 ) from exc
+
+    def _current_tool_policy_signature(self) -> tuple[Any, ...]:
+        if not self.tool_config:
+            return ()
+
+        refresh_overrides = getattr(
+            self.tool_config, "refresh_user_tool_overrides", None
+        )
+        if callable(refresh_overrides):
+            # Re-read the hook-backed policy before comparing signatures.
+            refresh_overrides()
+
+        get_overrides = getattr(self.tool_config, "get_user_tool_overrides", None)
+        overrides: Any = get_overrides() if callable(get_overrides) else {}
+        if isinstance(overrides, dict):
+            override_items = tuple(
+                sorted(
+                    (
+                        str(name),
+                        override.get("enabled") if isinstance(override, dict) else None,
+                    )
+                    for name, override in overrides.items()
+                )
+            )
+        else:
+            override_items = ()
+
+        get_allowed_tools = getattr(self.tool_config, "get_allowed_tools", None)
+        allowed_tools = get_allowed_tools() if callable(get_allowed_tools) else None
+        allowed_items = (
+            None
+            if allowed_tools is None
+            else tuple(str(name) for name in allowed_tools)
+        )
+
+        return (override_items, allowed_items)
 
     def _execution_type(self) -> str:
         if self.pattern == "dag_plan_execute":

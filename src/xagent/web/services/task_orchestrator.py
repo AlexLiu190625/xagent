@@ -49,10 +49,11 @@ import enum
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from ..models.task import Task, TaskStatus
 from ..models.user import User
+from .hot_path_cache import invalidate_task_cache
 from .task_lease_service import (
     acquire_task_lease_isolated,
     get_runner_id,
@@ -94,6 +95,12 @@ class TaskTurnPayload:
 
     transcript_message: str
     execution_message: Optional[str] = None
+    # Per-turn uploaded-file metadata persisted alongside the transcript
+    # row so historical replay can render the same clickable chips the
+    # user saw live. Each entry is the minimal chip shape (file_id,
+    # name, size, type) — already path-stripped by the websocket layer
+    # before reaching here.
+    attachments: Optional[List[Dict[str, Any]]] = None
 
     @property
     def for_agent(self) -> str:
@@ -293,6 +300,7 @@ class TaskTurnOrchestrator:
                 task_id=task_id,
                 user_id=int(user.id),
                 content=payload.transcript_message,
+                attachments=payload.attachments,
             )
             if persisted_message is not None:
                 db.flush()
@@ -300,6 +308,7 @@ class TaskTurnOrchestrator:
             else:
                 before_message_id = None
             db.commit()
+            invalidate_task_cache(task_id)
         except TaskTurnError:
             raise
         except Exception:
@@ -422,6 +431,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             fresh.output = latest_assistant.content
             fresh.error_message = None
             bg_db.commit()
+            invalidate_task_cache(task_id)
             logger.info(
                 "finish_turn: task %s output written (%d chars)",
                 task_id,
@@ -448,6 +458,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             changed = True
         if changed:
             bg_db.commit()
+            invalidate_task_cache(task_id)
             logger.info(
                 "finish_turn: task %s marked failed (cleared stale output)",
                 task_id,
@@ -484,6 +495,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         fresh.error_message = "Task execution failed without status update; see /steps."
         fresh.output = None  # latest-turn snapshot invariant
         bg_db.commit()
+        invalidate_task_cache(task_id)
         logger.warning(
             "finish_turn: task %s bg coroutine returned with status=RUNNING; "
             "flipping to FAILED",

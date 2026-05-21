@@ -354,6 +354,12 @@ class WebToolConfig(BaseToolConfig):
             self._cached_tool_overrides = {}
         return self._cached_tool_overrides
 
+    def refresh_user_tool_overrides(self) -> dict:
+        """Reload per-user tool overrides from the registered hook."""
+        # The policy can change while an AgentService instance is reused.
+        self._cached_tool_overrides = None
+        return self.get_user_tool_overrides()
+
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""
         return getattr(self, "_excluded_agent_id", None)

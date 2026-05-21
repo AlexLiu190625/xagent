@@ -38,6 +38,12 @@ def _build_post_body(author_urn: str, text: str) -> dict:
     }
 
 
+def _sanitize_post_text(text: str) -> str:
+    # Escape ASCII parentheses before publishing to avoid LinkedIn truncating
+    # automated posts at the first bracket in some publishing flows.
+    return text.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)")
+
+
 def _get_author_urn(headers: dict, proxies: dict | None) -> str:
     r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
     r.raise_for_status()
@@ -228,7 +234,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=r.text)]
 
         elif name == "create_post":
-            text = str(arguments.get("text") or "")
+            text = _sanitize_post_text(str(arguments.get("text") or ""))
             image_path = (arguments.get("image_path") or "").strip()
             alt_text = str(arguments.get("altText") or "")
             author_urn = _get_author_urn(headers, proxies)
@@ -257,14 +263,18 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             ]
 
         elif name == "create_article_post":
-            text = str(arguments.get("text") or "")
+            text = _sanitize_post_text(str(arguments.get("text") or ""))
             author_urn = _get_author_urn(headers, proxies)
             body = _build_post_body(author_urn, text)
             body["content"] = {
                 "article": {
                     "source": arguments.get("articleUrl"),
-                    "title": arguments.get("articleTitle"),
-                    "description": arguments.get("articleDescription", ""),
+                    "title": _sanitize_post_text(
+                        str(arguments.get("articleTitle") or "")
+                    ),
+                    "description": _sanitize_post_text(
+                        str(arguments.get("articleDescription") or "")
+                    ),
                 }
             }
             r2 = requests.post(
@@ -297,7 +307,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
         elif name == "create_comment":
             post_urn = arguments.get("post_urn")
-            text = str(arguments.get("text") or "")
+            text = _sanitize_post_text(str(arguments.get("text") or ""))
             r = requests.get(USERINFO_URL, headers=headers, proxies=proxies)
             r.raise_for_status()
             sub = r.json().get("sub", "")

@@ -1,6 +1,7 @@
 """Unit tests for AgentServiceManager task existence checking and reconstruction"""
 
 from datetime import datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -258,6 +259,57 @@ class TestAgentServiceManagerReconstruction:
         workspace_config = tool_config.get_workspace_config()
         assert workspace_config["base_dir"] == str(uploads_dir / "user_7")
         assert str(uploads_dir / "user_7") in workspace_config["allowed_external_dirs"]
+
+    @pytest.mark.asyncio
+    async def test_build_tools_maps_categories_from_full_catalog(
+        self, agent_manager, mock_db, sample_task, mock_user, monkeypatch
+    ):
+        """Disabled runtime tools should still be eligible for category allow-lists."""
+
+        class _Tool:
+            description = ""
+
+            def __init__(self, name: str, category: str) -> None:
+                self.name = name
+                self.metadata = SimpleNamespace(
+                    category=SimpleNamespace(value=category)
+                )
+
+        basic_tool = _Tool("calculator", "basic")
+        browser_tool = _Tool("browser_navigate", "browser")
+        override_filter_values: list[bool] = []
+
+        async def create_all_tools(
+            config,
+            apply_user_override_filter: bool = True,
+        ):
+            override_filter_values.append(apply_user_override_filter)
+            if apply_user_override_filter:
+                return [basic_tool]
+            return [basic_tool, browser_tool]
+
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            create_all_tools,
+        )
+
+        with patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None):
+            _tools, tool_config = await agent_manager._build_tools_for_task(
+                task_id=sample_task.id,
+                task=sample_task,
+                db=mock_db,
+                user=mock_user,
+                agent_config={
+                    "tool_categories": ["browser"],
+                    "knowledge_bases": [],
+                    "skills": [],
+                },
+                task_llm=None,
+                task_vision_llm=None,
+            )
+
+        assert override_filter_values[0] is False
+        assert tool_config.get_allowed_tools() == ["browser_navigate"]
 
     @pytest.mark.asyncio
     async def test_get_agent_for_task_existing_task_with_reconstruction(
