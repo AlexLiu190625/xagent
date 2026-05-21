@@ -13,7 +13,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
-from ..config import get_upload_path
+from ..config import get_upload_path, sanitize_path_component
 from ..kb_physical_sync import collection_physical_lock, move_collection_dir_to_trash
 from ..models.uploaded_file import UploadedFile
 from .kb_file_service import delete_uploaded_file_if_orphaned
@@ -39,6 +39,81 @@ class CollectionPhysicalRenameResult:
     error: Optional[str] = None
     old_collection_dir: Optional[Path] = None
     new_collection_dir: Optional[Path] = None
+
+
+def _path_belongs_to_collection_dir(
+    storage_path: str,
+    *,
+    owner_id: int,
+    collection_name: str,
+) -> bool:
+    """Return True when a stored path is under the owner's collection dir."""
+    try:
+        collection_dir = get_upload_path(
+            "",
+            user_id=owner_id,
+            collection=collection_name,
+            create_if_not_exists=False,
+            collection_is_sanitized=True,
+        ).resolve()
+        file_path = Path(storage_path).resolve()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Skipping collection owner discovery for invalid path %s: %s",
+            storage_path,
+            exc,
+        )
+        return False
+    return file_path == collection_dir or collection_dir in file_path.parents
+
+
+def list_collection_uploaded_file_owner_ids(
+    db: Session,
+    *,
+    collection_name: str,
+) -> Set[int]:
+    """List UploadedFile owners with files under a collection directory."""
+    owner_ids: Set[int] = set()
+    try:
+        safe_collection = sanitize_path_component(collection_name, "collection")
+    except ValueError:
+        logger.debug("Invalid collection name for UploadedFile owner discovery")
+        return owner_ids
+
+    try:
+        candidates = (
+            db.query(UploadedFile.user_id, UploadedFile.storage_path)
+            .filter(
+                UploadedFile.user_id.isnot(None),
+                UploadedFile.storage_path.contains(safe_collection),
+            )
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to list UploadedFile owner candidates for %s: %s",
+            collection_name,
+            exc,
+        )
+        return owner_ids
+
+    for row in candidates:
+        raw_user_id = getattr(row, "user_id", None)
+        storage_path = getattr(row, "storage_path", None)
+        if raw_user_id is None or not storage_path:
+            continue
+        try:
+            owner_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            logger.debug("Skipping invalid UploadedFile user_id: %r", raw_user_id)
+            continue
+        if _path_belongs_to_collection_dir(
+            str(storage_path),
+            owner_id=owner_id,
+            collection_name=safe_collection,
+        ):
+            owner_ids.add(owner_id)
+    return owner_ids
 
 
 def delete_collection_physical_dir(

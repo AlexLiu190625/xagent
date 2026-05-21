@@ -13,8 +13,19 @@ import threading
 import time
 import unicodedata
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypedDict, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    TypedDict,
+    TypeVar,
+    cast,
+)
 
 from fastapi import (
     APIRouter,
@@ -78,7 +89,11 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
 )
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
-from ...core.tools.core.RAG_tools.storage.factory import get_vector_index_store
+from ...core.tools.core.RAG_tools.storage.factory import (
+    get_ingestion_status_store,
+    get_metadata_store,
+    get_vector_index_store,
+)
 from ...core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
@@ -98,6 +113,7 @@ from ..models.user import User
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
     delete_collection_uploaded_files,
+    list_collection_uploaded_file_owner_ids,
     rename_collection_storage,
 )
 from ..services.kb_file_service import (
@@ -2840,11 +2856,22 @@ class ResolvedDocumentMatch(TypedDict):
     source_path: Optional[str]
 
 
-_DELETE_SHARED_COLLECTION_DETAIL = (
-    "Only admin users can delete collections containing documents from other users."
-)
-
 _CONFIG_ONLY_SENTINEL_KEY = "__config_only__"
+_DeleteMode = Literal["full", "config_only"]
+_CollectionMutationMode = Literal["tenant", "global"]
+
+
+@dataclass
+class CollectionMutationScope:
+    """Resolved collection mutation boundary for tenant/global operations."""
+
+    mode: _CollectionMutationMode
+    collection_name: str
+    requester_user_id: int
+    is_admin: bool
+    owner_user_ids: set[int]
+    document_records: List[DocumentRecord]
+    file_ids_by_owner: Dict[int, set[str]]
 
 
 def _http_detail_to_str(detail: Any) -> str:
@@ -2886,36 +2913,16 @@ def _get_collection_document_counts(
     return total_count, own_count
 
 
-def _check_can_delete_collection(
-    collection_name: str,
-    user_id: int,
-    is_admin: bool,
-) -> None:
-    """Validate collection name and non-admin full-delete permission."""
-    if not collection_name or not collection_name.strip():
-        raise HTTPException(status_code=422, detail="Collection name cannot be empty")
-    if is_admin:
-        return
-
-    total_count, own_count = _get_collection_document_counts(
-        collection_name, user_id, is_admin=False
-    )
-    if total_count > 0 and own_count < total_count:
-        raise HTTPException(status_code=403, detail=_DELETE_SHARED_COLLECTION_DETAIL)
-
-
 def _resolve_delete_mode_from_counts(
     total_count: int,
     own_count: int,
     is_admin: bool,
-) -> str:
-    """Decide full|config_only|forbidden from precomputed total/own counts."""
+) -> _DeleteMode:
+    """Decide full|config_only from precomputed total/own counts."""
     if is_admin:
         return "full"
     if total_count > 0 and own_count == 0:
         return "config_only"
-    if total_count > 0 and own_count < total_count:
-        return "forbidden"
     return "full"
 
 
@@ -2923,8 +2930,8 @@ def _get_collection_delete_mode(
     collection_name: str,
     user_id: int,
     is_admin: bool,
-) -> str:
-    """Return full|config_only|forbidden for collection delete."""
+) -> _DeleteMode:
+    """Return full|config_only for collection delete."""
     if not collection_name or not collection_name.strip():
         raise HTTPException(status_code=422, detail="Collection name cannot be empty")
     if is_admin:
@@ -2934,6 +2941,123 @@ def _get_collection_delete_mode(
         collection_name, user_id, is_admin=False
     )
     return _resolve_delete_mode_from_counts(total_count, own_count, is_admin=False)
+
+
+def _get_document_record_owner_id(
+    record: DocumentRecord,
+    *,
+    fallback_user_id: int,
+) -> int:
+    """Return the owner for storage cleanup, falling back for legacy projections."""
+    raw_user_id = getattr(record, "user_id", None)
+    if raw_user_id is None:
+        return fallback_user_id
+    try:
+        return int(raw_user_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid user_id on document record %s: %r; falling back to user_%s",
+            getattr(record, "doc_id", "<unknown>"),
+            raw_user_id,
+            fallback_user_id,
+        )
+        return fallback_user_id
+
+
+def _group_document_file_ids_by_owner(
+    records: List[DocumentRecord],
+    *,
+    fallback_user_id: int,
+) -> Dict[int, set[str]]:
+    """Group uploaded file ids by document owner for tenant storage cleanup."""
+    grouped: Dict[int, set[str]] = {}
+    for record in records:
+        owner_id = _get_document_record_owner_id(
+            record, fallback_user_id=fallback_user_id
+        )
+        grouped.setdefault(owner_id, set())
+        file_id = _get_document_record_file_id(record)
+        if file_id:
+            grouped[owner_id].add(file_id)
+    return grouped
+
+
+def _get_collection_storage_owner_ids(
+    records: List[DocumentRecord],
+    *,
+    fallback_user_id: int,
+) -> set[int]:
+    """Return owners whose physical KB storage may need collection-level cleanup."""
+    if not records:
+        return {fallback_user_id}
+    return {
+        _get_document_record_owner_id(record, fallback_user_id=fallback_user_id)
+        for record in records
+    }
+
+
+def _resolve_collection_mutation_scope(
+    *,
+    collection_name: str,
+    requester_user_id: int,
+    is_admin: bool,
+    db: Session,
+    vector_store: Any = None,
+) -> CollectionMutationScope:
+    """Resolve tenant/global mutation ownership once for delete and rename."""
+    if vector_store is None:
+        vector_store = get_vector_index_store()
+    document_records = vector_store.list_document_records(
+        collection_name=collection_name,
+        user_id=requester_user_id,
+        is_admin=is_admin,
+    )
+    file_ids_by_owner = _group_document_file_ids_by_owner(
+        document_records,
+        fallback_user_id=requester_user_id,
+    )
+
+    if not is_admin:
+        owner_user_ids = {requester_user_id}
+        file_ids_by_owner.setdefault(requester_user_id, set())
+        return CollectionMutationScope(
+            mode="tenant",
+            collection_name=collection_name,
+            requester_user_id=requester_user_id,
+            is_admin=False,
+            owner_user_ids=owner_user_ids,
+            document_records=document_records,
+            file_ids_by_owner=file_ids_by_owner,
+        )
+
+    owner_user_ids = (
+        {
+            _get_document_record_owner_id(record, fallback_user_id=requester_user_id)
+            for record in document_records
+        }
+        if document_records
+        else set()
+    )
+    owner_user_ids.update(
+        get_metadata_store().list_collection_config_owner_ids(collection_name)
+    )
+    owner_user_ids.update(
+        list_collection_uploaded_file_owner_ids(db, collection_name=collection_name)
+    )
+    if not owner_user_ids:
+        owner_user_ids = {requester_user_id}
+    for owner_id in owner_user_ids:
+        file_ids_by_owner.setdefault(owner_id, set())
+
+    return CollectionMutationScope(
+        mode="global",
+        collection_name=collection_name,
+        requester_user_id=requester_user_id,
+        is_admin=True,
+        owner_user_ids=owner_user_ids,
+        document_records=document_records,
+        file_ids_by_owner=file_ids_by_owner,
+    )
 
 
 def _remove_user_collection_config(
@@ -3032,7 +3156,7 @@ def _strip_config_only_sentinel(
     )
 
 
-def _preflight_batch_delete_permissions(
+def _validate_and_prefetch_batch_delete_counts(
     unique_names: List[str],
     user_id: int,
     is_admin: bool,
@@ -3041,9 +3165,9 @@ def _preflight_batch_delete_permissions(
     List[BatchDeleteFailureItem],
     Dict[str, tuple[int, int]],
 ]:
-    """Preflight validation for batch delete permissions and empty names.
+    """Validate batch delete names and prefetch count hints.
 
-    Returns ``(allowed_names, failed_items, counts_by_name)``. For non-admin
+    Returns ``(valid_names, failed_items, counts_by_name)``. For non-admin
     callers ``counts_by_name`` maps the trimmed collection name to its
     ``(total, own)`` document counts so callers can reuse them when invoking
     ``_perform_kb_collection_delete`` (avoids redundant LanceDB scans).
@@ -3091,28 +3215,21 @@ def _preflight_batch_delete_permissions(
         )
     except Exception as exc:
         logger.error(
-            "Batch permission scan failed (vector store grouped counts): %s",
+            "Batch delete count prefetch failed (vector store grouped counts): %s",
             exc,
             exc_info=True,
         )
         raise HTTPException(
             status_code=500,
-            detail="Failed to scan documents table for batch delete permission.",
+            detail="Failed to scan documents table for batch delete.",
         ) from exc
 
     for name in non_empty:
         key = str(name).strip()
         total = int(totals.get(key, 0))
         own = int(owns.get(key, 0))
-        if total > 0 and 0 < own < total:
-            failed.append(
-                BatchDeleteFailureItem(
-                    name=name, error=_DELETE_SHARED_COLLECTION_DETAIL
-                )
-            )
-        else:
-            allowed.append(name)
-            counts_by_name[key] = (total, own)
+        allowed.append(name)
+        counts_by_name[key] = (total, own)
 
     return allowed, failed, counts_by_name
 
@@ -3173,7 +3290,7 @@ def _perform_kb_collection_delete(
                 status_code=422, detail=f"Invalid collection name: {str(e)}"
             ) from e
 
-        preflight_delete_mode: Optional[str] = None
+        preflight_delete_mode: Optional[_DeleteMode] = None
         if preflight_counts is not None:
             total_count, own_count = preflight_counts
             preflight_delete_mode = _resolve_delete_mode_from_counts(
@@ -3203,53 +3320,48 @@ def _perform_kb_collection_delete(
                     delete_mode,
                 )
 
-        if delete_mode == "forbidden":
-            raise HTTPException(
-                status_code=403, detail=_DELETE_SHARED_COLLECTION_DETAIL
-            )
         if delete_mode == "config_only":
             return _perform_config_only_collection_delete(safe_collection, user_id)
 
-        vector_store = get_vector_index_store()
-        collection_records = vector_store.list_document_records(
+        mutation_scope = _resolve_collection_mutation_scope(
             collection_name=safe_collection,
-            user_id=user_id,
+            requester_user_id=user_id,
             is_admin=is_admin,
-        )
-        collection_file_ids = {
-            file_id
-            for file_id in (
-                _get_document_record_file_id(record) for record in collection_records
-            )
-            if file_id
-        }
-
-        collection_dir = get_upload_path(
-            "", user_id=user_id, collection=safe_collection
+            db=db,
         )
 
         result = delete_collection(safe_collection, user_id, is_admin)
 
-        physical_cleanup = delete_collection_physical_dir(
-            user_id=user_id,
-            collection_name=safe_collection,
-        )
-        physical_cleanup_status = physical_cleanup.status
-        physical_cleanup_error = physical_cleanup.error
-        if physical_cleanup.collection_dir is not None:
-            collection_dir = physical_cleanup.collection_dir
+        physical_cleanup_by_owner = {}
+        for owner_id in sorted(mutation_scope.owner_user_ids):
+            physical_cleanup_by_owner[owner_id] = delete_collection_physical_dir(
+                user_id=owner_id,
+                collection_name=safe_collection,
+            )
 
         if result.status == "error":
             cleanup_warnings = list(result.warnings) if result.warnings else []
-            if physical_cleanup_status == "success":
-                cleanup_warnings.append(
-                    f"Physical directory moved to trash: {collection_dir} "
-                    "(trash cleanup requires external scheduler/cron)"
+            for owner_id, physical_cleanup in physical_cleanup_by_owner.items():
+                collection_dir = physical_cleanup.collection_dir or get_upload_path(
+                    "", user_id=owner_id, collection=safe_collection
                 )
-            elif physical_cleanup_status == "not_found":
-                cleanup_warnings.append(
-                    "Physical directory cleanup: No physical directory found (collection had no files)"
-                )
+                physical_cleanup_status = physical_cleanup.status
+                if physical_cleanup_status == "success":
+                    cleanup_warnings.append(
+                        f"Physical directory moved to trash for user_{owner_id}: "
+                        f"{collection_dir} "
+                        "(trash cleanup requires external scheduler/cron)"
+                    )
+                elif physical_cleanup_status == "not_found":
+                    cleanup_warnings.append(
+                        f"Physical directory cleanup for user_{owner_id}: "
+                        "No physical directory found (collection had no files)"
+                    )
+                elif physical_cleanup.error:
+                    cleanup_warnings.append(
+                        f"Physical directory cleanup for user_{owner_id}: "
+                        f"{physical_cleanup.status} - {physical_cleanup.error}"
+                    )
 
             return CollectionOperationResult(
                 status="error",
@@ -3260,33 +3372,40 @@ def _perform_kb_collection_delete(
                 deleted_counts=result.deleted_counts,
             )
 
-        remaining_records = vector_store.list_document_records(
+        remaining_records = get_vector_index_store().list_document_records(
             collection_name=None,
             user_id=user_id,
             is_admin=is_admin,
         )
-        remaining_file_ids = {
-            file_id
-            for file_id in (
-                _get_document_record_file_id(record) for record in remaining_records
-            )
-            if file_id
-        }
+        remaining_file_ids_by_owner = _group_document_file_ids_by_owner(
+            remaining_records,
+            fallback_user_id=user_id,
+        )
         deleted_uploaded_files = 0
-        if physical_cleanup_status in {"success", "not_found"}:
-            deleted_uploaded_files = delete_collection_uploaded_files(
-                db,
-                user_id=user_id,
-                collection_file_ids=collection_file_ids,
-                remaining_file_ids=remaining_file_ids,
-                collection_dir=collection_dir,
+        for owner_id in sorted(mutation_scope.owner_user_ids):
+            physical_cleanup = physical_cleanup_by_owner[owner_id]
+            physical_cleanup_status = physical_cleanup.status
+            collection_dir = physical_cleanup.collection_dir or get_upload_path(
+                "", user_id=owner_id, collection=safe_collection
             )
-        else:
-            logger.warning(
-                "Preserving UploadedFile records for collection %s because physical cleanup status is %s",
-                safe_collection,
-                physical_cleanup_status,
-            )
+            if physical_cleanup_status in {"success", "not_found"}:
+                deleted_uploaded_files += delete_collection_uploaded_files(
+                    db,
+                    user_id=owner_id,
+                    collection_file_ids=mutation_scope.file_ids_by_owner.get(
+                        owner_id, set()
+                    ),
+                    remaining_file_ids=remaining_file_ids_by_owner.get(owner_id, set()),
+                    collection_dir=collection_dir,
+                )
+            else:
+                logger.warning(
+                    "Preserving UploadedFile records for collection %s/user_%s "
+                    "because physical cleanup status is %s",
+                    safe_collection,
+                    owner_id,
+                    physical_cleanup_status,
+                )
         if deleted_uploaded_files:
             logger.info(
                 "Deleted %s UploadedFile record(s) for collection %s",
@@ -3295,35 +3414,55 @@ def _perform_kb_collection_delete(
             )
 
         cleanup_warnings = list(result.warnings) if result.warnings else []
-        cleanup_info_message = ""
+        cleanup_info_messages: List[str] = []
+        has_physical_cleanup_issue = False
 
-        if physical_cleanup_status == "success":
-            cleanup_info = (
-                f"Physical directory moved to trash: {collection_dir} "
-                "(trash cleanup requires external scheduler/cron)"
+        for owner_id, physical_cleanup in physical_cleanup_by_owner.items():
+            physical_cleanup_status = physical_cleanup.status
+            physical_cleanup_error = physical_cleanup.error
+            collection_dir = physical_cleanup.collection_dir or get_upload_path(
+                "", user_id=owner_id, collection=safe_collection
             )
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}."
-        elif physical_cleanup_status == "not_found":
-            cleanup_info = "Physical directory cleanup: No physical directory found (collection had no files)"
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}."
-        elif physical_cleanup_status == "error" and physical_cleanup_error:
-            cleanup_info = f"Physical directory cleanup: Warning - {physical_cleanup_error}. Database deletion proceeded, but physical file cleanup status is uncertain."
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}"
-        elif physical_cleanup_status == "failed" and physical_cleanup_error:
-            cleanup_info = (
-                f"Physical directory cleanup: Failed - {physical_cleanup_error}"
-            )
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}"
+
+            if physical_cleanup_status == "success":
+                cleanup_info = (
+                    f"Physical directory moved to trash for user_{owner_id}: "
+                    f"{collection_dir} "
+                    "(trash cleanup requires external scheduler/cron)"
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+            elif physical_cleanup_status == "not_found":
+                cleanup_info = (
+                    f"Physical directory cleanup for user_{owner_id}: "
+                    "No physical directory found (collection had no files)"
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+            elif physical_cleanup_status == "error" and physical_cleanup_error:
+                has_physical_cleanup_issue = True
+                cleanup_info = (
+                    f"Physical directory cleanup for user_{owner_id}: Warning - "
+                    f"{physical_cleanup_error}. Database deletion proceeded, but "
+                    "physical file cleanup status is uncertain."
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+            elif physical_cleanup_status == "failed" and physical_cleanup_error:
+                has_physical_cleanup_issue = True
+                cleanup_info = (
+                    f"Physical directory cleanup for user_{owner_id}: Failed - "
+                    f"{physical_cleanup_error}"
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+
+        cleanup_info_message = ""
+        if cleanup_info_messages:
+            cleanup_info_message = f" {'; '.join(cleanup_info_messages)}."
 
         final_status = result.status
-        if result.status == "success" and physical_cleanup_status in (
-            "error",
-            "failed",
-        ):
+        if result.status == "success" and has_physical_cleanup_issue:
             final_status = "partial_success"
             if not cleanup_info_message:
                 cleanup_info_message = " Database deletion succeeded, but physical file cleanup encountered issues."
@@ -3420,7 +3559,7 @@ async def batch_delete_collections_api(
         seen.add(key)
         unique_names.append(raw_name)
 
-    allowed, failed, counts_by_name = _preflight_batch_delete_permissions(
+    allowed, failed, counts_by_name = _validate_and_prefetch_batch_delete_counts(
         unique_names, user_id, is_admin
     )
 
@@ -4246,16 +4385,6 @@ async def rename_collection_api(
     Returns:
         Success message
     """
-    from ...core.tools.core.RAG_tools.management.status import (
-        clear_ingestion_status,
-        load_ingestion_status,
-        write_ingestion_status,
-    )
-    from ...core.tools.core.RAG_tools.storage.factory import (
-        get_metadata_store,
-        get_vector_index_store,
-    )
-
     vector_store = get_vector_index_store()
 
     if not new_name or not new_name.strip():
@@ -4305,35 +4434,76 @@ async def rename_collection_api(
                 detail=f"Access denied for collection: {safe_new_collection}",
             )
 
-    physical_rename_status = "not_found"
-    physical_rename_error: Optional[str] = None
-    old_collection_dir: Optional[Path] = None
-    new_collection_dir: Optional[Path] = None
-    collection_records = vector_store.list_document_records(
+    mutation_scope = _resolve_collection_mutation_scope(
         collection_name=safe_old_collection,
-        user_id=int(_user.id),
+        requester_user_id=int(_user.id),
         is_admin=bool(_user.is_admin),
+        db=db,
+        vector_store=vector_store,
     )
-    collection_file_ids = {
-        file_id
-        for file_id in (
-            _get_document_record_file_id(record) for record in collection_records
-        )
-        if file_id
-    }
 
-    physical_rename = rename_collection_storage(
-        db,
-        user_id=int(_user.id),
-        old_collection_name=safe_old_collection,
-        new_collection_name=safe_new_collection,
-        collection_file_ids=collection_file_ids,
-    )
-    physical_rename_status = physical_rename.status
-    physical_rename_error = physical_rename.error
-    old_collection_dir = physical_rename.old_collection_dir
-    new_collection_dir = physical_rename.new_collection_dir
-    if physical_rename_status == "failed":
+    for owner_id in sorted(mutation_scope.owner_user_ids):
+        old_dir = get_upload_path(
+            "",
+            user_id=owner_id,
+            collection=safe_old_collection,
+            create_if_not_exists=False,
+            collection_is_sanitized=True,
+        )
+        new_dir = get_upload_path(
+            "",
+            user_id=owner_id,
+            collection=safe_new_collection,
+            create_if_not_exists=False,
+            collection_is_sanitized=True,
+        )
+        if old_dir.exists() and old_dir.is_dir() and new_dir.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Failed to rename collection: target physical directory already "
+                    f"exists for user_{owner_id}. A collection named "
+                    f"'{safe_new_collection}' already has physical files."
+                ),
+            )
+
+    physical_rename_results = {}
+    renamed_owner_ids: list[int] = []
+    for owner_id in sorted(mutation_scope.owner_user_ids):
+        physical_rename = rename_collection_storage(
+            db,
+            user_id=owner_id,
+            old_collection_name=safe_old_collection,
+            new_collection_name=safe_new_collection,
+            collection_file_ids=mutation_scope.file_ids_by_owner.get(owner_id, set()),
+        )
+        physical_rename_results[owner_id] = physical_rename
+        if physical_rename.status == "success":
+            renamed_owner_ids.append(owner_id)
+        if physical_rename.status != "failed":
+            continue
+
+        for rollback_owner_id in reversed(renamed_owner_ids):
+            rollback = rename_collection_storage(
+                db,
+                user_id=rollback_owner_id,
+                old_collection_name=safe_new_collection,
+                new_collection_name=safe_old_collection,
+                collection_file_ids=mutation_scope.file_ids_by_owner.get(
+                    rollback_owner_id, set()
+                ),
+            )
+            if rollback.status != "success":
+                logger.error(
+                    "Failed to roll back physical collection rename for user_%s "
+                    "%s -> %s: %s",
+                    rollback_owner_id,
+                    safe_new_collection,
+                    safe_old_collection,
+                    rollback.error,
+                )
+
+        physical_rename_error = physical_rename.error
         if (
             physical_rename_error
             == "Another operation is in progress; please try again later."
@@ -4350,11 +4520,12 @@ async def rename_collection_api(
 
     # Step 2: Update collection name in all tables (documents, parses, chunks, embeddings)
     # Use storage abstraction layer which handles all tables including embeddings
-    vector_store = get_vector_index_store()
     warnings.extend(
         vector_store.rename_collection_data(
             collection_name=safe_old_collection,
             new_name=safe_new_collection,
+            user_id=int(_user.id),
+            is_admin=bool(_user.is_admin),
         )
     )
 
@@ -4363,58 +4534,78 @@ async def rename_collection_api(
         await metadata_store.rename_collection(
             old_name=safe_old_collection,
             new_name=safe_new_collection,
+            user_id=int(_user.id),
+            is_admin=bool(_user.is_admin),
         )
     except Exception as e:
         logger.warning("Failed to rename metadata store keys: %s", e)
         warnings.append(f"Failed to rename collection metadata: {e}")
 
-    # Migrate ingestion status from old collection name to new
+    # Best-effort scoped ingestion status rename. The status store owns how
+    # collection/user filters map to its backend tables.
     try:
-        status_entries = load_ingestion_status(collection=safe_old_collection)
-        for entry in status_entries:
-            doc_id = entry.get("doc_id")
-            if doc_id:
-                write_ingestion_status(
-                    safe_new_collection,
-                    doc_id,
-                    status=entry.get("status", "pending"),
-                    message=entry.get("message", ""),
-                    parse_hash=entry.get("parse_hash", ""),
-                )
-                clear_ingestion_status(safe_old_collection, doc_id)
+        warnings.extend(
+            get_ingestion_status_store().rename_collection_status(
+                old_name=safe_old_collection,
+                new_name=safe_new_collection,
+                user_id=int(_user.id),
+                is_admin=bool(_user.is_admin),
+            )
+        )
     except Exception as e:
         logger.warning("Failed to update ingestion status: %s", e)
         warnings.append(f"Failed to update ingestion status: {e}")
 
     # Step 3: Add physical rename status to warnings and message for visibility
+    rename_info_messages: list[str] = []
+    has_physical_rename_issue = False
+    for owner_id, physical_rename in physical_rename_results.items():
+        physical_rename_status = physical_rename.status
+        physical_rename_error = physical_rename.error
+        if (
+            physical_rename_status == "success"
+            and physical_rename.old_collection_dir is not None
+            and physical_rename.new_collection_dir is not None
+        ):
+            rename_info = (
+                f"Physical directory renamed for user_{owner_id}: "
+                f"{physical_rename.old_collection_dir.name} -> "
+                f"{physical_rename.new_collection_dir.name}"
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+        elif physical_rename_status == "not_found":
+            rename_info = (
+                f"Physical directory rename for user_{owner_id}: "
+                "No physical directory found (collection had no files)"
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+        elif physical_rename_status == "error" and physical_rename_error:
+            has_physical_rename_issue = True
+            rename_info = (
+                f"Physical directory rename for user_{owner_id}: Warning - "
+                f"{physical_rename_error}. Database rename proceeded, but physical "
+                "directory rename status is uncertain."
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+        elif physical_rename_status == "failed" and physical_rename_error:
+            has_physical_rename_issue = True
+            rename_info = (
+                f"Physical directory rename for user_{owner_id}: Failed - "
+                f"{physical_rename_error}"
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+
     rename_info_message = ""
-    if (
-        physical_rename_status == "success"
-        and old_collection_dir is not None
-        and new_collection_dir is not None
-    ):
-        rename_info = f"Physical directory renamed: {old_collection_dir.name} -> {new_collection_dir.name}"
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}."
-    elif physical_rename_status == "not_found":
-        rename_info = "Physical directory rename: No physical directory found (collection had no files)"
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}."
-    elif physical_rename_status == "error" and physical_rename_error:
-        rename_info = (
-            f"Physical directory rename: Warning - {physical_rename_error}. "
-            "Database rename proceeded, but physical directory rename status is uncertain."
-        )
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}"
-    elif physical_rename_status == "failed" and physical_rename_error:
-        rename_info = f"Physical directory rename: Failed - {physical_rename_error}"
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}"
+    if rename_info_messages:
+        rename_info_message = f" {'; '.join(rename_info_messages)}."
 
     # Step 4: Determine final status
     final_status = "success" if not warnings else "partial_success"
-    if physical_rename_status in ("error", "failed"):
+    if has_physical_rename_issue:
         final_status = "partial_success"
         if not rename_info_message:
             rename_info_message = " Database rename succeeded, but physical directory rename encountered issues."
@@ -4423,7 +4614,7 @@ async def rename_collection_api(
     base_message = (
         f"Collection renamed from '{safe_old_collection}' to '{safe_new_collection}'"
     )
-    if warnings and len(warnings) > (1 if physical_rename_status != "not_found" else 0):
+    if warnings:
         final_message = f"{base_message} with some warnings"
     else:
         final_message = base_message

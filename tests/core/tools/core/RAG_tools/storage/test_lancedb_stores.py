@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from xagent.core.tools.core.RAG_tools.storage.lancedb_stores import (
+    LanceDBIngestionStatusStore,
     LanceDBMainPointerStore,
     LanceDBMetadataStore,
     LanceDBPromptTemplateStore,
@@ -71,7 +72,14 @@ def test_metadata_store_rename_collection_updates_tables(
     mock_conn.open_table.side_effect = _open
 
     store = LanceDBMetadataStore()
-    asyncio.run(store.rename_collection("old_col", "new_col"))
+    asyncio.run(
+        store.rename_collection(
+            "old_col",
+            "new_col",
+            user_id=1,
+            is_admin=True,
+        )
+    )
 
     mock_config.update.assert_called_once()
     cfg_where, cfg_updates = mock_config.update.call_args[0]
@@ -82,6 +90,57 @@ def test_metadata_store_rename_collection_updates_tables(
     meta_where, meta_updates = mock_meta.update.call_args[0]
     assert "old_col" in meta_where
     assert meta_updates["name"] == "new_col"
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.LanceDBMetadataStore.ensure_collection_metadata_table",
+    new_callable=AsyncMock,
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_collection_config_table"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_metadata_store_rename_collection_tenant_scoped_config_only(
+    mock_get_connection: Mock,
+    _mock_ensure_config: Mock,
+    _mock_ensure_meta: AsyncMock,
+) -> None:
+    """Tenant rename should update only the caller's config row."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+
+    mock_config = Mock()
+    mock_meta = Mock()
+
+    def _open(name: str) -> Mock:
+        if name == "collection_config":
+            return mock_config
+        if name == "collection_metadata":
+            return mock_meta
+        raise AssertionError(name)
+
+    mock_conn.open_table.side_effect = _open
+
+    store = LanceDBMetadataStore()
+    asyncio.run(
+        store.rename_collection(
+            "old_col",
+            "new_col",
+            user_id=42,
+            is_admin=False,
+        )
+    )
+
+    mock_config.update.assert_called_once()
+    cfg_where, cfg_updates = mock_config.update.call_args[0]
+    assert "old_col" in cfg_where
+    assert "user_id = 42" in cfg_where
+    assert cfg_updates["collection"] == "new_col"
+    mock_meta.delete.assert_called_once()
+    assert "old_col" in mock_meta.delete.call_args.args[0]
+    mock_meta.update.assert_not_called()
 
 
 @patch(
@@ -273,6 +332,38 @@ def test_metadata_store_get_collection_success(mock_get_connection: Mock) -> Non
     assert collection.document_names == ["a.pdf", "b.pdf"]
 
 
+@patch("xagent.core.tools.core.RAG_tools.storage.lancedb_stores.query_to_list")
+@patch(
+    "xagent.core.tools.core.RAG_tools.LanceDB.schema_manager.ensure_collection_config_table"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_metadata_store_list_collection_config_owner_ids(
+    mock_get_connection: Mock,
+    _mock_ensure_config: Mock,
+    mock_query_to_list: Mock,
+) -> None:
+    """Metadata store should own stale collection_config owner discovery."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_conn.open_table.return_value = mock_table
+    mock_query_to_list.return_value = [
+        {"user_id": 101},
+        {"user_id": "202"},
+        {"user_id": None},
+        {"user_id": "bad"},
+    ]
+
+    store = LanceDBMetadataStore()
+
+    assert store.list_collection_config_owner_ids("FAQ") == {101, 202}
+    mock_conn.open_table.assert_called_once_with("collection_config")
+    mock_query_to_list.assert_called_once()
+    mock_table.search.return_value.where.assert_called_once()
+
+
 @patch(
     "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.UserPermissions.get_user_filter"
 )
@@ -297,8 +388,8 @@ def test_vector_store_list_document_records_filters_and_maps(
     mock_table.schema = [SimpleNamespace(name="doc_id")]
     mock_conn.open_table.return_value = mock_table
     mock_query_to_list.return_value = [
-        {"doc_id": "doc-1", "source_path": "/tmp/a.pdf"},
-        {"doc_id": "doc-2", "source_path": None},
+        {"doc_id": "doc-1", "source_path": "/tmp/a.pdf", "user_id": 1},
+        {"doc_id": "doc-2", "source_path": None, "user_id": 1},
     ]
 
     store = LanceDBVectorIndexStore()
@@ -311,6 +402,7 @@ def test_vector_store_list_document_records_filters_and_maps(
 
     assert [r.doc_id for r in records] == ["doc-1", "doc-2"]
     assert records[0].source_path == "/tmp/a.pdf"
+    assert records[0].user_id == 1
     mock_table.search.return_value.where.assert_called_once()
 
 
@@ -337,11 +429,112 @@ def test_vector_store_rename_collection_data_updates_expected_tables(
     mock_conn.open_table.return_value = mock_table
 
     store = LanceDBVectorIndexStore()
-    warnings = store.rename_collection_data("old_name", "new_name")
+    warnings = store.rename_collection_data(
+        "old_name",
+        "new_name",
+        user_id=None,
+        is_admin=True,
+    )
 
     assert warnings == []
     # 4 target tables should be updated; control-plane table excluded.
     assert mock_table.update.call_count == 4
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.UserPermissions.get_user_filter"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_ingestion_status_store_rename_collection_status_is_tenant_scoped(
+    mock_get_connection: Mock,
+    mock_user_filter: Mock,
+) -> None:
+    """Non-admin status rename should include both collection and user filters."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_conn.open_table.return_value = mock_table
+    mock_user_filter.return_value = "user_id == 101"
+
+    store = LanceDBIngestionStatusStore()
+    warnings = store.rename_collection_status(
+        old_name="old",
+        new_name="new",
+        user_id=101,
+        is_admin=False,
+    )
+
+    assert warnings == []
+    where_expr = mock_table.update.call_args.args[0]
+    assert "collection == 'old'" in where_expr
+    assert "user_id == 101" in where_expr
+    assert mock_table.update.call_args.args[1]["collection"] == "new"
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.UserPermissions.get_user_filter"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_ingestion_status_store_rename_collection_status_admin_is_global(
+    mock_get_connection: Mock,
+    mock_user_filter: Mock,
+) -> None:
+    """Admin status rename should update every owner for the collection."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_table = Mock()
+    mock_conn.open_table.return_value = mock_table
+    mock_user_filter.return_value = None
+
+    store = LanceDBIngestionStatusStore()
+    warnings = store.rename_collection_status(
+        old_name="old",
+        new_name="new",
+        user_id=999,
+        is_admin=True,
+    )
+
+    assert warnings == []
+    where_expr = mock_table.update.call_args.args[0]
+    assert where_expr == "collection == 'old'"
+    assert mock_table.update.call_args.args[1]["collection"] == "new"
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_vector_store_rename_collection_data_tenant_scoped(
+    mock_get_connection: Mock,
+) -> None:
+    """Tenant rename should include the user filter in each table update."""
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    table_names = ["documents", "parses", "chunks", "embeddings_text_embedding_v4"]
+    mock_conn.table_names.return_value = table_names
+    mock_conn.list_tables.return_value = table_names
+    mock_table = Mock()
+    mock_table.schema = Mock(names=[])
+    mock_conn.open_table.return_value = mock_table
+
+    store = LanceDBVectorIndexStore()
+    warnings = store.rename_collection_data(
+        "old_name",
+        "new_name",
+        user_id=42,
+        is_admin=False,
+    )
+
+    assert warnings == []
+    assert mock_table.update.call_count == 4
+    for call_args in mock_table.update.call_args_list:
+        where_expr = call_args.args[0]
+        assert "old_name" in where_expr
+        assert "user_id" in where_expr
+        assert "42" in where_expr
 
 
 @patch(

@@ -742,7 +742,7 @@ async def list_collections(
 
         # Step 2: Get stats. Try metadata cache first; fallback to realtime scan.
         stats: Dict[str, Dict[str, int]] = {}
-        if not force_realtime:
+        if not force_realtime and is_admin:
             try:
                 for info in metadata_collections:
                     if info.name in collection_keys or is_admin:
@@ -841,7 +841,7 @@ async def list_collections(
                 if key not in stats:
                     if key in realtime_stats:
                         stats[key] = realtime_stats[key]
-                    elif key in metadata_stats_by_name:
+                    elif is_admin and key in metadata_stats_by_name:
                         stats[key] = metadata_stats_by_name[key]
                     else:
                         stats[key] = {
@@ -915,7 +915,11 @@ async def list_collections(
                     processed_documents=(
                         stats[collection]["parses"]
                         if stats[collection]["parses"] > 0
-                        else metadata_processed_documents_by_name.get(collection, 0)
+                        else (
+                            metadata_processed_documents_by_name.get(collection, 0)
+                            if is_admin
+                            else 0
+                        )
                     ),
                     timestamp_now=realtime_timestamp if used_realtime else None,
                 )

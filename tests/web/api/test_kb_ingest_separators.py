@@ -165,17 +165,18 @@ def test_ingest_separators_valid_json_passed_to_config(app_with_kb, mock_user):
     assert captured_config[0].separators == ["\n\n", "\n", "。"]
 
 
-def test_delete_collection_forbidden_for_non_admin_with_other_users_docs(
+def test_delete_collection_removes_only_current_user_docs_when_name_is_shared(
     app_with_kb, mock_user
 ):
-    """Non-admin is rejected by _ensure_collection_access before delete_collection."""
+    """Non-admin deletes own documents even when other users share the collection name."""
     with (
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
         patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
     ):
         mock_store = MagicMock()
         mock_get_vector_store.return_value = mock_store
-        mock_store.list_document_records.return_value = []
         # Simulate total_count=5 and own_count=3 for the same collection.
         mock_store.count_documents_grouped_by_collection.side_effect = [
             {"test_collection": 5},
@@ -183,44 +184,67 @@ def test_delete_collection_forbidden_for_non_admin_with_other_users_docs(
             {"test_collection": 5},
             {"test_collection": 3},
         ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
 
         client = TestClient(app_with_kb)
         resp = client.delete("/api/kb/collections/test_collection")
 
-    assert resp.status_code == 403
-    detail = resp.json()["detail"]
-    assert (
-        "Only admin users can delete collections containing documents from other users."
-        in detail
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
     )
-    mock_delete_collection.assert_not_called()
 
 
 def test_delete_collection_rechecks_permission_before_full_delete(
     app_with_kb, mock_user
 ):
-    """Single delete must not use stale ownership state for destructive delete."""
+    """Single delete rechecks live state but mixed ownership still deletes only own docs."""
     with (
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
         patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
         patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
     ):
         mock_store = MagicMock()
         mock_get_vector_store.return_value = mock_store
         mock_store.count_documents_grouped_by_collection.side_effect = [
-            {"test_collection": 1},
+            {"test_collection": 2},
             {"test_collection": 1},
             {"test_collection": 2},
             {"test_collection": 1},
         ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
 
         client = TestClient(app_with_kb)
         resp = client.delete("/api/kb/collections/test_collection")
 
-    assert resp.status_code == 403
-    assert "Only admin users can delete collections" in resp.json()["detail"]
-    mock_delete_collection.assert_not_called()
-    mock_physical.assert_not_called()
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
+    )
+    mock_physical.assert_called_once()
 
 
 def test_delete_collection_removes_stale_config_without_deleting_other_users_docs(
@@ -366,8 +390,10 @@ def test_batch_config_only_preflight_can_become_full_delete(app_with_kb, mock_us
     mock_metadata_store.delete_collection.assert_not_called()
 
 
-def test_batch_delete_rechecks_permission_before_full_delete(app_with_kb, mock_user):
-    """A stale batch preflight must not authorize a now mixed-owner delete."""
+def test_batch_delete_rechecks_and_deletes_only_current_user_docs_for_shared_name(
+    app_with_kb, mock_user
+):
+    """A stale batch preflight rechecks, then tenant-scoped delete handles mixed ownership."""
     mock_metadata_store = MagicMock()
     mock_metadata_store.delete_collection = AsyncMock(return_value=None)
 
@@ -375,6 +401,7 @@ def test_batch_delete_rechecks_permission_before_full_delete(app_with_kb, mock_u
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
         patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
         patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
         patch(
             "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
             return_value=mock_metadata_store,
@@ -388,6 +415,17 @@ def test_batch_delete_rechecks_permission_before_full_delete(app_with_kb, mock_u
             {"test_collection": 2},
             {"test_collection": 1},
         ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
 
         client = TestClient(app_with_kb)
         resp = client.post(
@@ -397,12 +435,12 @@ def test_batch_delete_rechecks_permission_before_full_delete(app_with_kb, mock_u
 
     assert resp.status_code == 200
     body = resp.json()
-    assert body["deleted"] == []
-    assert len(body["failed"]) == 1
-    assert body["failed"][0]["name"] == "test_collection"
-    assert "Only admin users can delete collections" in body["failed"][0]["error"]
-    mock_delete_collection.assert_not_called()
-    mock_physical.assert_not_called()
+    assert body["deleted"] == ["test_collection"]
+    assert body["failed"] == []
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
+    )
+    mock_physical.assert_called_once()
     mock_metadata_store.delete_collection.assert_not_called()
 
 

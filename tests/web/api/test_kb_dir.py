@@ -172,6 +172,63 @@ def _make_delete_tracker():
     return deleted_doc_ids, _fake_delete_document
 
 
+def test_list_collection_uploaded_file_owner_ids_uses_strict_path_containment(
+    test_env,
+    temp_uploads,
+):
+    """UploadedFile owner discovery should not confuse similar collection paths."""
+    _, _, user, TestingSessionLocal = test_env
+    from xagent.web.services.kb_collection_service import (
+        list_collection_uploaded_file_owner_ids,
+    )
+
+    session = TestingSessionLocal()
+    try:
+        matching_path = temp_uploads / f"user_{user.id}" / "FAQ" / "a.pdf"
+        similar_path = temp_uploads / f"user_{user.id}" / "FAQ-old" / "b.pdf"
+        unrelated_path = temp_uploads / f"user_{user.id}" / "Other" / "c.pdf"
+        for path in (matching_path, similar_path, unrelated_path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("data")
+
+        session.add_all(
+            [
+                UploadedFile(
+                    file_id="match",
+                    user_id=user.id,
+                    filename="a.pdf",
+                    storage_path=str(matching_path),
+                    file_size=1,
+                ),
+                UploadedFile(
+                    file_id="similar",
+                    user_id=user.id,
+                    filename="b.pdf",
+                    storage_path=str(similar_path),
+                    file_size=1,
+                ),
+                UploadedFile(
+                    file_id="unrelated",
+                    user_id=user.id,
+                    filename="c.pdf",
+                    storage_path=str(unrelated_path),
+                    file_size=1,
+                ),
+            ]
+        )
+        session.commit()
+
+        assert list_collection_uploaded_file_owner_ids(
+            session, collection_name="FAQ"
+        ) == {user.id}
+        assert (
+            list_collection_uploaded_file_owner_ids(session, collection_name="Missing")
+            == set()
+        )
+    finally:
+        session.close()
+
+
 def test_kb_ingest_creates_collection_dir(test_env, temp_uploads):
     """Test that ingesting a document creates a collection-specific directory"""
     app, headers, user, _ = test_env
@@ -1201,7 +1258,6 @@ def test_kb_delete_physical_cleanup_failure_preserves_uploaded_file_records(
     db.close()
 
     with (
-        patch("xagent.web.api.kb._check_can_delete_collection"),
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
         patch(
             "xagent.web.api.kb.delete_collection_physical_dir"
@@ -1418,9 +1474,7 @@ def test_kb_rename_physical_directory_rename(test_env, temp_uploads):
         ) as mock_list_tables,
         patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.status.load_ingestion_status"
-        ) as mock_load_status,
+        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
     ):
         mock_list_tables.return_value = []
 
@@ -1439,7 +1493,7 @@ def test_kb_rename_physical_directory_rename(test_env, temp_uploads):
         mock_rename_storage.return_value = mock_rename_result
 
         # Mock ingestion status operations
-        mock_load_status.return_value = []
+        mock_get_status_store.return_value.rename_collection_status.return_value = []
 
         # Attempt rename
         response = client.put(
@@ -1472,9 +1526,7 @@ def test_kb_rename_normalizes_padded_collection_names(test_env, temp_uploads):
         ) as mock_list_tables,
         patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.status.load_ingestion_status"
-        ) as mock_load_status,
+        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
     ):
         mock_list_tables.return_value = []
 
@@ -1492,7 +1544,7 @@ def test_kb_rename_normalizes_padded_collection_names(test_env, temp_uploads):
         mock_rename_result.new_collection_dir = None
         mock_rename_storage.return_value = mock_rename_result
 
-        mock_load_status.return_value = []
+        mock_get_status_store.return_value.rename_collection_status.return_value = []
 
         response = client.put(
             "/api/kb/collections/%20%20team%20notes%20%20",
@@ -1529,9 +1581,7 @@ def test_kb_rename_accepts_unicode_collection_name(test_env, temp_uploads):
         ) as mock_list_tables,
         patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.status.load_ingestion_status"
-        ) as mock_load_status,
+        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
     ):
         mock_list_tables.return_value = []
 
@@ -1549,7 +1599,7 @@ def test_kb_rename_accepts_unicode_collection_name(test_env, temp_uploads):
         mock_rename_result.new_collection_dir = None
         mock_rename_storage.return_value = mock_rename_result
 
-        mock_load_status.return_value = []
+        mock_get_status_store.return_value.rename_collection_status.return_value = []
 
         response = client.put(
             f"/api/kb/collections/{quote(old_collection_name, safe='')}",
@@ -1748,9 +1798,7 @@ def test_delete_after_rename_not_denied_by_stale_list_collections(test_env):
         patch("xagent.web.api.kb._list_collections_with_retry") as mock_retry,
         patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.status.load_ingestion_status"
-        ) as mock_load_status,
+        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
     ):
         mock_retry.side_effect = [stale_old_only, stale_old_only]
         mock_store = MagicMock()
@@ -1763,7 +1811,7 @@ def test_delete_after_rename_not_denied_by_stale_list_collections(test_env):
         mock_rename_result.old_collection_dir = None
         mock_rename_result.new_collection_dir = None
         mock_rename_storage.return_value = mock_rename_result
-        mock_load_status.return_value = []
+        mock_get_status_store.return_value.rename_collection_status.return_value = []
 
         rename_resp = client.put(
             f"/api/kb/collections/{old_collection_name}",
@@ -1843,9 +1891,7 @@ def test_delete_after_rename_not_blocked_when_new_collection_is_visible(test_env
         patch("xagent.web.api.kb._list_collections_with_retry") as mock_retry,
         patch("xagent.web.api.kb.get_vector_index_store") as mock_store_factory,
         patch("xagent.web.api.kb.rename_collection_storage") as mock_rename_storage,
-        patch(
-            "xagent.core.tools.core.RAG_tools.management.status.load_ingestion_status"
-        ) as mock_load_status,
+        patch("xagent.web.api.kb.get_ingestion_status_store") as mock_get_status_store,
     ):
         mock_retry.side_effect = [visible_old, visible_old]
         mock_store = MagicMock()
@@ -1858,7 +1904,7 @@ def test_delete_after_rename_not_blocked_when_new_collection_is_visible(test_env
         mock_rename_result.old_collection_dir = None
         mock_rename_result.new_collection_dir = None
         mock_rename_storage.return_value = mock_rename_result
-        mock_load_status.return_value = []
+        mock_get_status_store.return_value.rename_collection_status.return_value = []
 
         rename_resp = client.put(
             f"/api/kb/collections/{old_collection_name}",
