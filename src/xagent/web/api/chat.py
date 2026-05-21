@@ -966,7 +966,6 @@ class AgentServiceManager:
                     task_compact_llm = snapshot.task_compact_llm
                     agent_config = snapshot.agent_config
                     excluded_agent_id = snapshot.excluded_agent_id
-                    has_agent_builder_config = snapshot.agent is not None
 
                     if snapshot.agent is not None:
                         logger.info(
@@ -981,31 +980,24 @@ class AgentServiceManager:
                             )
 
                     if not task_llm:
-                        # Hand off to the upstream diagnostics helper so
-                        # the snapshot path produces the same context-
-                        # rich WARNING / 500 as the legacy
-                        # ``_resolve_task_runtime_config`` branch when
-                        # neither the agent-builder LLMs nor the
-                        # default LLM resolve. ``saved_model_ids`` /
-                        # ``saved_model_descriptors`` are carried by
-                        # ``snapshot.agent_config`` (set inside
-                        # ``load_agent_builder_config``).
-                        user_id_for_fallback: Optional[int] = (
-                            int(user.id)
-                            if user and user.id is not None
-                            else task.user_id
+                        # Snapshot path fallback intentionally stays
+                        # quiet -- emit a WARNING and accept that
+                        # downstream may receive ``None`` as the
+                        # default LLM. The legacy normal-creation
+                        # path also accepted that, and tests +
+                        # production sometimes run with no global
+                        # default LLM configured (``_default_llm``
+                        # is None when no LLM env keys are set). The
+                        # noisier ``_pick_default_llm_with_warning``
+                        # helper (which raises HTTPException for the
+                        # agent-builder case) stays on the
+                        # reconstruct path where the existing
+                        # contract already promises that behaviour.
+                        logger.warning(
+                            f"Task {task_id} has no valid LLM configuration, "
+                            "using defaults"
                         )
-                        task_llm = self._pick_default_llm_with_warning(
-                            self._default_llm,
-                            task_id=task_id,
-                            has_agent_builder_config=has_agent_builder_config,
-                            agent_id=task.agent_id,
-                            saved_model_ids=(agent_config or {}).get("saved_model_ids"),
-                            saved_model_descriptors=(agent_config or {}).get(
-                                "saved_model_descriptors"
-                            ),
-                            user_id=user_id_for_fallback,
-                        )
+                        task_llm = self._default_llm
 
                     logger.info(
                         f"Successfully loaded LLM configuration for task {task_id}: "
