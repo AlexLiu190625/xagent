@@ -102,11 +102,14 @@ class VisionCore:
                 return None
 
         try:
-            parsed = int(value)
+            parsed_float = float(value)
         except (TypeError, ValueError) as exc:
             raise ValueError(f"{field_name} must be an integer") from exc
 
-        return parsed
+        if not parsed_float.is_integer():
+            raise ValueError(f"{field_name} must be an integer")
+
+        return int(parsed_float)
 
     def _convert_image_to_base64(self, image_path: str) -> str:
         """

@@ -288,7 +288,7 @@ class TestOpenAILLM:
 
         call_args = mock_client.chat.completions.create.call_args
         assert call_args.kwargs["temperature"] == 0.0
-        assert call_args.kwargs["max_tokens"] == 1024
+        assert "max_tokens" not in call_args.kwargs
 
     @pytest.mark.asyncio
     async def test_cleanup(self, openai_llm_config, mock_chat_completion, mocker):

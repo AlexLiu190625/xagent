@@ -463,8 +463,6 @@ class OpenAILLM(BaseLLM):
 
         if max_tokens is not None:
             completion_params["max_tokens"] = max_tokens
-        elif self.default_max_tokens is not None:
-            completion_params["max_tokens"] = self.default_max_tokens
 
         if temperature is not None:
             completion_params["temperature"] = temperature
