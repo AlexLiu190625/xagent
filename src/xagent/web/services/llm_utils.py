@@ -2,6 +2,7 @@
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 from sqlalchemy.orm import Session
@@ -950,12 +951,65 @@ def make_normalize_model_id(core_storage: CoreStorage) -> Callable:
     return normalize_model_id
 
 
+@dataclass(frozen=True)
+class AgentRuntimeFields:
+    """Primitive subset of the ``Agent`` row produced by
+    ``resolve_task_runtime_config_core``.
+
+    Snapshot consumers (``load_task_setup_snapshot_sync``) can use
+    this directly as the frozen ``_AgentFields`` they expose;
+    main-loop consumers (``_reconstruct_agent_from_history``) read
+    these fields off the resolved ``RuntimeConfig`` and don't need
+    primitive isolation, but the same fields are convenient for log
+    lines etc.
+    """
+
+    id: int
+    name: str
+    status: Any  # AgentStatus enum (typed loosely to avoid an import cycle)
+    instructions: Optional[str]
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Resolved task runtime configuration: the LLM tuple, execution
+    pattern, and optional agent-builder overlay returned by
+    ``resolve_task_runtime_config_core``.
+
+    Frozen dataclass instead of a free-form dict because:
+
+      - typo'd field access fails at type-check time, not silently
+        returning ``None`` at runtime
+      - the contract is greppable / introspectable
+      - both consumers (main-loop wrapper + off-loop snapshot loader)
+        access fields by name; the dataclass lets ``mypy`` follow
+        the type through both branches
+
+    ``agent_config`` stays a ``dict | None`` because it carries
+    ``saved_model_ids`` / ``saved_model_descriptors`` (downstream
+    diagnostics) plus ``skills`` / ``knowledge_bases`` / etc.;
+    promoting that to a dataclass is a separate refactor.
+    """
+
+    llms: Tuple[
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+    ]
+    task_pattern: str
+    agent_config: Optional[dict]
+    has_agent_builder_config: bool
+    excluded_agent_id: Optional[int]
+    agent_fields: Optional[AgentRuntimeFields]
+
+
 def resolve_task_runtime_config_core(
     task_row: Any,
     session: Session,
     *,
     user_id: Optional[int],
-) -> dict[str, Any]:
+) -> RuntimeConfig:
     """Resolve a task's LLM tuple, agent-builder overlay, and execution
     pattern in one shot. Pure function over an open SQLAlchemy session
     -- no event loop, no logging, no fallback.
@@ -969,15 +1023,8 @@ def resolve_task_runtime_config_core(
         fallback.
       - ``load_task_setup_snapshot_sync`` (worker thread, used by
         ``_schedule_bg._runner`` on the normal-creation path) --
-        wraps this with primitive ``_TaskFields`` / ``_AgentFields``
-        snapshotting so no ORM rows escape the loader's session.
-
-    Returns dict with: ``llms`` (tuple of 4 ``Optional[BaseLLM]`` --
-    default / fast / vision / compact), ``task_pattern``,
-    ``agent_config`` (``dict | None``), ``has_agent_builder_config``,
-    ``excluded_agent_id``, ``agent_fields`` (primitive subset of the
-    ``Agent`` row when present; used by the snapshot loader to build
-    its frozen ``_AgentFields``).
+        wraps this with primitive ``_TaskFields`` snapshotting so no
+        ORM ``Task`` row escapes the loader's session.
 
     Does NOT apply the ``_pick_default_llm_with_warning`` fallback --
     that helper raises ``HTTPException``, which is unsafe to call from
@@ -1026,7 +1073,7 @@ def resolve_task_runtime_config_core(
     agent_config: Optional[dict] = None
     has_agent_builder_config = False
     excluded_agent_id: Optional[int] = None
-    agent_fields: Optional[dict] = None
+    agent_fields: Optional[AgentRuntimeFields] = None
 
     if task_row.agent_id is not None:
         agent_row = (
@@ -1061,25 +1108,25 @@ def resolve_task_runtime_config_core(
             if agent_row.status == AgentStatus.PUBLISHED:
                 excluded_agent_id = int(agent_row.id)
 
-            agent_fields = {
-                "id": int(agent_row.id),
-                "name": str(agent_row.name),
-                "status": agent_row.status,
-                "instructions": (
+            agent_fields = AgentRuntimeFields(
+                id=int(agent_row.id),
+                name=str(agent_row.name),
+                status=agent_row.status,
+                instructions=(
                     str(agent_row.instructions)
                     if agent_row.instructions is not None
                     else None
                 ),
-            }
+            )
 
-    return {
-        "llms": (task_llm, task_fast_llm, task_vision_llm, task_compact_llm),
-        "task_pattern": task_pattern,
-        "agent_config": agent_config,
-        "has_agent_builder_config": has_agent_builder_config,
-        "excluded_agent_id": excluded_agent_id,
-        "agent_fields": agent_fields,
-    }
+    return RuntimeConfig(
+        llms=(task_llm, task_fast_llm, task_vision_llm, task_compact_llm),
+        task_pattern=task_pattern,
+        agent_config=agent_config,
+        has_agent_builder_config=has_agent_builder_config,
+        excluded_agent_id=excluded_agent_id,
+        agent_fields=agent_fields,
+    )
 
 
 def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:

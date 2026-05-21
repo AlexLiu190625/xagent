@@ -483,27 +483,14 @@ class AgentServiceManager:
         if skill_context:
             logger.info(f"Loaded recovered skill context for task {task_id}")
 
-    def _load_agent_builder_config(
-        self, agent: Agent, db: Session, user_id: int
-    ) -> dict:
-        """Load all Agent Builder configuration.
-
-        Thin delegate to the shared
-        ``llm_utils.load_agent_builder_config`` so this in-method
-        caller and the off-loop snapshot loader stay byte-for-byte
-        consistent on LLM resolution semantics.
-
-        Returns dict with:
-        - llms: (default_llm, fast_llm, vision_llm, compact_llm)
-        - execution_mode: str
-        - instructions: str (system prompt)
-        - skills: List[str]
-        - knowledge_bases: List[str]
-        - tool_categories: List[str]
-        """
-        from ..services.llm_utils import load_agent_builder_config
-
-        return load_agent_builder_config(agent, db, user_id)
+    # NOTE: The legacy ``_load_agent_builder_config`` instance method
+    # used to live here; its body became a one-line delegate to
+    # ``llm_utils.load_agent_builder_config`` after the runtime-config
+    # refactor and no production caller remained (the snapshot loader
+    # and ``_resolve_task_runtime_config`` both call the module-level
+    # helper directly). Removed to avoid a zero-value wrapper that
+    # only existed as a test-mock surface; tests now patch
+    # ``llm_utils.load_agent_builder_config`` directly.
 
     @staticmethod
     def _pick_default_llm_with_warning(
@@ -651,44 +638,35 @@ class AgentServiceManager:
             task, db, user_id=user_id_for_resolution
         )
 
-        (
-            task_llm,
-            task_fast_llm,
-            task_vision_llm,
-            task_compact_llm,
-        ) = core["llms"]
-        task_pattern = core["task_pattern"]
-        agent_config = core["agent_config"]
-        has_agent_builder_config = core["has_agent_builder_config"]
-        agent_fields = core["agent_fields"]
+        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
 
         logger.info(
             "Task %s execution_mode=%s -> pattern=%s",
             task_id,
             getattr(task, "execution_mode", None),
-            task_pattern,
+            core.task_pattern,
         )
-        if agent_fields is not None:
+        if core.agent_fields is not None:
             logger.info(
                 "Task %s using Agent Builder config: %s",
                 task_id,
-                agent_fields["name"],
+                core.agent_fields.name,
             )
             logger.info(
                 "Task %s using Agent Builder execution mode: %s -> pattern=%s",
                 task_id,
-                (agent_config or {}).get("execution_mode"),
-                task_pattern,
+                (core.agent_config or {}).get("execution_mode"),
+                core.task_pattern,
             )
 
         if not task_llm:
             task_llm = self._pick_default_llm_with_warning(
                 self._default_llm,
                 task_id=task_id,
-                has_agent_builder_config=has_agent_builder_config,
+                has_agent_builder_config=core.has_agent_builder_config,
                 agent_id=getattr(task, "agent_id", None),
-                saved_model_ids=(agent_config or {}).get("saved_model_ids"),
-                saved_model_descriptors=(agent_config or {}).get(
+                saved_model_ids=(core.agent_config or {}).get("saved_model_ids"),
+                saved_model_descriptors=(core.agent_config or {}).get(
                     "saved_model_descriptors"
                 ),
                 user_id=user_id_for_resolution,
@@ -700,13 +678,13 @@ class AgentServiceManager:
             task_compact_llm.model_name if task_compact_llm else None,
         )
         return {
-            "agent_config": agent_config,
+            "agent_config": core.agent_config,
             "task_llm": task_llm,
             "task_fast_llm": task_fast_llm,
             "task_vision_llm": task_vision_llm,
             "task_compact_llm": task_compact_llm,
-            "task_pattern": task_pattern,
-            "has_agent_builder_config": has_agent_builder_config,
+            "task_pattern": core.task_pattern,
+            "has_agent_builder_config": core.has_agent_builder_config,
         }
 
     async def _build_tools_for_task(

@@ -41,9 +41,9 @@ from typing import Any, Optional
 from sqlalchemy.orm import Session
 
 from ...core.model.chat.basic.base import BaseLLM
-from ..models.agent import AgentStatus
 from ..models.database import get_session_local
 from ..models.task import Task
+from .llm_utils import AgentRuntimeFields
 
 logger = logging.getLogger(__name__)
 
@@ -63,14 +63,14 @@ class _TaskFields:
     agent_type: Optional[str]
 
 
-@dataclass(frozen=True)
-class _AgentFields:
-    """Primitive subset of the ``Agent`` row when ``task.agent_id`` is set."""
-
-    id: int
-    name: str
-    status: AgentStatus  # enum, not ORM
-    instructions: Optional[str]
+# ``_AgentFields`` historically lived here as the snapshot's local
+# frozen subset of the ``Agent`` row. The same shape is produced by
+# ``llm_utils.resolve_task_runtime_config_core`` as
+# ``AgentRuntimeFields`` -- a single source of truth shared with the
+# main-loop reconstruct path. We re-export the alias here so the
+# field type on ``TaskSetupSnapshot.agent`` reads naturally at the
+# call site and existing imports keep working.
+_AgentFields = AgentRuntimeFields
 
 
 @dataclass(frozen=True)
@@ -161,28 +161,21 @@ def load_task_setup_snapshot_sync(
         )
 
         core = resolve_task_runtime_config_core(task_row, session, user_id=user_id)
-        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core["llms"]
+        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
 
-        agent_fields: Optional[_AgentFields] = None
-        if core["agent_fields"] is not None:
-            af = core["agent_fields"]
-            agent_fields = _AgentFields(
-                id=af["id"],
-                name=af["name"],
-                status=af["status"],
-                instructions=af["instructions"],
-            )
-
+        # ``core.agent_fields`` is already an ``AgentRuntimeFields``
+        # frozen dataclass; pass it through directly. (``_AgentFields``
+        # is an alias for that type — see top of file.)
         return TaskSetupSnapshot(
             task=task_fields,
-            task_pattern=core["task_pattern"],
+            task_pattern=core.task_pattern,
             task_llm=task_llm,
             task_fast_llm=task_fast_llm,
             task_vision_llm=task_vision_llm,
             task_compact_llm=task_compact_llm,
-            agent=agent_fields,
-            agent_config=core["agent_config"],
-            excluded_agent_id=core["excluded_agent_id"],
+            agent=core.agent_fields,
+            agent_config=core.agent_config,
+            excluded_agent_id=core.excluded_agent_id,
         )
     finally:
         session.close()

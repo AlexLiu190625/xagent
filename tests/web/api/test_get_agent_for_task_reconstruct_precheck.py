@@ -126,23 +126,31 @@ def _build_db(
 
 def _stub_downstream(manager: AgentServiceManager):
     """Patch the heavy work past the reconstruct decision so the test
-    asserts only on whether reconstruct was called."""
+    asserts only on whether reconstruct was called.
+
+    LLM resolution + agent-builder config loading moved to module-
+    level helpers in ``llm_utils``; patches target those source
+    locations so the lazy imports inside the snapshot loader and
+    ``_resolve_task_runtime_config`` pick them up.
+    """
     return [
-        patch.object(
-            manager,
-            "_get_task_llm_ids",
-            return_value=[None, None, None, None],
-        ),
         patch(
-            "xagent.web.api.chat.resolve_llms_from_names",
+            "xagent.web.services.llm_utils.UserAwareModelStorage."
+            "resolve_llms_from_names",
             return_value=(None, None, None, None),
         ),
-        patch.object(
-            manager,
-            "_load_agent_builder_config",
+        patch(
+            "xagent.web.services.llm_utils.make_normalize_model_id",
+            return_value=lambda mid, mname: mname,
+        ),
+        patch(
+            "xagent.web.services.llm_utils.load_agent_builder_config",
             return_value={
                 "llms": (None, None, None, None),
+                "saved_model_ids": {},
+                "saved_model_descriptors": {},
                 "execution_mode": "flash",
+                "instructions": "",
                 "knowledge_bases": [],
                 "skills": [],
                 "tool_categories": ["basic"],
