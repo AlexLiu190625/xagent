@@ -18,6 +18,9 @@ from xagent.core.agent import (
     ReActPattern,
 )
 from xagent.core.agent.pattern.auto.auto import DECISION_TOOL_NAME, _AutoChildRuntime
+from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
 
 class FakeWorkspace:
@@ -52,7 +55,43 @@ class FakeLLM:
 
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
+        if not self.responses and has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
         return self.responses.pop(0)
+
+
+class StreamingDecisionLLM:
+    def __init__(self, argument_snapshots: list[str]) -> None:
+        self.argument_snapshots = argument_snapshots
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming decision should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        for arguments in self.argument_snapshots:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": f"call_{DECISION_TOOL_NAME}",
+                        "type": "function",
+                        "function": {
+                            "name": DECISION_TOOL_NAME,
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            )
+
+
+class OutboundCollector:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def __call__(self, payload: dict[str, Any]) -> None:
+        self.events.append(payload)
 
 
 class TimeoutLLM:
@@ -120,6 +159,49 @@ class QuerySkillManager:
             "description": "Task-specific skill",
             "content": f"Use guidance for {task}.",
         }
+
+
+def has_tool(kwargs: dict[str, Any], tool_name: str) -> bool:
+    for tool_schema in kwargs.get("tools") or []:
+        function = tool_schema.get("function")
+        if isinstance(function, dict) and function.get("name") == tool_name:
+            return True
+    return False
+
+
+def default_completion_assessment_response(kwargs: dict[str, Any]) -> dict[str, Any]:
+    answer = "done"
+    messages = kwargs.get("messages") or []
+    if messages:
+        try:
+            payload = json.loads(str(messages[-1].get("content", "{}")))
+            candidate = payload.get("candidate_output")
+            if isinstance(candidate, str):
+                answer = candidate
+            elif candidate is not None:
+                answer = json.dumps(candidate, ensure_ascii=False, default=str)
+        except (AttributeError, json.JSONDecodeError):
+            answer = "done"
+    return {
+        "tool_calls": [
+            {
+                "id": "call_assess_dag_completion",
+                "type": "function",
+                "function": {
+                    "name": DAG_COMPLETION_TOOL_NAME,
+                    "arguments": json.dumps(
+                        {
+                            "status": "completed",
+                            "reason": "Completion assessment.",
+                            "answer": answer,
+                            "missing_work": "",
+                            "replan_instruction": "",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
 
 
 class CapturingChildPattern:
@@ -472,6 +554,90 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert "Mandatory when action is final_answer" in answer_schema["description"]
     assert runtime.last_checkpoint is not None
     assert runtime.last_checkpoint["pattern"] == "AutoPattern"
+    assert (
+        "same natural language as the current user request"
+        in tool_schema["description"]
+    )
+    assert "tool results, source documents" in answer_schema["description"]
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_streams_direct_final_answer_as_tool_args_arrive() -> None:
+    prefix = (
+        '{"action":"final_answer","reason":"simple",'
+        '"requires_current_or_external_facts":false,'
+        '"existing_context_sufficient":true,'
+        '"evidence_basis":"current conversation",'
+        '"missing_verification":"",'
+        '"answer":"'
+    )
+    llm = StreamingDecisionLLM(
+        [
+            prefix + "Hi",
+            prefix + "Hi there",
+            prefix + "Hi there.",
+            prefix + 'Hi there."}',
+        ]
+    )
+    collector = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="auto-stream",
+        outbound_message_handler=collector,
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext(execution_id="auto-stream")
+    context.add_user_message("Say hello")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "Hi there."
+    assert [event["type"] for event in collector.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert [event["delta"] for event in collector.events[1:-1]] == [
+        "Hi",
+        " there",
+        ".",
+    ]
+    assert collector.events[-1]["content"] == "Hi there."
+    assert len({event["message_id"] for event in collector.events}) == 1
+    assert len(llm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_auto_pattern_does_not_stream_non_final_decision() -> None:
+    arguments = json.dumps(
+        {
+            "action": "react",
+            "reason": "Needs a tool.",
+            "requires_current_or_external_facts": False,
+            "existing_context_sufficient": True,
+            "evidence_basis": "current conversation",
+            "missing_verification": "",
+        }
+    )
+    llm = StreamingDecisionLLM([arguments[:80], arguments])
+    collector = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="auto-react-stream",
+        outbound_message_handler=collector,
+    )
+    child = CapturingChildPattern()
+    pattern = AutoPattern(react_pattern=child)  # type: ignore[arg-type]
+    context = ExecutionContext(execution_id="auto-react-stream")
+    context.add_user_message("Use a tool")
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "child done"
+    assert collector.events == []
+    assert pattern.selected_pattern == "react"
 
 
 @pytest.mark.asyncio
@@ -735,6 +901,39 @@ async def test_auto_pattern_retries_truncated_final_answer_arguments() -> None:
 
 
 @pytest.mark.asyncio
+async def test_auto_pattern_does_not_stream_rejected_final_answer_candidate() -> None:
+    llm = FakeLLM(
+        [
+            truncated_final_answer_decision_tool_response(),
+            decision_tool_response(
+                "final_answer",
+                "Retry produced the full answer.",
+                answer="Complete answer after retry.",
+            ),
+        ]
+    )
+    pattern = AutoPattern()
+    context = ExecutionContext(execution_id="auto-retry-stream")
+    context.add_user_message("Continue")
+    collector = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="auto-retry-stream",
+        outbound_message_handler=collector,
+    )
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "Complete answer after retry."
+    assert [event["type"] for event in collector.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert collector.events[1]["delta"] == "Complete answer after retry."
+
+
+@pytest.mark.asyncio
 async def test_auto_pattern_retries_unrepairable_decision_arguments() -> None:
     llm = FakeLLM(
         [
@@ -964,9 +1163,13 @@ async def test_auto_pattern_empty_final_answer_falls_back_to_react() -> None:
         ]
     )
     pattern = AutoPattern()
-    context = ExecutionContext()
+    context = ExecutionContext(execution_id="auto-empty-final-candidate")
     context.add_user_message("Continue")
-    runtime = RecordingRuntime()
+    collector = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="auto-empty-final-candidate",
+        outbound_message_handler=collector,
+    )
 
     result = await pattern.run(
         context=context,
@@ -990,6 +1193,7 @@ async def test_auto_pattern_empty_final_answer_falls_back_to_react() -> None:
     }
     assert pattern.selected_pattern == "react"
     assert len(llm.calls) == 2
+    assert collector.events == []
 
 
 @pytest.mark.asyncio
@@ -1011,9 +1215,13 @@ async def test_auto_pattern_final_answer_requiring_external_facts_falls_back_to_
         ]
     )
     pattern = AutoPattern()
-    context = ExecutionContext()
+    context = ExecutionContext(execution_id="auto-external-facts-candidate")
     context.add_user_message("总结最近 AI 圈子的供应链攻击")
-    runtime = RecordingRuntime()
+    collector = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="auto-external-facts-candidate",
+        outbound_message_handler=collector,
+    )
 
     result = await pattern.run(
         context=context,
@@ -1038,6 +1246,7 @@ async def test_auto_pattern_final_answer_requiring_external_facts_falls_back_to_
     }
     assert pattern.selected_pattern == "react"
     assert len(llm.calls) == 2
+    assert collector.events == []
 
 
 @pytest.mark.asyncio
@@ -1237,4 +1446,5 @@ async def test_auto_pattern_dag_resume_from_tracer_does_not_redecide(
     assert resumed["status"] == "completed"
     assert resumed["output"] == "resumed dag"
     assert resumed["pattern"] == "AutoPattern"
-    assert len(resumed_llm.calls) == 1
+    assert len(resumed_llm.calls) == 2
+    assert has_tool(resumed_llm.calls[1], DAG_COMPLETION_TOOL_NAME)

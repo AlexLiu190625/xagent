@@ -76,10 +76,10 @@ export interface ChatMessageProps {
 function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latestTitle?: string, taskStatus?: string, errorMessage?: string }) {
   const { t } = useI18n();
 
-  if (taskStatus === 'failed' && errorMessage) {
+  if (taskStatus === 'failed') {
     return (
       <div className="py-3 text-sm leading-relaxed text-red-500">
-        <span>{errorMessage}</span>
+        <span>{errorMessage || t("common.errors.unknown")}</span>
       </div>
     );
   }
@@ -347,6 +347,10 @@ export function ChatMessage({
       }
     }
   }
+  const failedMessageText =
+    typeof content === "string" && content.trim()
+      ? content
+      : errorMessage || t("common.errors.unknown");
 
   return (
     <div className="w-full space-y-2 animate-fade-in group">
@@ -383,7 +387,11 @@ export function ChatMessage({
 
           {/* Message content */}
           <div className={cn("flex-1 min-w-0")}>
-            {content ? (
+            {!isUser && taskStatus === "failed" ? (
+              <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
+                {failedMessageText}
+              </div>
+            ) : content ? (
               typeof content === "string" ? (
                 isUser ? (
                   <ExpandableMessage content={content} />

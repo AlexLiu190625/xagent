@@ -5,6 +5,7 @@ import { useAuth } from "@/contexts/auth-context"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { toast } from "sonner"
 import { getWsUrl, getApiUrl, getUploadApiUrl } from "@/lib/utils"
+import { isFinalAnswerStreamEventType } from "@/lib/streaming-final-answer"
 
 // Duplicate message detection: record recently sent messages
 const recentMessages: Array<{ message: string; timestamp: number; taskId: number }> = []
@@ -18,6 +19,9 @@ interface WebSocketMessage {
   step_id?: string
   event_id?: string
   event_type?: string
+  message_id?: string
+  delta?: string
+  content?: string
 }
 
 interface UseWebSocketOptions {
@@ -247,7 +251,18 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           // Handle different message types from the backend
           let message: WebSocketMessage
 
-          if (data.type === "trace_event") {
+          if (isFinalAnswerStreamEventType(data.type)) {
+            message = {
+              type: data.type,
+              data,
+              timestamp: data.timestamp || new Date().toISOString(),
+              task_id: data.task_id,
+              event_id: data.event_id,
+              message_id: data.message_id,
+              delta: data.delta,
+              content: data.content,
+            }
+          } else if (data.type === "trace_event") {
             // Ensure data.data is not an empty string
             const safeData = typeof data.data === 'string' && data.data === ''
               ? {}

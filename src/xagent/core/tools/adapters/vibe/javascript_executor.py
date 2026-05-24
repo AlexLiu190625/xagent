@@ -12,6 +12,11 @@ from pydantic import BaseModel, Field
 from xagent.core.tools.core.javascript_executor import JavaScriptExecutorCore
 from xagent.core.workspace import TaskWorkspace
 
+from ...artifacts import (
+    build_generated_file_metadata,
+    changed_generated_artifact_files,
+    snapshot_generated_artifact_files,
+)
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .function import FunctionTool
 from .sandboxed_tool.sandbox_config import sandbox_config
@@ -37,6 +42,9 @@ class JavaScriptExecutorResult(BaseModel):
     success: bool = Field(description="Whether the execution was successful")
     output: str = Field(description="Output from the execution")
     error: str = Field(default="", description="Error message if execution failed")
+    generated_files: list[str] = Field(default_factory=list)
+    file_refs: list[dict[str, Any]] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class JavaScriptExecutorTool(AbstractBaseTool):
@@ -82,8 +90,26 @@ class JavaScriptExecutorTool(AbstractBaseTool):
 
         # Execute code within auto_register context
         if self._workspace and working_directory:
+            files_before = snapshot_generated_artifact_files(working_directory)
             with self._workspace.auto_register_files():
                 result = executor.execute_code(exec_args.code, packages=pkg_list)
+            if result.get("success"):
+                files_after = snapshot_generated_artifact_files(working_directory)
+                metadata = build_generated_file_metadata(
+                    workspace=self._workspace,
+                    file_paths=changed_generated_artifact_files(
+                        files_before, files_after
+                    ),
+                )
+                result.update(metadata)
+                if metadata["generated_files"]:
+                    output = (
+                        result.get("output") or "Code executed successfully (no output)"
+                    )
+                    result["output"] = (
+                        f"{output}\n\nGenerated files: "
+                        f"{', '.join(metadata['generated_files'])}"
+                    )
         else:
             result = executor.execute_code(exec_args.code, packages=pkg_list)
 

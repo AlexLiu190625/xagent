@@ -224,11 +224,13 @@ class DocumentRecord:
         doc_id: Document identifier.
         file_id: Optional file identifier for uploaded file tracking.
         source_path: Original source path if available.
+        user_id: Optional tenant owner for owner-aware control-plane cleanup.
     """
 
     doc_id: str
     file_id: Optional[str] = None
     source_path: Optional[str] = None
+    user_id: Optional[int] = None
 
 
 class FilterOperator(str, Enum):
@@ -334,16 +336,26 @@ class MetadataStore(ABC):
         """Delete persisted metadata/config rows for a collection."""
 
     @abstractmethod
-    async def rename_collection(self, old_name: str, new_name: str) -> None:
+    async def rename_collection(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> None:
         """Rename persisted control-plane keys after a data-plane collection rename.
 
         Updates rows that gate :meth:`list_collections` visibility (for example
         per-tenant config rows and aggregate metadata) so they stay aligned with
-        vector tables when the ``collection`` / ``name`` fields change.
+        vector tables when the ``collection`` / ``name`` fields change. Non-admin
+        callers only rename their tenant config; admin callers rename global
+        metadata/cache rows as well.
 
         Args:
             old_name: Previous collection name (sanitized by the caller).
             new_name: Target collection name (sanitized by the caller).
+            user_id: User ID for tenant-scoped rename.
+            is_admin: Whether the caller can rename across tenants.
         """
 
     @abstractmethod
@@ -383,6 +395,10 @@ class MetadataStore(ABC):
         Returns:
             Config JSON string if found, None otherwise.
         """
+
+    @abstractmethod
+    def list_collection_config_owner_ids(self, collection_name: str) -> set[int]:
+        """List user IDs that have collection_config rows for a collection."""
 
     @abstractmethod
     def get_raw_connection(self) -> Any:
@@ -445,8 +461,14 @@ class VectorIndexStore(ABC):
         self,
         collection_name: str,
         new_name: str,
+        user_id: Optional[int],
+        is_admin: bool,
     ) -> List[str]:
         """Rename collection key across vector-side tables.
+
+        Applies the same multi-tenancy filter semantics as other vector store
+        writes: non-admin callers rename only rows for ``user_id``; admin callers
+        rename all matching rows.
 
         Returns:
             Warning messages generated during best-effort updates.
@@ -1271,6 +1293,20 @@ class IngestionStatusStore(ABC):
             DatabaseOperationError: If delete operation fails.
         """
 
+    @abstractmethod
+    def rename_collection_status(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Rename ingestion status rows for a collection.
+
+        Applies tenant filtering for non-admin callers and global filtering for
+        admin callers. Returns warnings for best-effort update failures.
+        """
+
     # --- Async methods ---
 
     @abstractmethod
@@ -1340,6 +1376,16 @@ class IngestionStatusStore(ABC):
         Raises:
             DatabaseOperationError: If delete operation fails.
         """
+
+    @abstractmethod
+    async def rename_collection_status_async(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Async version of :meth:`rename_collection_status`."""
 
 
 class PromptTemplateStore(ABC):

@@ -25,6 +25,8 @@ from xagent.config import (
     REDIS_URL,
     SANDBOX_CPUS,
     SANDBOX_ENV,
+    SANDBOX_HOST_PROJECT_ROOT,
+    SANDBOX_HOST_STORAGE_ROOT,
     SANDBOX_IMAGE,
     SANDBOX_MEMORY,
     SANDBOX_VOLUMES,
@@ -55,6 +57,8 @@ from xagent.config import (
     get_redis_url,
     get_sandbox_cpus,
     get_sandbox_env,
+    get_sandbox_host_project_root,
+    get_sandbox_host_storage_root,
     get_sandbox_image,
     get_sandbox_memory,
     get_sandbox_volumes,
@@ -89,6 +93,12 @@ class TestEnvironmentVariableConstants:
 
     def test_sandbox_image_constant(self):
         assert SANDBOX_IMAGE == "SANDBOX_IMAGE"
+
+    def test_sandbox_host_project_root_constant(self):
+        assert SANDBOX_HOST_PROJECT_ROOT == "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
+
+    def test_sandbox_host_storage_root_constant(self):
+        assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 
     def test_lancedb_path_constant(self):
         assert LANCEDB_PATH == "LANCEDB_PATH"
@@ -712,6 +722,70 @@ class TestGetSandboxVolumes:
         assert len(result) == 2
         assert result[0] == ("/host1", "/container1", "ro")
         assert result[1] == ("/host2", "/container2", "rw")
+
+    def test_host_side_sources_preserve_absolute_paths(self, monkeypatch):
+        """Docker sibling volume sources are already host paths."""
+        monkeypatch.setenv(SANDBOX_VOLUMES, "/host/data:/container:rw")
+        result = get_sandbox_volumes(host_side_sources=True)
+        assert result == [("/host/data", "/container", "rw")]
+
+    def test_host_side_sources_reject_relative_paths(self, monkeypatch):
+        """Docker sibling mode should not absolutize relative paths in backend."""
+        monkeypatch.setenv(SANDBOX_VOLUMES, "relative/path:/container:ro")
+        result = get_sandbox_volumes(host_side_sources=True)
+        assert result == []
+
+    def test_host_side_sources_reject_tilde_paths(self, monkeypatch):
+        """Docker sibling mode should not expand backend-container home paths."""
+        monkeypatch.setenv(SANDBOX_VOLUMES, "~/data:/container:ro")
+        result = get_sandbox_volumes(host_side_sources=True)
+        assert result == []
+
+
+class TestGetSandboxHostProjectRoot:
+    """Test get_sandbox_host_project_root() function."""
+
+    def test_no_env_var_returns_none(self, monkeypatch):
+        """Test that missing env var returns None."""
+        monkeypatch.delenv(SANDBOX_HOST_PROJECT_ROOT, raising=False)
+        result = get_sandbox_host_project_root()
+        assert result is None
+
+    def test_project_root_with_env_var(self, monkeypatch):
+        """Test project root with environment variable."""
+        monkeypatch.setenv(SANDBOX_HOST_PROJECT_ROOT, "/host/xagent")
+        result = get_sandbox_host_project_root()
+        assert result == Path("/host/xagent")
+
+    def test_project_root_expands_env_vars_without_user_or_abspath(self, monkeypatch):
+        """Host paths should not be resolved against the backend container."""
+        monkeypatch.setenv("HOST_PROJECT_ROOT", "/host/xagent")
+        monkeypatch.setenv(SANDBOX_HOST_PROJECT_ROOT, "$HOST_PROJECT_ROOT/../xagent")
+        result = get_sandbox_host_project_root()
+        assert result == Path("/host/xagent/../xagent")
+
+
+class TestGetSandboxHostStorageRoot:
+    """Test get_sandbox_host_storage_root() function."""
+
+    def test_no_env_var_returns_none(self, monkeypatch):
+        """Test that missing env var returns None."""
+        monkeypatch.delenv(SANDBOX_HOST_STORAGE_ROOT, raising=False)
+        result = get_sandbox_host_storage_root()
+        assert result is None
+
+    def test_storage_root_with_env_var(self, monkeypatch):
+        """Test storage root with environment variable."""
+        monkeypatch.setenv(SANDBOX_HOST_STORAGE_ROOT, "/host/.xagent")
+        result = get_sandbox_host_storage_root()
+        assert result == Path("/host/.xagent")
+
+    def test_storage_root_expands_env_vars_without_user_or_abspath(self, monkeypatch):
+        """Host paths should not be resolved against the backend container."""
+        monkeypatch.setenv("HOST_STORAGE_ROOT", "/host/.xagent")
+        monkeypatch.setenv(SANDBOX_HOST_STORAGE_ROOT, "$HOST_STORAGE_ROOT/../.xagent")
+        result = get_sandbox_host_storage_root()
+        assert result == Path("/host/.xagent/../.xagent")
 
 
 class TestGetBoxliteHomeDir:

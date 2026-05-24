@@ -59,6 +59,10 @@ def init_db(db_url: str | None = None) -> None:
         UserDefaultModel,
         UserModel,
         UserTemplateRelation,
+        Workforce,
+        WorkforceAgent,
+        WorkforceBuilderMessage,
+        WorkforceRun,
     )
     from .agent import Agent  # noqa: F401
     from .sandbox import SandboxInfo, SandboxSnapshot  # noqa: F401

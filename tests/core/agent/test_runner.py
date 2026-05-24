@@ -649,6 +649,8 @@ async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
         msg for msg in reversed(context.messages) if msg.role == "user"
     )
     assert new_user_message.metadata.get("files") == files
+    turn_id = new_user_message.metadata.get("turn_id")
+    assert isinstance(turn_id, str) and turn_id
 
     user_message_events = [
         event
@@ -657,6 +659,7 @@ async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
         and event["data"].get("message") == "Use the attached PDF."
     ]
     assert len(user_message_events) == 1
+    assert user_message_events[0]["data"]["turn_id"] == turn_id
     assert user_message_events[0]["data"]["files"] == files
     assert user_message_events[0]["data"]["attachments"] == files
 
@@ -739,6 +742,8 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
     assert latest_user.content == execution_message
     assert latest_user.metadata["display_message"] == "Read file"
     assert latest_user.metadata["files"] == files
+    turn_id = latest_user.metadata.get("turn_id")
+    assert isinstance(turn_id, str) and turn_id
 
     checkpoint_messages = tracer.by_execution_id["exec-display-contract"]["context"][
         "messages"
@@ -749,6 +754,7 @@ async def test_runner_post_user_message_preserves_display_and_execution_contract
     assert latest_checkpoint_user["content"] == execution_message
     assert latest_checkpoint_user["metadata"]["display_message"] == "Read file"
     assert latest_checkpoint_user["metadata"]["files"] == files
+    assert latest_checkpoint_user["metadata"]["turn_id"] == turn_id
 
 
 @pytest.mark.asyncio
@@ -781,10 +787,13 @@ async def test_runner_initial_user_message_preserves_display_metadata(
     assert first_user.content == execution_message
     assert first_user.metadata["display_message"] == "Read file"
     assert first_user.metadata["files"] == files
+    turn_id = first_user.metadata.get("turn_id")
+    assert isinstance(turn_id, str) and turn_id
     user_event = next(
         event for event in tracer.events if event["event_type"] == "task_start_message"
     )
     assert user_event["data"]["message"] == "Read file"
+    assert user_event["data"]["turn_id"] == turn_id
 
 
 @pytest.mark.asyncio

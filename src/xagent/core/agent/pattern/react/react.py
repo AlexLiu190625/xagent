@@ -14,9 +14,11 @@ from ...context.enrichment import (
     generate_and_store_react_memory,
     latest_user_text,
 )
+from ...language import final_answer_language_rule
 from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
+from ..final_answer_stream import ReActFinalAnswerStreamer
 
 
 class ReActReasoningMode(str, Enum):
@@ -118,7 +120,7 @@ class ReActPattern(AgentPattern):
         # Intentionally high for interactive and long-running agent tasks; callers
         # can pass a lower value when they need stricter cost or latency bounds.
         max_iterations: int = 200,
-        tool_choice: str | dict[str, Any] | None = "auto",
+        tool_choice: str | dict[str, Any] | None = "required",
         reasoning_mode: ReActReasoningMode | str = ReActReasoningMode.TOOL_CALLING,
         finalize_after_tool_result: bool = False,
     ) -> None:
@@ -131,6 +133,7 @@ class ReActPattern(AgentPattern):
         self.current_iteration = 0
         self.last_response: Any = None
         self.pending_tool_calls: list[dict[str, Any]] = []
+        self.pending_tool_call_content: dict[str, str] = {}
         self.tool_ledger: dict[str, ToolCallRecord] = {}
         self.force_final_answer_next = False
         self.waiting_for_user_request: dict[str, Any] | None = None
@@ -294,14 +297,25 @@ class ReActPattern(AgentPattern):
                 tools=tool_schemas or None,
                 metadata={"iteration": iteration},
             )
+            answer_streamer: ReActFinalAnswerStreamer | None = None
             try:
-                response = await runtime.run_llm_call(
-                    llm,
-                    messages=messages,
-                    tools=tool_schemas or None,
-                    tool_choice=self.tool_choice if tool_schemas else None,
-                )
+                llm_kwargs = {
+                    "messages": messages,
+                    "tools": tool_schemas or None,
+                    "tool_choice": self.tool_choice if tool_schemas else None,
+                }
+                if tool_schemas:
+                    answer_streamer = ReActFinalAnswerStreamer(runtime)
+                    response = await runtime.run_streaming_llm_call(
+                        llm,
+                        on_chunk=answer_streamer.handle_chunk,
+                        **llm_kwargs,
+                    )
+                else:
+                    response = await runtime.stream_final_answer(llm, **llm_kwargs)
             except LLMCallInterrupted:
+                if answer_streamer is not None:
+                    await answer_streamer.fail("interrupted during LLM stream")
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
                     context=context,
@@ -309,6 +323,10 @@ class ReActPattern(AgentPattern):
                 )
                 if interrupted is not None:
                     return interrupted
+                raise
+            except Exception as exc:
+                if answer_streamer is not None:
+                    await answer_streamer.fail(str(exc))
                 raise
             await runtime.on_llm_end(
                 context=context,
@@ -329,7 +347,14 @@ class ReActPattern(AgentPattern):
                 )
 
             tool_calls = normalized.get("tool_calls", [])
+            if answer_streamer is not None:
+                await self._finish_streamed_answer_if_final(
+                    answer_streamer=answer_streamer,
+                    assistant_content=assistant_content,
+                    tool_calls=tool_calls,
+                )
             if tool_calls:
+                self._remember_tool_call_content(tool_calls, assistant_content)
                 self.status = "acting"
                 self.pending_tool_calls = list(tool_calls)
                 await runtime.checkpoint("after_llm", context=context, pattern=self)
@@ -362,6 +387,34 @@ class ReActPattern(AgentPattern):
             metadata={"iterations": self.max_iterations, "status": self.status},
         ).to_dict()
 
+    async def _finish_streamed_answer_if_final(
+        self,
+        *,
+        answer_streamer: ReActFinalAnswerStreamer,
+        assistant_content: Any,
+        tool_calls: list[dict[str, Any]],
+    ) -> None:
+        if not answer_streamer.started:
+            return
+        final_answer = self._final_answer_tool_content(tool_calls)
+        if final_answer is not None and len(tool_calls) == 1:
+            await answer_streamer.finish(final_answer)
+            return
+        if not tool_calls and assistant_content is not None:
+            await answer_streamer.finish(str(assistant_content))
+
+    def _final_answer_tool_content(
+        self,
+        tool_calls: list[dict[str, Any]],
+    ) -> str | None:
+        for tool_call in tool_calls:
+            if tool_call.get("name") != "final_answer":
+                continue
+            args = tool_call.get("args")
+            if isinstance(args, dict):
+                return str(args.get("answer", ""))
+        return None
+
     def _messages_for_llm(
         self,
         context: Any,
@@ -375,7 +428,8 @@ class ReActPattern(AgentPattern):
             instruction = (
                 "You have already received the tool result needed for the current "
                 "step. Do not call tools again. Produce the final answer for this "
-                "step using the latest tool result."
+                "step using the latest tool result. "
+                f"{final_answer_language_rule()}"
             )
         elif has_tools:
             available_tools = ", ".join(tool_names or []) or "(none)"
@@ -386,7 +440,9 @@ class ReActPattern(AgentPattern):
                 "that a tool can determine. After a successful tool call, base the "
                 "final answer on the latest tool result instead of repeating the same "
                 "tool work. When the current task is complete, call the final_answer "
-                "tool exactly once instead of calling another work tool. If a tool "
+                "tool exactly once instead of calling another work tool or returning "
+                "plain assistant text. Do not write assistant text in the same "
+                "response as a work tool call; call the tool directly. If a tool "
                 "needs missing information from the user, call ask_user_question; do "
                 "not ask the question as plain assistant text. If the latest user "
                 "message explicitly asks you to call a named available tool, call "
@@ -451,6 +507,7 @@ class ReActPattern(AgentPattern):
             "task_text": self.task_text,
             "last_response": self.last_response,
             "pending_tool_calls": self.pending_tool_calls,
+            "pending_tool_call_content": self.pending_tool_call_content,
             "tool_ledger": {
                 key: record.to_dict() for key, record in self.tool_ledger.items()
             },
@@ -476,6 +533,9 @@ class ReActPattern(AgentPattern):
         self.task_text = str(stored_task_text) if stored_task_text else None
         self.last_response = state.get("last_response")
         self.pending_tool_calls = list(state.get("pending_tool_calls", []))
+        self.pending_tool_call_content = dict(
+            state.get("pending_tool_call_content", {})
+        )
         self.tool_ledger = {
             key: ToolCallRecord.from_dict(value)
             for key, value in state.get("tool_ledger", {}).items()
@@ -634,6 +694,24 @@ class ReActPattern(AgentPattern):
 
         return [call for call in normalized if call.get("name")]
 
+    def _remember_tool_call_content(
+        self, tool_calls: list[dict[str, Any]], assistant_content: Any
+    ) -> None:
+        if not isinstance(assistant_content, str):
+            return
+        content = assistant_content.strip()
+        if not content:
+            return
+
+        control_tool_names = self._control_tool_names()
+        for tool_call in tool_calls:
+            if tool_call.get("name") in control_tool_names:
+                continue
+            tool_call_id = str(tool_call.get("id") or "")
+            if tool_call_id:
+                self.pending_tool_call_content[tool_call_id] = content
+            return
+
     def _coerce_arguments(self, arguments: Any) -> dict[str, Any]:
         if isinstance(arguments, dict):
             return arguments
@@ -667,12 +745,16 @@ class ReActPattern(AgentPattern):
                     "description": (
                         "Finish the current ReAct step and send the final answer to "
                         "the user. Use this once the latest tool results satisfy the "
-                        "current user request. Do not call additional tools after this."
+                        "current user request. Do not call additional tools after "
+                        f"this. {final_answer_language_rule()}"
                     ),
                     "parameters": {
                         "type": "object",
                         "properties": {
-                            "answer": {"type": "string"},
+                            "answer": {
+                                "type": "string",
+                                "description": final_answer_language_rule(),
+                            },
                         },
                         "required": ["answer"],
                     },
@@ -959,6 +1041,7 @@ class ReActPattern(AgentPattern):
             )
             if control_result is not None:
                 self.pending_tool_calls = self.pending_tool_calls[1:]
+                self._forget_tool_call_content(tool_call)
                 await runtime.checkpoint(
                     str(control_result.get("status", "control_tool")),
                     context=context,
@@ -985,6 +1068,7 @@ class ReActPattern(AgentPattern):
                 tool_call_id=tool_call.get("id"),
             )
             self.pending_tool_calls = self.pending_tool_calls[1:]
+            self._forget_tool_call_content(tool_call)
             await runtime.checkpoint(
                 "after_tool",
                 context=context,
@@ -1139,6 +1223,7 @@ class ReActPattern(AgentPattern):
         tools: list[Any],
         runtime: PatternRuntime,
     ) -> Any:
+        tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
         self._record_tool_call(tool_call, status="running")
         await runtime.on_tool_start(tool_call=tool_call)
@@ -1195,6 +1280,21 @@ class ReActPattern(AgentPattern):
             "step_id": str(step_id),
             "dag_step_id": str(step_id),
         }
+
+    def _with_tool_call_content(self, tool_call: dict[str, Any]) -> dict[str, Any]:
+        tool_call_id = str(tool_call.get("id") or "")
+        content = self.pending_tool_call_content.get(tool_call_id)
+        if not content:
+            return tool_call
+        return {
+            **tool_call,
+            "assistant_content": content,
+        }
+
+    def _forget_tool_call_content(self, tool_call: dict[str, Any]) -> None:
+        tool_call_id = str(tool_call.get("id") or "")
+        if tool_call_id:
+            self.pending_tool_call_content.pop(tool_call_id, None)
 
     def _record_tool_call(
         self,

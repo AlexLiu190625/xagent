@@ -20,6 +20,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
@@ -257,6 +258,13 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
     kwargs = mock_schedule_bg.await_args.kwargs
     assert kwargs["payload"] is payload
     assert kwargs["force_fresh"] is True
+
+    persisted = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == int(task.id), TaskChatMessage.role == "user")
+        .one()
+    )
+    assert persisted.turn_id == payload.turn_id
 
 
 # ---------------------------------------------------------------------------
@@ -672,7 +680,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
             user=user,
             payload=payload,
             force_fresh=False,
-            context=None,
+            context={"turn_id": "caller-turn", "existing": "value"},
         )
         await bg_task
 
@@ -687,3 +695,5 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
     assert (
         kwargs["llm_user_message"] == "summarize this\n\n[uploaded file: secret.txt]"
     ), "execution_message must reach execute_task_background.llm_user_message"
+    assert kwargs["context"]["turn_id"] == payload.turn_id
+    assert kwargs["context"]["existing"] == "value"

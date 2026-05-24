@@ -16,12 +16,13 @@ import {
   Shield,
   MessageSquare,
 } from 'lucide-react';
-import { cn, getApiUrl, getFilePublicPreviewUrl } from '@/lib/utils';
+import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
 import { useI18n } from '@/contexts/i18n-context';
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
+import { InlineFilePreview } from '@/components/file/inline-file-preview';
 
 // Types
 interface ToolArgs {
@@ -43,6 +44,7 @@ interface ToolArtifact {
   type?: string;
   file_id?: string;
   filename?: string;
+  mime_type?: string;
   preview_url?: string;
   display?: string;
 }
@@ -70,6 +72,7 @@ interface TraceEvent {
       tool_args?: ToolArgs;
       tool_params?: ToolArgs;
       answer?: string;
+      assistant_content?: string;
     };
     result?: ToolResult | string;
     tools?: Array<{
@@ -99,9 +102,11 @@ interface StepAction {
       output?: any;
       artifacts?: ToolArtifact[];
       reasoning?: string;
+      assistant_content?: string;
       error?: any;
       tool_calls?: any;
       sandboxed?: boolean;
+      inline?: boolean;
   };
 }
 
@@ -290,6 +295,21 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         }
         // Support both data.response.tool_name and data.tool_name
         const toolName = event.data?.response?.tool_name || event.data?.tool_name || t('traceEventRenderer.unknownTool');
+        const assistantContent = event.data?.response?.assistant_content || event.data?.assistant_content;
+
+        if (typeof assistantContent === 'string' && assistantContent.trim()) {
+          step.actions.push({
+            id: `${eventId}-assistant-content`,
+            type: 'info',
+            title: t('traceEventRenderer.toolCallNote'),
+            status: 'completed',
+            timestamp,
+            data: {
+              output: assistantContent.trim(),
+              inline: true,
+            }
+          });
+        }
 
         if (toolName) {
           // Merge with existing tools instead of replacing
@@ -487,35 +507,28 @@ const CopyButton = ({ text, title }: { text: string, title?: string }) => {
   );
 };
 
-const getArtifactPreviewUrl = (artifact: ToolArtifact) => {
-  const apiUrl = getApiUrl();
-  if (artifact.preview_url) {
-    if (/^https?:\/\//.test(artifact.preview_url)) {
-      return artifact.preview_url;
-    }
-    return `${apiUrl}${artifact.preview_url.startsWith('/') ? '' : '/'}${artifact.preview_url}`;
-  }
-  if (artifact.file_id) {
-    return getFilePublicPreviewUrl(artifact.file_id, apiUrl);
-  }
-  return '';
-};
-
-const ToolArtifactsDisplay = ({ artifacts }: { artifacts?: ToolArtifact[] }) => {
-  const imageArtifacts = (artifacts || []).filter(
-    artifact => artifact?.type === 'image' && (artifact.preview_url || artifact.file_id)
+const ToolArtifactsDisplay = ({ artifacts, onFileClick, t }: { artifacts?: ToolArtifact[]; onFileClick?: (filePath: string, fileName: string) => void; t: (key: string) => string }) => {
+  const displayArtifacts = (artifacts || []).filter(
+    artifact => artifact && (artifact.preview_url || artifact.file_id) && (artifact.display === undefined || artifact.display === 'inline')
   );
 
-  if (imageArtifacts.length === 0) return null;
+  if (displayArtifacts.length === 0) return null;
 
   return (
     <div className="mt-4 grid gap-3">
-      {imageArtifacts.map((artifact, index) => (
-        <img
+      {displayArtifacts.map((artifact, index) => (
+        <InlineFilePreview
           key={`${artifact.file_id || artifact.preview_url || index}`}
-          src={getArtifactPreviewUrl(artifact)}
-          alt={artifact.filename || 'generated image'}
-          className="max-w-full rounded-lg border border-border/50 bg-muted/20"
+          source={{
+            fileId: artifact.file_id,
+            previewUrl: artifact.preview_url,
+            filename: artifact.filename,
+            mimeType: artifact.mime_type,
+            type: artifact.type,
+          }}
+          openLabel={t('files.previewDialog.buttons.open')}
+          loadErrorText={t('files.previewDialog.errors.loadFailed')}
+          onFileClick={onFileClick}
         />
       ))}
     </div>
@@ -524,7 +537,7 @@ const ToolArtifactsDisplay = ({ artifacts }: { artifacts?: ToolArtifact[] }) => 
 
 const ToolOutputDisplay = ({ action, isRunning, t, onFileClick, onAgentClick }: { action: StepAction, isRunning: boolean, t: any, onFileClick?: (filePath: string, fileName: string) => void, onAgentClick?: (agentId: string, agentName: string) => void }) => (
   <>
-    <ToolArtifactsDisplay artifacts={action.data.artifacts} />
+    <ToolArtifactsDisplay artifacts={action.data.artifacts} onFileClick={onFileClick} t={t} />
     {action.data.output !== undefined && action.data.output !== '' && (
       <div className="mt-4 flex flex-col gap-1.5">
         <div className="text-xs text-muted-foreground px-1 flex justify-between items-center">
@@ -865,6 +878,18 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
     };
   }, [updateToolSummaryVisibility]);
 
+  if (action.type === 'info' && action.data.inline) {
+    return (
+      <div className="px-3 py-1.5">
+        <MarkdownRenderer
+          content={formatActionContent(action.data.output)}
+          onFileClick={onFileClick}
+          className="text-sm leading-relaxed text-foreground prose-neutral dark:prose-invert max-w-none [&>p]:mb-1.5 [&>p:last-child]:mb-0"
+        />
+      </div>
+    );
+  }
+
   if (action.type === 'llm') {
     return (
       <div className="group transition-all duration-300">
@@ -1003,9 +1028,27 @@ interface StepItemProps {
 }
 
 function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAgentClick }: StepItemProps) {
+  const { t } = useI18n();
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
-  const [isExpanded, setIsExpanded] = useState(true); // Default to expanded
+  const [isExpanded, setIsExpanded] = useState(() => !isCompleted);
+  const wasCompletedRef = useRef(isCompleted);
+  const rawTitle = step.description || step.stepName;
+  const displayTitle =
+    isCompleted && step.stepName === t('traceEventRenderer.taskExecution') && !step.description
+      ? t('traceEventRenderer.thoughtProcess')
+      : rawTitle;
+
+  useEffect(() => {
+    if (isCompleted && !wasCompletedRef.current) {
+      setIsExpanded(false);
+    }
+    wasCompletedRef.current = isCompleted;
+  }, [isCompleted]);
+
+  const handleToggle = () => {
+    setIsExpanded((expanded) => !expanded);
+  };
 
   return (
     <motion.div
@@ -1015,31 +1058,34 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
       className="space-y-3"
     >
       {/* Step Title */}
-      <div
-        className="flex items-start gap-2 cursor-pointer group/step"
-        onClick={() => setIsExpanded(!isExpanded)}
+      <button
+        type="button"
+        className="flex w-full items-start gap-2 rounded-lg px-2 py-1 -ml-2 text-left transition-colors hover:bg-muted/50 group/step"
+        onClick={handleToggle}
+        aria-expanded={isExpanded}
       >
         {isCompleted ? (
-          <CheckCircle2 className="w-5 h-5 text-green-500" />
+          <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5" />
         ) : isFailed ? (
-          <Info className="w-5 h-5 text-red-500" />
+          <Info className="w-5 h-5 text-red-500 mt-0.5" />
         ) : (
-          <Loader2 className="w-5 h-5 text-primary animate-spin" />
+          <Loader2 className="w-5 h-5 text-primary animate-spin mt-0.5" />
         )}
 
         <div className="flex-1 min-w-0 flex items-start gap-2">
           <h3 className="min-w-0 flex-1 text-sm font-medium text-foreground break-words [overflow-wrap:anywhere]">
-            {step.description || step.stepName}
+            {displayTitle}
           </h3>
-          <div className="mt-0.5 shrink-0 opacity-0 group-hover/step:opacity-100 transition-opacity">
+          <span className="mt-0.5 shrink-0 inline-flex items-center gap-1 rounded-full border border-border/60 bg-background/80 px-2 py-0.5 text-[11px] font-medium text-muted-foreground transition-colors group-hover/step:text-foreground">
+            {isExpanded ? t('traceEventRenderer.hideProcess') : t('traceEventRenderer.showProcess')}
             {isExpanded ? (
-              <ChevronDown className="w-4 h-4 text-muted-foreground/50" />
+              <ChevronDown className="w-3.5 h-3.5" />
             ) : (
-              <ChevronRight className="w-4 h-4 text-muted-foreground/50" />
+              <ChevronRight className="w-3.5 h-3.5" />
             )}
-          </div>
+          </span>
         </div>
-      </div>
+      </button>
 
       <AnimatePresence>
         {isExpanded && (
@@ -1128,6 +1174,9 @@ export function TraceEventRenderer({ events }: TraceEventRendererProps) {
     // Better formatting for specific types
     if (action.type === 'tool') {
       content = `${t('traceEventRenderer.toolLabel')}${action.data.tool}\n\n${t('traceEventRenderer.argumentsLabel')}\n${JSON.stringify(action.data.args, null, 2)}`;
+      if (action.data.assistant_content) {
+        content += `\n\n${t('traceEventRenderer.toolCallNote')}\n${action.data.assistant_content}`;
+      }
       if (action.data.code) {
         content += `\n\n${t('traceEventRenderer.codeLabel')}\n${action.data.code}`;
       }

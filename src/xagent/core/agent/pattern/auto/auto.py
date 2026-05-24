@@ -18,9 +18,14 @@ from ...context.enrichment import (
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from ...language import final_answer_language_rule
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
 from ..dag import DAGPattern
+from ..final_answer_stream import (
+    FinalAnswerStreamSession,
+    ToolCallStringFieldStreamer,
+)
 from ..react import ReActPattern
 
 logger = logging.getLogger(__name__)
@@ -85,6 +90,12 @@ class AutoDecision:
         )
 
 
+@dataclass
+class AutoDecisionResult:
+    decision: AutoDecision
+    final_answer_stream: FinalAnswerStreamSession | None = None
+
+
 DECISION_TOOL_NAME = "select_execution_pattern"
 MAX_DECISION_PARSE_ATTEMPTS = 2
 
@@ -147,6 +158,34 @@ class _AutoChildRuntime:
 
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
+
+    async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
+        return await self.parent.stream_final_answer(llm, **kwargs)
+
+    async def start_final_answer_stream(self) -> str | None:
+        return await self.parent.start_final_answer_stream()
+
+    async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
+        await self.parent.emit_final_answer_delta(message_id, delta)
+
+    async def end_final_answer_stream(self, message_id: str, content: str) -> None:
+        await self.parent.end_final_answer_stream(message_id, content)
+
+    async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        await self.parent.fail_final_answer_stream(message_id, error)
+
+    async def run_streaming_llm_call(
+        self,
+        llm: Any,
+        *,
+        on_chunk: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self.parent.run_streaming_llm_call(
+            llm,
+            on_chunk=on_chunk,
+            **kwargs,
+        )
 
     async def send_message(
         self,
@@ -375,6 +414,7 @@ class AutoPattern(AgentPattern):
         **kwargs: Any,
     ) -> dict[str, Any]:
         self._invalidate_stale_final_answer_decision(context)
+        final_answer_stream: FinalAnswerStreamSession | None = None
         if self.decision is None:
             self.status = "deciding"
             task_text = latest_user_text(context)
@@ -415,9 +455,11 @@ class AutoPattern(AgentPattern):
                 "auto_before_decision", context=context, pattern=self
             )
             try:
-                self.decision = await self._decide(
+                decision_result = await self._decide(
                     context=context, tools=tools, llm=llm, runtime=runtime
                 )
+                self.decision = decision_result.decision
+                final_answer_stream = decision_result.final_answer_stream
             except LLMCallInterrupted:
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
@@ -451,6 +493,8 @@ class AutoPattern(AgentPattern):
 
         if self.decision.action == AutoAction.FINAL_ANSWER:
             answer = self.decision.answer or ""
+            if final_answer_stream is not None:
+                await final_answer_stream.finish(answer)
             if answer:
                 context.add_assistant_message(answer)
             self.status = "completed"
@@ -590,7 +634,7 @@ class AutoPattern(AgentPattern):
 
     async def _decide(
         self, *, context: Any, tools: list[Any], llm: Any, runtime: PatternRuntime
-    ) -> AutoDecision:
+    ) -> AutoDecisionResult:
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
 
@@ -618,15 +662,29 @@ class AutoPattern(AgentPattern):
                 tools=decision_tools,
                 metadata=metadata,
             )
+            answer_emitter = FinalAnswerStreamSession(
+                runtime,
+                enabled=True,
+            )
+            answer_streamer = ToolCallStringFieldStreamer(
+                runtime=runtime,
+                tool_name=DECISION_TOOL_NAME,
+                field_name="answer",
+                guard_field="action",
+                guard_value=AutoAction.FINAL_ANSWER.value,
+                emitter=answer_emitter,
+            )
             try:
-                response = await runtime.run_llm_call(
+                response = await runtime.run_streaming_llm_call(
                     llm,
                     messages=messages,
                     tools=decision_tools,
                     tool_choice="required",
                     thinking={"type": "disabled", "enable": False},
+                    on_chunk=answer_streamer.handle_chunk,
                 )
             except Exception as exc:
+                await answer_streamer.fail(str(exc))
                 await runtime.on_llm_error(
                     context=context, error=exc, metadata=metadata
                 )
@@ -635,7 +693,7 @@ class AutoPattern(AgentPattern):
                 context=context, response=response, metadata=metadata
             )
             try:
-                return self._parse_decision(response)
+                decision = self._parse_decision(response)
             except AutoDecisionArgumentsError as exc:
                 if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
                     raise
@@ -655,6 +713,15 @@ class AutoPattern(AgentPattern):
                         "error": str(exc),
                     },
                 )
+                continue
+            return AutoDecisionResult(
+                decision=decision,
+                final_answer_stream=(
+                    answer_emitter
+                    if decision.action == AutoAction.FINAL_ANSWER
+                    else None
+                ),
+            )
         raise RuntimeError("AutoPattern decision retry loop exited unexpectedly.")
 
     def _decision_retry_feedback(self, error: AutoDecisionArgumentsError) -> str:
@@ -694,7 +761,8 @@ class AutoPattern(AgentPattern):
             f"action must be one of: {available_actions}. "
             "Use final_answer for simple conversational replies that need no tools; "
             "when action is final_answer, you must include a complete non-empty "
-            "answer field in the same tool call. You must also classify whether "
+            "answer field in the same tool call. Put action before answer in the "
+            "tool arguments. You must also classify whether "
             "the latest request requires current or external facts, and whether "
             "the existing context is sufficient evidence for those facts. "
             "If the latest user message explicitly asks to call or use an available "
@@ -741,7 +809,8 @@ class AutoPattern(AgentPattern):
                 "description": (
                     "Select the execution pattern for this user request. If action "
                     "is final_answer, the answer argument is mandatory and must be "
-                    "a complete non-empty final response to the user."
+                    "a complete non-empty final response to the user. "
+                    f"{final_answer_language_rule()}"
                 ),
                 "parameters": {
                     "type": "object",
@@ -760,7 +829,7 @@ class AutoPattern(AgentPattern):
                             "description": (
                                 "Mandatory when action is final_answer: complete "
                                 "non-empty final response to the user. Leave unset "
-                                "for react or plan_execute."
+                                f"for react or plan_execute. {final_answer_language_rule()}"
                             ),
                         },
                         "requires_current_or_external_facts": {

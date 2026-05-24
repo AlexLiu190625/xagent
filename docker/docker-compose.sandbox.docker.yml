@@ -1,0 +1,20 @@
+services:
+  backend:
+    environment:
+      - SANDBOX_ENABLED=true
+      - SANDBOX_IMPLEMENTATION=docker
+      - DOCKER_HOST=unix:///var/run/docker.sock
+      - SANDBOX_IMAGE=xprobe/xagent-sandbox:0.4.1
+      - SANDBOX_CPUS=1
+      - SANDBOX_MEMORY=512
+      - XAGENT_SANDBOX_HOST_PROJECT_ROOT=${XAGENT_SANDBOX_HOST_PROJECT_ROOT:-${PWD}}
+      - XAGENT_SANDBOX_HOST_STORAGE_ROOT=${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
+    volumes:
+      - type: bind
+        source: ${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}
+        target: /root/.xagent
+      - type: bind
+        source: /var/run/docker.sock
+        target: /var/run/docker.sock
+        bind:
+          create_host_path: false

@@ -147,6 +147,7 @@ class PlanGenerationRequest:
     completed_step_results: dict[str, Any] = field(default_factory=dict)
     previous_plan: ExecutionPlan | None = None
     available_tool_names: list[str] = field(default_factory=list)
+    completion_feedback: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -157,6 +158,7 @@ class PlanGenerationRequest:
                 self.previous_plan.to_dict() if self.previous_plan is not None else None
             ),
             "available_tool_names": list(self.available_tool_names),
+            "completion_feedback": self.completion_feedback,
         }
 
 
@@ -407,6 +409,7 @@ class LLMPlanGenerator(PlanGenerator):
                 else None
             ),
             "available_tool_names": list(request.available_tool_names),
+            "completion_feedback": request.completion_feedback,
         }
         return json.dumps(payload, ensure_ascii=False)
 

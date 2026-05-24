@@ -6,15 +6,19 @@ import asyncio
 import logging
 import os
 import threading
-from typing import Optional
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any, Optional
 
 from ..config import (
     get_boxlite_home_dir,
     get_sandbox_cpus,
     get_sandbox_env,
+    get_sandbox_host_storage_root,
     get_sandbox_image,
     get_sandbox_memory,
     get_sandbox_volumes,
+    get_storage_root,
     get_uploads_dir,
 )
 from ..core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
@@ -24,6 +28,76 @@ from ..sandbox import SandboxService
 from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 
 logger = logging.getLogger(__name__)
+
+
+class SandboxPathMapper:
+    """Translate backend-visible workspace paths into sandbox volume tuples."""
+
+    def __init__(
+        self,
+        *,
+        backend_storage_root: Path,
+        host_storage_root: Path | None,
+        sandbox_storage_root: Path | None = None,
+    ) -> None:
+        self.backend_storage_root = self._as_backend_path(backend_storage_root)
+        self.host_storage_root = host_storage_root
+        self.sandbox_storage_root = self._as_backend_path(
+            sandbox_storage_root or self.backend_storage_root
+        )
+
+    @classmethod
+    def from_env(cls) -> "SandboxPathMapper":
+        return cls(
+            backend_storage_root=get_storage_root(),
+            host_storage_root=get_sandbox_host_storage_root(),
+        )
+
+    @property
+    def uses_host_storage_root(self) -> bool:
+        return self.host_storage_root is not None
+
+    @staticmethod
+    def _as_backend_path(path: str | Path) -> Path:
+        backend_path = Path(os.path.expandvars(str(path))).expanduser()
+        if not backend_path.is_absolute():
+            backend_path = Path.cwd() / backend_path
+        return backend_path
+
+    def _relative_to_backend_storage(self, backend_path: Path) -> Path | None:
+        try:
+            return backend_path.relative_to(self.backend_storage_root)
+        except ValueError:
+            return None
+
+    def to_host_bind_source(self, backend_path: str | Path) -> Path:
+        path = self._as_backend_path(backend_path)
+        if self.host_storage_root is None:
+            return path
+
+        relative_path = self._relative_to_backend_storage(path)
+        if relative_path is None:
+            return path
+        return self.host_storage_root / relative_path
+
+    def to_sandbox_target(self, backend_path: str | Path) -> Path:
+        path = self._as_backend_path(backend_path)
+        if self.host_storage_root is None:
+            return path
+
+        relative_path = self._relative_to_backend_storage(path)
+        if relative_path is None:
+            return path
+        return self.sandbox_storage_root / relative_path
+
+    def volume_for_backend_path(
+        self, backend_path: str | Path, mode: str = "rw"
+    ) -> tuple[str, str, str]:
+        return (
+            str(self.to_host_bind_source(backend_path)),
+            str(self.to_sandbox_target(backend_path)),
+            mode,
+        )
 
 
 class SandboxManager:
@@ -40,6 +114,7 @@ class SandboxManager:
         """
         self._service: SandboxService = service
         self._cache: dict[str, Sandbox] = {}
+        self._config_cache: dict[str, SandboxConfig] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
 
@@ -64,6 +139,7 @@ class SandboxManager:
         """Get sandbox image and configuration from centralized config module."""
         image = get_sandbox_image()
         config = SandboxConfig()
+        path_mapper = SandboxPathMapper.from_env()
 
         # CPU
         cpus = get_sandbox_cpus()
@@ -81,10 +157,83 @@ class SandboxManager:
             config.env = env
 
         # VOL
-        volumes = get_sandbox_volumes()
+        volumes = get_sandbox_volumes(
+            host_side_sources=path_mapper.uses_host_storage_root
+        )
         if volumes:
             config.volumes = volumes
 
+        return image, config
+
+    @staticmethod
+    def _append_unique_volume(
+        volumes: list[tuple[str, str, str]], volume: tuple[str, str, str]
+    ) -> None:
+        if volume not in volumes:
+            volumes.append(volume)
+
+    @staticmethod
+    def _workspace_mount_paths(
+        lifecycle_type: str,
+        lifecycle_id: str,
+        workspace_config: Mapping[str, Any] | None,
+    ) -> list[tuple[Path, bool]]:
+        paths: list[tuple[Path, bool]] = []
+
+        if workspace_config:
+            base_dir = workspace_config.get("base_dir")
+            if base_dir:
+                paths.append((Path(str(base_dir)), True))
+
+            for raw_dir in workspace_config.get("allowed_external_dirs") or []:
+                paths.append((Path(str(raw_dir)), False))
+        elif lifecycle_type == "user":
+            paths.append((get_uploads_dir() / f"user_{lifecycle_id}", True))
+
+        return paths
+
+    @staticmethod
+    def _config_equivalent(left: SandboxConfig, right: SandboxConfig) -> bool:
+        return (
+            left.cpus == right.cpus
+            and left.memory == right.memory
+            and (left.env or {}) == (right.env or {})
+            and set(left.volumes or []) == set(right.volumes or [])
+        )
+
+    @staticmethod
+    def _ensure_config_equivalent(
+        sandbox_name: str,
+        cached_config: SandboxConfig | None,
+        desired_config: SandboxConfig,
+    ) -> None:
+        if cached_config is None:
+            return
+        if SandboxManager._config_equivalent(cached_config, desired_config):
+            return
+        raise RuntimeError(
+            f"Sandbox {sandbox_name!r} already exists with different runtime "
+            "configuration. Use a distinct lifecycle id for different workspace "
+            "mounts."
+        )
+
+    def _build_sandbox_config(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        ensure_dir: bool,
+        workspace_config: Mapping[str, Any] | None = None,
+    ) -> tuple[str, SandboxConfig]:
+        image, config = self._get_sandbox_image_and_config()
+        config_volumes = list(config.volumes) if config.volumes else []
+        default_volumes = self._make_default_volumes(
+            lifecycle_type,
+            lifecycle_id,
+            ensure_dir=ensure_dir,
+            workspace_config=workspace_config,
+        )
+        config.volumes = config_volumes + default_volumes
         return image, config
 
     def _make_default_volumes(
@@ -93,6 +242,7 @@ class SandboxManager:
         lifecycle_id: str,
         *,
         ensure_dir: bool,
+        workspace_config: Mapping[str, Any] | None = None,
     ) -> list[tuple[str, str, str]]:
         """
         Build default volume mounts.
@@ -104,21 +254,41 @@ class SandboxManager:
             lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
             ensure_dir: When True, create the host directory
+            workspace_config: Actual tool workspace configuration, when known
         """
         # Code mounts are always present (at least src/)
         volumes: list[tuple[str, str, str]] = list(build_code_mount_volumes())
+        path_mapper = SandboxPathMapper.from_env()
 
-        # Mount user workspace as read-write
-        if lifecycle_type == "user":
-            user_workspace = str((get_uploads_dir() / f"user_{lifecycle_id}").resolve())
+        # Mount actual workspace roots as read-write.
+        for backend_path, should_create in self._workspace_mount_paths(
+            lifecycle_type,
+            lifecycle_id,
+            workspace_config,
+        ):
             if ensure_dir:
-                os.makedirs(user_workspace, exist_ok=True)
-            volumes.append((user_workspace, user_workspace, "rw"))
+                try:
+                    if should_create or backend_path.exists():
+                        os.makedirs(backend_path, exist_ok=True)
+                except OSError as exc:
+                    logger.warning(
+                        "Failed to prepare sandbox workspace mount %s: %s",
+                        backend_path,
+                        exc,
+                    )
+
+            self._append_unique_volume(
+                volumes, path_mapper.volume_for_backend_path(backend_path, "rw")
+            )
 
         return volumes
 
     async def get_or_create_sandbox(
-        self, lifecycle_type: str, lifecycle_id: str
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        workspace_config: Mapping[str, Any] | None = None,
     ) -> Sandbox:
         """
         Get or create a sandbox.
@@ -126,12 +296,22 @@ class SandboxManager:
         Args:
             lifecycle_type: e.g. task|user
             lifecycle_id: e.g. task_id|user_id
+            workspace_config: Actual tool workspace configuration to mount
 
         Returns:
             Sandbox instance
         """
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
+        image, desired_config = self._build_sandbox_config(
+            lifecycle_type,
+            lifecycle_id,
+            ensure_dir=False,
+            workspace_config=workspace_config,
+        )
+
+        cached_config = self._config_cache.get(sandbox_name)
         if sandbox_name in self._cache:
+            self._ensure_config_equivalent(sandbox_name, cached_config, desired_config)
             return self._cache[sandbox_name]
 
         # Acquire per-name lock to prevent concurrent creation
@@ -142,11 +322,20 @@ class SandboxManager:
 
         async with lock:
             # Double-check after acquiring lock
+            cached_config = self._config_cache.get(sandbox_name)
             if sandbox_name in self._cache:
+                self._ensure_config_equivalent(
+                    sandbox_name, cached_config, desired_config
+                )
                 return self._cache[sandbox_name]
 
             # Get base image and config from environment variables
-            image, config = self._get_sandbox_image_and_config()
+            image, config = self._build_sandbox_config(
+                lifecycle_type,
+                lifecycle_id,
+                ensure_dir=True,
+                workspace_config=workspace_config,
+            )
             logger.info(
                 "Getting/creating sandbox: image=%r, cpus=%r, memory=%r, volumes=%r, env_count=%r",
                 image,
@@ -158,13 +347,6 @@ class SandboxManager:
 
             template = SandboxTemplate(type="image", image=image)
 
-            default_volumes = self._make_default_volumes(
-                lifecycle_type, lifecycle_id, ensure_dir=True
-            )
-            config_volumes = list(config.volumes) if config.volumes else []
-            # Merge volumes
-            config.volumes = config_volumes + default_volumes
-
             logger.debug(f"Getting or creating sandbox for: {sandbox_name}")
             sandbox = await self._service.get_or_create(
                 sandbox_name,
@@ -173,6 +355,7 @@ class SandboxManager:
             )
 
             self._cache[sandbox_name] = sandbox
+            self._config_cache[sandbox_name] = config
             return sandbox
 
     async def delete_sandbox(self, lifecycle_type: str, lifecycle_id: str) -> None:
@@ -193,6 +376,7 @@ class SandboxManager:
             # Always evict from cache — even on failure the instance
             # may be in an unknown state and should be recreated.
             self._cache.pop(sandbox_name, None)
+            self._config_cache.pop(sandbox_name, None)
             self._locks.pop(sandbox_name, None)
 
     async def warmup(self) -> None:
@@ -330,6 +514,7 @@ class SandboxManager:
                     logger.error(f"Failed to handle sandbox {sb.name}: {e}")
 
             self._cache.clear()
+            self._config_cache.clear()
             self._locks.clear()
             logger.info("Sandbox cleanup completed")
         except Exception as e:

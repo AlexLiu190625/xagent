@@ -23,6 +23,7 @@ def persist_user_message(
     content: str,
     *,
     attachments: Optional[List[Dict[str, Any]]] = None,
+    turn_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     return _persist_message(
         db=db,
@@ -32,6 +33,7 @@ def persist_user_message(
         content=content,
         message_type="user_message",
         attachments=attachments,
+        turn_id=turn_id,
     )
 
 
@@ -42,6 +44,7 @@ def persist_user_message_no_commit(
     content: str,
     *,
     attachments: Optional[List[Dict[str, Any]]] = None,
+    turn_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     """``persist_user_message`` variant that stages the row but does NOT commit.
 
@@ -65,6 +68,7 @@ def persist_user_message_no_commit(
         content=normalized_content,
         message_type="user_message",
         interactions=None,
+        turn_id=turn_id,
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL`` —
         # callers may want to distinguish "no attachments specified" from
@@ -163,6 +167,7 @@ def _persist_message(
     message_type: str,
     interactions: Optional[List[Dict[str, Any]]] = None,
     attachments: Optional[List[Dict[str, Any]]] = None,
+    turn_id: Optional[str] = None,
 ) -> Optional[TaskChatMessage]:
     normalized_content = content.strip()
     if not normalized_content and not attachments:
@@ -175,6 +180,7 @@ def _persist_message(
         content=normalized_content,
         message_type=message_type,
         interactions=interactions,
+        turn_id=turn_id,
         # Pass through ``attachments`` directly so an explicit empty list
         # round-trips as ``[]`` rather than being coerced to ``NULL``.
         attachments=attachments,

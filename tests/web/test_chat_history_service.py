@@ -187,9 +187,11 @@ def test_persist_user_message_stores_attachments_for_chip_replay():
             int(task.user_id),
             "Read this for me.",
             attachments=attachments,
+            turn_id="turn-attachments",
         )
         row = db_session.query(TaskChatMessage).first()
         assert row is not None
+        assert row.turn_id == "turn-attachments"
         assert row.attachments == attachments
     finally:
         db_session.close()

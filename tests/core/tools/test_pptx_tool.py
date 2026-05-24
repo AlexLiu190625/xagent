@@ -751,6 +751,15 @@ class TestWorkspaceIntegration:
 
             assert result["success"] is True
             assert result.get("saved_to_workspace") is True
+            assert result["artifacts"] == [
+                {
+                    "type": "presentation",
+                    "file_id": result["file_id"],
+                    "filename": "test_workspace.pptx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "display": "inline",
+                }
+            ]
 
             # Check file is in workspace output directory
             expected_path = workspace.output_dir / "test_workspace.pptx"

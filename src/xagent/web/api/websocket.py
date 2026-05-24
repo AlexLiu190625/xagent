@@ -354,6 +354,27 @@ def _attachment_fingerprint(attachments: Any) -> str:
     return "|".join(sorted(file_ids))
 
 
+def _trace_user_message_turn_id(event_type: str, data: Any) -> str | None:
+    if event_type != "user_message" or not isinstance(data, dict):
+        return None
+    turn_id = data.get("turn_id")
+    return turn_id if isinstance(turn_id, str) and turn_id else None
+
+
+def _is_duplicate_user_message_turn(
+    event_type: str,
+    data: Any,
+    seen_turn_ids: set[str],
+) -> bool:
+    turn_id = _trace_user_message_turn_id(event_type, data)
+    if turn_id is None:
+        return False
+    if turn_id in seen_turn_ids:
+        return True
+    seen_turn_ids.add(turn_id)
+    return False
+
+
 def create_stream_event(
     event_type: str,
     task_id: Union[int, str],
@@ -361,24 +382,48 @@ def create_stream_event(
     timestamp: Optional[Any] = None,
 ) -> Dict[str, Any]:
     """Create unified stream event format"""
-    # Convert timestamp to Unix timestamp if it's a datetime
-    if timestamp is None:
-        timestamp = datetime.now(timezone.utc).timestamp()
-    elif isinstance(timestamp, datetime):
-        if timestamp.tzinfo is None:
-            timestamp = timestamp.replace(tzinfo=timezone.utc)
-        timestamp = timestamp.timestamp()
-    elif not isinstance(timestamp, (int, float)):
-        timestamp = datetime.now(timezone.utc).timestamp()
-
     return {
         "type": "trace_event",
         "event_id": str(uuid.uuid4()),
         "event_type": event_type,
         "task_id": task_id,
-        "timestamp": timestamp,
+        "timestamp": _stream_timestamp(timestamp),
         "data": data,
     }
+
+
+def create_final_answer_stream_event(
+    event_type: str,
+    task_id: Union[int, str],
+    data: Dict[str, Any],
+    timestamp: Optional[Any] = None,
+) -> Dict[str, Any]:
+    """Create non-persistent final-answer UI stream events."""
+
+    payload = dict(data)
+    payload.pop("type", None)
+    payload.pop("event_id", None)
+    payload.pop("task_id", None)
+    return {
+        "type": event_type,
+        "event_id": str(uuid.uuid4()),
+        "task_id": task_id,
+        "timestamp": _stream_timestamp(timestamp),
+        **payload,
+    }
+
+
+def _stream_timestamp(timestamp: Optional[Any] = None) -> float:
+    # Convert timestamp to Unix timestamp if it's a datetime
+    if timestamp is None:
+        return datetime.now(timezone.utc).timestamp()
+    if isinstance(timestamp, datetime):
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=timezone.utc)
+        return timestamp.timestamp()
+    if not isinstance(timestamp, (int, float)):
+        return datetime.now(timezone.utc).timestamp()
+    return float(timestamp)
 
 
 def _persist_agent_outbound_event(task_id: int, event: Dict[str, Any]) -> None:
@@ -449,6 +494,19 @@ def make_agent_outbound_handler(task_id: int) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
     async def handle_outbound_message(payload: Dict[str, Any]) -> None:
+        payload_type = str(payload.get("type") or "")
+        if payload_type in {
+            "final_answer_start",
+            "final_answer_delta",
+            "final_answer_end",
+            "final_answer_error",
+        }:
+            await manager.broadcast_to_task(
+                create_final_answer_stream_event(payload_type, task_id, dict(payload)),
+                task_id,
+            )
+            return
+
         event = create_stream_event(
             "agent_message",
             task_id,
@@ -3054,6 +3112,8 @@ async def send_historical_data_as_stream(
             # files no longer collapse into one — the second row used to
             # be dropped and its file chips disappeared on reload.
             trace_message_keys: set[tuple[str, str, str]] = set()
+            trace_user_turn_ids: set[str] = set()
+            seen_trace_user_turn_ids: set[str] = set()
 
             for trace_event in trace_events:
                 normalized_event_data = trace_event.data
@@ -3076,24 +3136,39 @@ async def send_historical_data_as_stream(
                     content = normalized_event_data.get(
                         "message"
                     ) or normalized_event_data.get("content")
-                    if isinstance(content, str) and content.strip():
-                        event_attachments = normalized_event_data.get(
-                            "files"
-                        ) or normalized_event_data.get("attachments")
-                        attachment_key = _attachment_fingerprint(event_attachments)
-                        if trace_event.event_type == "user_message":
+                    event_attachments = normalized_event_data.get(
+                        "files"
+                    ) or normalized_event_data.get("attachments")
+                    attachment_key = _attachment_fingerprint(event_attachments)
+                    if trace_event.event_type == "user_message":
+                        trace_turn_id = _trace_user_message_turn_id(
+                            "user_message", normalized_event_data
+                        )
+                        if trace_turn_id:
+                            trace_user_turn_ids.add(trace_turn_id)
+                        elif isinstance(content, str) and content.strip():
                             trace_message_keys.add(
                                 ("user", content.strip(), attachment_key)
                             )
-                        elif trace_event.event_type in {"agent_message", "ai_message"}:
-                            trace_message_keys.add(
-                                ("assistant", content.strip(), attachment_key)
-                            )
+                    elif (
+                        trace_event.event_type in {"agent_message", "ai_message"}
+                        and isinstance(content, str)
+                        and content.strip()
+                    ):
+                        trace_message_keys.add(
+                            ("assistant", content.strip(), attachment_key)
+                        )
 
             for trace_event in trace_events:
                 normalized_event_data = normalized_trace_data_by_event_id.get(
                     str(trace_event.event_id), trace_event.data
                 )
+                if _is_duplicate_user_message_turn(
+                    str(trace_event.event_type),
+                    normalized_event_data,
+                    seen_trace_user_turn_ids,
+                ):
+                    continue
                 if _is_agent_checkpoint_data(normalized_event_data):
                     continue
                 if historical_path_to_file_id and isinstance(
@@ -3142,16 +3217,28 @@ async def send_historical_data_as_stream(
                 # turn (user uploaded files without typing) and must be kept.
                 if not content and not row_attachments:
                     continue
-                if (
-                    content
-                    and (role, content, _attachment_fingerprint(row_attachments))
-                    in trace_message_keys
-                ):
-                    continue
 
                 if role == "user":
+                    row_turn_id = getattr(chat_message, "turn_id", None)
+                    if isinstance(row_turn_id, str):
+                        row_turn_id = row_turn_id.strip() or None
+                    else:
+                        row_turn_id = None
+
+                    if row_turn_id:
+                        if row_turn_id in trace_user_turn_ids:
+                            continue
+                    elif (
+                        content
+                        and (role, content, _attachment_fingerprint(row_attachments))
+                        in trace_message_keys
+                    ):
+                        continue
+
                     event_type = "user_message"
                     data: dict[str, Any] = {"message": content, "content": content}
+                    if row_turn_id:
+                        data["turn_id"] = row_turn_id
                     if row_attachments:
                         # Surface the persisted chip payload at the top level
                         # so the frontend user-message renderer can show
@@ -3160,6 +3247,12 @@ async def send_historical_data_as_stream(
                         data["files"] = row_attachments
                         data["attachments"] = row_attachments
                 elif role == "assistant":
+                    if (
+                        content
+                        and (role, content, _attachment_fingerprint(row_attachments))
+                        in trace_message_keys
+                    ):
+                        continue
                     interactions = chat_message.interactions
                     data = {
                         "message": content,
@@ -4559,6 +4652,13 @@ async def handle_build_preview_execution(
                 self.user: Any = type("obj", (), {"id": user_id})()
                 self.credentials: Any = None
 
+        preview_workspace_base_dir = str(get_uploads_dir() / "build_preview")
+        allowed_external_dirs = []
+        if user and user.id:
+            user_upload_dir = get_uploads_dir() / f"user_{user.id}"
+            allowed_external_dirs.append(str(user_upload_dir))
+        allowed_external_dirs.extend([str(d) for d in get_external_upload_dirs()])
+
         # Get or create user sandbox for run preview task tools
         from ..sandbox_manager import get_sandbox_manager
 
@@ -4568,7 +4668,14 @@ async def handle_build_preview_execution(
             user_id = int(user.id)
             try:
                 sandbox = await sandbox_manager.get_or_create_sandbox(
-                    "user", str(user_id)
+                    "build_preview",
+                    str(user_id),
+                    workspace_config={
+                        "base_dir": preview_workspace_base_dir,
+                        "task_id": preview_task_id,
+                        "user_id": user_id,
+                        "allowed_external_dirs": allowed_external_dirs,
+                    },
                 )
             except Exception as e:
                 logger.error(f"Failed to create sandbox for user {user_id}: {e}")
@@ -4679,7 +4786,7 @@ async def handle_build_preview_execution(
             allowed_skills=skills if skills is not None else None,
             allowed_tools=allowed_tools,
             task_id=preview_task_id,
-            workspace_base_dir=str(get_uploads_dir() / "build_preview"),
+            workspace_base_dir=preview_workspace_base_dir,
             vision_model=vision_llm,  # Pass vision model for tool creation
             include_mcp_tools=bool(
                 tool_categories and any(tc.startswith("mcp:") for tc in tool_categories)
@@ -4712,13 +4819,6 @@ async def handle_build_preview_execution(
         # Determine execution mode and map to pattern.
         pattern = get_agent_pattern_for_execution_mode(execution_mode)
 
-        # Build allowed external directories
-        allowed_external_dirs = []
-        if user and user.id:
-            user_upload_dir = get_uploads_dir() / f"user_{user.id}"
-            allowed_external_dirs.append(str(user_upload_dir))
-        allowed_external_dirs.extend([str(d) for d in get_external_upload_dirs()])
-
         logger.info(f"Preview execution_mode={execution_mode} -> pattern={pattern}")
 
         # Create agent service (using WebSocket tracer)
@@ -4740,7 +4840,7 @@ async def handle_build_preview_execution(
             pattern=pattern,  # Use pattern instead of use_dag_pattern
             id=preview_task_id,
             enable_workspace=True,
-            workspace_base_dir=str(get_uploads_dir() / "build_preview"),
+            workspace_base_dir=preview_workspace_base_dir,
             allowed_external_dirs=allowed_external_dirs,
             task_id=preview_task_id,
             tracer=preview_tracer,

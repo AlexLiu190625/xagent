@@ -5,15 +5,24 @@ from pathlib import Path
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.javascript_executor import JavaScriptExecutorTool
+from xagent.core.tools.artifacts import GENERATED_ARTIFACT_EXTENSIONS
 from xagent.core.tools.core.javascript_executor import (
+    GENERATED_FILE_PATTERNS,
     JavaScriptExecutorCore,
     execute_javascript,
     get_javascript_executor_tool,
 )
+from xagent.core.workspace import TaskWorkspace
 
 
 class TestJavaScriptExecutorCore:
     """Test JavaScript executor core functionality."""
+
+    def test_generated_file_patterns_match_supported_artifact_extensions(self):
+        assert GENERATED_FILE_PATTERNS == tuple(
+            f"*{extension}" for extension in sorted(GENERATED_ARTIFACT_EXTENSIONS)
+        )
 
     def test_simple_javascript_execution(self):
         """Test basic JavaScript code execution."""
@@ -472,5 +481,60 @@ console.log('File created');
             assert output_file.exists(), f"File not found in output: {output_file}"
             # Verify content
             assert output_file.read_text() == "Hello from JavaScript!"
-            # Check that generated_files is populated
-            assert "test_file.pdf" in result.get("generated_files", [])
+            assert result.get("generated_files", []) == []
+            assert "Generated files:" not in result["output"]
+
+
+class TestJavaScriptExecutorToolArtifacts:
+    """Test workspace-bound JavaScript executor generated file artifacts."""
+
+    def test_generated_pptx_file_returns_inline_artifact(self, tmp_path):
+        workspace = TaskWorkspace("test_js_pptx", str(tmp_path))
+        executor = JavaScriptExecutorTool(workspace=workspace)
+
+        result = executor.run_json_sync(
+            {
+                "code": "const fs = require('fs'); fs.writeFileSync('slides.pptx', 'pptx');",
+            }
+        )
+
+        assert result["success"] is True
+        assert result["generated_files"] == ["slides.pptx"]
+        assert result["file_refs"][0]["filename"] == "slides.pptx"
+        assert result["file_refs"][0]["file_id"]
+        assert result["artifacts"] == [
+            {
+                "type": "presentation",
+                "file_id": result["file_refs"][0]["file_id"],
+                "filename": "slides.pptx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "display": "inline",
+            }
+        ]
+
+    def test_stale_generated_files_are_not_returned_as_inline_artifacts(self, tmp_path):
+        workspace = TaskWorkspace("test_js_stale_artifacts", str(tmp_path))
+        executor = JavaScriptExecutorTool(workspace=workspace)
+
+        first_result = executor.run_json_sync(
+            {
+                "code": "const fs = require('fs'); fs.writeFileSync('old.pdf', 'old');",
+            }
+        )
+        second_result = executor.run_json_sync(
+            {
+                "code": "const fs = require('fs'); fs.writeFileSync('new.pdf', 'new');",
+            }
+        )
+
+        assert first_result["success"] is True
+        assert second_result["success"] is True
+        assert second_result["generated_files"] == ["new.pdf"]
+        assert [file_ref["filename"] for file_ref in second_result["file_refs"]] == [
+            "new.pdf"
+        ]
+        assert [artifact["filename"] for artifact in second_result["artifacts"]] == [
+            "new.pdf"
+        ]
+        assert "new.pdf" in second_result["output"]
+        assert "old.pdf" not in second_result["output"]

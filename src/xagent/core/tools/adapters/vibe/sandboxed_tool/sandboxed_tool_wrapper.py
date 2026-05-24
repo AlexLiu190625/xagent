@@ -17,6 +17,7 @@ from typing import Any, Mapping, Optional, Type
 import cloudpickle  # type: ignore[import-untyped]
 from pydantic import BaseModel
 
+from ......config import get_sandbox_host_project_root
 from ......sandbox.base import Sandbox
 from .....workspace import TaskWorkspace
 from ..base import AbstractBaseTool, ToolMetadata
@@ -479,14 +480,19 @@ def build_code_mount_volumes() -> list[tuple[str, str, str]]:
     Returns:
         List of (host_path, guest_path, mode) tuples.
     """
-    project_root = _get_project_root()
+    host_project_root = get_sandbox_host_project_root()
+    project_root = host_project_root or _get_project_root()
     volumes: list[tuple[str, str, str]] = []
 
     src_dir = project_root / "src"
-    volumes.append((str(src_dir.resolve()), SANDBOX_SRC_ROOT, "ro"))
+    src_path = str(src_dir if host_project_root is not None else src_dir.resolve())
+    volumes.append((src_path, SANDBOX_SRC_ROOT, "ro"))
 
     tests_dir = project_root / "tests"
-    if tests_dir.exists():
-        volumes.append((str(tests_dir.resolve()), "/app/tests", "ro"))
+    if host_project_root is not None or tests_dir.exists():
+        tests_path = str(
+            tests_dir if host_project_root is not None else tests_dir.resolve()
+        )
+        volumes.append((tests_path, "/app/tests", "ro"))
 
     return volumes

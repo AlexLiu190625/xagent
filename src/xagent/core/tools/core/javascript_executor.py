@@ -12,7 +12,13 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from ..artifacts import GENERATED_ARTIFACT_EXTENSIONS
+
 logger = logging.getLogger(__name__)
+
+GENERATED_FILE_PATTERNS = tuple(
+    f"*{extension}" for extension in sorted(GENERATED_ARTIFACT_EXTENSIONS)
+)
 
 
 # Known pptxgenjs API method names whose "methodName: <desc>" console.log
@@ -338,24 +344,11 @@ class JavaScriptExecutorCore:
                 "output": result.stdout,
             }
 
-        # Find generated files (they're already in the right place)
-        generated_files = []
-        for ext in ["*.pptx", "*.png", "*.jpg", "*.jpeg", "*.gif", "*.pdf"]:
-            for file in exec_dir.glob(ext):
-                # Only count files created during this execution (not script.js)
-                if file.name != "script.js":
-                    generated_files.append(file.name)
-
-        output = result.stdout or "Code executed successfully (no output)"
-        if generated_files:
-            file_info = f"\n\nGenerated files: {', '.join(generated_files)}"
-            output += file_info
-
         return {
             "success": True,
-            "output": output,
+            "output": result.stdout or "Code executed successfully (no output)",
             "error": "",
-            "generated_files": generated_files,
+            "generated_files": [],
         }
 
     def _get_deps(self, packages: Optional[list[str]]) -> Dict[str, str]:

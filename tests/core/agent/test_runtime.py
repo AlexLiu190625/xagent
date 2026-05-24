@@ -6,7 +6,12 @@ from typing import Any
 import pytest
 
 from xagent.core.agent import ExecutionContext, PatternRuntime
+from xagent.core.agent.pattern.final_answer_stream import (
+    ToolCallStringFieldStreamer,
+    _JsonStringFieldReader,
+)
 from xagent.core.agent.runtime import LLMCallInterrupted
+from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 
 class SlowLLM:
@@ -22,6 +27,127 @@ class SlowLLM:
 class CancelledLLM:
     async def chat(self, **_: Any) -> str:
         raise asyncio.CancelledError
+
+
+class StreamingLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
+        yield StreamChunk(type=ChunkType.TOKEN, delta=" world")
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingLLMWithUsage:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(type=ChunkType.TOKEN, delta="hello")
+        yield StreamChunk(
+            type=ChunkType.USAGE,
+            usage={
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "total_tokens": 10,
+            },
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class EmptyStreamingLLM:
+    async def chat(self, **_: Any) -> str:
+        return "fallback answer"
+
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(type=ChunkType.END)
+
+
+class UsageOnlyStreamingLLM:
+    async def chat(self, **_: Any) -> str:
+        return "fallback answer"
+
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(
+            type=ChunkType.USAGE,
+            usage={
+                "prompt_tokens": 7,
+                "completion_tokens": 3,
+                "total_tokens": 10,
+            },
+        )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingToolDeltaLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        for arguments in ['{"expression"', ':"2 + ', '2"}']:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call-1",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingFinalAnswerToolDeltaLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        for arguments in ['{"action":"final_answer"', ',"answer":"Hi', ' there"}']:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call-final",
+                        "function": {
+                            "name": "route",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class StreamingToolDeltaWithLeadingBraceLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        for arguments in ['{"answer":"', "{hi", '"}']:
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "index": 0,
+                        "id": "call-1",
+                        "function": {
+                            "name": "final_answer",
+                            "arguments": arguments,
+                        },
+                    }
+                ],
+            )
+        yield StreamChunk(type=ChunkType.END)
+
+
+class ErrorAfterTokenLLM:
+    async def stream_chat(self, **_: Any) -> Any:
+        yield StreamChunk(type=ChunkType.TOKEN, delta="partial")
+        raise RuntimeError("provider disconnected")
+
+
+class ChatOnlyLLM:
+    async def chat(self, **_: Any) -> str:
+        return "complete answer"
+
+
+class OutboundCollector:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def __call__(self, payload: dict[str, Any]) -> None:
+        self.events.append(payload)
 
 
 class CheckpointTracer:
@@ -101,6 +227,223 @@ async def test_runtime_preserves_non_interrupt_cancelled_error() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await runtime.run_llm_call(CancelledLLM())
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_final_answer_emits_ui_events() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+
+    result = await runtime.stream_final_answer(
+        StreamingLLM(), messages=[{"role": "user", "content": "Say hi"}]
+    )
+
+    assert result == "hello world"
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[0]["task_id"] == "task-123"
+    assert outbound.events[1]["delta"] == "hello"
+    assert outbound.events[2]["delta"] == " world"
+    assert outbound.events[3]["content"] == "hello world"
+    assert len({event["message_id"] for event in outbound.events}) == 1
+    assert (
+        runtime.last_final_answer_stream_message_id == outbound.events[0]["message_id"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_final_answer_preserves_usage_metadata() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    context = ExecutionContext(execution_id="task-123")
+
+    result = await runtime.stream_final_answer(StreamingLLMWithUsage(), messages=[])
+    await runtime.on_llm_end(context=context, response=result)
+
+    assert result == {
+        "content": "hello",
+        "usage": {
+            "prompt_tokens": 7,
+            "completion_tokens": 3,
+            "total_tokens": 10,
+        },
+    }
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[-1]["content"] == "hello"
+    usage = context.get_total_token_usage()
+    assert usage == {"total": 10, "input": 7, "output": 3, "call_count": 1}
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_final_answer_falls_back_to_chat_without_events() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(outbound_message_handler=outbound)
+
+    result = await runtime.stream_final_answer(ChatOnlyLLM(), messages=[])
+
+    assert result == "complete answer"
+    assert outbound.events == []
+
+
+@pytest.mark.asyncio
+async def test_runtime_stream_final_answer_emits_error_terminal_event() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+
+    with pytest.raises(RuntimeError, match="provider disconnected"):
+        await runtime.stream_final_answer(ErrorAfterTokenLLM(), messages=[])
+
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert outbound.events[1]["delta"] == "partial"
+    assert outbound.events[2]["error"] == "provider disconnected"
+    assert len({event["message_id"] for event in outbound.events}) == 1
+    assert runtime.last_final_answer_stream_message_id is None
+
+
+@pytest.mark.asyncio
+async def test_runtime_streaming_llm_call_merges_tool_call_argument_deltas() -> None:
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolDeltaLLM(),
+        messages=[],
+        tools=[],
+    )
+
+    assert result == {
+        "content": "",
+        "tool_calls": [
+            {
+                "index": 0,
+                "id": "call-1",
+                "function": {
+                    "name": "calculator",
+                    "arguments": '{"expression":"2 + 2"}',
+                },
+            }
+        ],
+    }
+
+
+@pytest.mark.asyncio
+async def test_runtime_streaming_llm_call_falls_back_when_stream_is_empty() -> None:
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(EmptyStreamingLLM(), messages=[])
+
+    assert result == "fallback answer"
+
+
+@pytest.mark.asyncio
+async def test_runtime_streaming_llm_call_falls_back_when_stream_has_only_usage() -> (
+    None
+):
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(UsageOnlyStreamingLLM(), messages=[])
+
+    assert result == "fallback answer"
+
+
+@pytest.mark.asyncio
+async def test_runtime_streaming_llm_call_preserves_leading_brace_delta() -> None:
+    runtime = PatternRuntime()
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolDeltaWithLeadingBraceLLM(),
+        messages=[],
+        tools=[],
+    )
+
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"answer":"{hi"}'
+
+
+@pytest.mark.asyncio
+async def test_tool_call_string_field_streamer_reads_argument_deltas() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    streamer = ToolCallStringFieldStreamer(
+        runtime=runtime,
+        tool_name="route",
+        field_name="answer",
+        guard_field="action",
+        guard_value="final_answer",
+    )
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingFinalAnswerToolDeltaLLM(),
+        messages=[],
+        tools=[],
+        on_chunk=streamer.handle_chunk,
+    )
+    await streamer.finish("Hi there")
+
+    assert result["tool_calls"][0]["function"]["arguments"] == (
+        '{"action":"final_answer","answer":"Hi there"}'
+    )
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[1]["delta"] == "Hi"
+    assert outbound.events[2]["delta"] == " there"
+
+
+@pytest.mark.asyncio
+async def test_tool_call_string_field_streamer_preserves_leading_brace_delta() -> None:
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(execution_id="task-123", outbound_message_handler=outbound)
+    streamer = ToolCallStringFieldStreamer(
+        runtime=runtime,
+        tool_name="final_answer",
+        field_name="answer",
+    )
+
+    result = await runtime.run_streaming_llm_call(
+        StreamingToolDeltaWithLeadingBraceLLM(),
+        messages=[],
+        tools=[],
+        on_chunk=streamer.handle_chunk,
+    )
+    await streamer.finish("{hi")
+
+    assert result["tool_calls"][0]["function"]["arguments"] == '{"answer":"{hi"}'
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[1]["delta"] == "{hi"
+
+
+def test_json_string_field_reader_handles_unicode_surrogate_pairs() -> None:
+    fields = _JsonStringFieldReader('{"answer":"hello \\ud83d\\ude00"}').read(
+        {"answer"}
+    )
+
+    assert fields["answer"].complete is True
+    assert fields["answer"].value == f"hello {chr(0x1F600)}"
+
+
+def test_json_string_field_reader_rejects_invalid_escape_sequences() -> None:
+    fields = _JsonStringFieldReader('{"answer":"bad \\z escape"}').read({"answer"})
+
+    assert fields["answer"].complete is False
+    assert fields["answer"].value == "bad "
 
 
 @pytest.mark.asyncio

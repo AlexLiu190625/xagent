@@ -316,6 +316,30 @@ def test_v2_tool_params_alias_reads_args():
     assert s["data"]["result"] == "search results"
 
 
+def test_v2_tool_start_preserves_assistant_content():
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="s_note",
+            data={
+                "tool_name": "web_search",
+                "tool_params": {"query": "ai news"},
+                "tool_call_id": "call-note",
+                "assistant_content": "I need current search results first.",
+            },
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "tool_call"
+    assert steps[0]["status"] == "running"
+    assert steps[0]["data"]["assistant_content"] == (
+        "I need current search results first."
+    )
+
+
 def test_v2_tool_call_id_does_not_collide_within_same_step():
     """Two v2 tool calls under the same ``step_id`` must each get their
     own pending entry — pair key has to be the per-invocation

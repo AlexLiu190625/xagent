@@ -85,6 +85,38 @@ def test_sanitize_tool_result_for_context_hides_image_path_when_artifact_exists(
     ]
 
 
+def test_add_tool_result_sanitizes_path_metadata_without_artifacts() -> None:
+    ctx = ExecutionContext()
+
+    tool = ctx.add_tool_result(
+        "pptx_tool",
+        {
+            "success": True,
+            "output": "/tmp/xagent/output/deck.pptx",
+            "output_path": "/tmp/xagent/output/deck.pptx",
+            "message": "Created PPTX file: /tmp/xagent/output/deck.pptx",
+            "file_ref": {
+                "file_id": "deck-file-id",
+                "filename": "deck.pptx",
+                "file_path": "/tmp/xagent/output/deck.pptx",
+                "relative_path": "output/deck.pptx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            },
+        },
+        tool_call_id="tool-1",
+    )
+
+    raw_result = tool.metadata["raw_result"]
+    assert "/tmp/xagent/output/deck.pptx" not in tool.content
+    assert "/tmp/xagent/output/deck.pptx" not in str(raw_result)
+    assert "output_path" not in raw_result
+    assert "file_path" not in raw_result["file_ref"]
+    assert raw_result["output"] == "deck.pptx"
+    assert raw_result["message"] == "Created PPTX file: deck.pptx"
+    assert raw_result["file_ref"]["file_id"] == "deck-file-id"
+    assert raw_result["file_ref"]["relative_path"] == "output/deck.pptx"
+
+
 def test_format_tool_result_uses_shared_image_artifact_observation() -> None:
     ctx = ExecutionContext()
 
@@ -452,6 +484,89 @@ def test_add_messages() -> None:
     assert tool.role == "tool"
     assert tool.metadata["tool_name"] == "python"
     assert tool.metadata["raw_result"]["output"] == "done"
+
+
+def test_artifact_tool_result_sanitizes_file_refs_in_raw_context_metadata() -> None:
+    ctx = ExecutionContext()
+
+    tool = ctx.add_tool_result(
+        "pptx_tool",
+        {
+            "success": True,
+            "file_ref": {
+                "file_id": "deck-file-id",
+                "filename": "deck.pptx",
+                "file_path": "/tmp/xagent/output/deck.pptx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            },
+            "metadata": {
+                "nested": {
+                    "file_id": "sheet-file-id",
+                    "filename": "data.xlsx",
+                    "file_path": "/tmp/xagent/output/data.xlsx",
+                    "relative_path": "output/data.xlsx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                }
+            },
+            "artifacts": [
+                {
+                    "type": "presentation",
+                    "file_id": "deck-file-id",
+                    "filename": "deck.pptx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "display": "inline",
+                }
+            ],
+        },
+        tool_call_id="tool-1",
+    )
+
+    raw_result = tool.metadata["raw_result"]
+    assert "file_path" not in raw_result["file_ref"]
+    assert "file_path" not in raw_result["metadata"]["nested"]
+    assert raw_result["file_ref"]["file_id"] == "deck-file-id"
+    assert raw_result["metadata"]["nested"]["relative_path"] == "output/data.xlsx"
+    assert "/tmp/xagent/output" not in str(raw_result)
+
+
+def test_artifact_tool_result_sanitizes_known_paths_in_output_and_message() -> None:
+    ctx = ExecutionContext()
+    ctx.attach_workspace("ws-1", "/tmp/xagent")
+
+    tool = ctx.add_tool_result(
+        "pptx_tool",
+        {
+            "success": True,
+            "output": "/tmp/xagent/output/deck.pptx",
+            "output_path": "/tmp/xagent/output/deck.pptx",
+            "message": "Created PPTX file: /tmp/xagent/output/deck.pptx",
+            "file_ref": {
+                "file_id": "deck-file-id",
+                "filename": "deck.pptx",
+                "file_path": "/tmp/xagent/output/deck.pptx",
+                "relative_path": "output/deck.pptx",
+                "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            },
+            "artifacts": [
+                {
+                    "type": "presentation",
+                    "file_id": "deck-file-id",
+                    "filename": "deck.pptx",
+                    "mime_type": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                    "display": "inline",
+                }
+            ],
+        },
+        tool_call_id="tool-1",
+    )
+
+    raw_result = tool.metadata["raw_result"]
+    assert "/tmp/xagent/output/deck.pptx" not in tool.content
+    assert "/tmp/xagent/output/deck.pptx" not in str(raw_result)
+    assert "output_path" not in raw_result
+    assert raw_result["output"] == "deck.pptx"
+    assert raw_result["message"] == "Created PPTX file: deck.pptx"
+    assert raw_result["file_ref"]["file_id"] == "deck-file-id"
 
 
 def test_read_file_tool_result_omits_binary_like_content_from_context() -> None:

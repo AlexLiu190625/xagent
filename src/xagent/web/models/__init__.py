@@ -16,6 +16,7 @@ from .uploaded_file import UploadedFile
 from .user import User, UserDefaultModel, UserModel
 from .user_channel import UserChannel
 from .user_oauth import UserOAuth
+from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
 
 __all__ = [
     "Base",
@@ -47,4 +48,8 @@ __all__ = [
     "SandboxSnapshot",
     "OAuthProvider",
     "PublicMCPApp",
+    "Workforce",
+    "WorkforceAgent",
+    "WorkforceRun",
+    "WorkforceBuilderMessage",
 ]

@@ -17,6 +17,15 @@ def response_language_rules(*, subject: str = "current user request") -> str:
     )
 
 
+def final_answer_language_rule(*, subject: str = "current user request") -> str:
+    """Return a compact language rule for final-answer tool fields."""
+    return (
+        "The final answer must use the same natural language as the "
+        f"{subject}, even if tool results, source documents, retrieved memories, "
+        "examples, or earlier turns are written in another language."
+    )
+
+
 def plan_language_rules() -> str:
     """Return language rules for DAG plan generation."""
     return (

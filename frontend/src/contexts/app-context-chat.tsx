@@ -35,11 +35,20 @@ export interface Interaction {
 }
 import { useWebSocket } from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
-import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
+import { getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
+import {
+  getFinalAnswerStreamActionPayload,
+  getFinalAnswerStreamMessageId,
+  getWebSocketEventType,
+  isFinalAnswerStreamEventType,
+  isStreamingFinalAnswerMessage,
+  mergeTraceEventsById,
+  shouldBufferMessageForHistoricalReplay,
+} from "@/lib/streaming-final-answer"
 
 // Unique ID generator for messages
 let messageIdCounter = 0
@@ -56,6 +65,53 @@ const arraysEqual = (a: string[], b: string[]): boolean => {
   if (a == null || b == null) return false
   if (a.length !== b.length) return false
   return a.every((val, index) => val === b[index])
+}
+
+type GeneratedPreviewFile = {
+  fileId: string
+  fileName: string
+}
+
+const normalizeGeneratedPreviewFiles = (files: Array<string | any> | undefined): GeneratedPreviewFile[] => {
+  if (!Array.isArray(files)) return []
+
+  return files.map((file) => {
+    if (typeof file === 'object' && file !== null) {
+      return {
+        fileId: file.file_id || '',
+        fileName: file.filename || 'unknown',
+      }
+    }
+
+    return {
+      fileId: '',
+      fileName: 'unknown',
+    }
+  }).filter((file) => !!file.fileId)
+}
+
+const getAutoOpenGeneratedPreviewIndex = (files: GeneratedPreviewFile[]): number => {
+  return files.findIndex((file) => shouldAutoOpenTaskPreview(file.fileName))
+}
+
+const dispatchAutoOpenPreview = (
+  files: Array<string | any> | undefined,
+  dispatch: React.Dispatch<any>,
+) => {
+  const previewFiles = normalizeGeneratedPreviewFiles(files)
+  const autoOpenIndex = getAutoOpenGeneratedPreviewIndex(previewFiles)
+  if (autoOpenIndex < 0) return
+
+  const autoOpenFile = previewFiles[autoOpenIndex]
+  dispatch({
+    type: "OPEN_FILE_PREVIEW",
+    payload: {
+      fileId: autoOpenFile.fileId,
+      fileName: autoOpenFile.fileName,
+      files: previewFiles,
+      index: autoOpenIndex,
+    }
+  })
 }
 
 // Function to clear duplicate message cache
@@ -256,6 +312,7 @@ interface Message {
   status?: "pending" | "running" | "completed" | "failed"
   isResult?: boolean
   isFileOutput?: boolean
+  streamMessageId?: string
   traceEvents?: TraceEvent[]
   interactions?: Interaction[]
 }
@@ -405,6 +462,7 @@ interface AppState {
 type AppAction =
   | { type: "SET_TASK_ID"; payload: number | null }
   | { type: "ADD_MESSAGE"; payload: Message }
+  | { type: "UPSERT_STREAMING_FINAL_ANSWER"; payload: { messageId: string; delta?: string; content?: string; status?: Message["status"]; timestamp: string } }
   | { type: "SET_CURRENT_TASK"; payload: Task }
   | { type: "UPDATE_TASK_STATUS"; payload: { status: Task["status"]; waitingQuestion?: string; waitingInteractions?: Interaction[] } }
   | { type: "TRIGGER_TASK_UPDATE" }
@@ -416,7 +474,14 @@ type AppAction =
   | { type: "SET_TRACE_EVENTS"; payload: TraceEvent[] }
   | { type: "SELECT_STEP"; payload: string | null }
   | { type: "SET_PROCESSING"; payload: boolean }
-  | { type: "CLEAR_MESSAGES"; payload?: { keepMessageId?: string | null } }
+  | {
+      type: "CLEAR_MESSAGES";
+      payload?: {
+        keepMessageId?: string | null;
+        preserveUserMessages?: boolean;
+        preserveStreamingFinalAnswers?: boolean;
+      };
+    }
   | { type: "RESET_STATE" }
   | { type: "OPEN_FILE_PREVIEW"; payload: { fileId: string; fileName: string; files?: Array<{ fileId: string; fileName: string }>; index?: number } }
   | { type: "CLOSE_FILE_PREVIEW" }
@@ -506,9 +571,36 @@ function appReducer(state: AppState, action: AppAction): AppState {
       if (newMessage.role === "assistant" && newMessage.isResult) {
         messageToAdd = {
           ...newMessage,
-          traceEvents: [...state.traceEvents]
+          traceEvents: mergeTraceEventsById(newMessage.traceEvents, state.traceEvents)
         }
         newTraceEvents = []
+      }
+
+      if (newMessage.role === "assistant" && newMessage.isResult) {
+        const replaceMessageAt = (targetIndex: number) => {
+          const updatedMessages = state.messages.map((message, index) =>
+            index === targetIndex
+              ? {
+                  ...message,
+                  ...messageToAdd,
+                  id: message.id,
+                  status: newMessage.status || "completed",
+                  traceEvents: mergeTraceEventsById(message.traceEvents, messageToAdd.traceEvents),
+                }
+              : message
+          )
+          return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+        }
+        if (newMessage.streamMessageId) {
+          const streamingIndex = state.messages.findIndex(
+            message =>
+              message.id === newMessage.streamMessageId &&
+              isStreamingFinalAnswerMessage(message)
+          )
+          if (streamingIndex >= 0) {
+            return replaceMessageAt(streamingIndex)
+          }
+        }
       }
 
       const updatedMessages = [...state.messages, messageToAdd]
@@ -516,6 +608,39 @@ function appReducer(state: AppState, action: AppAction): AppState {
         return normalizeTimestampMs(a.timestamp) - normalizeTimestampMs(b.timestamp)
       })
       return { ...state, messages: updatedMessages, traceEvents: newTraceEvents }
+    }
+
+    case "UPSERT_STREAMING_FINAL_ANSWER": {
+      const { messageId, delta, content, status, timestamp } = action.payload
+      const existing = state.messages.find(message => message.id === messageId)
+      if (!existing) {
+        const message: Message = {
+          id: messageId,
+          role: "assistant",
+          content: content || delta || "",
+          rawContent: content || delta || "",
+          timestamp,
+          status: status || "running",
+          isResult: true,
+          traceEvents: [...state.traceEvents],
+        }
+        return { ...state, messages: [...state.messages, message], traceEvents: [] }
+      }
+      const updatedMessages = state.messages.map(message => {
+        if (message.id !== messageId) {
+          return message
+        }
+        const currentContent =
+          typeof message.content === "string" ? message.content : ""
+        const nextContent = content !== undefined ? content : currentContent + (delta || "")
+        return {
+          ...message,
+          content: nextContent,
+          rawContent: nextContent,
+          status: status || message.status || "running",
+        }
+      })
+      return { ...state, messages: updatedMessages }
     }
 
     case "SET_CURRENT_TASK":
@@ -626,11 +751,25 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, isProcessing: action.payload }
 
     case "CLEAR_MESSAGES":
-      if (action.payload?.keepMessageId) {
-        return {
-          ...state,
-          messages: state.messages.filter(m => m.id === action.payload?.keepMessageId)
-        }
+      if (action.payload) {
+        const {
+          keepMessageId,
+          preserveUserMessages,
+          preserveStreamingFinalAnswers,
+        } = action.payload
+        const messagesToKeep = state.messages.filter(message => {
+          if (keepMessageId && message.id === keepMessageId) {
+            return true
+          }
+          if (preserveUserMessages && message.role === "user") {
+            return true
+          }
+          return (
+            preserveStreamingFinalAnswers &&
+            isStreamingFinalAnswerMessage(message)
+          )
+        })
+        return { ...state, messages: messagesToKeep }
       }
       return { ...state, messages: [] }
 
@@ -864,7 +1003,14 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
       const keepMessageId = pendingOptimisticMessageId.current
       pendingOptimisticMessageId.current = null
 
-      dispatch({ type: "CLEAR_MESSAGES", payload: { keepMessageId } })
+      dispatch({
+        type: "CLEAR_MESSAGES",
+        payload: {
+          keepMessageId,
+          preserveUserMessages: true,
+          preserveStreamingFinalAnswers: true,
+        },
+      })
       dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
       dispatch({ type: "SET_STEPS", payload: [] })
     } else {
@@ -873,6 +1019,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
 
     // Set history loading state
+    isHistoricalDataLoading = true
     dispatch({ type: "SET_HISTORY_LOADING", payload: true })
 
     // Safety timeout: if no history arrives within 2 seconds, assume empty or done
@@ -992,15 +1139,24 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
   const handleMessage = useCallback((message: WebSocketMessage, dispatch: React.Dispatch<AppAction>, currentState: AppState) => {
     // If we're in replay mode, don't process immediately - collect for delayed playback
-    if (currentState.isReplaying) {
+    if (
+      shouldBufferMessageForHistoricalReplay({
+        isReplaying: currentState.isReplaying,
+        isHistoryLoading: currentState.isHistoryLoading || isHistoricalDataLoading,
+        message,
+      })
+    ) {
       // Add to replay cache
       dispatch({ type: "ADD_TO_REPLAY_CACHE", payload: message })
 
       // If this is historical_data_complete, start the delayed playback
-      const isHistoricalComplete = message.type === "historical_data_complete" ||
-        (message.type === "trace_event" && (message as any).event_type === "historical_data_complete")
+      const isHistoricalComplete =
+        getWebSocketEventType(message) === "historical_data_complete"
 
       if (isHistoricalComplete) {
+        isHistoricalDataLoading = false
+        dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+        dispatch({ type: "SYNC_PROCESSING_STATUS" })
         // Add a small delay to ensure all events are collected before starting playback
         setTimeout(() => {
           startDelayedPlayback()
@@ -1011,6 +1167,23 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     }
 
     // Normal message processing when not in replay mode
+    if (isFinalAnswerStreamEventType(message.type)) {
+      const payload = getFinalAnswerStreamActionPayload({
+        eventType: message.type,
+        eventData: message,
+        eventId: message.event_id,
+        timestamp: message.timestamp,
+        fallbackMessageId: generateMessageId("msg-final-answer"),
+      })
+      if (payload) {
+        dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
+        if (message.type === "final_answer_start") {
+          dispatch({ type: "SET_PROCESSING", payload: true })
+        }
+      }
+      return
+    }
+
     switch (message.type) {
       case "chat":
         const chatData = message as any
@@ -1228,6 +1401,23 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             console.log('✅ User message dispatched successfully')
           }
 
+          else if (isFinalAnswerStreamEventType(eventType)) {
+            const payload = getFinalAnswerStreamActionPayload({
+              eventType,
+              eventData,
+              eventId: message.event_id,
+              timestamp: message.timestamp,
+              fallbackMessageId: generateMessageId("msg-final-answer"),
+            })
+            if (!payload) {
+              return
+            }
+            dispatch({ type: "UPSERT_STREAMING_FINAL_ANSWER", payload })
+            if (eventType === "final_answer_start") {
+              dispatch({ type: "SET_PROCESSING", payload: true })
+            }
+          }
+
           // Agent-to-user messages, including ask_user_question prompts.
           else if (eventType === "agent_message" || eventType === "ai_message") {
             const rawMessageContent = eventData.message || eventData.content || ""
@@ -1253,7 +1443,11 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 }
               })
             }
-            if (isDuplicateMessage(messageContent, 'agent-message')) {
+            const streamMessageId =
+              eventType === "ai_message"
+                ? getFinalAnswerStreamMessageId(eventData)
+                : undefined
+            if (!streamMessageId && isDuplicateMessage(messageContent, 'agent-message')) {
               return
             }
             const msgId = generateMessageId("msg-agent")
@@ -1267,6 +1461,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 timestamp: message.timestamp,
                 status: eventData.status === "completed" ? "completed" : "running",
                 isResult: true,
+                streamMessageId,
                 interactions: interactions.length > 0 ? interactions : undefined,
               }
             })
@@ -2184,6 +2379,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             delete (metaInfo as any).content
             delete (metaInfo as any).file_outputs
             delete (metaInfo as any).history
+            delete (metaInfo as any).stream_message_id
+            delete (metaInfo as any).streamMessageId
             const hasMetaInfo = Object.keys(metaInfo).length > 0 && metaInfo !== null && metaInfo !== undefined
 
             // 1.5. Extract step data from history and update state.steps
@@ -2335,17 +2532,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                           <button
                             onClick={() => {
                               // Dispatch custom event to open file preview with all files
-                              const allFiles = fileOutputsData.map((file: string | any) => {
-                                let fFileName, fFilePath
-                                if (typeof file === 'object' && file !== null) {
-                                  fFileName = file.filename || 'unknown'
-                                  fFilePath = file.file_id || ''
-                                } else {
-                                  fFileName = 'unknown'
-                                  fFilePath = ''
-                                }
-                                return { fileName: fFileName, fileId: fFilePath }
-                              }).filter((item: { fileId: string }) => !!item.fileId)
+                              const allFiles = normalizeGeneratedPreviewFiles(fileOutputsData)
 
                               if (!filePath) {
                                 return
@@ -2385,6 +2572,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                   }
                 })
               }
+
+              dispatchAutoOpenPreview(fileOutputsData, dispatch)
             }
 
             // Update task status and trigger sidebar update
@@ -3391,17 +3580,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                       <button
                         onClick={() => {
                           // Dispatch custom event to open file preview with all files
-                          const allFiles = (taskData.file_outputs || []).map((file: string | any) => {
-                            let fFileName, fFilePath
-                            if (typeof file === 'object' && file !== null) {
-                              fFileName = file.filename || 'unknown'
-                              fFilePath = file.file_id || ''
-                            } else {
-                              fFileName = 'unknown'
-                              fFilePath = ''
-                            }
-                            return { fileName: fFileName, fileId: fFilePath }
-                          }).filter((item: { fileId: string }) => !!item.fileId)
+                          const allFiles = normalizeGeneratedPreviewFiles(taskData.file_outputs)
 
                           if (!filePath) {
                             return
@@ -3441,6 +3620,8 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
               }
             })
           }
+
+          dispatchAutoOpenPreview(taskData.file_outputs, dispatch)
         }
 
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -3957,6 +4138,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
     dispatch({ type: "SET_TASK_ID", payload: taskId })
     // Set history loading state immediately when switching tasks to prevent empty state flash
     if (taskId) {
+      isHistoricalDataLoading = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
     }
   }, [router])

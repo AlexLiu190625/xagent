@@ -13,6 +13,9 @@ from ..agent.trace import (
     TraceScope,
     normalize_llm_trace_payload,
 )
+from ..model.chat.basic.base import BaseLLM
+from ..model.chat.types import ChunkType
+from .streaming import merge_streamed_tool_call_arguments
 
 
 class LLMCallInterrupted(Exception):
@@ -40,6 +43,7 @@ class PatternRuntime:
     finished_spans: list[dict[str, Any]] = field(default_factory=list)
     trace_runs: list[dict[str, Any]] = field(default_factory=list)
     active_react_step_id: str | None = None
+    last_final_answer_stream_message_id: str | None = None
     _active_llm_tasks: set[asyncio.Future[Any]] = field(
         default_factory=set,
         init=False,
@@ -90,6 +94,314 @@ class PatternRuntime:
             raise
         finally:
             self._active_llm_tasks.discard(task)
+
+    async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
+        """Stream only the final user-facing answer through the outbound boundary."""
+
+        if self.outbound_message_handler is None or not self._has_native_stream_chat(
+            llm
+        ):
+            return await self.run_llm_call(llm, **kwargs)
+
+        from .pattern.final_answer_stream import FinalAnswerStreamSession
+
+        stream = FinalAnswerStreamSession(self)
+        if await stream.start() is None:
+            return await self.run_llm_call(llm, **kwargs)
+
+        async def emit_text_delta(chunk: Any) -> None:
+            delta = self._chunk_text_delta(chunk)
+            if delta:
+                await stream.emit_delta(delta)
+
+        try:
+            response = await self.run_streaming_llm_call(
+                llm, on_chunk=emit_text_delta, **kwargs
+            )
+        except Exception as exc:
+            await stream.fail(str(exc))
+            raise
+        content = self._response_content(response)
+
+        await stream.finish(content)
+        return response
+
+    async def run_streaming_llm_call(
+        self,
+        llm: Any,
+        *,
+        on_chunk: Callable[[Any], Any] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        """Run a native streaming LLM call and reconstruct a chat-like response."""
+
+        stream_chat = getattr(llm, "stream_chat", None)
+        if not callable(stream_chat) or not self._has_native_stream_chat(llm):
+            return await self.run_llm_call(llm, **kwargs)
+
+        async def consume_stream() -> Any:
+            content_parts: list[str] = []
+            tool_call_chunks: dict[int, dict[str, Any]] = {}
+            usage_payload: dict[str, Any] = {}
+            saw_payload_chunk = False
+            async for chunk in stream_chat(**kwargs):
+                await self._raise_if_interrupted("interrupted during LLM stream")
+                self._raise_for_stream_error(chunk)
+                text_delta = self._chunk_text_delta(chunk)
+                if text_delta:
+                    saw_payload_chunk = True
+                    content_parts.append(text_delta)
+                chunk_tool_calls = self._chunk_tool_calls(chunk)
+                if chunk_tool_calls:
+                    saw_payload_chunk = True
+                    self._merge_tool_call_chunks(tool_call_chunks, chunk_tool_calls)
+                chunk_usage = self._chunk_usage(chunk)
+                if chunk_usage:
+                    self._merge_usage(usage_payload, chunk_usage)
+                if on_chunk is not None:
+                    await self._maybe_await(on_chunk(chunk))
+
+            content = "".join(content_parts)
+            tool_calls = [
+                tool_call_chunks[index] for index in sorted(tool_call_chunks.keys())
+            ]
+            if tool_calls:
+                response: dict[str, Any] = {
+                    "content": content,
+                    "tool_calls": tool_calls,
+                }
+                if usage_payload:
+                    response["usage"] = usage_payload
+                return response
+            if not saw_payload_chunk:
+                return await self.run_llm_call(llm, **kwargs)
+            if usage_payload:
+                return {
+                    "content": content,
+                    "usage": usage_payload,
+                }
+            return content
+
+        task: asyncio.Future[Any] = asyncio.ensure_future(consume_stream())
+        self._active_llm_tasks.add(task)
+        try:
+            return await task
+        except asyncio.CancelledError as exc:
+            if self._interrupt_requested:
+                raise LLMCallInterrupted(
+                    self.interrupt_reason or "interrupted during LLM stream"
+                ) from exc
+            raise
+        finally:
+            self._active_llm_tasks.discard(task)
+
+    async def _raise_if_interrupted(self, message: str) -> None:
+        if await self.should_interrupt():
+            raise LLMCallInterrupted(self.interrupt_reason or message)
+
+    def _raise_for_stream_error(self, chunk: Any) -> None:
+        chunk_type = getattr(chunk, "type", None)
+        is_error = callable(getattr(chunk, "is_error", None)) and chunk.is_error()
+        if chunk_type == ChunkType.ERROR or is_error:
+            raise RuntimeError(getattr(chunk, "content", "") or "LLM stream failed")
+
+    def _chunk_text_delta(self, chunk: Any) -> str:
+        chunk_type = getattr(chunk, "type", None)
+        is_token = callable(getattr(chunk, "is_token", None)) and chunk.is_token()
+        if chunk_type != ChunkType.TOKEN and not is_token:
+            return ""
+        return str(getattr(chunk, "delta", "") or getattr(chunk, "content", "") or "")
+
+    def _chunk_tool_calls(self, chunk: Any) -> list[dict[str, Any]]:
+        chunk_type = getattr(chunk, "type", None)
+        is_tool_call = (
+            callable(getattr(chunk, "is_tool_call", None)) and chunk.is_tool_call()
+        )
+        if chunk_type != ChunkType.TOOL_CALL and not is_tool_call:
+            return []
+        tool_calls = getattr(chunk, "tool_calls", None)
+        return list(tool_calls or [])
+
+    def _chunk_usage(self, chunk: Any) -> dict[str, Any]:
+        chunk_type = getattr(chunk, "type", None)
+        is_usage = callable(getattr(chunk, "is_usage", None)) and chunk.is_usage()
+        if chunk_type != ChunkType.USAGE and not is_usage:
+            return {}
+        usage = getattr(chunk, "usage", None)
+        if not usage:
+            return {}
+        if isinstance(usage, dict):
+            return dict(usage)
+        payload: dict[str, Any] = {}
+        for key in (
+            "prompt_tokens",
+            "completion_tokens",
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "prompt_token_count",
+            "completion_token_count",
+            "candidates_token_count",
+        ):
+            value = getattr(usage, key, None)
+            if value is not None:
+                payload[key] = value
+        return payload
+
+    def _merge_usage(
+        self,
+        current: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> None:
+        for key, value in incoming.items():
+            if isinstance(value, int):
+                current[key] = value
+            elif isinstance(value, float):
+                current[key] = int(value)
+            elif value is not None:
+                current[key] = value
+
+    def _merge_tool_call_chunks(
+        self,
+        accumulator: dict[int, dict[str, Any]],
+        tool_calls: list[Any],
+    ) -> None:
+        for position, raw_tool_call in enumerate(tool_calls):
+            tool_call = self._tool_call_to_dict(raw_tool_call)
+            index_value = tool_call.get("index", position)
+            index = index_value if isinstance(index_value, int) else position
+            current = accumulator.setdefault(index, {})
+            self._merge_tool_call_dict(current, tool_call)
+
+    def _tool_call_to_dict(self, tool_call: Any) -> dict[str, Any]:
+        if isinstance(tool_call, dict):
+            return dict(tool_call)
+        function_payload = getattr(tool_call, "function", None)
+        payload: dict[str, Any] = {
+            key: getattr(tool_call, key)
+            for key in ("id", "index", "type")
+            if getattr(tool_call, key, None) is not None
+        }
+        if function_payload is not None:
+            payload["function"] = {
+                key: getattr(function_payload, key)
+                for key in ("name", "arguments")
+                if getattr(function_payload, key, None) is not None
+            }
+        return payload
+
+    def _merge_tool_call_dict(
+        self,
+        current: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> None:
+        for key, value in incoming.items():
+            if key == "function" and isinstance(value, dict):
+                function_payload = current.setdefault("function", {})
+                if isinstance(function_payload, dict):
+                    self._merge_tool_call_function(function_payload, value)
+                continue
+            if value is not None:
+                current[key] = value
+
+    def _merge_tool_call_function(
+        self,
+        current: dict[str, Any],
+        incoming: dict[str, Any],
+    ) -> None:
+        name = incoming.get("name")
+        if name:
+            current["name"] = name
+
+        arguments = incoming.get("arguments")
+        if not isinstance(arguments, str):
+            if arguments is not None:
+                current["arguments"] = arguments
+            return
+
+        existing = current.get("arguments")
+        if not isinstance(existing, str) or not existing:
+            current["arguments"] = arguments
+        else:
+            mode = incoming.get("arguments_mode") or incoming.get(
+                "arguments_stream_mode"
+            )
+            current["arguments"] = merge_streamed_tool_call_arguments(
+                existing,
+                arguments,
+                mode=str(mode) if isinstance(mode, str) else None,
+            )
+
+    def _response_content(self, response: Any) -> str:
+        if isinstance(response, str):
+            return response
+        if isinstance(response, dict):
+            value = (
+                response.get("content")
+                or response.get("answer")
+                or response.get("output")
+                or response.get("message")
+                or ""
+            )
+            return str(value)
+        return str(response)
+
+    async def _emit_outbound(self, payload: dict[str, Any]) -> None:
+        if self.outbound_message_handler is not None:
+            await self._maybe_await(self.outbound_message_handler(payload))
+
+    async def start_final_answer_stream(self) -> str | None:
+        if self.outbound_message_handler is None:
+            return None
+        message_id = f"final_answer_{uuid4().hex}"
+        self.last_final_answer_stream_message_id = None
+        await self._emit_outbound(
+            {
+                "type": "final_answer_start",
+                "message_id": message_id,
+                "task_id": self.execution_id,
+            }
+        )
+        return message_id
+
+    async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
+        if not delta:
+            return
+        await self._emit_outbound(
+            {
+                "type": "final_answer_delta",
+                "message_id": message_id,
+                "task_id": self.execution_id,
+                "delta": delta,
+            }
+        )
+
+    async def end_final_answer_stream(self, message_id: str, content: str) -> None:
+        self.last_final_answer_stream_message_id = message_id
+        await self._emit_outbound(
+            {
+                "type": "final_answer_end",
+                "message_id": message_id,
+                "task_id": self.execution_id,
+                "content": content,
+            }
+        )
+
+    async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        if self.last_final_answer_stream_message_id == message_id:
+            self.last_final_answer_stream_message_id = None
+        await self._emit_outbound(
+            {
+                "type": "final_answer_error",
+                "message_id": message_id,
+                "task_id": self.execution_id,
+                "error": error,
+            }
+        )
+
+    def _has_native_stream_chat(self, llm: Any) -> bool:
+        stream_chat = getattr(type(llm), "stream_chat", None)
+        return stream_chat is not None and stream_chat is not BaseLLM.stream_chat
 
     async def checkpoint(
         self,
@@ -232,15 +544,20 @@ class PatternRuntime:
             )
 
     async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+        data = {
+            "tool_name": tool_call.get("name"),
+            "tool_params": tool_call.get("args", {}),
+            "tool_call_id": tool_call.get("id"),
+        }
+        assistant_content = tool_call.get("assistant_content")
+        if isinstance(assistant_content, str) and assistant_content.strip():
+            data["assistant_content"] = assistant_content.strip()
+
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
             task_id=self._task_id_from_payload(tool_call),
             step_id=self._step_id_from_payload(tool_call),
-            data={
-                "tool_name": tool_call.get("name"),
-                "tool_params": tool_call.get("args", {}),
-                "tool_call_id": tool_call.get("id"),
-            },
+            data=data,
         )
         if self.tracer is None:
             return

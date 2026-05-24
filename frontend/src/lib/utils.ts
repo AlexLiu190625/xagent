@@ -170,6 +170,28 @@ export function isCsvFile(fileName: string): boolean {
   return fileName.toLowerCase().endsWith('.csv')
 }
 
+export function isImageFile(fileName: string): boolean {
+  if (!fileName) return false
+  return /\.(jpg|jpeg|png|gif|webp|svg)$/i.test(fileName)
+}
+
+export function shouldAutoOpenTaskPreview(fileName: string): boolean {
+  if (!fileName) return false
+
+  const lowerName = fileName.toLowerCase()
+  if (isImageFile(lowerName)) return false
+
+  return (
+    lowerName.endsWith('.pdf')
+    || lowerName.endsWith('.ppt')
+    || lowerName.endsWith('.pptx')
+    || lowerName.endsWith('.docx')
+    || lowerName.endsWith('.xlsx')
+    || isCsvFile(lowerName)
+    || isHtmlFile(lowerName)
+  )
+}
+
 export function isToggleableFile(fileName: string): boolean {
   return isHtmlFile(fileName) || isMarkdownFile(fileName) || isCsvFile(fileName)
 }

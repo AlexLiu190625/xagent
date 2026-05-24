@@ -21,6 +21,9 @@ from xagent.core.agent import (
     PlanStep,
     PlanValidationError,
 )
+from xagent.core.model.chat.types import ChunkType, StreamChunk
+
+DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
 
 
 @pytest.fixture(autouse=True)
@@ -126,6 +129,11 @@ class SequenceLLM:
     async def chat(self, **kwargs: Any) -> dict[str, Any]:
         self.call_kwargs.append(kwargs)
         self.seen_messages.append(list(kwargs.get("messages", [])))
+        if self.calls >= len(self.responses) and has_tool(
+            kwargs,
+            DAG_COMPLETION_TOOL_NAME,
+        ):
+            return default_completion_assessment_response(kwargs)
         response = self.responses[self.calls]
         self.calls += 1
         return response
@@ -152,7 +160,54 @@ class PlanLLM:
 
     async def chat(self, **kwargs: Any) -> Any:
         self.calls.append(kwargs)
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
         return self.response
+
+
+class StreamingStepLLM:
+    def __init__(self) -> None:
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> Any:
+        raise AssertionError("streaming DAG step should not call chat()")
+
+    async def stream_chat(self, **kwargs: Any) -> Any:
+        self.stream_calls.append(kwargs)
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            yield StreamChunk(
+                type=ChunkType.TOOL_CALL,
+                tool_calls=[
+                    {
+                        "id": "call_completion",
+                        "function": {
+                            "name": DAG_COMPLETION_TOOL_NAME,
+                            "arguments": json.dumps(
+                                {
+                                    "status": "completed",
+                                    "reason": "Goal satisfied.",
+                                    "answer": "DAG done.",
+                                    "missing_work": "",
+                                    "replan_instruction": "",
+                                }
+                            ),
+                        },
+                    }
+                ],
+            )
+            yield StreamChunk(type=ChunkType.END)
+            return
+        yield StreamChunk(type=ChunkType.TOKEN, delta="DAG")
+        yield StreamChunk(type=ChunkType.TOKEN, delta=" done.")
+        yield StreamChunk(type=ChunkType.END)
+
+
+class OutboundCollector:
+    def __init__(self) -> None:
+        self.events: list[dict[str, Any]] = []
+
+    async def __call__(self, payload: dict[str, Any]) -> None:
+        self.events.append(payload)
 
 
 class MemoryNote:
@@ -203,6 +258,59 @@ def plan_tool_response(steps: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def has_tool(kwargs: dict[str, Any], tool_name: str) -> bool:
+    for tool_schema in kwargs.get("tools") or []:
+        function = tool_schema.get("function")
+        if isinstance(function, dict) and function.get("name") == tool_name:
+            return True
+    return False
+
+
+def default_completion_assessment_response(kwargs: dict[str, Any]) -> dict[str, Any]:
+    answer = "done"
+    messages = kwargs.get("messages") or []
+    if messages:
+        try:
+            payload = json.loads(str(messages[-1].get("content", "{}")))
+            candidate = payload.get("candidate_output")
+            if isinstance(candidate, str):
+                answer = candidate
+            elif candidate is not None:
+                answer = json.dumps(candidate, ensure_ascii=False, default=str)
+        except (json.JSONDecodeError, AttributeError):
+            answer = "done"
+    return completion_assessment_response(answer=answer)
+
+
+def completion_assessment_response(
+    *,
+    status: str = "completed",
+    answer: str = "done",
+    missing_work: str = "",
+    replan_instruction: str = "",
+) -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "call_assess_dag_completion",
+                "type": "function",
+                "function": {
+                    "name": DAG_COMPLETION_TOOL_NAME,
+                    "arguments": json.dumps(
+                        {
+                            "status": status,
+                            "reason": "Completion assessment.",
+                            "answer": answer,
+                            "missing_work": missing_work,
+                            "replan_instruction": replan_instruction,
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+
 class ConcurrentStepLLM:
     def __init__(self) -> None:
         self.release = asyncio.Event()
@@ -211,6 +319,8 @@ class ConcurrentStepLLM:
         self.max_active_calls = 0
 
     async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+            return default_completion_assessment_response(kwargs)
         messages = list(kwargs.get("messages", []))
         task = current_step_task(messages)
         self.started_by_task.setdefault(task, asyncio.Event()).set()
@@ -310,6 +420,101 @@ async def test_dag_pattern_interrupt_before_plan_skips_plan_generation() -> None
         "safe_point": "dag_before_plan",
         "reason": "paused by test",
     }
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_streams_overall_completion_not_step_result() -> None:
+    llm = StreamingStepLLM()
+    pattern = DAGPattern(lambda **_: build_plan(PlanStep(id="answer", task="Answer")))
+    context = ExecutionContext(execution_id="dag-step-stream")
+    context.add_user_message("Answer through DAG")
+    outbound = OutboundCollector()
+    runtime = PatternRuntime(
+        execution_id="dag-step-stream",
+        outbound_message_handler=outbound,
+    )
+
+    result = await pattern.run(context=context, tools=[], llm=llm, runtime=runtime)
+
+    assert result["success"] is True
+    assert result["output"] == "DAG done."
+    assert len(llm.stream_calls) == 2
+    assert not has_tool(llm.stream_calls[0], DAG_COMPLETION_TOOL_NAME)
+    assert has_tool(llm.stream_calls[1], DAG_COMPLETION_TOOL_NAME)
+    completion_messages = llm.stream_calls[1]["messages"]
+    assert (
+        "same natural language as the current user request"
+        in completion_messages[0]["content"]
+    )
+    completion_tool = llm.stream_calls[1]["tools"][0]["function"]
+    answer_schema = completion_tool["parameters"]["properties"]["answer"]
+    assert "tool results, source documents" in answer_schema["description"]
+    assert [event["type"] for event in outbound.events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_end",
+    ]
+    assert outbound.events[1]["delta"] == "DAG done."
+    assert outbound.events[2]["content"] == "DAG done."
+
+
+@pytest.mark.asyncio
+async def test_dag_completion_assessment_replans_when_goal_incomplete() -> None:
+    class CompletionReplanGenerator(PlanGenerator):
+        def __init__(self) -> None:
+            self.requests: list[PlanGenerationRequest] = []
+
+        async def generate_plan(
+            self,
+            *,
+            request: PlanGenerationRequest,
+            llm: Any,
+        ) -> ExecutionPlan:
+            del llm
+            self.requests.append(request)
+            if request.replan:
+                return build_plan(
+                    PlanStep(id="first", task="Do first part"),
+                    PlanStep(
+                        id="second",
+                        task="Do missing second part",
+                        dependencies=["first"],
+                    ),
+                )
+            return build_plan(PlanStep(id="first", task="Do first part"))
+
+    generator = CompletionReplanGenerator()
+    llm = SequenceLLM(
+        [
+            {"content": "first done", "done": True},
+            completion_assessment_response(
+                status="incomplete",
+                answer="",
+                missing_work="Second part is missing.",
+                replan_instruction="Add a second step.",
+            ),
+            {"content": "second done", "done": True},
+            completion_assessment_response(answer="final done"),
+        ]
+    )
+    pattern = DAGPattern(generator, max_completion_replans=1)
+
+    result = await pattern.run(
+        context=ExecutionContext(execution_id="dag-completion-replan"),
+        tools=[],
+        llm=llm,
+    )
+
+    assert result["success"] is True
+    assert result["output"] == "final done"
+    assert result["step_results"] == {
+        "first": "first done",
+        "second": "second done",
+    }
+    assert len(generator.requests) == 2
+    assert generator.requests[1].replan is True
+    assert generator.requests[1].completion_feedback == "Add a second step."
+    assert generator.requests[1].completed_step_results == {"first": "first done"}
 
 
 class ReplanningPlanGenerator(PlanGenerator):
@@ -698,6 +903,8 @@ async def test_dag_pattern_schedules_newly_ready_step_before_sibling_finishes() 
             self.started_by_task: dict[str, asyncio.Event] = {}
 
         async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+                return default_completion_assessment_response(kwargs)
             messages = list(kwargs.get("messages", []))
             task = current_step_task(messages)
             self.started_by_task.setdefault(task, asyncio.Event()).set()
@@ -849,6 +1056,8 @@ async def test_dag_completion_evidence_keeps_tools_for_multi_call_step() -> None
             self.calls: list[dict[str, Any]] = []
 
         async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+                return default_completion_assessment_response(kwargs)
             self.calls.append(kwargs)
             tools = kwargs.get("tools") or []
             tool_names = {
@@ -962,6 +1171,8 @@ async def test_dag_pattern_concurrent_interrupt_cancels_sibling_and_replans(
             self.slow_cancelled = asyncio.Event()
 
         async def chat(self, **kwargs: Any) -> dict[str, Any]:
+            if has_tool(kwargs, DAG_COMPLETION_TOOL_NAME):
+                return default_completion_assessment_response(kwargs)
             messages = list(kwargs.get("messages", []))
             task = current_step_task(messages)
             if task == "Slow task":

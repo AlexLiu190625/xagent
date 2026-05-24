@@ -1,7 +1,8 @@
 # Xagent Docker Deployment
 
 This directory contains Docker configuration files for deploying Xagent with Docker Compose.
-Note: docker-compose.yml is located in the project root directory.
+Note: the base `docker-compose.yml` is located in the project root directory. Advanced
+Compose overlays, including sandbox runtime options, live in this directory.
 
 ## Architecture
 
@@ -89,11 +90,65 @@ NGINX_PORT="8080"
 docker compose up -d
 ```
 
+### Sandbox Runtime Overlays
+
+Sandbox deployment is an advanced option. Use one sandbox overlay at a time, from
+the project root.
+
+Boxlite/KVM sandbox:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.sandbox.boxlite.yml \
+  up -d
+```
+
+This requires Linux or WSL2 with KVM support and grants the backend container
+KVM access.
+
+Docker sibling sandbox:
+
+```bash
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.sandbox.docker.yml \
+  up -d
+```
+
+This mounts the host Docker socket into the backend container so Xagent can
+create sibling sandbox containers through the host Docker daemon. Treat this as
+a privileged deployment mode: Docker socket access is effectively host-level
+container control.
+
+Docker sibling mode also resolves sandbox bind mounts on the Docker host. The
+overlay defaults `XAGENT_SANDBOX_HOST_PROJECT_ROOT` to the current project root
+and binds `${XAGENT_HOST_STORAGE_ROOT:-/root/.xagent}` to `/root/.xagent`. It
+also passes `XAGENT_SANDBOX_HOST_STORAGE_ROOT` into the backend so sandbox
+workspace mounts under `/root/.xagent` are translated back to the host storage
+path before they reach the host Docker daemon. Override these values when the
+host checkout or storage directory lives elsewhere:
+
+```bash
+XAGENT_SANDBOX_HOST_PROJECT_ROOT="$PWD" \
+XAGENT_HOST_STORAGE_ROOT="$HOME/.xagent" \
+docker compose \
+  -f docker-compose.yml \
+  -f docker/docker-compose.sandbox.docker.yml \
+  up -d
+```
+
+In Docker sibling mode, `SANDBOX_VOLUMES` sources are host-side paths. Use
+absolute host paths; relative paths and `~` are rejected instead of being
+expanded inside the backend container.
+
 ## Docker Files
 
 - `Dockerfile.backend` - Backend image (FastAPI, Python, Node.js)
 - `Dockerfile.frontend` - Frontend image (Next.js, nginx)
-- `docker-compose.yml` - Multi-service orchestration
+- `../docker-compose.yml` - Base multi-service orchestration
+- `docker-compose.sandbox.boxlite.yml` - Boxlite/KVM sandbox overlay
+- `docker-compose.sandbox.docker.yml` - Docker sibling sandbox overlay
 - `.dockerignore` - Backend build exclusions
 - `.dockerignore.frontend` - Frontend build exclusions
 - `nginx.conf` - Frontend nginx configuration

@@ -132,6 +132,28 @@ def dag_plan(steps: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def dag_completion(answer: str = "dag done") -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "call-assess",
+                "function": {
+                    "name": "assess_dag_completion",
+                    "arguments": json.dumps(
+                        {
+                            "status": "completed",
+                            "reason": "Done.",
+                            "answer": answer,
+                            "missing_work": "",
+                            "replan_instruction": "",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+
 @pytest.mark.asyncio
 async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answer() -> (
     None
@@ -172,7 +194,7 @@ async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answe
     assert result["metadata"]["execution_type"] == "agent_single_call"
     assert tool.calls == [{"value": "from tool"}]
     assert llm.calls[0]["tools"][0]["function"]["name"] == "noop"
-    assert llm.calls[0]["tool_choice"] == "auto"
+    assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[1]["tools"] is None
     assert llm.calls[1]["tool_choice"] is None
 
@@ -510,6 +532,7 @@ async def test_execution_adapter_routes_dag_to_dag() -> None:
         [
             dag_plan([{"id": "answer", "task": "Answer directly"}]),
             "dag done",
+            dag_completion("dag done"),
         ]
     )
     adapter = AgentExecutionAdapter(
@@ -621,6 +644,7 @@ async def test_execution_adapter_executes_auto_plan_execute() -> None:
             auto_decision("plan_execute", reason="Needs DAG."),
             dag_plan([{"id": "answer", "task": "Answer directly"}]),
             "dag done",
+            dag_completion("dag done"),
         ]
     )
     adapter = AgentExecutionAdapter(

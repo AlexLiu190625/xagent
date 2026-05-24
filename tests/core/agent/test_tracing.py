@@ -5,8 +5,12 @@ from typing import Any
 
 import pytest
 
-from xagent.core.agent import ExecutionContext, TraceEventCallback
-from xagent.core.agent.tracing import PENDING_MARKER_KEY
+from xagent.core.agent import ExecutionContext, PatternRuntime, TraceEventCallback
+from xagent.core.agent.tracing import (
+    PENDING_MARKER_KEY,
+    PENDING_TURN_ID_KEY,
+    TRACE_TURN_IDS_KEY,
+)
 
 
 def _stamp_pending(context: ExecutionContext) -> None:
@@ -25,6 +29,9 @@ def _stamp_pending(context: ExecutionContext) -> None:
     ts = callback._message_timestamp_iso(latest)
     if ts:
         context.metadata[PENDING_MARKER_KEY] = ts
+    turn_id = callback._message_turn_id(latest)
+    if turn_id:
+        context.metadata[PENDING_TURN_ID_KEY] = turn_id
 
 
 class TraceRecorder:
@@ -70,6 +77,68 @@ async def test_trace_callback_success_emits_user_assistant_and_completion() -> N
         "task_end_general",
     ]
     assert tracer.events[1]["data"]["content"] == "Done"
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_attaches_final_answer_stream_message_id() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runtime = PatternRuntime()
+    runtime.last_final_answer_stream_message_id = "final_answer_123"
+    runner = SimpleNamespace(
+        tracer=tracer,
+        _active_controls={
+            "exec-trace": SimpleNamespace(runtime=runtime),
+        },
+    )
+    context = ExecutionContext(execution_id="exec-trace")
+
+    await callback.on_run_end(
+        runner=runner,
+        context=context,
+        result={"success": True, "execution_id": "exec-trace", "answer": "Done"},
+    )
+
+    assert tracer.events[0]["data"]["stream_message_id"] == "final_answer_123"
+    assert tracer.events[1]["data"]["result"]["stream_message_id"] == "final_answer_123"
+
+
+@pytest.mark.asyncio
+async def test_trace_callback_ignores_failed_final_answer_stream_id() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    outbound_events: list[dict[str, Any]] = []
+
+    async def collect_outbound(payload: dict[str, Any]) -> None:
+        outbound_events.append(payload)
+
+    runtime = PatternRuntime(outbound_message_handler=collect_outbound)
+    message_id = await runtime.start_final_answer_stream()
+    assert message_id is not None
+    await runtime.emit_final_answer_delta(message_id, "partial")
+    await runtime.fail_final_answer_stream(message_id, "provider disconnected")
+    runner = SimpleNamespace(
+        tracer=tracer,
+        _active_controls={
+            "exec-trace": SimpleNamespace(runtime=runtime),
+        },
+    )
+    context = ExecutionContext(execution_id="exec-trace")
+
+    await callback.on_run_end(
+        runner=runner,
+        context=context,
+        result={"success": True, "execution_id": "exec-trace", "answer": "Done"},
+    )
+
+    assert runtime.last_final_answer_stream_message_id is None
+    assert [event["type"] for event in outbound_events] == [
+        "final_answer_start",
+        "final_answer_delta",
+        "final_answer_error",
+    ]
+    assert "stream_message_id" not in tracer.events[0]["data"]
+    assert "stream_message_id" not in tracer.events[1]["data"]["result"]
 
 
 @pytest.mark.asyncio
@@ -221,7 +290,7 @@ async def test_on_user_message_posted_emits_trace_event_with_files() -> None:
     ]
     new_message = context.add_user_message(
         "Follow-up question with a file.",
-        metadata={"files": files},
+        metadata={"files": files, "turn_id": "turn-files"},
     )
 
     await callback.on_user_message_posted(
@@ -235,6 +304,7 @@ async def test_on_user_message_posted_emits_trace_event_with_files() -> None:
     event = tracer.events[0]
     assert event["event_type"] == "task_start_message"
     assert event["data"]["message"] == "Follow-up question with a file."
+    assert event["data"]["turn_id"] == "turn-files"
     assert event["data"]["files"] == files
     assert event["data"]["attachments"] == files
 
@@ -249,12 +319,15 @@ async def test_on_user_message_posted_prevents_resume_from_duplicating() -> None
     runner = SimpleNamespace(tracer=tracer)
     context = ExecutionContext(execution_id="exec-cont")
     context.metadata["task"] = "Original task"
-    msg = context.add_user_message("Follow-up.", metadata={"files": []})
+    msg = context.add_user_message(
+        "Follow-up.", metadata={"files": [], "turn_id": "turn-follow-up"}
+    )
 
     await callback.on_user_message_posted(runner=runner, context=context, message=msg)
     await callback.on_run_start(runner=runner, context=context, resume=True)
 
     assert len(tracer.events) == 1  # not two
+    assert context.metadata[TRACE_TURN_IDS_KEY] == ["turn-follow-up"]
 
 
 @pytest.mark.asyncio
@@ -275,7 +348,10 @@ async def test_on_run_start_resume_emits_untraced_user_message() -> None:
             "type": "text/csv",
         }
     ]
-    context.add_user_message("Continue from here.", metadata={"files": files})
+    context.add_user_message(
+        "Continue from here.",
+        metadata={"files": files, "turn_id": "turn-recover"},
+    )
     # Simulate the runner: pending marker stamped just before the
     # crashed checkpoint. Catch-up will only replay turns whose ts
     # matches this marker, not all history.
@@ -291,6 +367,7 @@ async def test_on_run_start_resume_emits_untraced_user_message() -> None:
     assert len(tracer.events) == 1
     data = tracer.events[0]["data"]
     assert data["message"] == "Continue from here."
+    assert data["turn_id"] == "turn-recover"
     assert data["files"] == files
 
 
@@ -338,7 +415,10 @@ async def test_on_run_start_resume_with_pending_marker_replays_only_pending_turn
     context.add_user_message("Earlier historical turn.")
     pending_msg = context.add_user_message(
         "The turn that crashed mid-emit.",
-        metadata={"files": [{"file_id": "fid-crash", "name": "c.txt"}]},
+        metadata={
+            "files": [{"file_id": "fid-crash", "name": "c.txt"}],
+            "turn_id": "turn-crash",
+        },
     )
     # Pending marker points at the second message — only it should replay.
     pending_ts = callback._message_timestamp_iso(pending_msg)
@@ -350,6 +430,7 @@ async def test_on_run_start_resume_with_pending_marker_replays_only_pending_turn
     assert len(tracer.events) == 1
     data = tracer.events[0]["data"]
     assert data["message"] == "The turn that crashed mid-emit."
+    assert data["turn_id"] == "turn-crash"
     assert data["files"][0]["file_id"] == "fid-crash"
 
 
@@ -363,7 +444,7 @@ async def test_on_run_start_resume_skips_already_traced_user_messages() -> None:
     runner = SimpleNamespace(tracer=tracer)
     context = ExecutionContext(execution_id="exec-pure-resume")
     context.metadata["task"] = "Original task"
-    msg = context.add_user_message("Original turn.")
+    msg = context.add_user_message("Original turn.", metadata={"turn_id": "turn-orig"})
     callback._mark_traced(context, msg)
 
     await callback.on_run_start(runner=runner, context=context, resume=True)
@@ -372,6 +453,38 @@ async def test_on_run_start_resume_skips_already_traced_user_messages() -> None:
     )
 
     assert tracer.events == []
+
+
+@pytest.mark.asyncio
+async def test_on_user_message_posted_is_idempotent_by_turn_id() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-dup-turn")
+    msg = context.add_user_message("Same turn.", metadata={"turn_id": "turn-dup"})
+
+    await callback.on_user_message_posted(runner=runner, context=context, message=msg)
+    await callback.on_user_message_posted(runner=runner, context=context, message=msg)
+
+    assert len(tracer.events) == 1
+    assert tracer.events[0]["data"]["turn_id"] == "turn-dup"
+
+
+@pytest.mark.asyncio
+async def test_on_run_start_resume_turn_ids_allow_identical_text() -> None:
+    tracer = TraceRecorder()
+    callback = TraceEventCallback()
+    runner = SimpleNamespace(tracer=tracer)
+    context = ExecutionContext(execution_id="exec-identical")
+    context.add_user_message("Repeat", metadata={"turn_id": "turn-a"})
+    context.add_user_message("Repeat", metadata={"turn_id": "turn-b"})
+    context.metadata[PENDING_TURN_ID_KEY] = "turn-b"
+
+    await callback.on_run_start(runner=runner, context=context, resume=True)
+
+    assert len(tracer.events) == 1
+    assert tracer.events[0]["data"]["message"] == "Repeat"
+    assert tracer.events[0]["data"]["turn_id"] == "turn-b"
 
 
 @pytest.mark.asyncio

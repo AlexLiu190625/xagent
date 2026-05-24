@@ -338,6 +338,7 @@ class AgentRunner:
         metadata: dict[str, Any] = {"display_message": resolved_display_message}
         if files is not None:
             metadata["files"] = files
+        self._ensure_user_message_turn_id(metadata)
 
         added = context.add_user_message(resolved_execution_message, metadata=metadata)
         # Set a "this turn is waiting to be traced" pending marker before
@@ -360,6 +361,7 @@ class AgentRunner:
         # Snapshot the watermark BEFORE the callback so we can detect a
         # change (see comment below) and persist it.
         watermark_before = self._read_trace_watermark(context)
+        traced_turn_ids_before = self._read_traced_turn_ids(context)
         await self._dispatch_callback(
             "on_user_message_posted",
             runner=self,
@@ -375,7 +377,10 @@ class AgentRunner:
         # has now been emitted; doing both in one persist keeps the
         # invariant {pending => never traced yet} on every durable state.
         watermark_after = self._read_trace_watermark(context)
-        if watermark_after and watermark_after != watermark_before:
+        traced_turn_ids_after = self._read_traced_turn_ids(context)
+        if (
+            watermark_after and watermark_after != watermark_before
+        ) or traced_turn_ids_after != traced_turn_ids_before:
             self._clear_pending_user_message_marker(context)
             await self._persist_injected_context(
                 execution_id=execution_id,
@@ -401,6 +406,16 @@ class AgentRunner:
         return value if isinstance(value, str) and value else None
 
     @staticmethod
+    def _read_traced_turn_ids(context: ExecutionContext) -> tuple[str, ...]:
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return ()
+        value = metadata.get("_user_message_trace_turn_ids")
+        if not isinstance(value, list):
+            return ()
+        return tuple(item for item in value if isinstance(item, str) and item)
+
+    @staticmethod
     def _set_pending_user_message_marker(
         context: ExecutionContext, message: Any
     ) -> None:
@@ -417,12 +432,24 @@ class AgentRunner:
         metadata = getattr(context, "metadata", None)
         if isinstance(metadata, dict):
             metadata["_pending_user_message_trace_timestamp"] = ts
+            turn_id = AgentRunner._message_turn_id(message)
+            if turn_id:
+                metadata["_pending_user_message_trace_turn_id"] = turn_id
 
     @staticmethod
     def _clear_pending_user_message_marker(context: ExecutionContext) -> None:
         metadata = getattr(context, "metadata", None)
         if isinstance(metadata, dict):
             metadata.pop("_pending_user_message_trace_timestamp", None)
+            metadata.pop("_pending_user_message_trace_turn_id", None)
+
+    @staticmethod
+    def _message_turn_id(message: Any) -> str | None:
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("turn_id")
+        return value if isinstance(value, str) and value else None
 
     @staticmethod
     def _message_iso_timestamp(message: Any) -> str | None:
@@ -530,6 +557,13 @@ class AgentRunner:
         candidates.append(context_metadata)
 
         for candidate in candidates:
+            turn_id = candidate.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                metadata["turn_id"] = turn_id
+                break
+        self._ensure_user_message_turn_id(metadata)
+
+        for candidate in candidates:
             if "display_message" in candidate:
                 display_message = candidate.get("display_message")
                 metadata["display_message"] = (
@@ -554,6 +588,15 @@ class AgentRunner:
                 break
 
         return metadata
+
+    @staticmethod
+    def _ensure_user_message_turn_id(metadata: dict[str, Any]) -> str:
+        value = metadata.get("turn_id")
+        if isinstance(value, str) and value:
+            return value
+        turn_id = str(uuid4())
+        metadata["turn_id"] = turn_id
+        return turn_id
 
     def _apply_request_context(
         self,

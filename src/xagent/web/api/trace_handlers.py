@@ -151,6 +151,13 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             # Serialize data to ensure JSON compatibility
             data = self._serialize_data_for_json(event.data or {})
+            if self._is_duplicate_user_message_turn(db, event_type_str, data):
+                logger.debug(
+                    "Skipping duplicate user_message turn_id=%s for task %s",
+                    data.get("turn_id") if isinstance(data, dict) else None,
+                    self.task_id,
+                )
+                return
 
             # Create trace event record
             trace_event = DatabaseTraceEvent(
@@ -237,6 +244,28 @@ class DatabaseTraceHandler(BaseTraceHandler):
             logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()
             raise
+
+    def _is_duplicate_user_message_turn(
+        self,
+        db: Session,
+        event_type: str,
+        data: Any,
+    ) -> bool:
+        if event_type != "user_message" or not isinstance(data, dict):
+            return False
+        turn_id = data.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            return False
+        return (
+            db.query(DatabaseTraceEvent.id)
+            .filter(
+                DatabaseTraceEvent.task_id == self.task_id,
+                DatabaseTraceEvent.event_type == "user_message",
+                DatabaseTraceEvent.data["turn_id"].as_string() == turn_id,
+            )
+            .first()
+            is not None
+        )
 
     def _serialize_data_for_json(self, data: Any) -> Any:
         """Recursively serialize data to ensure JSON compatibility and clean problematic characters."""

@@ -49,6 +49,8 @@ SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
+SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
+SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
 WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
@@ -638,13 +640,20 @@ def get_sandbox_env() -> dict[str, str]:
     return env
 
 
-def get_sandbox_volumes() -> list[tuple[str, str, str]]:
+def get_sandbox_volumes(
+    *, host_side_sources: bool = False
+) -> list[tuple[str, str, str]]:
     """Get the volume mappings for sandbox containers.
 
     Format: src:dst[:mode];src2:dst2[:mode2]
-    - src: source path on host (expanded ~ and env vars)
+    - src: source path on host
     - dst: destination path in container
     - mode: ro or rw (default: ro)
+
+    Args:
+        host_side_sources: When True, source paths are already Docker-host paths.
+            Only environment variables are expanded; relative paths and ``~`` are
+            rejected instead of being normalized inside the backend container.
 
     Returns:
         List of (src, dst, mode) tuples
@@ -664,14 +673,23 @@ def get_sandbox_volumes() -> list[tuple[str, str, str]]:
             logger.warning(f"Invalid sandbox volume config: {item}")
             continue
 
-        src = os.path.expanduser(os.path.expandvars(parts[0].strip()))
+        src = os.path.expandvars(parts[0].strip())
         dst = parts[1].strip()
         if not src or not dst:
             logger.warning(f"Invalid sandbox volume: {item}")
             continue
 
-        # Normalize paths to resolve any relative components
-        src = os.path.abspath(src)
+        if host_side_sources:
+            if src.startswith("~") or not Path(src).is_absolute():
+                logger.warning(
+                    "Invalid sandbox host volume source in Docker sibling mode: %s",
+                    item,
+                )
+                continue
+        else:
+            # Normalize paths to resolve any relative components
+            src = os.path.abspath(os.path.expanduser(src))
+
         mode = parts[2].strip().lower() if len(parts) > 2 else "ro"
         if mode not in ("ro", "rw"):
             logger.warning(f"Invalid sandbox volume mode: {item}, using 'ro'")
@@ -680,6 +698,40 @@ def get_sandbox_volumes() -> list[tuple[str, str, str]]:
         volumes.append((src, dst, mode))
 
     return volumes
+
+
+def get_sandbox_host_project_root() -> Path | None:
+    """Get the host project root used for Docker sibling sandbox code mounts.
+
+    Priority:
+    1. XAGENT_SANDBOX_HOST_PROJECT_ROOT environment variable
+    2. None, which lets callers use their local runtime project root
+
+    Returns:
+        Path to the project root as resolved from the Docker host's perspective,
+        or None when not configured.
+    """
+    env_str = os.getenv(SANDBOX_HOST_PROJECT_ROOT)
+    if env_str:
+        return Path(os.path.expandvars(env_str.strip()))
+    return None
+
+
+def get_sandbox_host_storage_root() -> Path | None:
+    """Get the Docker host storage root used for sibling sandbox bind mounts.
+
+    Priority:
+    1. XAGENT_SANDBOX_HOST_STORAGE_ROOT environment variable
+    2. None, which lets callers use backend paths directly
+
+    Returns:
+        Path to the Xagent storage root as seen by the Docker host, or None when
+        not configured.
+    """
+    env_str = os.getenv(SANDBOX_HOST_STORAGE_ROOT)
+    if env_str:
+        return Path(os.path.expandvars(env_str.strip()))
+    return None
 
 
 def get_boxlite_home_dir() -> Path | None:

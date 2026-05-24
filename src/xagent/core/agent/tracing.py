@@ -21,6 +21,7 @@ from .trace import (
 # checkpoint round-trips because ``context.metadata`` is persisted in
 # ``ExecutionContext.to_dict``.
 TRACE_WATERMARK_KEY = "_user_message_trace_watermark"
+TRACE_TURN_IDS_KEY = "_user_message_trace_turn_ids"
 
 # Stamped on ``context.metadata`` by ``runner.inject_user_message`` just
 # before persisting a freshly-injected user message, and cleared when the
@@ -32,6 +33,12 @@ TRACE_WATERMARK_KEY = "_user_message_trace_watermark"
 # - pending only -> crashed between persist and trace emit, replay that turn
 # - watermark    -> normal "trace already emitted" path, fast-skip
 PENDING_MARKER_KEY = "_pending_user_message_trace_timestamp"
+PENDING_TURN_ID_KEY = "_pending_user_message_trace_turn_id"
+
+# Public per-turn identifier stored on ``Message.metadata`` and copied to the
+# user-message trace payload. Unlike timestamp/content watermarks this survives
+# identical user text, file-only turns, and replay ordering changes.
+TURN_ID_KEY = "turn_id"
 
 
 @dataclass
@@ -67,6 +74,7 @@ class TraceEventCallback:
                 context=context,
                 message=get_display_user_message(context, task or ""),
                 files=files,
+                turn_id=self._message_turn_id(self._latest_user_message(context)),
             )
             # Mark the latest user message (if the runner added one) as
             # traced so a subsequent resume does not re-emit it.
@@ -118,11 +126,14 @@ class TraceEventCallback:
         # the frontend's ``has_files`` fallback render the bubble.
         if not bubble_text and not resolved_files:
             return
+        if self._message_turn_id(message) in self._traced_turn_ids(context):
+            return
         await self._emit_user_message_trace(
             tracer=tracer,
             context=context,
             message=bubble_text,
             files=resolved_files,
+            turn_id=self._message_turn_id(message),
         )
         self._mark_traced(context, message)
 
@@ -143,10 +154,18 @@ class TraceEventCallback:
             "status": status or ("completed" if result.get("success") else "failed"),
             "pattern": result.get("pattern"),
         }
+        stream_message_id = self._final_answer_stream_message_id(
+            runner=runner,
+            execution_id=execution_id,
+        )
+        if stream_message_id:
+            data["stream_message_id"] = stream_message_id
 
         if result.get("success"):
             if output:
                 completion_result: dict[str, Any] = {"content": output}
+                if stream_message_id:
+                    completion_result["stream_message_id"] = stream_message_id
                 file_outputs = result.get("file_outputs")
                 if file_outputs:
                     completion_result["file_outputs"] = file_outputs
@@ -174,6 +193,17 @@ class TraceEventCallback:
             data={**data, "context": self._context_payload(context)},
         )
 
+    def _final_answer_stream_message_id(
+        self,
+        *,
+        runner: Any,
+        execution_id: str,
+    ) -> str | None:
+        control = getattr(runner, "_active_controls", {}).get(execution_id)
+        runtime = getattr(control, "runtime", None)
+        message_id = getattr(runtime, "last_final_answer_stream_message_id", None)
+        return message_id if isinstance(message_id, str) and message_id else None
+
     async def _emit_user_message_trace(
         self,
         *,
@@ -181,6 +211,7 @@ class TraceEventCallback:
         context: Any,
         message: str,
         files: list[dict[str, Any]],
+        turn_id: str | None = None,
     ) -> None:
         """Emit a user-message trace event with a browser-safe payload.
 
@@ -205,6 +236,8 @@ class TraceEventCallback:
         """
         safe_files = project_file_info_to_chip(files)
         trace_data: dict[str, Any] = {}
+        if turn_id:
+            trace_data[TURN_ID_KEY] = turn_id
         if safe_files:
             # Surface uploaded files at the top level of trace_data so the
             # frontend user-message renderer (which reads ``eventData.files``)
@@ -217,6 +250,8 @@ class TraceEventCallback:
     async def _emit_untraced_user_messages(self, *, tracer: Any, context: Any) -> None:
         watermark = self._watermark(context)
         pending = self._pending_marker(context)
+        pending_turn_id = self._pending_turn_id(context)
+        traced_turn_ids = self._traced_turn_ids(context)
         # Disambiguate old/pre-PR checkpoints from genuinely-pending turns:
         # a checkpoint that has neither marker is from before this PR (or
         # from a code path that doesn't go through the runner's
@@ -225,7 +260,12 @@ class TraceEventCallback:
         # crash-window for newly-injected messages is covered by the
         # pending marker below; long-term per-turn idempotency is tracked
         # in #454.
-        if watermark is None and pending is None:
+        if (
+            watermark is None
+            and pending is None
+            and pending_turn_id is None
+            and not traced_turn_ids
+        ):
             return
 
         messages = list(getattr(context, "messages", []) or [])
@@ -240,15 +280,20 @@ class TraceEventCallback:
             # Same display vs execution split as on_user_message_posted —
             # see the comment there.
             bubble_text = self._display_message_from(message) or content
+            turn_id = self._message_turn_id(message)
+            if turn_id and turn_id in traced_turn_ids:
+                continue
+            if pending_turn_id is not None and turn_id != pending_turn_id:
+                continue
             ts = self._message_timestamp_iso(message)
-            if watermark and ts and ts <= watermark:
+            if not turn_id and watermark and ts and ts <= watermark:
                 continue
             # Pending marker present without watermark advance: only replay
             # the matching turn. Any other historical turn at this point
             # was already visible to the client on the prior run; skip it
             # so we don't spam re-emissions for everything older than the
             # crash point.
-            if pending is not None and ts != pending:
+            if pending_turn_id is None and pending is not None and ts != pending:
                 continue
             files = self._files_from_message(message)
             # For the chronologically first user message we additionally fall
@@ -268,6 +313,7 @@ class TraceEventCallback:
                 context=context,
                 message=bubble_text,
                 files=files,
+                turn_id=turn_id,
             )
             self._mark_traced(context, message)
 
@@ -285,16 +331,51 @@ class TraceEventCallback:
         value = metadata.get(PENDING_MARKER_KEY)
         return value if isinstance(value, str) and value else None
 
+    def _pending_turn_id(self, context: Any) -> str | None:
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get(PENDING_TURN_ID_KEY)
+        return value if isinstance(value, str) and value else None
+
     def _mark_traced(self, context: Any, message: Any) -> None:
         ts = self._message_timestamp_iso(message)
-        if ts is None:
-            return
         metadata = getattr(context, "metadata", None)
         if not isinstance(metadata, dict):
             return
-        existing = metadata.get(TRACE_WATERMARK_KEY)
-        if not isinstance(existing, str) or ts > existing:
-            metadata[TRACE_WATERMARK_KEY] = ts
+        turn_id = self._message_turn_id(message)
+        if turn_id:
+            traced = metadata.get(TRACE_TURN_IDS_KEY)
+            traced_ids = (
+                [value for value in traced if isinstance(value, str) and value]
+                if isinstance(traced, list)
+                else []
+            )
+            if turn_id not in traced_ids:
+                traced_ids.append(turn_id)
+                metadata[TRACE_TURN_IDS_KEY] = traced_ids
+        if ts is not None:
+            existing = metadata.get(TRACE_WATERMARK_KEY)
+            if not isinstance(existing, str) or ts > existing:
+                metadata[TRACE_WATERMARK_KEY] = ts
+
+    def _traced_turn_ids(self, context: Any) -> set[str]:
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return set()
+        value = metadata.get(TRACE_TURN_IDS_KEY)
+        if not isinstance(value, list):
+            return set()
+        return {item for item in value if isinstance(item, str) and item}
+
+    def _message_turn_id(self, message: Any | None) -> str | None:
+        if message is None:
+            return None
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get(TURN_ID_KEY)
+        return value if isinstance(value, str) and value else None
 
     def _message_timestamp_iso(self, message: Any) -> str | None:
         ts = getattr(message, "timestamp", None)

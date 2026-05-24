@@ -47,9 +47,10 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from ..models.task import Task, TaskStatus
 from ..models.user import User
@@ -101,6 +102,10 @@ class TaskTurnPayload:
     # name, size, type) — already path-stripped by the websocket layer
     # before reaching here.
     attachments: Optional[List[Dict[str, Any]]] = None
+    # Stable identity shared by the transcript row and the user_message trace
+    # event for this user turn. Historical replay uses it to merge persisted
+    # transcript rows with trace rows without collapsing repeated text.
+    turn_id: str = field(default_factory=lambda: str(uuid4()))
 
     @property
     def for_agent(self) -> str:
@@ -301,6 +306,7 @@ class TaskTurnOrchestrator:
                 user_id=int(user.id),
                 content=payload.transcript_message,
                 attachments=payload.attachments,
+                turn_id=payload.turn_id,
             )
             if persisted_message is not None:
                 db.flush()
@@ -604,7 +610,7 @@ async def _schedule_bg(
                 await execute_task_background(
                     task_id=task_id,
                     user_message=payload.transcript_message,
-                    context=context or {},
+                    context=_execution_context_with_turn_id(context, payload.turn_id),
                     agent_manager=_get_agent_manager(),
                     user_id=user_id,
                     before_message_id=before_message_id,
@@ -680,3 +686,12 @@ async def _schedule_bg(
         force_fresh,
     )
     return bg_task
+
+
+def _execution_context_with_turn_id(
+    context: Optional[Dict[str, Any]], turn_id: str
+) -> Dict[str, Any]:
+    execution_context = dict(context or {})
+    if turn_id:
+        execution_context["turn_id"] = turn_id
+    return execution_context

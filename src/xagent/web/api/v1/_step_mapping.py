@@ -391,29 +391,41 @@ def _build_tool_start(
     args = _data_get(event, "tool_args")
     if args is None:
         args = _data_get(event, "tool_params")
+    assistant_content = _data_get(event, "assistant_content")
+    assistant_content = (
+        assistant_content.strip()
+        if isinstance(assistant_content, str) and assistant_content.strip()
+        else None
+    )
     if public_type == "agent_delegation" and isinstance(tool_name, str):
         sub_agent_name = tool_name[len(_AGENT_DELEGATION_PREFIX) :] or tool_name
+        data = {
+            "sub_agent_name": sub_agent_name,
+            "input": args,
+        }
+        if assistant_content:
+            data["assistant_content"] = assistant_content
         return {
             "id": f"agent_delegation:{key}",
             "type": "agent_delegation",
             "status": "running",
             "started_at": _ts(event),
             "completed_at": None,
-            "data": {
-                "sub_agent_name": sub_agent_name,
-                "input": args,
-            },
+            "data": data,
         }
+    data = {
+        "name": tool_name,
+        "args": args,
+    }
+    if assistant_content:
+        data["assistant_content"] = assistant_content
     return {
         "id": f"tool_call:{key}",
         "type": "tool_call",
         "status": "running",
         "started_at": _ts(event),
         "completed_at": None,
-        "data": {
-            "name": tool_name,
-            "args": args,
-        },
+        "data": data,
     }
 
 

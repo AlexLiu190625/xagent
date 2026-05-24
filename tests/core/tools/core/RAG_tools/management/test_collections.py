@@ -852,6 +852,87 @@ async def test_list_collections_non_admin_realtime_does_not_overwrite_global_met
     save_collection_mock.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_list_collections_non_admin_uses_tenant_stats_despite_metadata_cache(
+    temp_lancedb_dir: str,
+) -> None:
+    """A visible shared-name collection should show only the caller's document count."""
+    collection = "shared_name_cache_test"
+    now = datetime.now(timezone.utc)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-user-1",
+                "source_path": "/path/user1.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-1",
+                "uploaded_at": now,
+                "title": "User 1",
+                "language": "en",
+                "user_id": 1,
+            },
+            {
+                "collection": collection,
+                "doc_id": "doc-user-2",
+                "source_path": "/path/user2.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-2",
+                "uploaded_at": now,
+                "title": "User 2",
+                "language": "en",
+                "user_id": 2,
+            },
+        ]
+    )
+    await get_metadata_store().save_collection_config(collection, "{}", user_id=1)
+
+    result = await list_collections(user_id=1, is_admin=False)
+
+    info = next(c for c in result.collections if c.name == collection)
+    assert info.documents == 1
+    assert info.owners == [1]
+    assert info.document_names == ["user1.pdf"]
+
+
+@pytest.mark.asyncio
+async def test_list_collections_non_admin_stale_config_does_not_use_global_stats(
+    temp_lancedb_dir: str,
+) -> None:
+    """A stale user config should not inherit another user's cached stats."""
+    collection = "stale_config_shared_name_test"
+    now = datetime.now(timezone.utc)
+
+    _insert_documents(
+        [
+            {
+                "collection": collection,
+                "doc_id": "doc-user-2",
+                "source_path": "/path/user2.pdf",
+                "file_type": "pdf",
+                "content_hash": "hash-2",
+                "uploaded_at": now,
+                "title": "User 2",
+                "language": "en",
+                "user_id": 2,
+            }
+        ]
+    )
+    await get_metadata_store().save_collection_config(collection, "{}", user_id=1)
+
+    result = await list_collections(user_id=1, is_admin=False)
+
+    info = next(c for c in result.collections if c.name == collection)
+    assert info.documents == 0
+    assert info.parses == 0
+    assert info.chunks == 0
+    assert info.embeddings == 0
+    assert info.processed_documents == 0
+    assert info.owners == []
+    assert info.document_names == []
+
+
 # --- delete_collection metadata cleanup Tests ---
 
 

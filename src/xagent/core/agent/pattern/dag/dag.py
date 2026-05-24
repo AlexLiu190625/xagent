@@ -12,9 +12,11 @@ from ...context.enrichment import (
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from ...language import final_answer_language_rule
 from ...result import unwrap_final_answer_content
 from ...runtime import LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult
+from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
 from ..react import ReActPattern, ReActReasoningMode
 from .plan_generator import (
     CallablePlanGenerator,
@@ -26,6 +28,17 @@ from .plan_generator import (
 )
 
 logger = logging.getLogger(__name__)
+
+DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
+
+
+@dataclass
+class DAGCompletionAssessment:
+    complete: bool
+    answer: str = ""
+    reason: str = ""
+    missing_work: str = ""
+    replan_instruction: str = ""
 
 
 @dataclass
@@ -61,6 +74,19 @@ class _DAGStepRuntime:
         return await self.parent.should_interrupt()
 
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
+        return await self.parent.run_llm_call(llm, **kwargs)
+
+    async def run_streaming_llm_call(
+        self,
+        llm: Any,
+        *,
+        on_chunk: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del on_chunk
+        return await self.parent.run_streaming_llm_call(llm, **kwargs)
+
+    async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
 
     async def send_message(
@@ -236,6 +262,7 @@ class DAGPattern(AgentPattern):
         react_reasoning_mode: ReActReasoningMode
         | str = ReActReasoningMode.TOOL_CALLING,
         max_concurrency: int = 4,
+        max_completion_replans: int = 3,
     ) -> None:
         self.plan_generator = (
             plan_generator
@@ -245,6 +272,7 @@ class DAGPattern(AgentPattern):
         self.react_max_iterations = react_max_iterations
         self.react_reasoning_mode = ReActReasoningMode(react_reasoning_mode)
         self.max_concurrency = max(1, max_concurrency)
+        self.max_completion_replans = max(0, max_completion_replans)
         self.status = "idle"
         self.plan: ExecutionPlan | None = None
         self.active_step_id: str | None = None
@@ -255,6 +283,8 @@ class DAGPattern(AgentPattern):
         self.active_step_contexts: dict[str, dict[str, Any]] = {}
         self.step_results: dict[str, Any] = {}
         self.planned_user_message_count = 0
+        self.completion_feedback: str | None = None
+        self.completion_replan_count = 0
 
     async def run(
         self,
@@ -457,19 +487,15 @@ class DAGPattern(AgentPattern):
                         checkpoint_label="dag_plan_missing",
                     )
                 if self._all_steps_completed():
-                    self.status = "completed"
-                    await runtime.checkpoint(
-                        "dag_completed", context=context, pattern=self
+                    completion_result = await self._handle_completed_plan(
+                        context=context,
+                        tools=tools,
+                        llm=llm,
+                        runtime=runtime,
                     )
-                    output = self._final_output()
-                    return PatternResult(
-                        success=True,
-                        output=output,
-                        metadata={
-                            "status": self.status,
-                            "step_results": self.step_results,
-                        },
-                    ).to_dict()
+                    if completion_result is not None:
+                        return completion_result
+                    continue
                 failed_step = next(
                     (step for step in self.plan.steps if step.status == "failed"),
                     None,
@@ -903,6 +929,9 @@ class DAGPattern(AgentPattern):
             "step_results": dict(self.step_results),
             "planned_user_message_count": self.planned_user_message_count,
             "max_concurrency": self.max_concurrency,
+            "completion_feedback": self.completion_feedback,
+            "completion_replan_count": self.completion_replan_count,
+            "max_completion_replans": self.max_completion_replans,
         }
 
     def get_execution_snapshot(self, root_context: Any) -> dict[str, Any]:
@@ -991,6 +1020,13 @@ class DAGPattern(AgentPattern):
             state.get("planned_user_message_count", 0)
         )
         self.max_concurrency = max(1, int(state.get("max_concurrency", 4)))
+        feedback = state.get("completion_feedback")
+        self.completion_feedback = str(feedback) if feedback else None
+        self.completion_replan_count = int(state.get("completion_replan_count", 0))
+        self.max_completion_replans = max(
+            0,
+            int(state.get("max_completion_replans", self.max_completion_replans)),
+        )
 
     async def _fail(
         self,
@@ -1052,6 +1088,305 @@ class DAGPattern(AgentPattern):
         return self.plan is not None and all(
             step.status == "completed" for step in self.plan.steps
         )
+
+    async def _handle_completed_plan(
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        runtime: PatternRuntime,
+    ) -> dict[str, Any] | None:
+        try:
+            assessment = await self._assess_completion(
+                context=context,
+                llm=llm,
+                runtime=runtime,
+            )
+        except LLMCallInterrupted:
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="dag_during_completion_assessment",
+            )
+            if interrupted is not None:
+                return interrupted
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="completion_assessment_error",
+                checkpoint_label="dag_completion_assessment_failed",
+            )
+
+        if assessment.complete:
+            self.status = "completed"
+            self.completion_feedback = None
+            output = assessment.answer or self._final_output()
+            await runtime.checkpoint("dag_completed", context=context, pattern=self)
+            return PatternResult(
+                success=True,
+                output=output,
+                metadata={
+                    "status": self.status,
+                    "step_results": self.step_results,
+                    "completion_assessment": assessment.__dict__,
+                },
+            ).to_dict()
+
+        if self.completion_replan_count >= self.max_completion_replans:
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=(
+                    "DAG completion assessment requested additional work after "
+                    f"{self.max_completion_replans} replans."
+                ),
+                failure_reason="completion_replan_limit_exceeded",
+                checkpoint_label="dag_completion_replan_limit",
+            )
+
+        self.completion_replan_count += 1
+        self.completion_feedback = (
+            assessment.replan_instruction
+            or assessment.missing_work
+            or assessment.reason
+        )
+        await runtime.checkpoint(
+            "dag_completion_incomplete",
+            context=context,
+            pattern=self,
+            metadata={
+                "completion_assessment": assessment.__dict__,
+                "completion_replan_count": self.completion_replan_count,
+            },
+        )
+        try:
+            await self._generate_plan(
+                context=context,
+                tools=tools,
+                llm=llm,
+                runtime=runtime,
+                replan=True,
+            )
+        except PlanValidationError as exc:
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="invalid_plan",
+                checkpoint_label="dag_plan_invalid",
+            )
+        except LLMCallInterrupted:
+            interrupted = await self._interrupt_if_requested(
+                runtime=runtime,
+                context=context,
+                label="dag_during_completion_replan",
+            )
+            if interrupted is not None:
+                return interrupted
+            raise
+        except Exception as exc:  # noqa: BLE001
+            return await self._fail(
+                context=context,
+                runtime=runtime,
+                error=str(exc),
+                failure_reason="completion_replan_generation_error",
+                checkpoint_label="dag_plan_generation_failed",
+            )
+        return None
+
+    async def _assess_completion(
+        self,
+        *,
+        context: Any,
+        llm: Any,
+        runtime: PatternRuntime,
+    ) -> DAGCompletionAssessment:
+        messages = self._completion_assessment_messages(context)
+        tools = [self._completion_assessment_tool_schema()]
+        await runtime.on_dag_execution(
+            context=context,
+            phase="completion_assessment",
+            data={
+                "completed_step_count": len(self.step_results),
+                "plan_step_count": len(self.plan.steps) if self.plan else 0,
+            },
+        )
+        await runtime.on_llm_start(
+            context=context,
+            messages=messages,
+            tools=tools,
+            metadata={"phase": "dag_completion_assessment"},
+        )
+        final_answer_stream = FinalAnswerStreamSession(runtime)
+        streamer = ToolCallStringFieldStreamer(
+            runtime=runtime,
+            tool_name=DAG_COMPLETION_TOOL_NAME,
+            field_name="answer",
+            guard_field="status",
+            guard_value="completed",
+            emitter=final_answer_stream,
+        )
+        try:
+            response = await runtime.run_streaming_llm_call(
+                llm,
+                messages=messages,
+                tools=tools,
+                tool_choice="required",
+                thinking={"type": "disabled", "enable": False},
+                on_chunk=streamer.handle_chunk,
+            )
+        except Exception as exc:
+            await streamer.fail(str(exc))
+            await runtime.on_llm_error(
+                context=context,
+                error=exc,
+                metadata={"phase": "dag_completion_assessment"},
+            )
+            raise
+        await runtime.on_llm_end(
+            context=context,
+            response=response,
+            metadata={"phase": "dag_completion_assessment"},
+        )
+        assessment = self._parse_completion_assessment(response)
+        if assessment.complete:
+            await final_answer_stream.finish(assessment.answer)
+        return assessment
+
+    def _completion_assessment_messages(self, context: Any) -> list[dict[str, Any]]:
+        latest_messages = [
+            {"role": message.role, "content": message.content}
+            for message in getattr(context, "messages", [])
+            if getattr(message, "role", None) in {"user", "assistant", "tool"}
+        ]
+        payload = {
+            "messages": latest_messages,
+            "plan": self.plan.to_dict() if self.plan is not None else None,
+            "step_results": self.step_results,
+            "candidate_output": self._final_output(),
+            "previous_completion_feedback": self.completion_feedback,
+        }
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Assess whether the completed DAG steps satisfy the user's "
+                    "overall request. Call the assessment tool exactly once. If "
+                    "the goal is satisfied, choose status=completed and put the "
+                    "final user-facing answer in answer. If anything material is "
+                    "missing, choose status=incomplete, leave answer empty, and "
+                    "state the missing work plus concise replan instructions. Put "
+                    "status before answer in the tool arguments. "
+                    f"{final_answer_language_rule()}"
+                ),
+            },
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ]
+
+    def _completion_assessment_tool_schema(self) -> dict[str, Any]:
+        return {
+            "type": "function",
+            "function": {
+                "name": DAG_COMPLETION_TOOL_NAME,
+                "description": (
+                    "Decide whether DAG execution satisfies the overall user goal "
+                    "and either provide the final answer or request more work."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "status": {
+                            "type": "string",
+                            "enum": ["completed", "incomplete"],
+                        },
+                        "reason": {"type": "string"},
+                        "answer": {
+                            "type": "string",
+                            "description": (
+                                "Final user-facing answer when status is completed; "
+                                "empty when status is incomplete. "
+                                f"{final_answer_language_rule()}"
+                            ),
+                        },
+                        "missing_work": {
+                            "type": "string",
+                            "description": (
+                                "What remains unresolved when status is incomplete."
+                            ),
+                        },
+                        "replan_instruction": {
+                            "type": "string",
+                            "description": (
+                                "Concise instruction for the next DAG replan when "
+                                "status is incomplete."
+                            ),
+                        },
+                    },
+                    "required": [
+                        "status",
+                        "reason",
+                        "answer",
+                        "missing_work",
+                        "replan_instruction",
+                    ],
+                    "additionalProperties": False,
+                },
+            },
+        }
+
+    def _parse_completion_assessment(self, response: Any) -> DAGCompletionAssessment:
+        payload = self._extract_tool_arguments(response, DAG_COMPLETION_TOOL_NAME)
+        status = str(payload.get("status", "")).strip().lower()
+        if status not in {"completed", "incomplete"}:
+            raise ValueError(f"Invalid DAG completion status: {status}")
+        answer = str(payload.get("answer", ""))
+        return DAGCompletionAssessment(
+            complete=status == "completed",
+            answer=answer,
+            reason=str(payload.get("reason", "")),
+            missing_work=str(payload.get("missing_work", "")),
+            replan_instruction=str(payload.get("replan_instruction", "")),
+        )
+
+    def _extract_tool_arguments(self, response: Any, tool_name: str) -> dict[str, Any]:
+        tool_calls = self._response_tool_calls(response)
+        for tool_call in tool_calls:
+            function_payload = self._function_payload(tool_call)
+            if not function_payload or function_payload.get("name") != tool_name:
+                continue
+            return self._coerce_tool_arguments(function_payload.get("arguments", {}))
+        raise ValueError(f"DAG completion requires a {tool_name} tool call response.")
+
+    def _response_tool_calls(self, response: Any) -> list[Any]:
+        if isinstance(response, dict):
+            return list(response.get("tool_calls") or [])
+        return list(getattr(response, "tool_calls", []) or [])
+
+    def _function_payload(self, tool_call: Any) -> dict[str, Any] | None:
+        if isinstance(tool_call, dict):
+            function_payload = tool_call.get("function")
+            return function_payload if isinstance(function_payload, dict) else None
+        function_payload = getattr(tool_call, "function", None)
+        if function_payload is None:
+            return None
+        return {
+            "name": getattr(function_payload, "name", None),
+            "arguments": getattr(function_payload, "arguments", {}),
+        }
+
+    def _coerce_tool_arguments(self, arguments: Any) -> dict[str, Any]:
+        if isinstance(arguments, dict):
+            return arguments
+        if not isinstance(arguments, str):
+            raise TypeError("Tool call arguments must be an object or JSON string.")
+        payload = json.loads(arguments)
+        if not isinstance(payload, dict):
+            raise TypeError("Tool call arguments must decode to an object.")
+        return payload
 
     def _final_output(self) -> Any:
         if self.plan is None:
@@ -1173,6 +1508,7 @@ class DAGPattern(AgentPattern):
             completed_step_results=dict(self.step_results),
             previous_plan=self.plan,
             available_tool_names=[self._tool_name(tool) for tool in tools],
+            completion_feedback=self.completion_feedback,
         )
         self.plan = await self.plan_generator.generate_plan(
             request=request,

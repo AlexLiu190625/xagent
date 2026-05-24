@@ -23,6 +23,7 @@ from xml.etree import ElementTree as ET
 
 from ...file_ref import build_workspace_file_ref
 from ...workspace import TaskWorkspace
+from ..artifacts import build_inline_artifact
 
 # PPTX namespaces
 NS_P = "http://schemas.openxmlformats.org/presentationml/2006/main"
@@ -1930,6 +1931,7 @@ def generate_pptx(
                         )
                         result["file_id"] = file_ref["file_id"]
                         result["file_ref"] = file_ref
+                        result["artifacts"] = [build_inline_artifact(file_ref)]
                     except Exception as e:
                         logger.warning("Failed to build generated PPTX FileRef: %s", e)
                         result["file_ref_warning"] = str(e)
@@ -2001,6 +2003,7 @@ def pack_pptx(
                         )
                         result["file_id"] = file_ref["file_id"]
                         result["file_ref"] = file_ref
+                        result["artifacts"] = [build_inline_artifact(file_ref)]
                     except Exception as e:
                         logger.warning("Failed to build packed PPTX FileRef: %s", e)
                         result["file_ref_warning"] = str(e)
