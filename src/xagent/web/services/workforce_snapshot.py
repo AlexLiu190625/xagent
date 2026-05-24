@@ -182,6 +182,8 @@ def build_agent_tool_overrides(
             "extra_system_prompt": build_worker_system_prompt(
                 workforce_name, worker["assignment_instructions"]
             ),
+            "allowed_agent_ids": [],
+            "enable_global_agent_tools": False,
             "workforce_run_id": workforce_run_id,
             "workforce_id": workforce_id,
             "workforce_name": workforce_name,

@@ -407,6 +407,7 @@ class ToolFactory:
                 workspace_config.get("base_dir") or str(get_uploads_dir()),
                 task_id or "default",
                 allowed_external_dirs=workspace_config.get("allowed_external_dirs"),
+                db_task_id=workspace_config.get("db_task_id"),
             )
             user_id = workspace_config.get("user_id")
             if isinstance(user_id, int):

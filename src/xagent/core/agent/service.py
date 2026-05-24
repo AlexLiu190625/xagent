@@ -138,6 +138,7 @@ class AgentService:
                 ws_config.get("base_dir", self.workspace_base_dir),
                 ws_config.get("task_id", self.id),
                 self.allowed_external_dirs,
+                db_task_id=ws_config.get("db_task_id"),
             )
         elif self.enable_workspace:
             self._setup_workspace()
@@ -622,6 +623,10 @@ class AgentService:
         if not self.tool_config:
             return ()
 
+        def _get_conf(attr: str, default: Any = None) -> Any:
+            getter = getattr(self.tool_config, attr, None)
+            return getter() if callable(getter) else default
+
         refresh_overrides = getattr(
             self.tool_config, "refresh_user_tool_overrides", None
         )
@@ -629,8 +634,7 @@ class AgentService:
             # Re-read the hook-backed policy before comparing signatures.
             refresh_overrides()
 
-        get_overrides = getattr(self.tool_config, "get_user_tool_overrides", None)
-        overrides: Any = get_overrides() if callable(get_overrides) else {}
+        overrides: Any = _get_conf("get_user_tool_overrides", {})
         if isinstance(overrides, dict):
             override_items = tuple(
                 sorted(
@@ -644,15 +648,61 @@ class AgentService:
         else:
             override_items = ()
 
-        get_allowed_tools = getattr(self.tool_config, "get_allowed_tools", None)
-        allowed_tools = get_allowed_tools() if callable(get_allowed_tools) else None
+        allowed_tools = _get_conf("get_allowed_tools")
         allowed_items = (
             None
             if allowed_tools is None
             else tuple(str(name) for name in allowed_tools)
         )
 
-        return (override_items, allowed_items)
+        allowed_agent_ids = _get_conf("get_allowed_agent_ids")
+        allowed_agent_items = (
+            None
+            if allowed_agent_ids is None
+            else tuple(str(agent_id) for agent_id in allowed_agent_ids)
+        )
+
+        agent_tool_overrides = _get_conf("get_agent_tool_overrides", {})
+        if isinstance(agent_tool_overrides, dict):
+            agent_override_items = tuple(
+                sorted(
+                    (
+                        str(agent_id),
+                        tuple(
+                            sorted(
+                                (str(key), repr(value))
+                                for key, value in override.items()
+                            )
+                        )
+                        if isinstance(override, dict)
+                        else repr(override),
+                    )
+                    for agent_id, override in agent_tool_overrides.items()
+                )
+            )
+        else:
+            agent_override_items = ()
+
+        enable_global_agent_tools = _get_conf("get_enable_global_agent_tools", True)
+        allow_cross_user_agent_ids = _get_conf("get_allow_cross_user_agent_ids", False)
+        parent_task_id = _get_conf("get_parent_task_id")
+        parent_tracer = _get_conf("get_parent_tracer")
+        parent_tracer_identity = None if parent_tracer is None else id(parent_tracer)
+
+        agent_call_stack = _get_conf("get_agent_call_stack", [])
+        agent_call_stack_items = tuple(str(agent_id) for agent_id in agent_call_stack)
+
+        return (
+            override_items,
+            allowed_items,
+            allowed_agent_items,
+            agent_override_items,
+            bool(enable_global_agent_tools),
+            bool(allow_cross_user_agent_ids),
+            None if parent_task_id is None else str(parent_task_id),
+            parent_tracer_identity,
+            agent_call_stack_items,
+        )
 
     def _execution_type(self) -> str:
         if self.pattern == "dag_plan_execute":

@@ -757,6 +757,7 @@ def _insert_trace_event(
     timestamp: datetime,
     data: dict,
     step_id: str | None = None,
+    build_id: str | None = None,
 ) -> None:
     """Insert one TraceEvent row directly via the test DB.
 
@@ -772,6 +773,7 @@ def _insert_trace_event(
             event_type=event_type,
             timestamp=timestamp,
             step_id=step_id,
+            build_id=build_id,
             data=data,
         )
         db.add(ev)
@@ -932,6 +934,30 @@ def test_get_steps_empty_task_returns_empty_array(mock_start_task):
     assert body["task_id"] == task_id
     assert body["agent_id"] == agent_id
     assert body["steps"] == []
+
+
+def test_get_steps_ignores_worker_build_trace_events(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="worker-trace-1",
+        timestamp=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc),
+        step_id="worker-step",
+        build_id="agent_123_abcd1234",
+        data={
+            "tool_name": "worker_tool",
+            "tool_execution_id": "worker-call-1",
+            "worker_task_id": "agent_123_abcd1234",
+        },
+    )
+
+    resp = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["steps"] == []
 
 
 def test_get_steps_cache_reuses_mapping_until_trace_event_changes(mock_start_task):

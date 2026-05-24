@@ -2,8 +2,10 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.agent.service import AgentService
 from xagent.core.file_storage.factory import get_file_storage
-from xagent.core.workspace import TaskWorkspace
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.workspace import TaskWorkspace, WorkspaceManager
 from xagent.web.models import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -57,6 +59,179 @@ def test_workspace_register_file_writes_durable_storage(
     finally:
         db.close()
         engine.dispose()
+
+
+def test_agent_workspace_register_file_uses_explicit_db_task_id(
+    monkeypatch, tmp_path, mock_workspace_db
+):
+    # Override the global autouse fixture from tests/conftest.py for this module.
+    del mock_workspace_db
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_file_storage.cache_clear()
+
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="delegated-workspace-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        task = Task(id=321, user_id=user.id, title="Parent task")
+        db.add(task)
+        db.commit()
+
+        workspace = TaskWorkspace(
+            id="agent_2_abcd1234",
+            base_dir=str(tmp_path / "workspaces"),
+            db_task_id=321,
+        )
+        output_path = workspace.output_dir / "report.txt"
+        output_path.write_text("delegated output", encoding="utf-8")
+
+        file_id = workspace.register_file(str(output_path), db_session=db)
+        db.commit()
+
+        record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        assert workspace.current_task_id == 321
+        assert record.user_id == user.id
+        assert record.task_id == 321
+        assert record.storage_path == str(output_path)
+        assert record.storage_key == (
+            f"users/{user.id}/tasks/321/outputs/{file_id}/output/report.txt"
+        )
+        assert record.workspace_relative_path == "output/report.txt"
+        assert record.workspace_category == "output"
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_agent_workspace_register_file_rebinds_existing_output_to_db_task_id(
+    monkeypatch, tmp_path, mock_workspace_db
+):
+    # Override the global autouse fixture from tests/conftest.py for this module.
+    del mock_workspace_db
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_file_storage.cache_clear()
+
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="delegated-rebind-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        parent_task = Task(id=321, user_id=user.id, title="Parent task")
+        worker_task = Task(id=322, user_id=user.id, title="Worker task")
+        db.add_all([parent_task, worker_task])
+        db.commit()
+
+        workspace = TaskWorkspace(
+            id="agent_2_abcd1234",
+            base_dir=str(tmp_path / "workspaces"),
+            db_task_id=321,
+        )
+        output_path = workspace.output_dir / "report.txt"
+        output_path.write_text("worker output", encoding="utf-8")
+
+        from xagent.web.services.uploaded_file_store import UploadedFileStore
+
+        record = UploadedFileStore(db).create_from_local_path(
+            local_path=output_path,
+            user_id=int(user.id),
+            file_id="worker-output",
+            task_id=322,
+            filename="report.txt",
+            workspace_relative_path="output/report.txt",
+            workspace_category="output",
+            mime_type="text/plain",
+        )
+        db.commit()
+
+        output_path.write_text("parent-visible output", encoding="utf-8")
+        file_id = workspace.register_file(str(output_path), db_session=db)
+        db.commit()
+
+        assert file_id == "worker-output"
+        db.refresh(record)
+        assert record.user_id == user.id
+        assert record.task_id == 321
+        assert record.storage_key == (
+            f"users/{user.id}/tasks/321/outputs/worker-output/output/report.txt"
+        )
+        assert record.workspace_relative_path == "output/report.txt"
+        assert record.workspace_category == "output"
+        assert record.file_size == len("parent-visible output")
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_tool_factory_workspace_preserves_db_task_id(tmp_path):
+    workspace = ToolFactory._create_workspace(
+        {
+            "base_dir": str(tmp_path / "workspaces"),
+            "task_id": "agent_2_abcd1234",
+            "db_task_id": 654,
+        }
+    )
+
+    assert workspace is not None
+    assert workspace.id == "agent_2_abcd1234"
+    assert workspace.db_task_id == 654
+    assert workspace.current_task_id == 654
+
+
+def test_workspace_manager_updates_cached_workspace_db_task_id(tmp_path):
+    manager = WorkspaceManager()
+    workspace = manager.get_or_create_workspace(
+        str(tmp_path / "workspaces"),
+        "agent_2_abcd1234",
+    )
+    assert workspace.db_task_id is None
+    assert workspace.current_task_id is None
+
+    same_workspace = manager.get_or_create_workspace(
+        str(tmp_path / "workspaces"),
+        "agent_2_abcd1234",
+        db_task_id=654,
+    )
+
+    assert same_workspace is workspace
+    assert same_workspace.db_task_id == 654
+    assert same_workspace.current_task_id == 654
+
+
+def test_agent_service_workspace_preserves_config_db_task_id(tmp_path):
+    class ToolConfig:
+        _workspace_config = {
+            "base_dir": str(tmp_path / "workspaces"),
+            "task_id": "agent_2_abcd1234",
+            "db_task_id": 987,
+        }
+
+        def get_allowed_skills(self):
+            return None
+
+    service = AgentService(
+        name="worker",
+        id="agent_2_abcd1234",
+        tool_config=ToolConfig(),
+        enable_workspace=True,
+    )
+
+    assert service.workspace is not None
+    assert service.workspace.id == "agent_2_abcd1234"
+    assert service.workspace.db_task_id == 987
+    assert service.workspace.current_task_id == 987
 
 
 def test_workspace_register_file_uses_uploaded_file_store_create(

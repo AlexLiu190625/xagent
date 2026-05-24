@@ -13,13 +13,17 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     CreateAgentTool,
     ListAgentsTool,
     UpdateAgentTool,
+    _coerce_db_task_id,
     gen_agent_tool_name,
     get_published_agents_tools,
 )
 from xagent.core.tracing.langfuse.handler import LangfuseTraceHandler
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
+from xagent.web.models.task import Task
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
 
@@ -34,8 +38,24 @@ def _create_session() -> tuple[Session, str]:
     return SessionLocal(), temp_db.name
 
 
+@pytest.fixture
+def mock_workspace_db():
+    yield
+
+
 class TestCreateAgentTool:
     """Test suite for CreateAgentTool."""
+
+    def test_coerce_db_task_id_accepts_only_db_task_formats(self) -> None:
+        assert _coerce_db_task_id(12) == 12
+        assert _coerce_db_task_id("12") == 12
+        assert _coerce_db_task_id("web_task_12") == 12
+        assert _coerce_db_task_id("task_12") == 12
+
+        assert _coerce_db_task_id("agent_1_abcd1234") is None
+        assert _coerce_db_task_id("agent_1_12") is None
+        assert _coerce_db_task_id("web_task_abc") is None
+        assert _coerce_db_task_id(True) is None
 
     @pytest.mark.asyncio
     async def test_create_agent_success(self) -> None:
@@ -102,6 +122,494 @@ class TestCreateAgentTool:
                 assert agent.status == AgentStatus.DRAFT
                 assert agent.instructions == "You are a test agent for unit testing."
 
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_applies_workforce_runtime_overrides(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(username="testuser11", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="Worker Agent",
+                description="Nested workforce worker",
+                instructions="Base worker instructions.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            parent_handler = Mock()
+
+            class ParentTracer:
+                def __init__(self) -> None:
+                    self.handlers = [parent_handler]
+                    self.events = []
+
+                async def trace_event(
+                    self, event_type, task_id=None, step_id=None, data=None
+                ):
+                    self.events.append(
+                        {
+                            "event_type": event_type.value,
+                            "task_id": task_id,
+                            "step_id": step_id,
+                            "data": data or {},
+                        }
+                    )
+
+            parent_tracer = ParentTracer()
+
+            tool = AgentTool(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                agent_description=agent.description or "",
+                db=db,
+                user_id=user.id,
+                task_id="tool-session",
+                tool_name="call_workforce_worker_7_writer",
+                tool_description="Write the final report.",
+                extra_system_prompt="Workforce assignment: write only.",
+                parent_task_id="parent-task-2",
+                parent_tracer=parent_tracer,
+                agent_call_stack=[99],
+                delegation_allowed_agent_ids=[],
+                enable_global_agent_tools=False,
+                runtime_metadata={"workforce_id": 123, "worker_alias": "Writer"},
+            )
+
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.UserAwareModelStorage"
+                ) as mock_storage_class,
+                patch(
+                    "xagent.core.agent.service.AgentService"
+                ) as mock_agent_service_class,
+                patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+            ):
+                mock_storage = Mock()
+                mock_llm = Mock()
+                mock_storage.get_llm_by_name_with_access.return_value = mock_llm
+                mock_storage_class.return_value = mock_storage
+
+                mock_agent_service = mock_agent_service_class.return_value
+                mock_agent_service.execute_task = AsyncMock(
+                    return_value={
+                        "output": "worker response",
+                        "file_outputs": [{"filename": "report.txt"}],
+                    }
+                )
+
+                result = await tool.run_json_async({"task": "draft report"})
+
+            assert tool.name == "call_workforce_worker_7_writer"
+            assert tool.description == "Write the final report."
+            assert result["response"] == "worker response"
+            assert result["file_outputs"] == []
+            assert [event["data"]["event_type"] for event in parent_tracer.events] == [
+                "workforce_delegation_start",
+                "workforce_delegation_end",
+            ]
+            assert [event["event_type"] for event in parent_tracer.events] == [
+                "task_update_general",
+                "task_update_general",
+            ]
+            assert parent_tracer.events[0]["task_id"] == "parent-task-2"
+            assert parent_tracer.events[0]["data"]["__audit_only__"] is True
+            assert parent_tracer.events[0]["data"]["status"] == "start"
+            assert parent_tracer.events[0]["data"]["workforce_id"] == 123
+            assert parent_tracer.events[0]["data"]["worker_alias"] == "Writer"
+            assert parent_tracer.events[1]["data"]["__audit_only__"] is True
+            assert parent_tracer.events[1]["data"]["status"] == "end"
+            assert parent_tracer.events[1]["data"]["output"] == "worker response"
+            assert parent_tracer.events[1]["data"]["output_length"] == len(
+                "worker response"
+            )
+            assert "file_outputs" not in parent_tracer.events[1]["data"]
+
+            tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+            assert tool_config.get_allowed_agent_ids() == []
+            assert tool_config.get_enable_global_agent_tools() is False
+            assert tool_config.get_parent_task_id() == "parent-task-2"
+            assert tool_config.get_parent_tracer() is parent_tracer
+            assert tool_config.get_agent_call_stack() == [99, agent.id]
+
+            tracer = mock_agent_service_class.call_args.kwargs["tracer"]
+            assert tracer is not parent_tracer
+            assert parent_handler not in tracer.handlers
+
+            execute_context = mock_agent_service.execute_task.call_args.kwargs[
+                "context"
+            ]
+            assert execute_context["system_prompt"] == (
+                "Base worker instructions.\n\nWorkforce assignment: write only."
+            )
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_returns_parent_owned_file_refs_for_worker_outputs(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="worker-output-user", password_hash="x", is_admin=False
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            task = Task(id=77, user_id=user.id, title="Parent task")
+            db.add(task)
+            db.commit()
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="File Worker",
+                description="Writes files",
+                instructions="Write a report.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            class ParentTracer:
+                def __init__(self) -> None:
+                    self.handlers = []
+                    self.events = []
+
+                async def trace_event(
+                    self, event_type, task_id=None, step_id=None, data=None
+                ):
+                    self.events.append(
+                        {
+                            "event_type": event_type.value,
+                            "task_id": task_id,
+                            "step_id": step_id,
+                            "data": data or {},
+                        }
+                    )
+
+            parent_tracer = ParentTracer()
+
+            with tempfile.TemporaryDirectory() as workspace_root:
+                worker_workspace = TaskWorkspace(
+                    id=f"agent_{agent.id}_abcd1234",
+                    base_dir=workspace_root,
+                    db_task_id=77,
+                )
+                output_path = worker_workspace.output_dir / "report.txt"
+                output_path.write_text("worker report", encoding="utf-8")
+
+                tool = AgentTool(
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    agent_description=agent.description or "",
+                    db=db,
+                    user_id=user.id,
+                    task_id="77",
+                    parent_task_id="77",
+                    parent_tracer=parent_tracer,
+                    workspace_base_dir=workspace_root,
+                    runtime_metadata={"workforce_id": 1},
+                )
+
+                with (
+                    patch(
+                        "xagent.web.services.llm_utils.UserAwareModelStorage"
+                    ) as mock_storage_class,
+                    patch(
+                        "xagent.core.agent.service.AgentService"
+                    ) as mock_agent_service_class,
+                    patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+                ):
+                    mock_storage = Mock()
+                    mock_llm = Mock()
+                    mock_storage.get_llm_by_name_with_access.return_value = mock_llm
+                    mock_storage_class.return_value = mock_storage
+
+                    mock_agent_service = mock_agent_service_class.return_value
+                    mock_agent_service.workspace = worker_workspace
+                    mock_agent_service.execute_task = AsyncMock(
+                        return_value={
+                            "output": "worker response",
+                            "file_outputs": [
+                                {
+                                    "file_path": str(output_path),
+                                    "relative_path": "output/report.txt",
+                                    "filename": "report.txt",
+                                }
+                            ],
+                        }
+                    )
+
+                    result = await tool.run_json_async({"task": "draft report"})
+
+                file_outputs = result["file_outputs"]
+                assert len(file_outputs) == 1
+                assert file_outputs[0]["filename"] == "report.txt"
+                assert file_outputs[0]["download_url"].startswith(
+                    "/api/files/download/"
+                )
+                assert "file_path" not in file_outputs[0]
+                assert "relative_path" not in file_outputs[0]
+
+                file_record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_outputs[0]["file_id"])
+                    .one()
+                )
+                assert file_record.user_id == user.id
+                assert file_record.task_id == 77
+                assert file_record.storage_path == str(output_path)
+                assert file_record.workspace_relative_path == "output/report.txt"
+                assert file_record.workspace_category == "output"
+
+                tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+                assert tool_config.get_workspace_config()["db_task_id"] == 77
+                assert parent_tracer.events[-1]["data"]["file_outputs"] == file_outputs
+
+                tracer = mock_agent_service_class.call_args.kwargs["tracer"]
+                execution_task_id = mock_agent_service_class.call_args.kwargs["task_id"]
+                db_handlers = [
+                    handler
+                    for handler in tracer.handlers
+                    if handler.__class__.__name__
+                    == "_DelegatedAgentDatabaseTraceHandler"
+                ]
+                assert len(db_handlers) == 1
+                assert db_handlers[0].task_id == 77
+                assert db_handlers[0].build_id == execution_task_id
+                assert db_handlers[0].metadata["worker_task_id"] == execution_task_id
+                assert db_handlers[0].metadata["parent_task_id"] == "77"
+                assert db_handlers[0].metadata["parent_db_task_id"] == 77
+                assert db_handlers[0].metadata["agent_id"] == agent.id
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_rebinds_worker_owned_file_ids_to_parent_task(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="worker-owned-output-user",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            parent_task = Task(id=77, user_id=user.id, title="Parent task")
+            worker_task = Task(id=88, user_id=user.id, title="Worker task")
+            db.add_all([parent_task, worker_task])
+            db.commit()
+
+            with tempfile.TemporaryDirectory() as workspace_root:
+                worker_workspace = TaskWorkspace(
+                    id="agent_1_abcd1234",
+                    base_dir=workspace_root,
+                    db_task_id=77,
+                )
+                output_path = worker_workspace.output_dir / "report.txt"
+                output_path.write_text("worker report", encoding="utf-8")
+
+                db.add(
+                    UploadedFile(
+                        file_id="worker-owned-output",
+                        user_id=user.id,
+                        task_id=88,
+                        filename="report.txt",
+                        storage_path=str(output_path),
+                        mime_type="text/plain",
+                        file_size=len("worker report"),
+                        workspace_relative_path="output/report.txt",
+                        workspace_category="output",
+                    )
+                )
+                db.commit()
+
+                tool = AgentTool(
+                    agent_id=1,
+                    agent_name="File Worker",
+                    agent_description="Writes files",
+                    db=db,
+                    user_id=user.id,
+                    task_id="77",
+                    parent_task_id="77",
+                    workspace_base_dir=workspace_root,
+                )
+
+                file_outputs = tool._parent_owned_file_outputs(
+                    [
+                        {
+                            "file_id": "worker-owned-output",
+                            "file_path": str(output_path),
+                            "filename": "report.txt",
+                        }
+                    ],
+                    worker_workspace,
+                )
+
+                assert file_outputs is not None
+                assert len(file_outputs) == 1
+                assert file_outputs[0]["file_id"] == "worker-owned-output"
+                file_record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == "worker-owned-output")
+                    .one()
+                )
+                assert file_record.task_id == 77
+                assert file_record.workspace_relative_path == "output/report.txt"
+                assert file_record.workspace_category == "output"
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_omits_workforce_file_outputs_without_parent_db_task_id(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                db=db,
+                user_id=1,
+                task_id="agent_1_abcd1234",
+                parent_task_id="agent_1_abcd1234",
+                runtime_metadata={"workforce_id": 1},
+            )
+
+            file_outputs = [{"file_path": "/tmp/worker-output.txt"}]
+
+            assert tool._parent_owned_file_outputs(file_outputs, workspace=None) == []
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_preserves_non_workforce_file_outputs_without_parent_db_task_id(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                db=db,
+                user_id=1,
+                task_id="agent_1_abcd1234",
+                parent_task_id="agent_1_abcd1234",
+            )
+            file_outputs = [{"file_path": "/tmp/legacy-output.txt"}]
+
+            assert (
+                tool._parent_owned_file_outputs(file_outputs, workspace=None)
+                is file_outputs
+            )
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_does_not_swallow_delegated_output_registration_errors(
+        self,
+        tmp_path,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            output_path = tmp_path / "report.txt"
+            output_path.write_text("worker report", encoding="utf-8")
+            workspace = Mock()
+            workspace.resolve_path.return_value = output_path
+            workspace.register_file.side_effect = RuntimeError("storage unavailable")
+
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                db=db,
+                user_id=1,
+                task_id="77",
+                parent_task_id="77",
+            )
+
+            with pytest.raises(RuntimeError, match="storage unavailable"):
+                tool._parent_owned_file_outputs(
+                    [{"file_path": str(output_path), "filename": "report.txt"}],
+                    workspace,
+                )
         finally:
             db.close()
             try:

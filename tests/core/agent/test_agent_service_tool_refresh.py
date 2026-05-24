@@ -42,6 +42,41 @@ class AllowedToolsConfig:
         return self.allowed_tools
 
 
+class DelegationRuntimeConfig:
+    _workspace_config = None
+
+    def __init__(self) -> None:
+        self.parent_task_id = "parent-task-1"
+        self.parent_tracer = object()
+
+    def get_user_tool_overrides(self) -> dict[str, dict[str, bool]]:
+        return {}
+
+    def get_allowed_tools(self) -> list[str] | None:
+        return None
+
+    def get_allowed_agent_ids(self) -> list[int] | None:
+        return None
+
+    def get_agent_tool_overrides(self) -> dict[int, dict[str, Any]]:
+        return {}
+
+    def get_enable_global_agent_tools(self) -> bool:
+        return True
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        return False
+
+    def get_parent_task_id(self) -> str:
+        return self.parent_task_id
+
+    def get_parent_tracer(self) -> object:
+        return self.parent_tracer
+
+    def get_agent_call_stack(self) -> list[int]:
+        return []
+
+
 @pytest.mark.asyncio
 async def test_agent_service_refreshes_initialized_tools_when_policy_changes(
     monkeypatch: pytest.MonkeyPatch,
@@ -104,3 +139,42 @@ async def test_agent_service_refreshes_when_allowed_tools_changes_from_all_to_no
     tool_config.allowed_tools = []
     await service._ensure_tools_initialized()
     assert service.tools == []
+
+
+@pytest.mark.asyncio
+async def test_agent_service_refreshes_when_delegation_parent_context_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_config = DelegationRuntimeConfig()
+    tool_sets: list[list[Any]] = [
+        [NamedTool("initial")],
+        [NamedTool("new-task")],
+        [NamedTool("new-tracer")],
+    ]
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        return tool_sets.pop(0)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+
+    service = AgentService(
+        name="delegation-runtime-refresh-test",
+        id="delegation-runtime-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+    assert [tool.name for tool in service.tools] == ["initial"]
+
+    tool_config.parent_task_id = "parent-task-2"
+    await service._ensure_tools_initialized()
+    assert [tool.name for tool in service.tools] == ["new-task"]
+
+    tool_config.parent_tracer = object()
+    await service._ensure_tools_initialized()
+    assert [tool.name for tool in service.tools] == ["new-tracer"]

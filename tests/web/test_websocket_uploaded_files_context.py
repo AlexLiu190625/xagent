@@ -414,6 +414,88 @@ def test_normalize_file_outputs_rejects_foreign_untracked_storage_path(
     assert db_session.query(UploadedFile).count() == 0
 
 
+def test_normalize_file_outputs_accepts_registered_agent_workspace_output(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=20, user_id=1)
+    worker_path = uploads_dir / "agent_2_abcd1234" / "output" / "report.txt"
+    worker_path.parent.mkdir(parents=True)
+    worker_path.write_text("report")
+    db_session.add(
+        UploadedFile(
+            file_id="delegated-output",
+            user_id=1,
+            task_id=20,
+            filename="report.txt",
+            storage_path=str(worker_path),
+            mime_type="text/plain",
+            file_size=len("report"),
+            workspace_relative_path="output/report.txt",
+            workspace_category="output",
+        )
+    )
+    db_session.flush()
+
+    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+        db_session,
+        task_id=20,
+        task_user_id=1,
+        file_outputs=[{"path": str(worker_path), "filename": "report.txt"}],
+    )
+
+    assert len(normalized_outputs) == 1
+    assert normalized_outputs[0]["file_id"] == "delegated-output"
+    assert normalized_outputs[0]["download_url"] == (
+        "/api/files/download/delegated-output"
+    )
+    assert path_to_file_id[str(worker_path)] == "delegated-output"
+    assert path_to_file_id["output/report.txt"] == "delegated-output"
+    assert db_session.query(UploadedFile).count() == 1
+
+
+def test_normalize_file_outputs_rejects_registered_non_output_agent_file(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=20, user_id=1)
+    worker_path = uploads_dir / "agent_2_abcd1234" / "input" / "secret.txt"
+    worker_path.parent.mkdir(parents=True)
+    worker_path.write_text("secret")
+    db_session.add(
+        UploadedFile(
+            file_id="delegated-input",
+            user_id=1,
+            task_id=20,
+            filename="secret.txt",
+            storage_path=str(worker_path),
+            mime_type="text/plain",
+            file_size=len("secret"),
+            workspace_relative_path="input/secret.txt",
+            workspace_category="input",
+        )
+    )
+    db_session.flush()
+
+    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+        db_session,
+        task_id=20,
+        task_user_id=1,
+        file_outputs=[{"path": str(worker_path), "filename": "secret.txt"}],
+    )
+
+    assert normalized_outputs == []
+    assert path_to_file_id == {}
+
+
 def test_normalize_file_outputs_registers_current_task_output_path(
     db_session,
     tmp_path,

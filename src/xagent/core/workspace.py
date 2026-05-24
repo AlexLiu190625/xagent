@@ -69,8 +69,10 @@ class TaskWorkspace:
         id: str,
         base_dir: Optional[str] = None,
         allowed_external_dirs: Optional[List[str]] = None,
+        db_task_id: Optional[int] = None,
     ):
         self.id = id
+        self.db_task_id = db_task_id
         if base_dir is None:
             base_dir = str(get_uploads_dir())
         self.base_dir = (
@@ -80,7 +82,11 @@ class TaskWorkspace:
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self.owner_user_id: Optional[int] = None
-        self.current_task_id: Optional[int] = self._parse_task_id_from_workspace_id(id)
+        self.current_task_id: Optional[int] = (
+            db_task_id
+            if db_task_id is not None
+            else self._parse_task_id_from_workspace_id(id)
+        )
 
         # Create workspace directory
         self.workspace_dir = self.base_dir / id
@@ -173,17 +179,19 @@ class TaskWorkspace:
             if existing:
                 return
 
-            # Extract task_id from workspace id (e.g., 'web_task_265' -> 265)
-            # Handle test environment workspaces (e.g., 'test_task')
-            try:
-                task_id = int(self.id.split("_")[-1])
-            except (ValueError, IndexError):
-                # Not a valid task ID, likely a test workspace
-                # Skip database registration in test environments
-                logger.debug(
-                    f"Skipping database registration for test workspace '{self.id}', file_id={file_id}"
-                )
-                return
+            task_id = self.db_task_id
+            if task_id is None:
+                # Extract task_id from workspace id (e.g., 'web_task_265' -> 265).
+                # Delegated agent workspaces use non-DB ids such as
+                # 'agent_2_abcd1234', so callers should pass db_task_id explicitly.
+                try:
+                    task_id = int(self.id.split("_")[-1])
+                except (ValueError, IndexError):
+                    logger.debug(
+                        f"Skipping database registration for workspace '{self.id}' "
+                        f"without db_task_id, file_id={file_id}"
+                    )
+                    return
 
             # Get user_id from task
             task = db.query(Task).filter(Task.id == task_id).first()
@@ -274,6 +282,26 @@ class TaskWorkspace:
                 else:
                     db.flush()
                 return
+
+            if self.db_task_id is not None:
+                from ..web.models.task import Task
+
+                task = db.query(Task).filter(Task.id == self.db_task_id).first()
+                if not task:
+                    logger.warning(
+                        f"Task {self.db_task_id} not found, cannot rebind file record"
+                    )
+                    return
+                task_user_id = int(task.user_id)
+                if user_id != task_user_id:
+                    logger.warning(
+                        "Skipping file record rebind across users: "
+                        f"file_id={file_id}, record_user_id={user_id}, "
+                        f"task_user_id={task_user_id}"
+                    )
+                    return
+                task_id = self.db_task_id
+                user_id = task_user_id
 
             category = relative_path.split("/", 1)[0] if relative_path else "workspace"
             storage_key = _build_workspace_storage_key(
@@ -1056,6 +1084,7 @@ def create_workspace(
     id: str,
     base_dir: Optional[str] = None,
     allowed_external_dirs: Optional[List[str]] = None,
+    db_task_id: Optional[int] = None,
 ) -> TaskWorkspace:
     """
     Create a new workspace for the given id.
@@ -1070,7 +1099,7 @@ def create_workspace(
     """
     if base_dir is None:
         base_dir = str(get_uploads_dir())
-    return TaskWorkspace(id, base_dir, allowed_external_dirs)
+    return TaskWorkspace(id, base_dir, allowed_external_dirs, db_task_id=db_task_id)
 
 
 def get_workspace_output_files(
@@ -1108,6 +1137,7 @@ class WorkspaceManager:
         base_dir: str,
         task_id: str,
         allowed_external_dirs: Optional[List[str]] = None,
+        db_task_id: Optional[int] = None,
     ) -> TaskWorkspace:
         """
         Get existing workspace or create new one.
@@ -1123,8 +1153,16 @@ class WorkspaceManager:
         cache_key = f"{base_dir}:{task_id}"
 
         if cache_key not in self._workspaces:
-            workspace = TaskWorkspace(task_id, base_dir, allowed_external_dirs)
+            workspace = TaskWorkspace(
+                task_id,
+                base_dir,
+                allowed_external_dirs,
+                db_task_id=db_task_id,
+            )
             self._workspaces[cache_key] = workspace
+        elif db_task_id is not None and self._workspaces[cache_key].db_task_id is None:
+            self._workspaces[cache_key].db_task_id = db_task_id
+            self._workspaces[cache_key].current_task_id = db_task_id
 
         return self._workspaces[cache_key]
 

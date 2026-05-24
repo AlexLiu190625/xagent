@@ -137,6 +137,13 @@ class WebToolConfig(BaseToolConfig):
         allowed_collections: Optional[List[str]] = None,
         allowed_skills: Optional[List[str]] = None,
         allowed_tools: Optional[List[str]] = None,
+        allowed_agent_ids: Optional[List[int]] = None,
+        agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+        enable_global_agent_tools: bool = True,
+        allow_cross_user_agent_ids: bool = False,
+        parent_task_id: Optional[str] = None,
+        parent_tracer: Optional[Any] = None,
+        agent_call_stack: Optional[List[int]] = None,
         sandbox: Optional[Any] = None,
         selection_spec: Optional[Any] = None,
     ):
@@ -175,6 +182,15 @@ class WebToolConfig(BaseToolConfig):
         self._allowed_collections = allowed_collections
         self._allowed_skills = allowed_skills
         self._allowed_tools = allowed_tools
+        self._allowed_agent_ids = allowed_agent_ids
+        self._agent_tool_overrides = (
+            agent_tool_overrides if isinstance(agent_tool_overrides, dict) else {}
+        )
+        self._enable_global_agent_tools = bool(enable_global_agent_tools)
+        self._allow_cross_user_agent_ids = bool(allow_cross_user_agent_ids)
+        self._parent_task_id = parent_task_id
+        self._parent_tracer = parent_tracer
+        self._agent_call_stack = list(agent_call_stack or [])
         self._excluded_agent_id: Optional[int] = None
 
         # Cache user object for hook queries.
@@ -335,6 +351,34 @@ class WebToolConfig(BaseToolConfig):
     def get_allowed_tools(self) -> Optional[List[str]]:
         """Get allowed tool names. None means all tools are allowed."""
         return self._allowed_tools
+
+    def get_allowed_agent_ids(self) -> Optional[List[int]]:
+        """Get explicitly allowed published agent IDs. None means use defaults."""
+        return self._allowed_agent_ids
+
+    def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
+        """Get per-agent tool metadata/runtime overrides for delegation."""
+        return self._agent_tool_overrides
+
+    def get_enable_global_agent_tools(self) -> bool:
+        """Whether to include globally visible published agents as tools."""
+        return self._enable_global_agent_tools
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        """Whether explicit allowed agent IDs may cross the current user boundary."""
+        return self._allow_cross_user_agent_ids
+
+    def get_parent_task_id(self) -> Optional[str]:
+        """Get parent task ID for delegated tool execution."""
+        return self._parent_task_id
+
+    def get_parent_tracer(self) -> Optional[Any]:
+        """Get parent tracer for delegated tool execution."""
+        return self._parent_tracer
+
+    def get_agent_call_stack(self) -> List[int]:
+        """Get active agent delegation call stack for recursion prevention."""
+        return self._agent_call_stack
 
     def get_user_tool_overrides(self) -> dict:
         """Return per-user tool overrides from the registered hook.

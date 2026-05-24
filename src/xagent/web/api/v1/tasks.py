@@ -428,7 +428,12 @@ async def get_chat_task_steps(
     task = _resolve_task_or_404(task_id, agent, db)
 
     max_event_id = (
-        db.query(func.max(TraceEvent.id)).filter(TraceEvent.task_id == task_id).scalar()
+        db.query(func.max(TraceEvent.id))
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+        )
+        .scalar()
         or 0
     )
     cache_key = task_steps_key(task_id)
@@ -442,7 +447,10 @@ async def get_chat_task_steps(
     # clock-skew within a single task's write fan-out.
     events = (
         db.query(TraceEvent)
-        .filter(TraceEvent.task_id == task_id)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+        )
         .order_by(TraceEvent.id.asc())
         .all()
     )

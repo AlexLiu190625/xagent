@@ -101,13 +101,17 @@ class DatabaseTraceHandler(BaseTraceHandler):
     ) -> Optional[Dict[str, Any]]:
         db = next(get_db())
         try:
+            query = db.query(DatabaseTraceEvent).filter(
+                DatabaseTraceEvent.task_id == self.task_id,
+                DatabaseTraceEvent.event_type == "system_update_general",
+            )
+            if self.build_id is None:
+                query = query.filter(DatabaseTraceEvent.build_id.is_(None))
+            else:
+                query = query.filter(DatabaseTraceEvent.build_id == self.build_id)
+
             rows = (
-                db.query(DatabaseTraceEvent)
-                .filter(
-                    DatabaseTraceEvent.task_id == self.task_id,
-                    DatabaseTraceEvent.event_type == "system_update_general",
-                )
-                .order_by(
+                query.order_by(
                     DatabaseTraceEvent.timestamp.desc(),
                     DatabaseTraceEvent.id.desc(),
                 )
@@ -177,6 +181,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 event_type_str == "system_update_general"
                 and isinstance(data, dict)
                 and data.get("checkpoint_type") == CHECKPOINT_TYPE
+                and self.build_id is None
             ):
                 task = db.query(Task).filter(Task.id == self.task_id).first()
                 if task:
@@ -256,10 +261,16 @@ class DatabaseTraceHandler(BaseTraceHandler):
         turn_id = data.get("turn_id")
         if not isinstance(turn_id, str) or not turn_id:
             return False
+        build_filter = (
+            DatabaseTraceEvent.build_id == self.build_id
+            if self.build_id is not None
+            else DatabaseTraceEvent.build_id.is_(None)
+        )
         return (
             db.query(DatabaseTraceEvent.id)
             .filter(
                 DatabaseTraceEvent.task_id == self.task_id,
+                build_filter,
                 DatabaseTraceEvent.event_type == "user_message",
                 DatabaseTraceEvent.data["turn_id"].as_string() == turn_id,
             )

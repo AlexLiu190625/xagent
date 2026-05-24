@@ -121,6 +121,38 @@ class BaseToolConfig(ABC):
     def get_sql_connections(self) -> Dict[str, str]:
         return {}
 
+    def get_allowed_agent_ids(self) -> Optional[List[int]]:
+        """Get explicitly allowed published agent IDs. None means use defaults."""
+        return None
+
+    def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
+        """Get per-agent tool metadata/runtime overrides for delegation."""
+        return {}
+
+    def get_enable_global_agent_tools(self) -> bool:
+        """Whether to include globally visible published agents as tools."""
+        return True
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        """Whether explicit allowed agent IDs may cross the current user boundary."""
+        return False
+
+    def get_parent_task_id(self) -> Optional[str]:
+        """Get parent task ID for delegated tool execution."""
+        return None
+
+    def get_parent_tracer(self) -> Optional[Any]:
+        """Get parent tracer for delegated tool execution."""
+        return None
+
+    def get_agent_call_stack(self) -> List[int]:
+        """Get active agent delegation call stack for recursion prevention."""
+        return []
+
+    def get_excluded_agent_id(self) -> Optional[int]:
+        """Get agent ID to exclude from agent tools."""
+        return None
+
     @abstractmethod
     def get_db(self) -> Optional[Any]:
         """Get database session. Returns None for standalone usage."""
@@ -185,6 +217,15 @@ class ToolConfig(BaseToolConfig):
         allowed_collections = config_dict.get("allowed_collections")
         allowed_skills = config_dict.get("allowed_skills")
         allowed_tools = config_dict.get("allowed_tools")
+        allowed_agent_ids = config_dict.get("allowed_agent_ids")
+        agent_tool_overrides = config_dict.get("agent_tool_overrides") or {}
+        enable_global_agent_tools = config_dict.get("enable_global_agent_tools", True)
+        allow_cross_user_agent_ids = config_dict.get(
+            "allow_cross_user_agent_ids", False
+        )
+        parent_task_id = config_dict.get("parent_task_id")
+        parent_tracer = config_dict.get("parent_tracer")
+        agent_call_stack = config_dict.get("agent_call_stack") or []
         user_id = config_dict.get("user_id")
         is_admin = config_dict.get("is_admin", False)
         tool_credentials = config_dict.get("tool_credentials", {})
@@ -235,6 +276,15 @@ class ToolConfig(BaseToolConfig):
         self.allowed_collections: Optional[List[str]] = allowed_collections
         self.allowed_skills: Optional[List[str]] = allowed_skills
         self.allowed_tools: Optional[List[str]] = allowed_tools
+        self.allowed_agent_ids: Optional[List[int]] = allowed_agent_ids
+        self.agent_tool_overrides: Dict[int, Dict[str, Any]] = (
+            agent_tool_overrides if isinstance(agent_tool_overrides, dict) else {}
+        )
+        self.enable_global_agent_tools: bool = bool(enable_global_agent_tools)
+        self.allow_cross_user_agent_ids: bool = bool(allow_cross_user_agent_ids)
+        self.parent_task_id: Optional[str] = parent_task_id
+        self.parent_tracer: Optional[Any] = parent_tracer
+        self.agent_call_stack: List[int] = list(agent_call_stack)
         self.user_id: Optional[int] = user_id
         self.is_admin_value: bool = bool(is_admin)
         self.tool_credentials: Dict[str, Dict[str, str]] = tool_credentials
@@ -307,6 +357,27 @@ class ToolConfig(BaseToolConfig):
 
     def get_allowed_tools(self) -> Optional[List[str]]:
         return self.allowed_tools
+
+    def get_allowed_agent_ids(self) -> Optional[List[int]]:
+        return self.allowed_agent_ids
+
+    def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
+        return self.agent_tool_overrides
+
+    def get_enable_global_agent_tools(self) -> bool:
+        return self.enable_global_agent_tools
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        return self.allow_cross_user_agent_ids
+
+    def get_parent_task_id(self) -> Optional[str]:
+        return self.parent_task_id
+
+    def get_parent_tracer(self) -> Optional[Any]:
+        return self.parent_tracer
+
+    def get_agent_call_stack(self) -> List[int]:
+        return self.agent_call_stack
 
     def get_sandbox(self) -> Optional[Any]:
         return None  # Standalone config doesn't have sandbox
