@@ -664,3 +664,130 @@ async def test_e2e_empty_categories_yields_none_spec(static_creators):
         assert static_creators[cat].await_count == 1, (
             f"{cat} should run on the spec-less backward-compat path"
         )
+
+
+# ---------------------------------------------------------------------------
+# select_allowed_tool_names_from_categories — the SSOT helper that replaces
+# 2 inline implementations in chat.py + 1 in websocket.py. Pins the
+# "empty/None tool_categories → return None (ALL)" contract that
+# review C1 (factory.py:253) flagged as missing.
+# ---------------------------------------------------------------------------
+
+
+def _mock_tool(name: str, category: str):
+    """Build a minimal mock tool with the ``.metadata.category.value``
+    shape the helper inspects. Using ``MagicMock`` here would
+    silently match anything; explicit class keeps the contract tight.
+    """
+    from unittest.mock import MagicMock
+
+    tool = MagicMock()
+    tool.name = name
+    tool.metadata = MagicMock()
+    tool.metadata.category = MagicMock()
+    tool.metadata.category.value = category
+    return tool
+
+
+def test_select_allowed_tool_names_none_input_returns_none() -> None:
+    """``tool_categories=None`` is the "未配置" sentinel and must map
+    to ``None`` (factory's "no name-level restriction" short-circuit).
+    """
+    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+
+    result = select_allowed_tool_names_from_categories(
+        tool_categories=None,
+        all_tools=[_mock_tool("calculator", "basic")],
+    )
+    assert result is None, (
+        "tool_categories=None must yield None (ALL semantics); a non-None "
+        "result would inadvertently filter the full default tool set."
+    )
+
+
+def test_select_allowed_tool_names_empty_input_returns_none() -> None:
+    """**Review C1 core invariant.** ``Agent.tool_categories`` defaults
+    to ``[]`` for legacy / default agents. Before this fix, the inline
+    implementations in chat.py treated ``[]`` as "explicit no tools"
+    and stripped every tool from the default agent. The SSOT helper
+    must normalize ``[]`` to the same "未配置 → ALL" semantics as
+    ``None``.
+    """
+    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+
+    result = select_allowed_tool_names_from_categories(
+        tool_categories=[],
+        all_tools=[
+            _mock_tool("calculator", "basic"),
+            _mock_tool("file_read", "file"),
+        ],
+    )
+    assert result is None, (
+        "tool_categories=[] must yield None (legacy 'unconfigured' = "
+        "ALL); a non-None result reintroduces the C1 regression where "
+        "default agents lose every tool."
+    )
+
+
+def test_select_allowed_tool_names_plain_category_match() -> None:
+    """Plain category entry matches tools whose
+    ``metadata.category.value`` equals the entry."""
+    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+
+    result = select_allowed_tool_names_from_categories(
+        tool_categories=["basic"],
+        all_tools=[
+            _mock_tool("calculator", "basic"),
+            _mock_tool("python_executor", "basic"),
+            _mock_tool("file_read", "file"),
+        ],
+    )
+    assert sorted(result or []) == ["calculator", "python_executor"]
+
+
+def test_select_allowed_tool_names_mcp_server_form() -> None:
+    """``mcp:<server>`` entry matches tools named ``mcp_<server>_*``
+    (case-insensitive, with spaces / dashes folded to underscores).
+    """
+    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+
+    result = select_allowed_tool_names_from_categories(
+        tool_categories=["mcp:Gmail"],
+        all_tools=[
+            _mock_tool("mcp_gmail_send_message", "mcp"),
+            _mock_tool("mcp_gmail_list_messages", "mcp"),
+            _mock_tool("mcp_slack_send", "mcp"),  # different server, excluded
+            _mock_tool("calculator", "basic"),  # different category, excluded
+        ],
+    )
+    assert sorted(result or []) == [
+        "mcp_gmail_list_messages",
+        "mcp_gmail_send_message",
+    ]
+
+
+def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
+    """User selected an MCP server whose tools aren't registered (e.g.
+    server config exists but no tools loaded). The result is an
+    empty allow-list, NOT None -- the user did pick a category, so
+    "0 tools" is the correct intent (the factory's ``allowed_tools=[]``
+    short-circuit then produces zero tools).
+
+    This case validates that the helper preserves the
+    "non-empty input → possibly empty output" branch that distinguishes
+    legitimate 0 tools from the C1 regression.
+    """
+    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+
+    result = select_allowed_tool_names_from_categories(
+        tool_categories=["mcp:UnknownServer"],
+        all_tools=[
+            _mock_tool("calculator", "basic"),
+            _mock_tool("mcp_gmail_send", "mcp"),
+        ],
+    )
+    assert result == [], (
+        "Non-empty input with no matches must return [] (legitimate 0 "
+        "tools), not None (ALL); the latter would silently allow every "
+        "tool when the user specifically picked an unknown MCP server."
+    )

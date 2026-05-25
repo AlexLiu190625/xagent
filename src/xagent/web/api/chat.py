@@ -243,6 +243,97 @@ def _build_selection_spec_from_categories(
     )
 
 
+def select_allowed_tool_names_from_categories(
+    *,
+    tool_categories: Optional[List[str]],
+    all_tools: List[Any],
+) -> Optional[List[str]]:
+    """Normalize agent-builder ``tool_categories`` into an exact
+    tool-name allow-list. Shared by chat (snapshot + reconstruct
+    paths) and the WebSocket build-preview endpoint -- previously
+    inlined three times with subtly different behaviour on empty
+    input.
+
+    Contract (single source of truth):
+
+      - ``tool_categories`` is ``None`` or empty list → return
+        ``None``. Legacy "未配置" semantics: the factory's
+        ``allowed_tools=None`` short-circuit means no name-level
+        restriction, so the full default set passes through. This
+        is the fix for review C1: default / legacy agents (whose
+        ``Agent.tool_categories`` defaults to ``[]``) must not be
+        silently stripped of every tool.
+
+      - ``tool_categories`` is a non-empty list → return a list of
+        tool names that match any of:
+
+          * plain category entry (e.g. ``"basic"``, ``"file"``)
+            matches tools whose ``metadata.category.value`` is that
+            string;
+          * ``"mcp:<server-name>"`` entry matches tools named
+            ``mcp_<server-name>_*`` (case-insensitive, with
+            spaces / dashes folded to underscores to match the
+            adapter's naming convention);
+          * ``"mcp:<server-name>"`` entry also matches a single
+            Custom API tool named exactly ``api_<server-name>_call``
+            (the legacy dual-meaning ``mcp:`` form that fronts both
+            MCP servers and Custom APIs in the agent builder UI).
+
+        An empty result on non-empty input is the legitimate
+        "user picked categories that didn't match any registered
+        tool" case (e.g. ``mcp:UnknownServer``) -- the factory's
+        ``allowed_tools=[]`` short-circuit will yield zero tools,
+        which is the right intent there.
+
+    Pure function: does not call ``ToolFactory.create_all_tools``
+    itself. Callers are responsible for enumerating ``all_tools``
+    however suits their context (build-preview adds Custom API
+    tools manually before calling; chat callers use the
+    selection-spec-aware factory call to keep the registry skip
+    intact).
+    """
+    if not tool_categories:
+        return None
+
+    allowed: List[str] = []
+    for tool in all_tools:
+        if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
+            continue
+        category = str(tool.metadata.category.value)
+        tool_name = getattr(tool, "name", None)
+        if not tool_name:
+            continue
+
+        # Plain category match (e.g. "basic", "file", "image").
+        if category in tool_categories:
+            allowed.append(tool_name)
+            continue
+
+        # ``mcp:<server>`` -> matches mcp_<server>_* tools.
+        if category == "mcp":
+            for tc in tool_categories:
+                if not tc.startswith("mcp:"):
+                    continue
+                server_name = tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                if tool_name.lower().startswith(f"mcp_{server_name.lower()}_"):
+                    allowed.append(tool_name)
+                    break
+            continue
+
+        # ``mcp:<server>`` also fronts a single Custom API named
+        # api_<server>_call -- the legacy dual-meaning of mcp: in
+        # the agent builder UI.
+        if category == "other":
+            for tc in tool_categories:
+                if not tc.startswith("mcp:"):
+                    continue
+                server_name = tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                if tool_name.lower() == f"api_{server_name.lower()}_call":
+                    allowed.append(tool_name)
+                    break
+    return allowed
+
+
 def _build_allowed_external_dirs(
     user_id: Optional[int], *, only_existing: bool = False
 ) -> list[str]:
@@ -748,10 +839,9 @@ class AgentServiceManager:
                     "agent tools"
                 )
 
-        allowed_tools = None
-        if agent_config and "tool_categories" in agent_config:
-            tool_categories = agent_config["tool_categories"]
-
+        allowed_tools: Optional[List[str]] = None
+        if agent_config:
+            tool_categories = agent_config.get("tool_categories")
             from ...core.tools.adapters.vibe.factory import ToolFactory
 
             temp_config = WebToolConfig(
@@ -770,40 +860,20 @@ class AgentServiceManager:
             all_tools = await ToolFactory.create_all_tools(
                 temp_config, apply_user_override_filter=False
             )
-            allowed_tools = []
-
-            for tool in all_tools:
-                if not (
-                    hasattr(tool, "metadata") and hasattr(tool.metadata, "category")
-                ):
-                    continue
-
-                category = str(tool.metadata.category.value)
-                tool_name = getattr(tool, "name", None)
-                if not tool_name:
-                    continue
-
-                if category in tool_categories:
-                    allowed_tools.append(tool_name)
-                    continue
-
-                if category == "mcp":
-                    for tool_category in tool_categories:
-                        if not tool_category.startswith("mcp:"):
-                            continue
-                        server_name = (
-                            tool_category.split(":", 1)[1]
-                            .replace(" ", "_")
-                            .replace("-", "_")
-                        )
-                        if tool_name.lower().startswith(f"mcp_{server_name.lower()}_"):
-                            allowed_tools.append(tool_name)
-                            break
-
-            logger.info(
-                f"Tool categories {tool_categories} mapped to "
-                f"{len(allowed_tools)} tools for task {task_id}"
+            allowed_tools = select_allowed_tool_names_from_categories(
+                tool_categories=tool_categories,
+                all_tools=all_tools,
             )
+            if allowed_tools is None:
+                logger.info(
+                    f"Task {task_id} has no tool_categories restriction "
+                    "(legacy 'unconfigured' semantics) -- full default tool set will be built"
+                )
+            else:
+                logger.info(
+                    f"Tool categories {tool_categories} mapped to "
+                    f"{len(allowed_tools)} tools for task {task_id}"
+                )
 
         workspace_owner_id = int(task.user_id)
         sandbox_workspace_config = {
@@ -1153,13 +1223,10 @@ class AgentServiceManager:
                 selection_spec = _build_selection_spec_from_categories(
                     agent_config.get("tool_categories") if agent_config else None
                 )
-                if agent_config and "tool_categories" in agent_config:
-                    tool_categories = agent_config["tool_categories"]
-
-                    # Get tools by filtering using ToolFactory
+                if agent_config:
+                    tool_categories = agent_config.get("tool_categories")
                     from ...core.tools.adapters.vibe.factory import ToolFactory
 
-                    # Create temporary config to get all tools
                     temp_config = WebToolConfig(
                         db=db,
                         request=self.request,
@@ -1176,63 +1243,23 @@ class AgentServiceManager:
                         sandbox=sandbox,
                         selection_spec=selection_spec,
                     )
-
-                    # Get all tools and filter by category
                     all_tools = await ToolFactory.create_all_tools(
                         temp_config, apply_user_override_filter=False
                     )
-                    allowed_tools = []
-
-                    for tool in all_tools:
-                        if hasattr(tool, "metadata") and hasattr(
-                            tool.metadata, "category"
-                        ):
-                            category = str(tool.metadata.category.value)
-                            tool_name = getattr(tool, "name", None)
-
-                            # Standard category match
-                            if category in tool_categories:
-                                if tool_name:
-                                    allowed_tools.append(tool_name)
-                            # Support for specific MCP server selection ("mcp:ServerName")
-                            elif category == "mcp" and tool_name:
-                                for tc in tool_categories:
-                                    if tc.startswith("mcp:"):
-                                        # Use the exact raw server name for prefix comparison, just replace spaces with underscores
-                                        # as done in mcp_adapter.py (e.g. "LinkedIn" -> "LinkedIn", "Google Drive" -> "Google_Drive")
-                                        server_name = (
-                                            tc.split(":", 1)[1]
-                                            .replace(" ", "_")
-                                            .replace("-", "_")
-                                        )
-
-                                        # mcp_adapter prefix is f"mcp_{server_name}_" where server_name preserves original case
-                                        if tool_name.lower().startswith(
-                                            f"mcp_{server_name.lower()}_"
-                                        ):
-                                            allowed_tools.append(tool_name)
-                                            break
-                            elif category == "other" and tool_name:
-                                for tc in tool_categories:
-                                    if tc.startswith("mcp:"):
-                                        server_name = (
-                                            tc.split(":", 1)[1]
-                                            .replace(" ", "_")
-                                            .replace("-", "_")
-                                        )
-                                        logger.info(
-                                            f"Checking Custom API tool: '{tool_name}' vs 'api_{server_name}_call'"
-                                        )
-                                        if (
-                                            tool_name.lower()
-                                            == f"api_{server_name.lower()}_call"
-                                        ):
-                                            allowed_tools.append(tool_name)
-                                            break
-
-                    logger.info(
-                        f"Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
+                    allowed_tools = select_allowed_tool_names_from_categories(
+                        tool_categories=tool_categories,
+                        all_tools=all_tools,
                     )
+                    if allowed_tools is None:
+                        logger.info(
+                            f"Task {task_id} has no tool_categories restriction "
+                            "(legacy 'unconfigured' semantics) -- full default tool set will be built"
+                        )
+                    else:
+                        logger.info(
+                            f"Tool categories {tool_categories} mapped to "
+                            f"{len(allowed_tools)} tools for task {task_id}"
+                        )
 
                 # Create tools using ToolFactory. ``selection_spec`` is
                 # the same one used by the temp build above; passing it

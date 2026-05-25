@@ -4820,19 +4820,24 @@ async def handle_build_preview_execution(
                 sandbox=sandbox,
             )
 
-            # Collect tools by category (async)
+            # Collect tools by category (async) — uses the shared
+            # ``select_allowed_tool_names_from_categories`` helper from
+            # chat.py so build-preview, normal-creation snapshot path,
+            # and reconstruct path share the same name-match contract.
             async def _get_tools_by_category() -> list[str]:
-                all_tools = await ToolFactory.create_all_tools(temp_config)
-                allowed_tools = []
+                from .chat import select_allowed_tool_names_from_categories
 
-                # Check if we also need custom APIs
+                all_tools = await ToolFactory.create_all_tools(temp_config)
+
+                # Build-preview-specific: manually add Custom API tools
+                # because ``temp_config.include_mcp_tools`` semantics
+                # don't always load them. The shared helper then
+                # filters them via the ``"other"`` category branch.
                 has_custom_api = bool(
                     tool_categories
                     and any(tc.startswith("mcp:") for tc in tool_categories)
                 )
                 if has_custom_api:
-                    # Manually add custom APIs since temp_config might not load them properly
-                    # if they depend on include_mcp_tools
                     from ...core.tools.adapters.vibe.custom_api_factory import (
                         create_db_custom_api_tools,
                     )
@@ -4840,53 +4845,17 @@ async def handle_build_preview_execution(
                     custom_tools = await create_db_custom_api_tools(temp_config)
                     all_tools.extend(custom_tools)
 
-                for tool in all_tools:
-                    if hasattr(tool, "metadata") and hasattr(tool.metadata, "category"):
-                        category = str(tool.metadata.category.value)
-                        tool_name = getattr(tool, "name", None)
-                        if not tool_name:
-                            continue
-
-                        if category in tool_categories:
-                            allowed_tools.append(tool_name)
-                        elif category == "mcp":
-                            for tc in tool_categories:
-                                if tc.startswith("mcp:"):
-                                    server_name = (
-                                        tc.split(":", 1)[1]
-                                        .replace(" ", "_")
-                                        .replace("-", "_")
-                                    )
-                                    logger.info(
-                                        f"Checking MCP tool: '{tool_name}' vs 'mcp_{server_name}_'"
-                                    )
-                                    # Use case-insensitive matching for MCP server prefix
-                                    if tool_name.lower().startswith(
-                                        f"mcp_{server_name.lower()}_"
-                                    ):
-                                        allowed_tools.append(tool_name)
-                                        break
-                        elif category == "other":
-                            # Check if this is a custom API that was requested as an MCP tool
-                            for tc in tool_categories:
-                                if tc.startswith("mcp:"):
-                                    server_name = (
-                                        tc.split(":", 1)[1]
-                                        .replace(" ", "_")
-                                        .replace("-", "_")
-                                    )
-                                    logger.info(
-                                        f"Checking Custom API tool: '{tool_name}' vs 'api_{server_name}_call'"
-                                    )
-                                    # Custom APIs are now prefixed with api_ and suffixed with _call
-                                    if (
-                                        tool_name.lower()
-                                        == f"api_{server_name.lower()}_call"
-                                    ):
-                                        allowed_tools.append(tool_name)
-                                        break
-
-                return allowed_tools
+                allowed = select_allowed_tool_names_from_categories(
+                    tool_categories=tool_categories,
+                    all_tools=all_tools,
+                )
+                # Build-preview historically returned ``list[str]``,
+                # never ``None``. Preserve that shape: an empty
+                # tool_categories list yields an empty allow-list here
+                # (this endpoint is preview-only and the surrounding
+                # ``if tool_categories:`` already excludes the
+                # "未配置 → ALL" case before we get here).
+                return allowed if allowed is not None else []
 
             allowed_tools = await _get_tools_by_category()
 
