@@ -155,7 +155,11 @@ async def create_audio_tools_from_config(config: "BaseToolConfig") -> List[Any]:
     ``categories={"audio"}`` handles the common case; the internal
     check covers the legacy spec=None backward-compat path.
     """
-    spec = getattr(config, "selection_spec", None)
+    spec = (
+        config.get_tool_selection_spec()
+        if hasattr(config, "get_tool_selection_spec")
+        else None
+    )
     if spec is not None and not spec.includes_category("audio"):
         return []
     asr_models = config.get_asr_models()

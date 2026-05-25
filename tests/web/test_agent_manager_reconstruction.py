@@ -294,7 +294,16 @@ class TestAgentServiceManagerReconstruction:
     async def test_build_tools_maps_categories_from_full_catalog(
         self, agent_manager, mock_db, sample_task, mock_user, monkeypatch
     ):
-        """Disabled runtime tools should still be eligible for category allow-lists."""
+        """``_build_tools_for_task`` constructs a ``ToolSelectionSpec``
+        once via ``from_raw`` and hands it to
+        ``WebToolConfig.tool_selection_spec``. The factory's
+        ``spec.compute_allowed_names`` dispatch then drives the
+        name-level filter -- a single registry build, not a two-pass
+        ``create_all_tools`` with a manual select+merge stage.
+        """
+        from xagent.core.tools.adapters.vibe.selection_spec import (
+            _SpecByCategories,
+        )
 
         class _Tool:
             description = ""
@@ -307,15 +316,11 @@ class TestAgentServiceManagerReconstruction:
 
         basic_tool = _Tool("calculator", "basic")
         browser_tool = _Tool("browser_navigate", "browser")
-        override_filter_values: list[bool] = []
 
         async def create_all_tools(
             config,
             apply_user_override_filter: bool = True,
         ):
-            override_filter_values.append(apply_user_override_filter)
-            if apply_user_override_filter:
-                return [basic_tool]
             return [basic_tool, browser_tool]
 
         monkeypatch.setattr(
@@ -338,8 +343,11 @@ class TestAgentServiceManagerReconstruction:
                 task_vision_llm=None,
             )
 
-        assert override_filter_values[0] is False
-        assert tool_config.get_allowed_tools() == ["browser_navigate"]
+        spec = tool_config.get_tool_selection_spec()
+        assert isinstance(spec, _SpecByCategories), (
+            "BY_CATEGORIES mode expected for non-empty tool_categories"
+        )
+        assert "browser" in spec.categories
 
     @pytest.mark.asyncio
     async def test_get_agent_for_task_existing_task_with_reconstruction(

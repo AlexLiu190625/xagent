@@ -356,7 +356,26 @@ class ToolConfig(BaseToolConfig):
         return None  # Standalone config doesn't have web context
 
     def get_allowed_tools(self) -> Optional[List[str]]:
+        """Legacy raw-list accessor.
+
+        Kept for backward compat with callers that haven't migrated to
+        :class:`ToolSelectionSpec`. New code SHOULD construct a spec via
+        :meth:`ToolSelectionSpec.from_raw` and pass it through
+        :attr:`_tool_selection_spec` instead. The factory consults the
+        spec first; this method only fires for the no-spec path.
+        """
         return self.allowed_tools
+
+    def get_tool_selection_spec(self) -> Optional[Any]:
+        """Typed spec accessor (preferred over :meth:`get_allowed_tools`).
+
+        Subclasses set ``self._tool_selection_spec`` to a
+        :class:`ToolSelectionSpec` instance constructed via
+        :meth:`ToolSelectionSpec.from_raw`. The factory reads this in
+        ``create_all_tools`` and dispatches mode-aware filtering through
+        ``spec.compute_allowed_names(tools)``.
+        """
+        return getattr(self, "_tool_selection_spec", None)
 
     def get_allowed_agent_ids(self) -> Optional[List[int]]:
         return self.allowed_agent_ids

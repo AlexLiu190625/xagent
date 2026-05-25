@@ -35,7 +35,11 @@ async def create_db_custom_api_tools(config: BaseToolConfig) -> Sequence[Tool]:
     Returns:
         List of Tool instances for each configured Custom API.
     """
-    spec = getattr(config, "selection_spec", None)
+    spec = (
+        config.get_tool_selection_spec()
+        if hasattr(config, "get_tool_selection_spec")
+        else None
+    )
     if spec is not None and not spec.includes_custom_api():
         return []
     try:

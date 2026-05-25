@@ -123,17 +123,22 @@ class ToolRegistry:
     async def create_registered_tools(cls, config: BaseToolConfig) -> List[Tool]:
         """Create tools from all registered creators.
 
-        When ``config.selection_spec`` is set, creators whose declared
-        categories don't intersect ``spec.categories`` are skipped at
-        the registry level (no creator call, no I/O). Creators with
-        no declared categories (dynamic ones: MCP / Custom API /
-        Published Agent / Image / Audio) are always dispatched and are
-        responsible for short-circuiting internally based on the spec.
+        When ``config.get_tool_selection_spec()`` returns a spec,
+        creators whose declared categories don't intersect
+        ``spec.categories`` are skipped at the registry level (no
+        creator call, no I/O). Creators with no declared categories
+        (dynamic ones: MCP / Custom API / Published Agent / Image /
+        Audio) are always dispatched and are responsible for
+        short-circuiting internally based on the spec.
         """
         # Import tool modules on first call to trigger decorator registration
         cls._import_tool_modules()
 
-        spec: Optional[ToolSelectionSpec] = getattr(config, "selection_spec", None)
+        spec: Optional[ToolSelectionSpec] = (
+            config.get_tool_selection_spec()
+            if hasattr(config, "get_tool_selection_spec")
+            else None
+        )
         tools: List[Tool] = []
         for creator, declared_cats in cls._tool_creators:
             # Registry-level skip: declared categories known and no
@@ -236,31 +241,34 @@ class ToolFactory:
         # Auto-discover tools from @register_tool decorators
         tools = await ToolRegistry.create_registered_tools(config)
 
-        # Filter tools by allowed_tools if specified. ``None`` means "no
-        # filter" (build everything that came back from the registry);
-        # an explicit empty list means "no tools allowed" and now
-        # filters to an empty list rather than logging a warning and
-        # leaving the full set in place -- the original behavior could
-        # silently leak the full toolset when a caller wanted explicit
-        # exclusion.
+        # Name-level filter via the spec's ``compute_allowed_names``
+        # dispatch. The three return shapes encode the three modes:
         #
-        # ``allowed_set`` materialises the list into a set so the
-        # per-tool membership test below is O(1); this path runs
-        # multiple times per agent setup, so even small constant-factor
-        # wins matter and the set conversion is cheaper than the
-        # repeated linear scans on a list.
-        allowed_tools = config.get_allowed_tools()
-        if allowed_tools is not None:
-            allowed_set = set(allowed_tools)
-            if not allowed_set:
-                logger.warning(
-                    "allowed_tools is an empty list — returning empty tool set. "
-                    "Pass None instead if you want all tools."
-                )
-            tools = [tool for tool in tools if tool.name in allowed_set]
-            if allowed_set:
+        #   None             — ALL mode, keep every tool from the registry
+        #   frozenset()      — NONE mode, drop every tool
+        #   frozenset({...}) — BY_CATEGORIES mode, keep only matching names
+        #                      (plus any workforce ``name_extras`` injection)
+        #
+        # Sealed-type dispatch — the three modes are mutually exclusive
+        # and impossible to confuse, unlike the older raw list whose
+        # ``None`` vs ``[]`` distinction was a runtime truthiness check.
+        # Configs that don't carry a spec default to ALL (full set).
+        spec = (
+            config.get_tool_selection_spec()
+            if hasattr(config, "get_tool_selection_spec")
+            else None
+        )
+        if spec is not None:
+            allowed_names = spec.compute_allowed_names(tools)
+        else:
+            allowed_names = None
+
+        if allowed_names is not None:
+            tools = [tool for tool in tools if tool.name in allowed_names]
+            if allowed_names:
                 logger.info(
-                    f"Filtered tools to {len(tools)} allowed tools: {[t.name for t in tools]}"
+                    f"Filtered tools to {len(tools)} allowed tools: "
+                    f"{[t.name for t in tools]}"
                 )
 
         # Filter out tools disabled by per-user hook policy (execution layer)

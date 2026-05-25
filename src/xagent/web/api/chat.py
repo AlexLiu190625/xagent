@@ -69,7 +69,6 @@ from ..services.workforce_runtime import (
     resolve_workforce_task_runtime,
     sync_workforce_run_status,
 )
-from ..tools.config import WebToolConfig
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
@@ -232,139 +231,41 @@ def create_default_llm() -> Optional[BaseLLM]:
         return None
 
 
-def _build_selection_spec_from_categories(
-    tool_categories: Optional[List[str]],
-) -> Optional[Any]:
-    """Convert the agent builder ``tool_categories`` list into a
-    :class:`ToolSelectionSpec`.
+def _build_tool_selection_spec_for_task(
+    agent_config: Optional[dict],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+    *,
+    task_id: int,
+) -> Any:
+    """Single SSOT normalizer for chat reconstruct + snapshot paths.
 
-    The agent builder UI stores tool selection as a flat list of
-    strings: plain category names (``"basic"``, ``"file"``, ``"mcp"``)
-    plus a special ``"mcp:<server-name>"`` form that selects a specific
-    MCP server. We translate that representation into a structured
-    spec the factory and creators can act on:
-
-      - plain entries → ``spec.categories``
-      - ``mcp:<name>`` entries → both add ``"mcp"`` to ``categories``
-        (so the MCP creator runs) and ``<name>`` to ``mcp_servers``
-        (so per-server filtering in the MCP creator can take effect).
-      - Because the legacy chat path also routed ``mcp:<name>`` to
-        match a Custom API named ``api_<name>_call`` (category
-        ``"other"``), we conservatively include ``"other"`` in
-        ``categories`` whenever any ``mcp:`` entry is present, so we
-        don't change that behavior.
-
-    Returns ``None`` if ``tool_categories`` is missing/empty/None,
-    which preserves "no restriction = build everything" backward compat.
+    Both ``_build_tools_for_task`` (reconstruct) and
+    ``get_agent_for_task`` (snapshot) translate the same raw inputs
+    (``agent_config['tool_categories']`` + optional workforce worker
+    tool names) into a :class:`ToolSelectionSpec`. Centralising the
+    call here keeps the two paths in lockstep and avoids the 30-line
+    copy / paste that used to live in each.
     """
-    if not tool_categories:
-        return None
     from ...core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    cats: set[str] = set()
-    mcp_servers: set[str] = set()
-    for entry in tool_categories:
-        if entry.startswith("mcp:"):
-            server_name = entry.split(":", 1)[1].replace(" ", "_").replace("-", "_")
-            cats.add("mcp")
-            cats.add("other")  # Custom API name-match path lives under "other"
-            mcp_servers.add(server_name)
-        else:
-            cats.add(entry)
-    return ToolSelectionSpec(
-        categories=frozenset(cats),
-        mcp_servers=frozenset(mcp_servers) if mcp_servers else None,
+    tool_categories = agent_config.get("tool_categories") if agent_config else None
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=tool_categories,
+        workforce_extra_names=(
+            workforce_runtime.worker_tool_names if workforce_runtime else None
+        ),
     )
-
-
-def select_allowed_tool_names_from_categories(
-    *,
-    tool_categories: Optional[List[str]],
-    all_tools: List[Any],
-) -> Optional[List[str]]:
-    """Normalize agent-builder ``tool_categories`` into an exact
-    tool-name allow-list. Shared by chat (snapshot + reconstruct
-    paths) and the WebSocket build-preview endpoint -- previously
-    inlined three times with subtly different behaviour on empty
-    input.
-
-    Contract (single source of truth):
-
-      - ``tool_categories`` is ``None`` or empty list → return
-        ``None``. Legacy "未配置" semantics: the factory's
-        ``allowed_tools=None`` short-circuit means no name-level
-        restriction, so the full default set passes through. Default
-        and legacy agents (whose ``Agent.tool_categories`` defaults
-        to ``[]``) must not be silently stripped of every tool.
-
-      - ``tool_categories`` is a non-empty list → return a list of
-        tool names that match any of:
-
-          * plain category entry (e.g. ``"basic"``, ``"file"``)
-            matches tools whose ``metadata.category.value`` is that
-            string;
-          * ``"mcp:<server-name>"`` entry matches tools named
-            ``mcp_<server-name>_*`` (case-insensitive, with
-            spaces / dashes folded to underscores to match the
-            adapter's naming convention);
-          * ``"mcp:<server-name>"`` entry also matches a single
-            Custom API tool named exactly ``api_<server-name>_call``
-            (the legacy dual-meaning ``mcp:`` form that fronts both
-            MCP servers and Custom APIs in the agent builder UI).
-
-        An empty result on non-empty input is the legitimate
-        "user picked categories that didn't match any registered
-        tool" case (e.g. ``mcp:UnknownServer``) -- the factory's
-        ``allowed_tools=[]`` short-circuit will yield zero tools,
-        which is the right intent there.
-
-    Pure function: does not call ``ToolFactory.create_all_tools``
-    itself. Callers are responsible for enumerating ``all_tools``
-    however suits their context (build-preview adds Custom API
-    tools manually before calling; chat callers use the
-    selection-spec-aware factory call to keep the registry skip
-    intact).
-    """
-    if not tool_categories:
-        return None
-
-    allowed: List[str] = []
-    for tool in all_tools:
-        if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
-            continue
-        category = str(tool.metadata.category.value)
-        tool_name = getattr(tool, "name", None)
-        if not tool_name:
-            continue
-
-        # Plain category match (e.g. "basic", "file", "image").
-        if category in tool_categories:
-            allowed.append(tool_name)
-            continue
-
-        # ``mcp:<server>`` -> matches mcp_<server>_* tools.
-        if category == "mcp":
-            for tc in tool_categories:
-                if not tc.startswith("mcp:"):
-                    continue
-                server_name = tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
-                if tool_name.lower().startswith(f"mcp_{server_name.lower()}_"):
-                    allowed.append(tool_name)
-                    break
-            continue
-
-        # ``mcp:<server>`` also fronts a single Custom API named
-        # api_<server>_call -- the legacy dual-meaning of mcp: in
-        # the agent builder UI.
-        if category == "other":
-            for tc in tool_categories:
-                if not tc.startswith("mcp:"):
-                    continue
-                server_name = tc.split(":", 1)[1].replace(" ", "_").replace("-", "_")
-                if tool_name.lower() == f"api_{server_name.lower()}_call":
-                    allowed.append(tool_name)
-                    break
-    return allowed
+    if spec.is_all():
+        logger.info(
+            f"Task {task_id} has no tool_categories restriction "
+            "(legacy 'unconfigured' semantics) -- full default tool set will be built"
+        )
+    else:
+        logger.info(
+            f"Task {task_id} tool selection spec: "
+            f"{type(spec).__name__} with categories={tool_categories}"
+        )
+    return spec
 
 
 def _build_allowed_external_dirs(
@@ -390,22 +291,6 @@ def _build_allowed_external_dirs(
             dirs.append(str(user_upload_dir))
     dirs.extend([str(d) for d in get_external_upload_dirs()])
     return dirs
-
-
-def _merge_workforce_tool_names(
-    allowed_tools: Optional[List[str]],
-    workforce_runtime: Optional[WorkforceTaskRuntime],
-) -> Optional[List[str]]:
-    if allowed_tools is None or workforce_runtime is None:
-        return allowed_tools
-
-    merged = list(allowed_tools)
-    seen = set(merged)
-    for tool_name in sorted(workforce_runtime.worker_tool_names):
-        if tool_name not in seen:
-            merged.append(tool_name)
-            seen.add(tool_name)
-    return merged
 
 
 def _build_workforce_system_prompt(
@@ -438,12 +323,11 @@ async def create_default_tools(
     workspace_owner_id: Optional[int] = None,
     allowed_collections: Optional[List[str]] = None,
     allowed_skills: Optional[List[str]] = None,
-    allowed_tools: Optional[List[str]] = None,
     excluded_agent_id: Optional[int] = None,
     vision_model: Optional[Any] = None,
     sandbox: Optional[Any] = None,
     llm: Optional[Any] = None,
-    selection_spec: Optional[Any] = None,
+    tool_selection_spec: Optional[Any] = None,
     allowed_agent_ids: Optional[List[int]] = None,
     agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
     enable_global_agent_tools: bool = True,
@@ -489,16 +373,13 @@ async def create_default_tools(
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
         },
-        include_mcp_tools=bool(
-            allowed_tools and any(t.startswith("mcp_") for t in allowed_tools)
-        ),
+        include_mcp_tools=True,
         task_id=task_id,  # Pass task_id for browser session tracking
         browser_tools_enabled=True,  # Enable browser automation tools
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases
         allowed_skills=allowed_skills,  # Agent Builder skills
-        allowed_tools=allowed_tools,  # Agent Builder tool categories
         vision_model=vision_model,  # Pass task-specific vision model
-        selection_spec=selection_spec,  # Category/server-level skip in factory
+        tool_selection_spec=tool_selection_spec,  # Preferred SSOT typed spec
         allowed_agent_ids=allowed_agent_ids,
         agent_tool_overrides=agent_tool_overrides,
         enable_global_agent_tools=enable_global_agent_tools,
@@ -989,60 +870,9 @@ class AgentServiceManager:
                 )
 
         workforce_runtime = resolve_workforce_task_runtime(db, task)
-        allowed_tools: Optional[List[str]] = None
-        if agent_config:
-            tool_categories = agent_config.get("tool_categories")
-            from ...core.tools.adapters.vibe.factory import ToolFactory
-
-            temp_config = WebToolConfig(
-                db=db,
-                request=self.request,
-                llm=task_llm,
-                user_id=int(user.id),
-                is_admin=bool(user.is_admin),
-                workspace_config=None,
-                include_mcp_tools=True,
-                task_id=None,
-                browser_tools_enabled=True,
-                allowed_collections=agent_config.get("knowledge_bases"),
-                allowed_skills=agent_config.get("skills"),
-                allowed_agent_ids=workforce_runtime.allowed_agent_ids
-                if workforce_runtime
-                else None,
-                agent_tool_overrides=workforce_runtime.agent_tool_overrides
-                if workforce_runtime
-                else None,
-                enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
-                if workforce_runtime
-                else True,
-                allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
-                if workforce_runtime
-                else False,
-                parent_task_id=str(task_id) if workforce_runtime else None,
-                parent_tracer=parent_tracer if workforce_runtime else None,
-                agent_call_stack=workforce_runtime.agent_call_stack
-                if workforce_runtime
-                else None,
-            )
-            all_tools = await ToolFactory.create_all_tools(
-                temp_config, apply_user_override_filter=False
-            )
-            allowed_tools = select_allowed_tool_names_from_categories(
-                tool_categories=tool_categories,
-                all_tools=all_tools,
-            )
-            if allowed_tools is None:
-                logger.info(
-                    f"Task {task_id} has no tool_categories restriction "
-                    "(legacy 'unconfigured' semantics) -- full default tool set will be built"
-                )
-            else:
-                logger.info(
-                    f"Tool categories {tool_categories} mapped to "
-                    f"{len(allowed_tools)} tools for task {task_id}"
-                )
-
-        allowed_tools = _merge_workforce_tool_names(allowed_tools, workforce_runtime)
+        tool_selection_spec = _build_tool_selection_spec_for_task(
+            agent_config, workforce_runtime, task_id=task_id
+        )
         workspace_owner_id = int(task.user_id)
         sandbox_workspace_config = {
             "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
@@ -1081,7 +911,7 @@ class AgentServiceManager:
             if agent_config
             else None,
             allowed_skills=agent_config["skills"] if agent_config else None,
-            allowed_tools=allowed_tools,
+            tool_selection_spec=tool_selection_spec,
             excluded_agent_id=excluded_agent_id,
             vision_model=task_vision_llm,
             sandbox=sandbox,
@@ -1449,84 +1279,10 @@ class AgentServiceManager:
                                 f"falling back to local execution: {e}"
                             )
 
-                # Filter tools by tool category using tool metadata
-                # Note: Tool names are stable, defined in code, no database storage needed
-                allowed_tools: Optional[List[str]] = None
-                # Spec passed into the temp build so the factory skips
-                # creators (and their internal DB / MCP-discovery I/O)
-                # for categories this agent doesn't use. Same spec is
-                # also passed into the real build below; both calls
-                # therefore enumerate only the relevant subset rather
-                # than the full ~52-tool default set (see issue #427).
-                selection_spec = _build_selection_spec_from_categories(
-                    agent_config.get("tool_categories") if agent_config else None
+                tool_selection_spec = _build_tool_selection_spec_for_task(
+                    agent_config, workforce_runtime, task_id=task_id
                 )
-                if agent_config:
-                    tool_categories = agent_config.get("tool_categories")
-                    from ...core.tools.adapters.vibe.factory import ToolFactory
 
-                    temp_config = WebToolConfig(
-                        db=db,
-                        request=self.request,
-                        user=user,
-                        llm=task_llm,
-                        user_id=int(user.id),
-                        is_admin=bool(user.is_admin),
-                        workspace_config=None,
-                        include_mcp_tools=True,
-                        task_id=None,
-                        browser_tools_enabled=True,
-                        allowed_collections=agent_config.get("knowledge_bases"),
-                        allowed_skills=agent_config.get("skills"),
-                        sandbox=sandbox,
-                        selection_spec=selection_spec,
-                        allowed_agent_ids=workforce_runtime.allowed_agent_ids
-                        if workforce_runtime
-                        else None,
-                        agent_tool_overrides=workforce_runtime.agent_tool_overrides
-                        if workforce_runtime
-                        else None,
-                        enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
-                        if workforce_runtime
-                        else True,
-                        allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
-                        if workforce_runtime
-                        else False,
-                        parent_task_id=str(task_id) if workforce_runtime else None,
-                        parent_tracer=tracer if workforce_runtime else None,
-                        agent_call_stack=workforce_runtime.agent_call_stack
-                        if workforce_runtime
-                        else None,
-                    )
-                    all_tools = await ToolFactory.create_all_tools(
-                        temp_config, apply_user_override_filter=False
-                    )
-                    allowed_tools = select_allowed_tool_names_from_categories(
-                        tool_categories=tool_categories,
-                        all_tools=all_tools,
-                    )
-                    if allowed_tools is None:
-                        logger.info(
-                            f"Task {task_id} has no tool_categories restriction "
-                            "(legacy 'unconfigured' semantics) -- full default tool set will be built"
-                        )
-                    else:
-                        logger.info(
-                            f"Tool categories {tool_categories} mapped to "
-                            f"{len(allowed_tools)} tools for task {task_id}"
-                        )
-
-                # Two-step tool selection (前后组合,两个 SSOT 各自单一职责):
-                #   1. ``select_allowed_tool_names_from_categories`` (above)
-                #      maps Agent.tool_categories -> tool name list
-                #   2. ``_merge_workforce_tool_names`` (here) injects
-                #      worker-tool names from the workforce runtime
-                # ``selection_spec`` passed below is the same one used
-                # by the temp build above; both calls aligned on which
-                # creators to dispatch and skip (issue #427 perf).
-                allowed_tools = _merge_workforce_tool_names(
-                    allowed_tools, workforce_runtime
-                )
                 tools = await create_default_tools(
                     db,
                     request=self.request,
@@ -1537,12 +1293,11 @@ class AgentServiceManager:
                     if agent_config
                     else None,
                     allowed_skills=agent_config["skills"] if agent_config else None,
-                    allowed_tools=allowed_tools,
+                    tool_selection_spec=tool_selection_spec,
                     excluded_agent_id=excluded_agent_id,
                     vision_model=task_vision_llm,  # Pass task-specific vision model
                     sandbox=sandbox,
                     llm=task_llm,  # Pass task-specific LLM
-                    selection_spec=selection_spec,
                     allowed_agent_ids=workforce_runtime.allowed_agent_ids
                     if workforce_runtime
                     else None,

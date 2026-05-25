@@ -136,7 +136,6 @@ class WebToolConfig(BaseToolConfig):
         browser_tools_enabled: bool = True,
         allowed_collections: Optional[List[str]] = None,
         allowed_skills: Optional[List[str]] = None,
-        allowed_tools: Optional[List[str]] = None,
         allowed_agent_ids: Optional[List[int]] = None,
         agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
         enable_global_agent_tools: bool = True,
@@ -145,15 +144,14 @@ class WebToolConfig(BaseToolConfig):
         parent_tracer: Optional[Any] = None,
         agent_call_stack: Optional[List[int]] = None,
         sandbox: Optional[Any] = None,
-        selection_spec: Optional[Any] = None,
+        tool_selection_spec: Optional[Any] = None,
     ):
-        # ``selection_spec`` is :class:`ToolSelectionSpec` from the
-        # tools adapter package; typed as ``Any`` here to avoid an
+        # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
+        # the tools adapter package; typed as ``Any`` here to avoid an
         # import cycle (web.tools → core.tools.adapters). The factory
-        # reads ``getattr(config, "selection_spec", None)`` so leaving
-        # this attribute unset preserves the original "build everything"
-        # behavior for callers that don't supply a spec.
-        self.selection_spec = selection_spec
+        # reads ``config.get_tool_selection_spec()``. ``None`` defaults
+        # to the ``_SpecAll`` ALL-mode (build every default tool).
+        self._tool_selection_spec = tool_selection_spec
         self.db = db
         self.request = request
         self._user_id = (
@@ -181,7 +179,6 @@ class WebToolConfig(BaseToolConfig):
         self._browser_tools_enabled = browser_tools_enabled
         self._allowed_collections = allowed_collections
         self._allowed_skills = allowed_skills
-        self._allowed_tools = allowed_tools
         self._allowed_agent_ids = allowed_agent_ids
         self._agent_tool_overrides = (
             agent_tool_overrides if isinstance(agent_tool_overrides, dict) else {}
@@ -348,9 +345,16 @@ class WebToolConfig(BaseToolConfig):
         """Get allowed skill names. None means all skills are allowed."""
         return self._allowed_skills
 
-    def get_allowed_tools(self) -> Optional[List[str]]:
-        """Get allowed tool names. None means all tools are allowed."""
-        return self._allowed_tools
+    def get_tool_selection_spec(self) -> Optional[Any]:
+        """Typed spec accessor (preferred over :meth:`get_allowed_tools`).
+
+        Returns a :class:`ToolSelectionSpec` instance when the caller
+        supplied one via ``tool_selection_spec=ToolSelectionSpec.from_raw(...)``.
+        ``ToolFactory.create_all_tools`` reads this first; falls back to
+        ``get_allowed_tools()`` only if this returns ``None`` (legacy
+        backward-compat).
+        """
+        return self._tool_selection_spec
 
     def get_allowed_agent_ids(self) -> Optional[List[int]]:
         """Get explicitly allowed published agent IDs. None means use defaults."""

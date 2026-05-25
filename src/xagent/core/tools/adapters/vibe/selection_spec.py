@@ -9,98 +9,506 @@ Background:
     and assemble a name list -- a redundant build that dominated
     per-task setup time (see issue #427).
 
-    ``ToolSelectionSpec`` lets callers declare which categories /
-    MCP servers / Custom API IDs / Published Agent IDs the agent
-    actually needs, so the factory can skip both the registry-level
-    creator dispatch AND the creator-internal I/O (DB queries, MCP
-    server initialization) for selectors not in the spec.
+    ``ToolSelectionSpec`` is a sealed ABC with three concrete
+    subclasses (``_SpecAll`` / ``_SpecNone`` / ``_SpecByCategories``).
+    Modes are explicit through subclass identity and
+    :meth:`is_all` / :meth:`is_none` / :meth:`is_by_categories`
+    predicates -- not the older "None vs frozenset() vs frozenset({...})"
+    implicit signal that conflated the three states and caused
+    legacy ``Agent.tool_categories=[]`` to be misread as "zero tools".
+
+    Production callers MUST construct via
+    :meth:`ToolSelectionSpec.from_raw`, the single normalizer over
+    raw ORM / dict / SDK fields. Direct subclass instantiation is
+    used by tests; production paths that bypass ``from_raw`` are
+    flagged by a grep test.
+
+Mode completeness:
+    Each abstract method (``is_*`` / ``includes_*`` /
+    ``compute_allowed_names``) must be implemented by every subclass.
+    Missing an implementation is both a mypy error and a runtime
+    ``TypeError`` at instantiation time. Adding a new ``includes_*``
+    creator-dispatch method on the base forces every subclass to
+    update -- no grep test required to police mode dispatch.
 
 Backward compat:
-    Every field defaults to ``None``, which means "no restriction" --
-    callers that don't supply a spec get the original "build everything"
-    behavior. Empty sets (``frozenset()``) are explicit exclusion:
-    ``categories=frozenset()`` returns no tools.
+    All three subclasses expose ``categories`` /``mcp_servers`` /
+    ``custom_api_ids`` / ``published_agent_ids`` fields (the original
+    spec shape). ``_SpecAll`` has them at None / ``_SpecNone`` at
+    None plus empty ``categories``, so existing callsites that read
+    ``spec.categories`` directly keep working. New code should
+    prefer the typed dispatch (``spec.is_by_categories()`` etc.).
 
 This module deliberately has no dependencies on the rest of the
 codebase so the spec can be imported by both the factory and the
-individual tool creators without circular-import risk.
+individual tool creators without circular-import risk. The
+``compute_allowed_names`` helper uses duck typing for tool metadata
+access; no Tool type import required.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, List, Optional, Set
 
 
-@dataclass(frozen=True)
-class ToolSelectionSpec:
-    """Specification of which tools the caller wants the factory to build.
+class ToolSelectionSpec(ABC):
+    """Sealed type for tool selection.
 
-    Fields:
-        categories: When set, only creators whose declared categories
-            intersect this set are dispatched. ``None`` = no category
-            filter.
-        mcp_servers: When set, only MCP tools for these server names
-            are built. ``None`` = build MCP tools for every active
-            server (subject to category gating). Empty set is "no MCP
-            tools" -- the MCP creator must short-circuit and skip its
-            ``list_active_servers`` call.
-        custom_api_ids: When set, only these Custom API IDs produce
-            tools. ``None`` = build for every active Custom API.
-            Empty set is "no Custom API tools" -- the creator must
-            skip its DB lookup.
-        published_agent_ids: When set, only these Published Agent IDs
-            produce delegation tools. ``None`` = include every visible
-            published agent. Empty set is "no agent delegation" --
-            the creator must skip its DB lookup.
+    Three concrete subclasses, accessed through :meth:`from_raw`:
+      - ``_SpecAll`` — legacy "未配置" / no restriction; build every
+        default tool. Factory does not filter by name.
+      - ``_SpecNone`` — explicit "zero tools"; factory returns ``[]``.
+      - ``_SpecByCategories`` — filter by category, with optional
+        ID-level scopes (mcp_servers / custom_api_ids /
+        published_agent_ids) and ``name_extras`` (workforce worker
+        tool injection).
+
+    Mode completeness is enforced by ``@abstractmethod``: each
+    subclass must implement every predicate / dispatch method.
+    Missing one fails at instantiation time, not silently.
+
+    Direct ``ToolSelectionSpec(...)`` construction is supported for
+    backward compatibility: ``__new__`` inspects ``categories`` and
+    dispatches to the matching subclass. Production code should
+    prefer :meth:`from_raw` for the explicit normalizer contract;
+    direct construction is mostly for tests + legacy callers.
     """
 
-    categories: frozenset[str] | None = None
-    mcp_servers: frozenset[str] | None = None
-    custom_api_ids: frozenset[int] | None = None
-    published_agent_ids: frozenset[int] | None = None
+    def __new__(cls, *args: Any, **kwargs: Any) -> "ToolSelectionSpec":
+        """Dispatch ``ToolSelectionSpec(...)`` to the right subclass.
+
+        Backward-compat shim for callers / tests that construct the
+        old single-dataclass shape directly. New production code
+        should prefer :meth:`from_raw`.
+
+        Dispatch rules (match the legacy dataclass semantics):
+          - ``categories=None`` (default) → ``_SpecAll``
+          - ``categories=frozenset()``    → ``_SpecNone``
+          - ``categories=frozenset({...})`` non-empty → ``_SpecByCategories``
+
+        Subclass direct construction (``_SpecAll()``, ``_SpecNone()``,
+        ``_SpecByCategories(...)``) bypasses this dispatch.
+        """
+        if cls is ToolSelectionSpec:
+            categories = kwargs.get("categories")
+            if categories is None:
+                return _SpecAll.__new__(_SpecAll)
+            if isinstance(categories, frozenset) and len(categories) == 0:
+                return _SpecNone.__new__(_SpecNone)
+            return _SpecByCategories.__new__(_SpecByCategories)
+        return super().__new__(cls)
+
+    # ── Mode predicates ────────────────────────────────────────────
+    # Three mutually exclusive modes; exactly one is_*() returns True.
+
+    @abstractmethod
+    def is_all(self) -> bool:
+        """Whether this is the ALL mode (build every default tool)."""
+
+    @abstractmethod
+    def is_none(self) -> bool:
+        """Whether this is the NONE mode (factory returns ``[]``)."""
+
+    @abstractmethod
+    def is_by_categories(self) -> bool:
+        """Whether this is the BY_CATEGORIES mode (filtered build)."""
+
+    # ── Creator dispatch ──────────────────────────────────────────
+    # ToolRegistry / individual creators consult these to decide
+    # whether their work (DB queries / MCP init / etc) should run.
+
+    @abstractmethod
+    def includes_mcp(self) -> bool:
+        """Whether the MCP creator should run."""
+
+    @abstractmethod
+    def includes_custom_api(self) -> bool:
+        """Whether the Custom API creator should run.
+
+        In BY_CATEGORIES mode this also requires ``"other"`` in
+        :attr:`categories` because Custom API tools surface under
+        the ``other`` category; without it they cannot survive the
+        post-build name filter, so running the creator (and its
+        ``get_custom_api_configs()`` DB lookup) is wasted I/O.
+        """
+
+    @abstractmethod
+    def includes_published_agent(self) -> bool:
+        """Whether the Published Agent delegation creators should run."""
+
+    # ── Final name-level filter ───────────────────────────────────
+
+    @abstractmethod
+    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+        """Resolve the final allowed-tool-names set for this spec.
+
+        Returns:
+            ``None``       — caller keeps every tool in ``all_tools``
+                             (ALL mode).
+            ``frozenset()`` — caller returns ``[]`` (NONE mode).
+            non-empty set  — caller filters ``all_tools`` to names
+                             in the set (BY_CATEGORIES mode, plus
+                             :attr:`name_extras` injection).
+
+        The frozenset() vs None distinction is load-bearing:
+        ``ToolFactory.create_all_tools`` reads this method and
+        filters / short-circuits based on the three return types.
+        """
+
+    # ── Single normalizer ─────────────────────────────────────────
+
+    @classmethod
+    def from_raw(
+        cls,
+        *,
+        tool_categories: Optional[List[str]] = None,
+        mcp_servers: Optional[List[str]] = None,
+        custom_api_ids: Optional[List[int]] = None,
+        published_agent_ids: Optional[List[int]] = None,
+        workforce_extra_names: Optional[Set[str]] = None,
+        explicit_none: bool = False,
+    ) -> "ToolSelectionSpec":
+        """Build a spec from raw ORM / dict / SDK fields.
+
+        This is the **only** production entry point. Direct
+        subclass construction is for tests; a grep test pins
+        production code to use ``from_raw``.
+
+        Empty / unset input semantics:
+          - ``tool_categories=None`` or ``[]`` → ``_SpecAll``
+            (legacy "未配置" — build every default tool).
+          - ``explicit_none=True`` → ``_SpecNone`` regardless of
+            ``tool_categories`` (reserved for future "zero tools"
+            product UI).
+          - Otherwise → ``_SpecByCategories``.
+
+        ``workforce_extra_names`` is only meaningful in
+        BY_CATEGORIES mode (ALL already includes everything; NONE
+        rejects everything). It is silently ignored in ALL / NONE
+        to avoid forcing callers to branch.
+        """
+        if explicit_none:
+            return _SpecNone()
+        if tool_categories is None or len(tool_categories) == 0:
+            return _SpecAll()
+
+        # Agent-builder UI representation in ``tool_categories`` mixes
+        # two shapes:
+        #   - plain category names (``"basic"``, ``"file"``, ``"mcp"``)
+        #   - ``"mcp:<server-name>"`` (selects a specific MCP server
+        #     OR a Custom-API tool that fronts it; both surface as
+        #     name patterns under the ``"mcp"`` / ``"other"`` categories)
+        #
+        # Normalize the mixed shape into the structured spec form:
+        #   - plain entries land in ``categories``
+        #   - ``mcp:<server>`` entries add ``"mcp"`` + ``"other"`` to
+        #     ``categories`` (so MCP / Custom-API creators run) and
+        #     ``<server>`` to ``mcp_servers`` (per-server filter)
+        #
+        # The ``categories`` frozenset retains the original
+        # ``mcp:<server>`` strings too — :meth:`compute_allowed_names`
+        # uses them to match tool names (``mcp_<server>_*`` /
+        # ``api_<server>_call``) at the name-filter step.
+        derived_cats: Set[str] = set()
+        derived_mcp_servers: Set[str] = set()
+        for entry in tool_categories:
+            if isinstance(entry, str) and entry.startswith("mcp:"):
+                server_name = entry.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                derived_cats.add("mcp")
+                derived_cats.add("other")
+                derived_cats.add(entry)  # keep for name-filter step
+                derived_mcp_servers.add(server_name)
+            else:
+                derived_cats.add(entry)
+
+        # Caller-supplied mcp_servers (if any) merge with the
+        # derived set; explicit empty stays empty.
+        if mcp_servers is not None:
+            final_mcp_servers: Optional[frozenset[str]] = frozenset(mcp_servers)
+        elif derived_mcp_servers:
+            final_mcp_servers = frozenset(derived_mcp_servers)
+        else:
+            final_mcp_servers = None
+
+        return _SpecByCategories(
+            categories=frozenset(derived_cats),
+            mcp_servers=final_mcp_servers,
+            custom_api_ids=(
+                frozenset(custom_api_ids) if custom_api_ids is not None else None
+            ),
+            published_agent_ids=(
+                frozenset(published_agent_ids)
+                if published_agent_ids is not None
+                else None
+            ),
+            name_extras=frozenset(workforce_extra_names or ()),
+        )
+
+    # ── Backward-compat helper (kept from the original spec) ─────
 
     def includes_category(self, cat: str) -> bool:
         """Whether the given category passes the spec.
 
-        ``categories is None`` means "no restriction" so every category
-        passes. Otherwise membership is required.
+        ``ALL`` admits every category; ``NONE`` admits none;
+        ``BY_CATEGORIES`` admits members of :attr:`categories`.
+        Existing callers in ``factory.py`` registry-skip and
+        creator-internal short-circuits keep using this.
         """
-        if self.categories is None:
+        if self.is_all():
             return True
-        return cat in self.categories
+        if self.is_none():
+            return False
+        # ``categories`` exists on _SpecByCategories; mypy follows it
+        # through ``is_by_categories()`` narrowing in modern setups,
+        # but the duck-typed attribute access is also safe here.
+        return cat in getattr(self, "categories", frozenset())
+
+
+# ─────────────────────────────────────────────────────────────────
+# Concrete subclasses. Production code MUST go through ``from_raw``.
+# The leading underscore signals "internal" — direct construction is
+# legal but flagged by a grep test in non-test paths.
+# ─────────────────────────────────────────────────────────────────
+
+
+@dataclass(frozen=True)
+class _SpecAll(ToolSelectionSpec):
+    """ALL mode — legacy "未配置" / no restriction.
+
+    Exposes ``categories`` / ``mcp_servers`` / ``custom_api_ids`` /
+    ``published_agent_ids`` at ``None`` for backward compat with
+    callsites that read those attributes directly (e.g. the
+    registry-level skip in ``factory.py:ToolRegistry``).
+    """
+
+    # Backward-compat fields (kept None to preserve existing
+    # ``spec.categories is None`` truthiness in factory.py).
+    categories: Optional[frozenset[str]] = None
+    mcp_servers: Optional[frozenset[str]] = None
+    custom_api_ids: Optional[frozenset[int]] = None
+    published_agent_ids: Optional[frozenset[int]] = None
+
+    def is_all(self) -> bool:
+        return True
+
+    def is_none(self) -> bool:
+        return False
+
+    def is_by_categories(self) -> bool:
+        return False
 
     def includes_mcp(self) -> bool:
-        """Whether the MCP creator should run at all.
+        # Backward-compat: legacy callers could write
+        # ToolSelectionSpec(mcp_servers=frozenset()) to express
+        # "no MCP tools" even without a categories filter. Honor
+        # that here (the abstract method is still enforced -- this
+        # is just the ALL subclass's concrete implementation).
+        if self.mcp_servers is not None and len(self.mcp_servers) == 0:
+            return False
+        return True
 
-        Returns ``False`` if either:
-          - ``categories`` is set and doesn't contain ``"mcp"`` -- no
-            MCP work allowed regardless of server selection
-          - ``mcp_servers`` is an explicit empty set -- caller said
-            "no MCP tools"
+    def includes_custom_api(self) -> bool:
+        # Backward-compat mirror of includes_mcp above for the
+        # explicit-exclude legacy shape.
+        if self.custom_api_ids is not None and len(self.custom_api_ids) == 0:
+            return False
+        return True
 
-        Otherwise returns ``True``. The creator is then responsible for
-        consulting ``mcp_servers`` to filter at the server level.
-        """
-        if self.categories is not None and "mcp" not in self.categories:
+    def includes_published_agent(self) -> bool:
+        if self.published_agent_ids is not None and len(self.published_agent_ids) == 0:
+            return False
+        return True
+
+    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+        # None signals "no name-level filter" -- factory keeps
+        # every tool returned by the registry.
+        return None
+
+
+@dataclass(frozen=True)
+class _SpecNone(ToolSelectionSpec):
+    """NONE mode — explicit "zero tools" (no UI entry today, reserved).
+
+    ``categories`` is an explicit empty frozenset so existing
+    callsites that test ``spec.categories is not None`` see "set"
+    and walk the "no intersection" branch (factory.py:ToolRegistry
+    then skips every creator). This mirrors the original
+    ``categories=frozenset()`` "explicit exclusion" semantics
+    documented on the old dataclass.
+    """
+
+    categories: Optional[frozenset[str]] = field(default_factory=lambda: frozenset())
+    mcp_servers: Optional[frozenset[str]] = None
+    custom_api_ids: Optional[frozenset[int]] = None
+    published_agent_ids: Optional[frozenset[int]] = None
+
+    def is_all(self) -> bool:
+        return False
+
+    def is_none(self) -> bool:
+        return True
+
+    def is_by_categories(self) -> bool:
+        return False
+
+    def includes_mcp(self) -> bool:
+        return False
+
+    def includes_custom_api(self) -> bool:
+        return False
+
+    def includes_published_agent(self) -> bool:
+        return False
+
+    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+        # Empty frozenset signals "filter to []" -- factory drops
+        # every tool returned by the registry. Distinct from
+        # ``None`` (ALL mode, keep everything).
+        return frozenset()
+
+
+@dataclass(frozen=True)
+class _SpecByCategories(ToolSelectionSpec):
+    """BY_CATEGORIES mode — filtered build.
+
+    ``categories`` MUST be non-empty (the ``from_raw`` normalizer
+    routes empty input to ``_SpecAll``; direct construction with
+    empty categories raises ``ValueError`` at __post_init__).
+    """
+
+    categories: frozenset[str] = field(default_factory=frozenset)
+    mcp_servers: Optional[frozenset[str]] = None
+    custom_api_ids: Optional[frozenset[int]] = None
+    published_agent_ids: Optional[frozenset[int]] = None
+    # Workforce worker tool name injection. Only meaningful in
+    # BY_CATEGORIES mode (in ALL the full set already includes
+    # them; in NONE everything is rejected).
+    name_extras: frozenset[str] = field(default_factory=frozenset)
+
+    def __post_init__(self) -> None:
+        if not self.categories:
+            raise ValueError(
+                "_SpecByCategories requires non-empty categories. "
+                "Use ToolSelectionSpec.from_raw() with empty / None "
+                "categories to get _SpecAll, or pass "
+                "explicit_none=True for _SpecNone."
+            )
+        # Defense against direct-construction bypass: if categories
+        # carry the agent-builder ``mcp:<server>`` sub-category form,
+        # the parallel ``mcp_servers`` field must be populated for the
+        # MCP creator's per-server filter to work. ``from_raw`` derives
+        # both consistently; a caller that direct-constructs with
+        # ``mcp:<server>`` in categories but ``mcp_servers=None`` would
+        # land in an inconsistent state.
+        mcp_sub_categories = {
+            c for c in self.categories if isinstance(c, str) and c.startswith("mcp:")
+        }
+        if mcp_sub_categories and self.mcp_servers is None:
+            raise ValueError(
+                f"_SpecByCategories with mcp:<server> sub-categories "
+                f"({sorted(mcp_sub_categories)}) requires mcp_servers "
+                f"to be set (the parallel per-server filter). "
+                f"Construct via ToolSelectionSpec.from_raw(tool_categories=...) "
+                f"to derive both fields consistently."
+            )
+
+    def is_all(self) -> bool:
+        return False
+
+    def is_none(self) -> bool:
+        return False
+
+    def is_by_categories(self) -> bool:
+        return True
+
+    def includes_mcp(self) -> bool:
+        # Need "mcp" in categories; otherwise the registry-level
+        # skip would have caught it but creators with no static
+        # categories annotation can still consult this method.
+        if "mcp" not in self.categories:
             return False
         if self.mcp_servers is not None and len(self.mcp_servers) == 0:
             return False
         return True
 
     def includes_custom_api(self) -> bool:
-        """Whether the Custom API creator should run.
-
-        Mirrors :meth:`includes_mcp` but for custom APIs.
-        """
+        # P2 fix: Custom API tools live under the "other" category.
+        # If the caller restricts categories without including
+        # "other", custom API tools cannot survive the post-build
+        # name filter, so the creator's DB lookup is wasted I/O.
+        if "other" not in self.categories:
+            return False
         if self.custom_api_ids is not None and len(self.custom_api_ids) == 0:
             return False
         return True
 
     def includes_published_agent(self) -> bool:
-        """Whether the Published Agent delegation creators should run.
-
-        Mirrors :meth:`includes_mcp` but for published agents.
-        """
+        if "agent" not in self.categories:
+            return False
         if self.published_agent_ids is not None and len(self.published_agent_ids) == 0:
             return False
         return True
+
+    def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
+        """Filter ``all_tools`` by ``categories`` + add ``name_extras``.
+
+        Folds the matching logic of the retired
+        ``select_allowed_tool_names_from_categories`` helper plus
+        the ``_merge_workforce_tool_names`` workforce-extra step
+        into a single dispatch.
+
+        Duck-typed access to ``tool.metadata.category`` keeps this
+        module free of any Tool / AbstractBaseTool import.
+        """
+        names: Set[str] = set()
+        for tool in all_tools:
+            if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
+                continue
+            tool_name = getattr(tool, "name", None)
+            if not isinstance(tool_name, str):
+                continue
+            category = str(tool.metadata.category.value)
+
+            # Direct category match — except "mcp" and "other" which
+            # have sub-category semantics handled below. ``from_raw``
+            # adds "mcp" and "other" to ``categories`` to keep the
+            # registry-level skip happy (creators run), but at the
+            # name-filter step we want only the specific
+            # ``mcp_<server>_*`` / ``api_<server>_call`` tools that
+            # match the user's ``mcp:<server>`` selection, not every
+            # MCP/other tool.
+            if category in self.categories and category not in ("mcp", "other"):
+                names.add(tool_name)
+                continue
+
+            # "mcp:<server>" sub-category — match mcp_<server>_*
+            if category == "mcp":
+                for cat_spec in self.categories:
+                    if not cat_spec.startswith("mcp:"):
+                        continue
+                    server = (
+                        cat_spec.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                    )
+                    if tool_name.lower().startswith(f"mcp_{server.lower()}_"):
+                        names.add(tool_name)
+                        break
+
+            # "mcp:<server>" sub-category — match api_<server>_call
+            # (Custom-API tools surface under the "other" category but
+            # the user expresses them through the same mcp:<server> tag.)
+            elif category == "other":
+                for cat_spec in self.categories:
+                    if not cat_spec.startswith("mcp:"):
+                        continue
+                    server = (
+                        cat_spec.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                    )
+                    if tool_name.lower() == f"api_{server.lower()}_call":
+                        names.add(tool_name)
+                        break
+
+        # Inject workforce worker tool names (only meaningful in
+        # this mode; ``from_raw`` zeroes out for ALL / NONE).
+        return frozenset(names | self.name_extras)

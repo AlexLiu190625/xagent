@@ -31,6 +31,8 @@ What these tests pin:
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
 from typing import List
 from unittest.mock import AsyncMock, MagicMock
 
@@ -133,15 +135,16 @@ def isolated_registry():
 
 
 class _FakeConfig:
-    """Stand-in for ``BaseToolConfig`` carrying only the attribute the
-    factory's spec-skip logic reads. Avoids the abstract-method burden
-    of subclassing BaseToolConfig for these unit tests."""
+    """Stand-in for ``BaseToolConfig`` carrying only the attributes /
+    methods the factory's spec-skip logic reads. Avoids the
+    abstract-method burden of subclassing BaseToolConfig for these
+    unit tests."""
 
     def __init__(self, selection_spec: ToolSelectionSpec | None = None):
-        self.selection_spec = selection_spec
+        self._tool_selection_spec = selection_spec
 
-    def get_allowed_tools(self):  # noqa: D401
-        return None
+    def get_tool_selection_spec(self):  # noqa: D401
+        return self._tool_selection_spec
 
     def get_sandbox(self):  # noqa: D401
         return None
@@ -218,7 +221,10 @@ class _MCPConfig:
         selection_spec: ToolSelectionSpec | None = None,
     ):
         self._servers = servers
-        self.selection_spec = selection_spec
+        self._tool_selection_spec = selection_spec
+
+    def get_tool_selection_spec(self):
+        return self._tool_selection_spec
 
     async def get_mcp_server_configs(self):
         return self._servers
@@ -374,96 +380,11 @@ async def test_mcp_no_per_server_filter_when_spec_lacks_servers(monkeypatch):
 # ----- factory.py:194 allowed_tools=[] semantic fix ----------------------
 
 
-class _ConfigWithAllowed:
-    """Config returning a fixed ``allowed_tools`` so we can pin the
-    factory's filter behavior. Other accessors return safe defaults."""
-
-    def __init__(self, allowed: List[str] | None):
-        self._allowed = allowed
-
-    def get_allowed_tools(self):
-        return self._allowed
-
-    def get_sandbox(self):
-        return None
-
-    def get_workspace_config(self):
-        return None
-
-    @property
-    def selection_spec(self):
-        return None
-
-
-async def test_allowed_tools_empty_list_filters_to_empty(
-    isolated_registry, monkeypatch
-):
-    """Pre-fix behavior: ``allowed_tools=[]`` only logged a warning and
-    left the full tool set in place -- subtle leak when callers wanted
-    explicit exclusion. Post-fix: empty list filters to empty.
-    """
-    fake_tool = MagicMock()
-    fake_tool.name = "basic_tool"
-    fake_tool.metadata.category = MagicMock(value="basic")
-    creator = AsyncMock(return_value=[fake_tool])
-    creator.__name__ = "creator"
-    isolated_registry.register(creator, categories={"basic"})
-
-    # Stub the second-stage filters ToolFactory.create_all_tools chains
-    # on (sandbox wrapping, output filtering); we want to assert the
-    # name-filter slice in isolation.
-    monkeypatch.setattr(
-        ToolFactory, "_apply_output_filters", staticmethod(lambda tools, cfg: tools)
-    )
-
-    tools = await ToolFactory.create_all_tools(
-        _ConfigWithAllowed([]), apply_user_override_filter=False
-    )
-    assert tools == []
-
-
-async def test_allowed_tools_none_returns_all(isolated_registry, monkeypatch):
-    """``allowed_tools=None`` keeps the original "no name-level filter"
-    behavior, complementary to the empty-list case above."""
-    fake_tool = MagicMock()
-    fake_tool.name = "basic_tool"
-    fake_tool.metadata.category = MagicMock(value="basic")
-    creator = AsyncMock(return_value=[fake_tool])
-    creator.__name__ = "creator"
-    isolated_registry.register(creator, categories={"basic"})
-
-    monkeypatch.setattr(
-        ToolFactory, "_apply_output_filters", staticmethod(lambda tools, cfg: tools)
-    )
-
-    tools = await ToolFactory.create_all_tools(
-        _ConfigWithAllowed(None), apply_user_override_filter=False
-    )
-    assert len(tools) == 1
-
-
-async def test_allowed_tools_subset_filters_by_name(isolated_registry, monkeypatch):
-    """The name-filter still narrows the result when ``allowed_tools``
-    is a non-empty list."""
-    tool_a = MagicMock(name="a")
-    tool_a.name = "tool_a"
-    tool_a.metadata.category = MagicMock(value="basic")
-    tool_b = MagicMock(name="b")
-    tool_b.name = "tool_b"
-    tool_b.metadata.category = MagicMock(value="basic")
-    creator = AsyncMock(return_value=[tool_a, tool_b])
-    creator.__name__ = "creator"
-    isolated_registry.register(creator, categories={"basic"})
-
-    monkeypatch.setattr(
-        ToolFactory, "_apply_output_filters", staticmethod(lambda tools, cfg: tools)
-    )
-
-    tools = await ToolFactory.create_all_tools(
-        _ConfigWithAllowed(["tool_a"]), apply_user_override_filter=False
-    )
-    assert len(tools) == 1
-    assert tools[0].name == "tool_a"
+# ``_ConfigWithAllowed`` + the 3 raw-allowed_tools tests it backed are
+# OBSOLETE: the factory no longer reads ``config.get_allowed_tools()``
+# directly. Same behaviors are now pinned by ``test_factory_*_mode_*``
+# above (ALL → keep all, NONE → []  via ``_SpecNone()``, BY_CATEGORIES
+# → filter via ``_SpecByCategories.compute_allowed_names``).
 
 
 # ----- End-to-end: tool_categories → spec → factory dispatch -------------
@@ -525,12 +446,11 @@ class _E2EConfig:
     Carries the spec produced by chat.py's helper plus the minimal
     accessors ToolFactory.create_all_tools touches."""
 
-    def __init__(self, selection_spec, allowed_tools=None):
-        self.selection_spec = selection_spec
-        self._allowed_tools = allowed_tools
+    def __init__(self, selection_spec):
+        self._tool_selection_spec = selection_spec
 
-    def get_allowed_tools(self):
-        return self._allowed_tools
+    def get_tool_selection_spec(self):
+        return self._tool_selection_spec
 
     def get_sandbox(self):
         return None
@@ -546,9 +466,9 @@ async def test_e2e_single_basic_category_skips_all_others(static_creators):
     factory must dispatch *only* the basic creator. All seven other
     static creators stay un-called.
     """
-    from xagent.web.api.chat import _build_selection_spec_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    spec = _build_selection_spec_from_categories(["basic"])
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic"])
     assert spec is not None
     assert spec.categories == frozenset({"basic"})
     assert spec.mcp_servers is None
@@ -570,10 +490,18 @@ async def test_e2e_multi_category_dispatches_matching_creators(static_creators):
     'vision']): the spec includes all of them, the factory dispatches
     exactly those creators and skips the only category absent from
     the agent's selection (``ppt``)."""
-    from xagent.web.api.chat import _build_selection_spec_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    spec = _build_selection_spec_from_categories(
-        ["basic", "browser", "file", "database", "image", "knowledge", "vision"]
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=[
+            "basic",
+            "browser",
+            "file",
+            "database",
+            "image",
+            "knowledge",
+            "vision",
+        ]
     )
 
     await ToolFactory.create_all_tools(
@@ -594,10 +522,10 @@ async def test_e2e_mcp_server_form_extracts_servers_and_includes_mcp(static_crea
     (so the MCP creator's per-server filter narrows the work). Mimics
     agent 252 "Email Agent (Sales)_V2" = ['basic', 'file', 'knowledge',
     'mcp:Gmail']."""
-    from xagent.web.api.chat import _build_selection_spec_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    spec = _build_selection_spec_from_categories(
-        ["basic", "file", "knowledge", "mcp:Gmail"]
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic", "file", "knowledge", "mcp:Gmail"]
     )
 
     # ``"mcp"`` and ``"other"`` are added implicitly by the builder so the
@@ -630,10 +558,10 @@ async def test_e2e_mcp_server_name_normalization_matches_prod_shape(static_creat
     space-separated names to underscore-separated so the downstream
     per-server filter in mcp_tools.create_mcp_tools (which applies the
     same normalization to the server's stored ``name``) matches."""
-    from xagent.web.api.chat import _build_selection_spec_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    spec = _build_selection_spec_from_categories(
-        ["mcp:Google Calendar", "mcp:Google Drive", "mcp:HubSpot"]
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["mcp:Google Calendar", "mcp:Google Drive", "mcp:HubSpot"]
     )
 
     # All three server names normalized identically to the way
@@ -651,10 +579,13 @@ async def test_e2e_empty_categories_yields_none_spec(static_creators):
     This is the property production code relies on to never
     accidentally suppress tools for legacy agents that pre-date the
     tool_categories field."""
-    from xagent.web.api.chat import _build_selection_spec_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    assert _build_selection_spec_from_categories(None) is None
-    assert _build_selection_spec_from_categories([]) is None
+    # Empty / None → _SpecAll (mode predicate is_all()), not None.
+    # "No restriction" is represented as an explicit mode subclass
+    # rather than a sentinel value on a single dataclass.
+    assert ToolSelectionSpec.from_raw(tool_categories=None).is_all()
+    assert ToolSelectionSpec.from_raw(tool_categories=[]).is_all()
 
     await ToolFactory.create_all_tools(
         _E2EConfig(None), apply_user_override_filter=False
@@ -694,11 +625,10 @@ def test_select_allowed_tool_names_none_input_returns_none() -> None:
     """``tool_categories=None`` is the "未配置" sentinel and must map
     to ``None`` (factory's "no name-level restriction" short-circuit).
     """
-    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    result = select_allowed_tool_names_from_categories(
-        tool_categories=None,
-        all_tools=[_mock_tool("calculator", "basic")],
+    result = ToolSelectionSpec.from_raw(tool_categories=None).compute_allowed_names(
+        [_mock_tool("calculator", "basic")],
     )
     assert result is None, (
         "tool_categories=None must yield None (ALL semantics); a non-None "
@@ -713,11 +643,10 @@ def test_select_allowed_tool_names_empty_input_returns_none() -> None:
     from those agents. The SSOT helper normalizes ``[]`` to the same
     "未配置 → ALL" semantics as ``None``.
     """
-    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    result = select_allowed_tool_names_from_categories(
-        tool_categories=[],
-        all_tools=[
+    result = ToolSelectionSpec.from_raw(tool_categories=[]).compute_allowed_names(
+        [
             _mock_tool("calculator", "basic"),
             _mock_tool("file_read", "file"),
         ],
@@ -732,11 +661,12 @@ def test_select_allowed_tool_names_empty_input_returns_none() -> None:
 def test_select_allowed_tool_names_plain_category_match() -> None:
     """Plain category entry matches tools whose
     ``metadata.category.value`` equals the entry."""
-    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    result = select_allowed_tool_names_from_categories(
-        tool_categories=["basic"],
-        all_tools=[
+    result = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"]
+    ).compute_allowed_names(
+        [
             _mock_tool("calculator", "basic"),
             _mock_tool("python_executor", "basic"),
             _mock_tool("file_read", "file"),
@@ -749,11 +679,12 @@ def test_select_allowed_tool_names_mcp_server_form() -> None:
     """``mcp:<server>`` entry matches tools named ``mcp_<server>_*``
     (case-insensitive, with spaces / dashes folded to underscores).
     """
-    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    result = select_allowed_tool_names_from_categories(
-        tool_categories=["mcp:Gmail"],
-        all_tools=[
+    result = ToolSelectionSpec.from_raw(
+        tool_categories=["mcp:Gmail"]
+    ).compute_allowed_names(
+        [
             _mock_tool("mcp_gmail_send_message", "mcp"),
             _mock_tool("mcp_gmail_list_messages", "mcp"),
             _mock_tool("mcp_slack_send", "mcp"),  # different server, excluded
@@ -778,17 +709,512 @@ def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
     a legitimate 0 tools intent from the unconfigured "build all"
     semantic.
     """
-    from xagent.web.api.chat import select_allowed_tool_names_from_categories
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
-    result = select_allowed_tool_names_from_categories(
-        tool_categories=["mcp:UnknownServer"],
-        all_tools=[
+    result = ToolSelectionSpec.from_raw(
+        tool_categories=["mcp:UnknownServer"]
+    ).compute_allowed_names(
+        [
             _mock_tool("calculator", "basic"),
             _mock_tool("mcp_gmail_send", "mcp"),
         ],
     )
-    assert result == [], (
-        "Non-empty input with no matches must return [] (legitimate 0 "
-        "tools), not None (ALL); the latter would silently allow every "
-        "tool when the user specifically picked an unknown MCP server."
+    # Non-empty input with no matches: ``compute_allowed_names`` returns
+    # an empty frozenset (BY_CATEGORIES filtered to nothing matched),
+    # NOT None (which is the ALL-mode sentinel). Distinct return shapes
+    # are load-bearing -- factory L252 differentiates "filter to []" vs
+    # "no filter, keep all".
+    assert result == frozenset(), (
+        "Non-empty input with no matches must return frozenset() "
+        "(legitimate 0 tools), not None (ALL); the latter would silently "
+        "allow every tool when the user specifically picked an unknown "
+        "MCP server."
+    )
+
+
+# ----- ABC sealed-type strict invariants ---------------------------------
+#
+# These pin the type-level enforcement that replaces the older
+# runtime truthiness check on "None vs frozenset() vs frozenset({...})".
+# Adding a new abstract method on ToolSelectionSpec forces every
+# subclass to implement it -- a missing implementation is caught at
+# instantiation time (not silently with a default).
+
+
+def test_abc_base_cannot_be_instantiated_via_subclass_constructor():
+    """Direct ``_SpecAll() / _SpecNone() / _SpecByCategories()``
+    construction works -- they are concrete. Only the base ABC
+    rejects instantiation, and we verify that via the missing-
+    implementation test below (subclass that fails to override an
+    abstract method)."""
+    from xagent.core.tools.adapters.vibe.selection_spec import (
+        _SpecAll,
+        _SpecByCategories,
+        _SpecNone,
+    )
+
+    # Concrete subclasses work.
+    assert _SpecAll() is not None
+    assert _SpecNone() is not None
+    assert _SpecByCategories(categories=frozenset({"basic"})) is not None
+
+
+def test_abc_subclass_missing_abstract_method_raises_on_instantiation():
+    """``@abstractmethod`` enforces mode-dispatch completeness:
+    a subclass that fails to implement an abstract method cannot
+    be instantiated. This is the type-system replacement for the
+    grep test that used to police mode dispatch correctness."""
+    from dataclasses import dataclass
+
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+
+    # Define a subclass that misses ``compute_allowed_names``.
+    @dataclass(frozen=True)
+    class _BadSubclass(ToolSelectionSpec):
+        def is_all(self):
+            return True
+
+        def is_none(self):
+            return False
+
+        def is_by_categories(self):
+            return False
+
+        def includes_mcp(self):
+            return True
+
+        def includes_custom_api(self):
+            return True
+
+        def includes_published_agent(self):
+            return True
+
+        # compute_allowed_names deliberately missing -- ABC should
+        # reject instantiation.
+
+    with pytest.raises(TypeError, match=r"abstract method.*compute_allowed_names"):
+        _BadSubclass()
+
+
+def test_by_categories_rejects_empty_categories():
+    """``_SpecByCategories(categories=frozenset())`` would express
+    "BY_CATEGORIES with zero categories" which is semantically
+    indistinguishable from NONE mode; ``__post_init__`` rejects it
+    to keep modes mutually exclusive and force callers to ``_SpecNone()``.
+    """
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    with pytest.raises(ValueError, match="non-empty categories"):
+        _SpecByCategories(categories=frozenset())
+
+
+def test_subclasses_are_frozen():
+    """Frozen dataclasses; mutation raises ``FrozenInstanceError``."""
+    from dataclasses import FrozenInstanceError
+
+    from xagent.core.tools.adapters.vibe.selection_spec import (
+        _SpecAll,
+        _SpecByCategories,
+        _SpecNone,
+    )
+
+    sa = _SpecAll()
+    sn = _SpecNone()
+    sc = _SpecByCategories(categories=frozenset({"basic"}))
+
+    with pytest.raises(FrozenInstanceError):
+        sa.categories = frozenset({"x"})  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        sn.categories = frozenset({"x"})  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        sc.categories = frozenset({"x"})  # type: ignore[misc]
+
+
+# ----- Mode predicates (explicit replaces implicit) ----------------------
+
+
+def test_spec_all_mode_predicates():
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
+
+    s = _SpecAll()
+    assert s.is_all() is True
+    assert s.is_none() is False
+    assert s.is_by_categories() is False
+
+
+def test_spec_none_mode_predicates():
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
+
+    s = _SpecNone()
+    assert s.is_all() is False
+    assert s.is_none() is True
+    assert s.is_by_categories() is False
+
+
+def test_spec_by_categories_mode_predicates():
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    s = _SpecByCategories(categories=frozenset({"basic"}))
+    assert s.is_all() is False
+    assert s.is_none() is False
+    assert s.is_by_categories() is True
+
+
+# ----- from_raw single normalizer (4 entry cases) ------------------------
+
+
+def test_from_raw_none_categories_yields_all_mode():
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=None)
+    assert isinstance(spec, _SpecAll)
+
+
+def test_from_raw_empty_categories_yields_all_mode():
+    """Legacy "未配置" semantics: empty list is NOT zero tools, it's
+    ALL — every callsite must go through ``from_raw`` so this holds
+    consistently."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=[])
+    assert isinstance(spec, _SpecAll)
+
+
+def test_from_raw_categories_yields_by_categories_mode():
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "file"])
+    assert isinstance(spec, _SpecByCategories)
+    assert spec.categories == frozenset({"basic", "file"})
+
+
+def test_from_raw_explicit_none_yields_none_mode():
+    """``explicit_none=True`` wins over a non-empty ``tool_categories`` --
+    reserved entry for a future product UI for "zero tools"."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"],  # would normally yield BY_CATEGORIES
+        explicit_none=True,
+    )
+    assert isinstance(spec, _SpecNone)
+
+
+def test_from_raw_workforce_extras_ignored_in_all_mode():
+    """``workforce_extra_names`` is only meaningful in BY_CATEGORIES;
+    silently ignored in ALL (full set already includes everything)."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=None,
+        workforce_extra_names={"some_worker_tool"},
+    )
+    # ALL mode: no name_extras field on _SpecAll, callsite that
+    # asks for extras must have categories set.
+    assert isinstance(spec, _SpecAll)
+
+
+def test_from_raw_workforce_extras_carried_in_by_categories():
+    """In BY_CATEGORIES, ``workforce_extra_names`` lands on
+    :attr:`_SpecByCategories.name_extras` for ``compute_allowed_names``
+    injection."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"],
+        workforce_extra_names={"worker_tool_a", "worker_tool_b"},
+    )
+    assert isinstance(spec, _SpecByCategories)
+    assert spec.name_extras == frozenset({"worker_tool_a", "worker_tool_b"})
+
+
+# ----- P2 fix: includes_custom_api with category restriction -------------
+
+
+def test_by_categories_excludes_custom_api_when_other_missing():
+    """P2 fix: ``categories={"basic"}`` excludes ``"other"``, so Custom
+    API tools cannot survive the post-build category filter. The
+    ``create_db_custom_api_tools`` creator's ``get_custom_api_configs()``
+    DB lookup is wasted I/O in this case -- ``includes_custom_api``
+    must short-circuit."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = _SpecByCategories(categories=frozenset({"basic"}))
+    assert spec.includes_custom_api() is False
+
+
+def test_by_categories_includes_custom_api_when_other_present():
+    """Mirror of the P2 fix: ``"other"`` IN categories means custom
+    API tools survive the filter; creator must run."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = _SpecByCategories(categories=frozenset({"other"}))
+    assert spec.includes_custom_api() is True
+
+
+def test_by_categories_excludes_custom_api_when_other_present_but_ids_empty():
+    """Even with ``"other"`` in categories, an explicit empty
+    ``custom_api_ids=frozenset()`` skips the creator (legacy
+    'explicit exclude' shape preserved)."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = _SpecByCategories(
+        categories=frozenset({"other"}),
+        custom_api_ids=frozenset(),
+    )
+    assert spec.includes_custom_api() is False
+
+
+# ----- compute_allowed_names mode dispatch -------------------------------
+
+
+def test_compute_allowed_names_all_returns_none():
+    """ALL mode: factory should keep every tool, signalled by None."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
+
+    spec = _SpecAll()
+    result = spec.compute_allowed_names(
+        [_mock_tool("calc", "basic"), _mock_tool("img", "image")]
+    )
+    assert result is None
+
+
+def test_compute_allowed_names_none_returns_empty_frozenset():
+    """NONE mode: factory should drop every tool, signalled by
+    empty frozenset. Distinct from None (ALL) -- the
+    ``if allowed_names is not None`` check in factory differentiates."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
+
+    spec = _SpecNone()
+    result = spec.compute_allowed_names(
+        [_mock_tool("calc", "basic"), _mock_tool("img", "image")]
+    )
+    assert result == frozenset()
+
+
+def test_compute_allowed_names_by_categories_filters_correctly():
+    """BY_CATEGORIES mode: only tools whose category matches survive,
+    plus any ``name_extras`` injection."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = _SpecByCategories(
+        categories=frozenset({"basic"}),
+        name_extras=frozenset({"injected_worker_tool"}),
+    )
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("calc", "basic"),
+            _mock_tool("img", "image"),  # not in categories
+            _mock_tool("file", "file"),  # not in categories
+        ]
+    )
+    assert result == frozenset({"calc", "injected_worker_tool"})
+
+
+# ----- Factory L252 dispatch through spec.compute_allowed_names ---------
+
+
+async def test_factory_all_mode_keeps_all_tools(isolated_registry):
+    """ALL mode: factory must NOT name-filter; all tools from the
+    registry survive into the returned list."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
+
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic.__name__ = "basic_creator"
+    isolated_registry.register(basic, categories={"basic"})
+
+    cfg = MagicMock()
+    cfg.get_tool_selection_spec.return_value = _SpecAll()
+    cfg.get_allowed_tools.return_value = None
+    cfg.get_sandbox.return_value = None
+    cfg.get_workspace_config.return_value = None
+    cfg.get_user_tool_overrides.return_value = {}
+    cfg.get_max_output_length.return_value = None
+    cfg.get_max_field_count.return_value = None
+    cfg.get_max_recursion_depth.return_value = None
+
+    tools = await ToolFactory.create_all_tools(cfg)
+    assert [t.name for t in tools] == ["calc"]
+
+
+async def test_factory_none_mode_filters_to_empty(isolated_registry):
+    """NONE mode: factory must drop every tool (compute_allowed_names
+    returns frozenset() → caller filters to [])."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
+
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic.__name__ = "basic_creator"
+    isolated_registry.register(basic, categories={"basic"})
+
+    cfg = MagicMock()
+    cfg.get_tool_selection_spec.return_value = _SpecNone()
+    cfg.get_allowed_tools.return_value = None
+    cfg.get_sandbox.return_value = None
+    cfg.get_workspace_config.return_value = None
+    cfg.get_user_tool_overrides.return_value = {}
+    cfg.get_max_output_length.return_value = None
+    cfg.get_max_field_count.return_value = None
+    cfg.get_max_recursion_depth.return_value = None
+
+    tools = await ToolFactory.create_all_tools(cfg)
+    assert tools == []
+
+
+async def test_factory_by_categories_filters_by_compute_allowed_names(
+    isolated_registry,
+):
+    """BY_CATEGORIES mode: factory must filter the registry's output to
+    only the names returned by ``spec.compute_allowed_names``."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    basic_creator = AsyncMock(
+        return_value=[
+            _mock_tool("calc", "basic"),
+            _mock_tool("search", "basic"),
+        ]
+    )
+    basic_creator.__name__ = "basic_creator"
+    file_creator = AsyncMock(return_value=[_mock_tool("read", "file")])
+    file_creator.__name__ = "file_creator"
+    isolated_registry.register(basic_creator, categories={"basic"})
+    isolated_registry.register(file_creator, categories={"file"})
+
+    cfg = MagicMock()
+    cfg.get_tool_selection_spec.return_value = _SpecByCategories(
+        categories=frozenset({"basic"})
+    )
+    cfg.get_allowed_tools.return_value = None
+    cfg.get_sandbox.return_value = None
+    cfg.get_workspace_config.return_value = None
+    cfg.get_user_tool_overrides.return_value = {}
+    cfg.get_max_output_length.return_value = None
+    cfg.get_max_field_count.return_value = None
+    cfg.get_max_recursion_depth.return_value = None
+
+    tools = await ToolFactory.create_all_tools(cfg)
+    # ``file_creator`` is registry-skipped (declared "file", spec wants
+    # only "basic"); ``basic_creator`` runs and both names survive
+    # the post-build filter.
+    assert sorted(t.name for t in tools) == ["calc", "search"]
+
+
+def test_compute_allowed_names_by_categories_mcp_subcategory_match():
+    """``mcp:Gmail`` sub-category in categories matches ``mcp_gmail_*``
+    tool names (case-insensitive, spaces normalized)."""
+    # Use from_raw so ``mcp_servers`` is derived consistently with
+    # ``categories`` -- direct ``_SpecByCategories`` construction with
+    # ``mcp:<server>`` in categories but ``mcp_servers=None`` is
+    # rejected by ``__post_init__`` (defense against bypass).
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_gmail_send", "mcp"),
+            _mock_tool("mcp_gmail_read", "mcp"),
+            _mock_tool("mcp_slack_post", "mcp"),  # different server
+            _mock_tool("calc", "basic"),
+        ]
+    )
+    assert result == frozenset({"mcp_gmail_send", "mcp_gmail_read"})
+
+
+# ----- Mechanical SSOT pins(防未来同类回归)-----------------------------
+#
+# Defense-in-depth source-level grep tests. ABC + abstractmethod already
+# polices mode-dispatch completeness; these tests catch the kind of
+# pattern that the SSOT extraction was meant to eliminate — new
+# callpaths that bypass the normalizer with inline category matching,
+# new ``@register_tool`` creators forgetting the ``categories=``
+# annotation. If one fails, the message points the reader at the fix;
+# do NOT silence the test, fix the violation.
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+_SRC_ROOT = _REPO_ROOT / "src"
+
+
+def _iter_production_python_files():
+    """Yield every .py under src/ EXCEPT the helper module(s) that
+    legitimately implement the inlined match logic. Tests live under
+    tests/ so we skip src/ → tests/ is naturally excluded."""
+    helper_modules = {"selection_spec.py"}
+    for path in _SRC_ROOT.rglob("*.py"):
+        if path.name in helper_modules:
+            continue
+        yield path
+
+
+def test_no_inline_tool_categories_matching_in_production():
+    """Mechanical SSOT pin: only ``selection_spec.py`` may iterate
+    ``all_tools`` and match against ``tool.metadata.category`` to
+    derive a name allow-list. Any other file doing this bypasses the
+    ``empty list = ALL`` invariant — the exact failure mode the
+    ``AgentTool`` delegation path previously had.
+
+    If you legitimately need this mapping in a new file, call
+    ``ToolSelectionSpec.from_raw(...)`` and let
+    ``spec.compute_allowed_names`` do the matching instead.
+    """
+    inline_pattern = re.compile(
+        r"for\s+\w+\s+in\s+all_tools.*?metadata\.category", re.DOTALL
+    )
+    offenders: list[str] = []
+    for path in _iter_production_python_files():
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if inline_pattern.search(content):
+            offenders.append(str(path.relative_to(_REPO_ROOT)))
+    assert not offenders, (
+        f"Inline ``for tool in all_tools: ...metadata.category`` found in "
+        f"{offenders}. This bypasses the ToolSelectionSpec SSOT and risks "
+        f"the P1 regression where ``Agent.tool_categories=[]`` is misread "
+        f"as 'zero tools'. Replace with "
+        f"``ToolSelectionSpec.from_raw(tool_categories=...)`` and let "
+        f"``spec.compute_allowed_names`` do the matching."
+    )
+
+
+def test_register_tool_must_declare_categories_or_be_allowlisted():
+    """Every ``@register_tool`` creator MUST declare ``categories=``
+    (so the registry can skip it on category mismatch) OR be in the
+    explicit allowlist below. ``create_db_custom_api_tools`` is the
+    one legitimate unannotated creator because its tools have a
+    dynamic category that the spec's ``includes_custom_api`` checks
+    at runtime (the P2 fix). Any NEW unannotated creator must be
+    added here with rationale -- silently adding one risks the same
+    P2 perf-leak pattern (running the creator's DB lookup when the
+    spec would have skipped a static creator)."""
+    unannotated_allowlist = {"create_db_custom_api_tools"}
+    bare_register_pattern = re.compile(
+        r"^@register_tool\s*$",  # @register_tool with no args
+        re.MULTILINE,
+    )
+    function_def_after = re.compile(
+        r"^@register_tool\s*\n(?:async\s+)?def\s+(\w+)\b", re.MULTILINE
+    )
+    offenders: list[str] = []
+    for path in _iter_production_python_files():
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if not bare_register_pattern.search(content):
+            continue
+        # File has a bare ``@register_tool``; find the function name(s)
+        for match in function_def_after.finditer(content):
+            func_name = match.group(1)
+            if func_name not in unannotated_allowlist:
+                offenders.append(f"{path.relative_to(_REPO_ROOT)}:{func_name}")
+    assert not offenders, (
+        f"Unannotated ``@register_tool`` creators found: {offenders}. "
+        f"Every creator MUST declare its categories statically "
+        f"(``@register_tool(categories={{'basic'}})``) so the registry "
+        f"can skip it without invoking the creator (and any DB / network "
+        f"I/O the creator does). The only legitimate exception is "
+        f"``create_db_custom_api_tools`` whose tools have dynamic "
+        f"categories — the spec's ``includes_custom_api`` checks that at "
+        f"runtime. If you have a new dynamic-category creator, add it to "
+        f"the allowlist with rationale AND make sure "
+        f"``ToolSelectionSpec`` has the corresponding ``includes_*`` "
+        f"short-circuit method."
     )

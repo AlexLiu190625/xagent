@@ -30,7 +30,11 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     but no servers" case and the legacy spec=None backward-compat
     path.
     """
-    spec = getattr(config, "selection_spec", None)
+    spec = (
+        config.get_tool_selection_spec()
+        if hasattr(config, "get_tool_selection_spec")
+        else None
+    )
     if spec is not None and not spec.includes_mcp():
         return []
     mcp_configs = await config.get_mcp_server_configs()

@@ -1725,61 +1725,16 @@ class AgentTool(AbstractBaseTool):
                 def __init__(self, user_id: int):
                     self.user = type("obj", (), {"id": user_id})()
 
-            allowed_tools = None
-            if agent.tool_categories is not None:
-                from .factory import ToolFactory
+            # Delegated-agent tool selection goes through the shared
+            # ``ToolSelectionSpec.from_raw`` normalizer so the
+            # "empty / None tool_categories → build every default tool"
+            # invariant is preserved for legacy agents whose
+            # ``tool_categories`` field defaults to ``[]``.
+            from .selection_spec import ToolSelectionSpec
 
-                temp_config = WebToolConfig(
-                    db=self._db,
-                    request=MinimalRequest(self._user_id),
-                    user_id=self._user_id,
-                    include_mcp_tools=True,
-                    browser_tools_enabled=True,
-                    allowed_agent_ids=self._delegation_allowed_agent_ids,
-                    agent_tool_overrides=self._agent_tool_overrides,
-                    enable_global_agent_tools=self._enable_global_agent_tools,
-                    allow_cross_user_agent_ids=self._delegation_allow_cross_user_agent_ids,
-                    parent_task_id=self._parent_task_id,
-                    parent_tracer=self._parent_tracer,
-                    agent_call_stack=self._agent_call_stack,
-                )
-                all_tools = await ToolFactory.create_all_tools(temp_config)
-                allowed_tools = []
-                for tool in all_tools:
-                    if hasattr(tool, "metadata") and hasattr(tool.metadata, "category"):
-                        category = str(tool.metadata.category.value)
-                        tool_name = getattr(tool, "name", None)
-
-                        if category in agent.tool_categories:
-                            if tool_name:
-                                allowed_tools.append(tool_name)
-                        elif category == "mcp" and tool_name:
-                            for tc in agent.tool_categories:
-                                if tc.startswith("mcp:"):
-                                    server_name = (
-                                        tc.split(":", 1)[1]
-                                        .replace(" ", "_")
-                                        .replace("-", "_")
-                                    )
-                                    if tool_name.lower().startswith(
-                                        f"mcp_{server_name.lower()}_"
-                                    ):
-                                        allowed_tools.append(tool_name)
-                                        break
-                        elif category == "other" and tool_name:
-                            for tc in agent.tool_categories:
-                                if tc.startswith("mcp:"):
-                                    server_name = (
-                                        tc.split(":", 1)[1]
-                                        .replace(" ", "_")
-                                        .replace("-", "_")
-                                    )
-                                    if (
-                                        tool_name.lower()
-                                        == f"api_{server_name.lower()}_call"
-                                    ):
-                                        allowed_tools.append(tool_name)
-                                        break
+            tool_selection_spec = ToolSelectionSpec.from_raw(
+                tool_categories=agent.tool_categories,
+            )
 
             parent_db_task_id = _coerce_db_task_id(self._parent_task_id)
             tool_config = WebToolConfig(
@@ -1790,7 +1745,7 @@ class AgentTool(AbstractBaseTool):
                 if agent.knowledge_bases is not None
                 else None,
                 allowed_skills=agent.skills,
-                allowed_tools=allowed_tools,
+                tool_selection_spec=tool_selection_spec,
                 allowed_agent_ids=self._delegation_allowed_agent_ids,
                 agent_tool_overrides=self._agent_tool_overrides,
                 enable_global_agent_tools=self._enable_global_agent_tools,
@@ -2129,7 +2084,11 @@ async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
     handles the case where the spec's category set doesn't include
     ``"agent"`` at all.
     """
-    spec = getattr(config, "selection_spec", None)
+    spec = (
+        config.get_tool_selection_spec()
+        if hasattr(config, "get_tool_selection_spec")
+        else None
+    )
     if spec is not None and not spec.includes_published_agent():
         return []
     if not config.get_enable_agent_tools():
