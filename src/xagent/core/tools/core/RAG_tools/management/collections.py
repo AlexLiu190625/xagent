@@ -1261,6 +1261,18 @@ def delete_collection(
 
     warnings: List[str] = []
     metadata_cleanup_counts: dict[str, int] = {}
+    deleted_counts: Dict[str, int] = {}
+    doc_ids: List[str] = []
+
+    def _merge_deleted_counts(counts: Dict[str, int]) -> None:
+        for key, value in dict(counts).items():
+            deleted_count = int(value)
+            if deleted_count <= 0:
+                continue
+            table_name = str(key)
+            deleted_counts[table_name] = (
+                deleted_counts.get(table_name, 0) + deleted_count
+            )
 
     try:
         # Use storage abstraction for deletion
@@ -1275,18 +1287,6 @@ def delete_collection(
             max_results=DEFAULT_VECTOR_STORE_EXTENDED_SCAN_LIMIT,  # Higher limit for collection deletion
         )
         doc_ids = sorted({r.doc_id for r in doc_records})
-
-        deleted_counts: Dict[str, int] = {}
-
-        def _merge_deleted_counts(counts: Dict[str, int]) -> None:
-            for key, value in dict(counts).items():
-                deleted_count = int(value)
-                if deleted_count <= 0:
-                    continue
-                table_name = str(key)
-                deleted_counts[table_name] = (
-                    deleted_counts.get(table_name, 0) + deleted_count
-                )
 
         if is_admin:
             _merge_deleted_counts(
@@ -1323,9 +1323,36 @@ def delete_collection(
         )
 
     except Exception as exc:  # noqa: BLE001 - convert to structured failure
+        details = getattr(exc, "details", {})
+        partial_doc_ids: list[str] = []
+        if isinstance(details, dict):
+            raw_counts = details.get("deleted_counts")
+            if isinstance(raw_counts, dict):
+                _merge_deleted_counts(raw_counts)
+            raw_doc_ids = details.get("deleted_doc_ids")
+            if isinstance(raw_doc_ids, list):
+                partial_doc_ids = [str(doc_id) for doc_id in raw_doc_ids]
+
         logger.error(
             "Failed to delete collection '%s': %s", collection, exc, exc_info=True
         )
+        if deleted_counts:
+            partial_affected = [
+                CollectionOperationDetail(
+                    doc_id=doc_id,
+                    status=DocumentProcessingStatus.FAILED,
+                    message="Document deleted successfully before cleanup stopped.",
+                )
+                for doc_id in partial_doc_ids
+            ]
+            return CollectionOperationResult(
+                status="partial_success",
+                collection=collection,
+                message=f"Partially deleted collection '{collection}': {exc}",
+                warnings=warnings,
+                affected_documents=partial_affected,
+                deleted_counts=dict(deleted_counts),
+            )
         return CollectionOperationResult(
             status="error",
             collection=collection,

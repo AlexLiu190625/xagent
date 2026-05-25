@@ -879,34 +879,47 @@ class LanceDBVectorIndexStore(VectorIndexStore):
 
         batch_size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
         merged: Dict[str, int] = {}
-        for start in range(0, len(normalized_doc_ids), batch_size):
-            batch = normalized_doc_ids[start : start + batch_size]
-            try:
-                counts = cascade_delete_documents(
-                    collection=collection_name,
-                    doc_ids=batch,
-                    user_id=user_id,
-                    is_admin=is_admin,
-                    preview_only=False,
-                    confirm=True,
-                    conn=conn,
-                )
-            except Exception as exc:
-                if warnings_out is not None:
-                    warnings_out.append(
-                        "Failed to delete document batch "
-                        f"{start // batch_size + 1}: {exc}"
+        deleted_doc_ids: List[str] = []
+        try:
+            for start in range(0, len(normalized_doc_ids), batch_size):
+                batch = normalized_doc_ids[start : start + batch_size]
+                try:
+                    counts = cascade_delete_documents(
+                        collection=collection_name,
+                        doc_ids=batch,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        preview_only=False,
+                        confirm=True,
+                        conn=conn,
                     )
-                raise
-            for key, value in counts.items():
-                deleted_count = int(value)
-                if deleted_count <= 0:
-                    continue
-                merged[str(key)] = merged.get(str(key), 0) + deleted_count
+                except Exception as exc:
+                    if warnings_out is not None:
+                        warnings_out.append(
+                            "Failed to delete document batch "
+                            f"{start // batch_size + 1}: {exc}"
+                        )
+                    from ..core.exceptions import DatabaseOperationError
 
-        # Ensure subsequent reads don't observe stale cached table handles.
-        self.invalidate_table_cache()
-        return merged
+                    raise DatabaseOperationError(
+                        "Failed to delete document batch",
+                        details={
+                            "deleted_counts": dict(merged),
+                            "deleted_doc_ids": list(deleted_doc_ids),
+                            "failed_batch_index": start // batch_size + 1,
+                        },
+                    ) from exc
+                for key, value in counts.items():
+                    deleted_count = int(value)
+                    if deleted_count <= 0:
+                        continue
+                    merged[str(key)] = merged.get(str(key), 0) + deleted_count
+                deleted_doc_ids.extend(batch)
+
+            return merged
+        finally:
+            # Ensure subsequent reads don't observe stale cached table handles.
+            self.invalidate_table_cache()
 
     def _count_collections_fast(
         self,
