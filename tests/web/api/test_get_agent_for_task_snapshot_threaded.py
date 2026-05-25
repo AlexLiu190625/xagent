@@ -277,3 +277,102 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
     # before reaching this point.
     assert constructed.get("pattern") == "single_call"
     assert constructed.get("task_id") == "42"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -> None:
+    """Review fix C2: snapshot path must share the same fail-fast
+    failure policy as the reconstruct path.
+
+    Before this fix, an agent-builder task whose models couldn't be
+    resolved AND whose deployment had no global default LLM
+    (``self._default_llm`` is None — typical of CI / un-configured
+    deployments) would silently get ``task_llm = None``, build the
+    AgentService anyway, and crash later on the first LLM call. The
+    reconstruct path already raised ``HTTPException(500)`` via
+    ``_pick_default_llm_with_warning``; the snapshot path didn't.
+
+    This test pins the new contract: snapshot path also raises when
+    snapshot.agent is set, snapshot.task_llm is None, and
+    ``self._default_llm`` is None. ``saved_model_*`` diagnostic
+    fields from the snapshot's ``agent_config`` flow into the log
+    line via the same helper.
+    """
+    from fastapi import HTTPException
+
+    from xagent.web.services.llm_utils import AgentRuntimeFields
+
+    # Snapshot whose agent_builder ran but resolved no LLMs.
+    agent_builder_snapshot = TaskSetupSnapshot(
+        task=_TaskFields(
+            id=42,
+            user_id=1,
+            status=TaskStatus.PENDING,
+            agent_id=7,
+            agent_config=None,
+            model_name=None,
+            compact_model_name=None,
+            execution_mode="balanced",
+            agent_type="standard",
+        ),
+        task_pattern="react",
+        task_llm=None,
+        task_fast_llm=None,
+        task_vision_llm=None,
+        task_compact_llm=None,
+        agent=AgentRuntimeFields(
+            id=7,
+            name="builder-agent",
+            status="published",
+            instructions="be terse",
+        ),
+        agent_config={
+            "llms": (None, None, None, None),
+            "saved_model_ids": {"general": 123},
+            "saved_model_descriptors": {
+                "general": {"pk": 123, "model_id": "missing-model", "model_name": "X"}
+            },
+            "execution_mode": "balanced",
+            "instructions": "be terse",
+            "skills": [],
+            "knowledge_bases": [],
+            "tool_categories": ["basic"],
+        },
+        excluded_agent_id=7,
+    )
+
+    manager = AgentServiceManager()
+    manager._default_llm = None  # type: ignore[assignment]
+
+    user = _make_user()
+    db = MagicMock()
+    task_row = MagicMock()
+    task_row.status = TaskStatus.PENDING
+    db.query.return_value.filter.return_value.first.return_value = task_row
+
+    with (
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=agent_builder_snapshot,
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+        patch(
+            "xagent.web.api.chat.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.api.chat.create_default_tools",
+            new=AsyncMock(return_value=([], MagicMock())),
+        ),
+        patch(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            return_value=None,
+        ),
+        patch("xagent.web.api.chat.AgentService"),
+    ):
+        with pytest.raises(HTTPException) as exc_info:
+            await manager.get_agent_for_task(task_id=42, db=db, user=user)
+
+    assert exc_info.value.status_code == 500
+    assert "Agent model configuration is unavailable" in str(exc_info.value.detail)
