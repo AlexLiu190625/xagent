@@ -19,6 +19,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy.orm import sessionmaker
 
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -740,3 +741,240 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
     ), "execution_message must reach execute_task_background.llm_user_message"
     assert kwargs["context"]["turn_id"] == payload.turn_id
     assert kwargs["context"]["existing"] == "value"
+
+
+# ---------------------------------------------------------------------------
+# _runner setup-error → FAILED safety net (review fix C1: prevents the
+# acquire_lease-sets-RUNNING-then-no-one-clears-it zombie state when
+# snapshot load or execute_task_background raises)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
+    db_session,
+) -> None:
+    """Snapshot-load exception must not leave the row visible-as-running.
+
+    ``acquire_task_lease_isolated`` writes ``status=RUNNING`` as part
+    of taking the lease. Before review-fix C1, an exception out of
+    ``load_task_setup_snapshot_sync`` propagated through ``_runner``'s
+    inner ``try`` block, ``finish_turn`` and ``execute_task_background``
+    never ran, and the outer release block read the still-RUNNING
+    status and wrote it back -- task displayed as running but no
+    worker was actually executing it.
+
+    The new outer ``except`` in ``_runner`` calls
+    ``_mark_task_failed_if_running`` so the row is pushed to
+    ``FAILED`` before release. This test pins both halves: the
+    helper is invoked, and the row is FAILED at the end.
+    """
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_service import TaskLease
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            side_effect=RuntimeError("simulated snapshot load failure"),
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(),
+        ) as mock_exec,
+        patch(
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+        ) as mock_release,
+        patch(
+            "xagent.web.services.task_orchestrator.finish_turn",
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        bg_task = await _schedule_bg(
+            task=task,
+            user=user,
+            payload=TaskTurnPayload("x"),
+            force_fresh=False,
+            context=None,
+        )
+        try:
+            await bg_task
+        except RuntimeError:
+            pass
+
+    # execute_task_background must not run when snapshot load raised.
+    mock_exec.assert_not_called()
+    # Lease must still be released (otherwise the task TTL-stucks).
+    mock_release.assert_called_once()
+    # The row should now be FAILED, not the zombie RUNNING.
+    db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED, (
+        f"Expected task.status == FAILED after snapshot raise, got {task.status}. "
+        "If this fails, ``_mark_task_failed_if_running`` is not running, and the "
+        "zombie-RUNNING regression is back."
+    )
+    assert task.error_message is not None
+    assert "simulated snapshot load failure" in str(task.error_message)
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_marks_task_failed_when_execute_raises(
+    db_session,
+) -> None:
+    """Same safety net for exceptions out of ``execute_task_background``
+    that bypass its inner ``try/except``. The outer ``except`` in
+    ``_runner`` catches them and routes through
+    ``_mark_task_failed_if_running``.
+    """
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_service import TaskLease
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+
+    # Snapshot loader returns a minimal sentinel snapshot so the test
+    # proceeds past the snapshot-None branch.
+    fake_snapshot = MagicMock()
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=fake_snapshot,
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(side_effect=RuntimeError("simulated agent boom")),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+        ) as mock_release,
+        patch(
+            "xagent.web.services.task_orchestrator.finish_turn",
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        bg_task = await _schedule_bg(
+            task=task,
+            user=user,
+            payload=TaskTurnPayload("x"),
+            force_fresh=False,
+            context=None,
+        )
+        try:
+            await bg_task
+        except RuntimeError:
+            pass
+
+    mock_release.assert_called_once()
+    db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.error_message is not None
+    assert "simulated agent boom" in str(task.error_message)
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
+    db_session,
+) -> None:
+    """``_mark_task_failed_if_running`` is guarded by ``status==RUNNING``
+    so it never overwrites a terminal / control status that
+    ``execute_task_background`` may have set inside its own
+    try/except (PAUSED, WAITING_FOR_USER, FAILED, COMPLETED).
+
+    Simulate the inner handler setting PAUSED before raising. After
+    ``_runner`` returns, the row must remain PAUSED, not be flipped
+    to FAILED by the outer safety net.
+    """
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_service import TaskLease
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    fake_snapshot = MagicMock()
+
+    async def fake_execute(*args, **kwargs):
+        # Inner handler decides the turn is paused, commits, then a
+        # later step raises. Outer except must not undo the PAUSED.
+        from xagent.web.models.task import Task as TaskModel
+
+        with sessionmaker(bind=get_engine())() as inner:
+            row = inner.query(TaskModel).filter(TaskModel.id == task.id).first()
+            row.status = TaskStatus.PAUSED
+            inner.commit()
+        raise RuntimeError("simulated late-stage error after PAUSED")
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=fake_snapshot,
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=fake_execute,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.finish_turn",
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        bg_task = await _schedule_bg(
+            task=task,
+            user=user,
+            payload=TaskTurnPayload("x"),
+            force_fresh=False,
+            context=None,
+        )
+        try:
+            await bg_task
+        except RuntimeError:
+            pass
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.PAUSED, (
+        f"Expected PAUSED (set by execute), got {task.status}. If this fails, "
+        "``_mark_task_failed_if_running``'s status==RUNNING guard regressed."
+    )

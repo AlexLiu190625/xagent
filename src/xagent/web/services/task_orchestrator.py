@@ -376,6 +376,48 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
+def _mark_task_failed_if_running(task_id: int, error_message: str) -> None:
+    """Setup/run-error sentinel for ``_schedule_bg._runner``.
+
+    ``acquire_task_lease_isolated`` sets ``task.status = RUNNING`` as
+    part of taking the lease. If a later step in ``_runner`` raises
+    (snapshot load, ``execute_task_background``) and no downstream
+    handler moves the task to a terminal status, the release block
+    would see ``status=RUNNING`` and write it back -- leaving the row
+    visible as running but with no active worker (zombie state). This
+    helper closes that window: ``_runner`` calls it from an outer
+    ``except`` so the task is forced to ``FAILED`` before release.
+
+    Guarded by ``status == RUNNING`` -- never overwrites a terminal /
+    control status (``PAUSED`` / ``WAITING_FOR_USER`` / ``FAILED`` /
+    ``COMPLETED``) that ``execute_task_background`` may have set
+    inside its own inner ``try/except``. Opens / commits / closes
+    its own session so the caller doesn't have to thread a session
+    through the exception path.
+    """
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    try:
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if task is None or task.status != TaskStatus.RUNNING:
+                return
+            task.status = TaskStatus.FAILED
+            task.error_message = error_message  # type: ignore[assignment]
+            db.commit()
+    except Exception as e:
+        # Defensive: do not let this helper raise out of the ``except``
+        # path that's already handling an error. Log loudly so the
+        # zombie state, if it survives, is traceable.
+        logger.error(
+            "Failed to mark task %s as FAILED during setup/run error: %s",
+            task_id,
+            e,
+            exc_info=True,
+        )
+
+
 # ===== finish_turn / _schedule_bg (new lifecycle API) =====
 
 
@@ -591,35 +633,66 @@ async def _schedule_bg(
             stop_event = asyncio.Event()
             hb_task = asyncio.create_task(run_task_lease_heartbeat(lease, stop_event))
             try:
-                # Load the synchronous DB block on a worker thread so
-                # the main loop stays responsive. The loader opens
-                # and closes its own SessionLocal (no ORM leak), and
-                # the snapshot is passed straight through to
-                # execute_task_background → get_agent_for_task. That
-                # turns the previous chain of three redundant Task
-                # queries (here, in execute_task_background, and
-                # inside get_agent_for_task) into a single off-loop
-                # read.
-                snapshot = await asyncio.to_thread(
-                    load_task_setup_snapshot_sync, task_id, user_id
-                )
-                if snapshot is None:
-                    logger.warning(
-                        "bg task %s aborted: task vanished before snapshot load",
-                        task_id,
+                # Outer ``try/except`` is the lease-acquire-to-terminal
+                # safety net: ``acquire_task_lease_isolated`` already
+                # set ``status=RUNNING`` for this row, so any unhandled
+                # exception from snapshot load / execute_task_background
+                # would leave the task in a zombie state (visible as
+                # running, no active worker) once the release block
+                # below clears ``runner_id``. ``_mark_task_failed_if_running``
+                # closes the window. We swallow the exception so
+                # ``finish_turn`` + lease release still run cleanly with
+                # the now-terminal status.
+                try:
+                    # Load the synchronous DB block on a worker thread
+                    # so the main loop stays responsive. The loader
+                    # opens / closes its own SessionLocal (no ORM
+                    # leak), and the snapshot is passed straight
+                    # through to execute_task_background →
+                    # get_agent_for_task. That turns the previous
+                    # chain of three redundant Task queries into a
+                    # single off-loop read.
+                    snapshot = await asyncio.to_thread(
+                        load_task_setup_snapshot_sync, task_id, user_id
                     )
-                    return
+                    if snapshot is None:
+                        logger.warning(
+                            "bg task %s aborted: task vanished before snapshot load",
+                            task_id,
+                        )
+                        _mark_task_failed_if_running(
+                            task_id, "task vanished before snapshot load"
+                        )
+                        return
 
-                await execute_task_background(
-                    task_id=task_id,
-                    user_message=payload.transcript_message,
-                    context=_execution_context_with_turn_id(context, payload.turn_id),
-                    agent_manager=_get_agent_manager(),
-                    user_id=user_id,
-                    before_message_id=before_message_id,
-                    llm_user_message=payload.execution_message,
-                    task_setup_snapshot=snapshot,
-                )
+                    await execute_task_background(
+                        task_id=task_id,
+                        user_message=payload.transcript_message,
+                        context=_execution_context_with_turn_id(
+                            context, payload.turn_id
+                        ),
+                        agent_manager=_get_agent_manager(),
+                        user_id=user_id,
+                        before_message_id=before_message_id,
+                        llm_user_message=payload.execution_message,
+                        task_setup_snapshot=snapshot,
+                    )
+                except Exception as setup_or_run_err:
+                    logger.error(
+                        "bg task %s setup/run failed: %s",
+                        task_id,
+                        setup_or_run_err,
+                        exc_info=True,
+                    )
+                    _mark_task_failed_if_running(
+                        task_id,
+                        f"setup/run error: "
+                        f"{type(setup_or_run_err).__name__}: {setup_or_run_err}",
+                    )
+                    # Do not re-raise: ``finish_turn`` + release below
+                    # must run so the lease is freed and the row is
+                    # not stuck mid-lifecycle.
+
                 # Short-lived finalize session. ``finish_turn`` only
                 # reads / updates the task row once; opening here keeps
                 # the pool slot freed for the entire agent run above.
