@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import sqlite3
+import threading
+import time
 from typing import Dict
 
 import pytest
@@ -16,6 +19,7 @@ from xagent.core.model.model import (
     RerankModelConfig,
 )
 from xagent.core.model.rerank.base import BaseRerank
+from xagent.core.model.storage.error import ModelNotFoundError
 from xagent.core.tools.core.RAG_tools.core.exceptions import (
     EmbeddingAdapterError,
     RagCoreException,
@@ -34,7 +38,7 @@ class _StubHub:
 
     def load(self, model_id: str) -> object:
         if model_id not in self._models:
-            raise ValueError(f"Model {model_id} not found")
+            raise ModelNotFoundError(model_id)
         return self._models[model_id]
 
 
@@ -72,6 +76,217 @@ class TestGetOrInitModelHub:
         monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
         result = model_resolver._get_or_init_model_hub()
         assert result == stub_hub
+
+    def test_get_or_init_model_hub_initializes_cache_once_concurrently(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Concurrent callers should share one initialized engine/sessionmaker."""
+        model_resolver._reset_model_hub_cache()
+
+        worker_count = 5
+        barrier = threading.Barrier(worker_count)
+        guard = threading.Lock()
+        create_calls: list[object] = []
+        sessionmaker_calls: list[object] = []
+        sessions: list[object] = []
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.disposed = False
+
+            def dispose(self) -> None:
+                self.disposed = True
+
+        class FakeMetadata:
+            def create_all(self, engine: object) -> None:
+                time.sleep(0.02)
+
+        class FakeBase:
+            metadata = FakeMetadata()
+
+        class FakeSessionLocal:
+            def __call__(self) -> object:
+                session = object()
+                with guard:
+                    sessions.append(session)
+                return session
+
+        class FakeHub:
+            def __init__(self, db: object, model: object) -> None:
+                self.db = db
+                self.model = model
+
+        fake_session_local = FakeSessionLocal()
+        fake_model = object()
+
+        def fake_create_engine(*args: object, **kwargs: object) -> FakeEngine:
+            engine = FakeEngine()
+            with guard:
+                create_calls.append(engine)
+            time.sleep(0.05)
+            return engine
+
+        def fake_sessionmaker(*args: object, **kwargs: object) -> FakeSessionLocal:
+            with guard:
+                sessionmaker_calls.append(kwargs.get("bind"))
+            return fake_session_local
+
+        def worker() -> FakeHub:
+            barrier.wait(timeout=5)
+            hub = model_resolver._get_or_init_model_hub()
+            assert isinstance(hub, FakeHub)
+            return hub
+
+        monkeypatch.setattr(
+            model_resolver, "get_default_db_url", lambda: "sqlite:///concurrent.db"
+        )
+        monkeypatch.setattr(model_resolver, "create_engine", fake_create_engine)
+        monkeypatch.setattr(model_resolver, "declarative_base", lambda: FakeBase)
+        monkeypatch.setattr(
+            model_resolver, "create_model_table", lambda Base: fake_model
+        )
+        monkeypatch.setattr(model_resolver, "sessionmaker", fake_sessionmaker)
+        monkeypatch.setattr(model_resolver, "SQLAlchemyModelHub", FakeHub)
+
+        try:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=worker_count
+            ) as executor:
+                hubs = list(executor.map(lambda _: worker(), range(worker_count)))
+
+            assert len(create_calls) == 1
+            assert len(sessionmaker_calls) == 1
+            assert len(sessions) == worker_count
+            assert all(hub.model is fake_model for hub in hubs)
+        finally:
+            model_resolver._reset_model_hub_cache()
+
+    def test_reset_model_hub_cache_disposes_engine(self) -> None:
+        """Reset should dispose the active engine and clear the resource group."""
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.disposed = False
+
+            def dispose(self) -> None:
+                self.disposed = True
+
+        engine = FakeEngine()
+        model_resolver._MODEL_HUB_ENGINE = engine
+        model_resolver._MODEL_HUB_SESSION_LOCAL = object()
+        model_resolver._MODEL_HUB_MODEL = object()
+        model_resolver._MODEL_HUB_DB_URL = "sqlite:///old.db"
+
+        model_resolver._reset_model_hub_cache()
+
+        assert engine.disposed is True
+        assert model_resolver._MODEL_HUB_ENGINE is None
+        assert model_resolver._MODEL_HUB_SESSION_LOCAL is None
+        assert model_resolver._MODEL_HUB_MODEL is None
+        assert model_resolver._MODEL_HUB_DB_URL is None
+
+    def test_get_or_init_model_hub_re_raises_non_db_reinit_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-DB init failures should not be hidden as hub unavailability."""
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.disposed = False
+
+            def dispose(self) -> None:
+                self.disposed = True
+
+        class FakeMetadata:
+            def create_all(self, engine: object) -> None:
+                raise RuntimeError("create failed")
+
+        class FakeBase:
+            metadata = FakeMetadata()
+
+        old_engine = FakeEngine()
+        new_engine = FakeEngine()
+        old_session_local = object()
+        old_model = object()
+        model_resolver._MODEL_HUB_ENGINE = old_engine
+        model_resolver._MODEL_HUB_SESSION_LOCAL = old_session_local
+        model_resolver._MODEL_HUB_MODEL = old_model
+        model_resolver._MODEL_HUB_DB_URL = "sqlite:///old.db"
+
+        monkeypatch.setattr(
+            model_resolver, "get_default_db_url", lambda: "sqlite:///new.db"
+        )
+        monkeypatch.setattr(
+            model_resolver, "create_engine", lambda *args, **kwargs: new_engine
+        )
+        monkeypatch.setattr(model_resolver, "declarative_base", lambda: FakeBase)
+        monkeypatch.setattr(model_resolver, "create_model_table", lambda Base: object())
+
+        try:
+            with pytest.raises(RuntimeError, match="create failed"):
+                model_resolver._get_or_init_model_hub()
+
+            assert new_engine.disposed is True
+            assert old_engine.disposed is False
+            assert model_resolver._MODEL_HUB_ENGINE is old_engine
+            assert model_resolver._MODEL_HUB_SESSION_LOCAL is old_session_local
+            assert model_resolver._MODEL_HUB_MODEL is old_model
+            assert model_resolver._MODEL_HUB_DB_URL == "sqlite:///old.db"
+        finally:
+            model_resolver._reset_model_hub_cache()
+
+    def test_get_or_init_model_hub_returns_none_for_recoverable_db_reinit_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Recoverable DB init failures may fall back without polluting cache."""
+
+        class FakeEngine:
+            def __init__(self) -> None:
+                self.disposed = False
+
+            def dispose(self) -> None:
+                self.disposed = True
+
+        class FakeMetadata:
+            def create_all(self, engine: object) -> None:
+                raise SAOperationalError(
+                    "SELECT models",
+                    {},
+                    Exception("too many clients already"),
+                )
+
+        class FakeBase:
+            metadata = FakeMetadata()
+
+        old_engine = FakeEngine()
+        new_engine = FakeEngine()
+        old_session_local = object()
+        old_model = object()
+        model_resolver._MODEL_HUB_ENGINE = old_engine
+        model_resolver._MODEL_HUB_SESSION_LOCAL = old_session_local
+        model_resolver._MODEL_HUB_MODEL = old_model
+        model_resolver._MODEL_HUB_DB_URL = "sqlite:///old.db"
+
+        monkeypatch.setattr(
+            model_resolver, "get_default_db_url", lambda: "sqlite:///new.db"
+        )
+        monkeypatch.setattr(
+            model_resolver, "create_engine", lambda *args, **kwargs: new_engine
+        )
+        monkeypatch.setattr(model_resolver, "declarative_base", lambda: FakeBase)
+        monkeypatch.setattr(model_resolver, "create_model_table", lambda Base: object())
+
+        try:
+            assert model_resolver._get_or_init_model_hub() is None
+
+            assert new_engine.disposed is True
+            assert old_engine.disposed is False
+            assert model_resolver._MODEL_HUB_ENGINE is old_engine
+            assert model_resolver._MODEL_HUB_SESSION_LOCAL is old_session_local
+            assert model_resolver._MODEL_HUB_MODEL is old_model
+            assert model_resolver._MODEL_HUB_DB_URL == "sqlite:///old.db"
+        finally:
+            model_resolver._reset_model_hub_cache()
 
 
 class TestResolveEmbeddingAdapter:
@@ -135,12 +350,8 @@ class TestResolveEmbeddingAdapter:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test resolving embedding from env when hub fails (fallback)."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Set env vars for fallback
         monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "env-model")
@@ -156,14 +367,25 @@ class TestResolveEmbeddingAdapter:
         assert cfg.dimension == 1536
         assert isinstance(adapter, BaseEmbedding)
 
+    def test_resolve_embedding_does_not_fallback_for_non_db_init_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-DB hub initialization errors should surface even when env exists."""
+
+        def buggy_hub() -> object:
+            raise RuntimeError("broken model hub initialization")
+
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", buggy_hub)
+        monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "env-model")
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
+
+        with pytest.raises(RuntimeError, match="broken model hub initialization"):
+            model_resolver.resolve_embedding_adapter(model_id=None)
+
     def test_resolve_embedding_both_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that error is raised when both hub and env fail."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Clear env vars
         for key in [
@@ -236,12 +458,8 @@ class TestResolveRerankAdapter:
 
     def test_resolve_rerank_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test resolving rerank from env when hub fails (fallback)."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Set env vars for fallback
         monkeypatch.setenv("DASHSCOPE_RERANK_MODEL", "env-rerank")
@@ -258,12 +476,8 @@ class TestResolveRerankAdapter:
 
     def test_resolve_rerank_both_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that error is raised when both hub and env fail."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Clear env vars
         for key in [
@@ -337,12 +551,8 @@ class TestResolveLLMAdapter:
 
     def test_resolve_llm_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test resolving LLM from env when hub fails (fallback)."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Set env vars for fallback (OpenAI)
         monkeypatch.setenv("OPENAI_API_KEY", "env-key")
@@ -358,12 +568,8 @@ class TestResolveLLMAdapter:
 
     def test_resolve_llm_both_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that error is raised when both hub and env fail."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Clear env vars
         for key in ["OPENAI_API_KEY", "ZHIPU_API_KEY", "DEEPSEEK_API_KEY"]:

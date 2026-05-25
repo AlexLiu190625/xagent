@@ -1,6 +1,7 @@
 """Unit tests for web crawler."""
 
 import logging
+import subprocess
 import sys
 import types
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -9,7 +10,10 @@ import httpx
 import pytest
 
 from xagent.core.tools.core.RAG_tools.core.schemas import WebCrawlConfig
-from xagent.core.tools.core.RAG_tools.web_crawler.crawler import WebCrawler
+from xagent.core.tools.core.RAG_tools.web_crawler.crawler import (
+    WebCrawler,
+    _get_httpx_accept_encoding,
+)
 
 
 class TestWebCrawler:
@@ -63,6 +67,53 @@ class TestWebCrawler:
         config = WebCrawlConfig(start_url="https://example.com")
 
         assert config.tls_impersonate is None
+
+    def test_httpx_accept_encoding_excludes_brotli_without_decoder(self):
+        """Do not advertise Brotli unless httpx can decode it."""
+        with patch(
+            "xagent.core.tools.core.RAG_tools.web_crawler.crawler."
+            "importlib.util.find_spec",
+            return_value=None,
+        ):
+            assert _get_httpx_accept_encoding() == "gzip, deflate"
+
+    def test_httpx_accept_encoding_includes_brotli_with_decoder(self):
+        """Advertise Brotli when a supported decoder package is installed."""
+
+        def fake_find_spec(name):
+            return object() if name == "brotlicffi" else None
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.web_crawler.crawler."
+            "importlib.util.find_spec",
+            side_effect=fake_find_spec,
+        ):
+            assert _get_httpx_accept_encoding() == "gzip, deflate, br"
+
+    def test_httpx_accept_encoding_works_in_clean_interpreter(self):
+        """Crawler should explicitly load importlib.util before using find_spec."""
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import importlib, sys; "
+                    "sys.modules.pop('importlib.util', None); "
+                    "delattr(importlib, 'util') if hasattr(importlib, 'util') else None; "
+                    "from xagent.core.tools.core.RAG_tools.web_crawler.crawler "
+                    "import _get_httpx_accept_encoding; "
+                    "print(_get_httpx_accept_encoding())"
+                ),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        assert result.stdout.strip() in {
+            "gzip, deflate",
+            "gzip, deflate, br",
+        }
 
     @pytest.mark.asyncio
     async def test_crawl_single_page(self, crawl_config, sample_html):

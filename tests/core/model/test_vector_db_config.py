@@ -10,6 +10,10 @@ from xagent.core.model.model import (
 )
 from xagent.core.model.storage.db.adapter import SQLAlchemyModelHub
 from xagent.core.model.storage.db.db_models import create_model_table
+from xagent.core.model.storage.error import (
+    ModelNotFoundError,
+    UnsupportedModelCategoryError,
+)
 
 Base = declarative_base()
 Model = create_model_table(Base)
@@ -217,8 +221,56 @@ def test_vector_db_config_delete(db_session):
     assert hub.exists("to-delete")
     hub.delete("to-delete")
     assert not hub.exists("to-delete")
-    with pytest.raises(ValueError, match="Model not found"):
+    with pytest.raises(ModelNotFoundError, match="Model not found"):
         hub.load("to-delete")
+
+
+def test_model_hub_load_unknown_category_raises_domain_error(
+    db_session, setup_encryption_key
+):
+    hub = SQLAlchemyModelHub(db_session, Model)
+    cipher = Fernet(setup_encryption_key.encode())
+    valid_encrypted = cipher.encrypt(b"k").decode()
+    db_record = Model(
+        model_id="bad-category",
+        category="audio",
+        model_provider="none",
+        model_name="BadCategory",
+        _api_key_encrypted=valid_encrypted,
+        is_active=True,
+    )
+    db_session.add(db_record)
+    db_session.commit()
+
+    with pytest.raises(
+        UnsupportedModelCategoryError,
+        match="Unknown model category for bad-category: audio",
+    ):
+        hub.load("bad-category")
+
+
+def test_model_hub_list_unknown_category_raises_domain_error(
+    db_session, setup_encryption_key
+):
+    hub = SQLAlchemyModelHub(db_session, Model)
+    cipher = Fernet(setup_encryption_key.encode())
+    valid_encrypted = cipher.encrypt(b"k").decode()
+    db_record = Model(
+        model_id="bad-list-category",
+        category="audio",
+        model_provider="none",
+        model_name="BadListCategory",
+        _api_key_encrypted=valid_encrypted,
+        is_active=True,
+    )
+    db_session.add(db_record)
+    db_session.commit()
+
+    with pytest.raises(
+        UnsupportedModelCategoryError,
+        match="Unknown model category for bad-list-category: audio",
+    ):
+        hub.list()
 
 
 def test_vector_db_config_normalize_case(db_session, setup_encryption_key):
