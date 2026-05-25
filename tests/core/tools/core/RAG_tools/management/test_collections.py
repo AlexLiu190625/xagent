@@ -556,14 +556,14 @@ def test_delete_collection_preserves_partial_vector_cleanup(
     assert result.warnings == [warnings_from_store]
 
 
-def test_delete_collection_non_admin_uses_document_scoped_deletes(
+def test_delete_collection_non_admin_uses_batched_document_scoped_delete(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Non-admin collection delete should avoid collection-wide legacy cleanup."""
 
     class FakeVectorStore:
         def __init__(self) -> None:
-            self.document_delete_calls: list[tuple[str, str, int | None, bool]] = []
+            self.documents_delete_calls: list[dict[str, object]] = []
 
         def list_document_records(self, **_kwargs: object) -> list[DocumentRecord]:
             return [
@@ -576,6 +576,10 @@ def test_delete_collection_non_admin_uses_document_scoped_deletes(
                 "non-admin delete must not use collection-wide cleanup"
             )
 
+        def delete_documents_data(self, **_kwargs: object) -> dict[str, int]:
+            self.documents_delete_calls.append(dict(_kwargs))
+            return {"chunks": 2}
+
         def delete_document_data(
             self,
             *,
@@ -584,10 +588,7 @@ def test_delete_collection_non_admin_uses_document_scoped_deletes(
             user_id: int | None,
             is_admin: bool,
         ) -> dict[str, int]:
-            self.document_delete_calls.append(
-                (collection_name, doc_id, user_id, is_admin)
-            )
-            return {"chunks": 1}
+            raise AssertionError("collection delete should not fan out per document")
 
     store = FakeVectorStore()
     monkeypatch.setattr(collections_module, "get_vector_index_store", lambda: store)
@@ -600,10 +601,11 @@ def test_delete_collection_non_admin_uses_document_scoped_deletes(
     result = delete_collection("shared", user_id=7, is_admin=False)
 
     assert result.status == "success"
-    assert store.document_delete_calls == [
-        ("shared", "doc-1", 7, False),
-        ("shared", "doc-2", 7, False),
-    ]
+    assert len(store.documents_delete_calls) == 1
+    assert store.documents_delete_calls[0]["collection_name"] == "shared"
+    assert store.documents_delete_calls[0]["doc_ids"] == ["doc-1", "doc-2"]
+    assert store.documents_delete_calls[0]["user_id"] == 7
+    assert store.documents_delete_calls[0]["is_admin"] is False
 
 
 def test_delete_collection_reports_success_when_only_orphan_artifacts_deleted(
