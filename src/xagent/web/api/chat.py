@@ -259,10 +259,9 @@ def select_allowed_tool_names_from_categories(
       - ``tool_categories`` is ``None`` or empty list → return
         ``None``. Legacy "未配置" semantics: the factory's
         ``allowed_tools=None`` short-circuit means no name-level
-        restriction, so the full default set passes through. This
-        is the fix for review C1: default / legacy agents (whose
-        ``Agent.tool_categories`` defaults to ``[]``) must not be
-        silently stripped of every tool.
+        restriction, so the full default set passes through. Default
+        and legacy agents (whose ``Agent.tool_categories`` defaults
+        to ``[]``) must not be silently stripped of every tool.
 
       - ``tool_categories`` is a non-empty list → return a list of
         tool names that match any of:
@@ -1049,8 +1048,8 @@ class AgentServiceManager:
 
                 if task_setup_snapshot is not None:
                     # Caller already loaded the snapshot off-loop
-                    # (typically ``_schedule_bg._runner`` → Step 4).
-                    # Reuse it instead of re-spinning a worker thread.
+                    # (typically ``_schedule_bg._runner``). Reuse it
+                    # instead of re-spinning a worker thread.
                     snapshot = task_setup_snapshot
                 else:
                     user_id_for_snapshot: Optional[int] = (

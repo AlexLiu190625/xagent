@@ -744,9 +744,9 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
 
 
 # ---------------------------------------------------------------------------
-# _runner setup-error → FAILED safety net (review fix C1: prevents the
+# _runner setup-error → FAILED safety net: prevents the
 # acquire_lease-sets-RUNNING-then-no-one-clears-it zombie state when
-# snapshot load or execute_task_background raises)
+# snapshot load or execute_task_background raises.
 # ---------------------------------------------------------------------------
 
 
@@ -757,14 +757,15 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     """Snapshot-load exception must not leave the row visible-as-running.
 
     ``acquire_task_lease_isolated`` writes ``status=RUNNING`` as part
-    of taking the lease. Before review-fix C1, an exception out of
-    ``load_task_setup_snapshot_sync`` propagated through ``_runner``'s
-    inner ``try`` block, ``finish_turn`` and ``execute_task_background``
-    never ran, and the outer release block read the still-RUNNING
-    status and wrote it back -- task displayed as running but no
-    worker was actually executing it.
+    of taking the lease. Without the outer ``except`` in ``_runner``,
+    an exception out of ``load_task_setup_snapshot_sync`` propagates
+    through ``_runner``'s inner ``try`` block; ``finish_turn`` and
+    ``execute_task_background`` never run, and the outer release
+    block reads the still-RUNNING status and writes it back --
+    leaving the task displayed as running but with no worker
+    executing it.
 
-    The new outer ``except`` in ``_runner`` calls
+    The outer ``except`` in ``_runner`` calls
     ``_mark_task_failed_if_running`` so the row is pushed to
     ``FAILED`` before release. This test pins both halves: the
     helper is invoked, and the row is FAILED at the end.

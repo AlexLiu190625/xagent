@@ -2,10 +2,10 @@
 provided and falls back to its legacy Task SELECT when it isn't.
 
 Background:
-    Profiling on 2026-05-20 measured the inline ``db.query(Task)`` at
-    the top of ``execute_task_background`` at 3.33s of synchronous DB
-    read under contention (the same row had just been queried 0.81s
-    earlier in ``_schedule_bg._runner``). Step 4 plumbs a
+    Profiling measured the inline ``db.query(Task)`` at the top of
+    ``execute_task_background`` at ~3.3s of synchronous DB read under
+    contention (the same row had just been queried by
+    ``_schedule_bg._runner``). The off-loop snapshot path plumbs a
     ``task_setup_snapshot`` parameter through ``_runner`` →
     ``execute_task_background`` → ``get_agent_for_task`` so the Task
     SELECT happens once, off-loop, in
@@ -228,8 +228,8 @@ async def test_snapshot_path_skips_task_query_keeps_user_query() -> None:
 
     assert counter.calls_by_model[Task] == 0, (
         f"Task queried {counter.calls_by_model[Task]} time(s) on the request "
-        "session with snapshot provided -- expected 0. Step 4's whole point "
-        "is to skip this re-read."
+        "session with snapshot provided -- expected 0. The snapshot "
+        "passthrough exists to skip this re-read."
     )
     assert counter.calls_by_model[User] == 1, (
         f"User queried {counter.calls_by_model[User]} time(s) -- expected 1 "

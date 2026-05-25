@@ -1,28 +1,15 @@
 """Regression test: ``get_agent_for_task`` must not double-query Task or Agent
 on the request session.
 
-Background:
-    Originally, ``chat.py:get_agent_for_task`` ran ``db.query(Task)``
-    twice on the new-agent setup path (once for the existence check,
-    once at the top of the LLM-config block) and ``db.query(Agent)``
-    twice (once in the agent-builder branch to load configuration,
-    once again in the tools-init block to read ``.status`` for the
-    published-agent exclusion list). Step 1 of the PR3 sequence
-    (Codex-revised) reused the first result in both cases, dropping
-    each count to one.
+Invariants pinned here:
 
-    Step 3 of the same sequence then moved the entire LLM-config +
-    agent-builder DB chain (Task re-read, Agent lookup, DBModel
-    lookups, LLM access checks) into ``task_setup_snapshot``, which
-    runs off-loop via ``asyncio.to_thread`` and uses its own
-    ``SessionLocal``. The request session ``db`` is no longer
-    responsible for any Agent query in the setup path.
-
-What this test pins (post-Step-3 invariant):
     * ``db.query(Task)`` fires at most once on the request session
-      (the existence check) -- the post-existence re-read is gone.
-    * ``db.query(Agent)`` fires zero times on the request session --
-      the snapshot owns that lookup now.
+      (the existence check). The LLM-config block does not re-read
+      Task on the request session.
+    * ``db.query(Agent)`` fires zero times on the request session.
+      The published-agent lookup lives inside the off-loop snapshot
+      loader (``task_setup_snapshot.load_task_setup_snapshot_sync``),
+      which uses its own ``SessionLocal``.
 
 Snapshot-internal query counts are not the responsibility of this
 file; those are covered by ``test_task_setup_snapshot.py``.
@@ -115,26 +102,17 @@ class _QueryCounter:
 
 @pytest.mark.asyncio
 async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
-    """Existing task + agent path: post-Step-3 the request session
-    only handles the existence check.
+    """Existing task + agent path: the request session sees only the
+    existence check.
 
-    Pre-PR3 baseline:
-      - ``db.query(Task)`` called >= 2 times (existence check + LLM-config
-        re-load).
-      - ``db.query(Agent)`` called >= 2 times (LLM-config agent-builder
-        branch + tools-init published-status branch).
-
-    After PR3 Step 1:
-      - Each query happened at most once.
-
-    After PR3 Step 3 (current invariant):
+    Current invariant:
       - ``db.query(Task)`` happens at most once (existence check).
-        The LLM-config block calls ``task_setup_snapshot`` which uses
-        its own ``SessionLocal`` and is mocked out here -- so it
-        contributes nothing to the counter on ``db``.
+        The LLM-config block calls the off-loop snapshot loader,
+        which uses its own ``SessionLocal`` and is mocked out
+        here -- so it contributes nothing to the counter on ``db``.
       - ``db.query(Agent)`` happens zero times. The snapshot loader
-        owns the Agent lookup now; the duplicated published-agent
-        status read is gone.
+        owns the Agent lookup; there is no published-agent
+        re-read on the request session.
     """
     manager = AgentServiceManager()
     user = _make_user()
@@ -242,8 +220,8 @@ async def test_existing_task_with_agent_dedups_task_and_agent_queries() -> None:
     )
     assert counter.calls_by_model[Agent] == 0, (
         f"Agent queried {counter.calls_by_model[Agent]} times on the "
-        "request session -- expected 0. Step 3 moved the agent lookup "
-        "into ``task_setup_snapshot`` (its own SessionLocal). If this "
-        "becomes non-zero, something is bypassing the snapshot and "
+        "request session -- expected 0. The agent lookup belongs to "
+        "``task_setup_snapshot`` (its own SessionLocal). A non-zero "
+        "count here means something is bypassing the snapshot and "
         "re-doing the agent lookup on the loop thread."
     )

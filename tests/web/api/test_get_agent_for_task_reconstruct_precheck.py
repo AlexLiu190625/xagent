@@ -2,21 +2,20 @@
 RUNNING tasks but still runs it when prior state actually exists.
 
 Background:
-    ``begin_turn`` (introduced in PR #384) atomically flips a newly
-    created SDK task's status to ``RUNNING`` before
-    ``get_agent_for_task`` is called. The original
+    ``begin_turn`` atomically flips a newly created SDK task's status
+    to ``RUNNING`` before ``get_agent_for_task`` is called. A naive
     ``should_reconstruct = status in {RUNNING, PAUSED,
-    WAITING_FOR_USER}`` test then routes every brand-new SDK task into
-    ``_reconstruct_agent_from_history``, which queries ``TraceEvent``
-    and ``DAGExecution.current_plan``, finds nothing, logs a misleading
-    "Failed to reconstruct agent from history" warning, and falls
-    through to normal creation. The full reconstruct path is 1-2s of
-    wasted DB work plus a noisy log line that confuses incident triage.
+    WAITING_FOR_USER}`` test would route every brand-new SDK task
+    into ``_reconstruct_agent_from_history``, which queries
+    ``TraceEvent`` and ``DAGExecution.current_plan``, finds nothing,
+    logs a misleading "Failed to reconstruct agent from history"
+    warning, and falls through to normal creation. The full
+    reconstruct path is 1-2s of wasted DB work plus a noisy log line
+    that confuses incident triage.
 
-    Step 2 of the PR3 sequence (Codex-revised) adds a cheap pre-check
-    via ``_has_reconstructable_history`` that gates the reconstruct
-    branch for ``RUNNING`` tasks: if neither a ``TraceEvent`` row nor
-    a ``DAGExecution`` row exists for the task, the reconstruct branch
+    ``_has_reconstructable_history`` gates the reconstruct branch
+    for ``RUNNING`` tasks: if neither a ``TraceEvent`` row nor a
+    ``DAGExecution`` row exists for the task, the reconstruct branch
     is skipped and the function goes straight to normal creation.
 
     ``PAUSED`` / ``WAITING_FOR_USER`` tasks are NOT gated on the
@@ -175,7 +174,7 @@ def _stub_downstream(manager: AgentServiceManager):
 
 @pytest.mark.asyncio
 async def test_running_with_no_history_skips_reconstruct() -> None:
-    """The Step 2 hot case: brand-new SDK task is RUNNING but has zero
+    """The pre-check hot case: brand-new SDK task is RUNNING but has zero
     prior state, so reconstruct must be skipped.
     """
     manager = AgentServiceManager()

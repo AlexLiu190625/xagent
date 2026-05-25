@@ -476,9 +476,9 @@ async def test_allowed_tools_subset_filters_by_name(isolated_registry, monkeypat
 #   ToolRegistry registry-level skip + per-creator short-circuit.
 #
 # The unit tests above pin each layer in isolation; these tests pin the
-# composition. Real production agents (75 published, avg 3.9 categories,
-# 43% with mcp:<server> entries — see PR #461 discussion) carry exactly
-# the string shapes the cases below exercise.
+# composition. The string shapes exercised below match what real
+# production agents carry: a small set of plain category names plus
+# the ``mcp:<server>`` form for selecting specific MCP servers.
 
 
 def _make_static_creator(name: str):
@@ -668,9 +668,10 @@ async def test_e2e_empty_categories_yields_none_spec(static_creators):
 
 # ---------------------------------------------------------------------------
 # select_allowed_tool_names_from_categories — the SSOT helper that replaces
-# 2 inline implementations in chat.py + 1 in websocket.py. Pins the
-# "empty/None tool_categories → return None (ALL)" contract that
-# review C1 (factory.py:253) flagged as missing.
+# inline implementations in chat.py + websocket.py. Pins the
+# "empty/None tool_categories → return None (ALL)" contract so legacy
+# default agents (whose Agent.tool_categories defaults to []) are not
+# silently stripped of every tool.
 # ---------------------------------------------------------------------------
 
 
@@ -706,12 +707,11 @@ def test_select_allowed_tool_names_none_input_returns_none() -> None:
 
 
 def test_select_allowed_tool_names_empty_input_returns_none() -> None:
-    """**Review C1 core invariant.** ``Agent.tool_categories`` defaults
-    to ``[]`` for legacy / default agents. Before this fix, the inline
-    implementations in chat.py treated ``[]`` as "explicit no tools"
-    and stripped every tool from the default agent. The SSOT helper
-    must normalize ``[]`` to the same "未配置 → ALL" semantics as
-    ``None``.
+    """Legacy-default invariant. ``Agent.tool_categories`` defaults
+    to ``[]`` for legacy / default agents. Inline implementations
+    that treat ``[]`` as "explicit no tools" would strip every tool
+    from those agents. The SSOT helper normalizes ``[]`` to the same
+    "未配置 → ALL" semantics as ``None``.
     """
     from xagent.web.api.chat import select_allowed_tool_names_from_categories
 
@@ -724,8 +724,8 @@ def test_select_allowed_tool_names_empty_input_returns_none() -> None:
     )
     assert result is None, (
         "tool_categories=[] must yield None (legacy 'unconfigured' = "
-        "ALL); a non-None result reintroduces the C1 regression where "
-        "default agents lose every tool."
+        "ALL); a non-None result lets the factory strip every tool "
+        "from default agents."
     )
 
 
@@ -775,7 +775,8 @@ def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
 
     This case validates that the helper preserves the
     "non-empty input → possibly empty output" branch that distinguishes
-    legitimate 0 tools from the C1 regression.
+    a legitimate 0 tools intent from the unconfigured "build all"
+    semantic.
     """
     from xagent.web.api.chat import select_allowed_tool_names_from_categories
 

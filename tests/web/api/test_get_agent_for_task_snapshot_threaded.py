@@ -1,5 +1,5 @@
-"""Integration test for PR3 Step 3: ``get_agent_for_task`` consumes
-``TaskSetupSnapshot`` produced on a worker thread.
+"""Integration test for the off-loop snapshot path: ``get_agent_for_task``
+consumes ``TaskSetupSnapshot`` produced on a worker thread.
 
 What this test pins:
 
@@ -13,8 +13,8 @@ What this test pins:
        drive other coroutines forward. We verify by kicking off a
        concurrent ``asyncio.sleep`` task and confirming it advances
        during the snapshot load window. This is the core invariant
-       Step 3 exists to provide -- main-loop release during the
-       synchronous DB block (issue #427).
+       the off-loop snapshot loader exists to provide -- main-loop
+       release during the synchronous DB block (issue #427).
 
     3. The snapshot's fields are observed by ``get_agent_for_task``
        on the loop thread without lazy-loading from the loader's
@@ -72,8 +72,9 @@ def _build_snapshot() -> TaskSetupSnapshot:
 @pytest.mark.asyncio
 async def test_snapshot_runs_off_loop_thread() -> None:
     """``asyncio.to_thread`` must hand the loader off to a worker
-    thread -- otherwise we haven't released the loop and Step 3 is a
-    no-op. Compare the loader's thread id to the loop thread's."""
+    thread -- otherwise the main loop hasn't been released and the
+    off-loop optimization is a no-op. Compare the loader's thread
+    id to the loop thread's."""
     loop_thread_id = threading.get_ident()
     loader_thread_id: dict[str, int] = {}
 
@@ -124,25 +125,25 @@ async def test_snapshot_runs_off_loop_thread() -> None:
     )
     assert loader_thread_id["id"] != loop_thread_id, (
         f"Loader ran on the loop thread (id={loop_thread_id}). "
-        "Step 3's whole point is to push the synchronous DB block off "
-        "the loop via ``asyncio.to_thread`` -- if this fails, either "
-        "the to_thread wrapper was removed or the loader is being "
-        "called inline."
+        "The snapshot loader exists to push the synchronous DB "
+        "block off the loop via ``asyncio.to_thread``; this check "
+        "fails when the ``to_thread`` wrapper is removed or the "
+        "loader is being called inline."
     )
 
 
 @pytest.mark.asyncio
 async def test_event_loop_stays_responsive_during_snapshot_load() -> None:
-    """The other half of the Step 3 contract: while the snapshot
+    """The other half of the off-loop contract: while the snapshot
     loader is sleeping (simulating a slow DB read), other coroutines
     on the same loop must still be able to make progress.
 
     We block the loader for 0.3s and concurrently schedule a tight
     polling task that records its tick count. If ``to_thread`` works,
     the polling task progresses across many ticks during the loader's
-    sleep. If Step 3 regressed back to an inline synchronous call,
-    the polling task records at most one tick (no progress until the
-    blocking sleep returns).
+    sleep. If the loader regresses back to an inline synchronous
+    call, the polling task records at most one tick (no progress
+    until the blocking sleep returns).
     """
     snapshot = _build_snapshot()
     ticks: list[float] = []
@@ -211,7 +212,7 @@ async def test_event_loop_stays_responsive_during_snapshot_load() -> None:
     assert len(ticks) >= 5, (
         f"Loop ticked only {len(ticks)} times during the 0.3s snapshot "
         "load -- the loader appears to be running inline on the loop "
-        "thread (Step 3 regressed)."
+        "thread (the off-loop invariant regressed)."
     )
 
 
@@ -281,18 +282,19 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
 
 @pytest.mark.asyncio
 async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -> None:
-    """Review fix C2: snapshot path must share the same fail-fast
-    failure policy as the reconstruct path.
+    """Snapshot path must share the same fail-fast failure policy as
+    the reconstruct path.
 
-    Before this fix, an agent-builder task whose models couldn't be
-    resolved AND whose deployment had no global default LLM
-    (``self._default_llm`` is None — typical of CI / un-configured
+    Without this guard, an agent-builder task whose models couldn't
+    be resolved AND whose deployment had no global default LLM
+    (``self._default_llm`` is None -- typical of CI / un-configured
     deployments) would silently get ``task_llm = None``, build the
     AgentService anyway, and crash later on the first LLM call. The
-    reconstruct path already raised ``HTTPException(500)`` via
-    ``_pick_default_llm_with_warning``; the snapshot path didn't.
+    reconstruct path raises ``HTTPException(500)`` via
+    ``_pick_default_llm_with_warning``; the snapshot path must do
+    the same.
 
-    This test pins the new contract: snapshot path also raises when
+    This test pins the invariant: snapshot path raises when
     snapshot.agent is set, snapshot.task_llm is None, and
     ``self._default_llm`` is None. ``saved_model_*`` diagnostic
     fields from the snapshot's ``agent_config`` flow into the log

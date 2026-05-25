@@ -28,7 +28,8 @@ Out of scope (first cut, by design):
       ``_load_persisted_execution_context`` -- already separate async
       helpers; can be migrated in a follow-up.
     * ToolFactory inner DB I/O -- tool subclasses hold ``self._db``;
-      that refactor is Step 4 in the PR3 sequence.
+      threading the factory requires a session-factory refactor of
+      every tool subclass first.
     * MCP server configs -- async + OAuth refresh path.
 """
 
