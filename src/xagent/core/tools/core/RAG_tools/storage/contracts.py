@@ -515,6 +515,32 @@ class VectorIndexStore(ABC):
         """
 
     @abstractmethod
+    def delete_documents_data(
+        self,
+        collection_name: str,
+        doc_ids: Sequence[str],
+        user_id: Optional[int],
+        is_admin: bool,
+        warnings_out: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        """Delete vector-side data for multiple documents in one storage call.
+
+        Implementations should batch internally and preserve document-scoped
+        tenant safety: predicates must include collection and doc_id constraints,
+        and add user_id filtering where the backend table supports it.
+
+        Args:
+            collection_name: Name of the collection.
+            doc_ids: Document identifiers to delete.
+            user_id: User ID for tenant-scoped deletion.
+            is_admin: Whether the caller can delete across tenants.
+            warnings_out: Optional list to append best-effort deletion warnings to.
+
+        Returns:
+            Dictionary mapping table names to deleted row counts.
+        """
+
+    @abstractmethod
     def aggregate_collection_stats(
         self,
         user_id: Optional[int],

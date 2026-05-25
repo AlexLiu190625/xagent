@@ -574,6 +574,47 @@ def test_delete_collection_data_delegates_to_cascade_delete(
     assert warnings == []
 
 
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.cascade_delete_documents"
+)
+@patch(
+    "xagent.core.tools.core.RAG_tools.storage.lancedb_stores.get_connection_from_env"
+)
+def test_delete_documents_data_delegates_to_batched_cascade_delete(
+    mock_get_connection: Mock,
+    mock_cascade_delete_documents: Mock,
+) -> None:
+    """delete_documents_data should batch document-scoped cascade deletes."""
+
+    mock_conn = Mock()
+    mock_get_connection.return_value = mock_conn
+    mock_cascade_delete_documents.return_value = {"documents": 2, "chunks": 4}
+
+    store = LanceDBVectorIndexStore()
+    warnings: List[str] = []
+
+    deleted_counts = store.delete_documents_data(
+        "demo",
+        ["doc-2", "doc-1", "doc-1"],
+        user_id=7,
+        is_admin=False,
+        warnings_out=warnings,
+    )
+
+    mock_cascade_delete_documents.assert_called_once()
+    called = mock_cascade_delete_documents.call_args.kwargs
+    assert called["collection"] == "demo"
+    assert called["doc_ids"] == ["doc-1", "doc-2"]
+    assert called["user_id"] == 7
+    assert called["is_admin"] is False
+    assert called["preview_only"] is False
+    assert called["confirm"] is True
+    assert called["conn"] is mock_conn
+
+    assert deleted_counts == {"documents": 2, "chunks": 4}
+    assert warnings == []
+
+
 # --- Upsert Fallback Tests ---
 
 

@@ -15,7 +15,11 @@ from lancedb.db import DBConnection
 
 from xagent.providers.vector_store.lancedb import get_connection_from_env
 
-from ..core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT, IndexPolicy
+from ..core.config import (
+    DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE,
+    DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    IndexPolicy,
+)
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import list_table_names, query_to_list
@@ -856,6 +860,53 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         # Ensure subsequent reads don't observe stale cached table handles.
         self.invalidate_table_cache()
         return counts
+
+    def delete_documents_data(
+        self,
+        collection_name: str,
+        doc_ids: Sequence[str],
+        user_id: Optional[int],
+        is_admin: bool,
+        warnings_out: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        """Delete vector-side data for multiple documents in batches."""
+        normalized_doc_ids = sorted({str(doc_id) for doc_id in doc_ids if str(doc_id)})
+        if not normalized_doc_ids:
+            return {}
+
+        conn = self._get_connection()
+        from ..version_management.cascade_cleaner import cascade_delete_documents
+
+        batch_size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
+        merged: Dict[str, int] = {}
+        for start in range(0, len(normalized_doc_ids), batch_size):
+            batch = normalized_doc_ids[start : start + batch_size]
+            try:
+                counts = cascade_delete_documents(
+                    collection=collection_name,
+                    doc_ids=batch,
+                    user_id=user_id,
+                    is_admin=is_admin,
+                    preview_only=False,
+                    confirm=True,
+                    conn=conn,
+                )
+            except Exception as exc:
+                if warnings_out is not None:
+                    warnings_out.append(
+                        "Failed to delete document batch "
+                        f"{start // batch_size + 1}: {exc}"
+                    )
+                raise
+            for key, value in counts.items():
+                deleted_count = int(value)
+                if deleted_count <= 0:
+                    continue
+                merged[str(key)] = merged.get(str(key), 0) + deleted_count
+
+        # Ensure subsequent reads don't observe stale cached table handles.
+        self.invalidate_table_cache()
+        return merged
 
     def _count_collections_fast(
         self,

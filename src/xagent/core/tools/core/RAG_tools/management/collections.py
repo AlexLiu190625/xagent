@@ -1297,30 +1297,16 @@ def delete_collection(
                     warnings_out=warnings,
                 )
             )
-        else:
-            for doc_id in doc_ids:
-                _merge_deleted_counts(
-                    vector_store.delete_document_data(
-                        collection_name=collection,
-                        doc_id=doc_id,
-                        user_id=user_id,
-                        is_admin=is_admin,
-                    )
-                )
-
-        # Clear ingestion status for all documents
-        for doc_id in doc_ids:
-            try:
-                clear_ingestion_status(
-                    collection,
-                    doc_id,
+        elif doc_ids:
+            _merge_deleted_counts(
+                vector_store.delete_documents_data(
+                    collection_name=collection,
+                    doc_ids=doc_ids,
                     user_id=user_id,
                     is_admin=is_admin,
+                    warnings_out=warnings,
                 )
-            except Exception as exc:  # noqa: BLE001
-                warning = f"Failed to clear ingestion status for '{doc_id}': {exc}"
-                logger.warning(warning)
-                warnings.append(warning)
+            )
 
         remaining_collection_records = vector_store.list_document_records(
             collection_name=collection,
