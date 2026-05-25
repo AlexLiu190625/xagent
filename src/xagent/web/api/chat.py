@@ -1093,34 +1093,51 @@ class AgentServiceManager:
                             )
 
                     if not task_llm:
-                        # Snapshot path and reconstruct path now share
-                        # the same failure policy. Previously this
-                        # branch silently fell back to ``self._default_llm``
-                        # (possibly None), which turned a deterministic
-                        # configuration error into a later execution
-                        # crash. ``_pick_default_llm_with_warning``
-                        # raises HTTPException(500) when neither the
-                        # task LLM nor the agent-builder LLM nor the
-                        # global default resolves -- fail-fast with
-                        # the saved-model diagnostics in the log line
-                        # so on-call can trace back to the offending
-                        # agent row.
-                        user_id_for_fallback: Optional[int] = (
-                            int(user.id)
-                            if user and user.id is not None
-                            else task.user_id
-                        )
-                        task_llm = self._pick_default_llm_with_warning(
-                            self._default_llm,
-                            task_id=task_id,
-                            has_agent_builder_config=snapshot.agent is not None,
-                            agent_id=task.agent_id,
-                            saved_model_ids=(agent_config or {}).get("saved_model_ids"),
-                            saved_model_descriptors=(agent_config or {}).get(
-                                "saved_model_descriptors"
-                            ),
-                            user_id=user_id_for_fallback,
-                        )
+                        # Two failure modes, two different policies:
+                        #
+                        # 1. Agent-builder agent whose configured models
+                        #    can't be resolved → fail-fast via the
+                        #    shared diagnostic helper. This is a real
+                        #    configuration error (the agent row points
+                        #    at models the runtime can't load); the
+                        #    helper raises HTTPException(500) with
+                        #    saved-model metadata in the log so
+                        #    on-call can trace back to the agent row.
+                        #
+                        # 2. Plain task with no agent-builder layer and
+                        #    no resolvable LLM (e.g. the deployment
+                        #    runs with no LLM env keys at all, or the
+                        #    task is tool-only and never calls an
+                        #    LLM) → silent fallback to ``self._default_llm``
+                        #    even if that itself is None. Some tasks
+                        #    legitimately never invoke an LLM; we
+                        #    cannot turn that case into a 500 without
+                        #    breaking those callers.
+                        if snapshot.agent is not None:
+                            user_id_for_fallback: Optional[int] = (
+                                int(user.id)
+                                if user and user.id is not None
+                                else task.user_id
+                            )
+                            task_llm = self._pick_default_llm_with_warning(
+                                self._default_llm,
+                                task_id=task_id,
+                                has_agent_builder_config=True,
+                                agent_id=task.agent_id,
+                                saved_model_ids=(agent_config or {}).get(
+                                    "saved_model_ids"
+                                ),
+                                saved_model_descriptors=(agent_config or {}).get(
+                                    "saved_model_descriptors"
+                                ),
+                                user_id=user_id_for_fallback,
+                            )
+                        else:
+                            logger.warning(
+                                f"Task {task_id} has no valid LLM configuration; "
+                                "using default LLM (may be None for tool-only tasks)"
+                            )
+                            task_llm = self._default_llm
 
                     logger.info(
                         f"Successfully loaded LLM configuration for task {task_id}: "
