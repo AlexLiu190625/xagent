@@ -3,8 +3,9 @@
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Mapping, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy import func, or_
@@ -16,6 +17,8 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.agent.service import AgentService
+from ...core.memory.base import MemoryStore
+from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
@@ -52,7 +55,6 @@ from ..services.task_execution_context_service import (
 from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
-    release_task_lease,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
@@ -61,6 +63,12 @@ from ..services.task_setup_snapshot import (
     load_task_setup_snapshot_sync,
 )
 from ..services.trace_message_storage import decode_trace_events_data
+from ..services.workforce_runtime import (
+    WorkforceTaskRuntime,
+    release_task_lease_with_workforce_sync,
+    resolve_workforce_task_runtime,
+    sync_workforce_run_status,
+)
 from ..tools.config import WebToolConfig
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -105,6 +113,32 @@ def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
         or 0
     )
     return int(max_trace_event_id), int(max_chat_message_id)
+
+
+@dataclass(frozen=True)
+class AgentServiceMemoryPolicy:
+    memory: MemoryStore
+    memory_enabled: bool
+
+
+def resolve_agent_service_memory_policy(
+    *,
+    task: Optional[Task] = None,
+    agent_config: Optional[Mapping[str, Any]] = None,
+) -> AgentServiceMemoryPolicy:
+    """Resolve the memory store and enablement for an AgentService runtime."""
+    config = agent_config
+    if config is None:
+        task_config = getattr(task, "agent_config", None)
+        config = task_config if isinstance(task_config, Mapping) else {}
+
+    if config.get("is_preview") is True:
+        return AgentServiceMemoryPolicy(InMemoryMemoryStore(), False)
+
+    if task is not None and task.agent_id:
+        return AgentServiceMemoryPolicy(get_memory_store(), False)
+
+    return AgentServiceMemoryPolicy(get_memory_store(), True)
 
 
 def create_default_llm() -> Optional[BaseLLM]:
@@ -358,6 +392,44 @@ def _build_allowed_external_dirs(
     return dirs
 
 
+def _merge_workforce_tool_names(
+    allowed_tools: Optional[List[str]],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+) -> Optional[List[str]]:
+    if allowed_tools is None or workforce_runtime is None:
+        return allowed_tools
+
+    merged = list(allowed_tools)
+    seen = set(merged)
+    for tool_name in sorted(workforce_runtime.worker_tool_names):
+        if tool_name not in seen:
+            merged.append(tool_name)
+            seen.add(tool_name)
+    return merged
+
+
+def _build_workforce_system_prompt(
+    base_system_prompt: Optional[str],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+) -> Optional[str]:
+    prompts = []
+    if workforce_runtime and workforce_runtime.manager_system_prompt:
+        prompts.append(workforce_runtime.manager_system_prompt)
+    if base_system_prompt:
+        prompts.append(base_system_prompt)
+    return "\n\n".join(prompts) if prompts else None
+
+
+def _int_id_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 async def create_default_tools(
     db: Session,
     request: Any = None,
@@ -372,6 +444,13 @@ async def create_default_tools(
     sandbox: Optional[Any] = None,
     llm: Optional[Any] = None,
     selection_spec: Optional[Any] = None,
+    allowed_agent_ids: Optional[List[int]] = None,
+    agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+    enable_global_agent_tools: bool = True,
+    allow_cross_user_agent_ids: bool = False,
+    parent_task_id: Optional[str] = None,
+    parent_tracer: Optional[Any] = None,
+    agent_call_stack: Optional[List[int]] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -420,6 +499,13 @@ async def create_default_tools(
         allowed_tools=allowed_tools,  # Agent Builder tool categories
         vision_model=vision_model,  # Pass task-specific vision model
         selection_spec=selection_spec,  # Category/server-level skip in factory
+        allowed_agent_ids=allowed_agent_ids,
+        agent_tool_overrides=agent_tool_overrides,
+        enable_global_agent_tools=enable_global_agent_tools,
+        allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+        parent_task_id=parent_task_id,
+        parent_tracer=parent_tracer,
+        agent_call_stack=agent_call_stack,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -774,10 +860,29 @@ class AgentServiceManager:
                 task_id,
                 core.agent_fields.name,
             )
+            if core.workforce is not None:
+                # Workforce task keeps its own execution_mode rather
+                # than inheriting from agent_config; surface that so
+                # on-call doesn't confuse it with the legacy override.
+                logger.info(
+                    "Workforce task %s keeping task execution mode -> pattern=%s",
+                    task_id,
+                    core.task_pattern,
+                )
+            else:
+                logger.info(
+                    "Task %s using Agent Builder execution mode: %s -> pattern=%s",
+                    task_id,
+                    (core.agent_config or {}).get("execution_mode"),
+                    core.task_pattern,
+                )
+        elif core.agent_config is not None:
+            # Inline agent_config path (build-preview tasks routed
+            # through normal task flow with config embedded in the row).
             logger.info(
-                "Task %s using Agent Builder execution mode: %s -> pattern=%s",
+                "Task %s using inline Agent Builder config: execution_mode=%s -> pattern=%s",
                 task_id,
-                (core.agent_config or {}).get("execution_mode"),
+                core.agent_config.get("execution_mode"),
                 core.task_pattern,
             )
 
@@ -809,6 +914,31 @@ class AgentServiceManager:
             "has_agent_builder_config": core.has_agent_builder_config,
         }
 
+    def _load_task_inline_agent_config(self, task: Task) -> Optional[dict[str, Any]]:
+        if not isinstance(task.agent_config, dict):
+            return None
+
+        inline_config = task.agent_config
+        if not any(
+            key in inline_config
+            for key in ("instructions", "knowledge_bases", "skills", "tool_categories")
+        ):
+            return None
+
+        return {
+            "llms": (None, None, None, None),
+            "execution_mode": getattr(task, "execution_mode", None) or "balanced",
+            "instructions": inline_config.get("instructions"),
+            "skills": inline_config.get("skills") or [],
+            "knowledge_bases": inline_config.get("knowledge_bases") or [],
+            "tool_categories": inline_config.get("tool_categories") or [],
+            "memory_similarity_threshold": inline_config.get(
+                "memory_similarity_threshold"
+            ),
+            "is_preview": inline_config.get("is_preview"),
+            "preview_agent_id": inline_config.get("preview_agent_id"),
+        }
+
     async def _build_tools_for_task(
         self,
         *,
@@ -819,15 +949,17 @@ class AgentServiceManager:
         agent_config: Optional[dict],
         task_llm: Optional[BaseLLM],
         task_vision_llm: Optional[BaseLLM],
+        parent_tracer: Optional[Any] = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
         excluded_agent_id = None
-        if task.agent_id:
+        task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
+        if task_agent_id is not None:
             from ..models.agent import AgentStatus
 
             current_agent = (
                 db.query(Agent)
-                .filter(Agent.id == task.agent_id, Agent.user_id == task.user_id)
+                .filter(Agent.id == task_agent_id, Agent.user_id == task.user_id)
                 .first()
             )
             if current_agent and current_agent.status == AgentStatus.PUBLISHED:
@@ -837,7 +969,26 @@ class AgentServiceManager:
                     f"{current_agent.id} ({current_agent.name}), will exclude from "
                     "agent tools"
                 )
+        elif agent_config and agent_config.get("preview_agent_id"):
+            from ..models.agent import AgentStatus
 
+            current_agent = (
+                db.query(Agent)
+                .filter(
+                    Agent.id == agent_config["preview_agent_id"],
+                    Agent.user_id == task.user_id,
+                )
+                .first()
+            )
+            if current_agent and current_agent.status == AgentStatus.PUBLISHED:
+                excluded_agent_id = int(current_agent.id)
+                logger.info(
+                    f"Preview task {task_id} is for published agent "
+                    f"{current_agent.id} ({current_agent.name}), will exclude from "
+                    "agent tools"
+                )
+
+        workforce_runtime = resolve_workforce_task_runtime(db, task)
         allowed_tools: Optional[List[str]] = None
         if agent_config:
             tool_categories = agent_config.get("tool_categories")
@@ -855,6 +1006,23 @@ class AgentServiceManager:
                 browser_tools_enabled=True,
                 allowed_collections=agent_config.get("knowledge_bases"),
                 allowed_skills=agent_config.get("skills"),
+                allowed_agent_ids=workforce_runtime.allowed_agent_ids
+                if workforce_runtime
+                else None,
+                agent_tool_overrides=workforce_runtime.agent_tool_overrides
+                if workforce_runtime
+                else None,
+                enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+                if workforce_runtime
+                else True,
+                allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+                if workforce_runtime
+                else False,
+                parent_task_id=str(task_id) if workforce_runtime else None,
+                parent_tracer=parent_tracer if workforce_runtime else None,
+                agent_call_stack=workforce_runtime.agent_call_stack
+                if workforce_runtime
+                else None,
             )
             all_tools = await ToolFactory.create_all_tools(
                 temp_config, apply_user_override_filter=False
@@ -874,6 +1042,7 @@ class AgentServiceManager:
                     f"{len(allowed_tools)} tools for task {task_id}"
                 )
 
+        allowed_tools = _merge_workforce_tool_names(allowed_tools, workforce_runtime)
         workspace_owner_id = int(task.user_id)
         sandbox_workspace_config = {
             "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
@@ -917,6 +1086,23 @@ class AgentServiceManager:
             vision_model=task_vision_llm,
             sandbox=sandbox,
             llm=task_llm,
+            allowed_agent_ids=workforce_runtime.allowed_agent_ids
+            if workforce_runtime
+            else None,
+            agent_tool_overrides=workforce_runtime.agent_tool_overrides
+            if workforce_runtime
+            else None,
+            enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+            if workforce_runtime
+            else True,
+            allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+            if workforce_runtime
+            else False,
+            parent_task_id=str(task_id) if workforce_runtime else None,
+            parent_tracer=parent_tracer if workforce_runtime else None,
+            agent_call_stack=workforce_runtime.agent_call_stack
+            if workforce_runtime
+            else None,
         )
 
     async def get_agent_for_task(
@@ -1175,11 +1361,11 @@ class AgentServiceManager:
                         "Database connection is required for agent creation"
                     )
 
-                # ``excluded_agent_id`` is set by the snapshot loader
-                # (it already filtered the published-agent case in the
-                # same SELECT used for LLM resolution). Surface the log
-                # line here so on-call still sees the published-agent
-                # exclusion in production logs.
+                # ``excluded_agent_id`` for the legacy task-agent
+                # (published-agent) case is pre-computed by the snapshot
+                # loader (same SELECT as LLM resolution). Surface the log
+                # line here so on-call still sees the exclusion in
+                # production logs.
                 if (
                     excluded_agent_id is not None
                     and snapshot is not None
@@ -1191,6 +1377,42 @@ class AgentServiceManager:
                         "will exclude from agent tools"
                     )
 
+                # Inline preview_agent_id case (#459 build-preview): the
+                # snapshot path doesn't cover this because it resolves
+                # excluded_agent_id only through ``task.agent_id``; the
+                # preview agent is referenced inside the inline
+                # ``agent_config`` dict on tasks with ``agent_id=None``.
+                # Run this in addition to (not instead of) the snapshot
+                # value above -- they're mutually exclusive by design
+                # (either task has an agent_id OR has inline preview).
+                if (
+                    excluded_agent_id is None
+                    and agent_config
+                    and agent_config.get("preview_agent_id")
+                ):
+                    from ..models.agent import AgentStatus
+
+                    if task is None:
+                        raise ValueError(
+                            f"Task {task_id} missing while resolving preview agent"
+                        )
+                    current_agent = (
+                        db.query(Agent)
+                        .filter(
+                            Agent.id == agent_config["preview_agent_id"],
+                            Agent.user_id == task.user_id,
+                        )
+                        .first()
+                    )
+                    if current_agent and current_agent.status == AgentStatus.PUBLISHED:
+                        excluded_agent_id = int(current_agent.id)
+                        logger.info(
+                            f"Preview task {task_id} is for published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
+                        )
+
+                workforce_runtime = (
+                    resolve_workforce_task_runtime(db, task) if task else None
+                )
                 workspace_owner_id = (
                     int(task.user_id)
                     if task and task.user_id is not None
@@ -1229,7 +1451,7 @@ class AgentServiceManager:
 
                 # Filter tools by tool category using tool metadata
                 # Note: Tool names are stable, defined in code, no database storage needed
-                allowed_tools = None
+                allowed_tools: Optional[List[str]] = None
                 # Spec passed into the temp build so the factory skips
                 # creators (and their internal DB / MCP-discovery I/O)
                 # for categories this agent doesn't use. Same spec is
@@ -1258,6 +1480,23 @@ class AgentServiceManager:
                         allowed_skills=agent_config.get("skills"),
                         sandbox=sandbox,
                         selection_spec=selection_spec,
+                        allowed_agent_ids=workforce_runtime.allowed_agent_ids
+                        if workforce_runtime
+                        else None,
+                        agent_tool_overrides=workforce_runtime.agent_tool_overrides
+                        if workforce_runtime
+                        else None,
+                        enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+                        if workforce_runtime
+                        else True,
+                        allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+                        if workforce_runtime
+                        else False,
+                        parent_task_id=str(task_id) if workforce_runtime else None,
+                        parent_tracer=tracer if workforce_runtime else None,
+                        agent_call_stack=workforce_runtime.agent_call_stack
+                        if workforce_runtime
+                        else None,
                     )
                     all_tools = await ToolFactory.create_all_tools(
                         temp_config, apply_user_override_filter=False
@@ -1277,13 +1516,17 @@ class AgentServiceManager:
                             f"{len(allowed_tools)} tools for task {task_id}"
                         )
 
-                # Create tools using ToolFactory. ``selection_spec`` is
-                # the same one used by the temp build above; passing it
-                # here too keeps both factory calls aligned on which
-                # creators to dispatch and skip. ``workspace_owner_id``
-                # is already resolved upstream at the workspace-config
-                # block (currently chat.py:807), so the duplicate
-                # ``task.user_id`` fallback that lived here is dropped.
+                # Two-step tool selection (前后组合,两个 SSOT 各自单一职责):
+                #   1. ``select_allowed_tool_names_from_categories`` (above)
+                #      maps Agent.tool_categories -> tool name list
+                #   2. ``_merge_workforce_tool_names`` (here) injects
+                #      worker-tool names from the workforce runtime
+                # ``selection_spec`` passed below is the same one used
+                # by the temp build above; both calls aligned on which
+                # creators to dispatch and skip (issue #427 perf).
+                allowed_tools = _merge_workforce_tool_names(
+                    allowed_tools, workforce_runtime
+                )
                 tools = await create_default_tools(
                     db,
                     request=self.request,
@@ -1300,6 +1543,23 @@ class AgentServiceManager:
                     sandbox=sandbox,
                     llm=task_llm,  # Pass task-specific LLM
                     selection_spec=selection_spec,
+                    allowed_agent_ids=workforce_runtime.allowed_agent_ids
+                    if workforce_runtime
+                    else None,
+                    agent_tool_overrides=workforce_runtime.agent_tool_overrides
+                    if workforce_runtime
+                    else None,
+                    enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+                    if workforce_runtime
+                    else True,
+                    allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+                    if workforce_runtime
+                    else False,
+                    parent_task_id=str(task_id) if workforce_runtime else None,
+                    parent_tracer=tracer if workforce_runtime else None,
+                    agent_call_stack=workforce_runtime.agent_call_stack
+                    if workforce_runtime
+                    else None,
                 )
 
                 with UserContext(int(user.id)):
@@ -1318,6 +1578,9 @@ class AgentServiceManager:
                     system_prompt = enhance_system_prompt_with_kb(
                         system_prompt, kb_list
                     )
+                    system_prompt = _build_workforce_system_prompt(
+                        system_prompt, workforce_runtime
+                    )
 
                     # Extract memory similarity threshold from agent config
                     memory_similarity_threshold = None
@@ -1325,9 +1588,10 @@ class AgentServiceManager:
                         memory_similarity_threshold = agent_config[
                             "memory_similarity_threshold"
                         ]
-                    # Agent Builder agents serve end users, so v2 task memory is
-                    # disabled until the product exposes an explicit opt-in.
-                    agent_builder_memory_enabled = not bool(task and task.agent_id)
+                    memory_policy = resolve_agent_service_memory_policy(
+                        task=task,
+                        agent_config=agent_config,
+                    )
 
                     # Build allowed external directories for the task owner's uploads.
                     allowed_external_dirs = _build_allowed_external_dirs(
@@ -1344,7 +1608,7 @@ class AgentServiceManager:
                         compact_llm=task_compact_llm,
                         tools=tools_list,
                         tool_config=tool_config,  # Pass tool_config for proper multi-tenancy
-                        memory=get_memory_store(),  # Use dynamic memory store for auto-switching
+                        memory=memory_policy.memory,
                         pattern=task_pattern,  # Use pattern instead of use_dag_pattern
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
@@ -1354,7 +1618,7 @@ class AgentServiceManager:
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
                         task_id=str(task_id),  # Pass task_id for proper tracing
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
-                        memory_enabled=agent_builder_memory_enabled,
+                        memory_enabled=memory_policy.memory_enabled,
                         system_prompt=system_prompt,  # Pass agent builder instructions
                     )
 
@@ -1493,6 +1757,21 @@ class AgentServiceManager:
                     "status": "running_elsewhere",
                     "error": "Task is already running on another worker.",
                 }
+            try:
+                task_for_sync = (
+                    db_session.query(Task)
+                    .filter(Task.id == int(tracker_task_id))
+                    .first()
+                )
+                if task_for_sync is not None and sync_workforce_run_status(
+                    db_session, task_for_sync, TaskStatus.RUNNING
+                ):
+                    db_session.commit()
+            except Exception:
+                logger.debug(
+                    "Failed to sync workforce run status after lease acquisition",
+                    exc_info=True,
+                )
             lease_stop_event = asyncio.Event()
             lease_heartbeat_task = asyncio.create_task(
                 run_task_lease_heartbeat(lease, lease_stop_event)
@@ -1546,7 +1825,9 @@ class AgentServiceManager:
                         final_status = TaskStatus.COMPLETED
                     else:
                         final_status = TaskStatus.FAILED
-                release_task_lease(db_session, lease, status=final_status)
+                release_task_lease_with_workforce_sync(
+                    db_session, lease, status=final_status
+                )
             # Complete tracking if it was started
             if tracker:
                 try:
@@ -1740,6 +2021,7 @@ class AgentServiceManager:
                             agent_config=agent_config,
                             task_llm=task_llm,
                             task_vision_llm=task_vision_llm,
+                            parent_tracer=tracer,
                         )
                     else:
                         raise ValueError(
@@ -1774,6 +2056,10 @@ class AgentServiceManager:
                         system_prompt = enhance_system_prompt_with_kb(
                             system_prompt, kb_list
                         )
+                        system_prompt = _build_workforce_system_prompt(
+                            system_prompt,
+                            resolve_workforce_task_runtime(db, task),
+                        )
                         memory_similarity_threshold = None
                         if (
                             agent_config
@@ -1782,9 +2068,10 @@ class AgentServiceManager:
                             memory_similarity_threshold = agent_config[
                                 "memory_similarity_threshold"
                             ]
-                        # Agent Builder agents serve end users, so v2 task memory is
-                        # disabled until the product exposes an explicit opt-in.
-                        agent_builder_memory_enabled = not bool(task and task.agent_id)
+                        memory_policy = resolve_agent_service_memory_policy(
+                            task=task,
+                            agent_config=agent_config,
+                        )
                         self._agents[task_id] = AgentService(
                             name=f"reconstructed_agent_task_{task_id}",
                             id=f"web_task_{task_id}",  # Use task ID only for workspace
@@ -1794,7 +2081,7 @@ class AgentServiceManager:
                             compact_llm=task_compact_llm,
                             tools=tools_list,
                             tool_config=tool_config,
-                            memory=get_memory_store(),  # Use dynamic memory store for auto-switching
+                            memory=memory_policy.memory,
                             pattern=task_pattern,
                             tracer=tracer,
                             system_prompt=system_prompt,
@@ -1805,7 +2092,7 @@ class AgentServiceManager:
                             allowed_external_dirs=allowed_external_dirs,
                             task_id=str(task_id),
                             memory_similarity_threshold=memory_similarity_threshold,
-                            memory_enabled=agent_builder_memory_enabled,
+                            memory_enabled=memory_policy.memory_enabled,
                         )
                 else:
                     raise ValueError(
@@ -2139,6 +2426,9 @@ async def create_task(
             request.agent_config,
             selected_file_ids,
         )
+        if request.is_preview:
+            task_agent_config = task_agent_config or {}
+            task_agent_config["is_preview"] = True
 
         task_execution_mode = request.execution_mode
         if not task_execution_mode:
@@ -2169,6 +2459,7 @@ async def create_task(
             process_description=request.process_description,
             examples=examples_data,
             agent_id=request.agent_id,  # Set agent_id if provided
+            is_visible=False if request.is_preview else request.is_visible,
         )
 
         # Set agent_type using the property to avoid Column type issues
@@ -2243,6 +2534,7 @@ async def get_tasks(
     exclude_agent_type: Optional[str] = None,
     execution_mode: Optional[str] = None,
     exclude_execution_mode: Optional[str] = None,
+    include_hidden: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -2259,6 +2551,9 @@ async def get_tasks(
             else:
                 # Regular users can only see their own tasks
                 query = db.query(Task).filter(Task.user_id == user.id)
+
+            if not include_hidden:
+                query = query.filter(Task.is_visible.is_(True))
 
             # Apply search filter if provided
             if search:

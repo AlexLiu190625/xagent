@@ -50,6 +50,19 @@ class WorkforcePolicy:
     ) -> None:
         del db, user, workforce
 
+    def is_agent_in_workforce_run_scope(
+        self,
+        db: Session,
+        user: User,
+        workforce: Workforce,
+        agent: Agent,
+    ) -> bool:
+        del db
+        return bool(
+            int(workforce.owner_user_id) == int(user.id)
+            and int(agent.user_id) == int(user.id)
+        )
+
     def after_workforce_run_created(
         self,
         db: Session,
@@ -177,6 +190,7 @@ def ensure_workforce_agent_run_access(
     agent: Agent | None,
     user: User,
     db: Session,
+    workforce: Workforce,
 ) -> Agent:
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -184,9 +198,8 @@ def ensure_workforce_agent_run_access(
         raise HTTPException(
             status_code=400, detail="Workforce agents must be published"
         )
-    if user.is_admin or int(agent.user_id) == int(user.id):
-        return agent
-    visible_agent_ids = get_visible_agent_ids(db, user, "workforce_run")
-    if visible_agent_ids is not None and int(agent.id) in visible_agent_ids:
+    if get_workforce_policy().is_agent_in_workforce_run_scope(
+        db, user, workforce, agent
+    ):
         return agent
     raise HTTPException(status_code=403, detail="Access denied to agent")

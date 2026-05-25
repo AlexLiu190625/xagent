@@ -1001,6 +1001,11 @@ class RuntimeConfig:
     has_agent_builder_config: bool
     excluded_agent_id: Optional[int]
     agent_fields: Optional[AgentRuntimeFields]
+    # Workforce runtime if the task carries ``workforce_run_id`` in its
+    # ``agent_config``. ``Any`` instead of ``WorkforceTaskRuntime`` to
+    # keep this module free of the workforce import cycle -- callers
+    # that need the typed view import it themselves.
+    workforce: Any = None
 
 
 def resolve_task_runtime_config_core(
@@ -1074,15 +1079,27 @@ def resolve_task_runtime_config_core(
     excluded_agent_id: Optional[int] = None
     agent_fields: Optional[AgentRuntimeFields] = None
 
+    # Workforce runtime resolution -- pure query against the same
+    # session, no side effect. workforce mode changes two things in
+    # the resolution below: (1) the Agent ownership filter (manager
+    # agent is legitimately cross-user), and (2) the execution_mode
+    # override (workforce task keeps its own mode, doesn't inherit
+    # from agent_config).
+    from .workforce_runtime import resolve_workforce_task_runtime
+
+    workforce = resolve_workforce_task_runtime(session, task_row)
+
     if task_row.agent_id is not None:
-        agent_row = (
-            session.query(Agent)
-            .filter(
-                Agent.id == task_row.agent_id,
-                Agent.user_id == task_row.user_id,
-            )
-            .first()
-        )
+        agent_filters = [Agent.id == task_row.agent_id]
+        if not (
+            workforce is not None and workforce.manager_agent_id == task_row.agent_id
+        ):
+            # Defense in depth: workforce manager is cross-user by
+            # design, but ANY other case must keep the user_id filter
+            # so a misconfigured workforce_run_id can't be used as a
+            # cross-tenant agent read primitive.
+            agent_filters.append(Agent.user_id == task_row.user_id)
+        agent_row = session.query(Agent).filter(*agent_filters).first()
         if agent_row is not None:
             agent_config = load_agent_builder_config(
                 agent_row, session, int(task_row.user_id)
@@ -1101,8 +1118,16 @@ def resolve_task_runtime_config_core(
                 agent_llm or baseline
                 for baseline, agent_llm in zip(baseline_llms, agent_config["llms"])
             )
-            agent_execution_mode = agent_config.get("execution_mode", "balanced")
-            task_pattern = get_agent_pattern_for_execution_mode(agent_execution_mode)
+
+            if workforce is None:
+                # Non-workforce: agent_config.execution_mode overrides
+                # the task's own mode (legacy agent-builder behavior).
+                agent_execution_mode = agent_config.get("execution_mode", "balanced")
+                task_pattern = get_agent_pattern_for_execution_mode(
+                    agent_execution_mode
+                )
+            # workforce mode: keep task_pattern computed above from
+            # task.execution_mode; do not let agent_config override.
 
             if agent_row.status == AgentStatus.PUBLISHED:
                 excluded_agent_id = int(agent_row.id)
@@ -1117,6 +1142,15 @@ def resolve_task_runtime_config_core(
                     else None
                 ),
             )
+    else:
+        # Inline agent_config path: task carries its own agent config
+        # dict (no Agent row reference). Used by build-preview tasks
+        # routed through normal task flow.
+        inline_agent_config = load_task_inline_agent_config(task_row)
+        if inline_agent_config is not None:
+            agent_config = inline_agent_config
+            inline_execution_mode = agent_config.get("execution_mode") or "balanced"
+            task_pattern = get_agent_pattern_for_execution_mode(inline_execution_mode)
 
     return RuntimeConfig(
         llms=(task_llm, task_fast_llm, task_vision_llm, task_compact_llm),
@@ -1125,7 +1159,44 @@ def resolve_task_runtime_config_core(
         has_agent_builder_config=has_agent_builder_config,
         excluded_agent_id=excluded_agent_id,
         agent_fields=agent_fields,
+        workforce=workforce,
     )
+
+
+def load_task_inline_agent_config(task: Any) -> Optional[dict]:
+    """Build an inline agent_config dict from ``task.agent_config`` JSON.
+
+    Returns ``None`` when the task carries no inline agent fields (the
+    common case: the task references an Agent row by ``agent_id``).
+
+    Inline configs are used by build-preview tasks (#459) that get
+    routed through normal task flow with their config embedded in the
+    Task row rather than a separate Agent row.
+
+    Shape matches ``load_agent_builder_config`` so downstream consumers
+    can treat them uniformly.
+    """
+    raw = getattr(task, "agent_config", None)
+    if not isinstance(raw, dict):
+        return None
+
+    if not any(
+        key in raw
+        for key in ("instructions", "knowledge_bases", "skills", "tool_categories")
+    ):
+        return None
+
+    return {
+        "llms": (None, None, None, None),
+        "execution_mode": getattr(task, "execution_mode", None) or "balanced",
+        "instructions": raw.get("instructions"),
+        "skills": raw.get("skills") or [],
+        "knowledge_bases": raw.get("knowledge_bases") or [],
+        "tool_categories": raw.get("tool_categories") or [],
+        "memory_similarity_threshold": raw.get("memory_similarity_threshold"),
+        "is_preview": raw.get("is_preview"),
+        "preview_agent_id": raw.get("preview_agent_id"),
+    }
 
 
 def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:

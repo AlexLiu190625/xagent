@@ -58,10 +58,10 @@ from .hot_path_cache import invalidate_task_cache
 from .task_lease_service import (
     acquire_task_lease_isolated,
     get_runner_id,
-    release_current_runner_task_lease,
     run_task_lease_heartbeat,
 )
 from .task_setup_snapshot import load_task_setup_snapshot_sync
+from .workforce_runtime import release_current_runner_task_lease_with_workforce_sync
 
 logger = logging.getLogger(__name__)
 
@@ -458,6 +458,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
       - other statuses (PAUSED / WAITING_FOR_USER): leave alone
     """
     from ..models.chat_message import TaskChatMessage
+    from .workforce_runtime import sync_workforce_run_status
 
     bg_db.expire_all()
 
@@ -481,6 +482,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         if latest_assistant is not None:
             fresh.output = latest_assistant.content
             fresh.error_message = None
+            sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
             bg_db.commit()
             invalidate_task_cache(task_id)
             logger.info(
@@ -493,6 +495,9 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
                 "finish_turn: task %s completed but no assistant message found",
                 task_id,
             )
+            if sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED):
+                bg_db.commit()
+                invalidate_task_cache(task_id)
         return
 
     if status == TaskStatus.FAILED:
@@ -507,7 +512,8 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             # see a contradiction (status=failed + output populated).
             fresh.output = None
             changed = True
-        if changed:
+        run_changed = sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
+        if changed or run_changed:
             bg_db.commit()
             invalidate_task_cache(task_id)
             logger.info(
@@ -545,6 +551,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         fresh.status = TaskStatus.FAILED
         fresh.error_message = "Task execution failed without status update; see /steps."
         fresh.output = None  # latest-turn snapshot invariant
+        sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
         bg_db.commit()
         invalidate_task_cache(task_id)
         logger.warning(
@@ -741,8 +748,15 @@ async def _schedule_bg(
                             release_db.rollback()
                         except Exception:
                             pass
+                    # Use the workforce-aware release helper: it wraps
+                    # ``release_current_runner_task_lease`` (signature
+                    # unchanged) and additionally syncs the workforce
+                    # run status when the released task belongs to one.
+                    # Both PR #461 (short-open/short-close release_db
+                    # pattern) and PR #528 (workforce sync) compose
+                    # cleanly here -- decorator-style, no perf regression.
                     try:
-                        release_current_runner_task_lease(
+                        release_current_runner_task_lease_with_workforce_sync(
                             release_db, task_id, status=final_status
                         )
                     except Exception as e:

@@ -41,6 +41,7 @@ MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
 FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
 FILE_MATERIALIZE_DIR = "XAGENT_FILE_MATERIALIZE_DIR"
+PREVIEW_TMP_DIR = "XAGENT_PREVIEW_TMP_DIR"
 FILE_STORAGE_STARTUP_SYNC_ENABLED = "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
@@ -390,6 +391,15 @@ def get_file_materialize_dir() -> Path:
         return Path(env_value)
 
     return Path(tempfile.gettempdir()) / "xagent-materialized"
+
+
+def get_preview_tmp_dir() -> Path:
+    """Get the local directory used for temporary build-preview files."""
+    env_value = os.getenv(PREVIEW_TMP_DIR)
+    if env_value:
+        return Path(env_value).expanduser()
+
+    return Path(tempfile.gettempdir()) / "xagent-preview"
 
 
 def get_file_storage_startup_sync_enabled() -> bool:

@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState, useEffect, useRef, useMemo } from "react"
+import React, { useState, useEffect, useRef, useMemo, useCallback } from "react"
 import { ResizableThreeColumnLayout } from "@/components/layout/resizable-three-column-layout"
 import { AgentBuilderChat } from "./agent-builder-chat"
 import { Input } from "@/components/ui/input"
@@ -8,17 +8,13 @@ import { Textarea } from "@/components/ui/textarea"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { ScrollArea } from "@/components/ui/scroll-area"
-import { ChatInput } from "@/components/chat/ChatInput"
-import { ChatMessage } from "@/components/chat/ChatMessage"
 import { apiRequest } from "@/lib/api-wrapper"
-import { getApiUrl, getWsUrl } from "@/lib/utils"
-import { PlusCircle, MessageSquare, Upload, Download, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain } from "lucide-react"
+import { getApiUrl } from "@/lib/utils"
+import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, ChevronLeft, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain } from "lucide-react"
 import { ConnectMcpDialog } from "@/components/mcp/connect-mcp-dialog"
 import { useI18n } from "@/contexts/i18n-context"
-import { useAuth } from "@/contexts/auth-context"
+import { useApp } from "@/contexts/app-context-chat"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
-import { FileAttachment } from "@/components/file/file-attachment"
 import { createFileChipHTML } from "@/components/chat/FileChip"
 import { MultiSelect } from "@/components/ui/multi-select"
 import { useFileMention } from "@/hooks/use-file-mention"
@@ -27,7 +23,6 @@ import { Select } from "@/components/ui/select"
 import {
   InfoTooltip,
 } from "@/components/ui/tooltip"
-import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet"
 import {
   Dialog,
   DialogContent,
@@ -41,6 +36,8 @@ import { KnowledgeBaseCreationDialog } from "@/components/kb/knowledge-base-crea
 import { toast } from "sonner"
 import { cn } from "@/lib/utils"
 import { getBrandingFromEnv } from "@/lib/branding"
+import { BuildFilePreviewSheet } from "./build-file-preview-sheet"
+import { TaskConversationPanel } from "@/components/task/task-conversation-panel"
 
 interface KnowledgeBase {
   name: string
@@ -90,13 +87,6 @@ interface AgentModelConfig {
   compact: number | null
 }
 
-interface Message {
-  role: "user" | "assistant" | "system"
-  content: string | React.ReactNode
-  traceEvents?: any[]
-  timestamp?: number
-}
-
 interface AgentBuilderProps {
   agentId?: string
 }
@@ -110,8 +100,8 @@ interface TemplateRequirements {
 
 export function AgentBuilder({ agentId }: AgentBuilderProps) {
   const MAX_INSTRUCTIONS_LENGTH = 8192;
+  const { state, setTaskId, sendMessage, dispatch, closeFilePreview } = useApp()
   const { t, locale } = useI18n()
-  const { token } = useAuth()
   const { apps: officialApps, getAppIcon } = useMcpApps()
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -353,185 +343,34 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     }
   }, [instructions]);
 
-  // Chat State
-  const [messages, setMessages] = useState<Message[]>([])
-
-  useEffect(() => {
-    setMessages([{
-      role: "assistant",
-      content: t("builds.preview.initialMessage"),
-      timestamp: Date.now()
-    }])
-  }, [t])
-
-  const [isChatLoading, setIsChatLoading] = useState(false)
-  const [taskStatus, setTaskStatus] = useState<"idle" | "running" | "paused">("idle")
   const fileInputRef = useRef<HTMLInputElement>(null)
-  const [files, setFiles] = useState<File[]>([])
+  const previewTaskIdRef = useRef<number | null>(null)
 
-  // WebSocket for preview
-  const [wsConnected, setWsConnected] = useState(false)
-  const wsRef = useRef<WebSocket | null>(null)
-  const previewStepsRef = useRef<any[]>([])
-  const traceEventsRef = useRef<any[]>([])
-  const reconnectTimeoutRef = useRef<NodeJS.Timeout | null>(null)
-  const reconnectAttemptsRef = useRef(0)
-  const maxReconnectAttempts = 5
+  const resetPreviewSession = useCallback(() => {
+    previewTaskIdRef.current = null
+    closeFilePreview()
+    dispatch({ type: "CLEAR_MESSAGES" })
+    dispatch({ type: "SET_TRACE_EVENTS", payload: [] })
+    dispatch({ type: "SET_STEPS", payload: [] })
+    dispatch({ type: "SET_DAG_EXECUTION", payload: null })
+    dispatch({ type: "SET_CURRENT_TASK", payload: null })
+    dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+    setTaskId(null, { navigate: false })
+  }, [closeFilePreview, dispatch, setTaskId])
 
-  // Setup WebSocket connection
   useEffect(() => {
-    const connectWebSocket = () => {
-      if (!token) {
-        console.log('⏳ Waiting for token to connect to WS...')
-        return
-      }
-
-      // Clear any existing reconnect timeout
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current)
-        reconnectTimeoutRef.current = null
-      }
-
-      const baseUrl = getWsUrl()
-      const wsUrl = `${baseUrl}/ws/build/preview?token=${token}`
-      console.log('🔌 Connecting to Build Preview WS:', wsUrl)
-
-      try {
-        const ws = new WebSocket(wsUrl)
-
-        ws.onopen = () => {
-          console.log('✅ Build preview WebSocket connected')
-          setWsConnected(true)
-          wsRef.current = ws
-          reconnectAttemptsRef.current = 0
-        }
-
-        ws.onmessage = (event) => {
-          try {
-            const message = JSON.parse(event.data)
-            console.log('Build preview WebSocket message:', message)
-
-            // Handle different message types
-            if (message.type === 'preview_started') {
-              setIsChatLoading(true)
-              setTaskStatus('running')
-              previewStepsRef.current = []
-              traceEventsRef.current = []
-              // Add a placeholder message for the assistant response
-              setMessages(prev => [...prev, {
-                role: "assistant",
-                content: "",
-                traceEvents: [],
-                timestamp: Date.now()
-              }])
-            } else if (message.type === 'task_paused') {
-              setIsChatLoading(false)
-              setTaskStatus('paused')
-            } else if (message.type === 'task_resumed') {
-              setIsChatLoading(true)
-              setTaskStatus('running')
-            } else if (message.type === 'trace_event') {
-              // Collect trace events and steps
-              traceEventsRef.current.push(message)
-              if (message.event_type === 'dag_step_start' || message.event_type === 'dag_step_end') {
-                previewStepsRef.current.push(message)
-              }
-              // Update the last message (assistant) with the new trace event
-              setMessages(prev => {
-                const newMessages = [...prev]
-                const lastMsg = newMessages[newMessages.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant') {
-                  newMessages[newMessages.length - 1] = {
-                    ...lastMsg,
-                    traceEvents: [...(lastMsg.traceEvents || []), message]
-                  }
-                  return newMessages
-                }
-                return prev
-              })
-            } else if (message.type === 'task_completed') {
-              const completionText = typeof message.result === 'string'
-                ? message.result
-                : message.result?.content || ""
-              const interruptedByPause =
-                message.success === false &&
-                completionText === "ReActPattern interrupted."
-
-              if (interruptedByPause) {
-                return
-              }
-
-              setIsChatLoading(false)
-              setTaskStatus('idle')
-              setMessages(prev => {
-                const newMessages = [...prev]
-                const lastMsg = newMessages[newMessages.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant') {
-                  newMessages[newMessages.length - 1] = {
-                    ...lastMsg,
-                    content: completionText || message.output || "Preview completed"
-                  }
-                  return newMessages
-                }
-                return prev
-              })
-            } else if (message.type === 'task_error') {
-              setIsChatLoading(false)
-              setTaskStatus('idle')
-              setMessages(prev => [...prev, {
-                role: "assistant",
-                content: `Error: ${message.error}`,
-                timestamp: Date.now()
-              }])
-            }
-          } catch (error) {
-            console.error('Failed to parse WebSocket message:', error)
-          }
-        }
-
-        ws.onerror = (error) => {
-          console.error('Build preview WebSocket error:', error)
-          // Don't set connected false here, let onclose handle it
-        }
-
-        ws.onclose = (event) => {
-          console.log('Build preview WebSocket closed', event.code, event.reason)
-          setWsConnected(false)
-          wsRef.current = null
-
-          // Don't reconnect if component unmounted or token changed (handled by cleanup)
-          // Retry logic
-          if (reconnectAttemptsRef.current < maxReconnectAttempts) {
-            reconnectAttemptsRef.current++
-            const delay = Math.min(1000 * reconnectAttemptsRef.current, 5000)
-            console.log(`🔄 Reconnecting in ${delay}ms... (Attempt ${reconnectAttemptsRef.current}/${maxReconnectAttempts})`)
-            reconnectTimeoutRef.current = setTimeout(connectWebSocket, delay)
-          } else {
-            console.log('❌ Max reconnect attempts reached')
-          }
-        }
-      } catch (error) {
-        console.error('Failed to create WebSocket:', error)
-        // Retry immediately if creation failed
-        if (reconnectAttemptsRef.current < maxReconnectAttempts) {
-          reconnectAttemptsRef.current++
-          reconnectTimeoutRef.current = setTimeout(connectWebSocket, 1000)
-        }
-      }
-    }
-
-    connectWebSocket()
-
+    resetPreviewSession()
     return () => {
-      if (reconnectTimeoutRef.current) {
-        clearTimeout(reconnectTimeoutRef.current)
-      }
-      if (wsRef.current) {
-        wsRef.current.close()
-        wsRef.current = null
-      }
+      resetPreviewSession()
     }
-  }, [token])
+  }, [resetPreviewSession])
+
+  useEffect(() => {
+    if (!previewTaskIdRef.current) {
+      return
+    }
+    resetPreviewSession()
+  }, [instructions, executionMode, selectedKbs, selectedSkills, selectedToolCategories, selectedMcpServers, modelConfig, resetPreviewSession])
 
   // Fetch Data
   useEffect(() => {
@@ -820,146 +659,119 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
     return labels[category] || category
   }
 
-  const [previewState, setPreviewState] = useState<{
-    isOpen: boolean;
-    fileUrl?: string;
-    fileName?: string;
-    fileType?: string;
-  }>({ isOpen: false });
-
-  const handlePreviewFile = (url: string, name: string, type: string) => {
-    setPreviewState({
-      isOpen: true,
-      fileUrl: url,
-      fileName: name,
-      fileType: type
-    });
-  };
-
-  const handleDownloadFile = () => {
-    if (!previewState.fileUrl || !previewState.fileName) return;
-    const a = document.createElement('a');
-    a.href = previewState.fileUrl;
-    a.download = previewState.fileName;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-  };
-
-  const handlePause = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "pause" }))
-    }
-  }
-
-  const handleResume = () => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: "resume" }))
-    }
-  }
-
-  const handleSendMessage = async (content: string, _config?: any) => {
-    // Construct UI message with files if present
-    let uiContent: React.ReactNode = content
-    if (files.length > 0) {
-      // Create object URLs for local preview
-      const fileInfos = files.map(f => ({
-        name: f.name,
-        size: f.size,
-        type: f.type,
-        path: URL.createObjectURL(f)
-      }));
-
-      uiContent = (
-        <div className="space-y-2">
-          <div>{content}</div>
-          <FileAttachment
-            files={fileInfos}
-            variant="user-message"
-            onPreview={(file) => {
-              if (file.path) {
-                handlePreviewFile(file.path, file.name, file.type);
-              }
-            }}
-          />
-        </div>
-      )
-    }
-
-    setMessages(prev => [...prev, { role: "user", content: uiContent, timestamp: Date.now() }])
-    setIsChatLoading(true)
-
+  const handlePreviewSendMessage = async (content: string, _config?: any, files?: File[]) => {
     try {
       // Check if general model is selected
       if (!modelConfig.general) {
-        setMessages(prev => [...prev, {
-          role: "assistant",
-          content: t("builds.preview.errors.noModel"),
-          timestamp: Date.now()
-        }])
-        setIsChatLoading(false)
+        dispatch({
+          type: "ADD_MESSAGE",
+          payload: {
+            id: `preview-error-${Date.now()}`,
+            role: "assistant",
+            content: t("builds.preview.errors.noModel"),
+            timestamp: Date.now().toString(),
+            isResult: true,
+          }
+        })
         return
       }
 
-      // Check WebSocket connection
-      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) {
-        setMessages(prev => [...prev, {
-          role: "assistant",
-          content: "⚠️ WebSocket not connected. The system is attempting to reconnect. Please wait a moment and try again.",
-          timestamp: Date.now()
-        }])
-        setIsChatLoading(false)
-        return
-      }
+      let previewTaskId = previewTaskIdRef.current
+      const processedFiles = (files || []).map(f => ({
+        file_id: (f as any).file_id,
+        name: f.name,
+        size: f.size,
+        type: f.type || ''
+      }))
 
-      // Process files if any
-      let processedFiles: any[] = []
-      if (files.length > 0) {
-        // Files are already uploaded by ChatInput component
-        processedFiles = files.map(f => ({
-          file_id: (f as any).file_id,
-          name: f.name,
-          size: f.size,
-          type: f.type || ''
-        }))
-      }
-
-      // Ensure message is not empty for backend
       let backendMessage = content
       if (!backendMessage.trim() && processedFiles.length > 0) {
         backendMessage = `Uploaded files: ${processedFiles.map(f => f.name).join(', ')}`
       }
 
-      // Add selected MCP servers back into tool_categories
-      const finalToolCategories = [...selectedToolCategories];
+      const finalToolCategories = [...selectedToolCategories]
       selectedMcpServers.forEach(server => {
-        finalToolCategories.push(`mcp:${server}`);
-      });
+        finalToolCategories.push(`mcp:${server}`)
+      })
 
-      // Send preview request via WebSocket
-      wsRef.current.send(JSON.stringify({
-        type: "preview",
-        agent_id: localAgentId && typeof localAgentId === 'string' ? parseInt(localAgentId) : null,  // Exclude this agent from agent tools if published
-        instructions,
-        execution_mode: executionMode,
-        models: modelConfig,
-        knowledge_bases: selectedKbs,
-        skills: selectedSkills,
-        tool_categories: finalToolCategories,
-        message: backendMessage,
-        files: processedFiles
-      }))
+      if (!previewTaskId) {
+        const response = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            title: (backendMessage || "Build preview").slice(0, 80),
+            description: backendMessage,
+            llm_ids: [
+              modelConfig.general ? String(modelConfig.general) : null,
+              modelConfig.small_fast ? String(modelConfig.small_fast) : null,
+              modelConfig.visual ? String(modelConfig.visual) : null,
+              modelConfig.compact ? String(modelConfig.compact) : null,
+            ],
+            agent_config: {
+              instructions,
+              knowledge_bases: selectedKbs,
+              skills: selectedSkills,
+              tool_categories: finalToolCategories,
+              is_preview: true,
+              preview_agent_id: localAgentId && typeof localAgentId === 'string' ? parseInt(localAgentId) : null,
+            },
+            execution_mode: executionMode,
+            is_visible: false,
+          }),
+        })
 
-      setFiles([])
+        if (!response.ok) {
+          throw new Error(await response.text())
+        }
 
+        const taskData = await response.json()
+        previewTaskId = Number(taskData.task_id)
+        if (!Number.isFinite(previewTaskId)) {
+          throw new Error("Preview task creation returned an invalid task id")
+        }
+        previewTaskIdRef.current = previewTaskId
+
+        setTaskId(previewTaskId, { navigate: false })
+        dispatch({
+          type: "SET_CURRENT_TASK",
+          payload: {
+            id: previewTaskId.toString(),
+            title: taskData.title,
+            description: taskData.description || backendMessage,
+            status: taskData.status,
+            createdAt: taskData.created_at,
+            updatedAt: taskData.updated_at,
+            modelId: taskData.model_id,
+            smallFastModelId: taskData.small_fast_model_id,
+            visualModelId: taskData.visual_model_id,
+            compactModelId: taskData.compact_model_id,
+            modelName: taskData.model_name || taskData.modelName,
+            smallFastModelName: taskData.small_fast_model_name || taskData.smallFastModelName,
+            visualModelName: taskData.visual_model_name,
+            compactModelName: taskData.compact_model_name,
+            executionMode: taskData.execution_mode,
+            isDag: taskData.is_dag,
+            agentId: taskData.agent_id,
+            waitingQuestion: taskData.waiting_question,
+            waitingInteractions: taskData.waiting_interactions,
+          }
+        })
+        dispatch({ type: "TRIGGER_TASK_UPDATE" })
+      }
+
+      await sendMessage(backendMessage, { force: true, targetTaskId: previewTaskId }, files)
     } catch (error) {
       console.error("Preview failed:", error)
-      setMessages(prev => [...prev, {
-        role: "assistant",
-        content: t("builds.preview.errors.requestFailed"),
-        timestamp: Date.now()
-      }])
-      setIsChatLoading(false)
+      dispatch({
+        type: "ADD_MESSAGE",
+        payload: {
+          id: `preview-error-${Date.now()}`,
+          role: "assistant",
+          content: t("builds.preview.errors.requestFailed"),
+          timestamp: Date.now().toString(),
+          isResult: true,
+        }
+      })
     }
   }
 
@@ -1301,7 +1113,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         selectedToolCategories.length > 0 ||
         selectedMcpServers.length > 0
       )
-  const previewStepCompleted = messages.some((message) => message.role === "user")
+  const previewStepCompleted = state.messages.some((message) => message.role === "user")
   const shouldHighlightConfigStep = !configStepCompleted
   const shouldHighlightKbSection = useTemplateSpecificHighlights ? templateMissingKb : shouldHighlightConfigStep
   const shouldHighlightSkillsSection = useTemplateSpecificHighlights ? templateMissingSkills : shouldHighlightConfigStep
@@ -2018,7 +1830,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
 
   const RightPanel = (
     <div className="flex flex-col flex-1 min-h-0 h-full bg-background border-l">
-      {/* Header */}
       <div className="h-14 border-b flex items-center px-4 gap-2 bg-card/30">
         <MessageSquare className="h-5 w-5 text-muted-foreground" />
         <span className="font-medium">{t("builds.preview.title")}</span>
@@ -2034,64 +1845,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
             variant="ghost"
             size="icon"
             className="h-8 w-8 text-muted-foreground hover:text-foreground"
-            disabled={isChatLoading}
-            onClick={() => {
-              setMessages([{
-                role: "assistant",
-                content: t("builds.preview.initialMessage"),
-                timestamp: Date.now()
-              }])
-              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                wsRef.current.send(JSON.stringify({ type: "clear_context" }))
-              }
-            }}
+            onClick={resetPreviewSession}
             title={t("common.clear") || "Clear"}
           >
             <Trash2 className="h-4 w-4" />
           </Button>
-          <div
-            className={`w-2.5 h-2.5 rounded-full ${wsConnected ? 'bg-green-500' : 'bg-red-500'}`}
-            title={wsConnected ? t("builds.preview.status.connected") : t("builds.preview.status.disconnected")}
-          />
-          <span className="text-xs text-muted-foreground">
-            {wsConnected ? t("builds.preview.status.connected") : t("builds.preview.status.disconnected")}
-          </span>
         </div>
       </div>
-
-      {/* Messages */}
-      <div className="flex-1 overflow-hidden relative">
-        <ScrollArea className="h-full px-4 py-4">
-          <div className="space-y-4 max-w-3xl mx-auto">
-            {messages.map((msg, index) => (
-              <ChatMessage
-                key={index}
-                role={msg.role}
-                content={msg.content}
-                traceEvents={msg.traceEvents}
-                showProcessView={true}
-                timestamp={msg.timestamp}
-                taskStatus={index === messages.length - 1 && msg.role === 'assistant' ? taskStatus : undefined}
-              />
-            ))}
-          </div>
-        </ScrollArea>
-      </div>
-
-      {/* Input */}
-      <div className="p-4 border-t bg-card/30 mb-8">
-        <div className="max-w-3xl mx-auto">
-          <ChatInput
-            onSend={handleSendMessage}
-            isLoading={isChatLoading}
-            hideConfig={true}
-            files={files}
-            onFilesChange={setFiles}
-            taskStatus={taskStatus as any}
-            onPause={handlePause}
-            onResume={handleResume}
-          />
-        </div>
+      <div className="flex-1 min-h-0">
+        <TaskConversationPanel
+          mode="embedded-preview"
+          showTaskActions={true}
+          showTokenUsage={false}
+          showDagPreview={false}
+          showTaskFiles={true}
+          autoFocusInput={false}
+          onSend={handlePreviewSendMessage}
+        />
       </div>
     </div>
   )
@@ -2151,57 +1921,6 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           minRightWidth={20}
         />
       </div>
-      {/* File Preview Drawer */}
-      <Sheet open={previewState.isOpen} onOpenChange={(open) => setPreviewState(prev => ({ ...prev, isOpen: open }))}>
-        <SheetContent className="!max-w-[1200px] w-[90vw] sm:w-[800px] md:w-[900px] lg:w-[1000px] flex flex-col p-0 gap-0">
-          <div className="flex flex-col gap-1.5 p-4 flex-shrink-0 bg-background/80 backdrop-blur-sm border-b">
-            <div className="flex items-center justify-between">
-              <SheetTitle className="flex items-center gap-2">
-                {previewState.fileName}
-              </SheetTitle>
-              <div className="flex items-center gap-2 mr-8">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={handleDownloadFile}
-                  className="h-8 w-8 p-0"
-                  title={t("files.previewDialog.buttons.download")}
-                >
-                  <Download className="h-4 w-4" />
-                </Button>
-              </div>
-            </div>
-          </div>
-          <div className="flex-1 overflow-hidden flex flex-col min-h-0 bg-muted/30 p-4">
-            {previewState.fileUrl && (
-              <div className="w-full h-full flex items-center justify-center bg-background rounded-lg border overflow-auto">
-                {previewState.fileType?.startsWith('image/') ? (
-                  <img
-                    src={previewState.fileUrl}
-                    alt={previewState.fileName}
-                    className="max-w-full max-h-full object-contain"
-                  />
-                ) : (previewState.fileType?.includes('pdf') || previewState.fileName?.endsWith('.pdf')) ? (
-                  <iframe
-                    src={previewState.fileUrl}
-                    className="w-full h-full border-0"
-                    title={previewState.fileName}
-                  />
-                ) : (
-                  <div className="text-center p-8">
-                    <p className="text-muted-foreground mb-4">{t("files.previewDialog.noPreview") || "No preview available for this file type."}</p>
-                    <Button onClick={handleDownloadFile} variant="outline">
-                      <Download className="mr-2 h-4 w-4" />
-                      {t("files.previewDialog.buttons.download")}
-                    </Button>
-                  </div>
-                )}
-              </div>
-            )}
-          </div>
-        </SheetContent>
-      </Sheet>
-
       {/* Success Dialog */}
       <Dialog open={showSuccessDialog} onOpenChange={handleDialogClose}>
         <DialogContent>
@@ -2241,6 +1960,13 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }}
       />
 
+      {state.filePreview.isOpen && (
+        <div className="absolute inset-y-0 right-0 z-50 w-full max-w-[720px] p-4 pointer-events-none">
+          <div className="h-full pointer-events-auto">
+            <BuildFilePreviewSheet />
+          </div>
+        </div>
+      )}
       <ConnectMcpDialog
         open={isConnectMcpOpen}
         onOpenChange={setIsConnectMcpOpen}

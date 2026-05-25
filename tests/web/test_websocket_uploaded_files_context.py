@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.trace import get_display_user_message
+from xagent.core.file_storage.factory import get_file_storage
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
@@ -14,6 +15,7 @@ from xagent.web.api.websocket import (
     _display_message_for_user,
     _normalize_attachments_for_persistence,
     _normalize_file_outputs,
+    _normalize_task_file_outputs,
     _register_uploaded_files_for_agent,
     _selected_file_refs_from_task,
     execute_task_background,
@@ -165,7 +167,9 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
     def fake_get_db():
         yield db_session
 
-    def fake_release_current_runner_task_lease(db, task_id, *, status):
+    def fake_release_current_runner_task_lease_with_workforce_sync(
+        db, task_id, *, status
+    ):
         return True
 
     monkeypatch.setattr(
@@ -176,8 +180,8 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
     monkeypatch.setattr(websocket_api, "manager", BroadcastManager())
     monkeypatch.setattr(
         websocket_api,
-        "release_current_runner_task_lease",
-        fake_release_current_runner_task_lease,
+        "release_current_runner_task_lease_with_workforce_sync",
+        fake_release_current_runner_task_lease_with_workforce_sync,
     )
     monkeypatch.setattr(database_models, "get_db", fake_get_db)
     monkeypatch.setattr(
@@ -503,17 +507,51 @@ def test_normalize_file_outputs_registers_current_task_output_path(
 ):
     uploads_dir = tmp_path / "uploads"
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
+    get_file_storage.cache_clear()
     _create_user(db_session, 1, "owner")
     _create_task(db_session, task_id=20, user_id=1)
     output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
     output_path.parent.mkdir(parents=True)
     output_path.write_text("report")
 
-    normalized_outputs, path_to_file_id = _normalize_file_outputs(
+    try:
+        normalized_outputs, path_to_file_id = _normalize_file_outputs(
+            db_session,
+            task_id=20,
+            task_user_id=1,
+            file_outputs=[{"path": str(output_path), "filename": "report.txt"}],
+        )
+    finally:
+        get_file_storage.cache_clear()
+
+    assert len(normalized_outputs) == 1
+    assert normalized_outputs[0]["filename"] == "report.txt"
+    assert path_to_file_id[str(output_path)] == normalized_outputs[0]["file_id"]
+    file_record = db_session.query(UploadedFile).one()
+    assert file_record.user_id == 1
+    assert file_record.task_id == 20
+    assert file_record.storage_path == str(output_path)
+
+
+def test_normalize_task_file_outputs_registers_preview_output_normally(
+    db_session,
+    tmp_path,
+    monkeypatch,
+):
+    uploads_dir = tmp_path / "uploads"
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
+    _create_user(db_session, 1, "owner")
+    task = _create_task(db_session, task_id=20, user_id=1)
+    task.agent_config = {"is_preview": True}
+    output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
+    output_path.parent.mkdir(parents=True)
+    output_path.write_text("preview report")
+
+    normalized_outputs, path_to_file_id = _normalize_task_file_outputs(
         db_session,
-        task_id=20,
-        task_user_id=1,
-        file_outputs=[{"path": str(output_path), "filename": "report.txt"}],
+        task,
+        [{"path": str(output_path), "filename": "report.txt"}],
     )
 
     assert len(normalized_outputs) == 1

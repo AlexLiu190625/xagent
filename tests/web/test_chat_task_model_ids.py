@@ -557,6 +557,49 @@ def test_get_task_llm_ids_preserves_stored_id_when_model_missing(test_db):
         db.close()
 
 
+def test_get_tasks_hides_invisible_tasks_by_default(test_db, user1_headers):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").one()
+        normal_task = Task(
+            user_id=user.id,
+            title="normal task",
+            description="normal",
+            status=TaskStatus.PENDING,
+        )
+        preview_task = Task(
+            user_id=user.id,
+            title="preview task",
+            description="preview",
+            status=TaskStatus.PENDING,
+            is_visible=False,
+        )
+        db.add_all([normal_task, preview_task])
+        db.commit()
+
+        default_response = client.get("/api/chat/tasks", headers=user1_headers)
+        assert default_response.status_code == 200
+        assert [task["title"] for task in default_response.json()["tasks"]] == [
+            "normal task"
+        ]
+
+        include_response = client.get(
+            "/api/chat/tasks?include_hidden=true",
+            headers=user1_headers,
+        )
+        assert include_response.status_code == 200
+        assert {task["title"] for task in include_response.json()["tasks"]} == {
+            "normal task",
+            "preview task",
+        }
+    finally:
+        db.close()
+
+
 def test_task_create_skips_stale_user_default(test_db, user1_headers):
     """When a user's default model is no longer visible, task falls back to admin shared."""
     from xagent.web.models.database import get_db

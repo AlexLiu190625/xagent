@@ -22,6 +22,7 @@ from xagent.config import (
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    PREVIEW_TMP_DIR,
     REDIS_URL,
     SANDBOX_CPUS,
     SANDBOX_ENV,
@@ -54,6 +55,7 @@ from xagent.config import (
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_preview_tmp_dir,
     get_redis_url,
     get_sandbox_cpus,
     get_sandbox_env,
@@ -123,6 +125,9 @@ class TestEnvironmentVariableConstants:
 
     def test_file_materialize_dir_constant(self):
         assert FILE_MATERIALIZE_DIR == "XAGENT_FILE_MATERIALIZE_DIR"
+
+    def test_preview_tmp_dir_constant(self):
+        assert PREVIEW_TMP_DIR == "XAGENT_PREVIEW_TMP_DIR"
 
     def test_file_storage_startup_sync_enabled_constant(self):
         assert (
@@ -306,6 +311,16 @@ class TestFileStorageConfig:
         monkeypatch.setenv(FILE_MATERIALIZE_DIR, "/custom/materialized")
 
         assert get_file_materialize_dir() == Path("/custom/materialized")
+
+    def test_preview_tmp_dir_default(self, monkeypatch):
+        monkeypatch.delenv(PREVIEW_TMP_DIR, raising=False)
+
+        assert get_preview_tmp_dir() == Path(gettempdir()) / "xagent-preview"
+
+    def test_preview_tmp_dir_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(PREVIEW_TMP_DIR, "/custom/preview-tmp")
+
+        assert get_preview_tmp_dir() == Path("/custom/preview-tmp")
 
     def test_file_storage_startup_sync_enabled_defaults_true(self, monkeypatch):
         monkeypatch.delenv(FILE_STORAGE_STARTUP_SYNC_ENABLED, raising=False)

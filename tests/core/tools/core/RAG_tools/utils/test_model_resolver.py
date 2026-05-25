@@ -5,6 +5,8 @@ from __future__ import annotations
 from typing import Dict
 
 import pytest
+from sqlalchemy.exc import InvalidRequestError
+from sqlalchemy.exc import OperationalError as SAOperationalError
 
 from xagent.core.model.chat.basic.base import BaseLLM
 from xagent.core.model.embedding.base import BaseEmbedding
@@ -14,6 +16,10 @@ from xagent.core.model.model import (
     RerankModelConfig,
 )
 from xagent.core.model.rerank.base import BaseRerank
+from xagent.core.model.storage.error import (
+    ModelNotFoundError,
+    UnsupportedModelCategoryError,
+)
 from xagent.core.tools.core.RAG_tools.core.exceptions import (
     EmbeddingAdapterError,
     RagCoreException,
@@ -26,14 +32,79 @@ class _StubHub:
 
     def __init__(self, models: Dict[str, object]) -> None:
         self._models = models
+        self.close_calls = 0
 
     def list(self) -> Dict[str, object]:
         return self._models
 
     def load(self, model_id: str) -> object:
-        if model_id not in self._models:
-            raise ValueError(f"Model {model_id} not found")
-        return self._models[model_id]
+        if model_id in self._models:
+            return self._models[model_id]
+
+        for model in self._models.values():
+            if getattr(model, "model_name", None) == model_id:
+                return model
+
+        raise ModelNotFoundError(model_id)
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FailingLoadHub:
+    """Stub hub that fails with a DB error during query execution."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def load(self, model_id: str) -> object:
+        raise SAOperationalError(
+            "SELECT models",
+            {},
+            Exception("too many clients already"),
+        )
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _BuggyLoadHub:
+    """Stub hub that fails with a non-recoverable SQLAlchemy error."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def load(self, model_id: str) -> object:
+        raise InvalidRequestError("invalid model hub row")
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _UnsupportedCategoryHub:
+    """Stub hub that finds a row but cannot convert its category."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def load(self, model_id: str) -> object:
+        raise UnsupportedModelCategoryError(model_id, "audio")
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _BuggyListHub:
+    """Stub hub that fails with a non-recoverable SQLAlchemy error while listing."""
+
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def list(self) -> Dict[str, object]:
+        raise InvalidRequestError("invalid model hub query")
+
+    def close(self) -> None:
+        self.close_calls += 1
 
 
 class TestGetOrInitModelHub:
@@ -74,6 +145,18 @@ class TestGetOrInitModelHub:
         assert result == stub_hub
         assert hasattr(result, "list")
 
+    def test_list_model_hub_configs_does_not_hide_non_db_sqlalchemy_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test SQLAlchemy non-DB errors are not converted to an empty config list."""
+        stub_hub = _BuggyListHub()
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
+
+        with pytest.raises(InvalidRequestError):
+            model_resolver._list_model_hub_configs()
+
+        assert stub_hub.close_calls == 1
+
 
 class TestResolveEmbeddingAdapter:
     """Test resolve_embedding_adapter function with strict priority."""
@@ -102,6 +185,34 @@ class TestResolveEmbeddingAdapter:
         cfg, adapter = model_resolver.resolve_embedding_adapter(model_id="hub-model")
         assert cfg.id == "hub-model"
         assert isinstance(adapter, BaseEmbedding)
+        assert stub_hub.close_calls == 1
+
+    def test_resolve_embedding_by_model_name_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test resolving embedding by provider model_name fallback."""
+        stub_hub = _StubHub(
+            {
+                "hub-id": EmbeddingModelConfig(
+                    id="hub-id",
+                    model_name="text-embedding-v4",
+                    model_provider="dashscope",
+                    api_key="hub-key",
+                    abilities=["embedding"],
+                )
+            }
+        )
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
+        monkeypatch.delenv("DASHSCOPE_EMBEDDING_MODEL", raising=False)
+        monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+
+        cfg, adapter = model_resolver.resolve_embedding_adapter(
+            model_id="text-embedding-v4"
+        )
+
+        assert cfg.id == "hub-id"
+        assert isinstance(adapter, BaseEmbedding)
+        assert stub_hub.close_calls == 1
 
     def test_resolve_embedding_default_placeholder(
         self, monkeypatch: pytest.MonkeyPatch
@@ -165,12 +276,8 @@ class TestResolveEmbeddingAdapter:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test resolving embedding from env when hub fails (fallback)."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Set env vars for fallback
         monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "env-model")
@@ -186,14 +293,63 @@ class TestResolveEmbeddingAdapter:
         assert cfg.dimension == 1536
         assert isinstance(adapter, BaseEmbedding)
 
+    def test_resolve_embedding_env_fallback_when_hub_query_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test env fallback and session close when hub query fails."""
+        stub_hub = _FailingLoadHub()
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
+
+        monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "env-model")
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
+
+        cfg, adapter = model_resolver.resolve_embedding_adapter(model_id=None)
+
+        assert cfg.id == "env-model"
+        assert isinstance(adapter, BaseEmbedding)
+        assert stub_hub.close_calls == 1
+
+    def test_resolve_embedding_does_not_fallback_for_non_db_hub_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Test non-DB hub errors are not hidden by env fallback."""
+        stub_hub = _BuggyLoadHub()
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
+
+        monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "env-model")
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
+
+        with pytest.raises(
+            EmbeddingAdapterError,
+            match="Failed to resolve embedding model from model hub",
+        ):
+            model_resolver.resolve_embedding_adapter(model_id=None)
+
+        assert stub_hub.close_calls == 1
+
+    def test_resolve_embedding_does_not_fallback_for_unsupported_hub_category(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Malformed hub rows should not be treated as not-found fallback."""
+        stub_hub = _UnsupportedCategoryHub()
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: stub_hub)
+
+        monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "env-model")
+        monkeypatch.setenv("DASHSCOPE_API_KEY", "env-key")
+
+        with pytest.raises(
+            EmbeddingAdapterError,
+            match="Failed to resolve embedding model from model hub",
+        ) as exc_info:
+            model_resolver.resolve_embedding_adapter(model_id=None)
+
+        assert exc_info.value.details["error_type"] == "UnsupportedModelCategoryError"
+        assert stub_hub.close_calls == 1
+
     def test_resolve_embedding_both_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that error is raised when both hub and env fail."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Clear env vars
         for key in [
@@ -203,7 +359,10 @@ class TestResolveEmbeddingAdapter:
         ]:
             monkeypatch.delenv(key, raising=False)
 
-        with pytest.raises(EmbeddingAdapterError):
+        with pytest.raises(
+            EmbeddingAdapterError,
+            match="model hub database unavailable and no environment configuration",
+        ):
             model_resolver.resolve_embedding_adapter(model_id=None)
 
 
@@ -266,12 +425,8 @@ class TestResolveRerankAdapter:
 
     def test_resolve_rerank_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test resolving rerank from env when hub fails (fallback)."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Set env vars for fallback
         monkeypatch.setenv("DASHSCOPE_RERANK_MODEL", "env-rerank")
@@ -288,12 +443,8 @@ class TestResolveRerankAdapter:
 
     def test_resolve_rerank_both_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that error is raised when both hub and env fail."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Clear env vars
         for key in [
@@ -367,12 +518,8 @@ class TestResolveLLMAdapter:
 
     def test_resolve_llm_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test resolving LLM from env when hub fails (fallback)."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Set env vars for fallback (OpenAI)
         monkeypatch.setenv("OPENAI_API_KEY", "env-key")
@@ -388,12 +535,8 @@ class TestResolveLLMAdapter:
 
     def test_resolve_llm_both_fail(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Test that error is raised when both hub and env fail."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Clear env vars
         for key in ["OPENAI_API_KEY", "ZHIPU_API_KEY", "DEEPSEEK_API_KEY"]:
@@ -408,12 +551,8 @@ class TestResolveLLMAdapter:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Test resolving LLM from Zhipu env when hub fails and OpenAI is not configured."""
-
-        # Mock hub to raise exception
-        def failing_hub():
-            raise Exception("Hub not available")
-
-        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+        # Mock recoverable hub unavailability.
+        monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
         # Clear OpenAI env vars, set Zhipu env vars
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)

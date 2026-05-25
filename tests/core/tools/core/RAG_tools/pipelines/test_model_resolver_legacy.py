@@ -5,6 +5,7 @@ from typing import Dict
 import pytest
 
 from xagent.core.model.model import EmbeddingModelConfig, RerankModelConfig
+from xagent.core.model.storage.error import ModelNotFoundError
 from xagent.core.tools.core.RAG_tools.core.schemas import SearchType
 from xagent.core.tools.core.RAG_tools.utils import model_resolver
 from xagent.core.tools.core.RAG_tools.utils.config_utils import coerce_search_config
@@ -19,7 +20,7 @@ class _StubHub:
 
     def load(self, model_id: str) -> object:
         if model_id not in self._models:
-            raise ValueError(f"Model {model_id} not found")
+            raise ModelNotFoundError(model_id)
         return self._models[model_id]
 
 
@@ -50,12 +51,8 @@ def test_resolve_embedding_hub_priority(monkeypatch: pytest.MonkeyPatch) -> None
 
 def test_resolve_embedding_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that env is used as fallback when hub fails."""
-
-    # Mock hub to raise exception
-    def failing_hub():
-        raise Exception("Hub not available")
-
-    monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+    # Mock recoverable hub unavailability.
+    monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
     # Set env vars for fallback
     monkeypatch.setenv("DASHSCOPE_EMBEDDING_MODEL", "env-model")
@@ -113,12 +110,8 @@ def test_resolve_rerank_hub_priority(monkeypatch: pytest.MonkeyPatch) -> None:
 
 def test_resolve_rerank_env_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     """Test that env is used as fallback when hub fails."""
-
-    # Mock hub to raise exception
-    def failing_hub():
-        raise Exception("Hub not available")
-
-    monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", failing_hub)
+    # Mock recoverable hub unavailability.
+    monkeypatch.setattr(model_resolver, "_get_or_init_model_hub", lambda: None)
 
     # Set env vars for fallback
     monkeypatch.setenv("DASHSCOPE_RERANK_MODEL", "env-rerank")

@@ -616,7 +616,7 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
     db_session,
 ) -> None:
     """Lease must not leak when execute_task_background raises — _runner.finally
-    must still call release_current_runner_task_lease."""
+    must still call the lease release + workforce sync helper."""
     from xagent.web.api.websocket import background_task_manager
     from xagent.web.services.task_lease_service import TaskLease
 
@@ -638,7 +638,7 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
             new=AsyncMock(side_effect=RuntimeError("boom")),
         ),
         patch(
-            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease_with_workforce_sync",
         ) as mock_release,
         patch(
             "xagent.web.services.task_orchestrator.finish_turn",
@@ -704,7 +704,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
             new=AsyncMock(),
         ) as mock_exec,
         patch(
-            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease_with_workforce_sync",
         ),
         patch(
             "xagent.web.services.task_orchestrator.finish_turn",
@@ -795,7 +795,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
             new=AsyncMock(),
         ) as mock_exec,
         patch(
-            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease_with_workforce_sync",
         ) as mock_release,
         patch(
             "xagent.web.services.task_orchestrator.finish_turn",
@@ -871,7 +871,7 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
             new=AsyncMock(side_effect=RuntimeError("simulated agent boom")),
         ),
         patch(
-            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease_with_workforce_sync",
         ) as mock_release,
         patch(
             "xagent.web.services.task_orchestrator.finish_turn",
@@ -951,7 +951,7 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
             new=fake_execute,
         ),
         patch(
-            "xagent.web.services.task_orchestrator.release_current_runner_task_lease",
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease_with_workforce_sync",
         ),
         patch(
             "xagent.web.services.task_orchestrator.finish_turn",

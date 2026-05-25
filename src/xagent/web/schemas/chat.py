@@ -60,6 +60,8 @@ class TaskCreateRequest(BaseModel):
     )
     agent_type: Optional[str] = "standard"
     agent_config: Optional[Dict[str, Any]] = None  # Agent-specific configuration
+    is_preview: bool = False  # Backward-compatible alias for is_visible=False.
+    is_visible: bool = True
 
     # Execution mode field
     execution_mode: Optional[str] = None  # "flash", "balanced", "think", or "auto"

@@ -5,21 +5,18 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from tests.utils.langfuse_execution_fakes import (
-    CalculatorTool,
-    DeterministicReActLLM,
-    FakeLangfuseClient,
-)
 from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
 from xagent.web.api.websocket import (
     _normalize_file_outputs,
     handle_build_preview_execution,
 )
 from xagent.web.models.database import Base
-from xagent.web.models.model import Model as DBModel
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.schemas.chat import TaskCreateResponse
 from xagent.web.services.managed_file_ref import (
     DurableStorageOperationError,
     build_task_output_storage_key,
@@ -27,12 +24,7 @@ from xagent.web.services.managed_file_ref import (
 
 
 @pytest.mark.asyncio
-async def test_handle_build_preview_execution_empty_tool_categories():
-    """
-    Test that handle_build_preview_execution does not raise UnboundLocalError
-    when tool_categories is empty.
-    """
-    # Arrange
+async def test_handle_build_preview_execution_uses_normal_task_flow():
     mock_websocket = AsyncMock()
     mock_user = MagicMock(spec=User)
     mock_user.id = 1
@@ -48,55 +40,213 @@ async def test_handle_build_preview_execution_empty_tool_categories():
         "message": "test message",
     }
 
-    # Mock DB Session
     mock_db = MagicMock(spec=Session)
-
-    # Mock DB query results for models
-    mock_model = MagicMock(spec=DBModel)
-    mock_model.model_id = "test-model-id"
-
-    # Mock query().filter().first() chain
-    mock_query = MagicMock()
-    mock_filter = MagicMock()
-    mock_db.query.return_value = mock_query
-    mock_query.filter.return_value = mock_filter
-    mock_filter.first.return_value = mock_model
-
-    # Mock dependencies
+    task_response = TaskCreateResponse(
+        task_id=123,
+        title="test message",
+        status="pending",
+        created_at="2026-05-20T00:00:00Z",
+    )
     with (
         patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
-        patch("xagent.web.services.llm_utils.UserAwareModelStorage") as MockStorage,
-        patch("xagent.core.agent.service.AgentService") as MockAgentService,
-        patch("xagent.web.api.websocket.WebToolConfig") as MockWebToolConfig,
-        patch("xagent.core.agent.trace.Tracer"),
-        patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+        patch(
+            "xagent.web.api.chat.create_task",
+            new=AsyncMock(return_value=task_response),
+        ) as mock_create_task,
+        patch(
+            "xagent.web.api.websocket.handle_chat_message",
+            new=AsyncMock(),
+        ) as mock_handle_chat_message,
+        patch(
+            "xagent.web.api.websocket.manager.register_connection"
+        ) as mock_register_connection,
+        patch(
+            "xagent.web.api.websocket.manager.connect", new=AsyncMock()
+        ) as mock_connect,
     ):
-        mock_storage_instance = MockStorage.return_value
-        mock_storage_instance.get_llm_by_name_with_access.return_value = MagicMock()
+        await handle_build_preview_execution(mock_websocket, message_data, mock_user)
 
-        mock_agent_service = MockAgentService.return_value
-        mock_agent_service.execute_task = AsyncMock(
-            return_value={"output": "success", "status": "completed"}
-        )
+    mock_create_task.assert_awaited_once()
+    create_request = mock_create_task.await_args.args[0]
+    assert create_request.is_visible is False
+    assert create_request.agent_id is None
+    assert create_request.agent_config["instructions"] == "test instructions"
+    assert create_request.llm_ids == ["1", None, None, None]
+    assert create_request.files is None
+    mock_register_connection.assert_called_once_with(mock_websocket, 123)
+    mock_connect.assert_not_awaited()
+    mock_handle_chat_message.assert_awaited_once()
+    assert mock_handle_chat_message.await_args.args[1] == 123
 
-        # Act
-        try:
-            await handle_build_preview_execution(
-                mock_websocket, message_data, mock_user
-            )
-        except UnboundLocalError as e:
-            pytest.fail(f"UnboundLocalError raised: {e}")
-        except Exception as e:
-            # If other errors occur, we should check if they are related to our test setup
-            # but getting past the UnboundLocalError is the main goal.
-            # However, for a good test, it should run successfully.
-            # Let's see if we can make it run successfully.
-            # If we mock everything, it should be fine.
-            pytest.fail(f"Unexpected error raised: {e}")
 
-        # Assert
-        # Verify WebToolConfig was called (this is where MinimalRequest is used)
-        assert MockWebToolConfig.called
+@pytest.mark.asyncio
+async def test_handle_build_preview_execution_does_not_use_preview_sessions():
+    mock_websocket = AsyncMock()
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = False
+
+    message_data = {
+        "type": "preview",
+        "instructions": "test instructions",
+        "models": {"general": 1},
+        "message": "test message",
+        "files": [{"file_id": "normal-file-1", "name": "data.csv"}],
+    }
+
+    mock_db = MagicMock(spec=Session)
+    task_response = TaskCreateResponse(
+        task_id=123,
+        title="test message",
+        status="pending",
+        created_at="2026-05-20T00:00:00Z",
+    )
+    with (
+        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
+        patch(
+            "xagent.web.api.chat.create_task",
+            new=AsyncMock(return_value=task_response),
+        ) as mock_create_task,
+        patch(
+            "xagent.web.api.websocket.handle_chat_message",
+            new=AsyncMock(),
+        ) as mock_handle_chat_message,
+        patch("xagent.web.api.websocket.manager.register_connection"),
+    ):
+        await handle_build_preview_execution(mock_websocket, message_data, mock_user)
+
+    create_request = mock_create_task.await_args.args[0]
+    assert create_request.is_visible is False
+    assert "preview_session_id" not in create_request.agent_config
+    assert "preview_session_id" not in vars(mock_websocket.state)
+    assert mock_handle_chat_message.await_args.args[2]["context"] == {}
+
+
+@pytest.mark.asyncio
+async def test_handle_build_preview_execution_reuses_existing_preview_task():
+    mock_websocket = AsyncMock()
+    mock_websocket.state.preview_task_id = 123
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = False
+
+    message_data = {
+        "type": "preview",
+        "instructions": "updated instructions",
+        "models": {"general": 1},
+        "message": "second turn",
+        "files": [{"file_id": "second-turn-file", "name": "data.csv"}],
+    }
+
+    with (
+        patch(
+            "xagent.web.api.chat.create_task",
+            new=AsyncMock(),
+        ) as mock_create_task,
+        patch(
+            "xagent.web.api.websocket.handle_chat_message",
+            new=AsyncMock(),
+        ) as mock_handle_chat_message,
+        patch(
+            "xagent.web.api.websocket.manager.register_connection"
+        ) as mock_register_connection,
+    ):
+        await handle_build_preview_execution(mock_websocket, message_data, mock_user)
+
+    mock_create_task.assert_not_awaited()
+    mock_register_connection.assert_not_called()
+    mock_handle_chat_message.assert_awaited_once()
+    assert mock_handle_chat_message.await_args.args[1] == 123
+    assert mock_handle_chat_message.await_args.args[2]["message"] == "second turn"
+    assert mock_handle_chat_message.await_args.args[2]["files"] == [
+        {"file_id": "second-turn-file", "name": "data.csv"}
+    ]
+    mock_websocket.send_text.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_handle_build_preview_execution_creates_task_when_no_preview_task_exists():
+    mock_websocket = AsyncMock()
+    mock_user = MagicMock(spec=User)
+    mock_user.id = 1
+    mock_user.is_admin = False
+
+    message_data = {
+        "type": "preview",
+        "instructions": "updated instructions",
+        "execution_mode": "balanced",
+        "models": {"general": 1},
+        "message": "second turn",
+    }
+
+    mock_db = MagicMock(spec=Session)
+    task_response = TaskCreateResponse(
+        task_id=456,
+        title="second turn",
+        status="pending",
+        created_at="2026-05-20T00:00:00Z",
+    )
+    with (
+        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
+        patch(
+            "xagent.web.api.chat.create_task",
+            new=AsyncMock(return_value=task_response),
+        ) as mock_create_task,
+        patch(
+            "xagent.web.api.websocket.handle_chat_message",
+            new=AsyncMock(),
+        ) as mock_handle_chat_message,
+        patch("xagent.web.api.websocket.manager.disconnect") as mock_disconnect,
+        patch(
+            "xagent.web.api.websocket.manager.register_connection"
+        ) as mock_register_connection,
+    ):
+        await handle_build_preview_execution(mock_websocket, message_data, mock_user)
+
+    mock_create_task.assert_awaited_once()
+    create_request = mock_create_task.await_args.args[0]
+    assert create_request.agent_config["instructions"] == "updated instructions"
+    assert create_request.is_visible is False
+    assert mock_disconnect.call_args_list == []
+    mock_register_connection.assert_called_once_with(mock_websocket, 456)
+    mock_handle_chat_message.assert_awaited_once()
+    assert mock_handle_chat_message.await_args.args[1] == 456
+    assert mock_websocket.state.preview_task_id == 456
+
+
+def test_preview_agent_config_uses_in_memory_disabled_policy():
+    task = MagicMock(spec=Task)
+    task.agent_id = None
+    task.agent_config = {
+        "is_preview": True,
+    }
+
+    policy = resolve_agent_service_memory_policy(task=task)
+
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert policy.memory_enabled is False
+
+
+def test_inline_preview_agent_config_uses_in_memory_disabled_policy():
+    task = MagicMock(spec=Task)
+    task.agent_id = None
+    task.execution_mode = "balanced"
+    task.agent_config = {
+        "instructions": "preview instructions",
+        "knowledge_bases": [],
+        "skills": [],
+        "tool_categories": [],
+        "is_preview": True,
+    }
+
+    agent_config = AgentServiceManager()._load_task_inline_agent_config(task)
+    policy = resolve_agent_service_memory_policy(
+        task=task,
+        agent_config=agent_config,
+    )
+
+    assert isinstance(policy.memory, InMemoryMemoryStore)
+    assert policy.memory_enabled is False
 
 
 def test_normalize_file_outputs_rolls_back_when_durable_storage_fails(
@@ -204,17 +354,11 @@ async def test_websocket_build_preview_endpoint_clear_context():
     """
     Test that websocket_build_preview_endpoint handles 'clear_context' message correctly.
     """
-    import json
-    from unittest.mock import MagicMock, patch
-
     from xagent.web.api.websocket import websocket_build_preview_endpoint
 
     mock_websocket = AsyncMock()
-    # Setup websocket state
     mock_websocket.state = MagicMock()
-    mock_memory = MagicMock()
-    mock_websocket.state.preview_memory = mock_memory
-    mock_websocket.state.preview_history = [{"role": "user", "content": "hello"}]
+    mock_websocket.state.preview_task_id = 123
 
     # Mock user
     mock_user = MagicMock(spec=User)
@@ -236,11 +380,7 @@ async def test_websocket_build_preview_endpoint_clear_context():
     # Verify accept was called
     mock_websocket.accept.assert_called_once()
 
-    # Verify memory was cleared
-    mock_memory.clear.assert_called_once()
-
-    # Verify history was cleared
-    assert mock_websocket.state.preview_history == []
+    assert mock_websocket.state.preview_task_id is None
 
     # Verify a response was sent
     send_text_calls = mock_websocket.send_text.call_args_list
@@ -255,17 +395,12 @@ async def test_websocket_build_preview_endpoint_pause_resume():
     """
     Test that websocket_build_preview_endpoint handles 'pause' and 'resume' messages correctly.
     """
-    import json
-    from unittest.mock import MagicMock, patch
-
     from xagent.web.api.websocket import websocket_build_preview_endpoint
 
     mock_websocket = AsyncMock()
     mock_websocket.state = MagicMock()
 
-    mock_agent_service = AsyncMock()
-    mock_agent_service.supports_live_control = MagicMock(return_value=False)
-    mock_websocket.state.preview_agent_service = mock_agent_service
+    mock_websocket.state.preview_task_id = 123
 
     mock_user = MagicMock(spec=User)
     mock_user.id = 1
@@ -278,109 +413,16 @@ async def test_websocket_build_preview_endpoint_pause_resume():
         WebSocketDisconnect(),
     ]
 
-    with patch(
-        "xagent.web.api.websocket.get_authenticated_user", return_value=mock_user
+    with (
+        patch(
+            "xagent.web.api.websocket.get_authenticated_user", return_value=mock_user
+        ),
+        patch("xagent.web.api.websocket.handle_pause_task", new=AsyncMock()) as pause,
+        patch("xagent.web.api.websocket.handle_resume_task", new=AsyncMock()) as resume,
     ):
         await websocket_build_preview_endpoint(mock_websocket)
 
-    # Verify pause and resume were called
-    mock_agent_service.pause_execution.assert_awaited_once()
-    mock_agent_service.resume_execution.assert_awaited_once()
-
-    # Verify responses were sent
-    send_text_calls = mock_websocket.send_text.call_args_list
-    assert len(send_text_calls) == 2
-
-    pause_data = json.loads(send_text_calls[0][0][0])
-    assert pause_data["type"] == "task_paused"
-    assert "timestamp" in pause_data
-
-    resume_data = json.loads(send_text_calls[1][0][0])
-    assert resume_data["type"] == "task_resumed"
-    assert "timestamp" in resume_data
-
-
-@pytest.mark.asyncio
-async def test_handle_build_preview_execution_exports_langfuse_trace(
-    mocker, monkeypatch, langfuse_client_reset, tmp_path
-):
-    mock_websocket = AsyncMock()
-    mock_websocket.state = MagicMock()
-    mock_websocket.state.preview_history = []
-
-    user = MagicMock(spec=User)
-    user.id = 1
-    user.is_admin = False
-
-    message_data = {
-        "instructions": "preview instructions",
-        "execution_mode": "flash",
-        "models": {"general": 1},
-        "knowledge_bases": [],
-        "skills": [],
-        "tool_categories": [],
-        "message": "calculate 2 + 2",
-        "files": [],
-    }
-
-    mock_db = MagicMock(spec=Session)
-    mock_model = MagicMock(spec=DBModel)
-    mock_model.model_id = "test-model-id"
-    mock_db.query.return_value.filter.return_value.first.return_value = mock_model
-
-    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
-    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
-    fake_client = FakeLangfuseClient()
-    mocker.patch(
-        "xagent.core.tracing.langfuse.client.Langfuse", return_value=fake_client
-    )
-
-    with (
-        patch("xagent.web.models.database.get_db", return_value=iter([mock_db])),
-        patch(
-            "xagent.web.services.llm_utils.UserAwareModelStorage"
-        ) as mock_storage_class,
-        patch(
-            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
-            new=AsyncMock(return_value=[CalculatorTool()]),
-        ),
-        patch(
-            "xagent.web.api.websocket.get_uploads_dir",
-            return_value=tmp_path / "uploads",
-        ),
-        patch(
-            "xagent.web.api.websocket.get_external_upload_dirs",
-            return_value=[],
-        ),
-    ):
-        mock_storage = MagicMock()
-        mock_storage.get_llm_by_name_with_access.return_value = DeterministicReActLLM()
-        mock_storage_class.return_value = mock_storage
-
-        await handle_build_preview_execution(mock_websocket, message_data, user)
-
-    sent_payloads = [
-        json.loads(call.args[0]) for call in mock_websocket.send_text.call_args_list
-    ]
-    assert any(payload["type"] == "preview_started" for payload in sent_payloads)
-    assert any(payload["type"] == "task_completed" for payload in sent_payloads)
-    assert any(payload["type"] == "trace_event" for payload in sent_payloads)
-
-    root_observations = [
-        observation
-        for observation in fake_client.observations
-        if observation.start_kwargs.get("as_type") == "agent"
-    ]
-    assert len(root_observations) == 1
-    root = root_observations[0]
-    assert root.ended is True
-    assert root.start_kwargs["metadata"]["is_preview"] is True
-    assert root.trace_updates[0]["session_id"].startswith("build_preview_")
-
-    generation_observations = [
-        observation
-        for observation in fake_client.observations
-        if observation.start_kwargs.get("as_type") == "generation"
-    ]
-    assert len(generation_observations) >= 1
-    assert all(observation.ended for observation in generation_observations)
+    pause.assert_awaited_once()
+    assert pause.await_args.args[1] == 123
+    resume.assert_awaited_once()
+    assert resume.await_args.args[1] == 123

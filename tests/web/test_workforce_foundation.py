@@ -329,6 +329,7 @@ def test_workforce_status_and_tool_name_normalization() -> None:
     assert normalize_workforce_status(None) == "draft"
     assert normalize_workforce_status(" ACTIVE ") == "active"
     assert normalize_workforce_run_status(None) == "pending"
+    assert normalize_workforce_run_status(" Paused ") == "paused"
     assert normalize_workforce_run_status(" Completed ") == "completed"
     assert len(tool_name) <= 64
     assert tool_name.startswith("call_workforce_worker_99_")

@@ -60,6 +60,13 @@ interface BuildChatPayload {
   files?: { file_id: string; name: string; size: number; type: string }[]
 }
 
+type UploadedBuildFile = {
+  file_id: string
+  name: string
+  size: number
+  type: string
+}
+
 interface AgentBuilderChatProps {
   agentConfig: AgentConfig
   onUpdateConfig: (config: Partial<AgentConfig>) => void
@@ -71,6 +78,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   const { t } = useI18n()
   const { token } = useAuth()
   const [messages, setMessages] = useState<Message[]>([])
+  const [files, setFiles] = useState<File[]>([])
   const branding = getBrandingFromEnv()
 
   // Set initial message on mount to avoid hydration mismatch and get translation
@@ -114,7 +122,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   }, [messages])
 
   const handleSendMessage = useCallback(async (text: string, files?: File[], metadata?: any) => {
-    if ((!text.trim() && (!files || files.length === 0)) || isLoading) return
+    if ((!text.trim() && (!files || files.length === 0)) || isLoading) return false
 
     let displayMessage: string | React.ReactNode = text || t("chatPage.clarification.uploadedFiles")
     if (files && files.length > 0) {
@@ -138,40 +146,58 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
     let currentReply = ""
     let finalMessage = text;
-    let uploadedFileIds: { file_id: string; name: string; size: number; type: string }[] = [];
+    let uploadedFileIds: UploadedBuildFile[] = [];
 
     if (files && files.length > 0) {
       try {
-        const formData = new FormData();
-        files.forEach(f => formData.append('files', f));
-        formData.append('task_type', 'task');
+        const filesToUpload = files.filter((file) => typeof (file as File & { file_id?: string }).file_id !== "string")
+        uploadedFileIds = files
+          .map((file) => {
+            const fileId = (file as File & { file_id?: string }).file_id
+            if (typeof fileId !== "string") return null
+            return {
+              file_id: fileId,
+              name: file.name,
+              size: file.size,
+              type: file.type || "",
+            }
+          })
+          .filter((file): file is UploadedBuildFile => file !== null)
 
-        const uploadResponse = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-          method: 'POST',
-          body: formData,
-        });
-        const parsed = await parseApiResponse(uploadResponse);
-        if (!uploadResponse.ok) {
-          throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
-            generic: "Failed to upload files",
-            ...UPLOAD_ERROR_MESSAGES,
-          }));
-        }
-        const uploadData = parsed.data;
-        if (isJsonRecord(uploadData) && uploadData.success && Array.isArray(uploadData.files)) {
-          uploadedFileIds = uploadData.files.map((f: any) => ({
-            file_id: f.file_id,
-            name: f.filename || '',
-            size: f.file_size || 0,
-            type: f.mime_type || '',
-          }));
+        if (filesToUpload.length > 0) {
+          const formData = new FormData();
+          filesToUpload.forEach(f => formData.append('files', f));
+          formData.append('task_type', 'task');
+
+          const uploadResponse = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+            method: 'POST',
+            body: formData,
+          });
+          const parsed = await parseApiResponse(uploadResponse);
+          if (!uploadResponse.ok) {
+            throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
+              generic: "Failed to upload files",
+              ...UPLOAD_ERROR_MESSAGES,
+            }));
+          }
+          const uploadData = parsed.data;
+          if (isJsonRecord(uploadData) && uploadData.success && Array.isArray(uploadData.files)) {
+            uploadedFileIds.push(
+              ...uploadData.files.map((f: any) => ({
+                file_id: f.file_id,
+                name: f.filename || '',
+                size: f.file_size || 0,
+                type: f.mime_type || '',
+              }))
+            );
+          }
         }
       } catch (err) {
         console.error("Failed to upload files", err);
         toast.error(err instanceof Error ? err.message : "Failed to upload files");
         setIsLoading(false);
         setMessages(prev => prev.slice(0, -1));
-        return;
+        return false;
       }
     } else if (metadata?.url) {
       const url = metadata.url;
@@ -433,7 +459,9 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       console.error(error)
       toast.error(t("builds.configForm.chat.errorInit") || "Failed to initialize connection.")
       setIsLoading(false)
+      return false
     }
+    return true
   }, [messages, isLoading, token, agentConfig, onUpdateConfig])
 
   const handleStop = () => {
@@ -466,7 +494,12 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               showProcessView={true}
               timestamp={msg.timestamp}
               interactions={msg.interactions}
-              onSendInteraction={(text, files, meta) => handleSendMessage(text, files, meta)}
+              onSendInteraction={async (text, files, meta) => {
+                const didSend = await handleSendMessage(text, files, meta)
+                if (!didSend) {
+                  throw new Error("Failed to send interaction")
+                }
+              }}
             />
           ))}
         </div>
@@ -474,11 +507,17 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
       <div className="p-4 bg-background border-t">
         <ChatInput
-          onSend={(text) => handleSendMessage(text)}
+          onSend={async (text) => {
+            const didSend = await handleSendMessage(text, files)
+            if (didSend) {
+              setFiles([])
+            }
+          }}
           isLoading={isLoading}
           hideConfig={true}
-          hideFileUpload={true}
           compact={true}
+          files={files}
+          onFilesChange={setFiles}
         />
       </div>
     </div>

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  getInlineFileDownloadUrl,
   getInlineFilePreviewKind,
   getInlineFilePreviewUrl,
   getPreviewUrlTrust,
@@ -157,5 +158,52 @@ describe('inline-file-preview-utils', () => {
       isExternal: true,
       isTrusted: false,
     })
+  })
+
+  it('routes managed file ids through the public download endpoint for open links', () => {
+    // The "Open" affordance must hand the user the source artifact, not
+    // the inline-preview payload (which on some deployments is a derived
+    // PDF), so file-id sources resolve to /api/files/public/download.
+    // The public/* route is required because plain ``<a href>`` clicks
+    // (and middle-click / right-click "open in new tab" / "copy link")
+    // don't carry the bearer token that the auth'd /api/files/download
+    // route requires.
+    expect(
+      getInlineFileDownloadUrl(
+        { fileId: 'slides-file-id', filename: 'slides.pptx' },
+        'http://api.local'
+      )
+    ).toBe('http://api.local/api/files/public/download/slides-file-id')
+  })
+
+  it('falls back to the preview URL for external sources without a file id', () => {
+    // Cross-origin previewUrl sources have no managed download endpoint —
+    // the only sane "Open" target is the previewUrl itself.
+    expect(
+      getInlineFileDownloadUrl(
+        {
+          previewUrl: 'https://cdn.example.com/report.docx',
+          filename: 'report.docx',
+        },
+        'http://api.local'
+      )
+    ).toBe('https://cdn.example.com/report.docx')
+  })
+
+  it('prefers file-id download URLs over external preview URLs', () => {
+    expect(
+      getInlineFileDownloadUrl(
+        {
+          fileId: 'doc-file-id',
+          previewUrl: 'https://cdn.example.com/report.docx',
+          filename: 'report.docx',
+        },
+        'http://api.local'
+      )
+    ).toBe('http://api.local/api/files/public/download/doc-file-id')
+  })
+
+  it('returns an empty string when no file id or preview URL is available', () => {
+    expect(getInlineFileDownloadUrl({ filename: 'anon.bin' }, 'http://api.local')).toBe('')
   })
 })

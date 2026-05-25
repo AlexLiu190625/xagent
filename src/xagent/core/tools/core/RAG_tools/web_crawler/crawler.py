@@ -2,6 +2,7 @@
 
 import asyncio
 import importlib
+import importlib.util
 import logging
 import time
 from collections import deque
@@ -359,6 +360,51 @@ _DEFAULT_USER_AGENT: str = (
     "Chrome/130.0.0.0 Safari/537.36"
 )
 
+
+def _get_httpx_accept_encoding() -> str:
+    """Return encodings httpx can actually decode in this environment."""
+    encodings = ["gzip", "deflate"]
+    if importlib.util.find_spec("brotli") or importlib.util.find_spec("brotlicffi"):
+        encodings.append("br")
+    return ", ".join(encodings)
+
+
+def _response_log_metadata(
+    response: Any,
+    report: Optional[_ContentQualityReport] = None,
+) -> Dict[str, Any]:
+    """Build safe response metadata for crawl quality logs."""
+    headers = getattr(response, "headers", {}) or {}
+    header_get = getattr(headers, "get", None)
+
+    def _get_header(name: str) -> Optional[str]:
+        if callable(header_get):
+            value = header_get(name)
+            return value if isinstance(value, str) else None
+        return None
+
+    metadata: Dict[str, Any] = {
+        "status_code": getattr(response, "status_code", None),
+        "content_encoding": _get_header("content-encoding"),
+        "content_type": _get_header("content-type"),
+    }
+    if report is not None:
+        metadata.update(
+            {
+                "quality_code": report.code,
+                "text_length": report.text_length,
+                "null_count": report.null_count,
+                "replacement_count": report.replacement_count,
+                "control_count": report.control_count,
+                "unreadable_count": report.unreadable_count,
+                "replacement_ratio": report.replacement_ratio,
+                "control_ratio": report.control_ratio,
+                "readable_ratio": report.readable_ratio,
+            }
+        )
+    return metadata
+
+
 # Mapping from a curl_cffi impersonate spec to the User-Agent that spec
 # actually puts on the wire. We need this for policy code (robots.txt)
 # which has to reason about the identity we are presenting -- since
@@ -505,7 +551,7 @@ class WebCrawler:
                     "image/avif,image/webp,*/*;q=0.8"
                 ),
                 "Accept-Language": "en-US,en;q=0.9",
-                "Accept-Encoding": "gzip, deflate, br",
+                "Accept-Encoding": _get_httpx_accept_encoding(),
                 "Sec-Fetch-Dest": "document",
                 "Sec-Fetch-Mode": "navigate",
                 "Sec-Fetch-Site": "none",
@@ -848,7 +894,21 @@ class WebCrawler:
                         error_msg = fetch_result.markdown_quality.reason
                     else:
                         error_msg = raw_quality.reason or "TLS fallback exhausted"
-                    logger.error("Failed to crawl %s: %s", url, error_msg)
+                    quality_report = raw_quality
+                    if (
+                        fetch_result.markdown_quality
+                        and not fetch_result.markdown_quality.ok
+                    ):
+                        quality_report = fetch_result.markdown_quality
+                    logger.error(
+                        "Failed to crawl %s: %s",
+                        url,
+                        error_msg,
+                        extra={
+                            "crawl_url": url,
+                            **_response_log_metadata(response, quality_report),
+                        },
+                    )
                     self.failed_urls[url] = error_msg
                     return None, set()
 
@@ -870,6 +930,10 @@ class WebCrawler:
                         "Rejected crawl content at %s: %s",
                         url,
                         raw_quality.reason,
+                        extra={
+                            "crawl_url": url,
+                            **_response_log_metadata(response, raw_quality),
+                        },
                     )
                     self.failed_urls[url] = raw_quality.reason
                     return None, set()
@@ -895,6 +959,10 @@ class WebCrawler:
                         "Rejected extracted crawl content at %s: %s",
                         url,
                         markdown_quality.reason,
+                        extra={
+                            "crawl_url": url,
+                            **_response_log_metadata(response, markdown_quality),
+                        },
                     )
                     self.failed_urls[url] = markdown_quality.reason
                     return None, set()

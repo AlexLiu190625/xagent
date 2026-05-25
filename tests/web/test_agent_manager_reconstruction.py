@@ -208,6 +208,36 @@ class TestAgentServiceManagerReconstruction:
         assert agent_manager._agents[1] == mock_agent_service
 
     @pytest.mark.asyncio
+    async def test_get_agent_for_task_cached_sandbox_without_agent_config(
+        self, agent_manager, mock_db, sample_task, mock_user
+    ):
+        """A cached sandbox should not skip allowed_tools initialization."""
+        agent_manager._sandboxes["user:1"] = MagicMock()
+
+        with (
+            patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
+            patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
+            patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
+            patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolFactory"
+            ) as mock_tool_factory,
+        ):
+            mock_resolve_llms.return_value = (MagicMock(), None, None, None)
+            mock_get_memory.return_value = MagicMock()
+            mock_tool_factory.create_all_tools = AsyncMock(return_value=[])
+            mock_agent_service = MagicMock()
+            mock_agent_service_class.return_value = mock_agent_service
+
+            mock_task_query = MagicMock()
+            mock_task_query.first.return_value = sample_task
+            mock_db.query.return_value = mock_task_query
+
+            agent = await agent_manager.get_agent_for_task(1, mock_db, user=mock_user)
+
+        assert agent is mock_agent_service
+        assert 1 in agent_manager._agents
+
+    @pytest.mark.asyncio
     async def test_admin_task_uses_task_owner_workspace_dirs(
         self, agent_manager, mock_db, tmp_path
     ):

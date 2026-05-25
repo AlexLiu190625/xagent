@@ -3,6 +3,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     Column,
     DateTime,
     Enum,
@@ -165,6 +166,16 @@ class Task(Base):  # type: ignore
         default="internal",
         server_default="internal",
         nullable=True,
+        index=True,
+    )
+
+    # Visibility flag for discovery surfaces such as sidebar/history/search.
+    # Hidden tasks still use normal owner/admin access by exact task_id.
+    is_visible = Column(
+        Boolean,
+        default=True,
+        server_default="1",
+        nullable=False,
         index=True,
     )
 

@@ -1,6 +1,6 @@
 import hashlib
 import re
-from typing import Any, cast
+from typing import Any, Literal, cast, overload
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
@@ -12,7 +12,7 @@ from ..models.workforce import Workforce, WorkforceAgent
 from .workforce_access import ensure_workforce_access, ensure_workforce_agent_run_access
 
 WORKFORCE_STATUSES = {"draft", "active", "archived"}
-RUN_STATUSES = {"pending", "running", "completed", "failed", "cancelled"}
+RUN_STATUSES = {"pending", "running", "paused", "completed", "failed", "cancelled"}
 
 
 def normalize_workforce_status(status: str | None) -> str:
@@ -27,6 +27,18 @@ def normalize_workforce_run_status(status: str | None) -> str:
     if normalized not in RUN_STATUSES:
         raise HTTPException(status_code=400, detail="Invalid workforce run status")
     return normalized
+
+
+@overload
+def normalize_text(
+    value: str | None, field_name: str, required: Literal[True]
+) -> str: ...
+
+
+@overload
+def normalize_text(
+    value: str | None, field_name: str, required: Literal[False] = False
+) -> str | None: ...
 
 
 def normalize_text(
@@ -90,7 +102,9 @@ def validate_workforce_for_run(
     if workforce.status != "active":
         raise HTTPException(status_code=400, detail="Workforce must be active to run")
 
-    manager_agent = ensure_workforce_agent_run_access(workforce.manager_agent, user, db)
+    manager_agent = ensure_workforce_agent_run_access(
+        workforce.manager_agent, user, db, workforce
+    )
     workers = _sorted_workers(workforce)
     enabled_workers = [worker for worker in workers if worker.enabled]
     if not enabled_workers:
@@ -99,7 +113,7 @@ def validate_workforce_for_run(
         )
 
     for worker in enabled_workers:
-        ensure_workforce_agent_run_access(worker.agent, user, db)
+        ensure_workforce_agent_run_access(worker.agent, user, db, workforce)
         instructions = normalize_text(
             cast(str | None, worker.assignment_instructions),
             "assignment_instructions",
@@ -250,3 +264,19 @@ def build_workforce_snapshot(
     }
     snapshot["manager"]["runtime_prompt"] = build_manager_system_prompt(snapshot)
     return snapshot
+
+
+def build_workforce_task_config(
+    snapshot: dict[str, Any],
+    selected_file_ids: list[str] | None = None,
+    workforce_run_id: int | None = None,
+) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "workforce_id": snapshot["workforce"]["id"],
+        "workforce_snapshot": snapshot,
+    }
+    if workforce_run_id is not None:
+        config["workforce_run_id"] = workforce_run_id
+    if selected_file_ids:
+        config["selected_file_ids"] = selected_file_ids
+    return config

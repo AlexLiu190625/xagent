@@ -821,27 +821,25 @@ async def rebuild_collection_metadata() -> None:
         from xagent.core.model.model import EmbeddingModelConfig
 
         from ..LanceDB.model_tag_utils import to_model_tag
-        from ..utils.model_resolver import _get_or_init_model_hub
+        from ..utils.model_resolver import _list_model_hub_configs
 
-        hub = _get_or_init_model_hub()
-        if hub is not None:
-            for cfg in hub.list().values():
-                if not isinstance(cfg, EmbeddingModelConfig):
-                    continue
-                register_tag_mapping(
-                    hub_tag_to_id,
-                    to_model_tag(cfg.id),
-                    (cfg.id, cfg.dimension),
-                    get_identity=lambda item: item[0],
-                    logger=logger,
-                )
-                register_tag_mapping(
-                    hub_tag_to_id,
-                    to_model_tag(cfg.model_name),
-                    (cfg.id, cfg.dimension),
-                    get_identity=lambda item: item[0],
-                    logger=logger,
-                )
+        for cfg in _list_model_hub_configs().values():
+            if not isinstance(cfg, EmbeddingModelConfig):
+                continue
+            register_tag_mapping(
+                hub_tag_to_id,
+                to_model_tag(cfg.id),
+                (cfg.id, cfg.dimension),
+                get_identity=lambda item: item[0],
+                logger=logger,
+            )
+            register_tag_mapping(
+                hub_tag_to_id,
+                to_model_tag(cfg.model_name),
+                (cfg.id, cfg.dimension),
+                get_identity=lambda item: item[0],
+                logger=logger,
+            )
     except Exception as e:
         logger.warning(
             "Model hub initialization failed during collection metadata rebuild: "
