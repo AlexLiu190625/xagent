@@ -519,6 +519,8 @@ def cascade_delete_documents(
     user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
     user_id = user_scope.user_id
     is_admin = user_scope.is_admin
+    if not is_admin and user_id is None:
+        return {}
 
     if conn is None:
         conn = get_vector_store_raw_connection()

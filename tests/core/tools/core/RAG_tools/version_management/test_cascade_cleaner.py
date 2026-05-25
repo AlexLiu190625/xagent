@@ -983,6 +983,26 @@ def test_cascade_delete_documents_builds_doc_id_batched_predicates(
 @patch(
     "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
 )
+def test_cascade_delete_documents_noops_for_unauthenticated_non_admin(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Unauthenticated callers should not build predicates for legacy tables."""
+    result = cascade_delete_documents(
+        collection="c_batch",
+        doc_ids=["d1"],
+        user_id=None,
+        is_admin=False,
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert result == {}
+    mock_get_conn.assert_not_called()
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
 def test_cascade_delete_document_model_tag_only_builds_target_embeddings_predicate(
     mock_get_conn: MagicMock,
 ) -> None:
