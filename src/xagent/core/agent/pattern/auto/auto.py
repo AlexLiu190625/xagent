@@ -808,12 +808,7 @@ class AutoPattern(AgentPattern):
                 decision = self._parse_decision(response, attempts=attempt + 1)
             except RequiredToolCallError:
                 if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
-                    raise RequiredToolCallError(
-                        owner="AutoPattern decision",
-                        tool_name=DECISION_TOOL_NAME,
-                        attempts=MAX_DECISION_PARSE_ATTEMPTS,
-                        user_message=AUTO_DECISION_REQUIRED_TOOL_MESSAGE,
-                    )
+                    raise
                 retry_feedback = self._required_tool_call_retry_feedback(
                     DECISION_TOOL_NAME
                 )

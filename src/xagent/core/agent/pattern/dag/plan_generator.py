@@ -305,12 +305,7 @@ class LLMPlanGenerator(PlanGenerator):
                 )
             except RequiredToolCallError:
                 if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
-                    raise RequiredToolCallError(
-                        owner="LLMPlanGenerator",
-                        tool_name=self.PLAN_TOOL_NAME,
-                        attempts=MAX_PLAN_TOOL_CALL_ATTEMPTS,
-                        user_message=PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
-                    )
+                    raise
                 retry_feedback = self._required_tool_call_retry_feedback(
                     self.PLAN_TOOL_NAME
                 )
