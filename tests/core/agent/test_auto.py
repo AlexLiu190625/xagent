@@ -542,6 +542,11 @@ async def test_auto_pattern_final_answer_completes_without_child_pattern() -> No
     assert [message["role"] for message in llm.calls[0]["messages"]].count(
         "system"
     ) == 1
+    first_call_roles = [message["role"] for message in llm.calls[0]["messages"]]
+    assert not any(
+        current == previous == "user"
+        for previous, current in zip(first_call_roles, first_call_roles[1:])
+    )
     decision_prompt = llm.calls[0]["messages"][-1]["content"]
     assert llm.calls[0]["messages"][-1]["role"] == "user"
     assert "must include a complete non-empty answer field" in decision_prompt
@@ -1241,6 +1246,11 @@ async def test_auto_pattern_retries_missing_decision_tool_call() -> None:
     assert result["success"] is True
     assert result["response"] == "Complete answer after retry."
     assert len(llm.calls) == 2
+    retry_roles = [message["role"] for message in llm.calls[1]["messages"]]
+    assert not any(
+        current == previous == "user"
+        for previous, current in zip(retry_roles, retry_roles[1:])
+    )
     retry_message = llm.calls[1]["messages"][-1]["content"]
     assert f"did not call the required {DECISION_TOOL_NAME} tool" in retry_message
 

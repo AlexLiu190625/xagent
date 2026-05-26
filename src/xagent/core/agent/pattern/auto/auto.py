@@ -30,6 +30,7 @@ from ..base import (
     AgentPattern,
     PatternResult,
     RequiredToolCallError,
+    append_user_message_preserving_turns,
     extract_required_tool_arguments,
 )
 from ..dag import DAGPattern
@@ -761,10 +762,17 @@ class AutoPattern(AgentPattern):
         decision_tools = [self._decision_tool_schema()]
         retry_feedback: str | None = None
         for attempt in range(MAX_DECISION_PARSE_ATTEMPTS):
-            messages = list(base_messages)
-            messages.append({"role": "user", "content": decision_prompt})
+            messages = append_user_message_preserving_turns(
+                base_messages,
+                content=decision_prompt,
+                section_title="Auto routing instruction",
+            )
             if retry_feedback:
-                messages.append({"role": "user", "content": retry_feedback})
+                messages = append_user_message_preserving_turns(
+                    messages,
+                    content=retry_feedback,
+                    section_title="Auto routing retry feedback",
+                )
             metadata: dict[str, Any] = {"phase": "auto_decision"}
             if attempt:
                 metadata["attempt"] = attempt + 1

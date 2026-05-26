@@ -13,7 +13,11 @@ from ...language import (
     output_language_policy,
     plan_language_rules,
 )
-from ..base import RequiredToolCallError, extract_required_tool_arguments
+from ..base import (
+    RequiredToolCallError,
+    append_user_message_preserving_turns,
+    extract_required_tool_arguments,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +294,11 @@ class LLMPlanGenerator(PlanGenerator):
         for attempt in range(MAX_PLAN_TOOL_CALL_ATTEMPTS):
             attempt_messages = list(messages)
             if retry_feedback:
-                attempt_messages.append({"role": "user", "content": retry_feedback})
+                attempt_messages = append_user_message_preserving_turns(
+                    attempt_messages,
+                    content=retry_feedback,
+                    section_title="Required tool retry feedback",
+                )
             response = await llm.chat(
                 messages=attempt_messages,
                 tools=plan_tools,

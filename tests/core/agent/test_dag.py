@@ -1484,6 +1484,11 @@ async def test_llm_plan_generator_retries_missing_required_tool_call() -> None:
 
     assert [step.id for step in plan.steps] == ["final"]
     assert llm.calls == 2
+    retry_roles = [message["role"] for message in llm.seen_messages[1]]
+    assert not any(
+        current == previous == "user"
+        for previous, current in zip(retry_roles, retry_roles[1:])
+    )
     retry_message = llm.seen_messages[1][-1]["content"]
     assert "did not call the required generate_execution_plan tool" in retry_message
 

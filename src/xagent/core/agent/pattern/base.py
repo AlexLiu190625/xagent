@@ -61,6 +61,41 @@ def extract_required_tool_arguments(
     )
 
 
+def append_user_message_preserving_turns(
+    messages: list[dict[str, Any]],
+    *,
+    content: str,
+    section_title: str | None = None,
+) -> list[dict[str, Any]]:
+    """Append user-scoped pattern feedback without creating adjacent user turns."""
+
+    updated = [dict(message) for message in messages]
+    if not updated or updated[-1].get("role") != "user":
+        updated.append({"role": "user", "content": content})
+        return updated
+
+    last_message = dict(updated[-1])
+    previous_content = last_message.get("content")
+    if isinstance(previous_content, str):
+        title = section_title or "Additional instruction"
+        last_message["content"] = (
+            f"{previous_content.rstrip()}\n\n{title}:\n{content}"
+            if previous_content.strip()
+            else content
+        )
+        updated[-1] = last_message
+        return updated
+
+    updated.append(
+        {
+            "role": "assistant",
+            "content": "Acknowledged. I will follow the next instruction.",
+        }
+    )
+    updated.append({"role": "user", "content": content})
+    return updated
+
+
 def iter_tool_function_payloads(response: Any) -> list[dict[str, Any]]:
     tool_calls = _response_tool_calls(response)
     function_payloads: list[dict[str, Any]] = []
