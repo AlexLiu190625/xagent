@@ -244,6 +244,11 @@ class ToolSelectionSpec(ABC):
                 else None
             ),
             name_extras=frozenset(workforce_extra_names or ()),
+            # Record the user's raw category list so
+            # ``compute_allowed_names`` can tell plain "mcp" / "other"
+            # admit-all from a derived "mcp" added solely for the
+            # registry-skip side of mcp:<server> sub-categories.
+            _user_picked=frozenset(tool_categories),
         )
 
     # ── Backward-compat helper (kept from the original spec) ─────
@@ -386,6 +391,15 @@ class _SpecByCategories(ToolSelectionSpec):
     # BY_CATEGORIES mode (in ALL the full set already includes
     # them; in NONE everything is rejected).
     name_extras: frozenset[str] = field(default_factory=frozenset)
+    # The pre-derivation user input, used by ``compute_allowed_names``
+    # to tell apart "user picked plain 'mcp' (admit ALL mcp tools)"
+    # from "user picked only 'mcp:<server>' (from_raw added 'mcp' to
+    # categories for the registry skip, but the name filter should
+    # NOT broaden to every mcp tool)". Set by :meth:`from_raw`. For
+    # direct construction the default is the same as ``categories``
+    # (so direct-construction callers without sub-category derivation
+    # behave as the legacy single-dataclass spec did).
+    _user_picked: Optional[frozenset[str]] = None
 
     def __post_init__(self) -> None:
         if not self.categories:
@@ -422,6 +436,19 @@ class _SpecByCategories(ToolSelectionSpec):
 
     def is_by_categories(self) -> bool:
         return True
+
+    def _user_categories(self) -> frozenset[str]:
+        """Return the pre-derivation user-picked category set.
+
+        ``from_raw`` records the user's original list here so the
+        name-filter step can tell "user said plain 'mcp'" (admit all
+        mcp tools) apart from "user said only 'mcp:<server>'" (admit
+        only that server's tools). For direct construction without
+        a ``_user_picked`` arg, fall back to ``categories`` — that
+        matches the legacy single-dataclass behaviour where
+        ``categories`` was the user input verbatim.
+        """
+        return self._user_picked if self._user_picked is not None else self.categories
 
     def includes_mcp(self) -> bool:
         # Need "mcp" in categories; otherwise the registry-level
@@ -471,15 +498,35 @@ class _SpecByCategories(ToolSelectionSpec):
                 continue
             category = str(tool.metadata.category.value)
 
-            # Direct category match — except "mcp" and "other" which
-            # have sub-category semantics handled below. ``from_raw``
-            # adds "mcp" and "other" to ``categories`` to keep the
-            # registry-level skip happy (creators run), but at the
-            # name-filter step we want only the specific
-            # ``mcp_<server>_*`` / ``api_<server>_call`` tools that
-            # match the user's ``mcp:<server>`` selection, not every
-            # MCP/other tool.
-            if category in self.categories and category not in ("mcp", "other"):
+            # Plain category match. Note ``from_raw`` may add "mcp" /
+            # "other" to ``categories`` when the user picked a
+            # ``mcp:<server>`` sub-category — that is for the
+            # registry-level skip, not a name-level admit. The
+            # ``categories`` frozenset distinguishes the two cases by
+            # carrying the original raw strings:
+            #
+            #   from_raw(["mcp"])           -> {"mcp"}
+            #     → user explicitly asked for ALL mcp tools; admit
+            #   from_raw(["mcp:Gmail"])     -> {"mcp", "other", "mcp:Gmail"}
+            #     → user asked for one server; do NOT broaden to all mcp
+            #   from_raw(["mcp", "mcp:X"])  -> {"mcp", "other", "mcp:X"}
+            #     → "mcp" plain entry wins → admit all mcp tools
+            #
+            # So a tool whose category is "mcp" / "other" admits when
+            # the *plain* string is in ``categories``; a tool whose
+            # category is "mcp:<server>" wouldn't exist (servers don't
+            # have their own category) -- this branch only runs once
+            # per tool. ``_raw_user_categories`` is set by ``from_raw``
+            # to the pre-derivation user input; for direct construction
+            # it falls back to ``categories``.
+            user_picked = self._user_categories()
+            if category in ("mcp", "other"):
+                if category in user_picked:
+                    names.add(tool_name)
+                    continue
+                # No plain "mcp" / "other" picked; fall through to
+                # mcp:<server> sub-category matching below.
+            elif category in self.categories:
                 names.add(tool_name)
                 continue
 

@@ -231,6 +231,33 @@ def create_default_llm() -> Optional[BaseLLM]:
         return None
 
 
+def _spec_wants_mcp(tool_selection_spec: Optional[Any]) -> bool:
+    """Whether the caller's spec actually asked for MCP tools.
+
+    Default agents (no spec, or ``_SpecAll``) should NOT trigger the
+    MCP server DB query + per-server session init in
+    ``WebToolConfig``. Only an explicit ``"mcp"`` plain entry or a
+    ``"mcp:<server>"`` sub-category entry in the user's selection
+    means MCP loading is wanted; anything else keeps the legacy
+    no-MCP behaviour for cost reasons.
+
+    Returns ``False`` for ``None`` (no spec / legacy caller),
+    ``_SpecAll`` (no restriction means "build registered defaults",
+    NOT "ALL including MCP"), and ``_SpecNone`` (zero tools). Returns
+    ``True`` only when ``_SpecByCategories._user_categories()`` (the
+    pre-derivation user input) carries the ``mcp`` token or any
+    ``mcp:<server>`` form.
+    """
+    if tool_selection_spec is None:
+        return False
+    if not tool_selection_spec.is_by_categories():
+        return False
+    user_picked = tool_selection_spec._user_categories()
+    return any(
+        c == "mcp" or (isinstance(c, str) and c.startswith("mcp:")) for c in user_picked
+    )
+
+
 def _build_tool_selection_spec_for_task(
     agent_config: Optional[dict],
     workforce_runtime: Optional[WorkforceTaskRuntime],
@@ -373,7 +400,13 @@ async def create_default_tools(
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
         },
-        include_mcp_tools=True,
+        # Only load MCP servers (a DB query + per-server session init)
+        # when the caller actually picked MCP. Spec=None / _SpecAll
+        # default agents shouldn't pay that cost; only explicit
+        # ``mcp`` / ``mcp:<server>`` selection triggers MCP loading.
+        # Derived from the spec rather than re-deriving from a raw
+        # name list so the source of truth is in one place.
+        include_mcp_tools=_spec_wants_mcp(tool_selection_spec),
         task_id=task_id,  # Pass task_id for browser session tracking
         browser_tools_enabled=True,  # Enable browser automation tools
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases

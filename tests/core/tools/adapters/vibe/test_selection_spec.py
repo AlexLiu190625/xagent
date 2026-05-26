@@ -1218,3 +1218,138 @@ def test_register_tool_must_declare_categories_or_be_allowlisted():
         f"``ToolSelectionSpec`` has the corresponding ``includes_*`` "
         f"short-circuit method."
     )
+
+
+# ----- Follow-up review regressions(防回归)-----------------------------
+
+
+def test_factory_falls_back_to_get_allowed_tools_when_spec_none():
+    """When the caller doesn't supply a ``ToolSelectionSpec``,
+    ``BaseToolConfig.get_allowed_tools()`` is still the public
+    name-allow-list contract (standalone ``ToolConfig`` callers).
+    Factory must honour the raw list rather than silently keeping
+    every tool.
+    """
+    import asyncio
+    from unittest.mock import MagicMock as _MagicMock
+
+    tool_allowed = _mock_tool("allowed", "basic")
+    tool_leaked = _mock_tool("leaked", "basic")
+
+    cfg = _MagicMock()
+    cfg.get_tool_selection_spec.return_value = None
+    cfg.get_allowed_tools.return_value = ["allowed"]
+    cfg.get_sandbox.return_value = None
+    cfg.get_workspace_config.return_value = None
+    cfg.get_user_tool_overrides.return_value = {}
+    cfg.get_max_output_length.return_value = None
+    cfg.get_max_field_count.return_value = None
+    cfg.get_max_recursion_depth.return_value = None
+
+    saved_creators = list(ToolRegistry._tool_creators)
+    saved_imported = ToolRegistry._modules_imported
+    ToolRegistry._tool_creators = []
+    ToolRegistry._modules_imported = True
+    try:
+
+        async def creator(_cfg):
+            return [tool_allowed, tool_leaked]
+
+        creator.__name__ = "test_creator"
+        ToolRegistry.register(creator, categories={"basic"})
+
+        tools = asyncio.run(ToolFactory.create_all_tools(cfg))
+        assert [t.name for t in tools] == ["allowed"], (
+            "spec=None must still apply config.get_allowed_tools() as a "
+            "name allow-list; leaving every tool through breaks the "
+            "legacy ToolConfig contract."
+        )
+    finally:
+        ToolRegistry._tool_creators = saved_creators
+        ToolRegistry._modules_imported = saved_imported
+
+
+def test_compute_allowed_names_plain_mcp_admits_all_mcp_tools():
+    """User picked plain ``["mcp"]`` (no server qualifier) — MUST
+    admit every mcp-category tool, not 0. Previously broken because
+    the name-filter step routed all mcp/other tools to sub-category
+    matching, which found no ``mcp:<server>`` entry to match against."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp"])
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_gmail_send", "mcp"),
+            _mock_tool("mcp_slack_post", "mcp"),
+            _mock_tool("calc", "basic"),
+        ]
+    )
+    assert result == frozenset({"mcp_gmail_send", "mcp_slack_post"})
+
+
+def test_compute_allowed_names_plain_other_admits_all_other_tools():
+    """User picked plain ``["other"]`` — MUST admit every other-
+    category tool."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["other"])
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("api_custom_call", "other"),
+            _mock_tool("api_legacy_call", "other"),
+            _mock_tool("calc", "basic"),
+        ]
+    )
+    assert result == frozenset({"api_custom_call", "api_legacy_call"})
+
+
+def test_compute_allowed_names_mcp_server_does_not_broaden_to_all_mcp():
+    """User picked only ``["mcp:Gmail"]`` — MUST stay narrow to
+    Gmail's mcp tools, NOT broaden to every mcp tool."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_gmail_send", "mcp"),
+            _mock_tool("mcp_slack_post", "mcp"),
+        ]
+    )
+    assert result == frozenset({"mcp_gmail_send"})
+
+
+def test_compute_allowed_names_mixed_plain_and_server_picks():
+    """``["mcp:Gmail", "other"]`` should pick only Gmail's mcp tools
+    plus every other-category tool."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail", "other"])
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_gmail_send", "mcp"),
+            _mock_tool("mcp_slack_post", "mcp"),
+            _mock_tool("api_custom_call", "other"),
+            _mock_tool("calc", "basic"),
+        ]
+    )
+    assert result == frozenset({"mcp_gmail_send", "api_custom_call"})
+
+
+def test_spec_wants_mcp_only_for_explicit_mcp_selection():
+    """``_spec_wants_mcp`` (chat.py) must NOT trigger MCP DB query for
+    default / no-MCP agents. Pin the contract here to keep the
+    derivation honest."""
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll, _SpecNone
+    from xagent.web.api.chat import _spec_wants_mcp
+
+    assert _spec_wants_mcp(None) is False  # legacy / no-spec caller
+    assert _spec_wants_mcp(_SpecAll()) is False  # default agent
+    assert _spec_wants_mcp(_SpecNone()) is False  # explicit zero tools
+    assert (
+        _spec_wants_mcp(ToolSelectionSpec.from_raw(tool_categories=["basic"])) is False
+    )  # no mcp picked
+    assert (
+        _spec_wants_mcp(ToolSelectionSpec.from_raw(tool_categories=["mcp"])) is True
+    )  # plain mcp
+    assert (
+        _spec_wants_mcp(ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"]))
+        is True
+    )  # mcp:<server>
+    assert (
+        _spec_wants_mcp(
+            ToolSelectionSpec.from_raw(tool_categories=["basic", "mcp:Gmail"])
+        )
+        is True
+    )  # mixed

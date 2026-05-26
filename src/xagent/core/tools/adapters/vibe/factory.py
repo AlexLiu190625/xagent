@@ -261,7 +261,22 @@ class ToolFactory:
         if spec is not None:
             allowed_names = spec.compute_allowed_names(tools)
         else:
-            allowed_names = None
+            # Legacy contract: ``BaseToolConfig.get_allowed_tools()`` is
+            # still a public accessor on non-WebToolConfig subclasses
+            # (e.g. the standalone ``ToolConfig`` in
+            # core/tools/adapters/vibe/config.py:201). A caller that
+            # hasn't migrated to ToolSelectionSpec still expresses the
+            # name allow-list there; honour it so legacy ``ToolConfig``
+            # callers (third-party / standalone embedding) keep working.
+            #   None       — no filter (full default set)
+            #   []         — explicit zero tools
+            #   [...]      — concrete name allow-list
+            legacy_list = (
+                config.get_allowed_tools()
+                if hasattr(config, "get_allowed_tools")
+                else None
+            )
+            allowed_names = None if legacy_list is None else frozenset(legacy_list)
 
         if allowed_names is not None:
             tools = [tool for tool in tools if tool.name in allowed_names]
