@@ -1778,12 +1778,6 @@ class TestCreateAndCallAgent:
                 task_id="parent-task-mcp",
             )
 
-            fake_mcp_tool = Mock()
-            fake_mcp_tool.name = "mcp_LinkedIn_get_profile"
-            fake_mcp_tool.metadata = Mock()
-            fake_mcp_tool.metadata.category = Mock()
-            fake_mcp_tool.metadata.category.value = "mcp"
-
             with (
                 patch(
                     "xagent.web.services.llm_utils.UserAwareModelStorage"
@@ -1791,10 +1785,6 @@ class TestCreateAndCallAgent:
                 patch(
                     "xagent.core.agent.service.AgentService"
                 ) as mock_agent_service_class,
-                patch(
-                    "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
-                    new=AsyncMock(return_value=[fake_mcp_tool]),
-                ),
                 patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
             ):
                 mock_storage = Mock()
@@ -1809,9 +1799,25 @@ class TestCreateAndCallAgent:
 
                 result = await tool.run_json_async({"task": "get linkedin profile"})
 
+            # The delegation path now hands a typed ToolSelectionSpec to
+            # WebToolConfig (rather than a pre-computed allowed_tools
+            # list). The factory's spec.compute_allowed_names does the
+            # name-level filter at build time. Pin the spec shape here
+            # so a regression that drops mcp:<server> derivation surfaces.
+            from xagent.core.tools.adapters.vibe.selection_spec import (
+                _SpecByCategories,
+            )
+
             assert result["response"] == "nested response"
             tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
-            assert tool_config.get_allowed_tools() == ["mcp_LinkedIn_get_profile"]
+            spec = tool_config.get_tool_selection_spec()
+            assert isinstance(spec, _SpecByCategories), (
+                "mcp:LinkedIn tool_categories must produce a BY_CATEGORIES "
+                "spec, not ALL/NONE -- otherwise the factory's name filter "
+                "won't restrict to LinkedIn MCP tools."
+            )
+            assert "mcp:LinkedIn" in spec.categories
+            assert spec.mcp_servers == frozenset({"LinkedIn"})
         finally:
             db.close()
             try:
