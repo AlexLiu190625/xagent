@@ -21,6 +21,10 @@ from xagent.core.agent import (
     PlanStep,
     PlanValidationError,
 )
+from xagent.core.agent.pattern.base import RequiredToolCallError
+from xagent.core.agent.pattern.dag.plan_generator import (
+    PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
+)
 from xagent.core.model.chat.types import ChunkType, StreamChunk
 
 DAG_COMPLETION_TOOL_NAME = "assess_dag_completion"
@@ -1442,6 +1446,77 @@ async def test_llm_plan_generator_builds_plan_from_model_json() -> None:
     assert "response_format" not in llm.calls[0]
 
 
+@pytest.mark.asyncio
+async def test_llm_plan_generator_retries_missing_required_tool_call() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-retry")
+    context.add_user_message("Create a short plan")
+    llm = SequenceLLM(
+        [
+            {"content": "plain text instead of a tool call"},
+            plan_tool_response(
+                [
+                    {
+                        "id": "final",
+                        "task": "Finalize answer",
+                        "dependencies": [],
+                        "termination_condition": (
+                            "Stop after final_answer returns the answer."
+                        ),
+                        "completion_evidence": (
+                            "The final answer has been returned successfully."
+                        ),
+                        "tool_names": [],
+                    }
+                ]
+            ),
+        ]
+    )
+
+    plan = await generator.generate_plan(
+        request=PlanGenerationRequest(
+            context=context,
+            execution_id="dag-llm-plan-retry",
+            available_tool_names=[],
+        ),
+        llm=llm,
+    )
+
+    assert [step.id for step in plan.steps] == ["final"]
+    assert llm.calls == 2
+    retry_message = llm.seen_messages[1][-1]["content"]
+    assert "did not call the required generate_execution_plan tool" in retry_message
+
+
+@pytest.mark.asyncio
+async def test_llm_plan_generator_reports_missing_required_tool_call() -> None:
+    generator = LLMPlanGenerator()
+    context = ExecutionContext(execution_id="dag-llm-plan-missing")
+    context.add_user_message("Create a short plan")
+    llm = SequenceLLM(
+        [
+            {"content": "plain text instead of a tool call"},
+            {"tool_calls": []},
+        ]
+    )
+
+    with pytest.raises(RequiredToolCallError) as exc_info:
+        await generator.generate_plan(
+            request=PlanGenerationRequest(
+                context=context,
+                execution_id="dag-llm-plan-missing",
+                available_tool_names=[],
+            ),
+            llm=llm,
+        )
+
+    assert exc_info.value.tool_name == "generate_execution_plan"
+    assert exc_info.value.attempts == 2
+    assert exc_info.value.user_message == PLAN_GENERATION_REQUIRED_TOOL_MESSAGE
+    assert "LLMPlanGenerator requires" not in str(exc_info.value)
+    assert llm.calls == 2
+
+
 def test_dag_output_language_reads_dict_context_metadata() -> None:
     assert (
         DAGPattern._output_language({"metadata": {"output_language": "English"}})
@@ -1638,6 +1713,45 @@ async def test_dag_pattern_returns_failed_result_for_plan_generator_exception() 
     assert (
         runtime.last_checkpoint["metadata"]["failure_reason"] == "plan_generation_error"
     )
+
+
+@pytest.mark.asyncio
+async def test_dag_pattern_returns_friendly_missing_required_tool_failure() -> None:
+    runtime = PatternRuntime(execution_id="dag-plan-tool-missing")
+    pattern = DAGPattern(LLMPlanGenerator())
+    context = ExecutionContext(execution_id="dag-plan-tool-missing")
+    context.add_user_message("Create a short plan")
+    llm = SequenceLLM(
+        [
+            {"content": "plain text instead of a tool call"},
+            {"tool_calls": []},
+        ]
+    )
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=llm,
+        runtime=runtime,
+    )
+
+    assert result["success"] is False
+    assert result["status"] == "failed"
+    assert result["failure_reason"] == "missing_required_tool_call"
+    assert result["required_tool_name"] == "generate_execution_plan"
+    assert result["attempts"] == 2
+    assert result["error"] == PLAN_GENERATION_REQUIRED_TOOL_MESSAGE
+    assert "LLMPlanGenerator requires" not in result["error"]
+    assert runtime.last_checkpoint is not None
+    assert runtime.last_checkpoint["label"] == "dag_plan_generation_failed"
+    assert runtime.last_checkpoint["metadata"]["failure_reason"] == (
+        "missing_required_tool_call"
+    )
+    assert (
+        runtime.last_checkpoint["metadata"]["required_tool_name"]
+        == "generate_execution_plan"
+    )
+    assert runtime.last_checkpoint["metadata"]["attempts"] == 2
 
 
 @pytest.mark.asyncio

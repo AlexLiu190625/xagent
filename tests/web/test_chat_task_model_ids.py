@@ -3,6 +3,7 @@
 import logging
 import os
 import tempfile
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -703,5 +704,136 @@ def test_task_create_rejects_agent_id_from_another_user(
 
         assert resp.status_code == 404
         assert resp.json()["detail"] == "Agent not found or access denied"
+    finally:
+        db.close()
+
+
+def test_delete_task_removes_trace_blobs_and_task_owned_rows(test_db, user1_headers):
+    from xagent.web.models.chat_message import TaskChatMessage
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import (
+        DAGExecution,
+        DAGExecutionPhase,
+        Task,
+        TaskStatus,
+        TraceCheckpointBlob,
+        TraceEvent,
+        TraceMessageBlob,
+    )
+    from xagent.web.models.uploaded_file import UploadedFile
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user = db.query(User).filter(User.username == "user1").first()
+        assert user is not None
+
+        task = Task(
+            user_id=user.id,
+            title="delete me",
+            description="task with task-owned rows",
+            status=TaskStatus.COMPLETED,
+        )
+        db.add(task)
+        db.flush()
+
+        db.add_all(
+            [
+                DAGExecution(
+                    task_id=task.id,
+                    phase=DAGExecutionPhase.COMPLETED,
+                ),
+                TraceEvent(
+                    task_id=task.id,
+                    build_id=None,
+                    event_id="vibe-event",
+                    event_type="dag_execute_end",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"ok": True},
+                ),
+                TraceEvent(
+                    task_id=task.id,
+                    build_id="builder-session",
+                    event_id="build-event",
+                    event_type="agent_message",
+                    timestamp=datetime.now(timezone.utc),
+                    data={"ok": True},
+                ),
+                TraceMessageBlob(
+                    task_id=task.id,
+                    execution_id="exec-delete",
+                    message_hash="message-hash",
+                    message_data={"role": "user", "content": "hello"},
+                    message_bytes=42,
+                ),
+                TraceCheckpointBlob(
+                    task_id=task.id,
+                    execution_id="exec-delete",
+                    blob_kind="messages",
+                    blob_hash="checkpoint-hash",
+                    blob_data={"messages": []},
+                    blob_bytes=17,
+                ),
+                TaskChatMessage(
+                    task_id=task.id,
+                    user_id=user.id,
+                    role="user",
+                    content="hello",
+                    message_type="user_message",
+                ),
+                UploadedFile(
+                    user_id=user.id,
+                    task_id=task.id,
+                    filename="input.txt",
+                    storage_path=f"/tmp/task-{task.id}/input.txt",
+                    file_size=5,
+                ),
+            ]
+        )
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    resp = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+
+    assert resp.status_code == 200, resp.text
+    db = next(get_db())
+    try:
+        assert db.query(Task).filter(Task.id == task_id).count() == 0
+        assert db.query(TraceMessageBlob).filter_by(task_id=task_id).count() == 0
+        assert db.query(TraceCheckpointBlob).filter_by(task_id=task_id).count() == 0
+        assert db.query(TraceEvent).filter_by(task_id=task_id).count() == 0
+        assert db.query(DAGExecution).filter_by(task_id=task_id).count() == 0
+        assert db.query(TaskChatMessage).filter_by(task_id=task_id).count() == 0
+        assert db.query(UploadedFile).filter_by(task_id=task_id).count() == 0
+    finally:
+        db.close()
+
+
+def test_delete_task_keeps_cross_user_access_denied(
+    test_db, user1_headers, user2_headers
+):
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user2 = db.query(User).filter(User.username == "user2").first()
+        assert user2 is not None
+        task = Task(user_id=user2.id, title="private", description="private")
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    resp = client.delete(f"/api/chat/task/{task_id}", headers=user1_headers)
+
+    assert resp.status_code == 404
+    db = next(get_db())
+    try:
+        assert db.query(Task).filter(Task.id == task_id).count() == 1
     finally:
         db.close()

@@ -2833,24 +2833,26 @@ async def delete_task(
             # Delete related data in correct order to respect foreign key constraints
             logger.info(f"Deleting task {task_id} and all related data")
 
-            # Delete DAG execution (if any)
-            from ..models.task import DAGExecution
-
-            dag_execution = (
-                db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
+            # Delete task-owned rows that do not all have DB-level cascades.
+            from ..models.task import (
+                DAGExecution,
+                TraceCheckpointBlob,
+                TraceEvent,
+                TraceMessageBlob,
             )
-            if dag_execution:
-                db.delete(dag_execution)
 
-            # Note: execution_logs table has been removed - replaced by trace_events
-
-            # Delete trace events (only VIBE phase, BUILD sessions are separate)
-            from ..models.task import TraceEvent
-
-            db.query(TraceEvent).filter(
-                TraceEvent.task_id == task_id,
-                TraceEvent.build_id.is_(None),  # ← Only delete VIBE events
-            ).delete()
+            db.query(TraceCheckpointBlob).filter(
+                TraceCheckpointBlob.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.query(TraceMessageBlob).filter(
+                TraceMessageBlob.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.query(TraceEvent).filter(TraceEvent.task_id == task_id).delete(
+                synchronize_session=False
+            )
+            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).delete(
+                synchronize_session=False
+            )
 
             # Note: tool_usages, agents, and agent_tools tables have been removed
 

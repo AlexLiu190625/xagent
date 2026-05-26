@@ -13,8 +13,15 @@ from ...language import (
     output_language_policy,
     plan_language_rules,
 )
+from ..base import RequiredToolCallError, extract_required_tool_arguments
 
 logger = logging.getLogger(__name__)
+
+MAX_PLAN_TOOL_CALL_ATTEMPTS = 2
+PLAN_GENERATION_REQUIRED_TOOL_MESSAGE = (
+    "Plan generation failed because the model did not return the required "
+    "planning tool call. Please retry."
+)
 
 
 class PlanValidationError(ValueError):
@@ -210,87 +217,118 @@ class LLMPlanGenerator(PlanGenerator):
         llm: Any,
     ) -> ExecutionPlan:
         plan_tools = [self._plan_tool_schema()]
-        response = await llm.chat(
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Generate a DAG execution plan by calling the "
-                        f"{self.PLAN_TOOL_NAME} tool exactly once. Each step requires "
-                        '"id", "task", "dependencies", "termination_condition", '
-                        '"completion_evidence", and "tool_names"; "description" is '
-                        "optional but strongly recommended. "
-                        "dependencies is required for every step; "
-                        "use an empty array only for true entry steps that do not "
-                        "need any prior output. If a step uses data, files, decisions, "
-                        "analysis, or artifacts produced by another step, it must "
-                        "depend on that producing step. For example, screenshot or "
-                        "render steps must depend on the step that creates the HTML "
-                        "or file they render, and final synthesis steps must depend "
-                        "on the research or build steps they summarize. Use task as "
-                        "the short node title, "
-                        "description for the concrete work to perform, and tool_names "
-                        "for the step's suggested execution tool scope. Use "
-                        "termination_condition for the exact stop rule that tells the "
-                        "step executor when this step is done and what it must report. "
-                        "The termination_condition must be concrete and action-specific; "
-                        "do not use vague wording such as 'when complete' or 'when the "
-                        "task is done'. For artifact-producing steps, name an exact path "
-                        "only when the user requires that path or the tool accepts it as "
-                        "an argument; otherwise refer to the artifact returned by the "
-                        "tool. State that the step must call final_answer after the "
-                        "condition is satisfied. Put review, "
-                        "verification, rendering, optimization, and final synthesis in "
-                        "separate dependent steps unless this step explicitly owns that "
-                        "work. Use completion_evidence for a short natural-language "
-                        "proof that this specific step is done, usually naming the "
-                        "successful tool result fields to check. Do not use global "
-                        "effect labels or invented fixed filenames. For auto-named "
-                        "outputs, say that the tool returned a usable path. Keep "
-                        "completion_evidence under 160 characters. If a workflow needs "
-                        "several tool actions and only the last one proves completion, "
-                        "split those actions into dependent steps. Few-shot examples: "
-                        "auto-named output evidence: 'The generator returned success=true "
-                        "and a non-empty path or URL for the created asset.' explicit "
-                        "path evidence: 'The writer returned success=true for the "
-                        "requested output path.' non-file evidence: 'The tool returned "
-                        "the requested answer data successfully.' tool_names "
-                        "must only contain exact names from available_tool_names. "
-                        "Include the best matching available tools for every step "
-                        "that needs tool use. Leave tool_names empty only for pure "
-                        "reasoning, summarization, or formatting steps that can be "
-                        "completed from provided context and dependency results. Do "
-                        "not put skill names, artifact types, programming languages, "
-                        "or made-up tools in tool_names. tool_names are not hard "
-                        "limits, but they define the expected tool scope for the "
-                        "step executor; choose them carefully so the executor does "
-                        "not need to perform sibling or downstream step work. "
-                        "Set response_language to the natural language that "
-                        "user-facing prose should use for this request. If the "
-                        "user prompt includes an output_language_policy field, "
-                        "follow it exactly and make response_language match it. "
-                        "The messages array, selected skill context, retrieved "
-                        "memories, examples, URLs, and source content are "
-                        "supporting context only and must not change the plan "
-                        "language. "
-                        f"{plan_language_rules()} "
-                        "Keep ids stable "
-                        "across replans when a completed step can be reused."
-                    ),
-                },
-                {"role": "user", "content": self._build_prompt(request)},
-            ],
-            tools=plan_tools,
-            tool_choice="required",
-            thinking={"type": "disabled", "enable": False},
-        )
-        plan_arguments = self._extract_tool_arguments(response, self.PLAN_TOOL_NAME)
-        self._apply_response_language(request.context, plan_arguments)
-        plan = coerce_execution_plan(plan_arguments)
-        return self._filter_suggested_tools(
-            plan=plan,
-            available_tool_names=request.available_tool_names,
-        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Generate a DAG execution plan by calling the "
+                    f"{self.PLAN_TOOL_NAME} tool exactly once. Each step requires "
+                    '"id", "task", "dependencies", "termination_condition", '
+                    '"completion_evidence", and "tool_names"; "description" is '
+                    "optional but strongly recommended. "
+                    "dependencies is required for every step; "
+                    "use an empty array only for true entry steps that do not "
+                    "need any prior output. If a step uses data, files, decisions, "
+                    "analysis, or artifacts produced by another step, it must "
+                    "depend on that producing step. For example, screenshot or "
+                    "render steps must depend on the step that creates the HTML "
+                    "or file they render, and final synthesis steps must depend "
+                    "on the research or build steps they summarize. Use task as "
+                    "the short node title, "
+                    "description for the concrete work to perform, and tool_names "
+                    "for the step's suggested execution tool scope. Use "
+                    "termination_condition for the exact stop rule that tells the "
+                    "step executor when this step is done and what it must report. "
+                    "The termination_condition must be concrete and action-specific; "
+                    "do not use vague wording such as 'when complete' or 'when the "
+                    "task is done'. For artifact-producing steps, name an exact path "
+                    "only when the user requires that path or the tool accepts it as "
+                    "an argument; otherwise refer to the artifact returned by the "
+                    "tool. State that the step must call final_answer after the "
+                    "condition is satisfied. Put review, "
+                    "verification, rendering, optimization, and final synthesis in "
+                    "separate dependent steps unless this step explicitly owns that "
+                    "work. Use completion_evidence for a short natural-language "
+                    "proof that this specific step is done, usually naming the "
+                    "successful tool result fields to check. Do not use global "
+                    "effect labels or invented fixed filenames. For auto-named "
+                    "outputs, say that the tool returned a usable path. Keep "
+                    "completion_evidence under 160 characters. If a workflow needs "
+                    "several tool actions and only the last one proves completion, "
+                    "split those actions into dependent steps. Few-shot examples: "
+                    "auto-named output evidence: 'The generator returned success=true "
+                    "and a non-empty path or URL for the created asset.' explicit "
+                    "path evidence: 'The writer returned success=true for the "
+                    "requested output path.' non-file evidence: 'The tool returned "
+                    "the requested answer data successfully.' tool_names "
+                    "must only contain exact names from available_tool_names. "
+                    "Include the best matching available tools for every step "
+                    "that needs tool use. Leave tool_names empty only for pure "
+                    "reasoning, summarization, or formatting steps that can be "
+                    "completed from provided context and dependency results. Do "
+                    "not put skill names, artifact types, programming languages, "
+                    "or made-up tools in tool_names. tool_names are not hard "
+                    "limits, but they define the expected tool scope for the "
+                    "step executor; choose them carefully so the executor does "
+                    "not need to perform sibling or downstream step work. "
+                    "Set response_language to the natural language that "
+                    "user-facing prose should use for this request. If the "
+                    "user prompt includes an output_language_policy field, "
+                    "follow it exactly and make response_language match it. "
+                    "The messages array, selected skill context, retrieved "
+                    "memories, examples, URLs, and source content are "
+                    "supporting context only and must not change the plan "
+                    "language. "
+                    f"{plan_language_rules()} "
+                    "Keep ids stable "
+                    "across replans when a completed step can be reused."
+                ),
+            },
+            {"role": "user", "content": self._build_prompt(request)},
+        ]
+        retry_feedback: str | None = None
+        for attempt in range(MAX_PLAN_TOOL_CALL_ATTEMPTS):
+            attempt_messages = list(messages)
+            if retry_feedback:
+                attempt_messages.append({"role": "user", "content": retry_feedback})
+            response = await llm.chat(
+                messages=attempt_messages,
+                tools=plan_tools,
+                tool_choice="required",
+                thinking={"type": "disabled", "enable": False},
+            )
+            try:
+                plan_arguments = self._extract_tool_arguments(
+                    response,
+                    self.PLAN_TOOL_NAME,
+                    attempts=attempt + 1,
+                )
+            except RequiredToolCallError:
+                if attempt + 1 >= MAX_PLAN_TOOL_CALL_ATTEMPTS:
+                    raise RequiredToolCallError(
+                        owner="LLMPlanGenerator",
+                        tool_name=self.PLAN_TOOL_NAME,
+                        attempts=MAX_PLAN_TOOL_CALL_ATTEMPTS,
+                        user_message=PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
+                    )
+                retry_feedback = self._required_tool_call_retry_feedback(
+                    self.PLAN_TOOL_NAME
+                )
+                logger.warning(
+                    "LLMPlanGenerator response omitted required %s tool call; "
+                    "retrying plan generation. execution_id=%s attempt=%s",
+                    self.PLAN_TOOL_NAME,
+                    request.execution_id,
+                    attempt + 1,
+                )
+                continue
+            self._apply_response_language(request.context, plan_arguments)
+            plan = coerce_execution_plan(plan_arguments)
+            return self._filter_suggested_tools(
+                plan=plan,
+                available_tool_names=request.available_tool_names,
+            )
+        raise RuntimeError("LLMPlanGenerator retry loop exited unexpectedly.")
 
     def _filter_suggested_tools(
         self,
@@ -452,33 +490,28 @@ class LLMPlanGenerator(PlanGenerator):
         ):
             metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
 
-    def _extract_tool_arguments(self, response: Any, tool_name: str) -> dict[str, Any]:
-        tool_calls = self._response_tool_calls(response)
-        for tool_call in tool_calls:
-            function_payload = self._function_payload(tool_call)
-            if not function_payload:
-                continue
-            if function_payload.get("name") != tool_name:
-                continue
-            return self._coerce_arguments(function_payload.get("arguments", {}))
-        raise ValueError(f"LLMPlanGenerator requires a {tool_name} tool call response.")
+    def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
+        return (
+            f"The previous response did not call the required {tool_name} tool. "
+            f"Call {tool_name} exactly once with a complete executable plan. "
+            "Do not answer in natural language."
+        )
 
-    def _response_tool_calls(self, response: Any) -> list[Any]:
-        if isinstance(response, dict):
-            return list(response.get("tool_calls") or [])
-        return list(getattr(response, "tool_calls", []) or [])
-
-    def _function_payload(self, tool_call: Any) -> dict[str, Any] | None:
-        if isinstance(tool_call, dict):
-            function_payload = tool_call.get("function")
-            return function_payload if isinstance(function_payload, dict) else None
-        function_payload = getattr(tool_call, "function", None)
-        if function_payload is None:
-            return None
-        return {
-            "name": getattr(function_payload, "name", None),
-            "arguments": getattr(function_payload, "arguments", {}),
-        }
+    def _extract_tool_arguments(
+        self,
+        response: Any,
+        tool_name: str,
+        *,
+        attempts: int = 1,
+    ) -> dict[str, Any]:
+        arguments = extract_required_tool_arguments(
+            response,
+            tool_name=tool_name,
+            owner="LLMPlanGenerator",
+            attempts=attempts,
+            user_message=PLAN_GENERATION_REQUIRED_TOOL_MESSAGE,
+        )
+        return self._coerce_arguments(arguments)
 
     def _coerce_arguments(self, arguments: Any) -> dict[str, Any]:
         if isinstance(arguments, dict):

@@ -25,7 +25,13 @@ from ...language import (
     output_language_policy,
 )
 from ...runtime import LLMCallInterrupted, PatternRuntime
-from ..base import AgentPattern, PatternResult
+from ..base import (
+    REQUIRED_TOOL_CALL_FAILURE_REASON,
+    AgentPattern,
+    PatternResult,
+    RequiredToolCallError,
+    extract_required_tool_arguments,
+)
 from ..dag import DAGPattern
 from ..final_answer_stream import (
     FinalAnswerStreamSession,
@@ -109,6 +115,10 @@ class AutoDecisionResult:
 
 DECISION_TOOL_NAME = "select_execution_pattern"
 MAX_DECISION_PARSE_ATTEMPTS = 2
+AUTO_DECISION_REQUIRED_TOOL_MESSAGE = (
+    "Auto routing failed because the model did not return the required "
+    "decision tool call. Please retry."
+)
 
 
 class AutoDecisionArgumentsError(ValueError):
@@ -405,6 +415,17 @@ class AutoPattern(AgentPattern):
                 memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
                 compact_llm=kwargs.get("compact_llm"),
             )
+        except RequiredToolCallError as exc:
+            result = await self._fail(
+                context=context,
+                runtime=runtime,
+                error=exc.user_message,
+                failure_reason=exc.failure_reason,
+                checkpoint_label="auto_decision_failed",
+                extra_metadata=exc.to_metadata(),
+            )
+            await runtime.on_pattern_end(context=context, pattern=self, result=result)
+            return result
         except Exception as exc:
             self.status = "failed"
             await runtime.on_pattern_error(context=context, pattern=self, error=exc)
@@ -594,6 +615,38 @@ class AutoPattern(AgentPattern):
         self.last_result = result
         return result
 
+    async def _fail(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        error: str,
+        failure_reason: str,
+        checkpoint_label: str,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.status = "failed"
+        metadata: dict[str, Any] = {
+            "status": self.status,
+            "failure_reason": failure_reason,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        result = PatternResult(
+            success=False,
+            error=error,
+            metadata=metadata,
+        ).to_dict()
+        self.last_result = result
+        await runtime.checkpoint(
+            checkpoint_label,
+            context=context,
+            pattern=self,
+            status=self.status,
+            metadata=metadata,
+        )
+        return result
+
     def _normalize_decision(self) -> None:
         if self.decision is None:
             return
@@ -752,7 +805,36 @@ class AutoPattern(AgentPattern):
                 context=context, response=response, metadata=metadata
             )
             try:
-                decision = self._parse_decision(response)
+                decision = self._parse_decision(response, attempts=attempt + 1)
+            except RequiredToolCallError:
+                if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
+                    raise RequiredToolCallError(
+                        owner="AutoPattern decision",
+                        tool_name=DECISION_TOOL_NAME,
+                        attempts=MAX_DECISION_PARSE_ATTEMPTS,
+                        user_message=AUTO_DECISION_REQUIRED_TOOL_MESSAGE,
+                    )
+                retry_feedback = self._required_tool_call_retry_feedback(
+                    DECISION_TOOL_NAME
+                )
+                logger.warning(
+                    "AutoPattern decision response omitted required %s tool call; "
+                    "retrying decision. execution_id=%s attempt=%s",
+                    DECISION_TOOL_NAME,
+                    getattr(context, "execution_id", None),
+                    attempt + 1,
+                )
+                await runtime.checkpoint(
+                    "auto_decision_retry",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "attempt": attempt + 1,
+                        "failure_reason": REQUIRED_TOOL_CALL_FAILURE_REASON,
+                        "required_tool_name": DECISION_TOOL_NAME,
+                    },
+                )
+                continue
             except AutoDecisionArgumentsError as exc:
                 if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
                     raise
@@ -782,6 +864,13 @@ class AutoPattern(AgentPattern):
                 ),
             )
         raise RuntimeError("AutoPattern decision retry loop exited unexpectedly.")
+
+    def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
+        return (
+            f"The previous response did not call the required {tool_name} tool. "
+            f"Call {tool_name} exactly once with a complete routing decision. "
+            "Do not answer in natural language."
+        )
 
     def _decision_retry_feedback(self, error: AutoDecisionArgumentsError) -> str:
         argument_preview = self._truncate_retry_preview(error.arguments or "")
@@ -962,39 +1051,29 @@ class AutoPattern(AgentPattern):
             actions.append(AutoAction.PLAN_EXECUTE.value)
         return actions
 
-    def _parse_decision(self, response: Any) -> AutoDecision:
-        payload = self._extract_tool_arguments(response, DECISION_TOOL_NAME)
+    def _parse_decision(self, response: Any, *, attempts: int = 1) -> AutoDecision:
+        payload = self._extract_tool_arguments(
+            response,
+            DECISION_TOOL_NAME,
+            attempts=attempts,
+        )
         return AutoDecision.from_dict(payload)
 
-    def _extract_tool_arguments(self, response: Any, tool_name: str) -> dict[str, Any]:
-        tool_calls = self._response_tool_calls(response)
-        for tool_call in tool_calls:
-            function_payload = self._function_payload(tool_call)
-            if not function_payload:
-                continue
-            if function_payload.get("name") != tool_name:
-                continue
-            return self._coerce_arguments(function_payload.get("arguments", {}))
-        raise ValueError(
-            f"AutoPattern decision requires a {tool_name} tool call response."
+    def _extract_tool_arguments(
+        self,
+        response: Any,
+        tool_name: str,
+        *,
+        attempts: int = 1,
+    ) -> dict[str, Any]:
+        arguments = extract_required_tool_arguments(
+            response,
+            tool_name=tool_name,
+            owner="AutoPattern decision",
+            attempts=attempts,
+            user_message=AUTO_DECISION_REQUIRED_TOOL_MESSAGE,
         )
-
-    def _response_tool_calls(self, response: Any) -> list[Any]:
-        if isinstance(response, dict):
-            return list(response.get("tool_calls") or [])
-        return list(getattr(response, "tool_calls", []) or [])
-
-    def _function_payload(self, tool_call: Any) -> dict[str, Any] | None:
-        if isinstance(tool_call, dict):
-            function_payload = tool_call.get("function")
-            return function_payload if isinstance(function_payload, dict) else None
-        function_payload = getattr(tool_call, "function", None)
-        if function_payload is None:
-            return None
-        return {
-            "name": getattr(function_payload, "name", None),
-            "arguments": getattr(function_payload, "arguments", {}),
-        }
+        return self._coerce_arguments(arguments)
 
     def _coerce_arguments(self, arguments: Any) -> dict[str, Any]:
         if isinstance(arguments, dict):
