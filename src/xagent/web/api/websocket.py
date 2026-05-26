@@ -1109,16 +1109,37 @@ def _normalize_task_file_outputs(
     db: Session,
     task: Any,
     file_outputs: Any,
+    *,
+    task_id: Optional[int] = None,
+    task_user_id: Optional[int] = None,
 ) -> tuple[list[Dict[str, Any]], Dict[str, str]]:
-    task_user_id = _task_user_id(task)
-    if task_user_id is None:
+    """Resolve and persist ``file_outputs`` produced by an agent run.
+
+    Two callsite shapes:
+      1. WS / legacy paths still hold the ORM ``task`` row in-scope —
+         pass it as ``task`` and the user_id / task_id come from there.
+      2. Snapshot path (``execute_task_background`` with off-loop
+         loader) sets ``task=None`` to avoid ORM session crossings,
+         and supplies ``task_id`` + ``task_user_id`` directly. Without
+         this overload the persistence step silently no-ops because
+         ``_task_user_id(None)`` returns ``None``.
+    """
+    resolved_user_id: Optional[int]
+    resolved_task_id: Optional[int]
+    if task is not None:
+        resolved_user_id = _task_user_id(task)
+        resolved_task_id = int(cast(Any, task.id))
+    else:
+        resolved_user_id = task_user_id
+        resolved_task_id = task_id
+
+    if resolved_user_id is None or resolved_task_id is None:
         return [], {}
 
-    task_id = int(cast(Any, task.id))
     return _normalize_file_outputs(
         db,
-        task_id=task_id,
-        task_user_id=task_user_id,
+        task_id=resolved_task_id,
+        task_user_id=resolved_user_id,
         file_outputs=file_outputs,
     )
 
@@ -1253,6 +1274,8 @@ async def execute_task_background(
             db,
             task,
             result.get("file_outputs", []),
+            task_id=int(task_id) if task is None else None,
+            task_user_id=task_user_id if task is None else None,
         )
         if normalized_outputs:
             result["file_outputs"] = normalized_outputs
