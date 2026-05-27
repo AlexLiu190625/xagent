@@ -37,10 +37,12 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
         self,
         user_id: int,
         is_admin: bool = False,
+        default_embedding_model_id: Optional[str] = None,
     ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.user_id = user_id
         self.is_admin = is_admin
+        self.default_embedding_model_id = default_embedding_model_id
 
     @property
     def name(self) -> str:
@@ -68,11 +70,7 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
         try:
             import time
 
-            from ...core.RAG_tools.core.schemas import (
-                DEFAULT_EMBEDDING_MODEL_ID,
-                IngestionConfig,
-                WebCrawlConfig,
-            )
+            from ...core.RAG_tools.core.schemas import IngestionConfig, WebCrawlConfig
             from ...core.RAG_tools.pipelines.web_ingestion import run_web_ingestion
             from .agent_kb_service import AgentKnowledgeBaseService
 
@@ -99,17 +97,18 @@ class CreateKnowledgeBaseFromUrlTool(AbstractBaseTool):
                 max_depth=2,
             )
 
-            ingest_config = IngestionConfig(
-                embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID
-            )
+            ingest_config = IngestionConfig()
             kb_service = AgentKnowledgeBaseService(
                 user_id=self.user_id,
                 is_admin=self.is_admin,
+                default_embedding_model_id=self.default_embedding_model_id,
             )
-            collection_name = await kb_service.prepare_collection(
+            prepared = await kb_service.prepare_collection(
                 collection_name=collection_name,
                 ingestion_config=ingest_config,
             )
+            collection_name = prepared.collection_name
+            ingest_config = prepared.ingestion_config
 
             logger.info(
                 f"Starting background web ingestion for {tool_args.url} into {collection_name}"
@@ -175,6 +174,7 @@ async def create_web_ingestion_tools(config: WebToolConfig) -> list[AbstractBase
         tool = CreateKnowledgeBaseFromUrlTool(
             user_id=user_id,
             is_admin=is_admin,
+            default_embedding_model_id=config.get_embedding_model(),
         )
         logger.debug(f"Created CreateKnowledgeBaseFromUrlTool for user {user_id}")
         return [tool]

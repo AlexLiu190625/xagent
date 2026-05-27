@@ -1,4 +1,3 @@
-import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -21,31 +20,37 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     IngestionResult,
     WebIngestionResult,
 )
+from xagent.core.tools.core.RAG_tools.management.ingestion_prepare import (
+    PreparedKnowledgeBaseIngestion,
+)
 
 
 @pytest.mark.asyncio
 async def test_agent_kb_service_prepare_collection_persists_config_and_sanitizes():
-    metadata_store = MagicMock()
-    metadata_store.save_collection_config = AsyncMock()
     service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
     ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
+    prepared = PreparedKnowledgeBaseIngestion(
+        collection_name="agent url kb",
+        ingestion_config=ingest_config,
+        collection_existed_before=False,
+        should_save_config=True,
+    )
+    prepare_kb_ingestion = AsyncMock(return_value=prepared)
 
     with patch(
-        "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
-        return_value=metadata_store,
+        "xagent.core.tools.adapters.vibe.agent_kb_service.prepare_kb_ingestion",
+        new=prepare_kb_ingestion,
     ):
-        collection_name = await service.prepare_collection(
-            "  agent url kb  ", ingest_config
-        )
+        result = await service.prepare_collection("  agent url kb  ", ingest_config)
 
-    assert collection_name == "agent url kb"
-    metadata_store.save_collection_config.assert_awaited_once()
-    _, save_kwargs = metadata_store.save_collection_config.await_args
-    assert save_kwargs["collection"] == "agent url kb"
-    assert save_kwargs["user_id"] == 71
-    assert json.loads(save_kwargs["config_json"]) == {
-        "embedding_model_id": DEFAULT_EMBEDDING_MODEL_ID
-    }
+    assert result == prepared
+    prepare_kb_ingestion.assert_awaited_once_with(
+        collection_name="agent url kb",
+        ingestion_config=ingest_config,
+        user_id=71,
+        is_admin=False,
+        fallback_embedding_model_id=None,
+    )
 
 
 @pytest.mark.asyncio
@@ -82,20 +87,16 @@ async def test_agent_kb_service_refresh_collection_metadata_skips_non_admin_refr
 
 @pytest.mark.asyncio
 async def test_agent_kb_service_prepare_collection_raises_on_config_save_failure():
-    metadata_store = MagicMock()
-    metadata_store.save_collection_config = AsyncMock(
-        side_effect=RuntimeError("config save failed")
-    )
     service = AgentKnowledgeBaseService(user_id=71, is_admin=False)
     ingest_config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
 
     with (
         patch(
-            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
-            return_value=metadata_store,
+            "xagent.core.tools.adapters.vibe.agent_kb_service.prepare_kb_ingestion",
+            new=AsyncMock(side_effect=RuntimeError("config save failed")),
         ),
         pytest.raises(
-            AgentKnowledgeBaseError, match="Failed to save collection config"
+            AgentKnowledgeBaseError, match="Failed to prepare knowledge base"
         ),
     ):
         await service.prepare_collection("agent kb", ingest_config)
@@ -138,8 +139,14 @@ async def test_create_kb_from_url_uses_shared_service(monkeypatch):
         warnings=[],
         elapsed_time_ms=123,
     )
+    prepared = PreparedKnowledgeBaseIngestion(
+        collection_name="agent_url_kb",
+        ingestion_config=IngestionConfig(embedding_model_id="bound-model"),
+        collection_existed_before=True,
+        should_save_config=False,
+    )
     service = MagicMock()
-    service.prepare_collection = AsyncMock(return_value="agent_url_kb")
+    service.prepare_collection = AsyncMock(return_value=prepared)
     service.refresh_collection_metadata = AsyncMock()
     run_web_ingestion_mock = AsyncMock(return_value=ingest_result)
 
@@ -162,13 +169,10 @@ async def test_create_kb_from_url_uses_shared_service(monkeypatch):
     service.prepare_collection.assert_awaited_once()
     _, prepare_kwargs = service.prepare_collection.await_args
     assert prepare_kwargs["collection_name"] == "agent_url_kb"
-    assert (
-        prepare_kwargs["ingestion_config"].embedding_model_id
-        == DEFAULT_EMBEDDING_MODEL_ID
-    )
     service.refresh_collection_metadata.assert_awaited_once_with("agent_url_kb")
     run_web_ingestion_mock.assert_awaited_once()
     _, run_kwargs = run_web_ingestion_mock.await_args
+    assert run_kwargs["ingestion_config"].embedding_model_id == "bound-model"
     assert run_kwargs["crawl_config"].tls_impersonate == "auto"
 
 
@@ -250,8 +254,14 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
         warnings=[],
         file_id="file-1",
     )
+    prepared = PreparedKnowledgeBaseIngestion(
+        collection_name="agent_file_kb",
+        ingestion_config=IngestionConfig(embedding_model_id="bound-model"),
+        collection_existed_before=True,
+        should_save_config=False,
+    )
     service = MagicMock()
-    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
+    service.prepare_collection = AsyncMock(return_value=prepared)
     service.refresh_collection_metadata = AsyncMock()
 
     with (
@@ -274,10 +284,6 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
     service.prepare_collection.assert_awaited_once()
     _, prepare_kwargs = service.prepare_collection.await_args
     assert prepare_kwargs["collection_name"] == "agent_file_kb"
-    assert (
-        prepare_kwargs["ingestion_config"].embedding_model_id
-        == DEFAULT_EMBEDDING_MODEL_ID
-    )
     service.refresh_collection_metadata.assert_awaited_once_with("agent_file_kb")
     db.close.assert_called_once()
 
@@ -318,8 +324,14 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
         warnings=[],
         file_id="file-1",
     )
+    prepared = PreparedKnowledgeBaseIngestion(
+        collection_name="agent_file_kb",
+        ingestion_config=IngestionConfig(embedding_model_id="bound-model"),
+        collection_existed_before=True,
+        should_save_config=False,
+    )
     service = MagicMock()
-    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
+    service.prepare_collection = AsyncMock(return_value=prepared)
     service.refresh_collection_metadata = AsyncMock()
     run_ingestion = Mock(return_value=ingest_result)
 
@@ -347,6 +359,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
     ensure_local.assert_called_once_with(file_record)
     _, ingestion_kwargs = run_ingestion.call_args
     assert ingestion_kwargs["source_path"] == str(restored_source)
+    assert ingestion_kwargs["ingestion_config"].embedding_model_id == "bound-model"
     db.close.assert_called_once()
 
 
@@ -383,8 +396,14 @@ async def test_create_kb_from_file_returns_error_when_metadata_refresh_fails(tmp
         warnings=[],
         file_id="file-1",
     )
+    prepared = PreparedKnowledgeBaseIngestion(
+        collection_name="agent_file_kb",
+        ingestion_config=IngestionConfig(embedding_model_id="bound-model"),
+        collection_existed_before=True,
+        should_save_config=False,
+    )
     service = MagicMock()
-    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
+    service.prepare_collection = AsyncMock(return_value=prepared)
     service.refresh_collection_metadata = AsyncMock(
         side_effect=AgentKnowledgeBaseError("metadata refresh failed")
     )

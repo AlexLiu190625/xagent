@@ -578,9 +578,12 @@ def process_document(
             selected_model_id,
         )
         if selected_model_id:
-            initialize_collection_embedding_sync(
+            initialized_collection = initialize_collection_embedding_sync(
                 collection_name=collection, embedding_model_id=selected_model_id
             )
+            if initialized_collection.embedding_model_id:
+                selected_model_id = initialized_collection.embedding_model_id
+                cfg = cfg.model_copy(update={"embedding_model_id": selected_model_id})
         else:
             # Even without embedding_model_id, ensure basic metadata exists
             logger.info(

@@ -24,7 +24,13 @@ from tests.e2e.minio_harness import MinioStorage, run_minio_storage
 from xagent.core.tools.adapters.vibe.file_ingestion_tool import (
     CreateKnowledgeBaseFromFileTool,
 )
-from xagent.core.tools.core.RAG_tools.core.schemas import IngestionResult
+from xagent.core.tools.core.RAG_tools.core.schemas import (
+    IngestionConfig,
+    IngestionResult,
+)
+from xagent.core.tools.core.RAG_tools.management.ingestion_prepare import (
+    PreparedKnowledgeBaseIngestion,
+)
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -436,12 +442,17 @@ async def test_create_kb_from_file_tool_restores_durable_only_upload_from_minio(
         return ingest_result
 
     service = AsyncMock()
-    service.prepare_collection.return_value = "agent_file_kb"
+    service.prepare_collection.return_value = PreparedKnowledgeBaseIngestion(
+        collection_name="agent_file_kb",
+        ingestion_config=IngestionConfig(embedding_model_id="bound-model"),
+        collection_existed_before=True,
+        should_save_config=False,
+    )
     service.refresh_collection_metadata.return_value = None
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
-        lambda user_id, is_admin: service,
+        lambda user_id, is_admin, default_embedding_model_id=None: service,
     )
     monkeypatch.setattr(
         "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",

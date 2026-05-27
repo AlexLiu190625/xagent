@@ -37,10 +37,16 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
 
     category = ToolCategory.KNOWLEDGE
 
-    def __init__(self, user_id: int, is_admin: bool = False) -> None:
+    def __init__(
+        self,
+        user_id: int,
+        is_admin: bool = False,
+        default_embedding_model_id: Optional[str] = None,
+    ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self.user_id = user_id
         self.is_admin = is_admin
+        self.default_embedding_model_id = default_embedding_model_id
 
     @property
     def name(self) -> str:
@@ -74,10 +80,7 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
                 DurableStorageOperationError,
                 ensure_uploaded_file_local_path,
             )
-            from ...core.RAG_tools.core.schemas import (
-                DEFAULT_EMBEDDING_MODEL_ID,
-                IngestionConfig,
-            )
+            from ...core.RAG_tools.core.schemas import IngestionConfig
             from ...core.RAG_tools.pipelines.document_ingestion import (
                 run_document_ingestion,
             )
@@ -114,15 +117,18 @@ class CreateKnowledgeBaseFromFileTool(AbstractBaseTool):
                     )[:30]
                     collection_name = f"{base_name}_{int(time.time())}"
 
-                config = IngestionConfig(embedding_model_id=DEFAULT_EMBEDDING_MODEL_ID)
+                config = IngestionConfig()
                 kb_service = AgentKnowledgeBaseService(
                     user_id=self.user_id,
                     is_admin=self.is_admin,
+                    default_embedding_model_id=self.default_embedding_model_id,
                 )
-                collection_name = await kb_service.prepare_collection(
+                prepared = await kb_service.prepare_collection(
                     collection_name=collection_name,
                     ingestion_config=config,
                 )
+                collection_name = prepared.collection_name
+                config = prepared.ingestion_config
 
                 ingested_count = 0
                 errors = []
@@ -214,6 +220,7 @@ async def create_file_ingestion_tools(config: WebToolConfig) -> list[AbstractBas
         tool = CreateKnowledgeBaseFromFileTool(
             user_id=user_id,
             is_admin=is_admin,
+            default_embedding_model_id=config.get_embedding_model(),
         )
         logger.debug("Created CreateKnowledgeBaseFromFileTool for user %s", user_id)
         return [tool]

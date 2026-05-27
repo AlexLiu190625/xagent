@@ -115,6 +115,61 @@ class TestCollectionManager:
         assert saved.embedding_model_id == "text-embedding-ada-002"
 
     @pytest.mark.asyncio
+    async def test_initialize_collection_embedding_allows_equivalent_model_id(
+        self, manager
+    ):
+        collection_name = "equivalent_model"
+        initial = CollectionInfo(
+            name=collection_name,
+            embedding_model_id="text-embedding-v4-dashscope-1",
+            embedding_dimension=1024,
+        )
+        await manager.save_collection(initial)
+
+        def _resolve(model_id: str):
+            cfg = Mock()
+            cfg.id = "text-embedding-v4-dashscope-1"
+            cfg.dimension = 1024
+            return cfg, Mock()
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_embedding_adapter",
+            side_effect=_resolve,
+        ):
+            result = await manager.initialize_collection_embedding(
+                collection_name, "text-embedding-v4"
+            )
+
+        assert result.embedding_model_id == "text-embedding-v4-dashscope-1"
+
+    @pytest.mark.asyncio
+    async def test_initialize_collection_embedding_rejects_different_model_id(
+        self, manager
+    ):
+        collection_name = "different_model"
+        initial = CollectionInfo(
+            name=collection_name,
+            embedding_model_id="model-a",
+            embedding_dimension=1024,
+        )
+        await manager.save_collection(initial)
+
+        def _resolve(model_id: str):
+            cfg = Mock()
+            cfg.id = model_id
+            cfg.dimension = 1024
+            return cfg, Mock()
+
+        with (
+            patch(
+                "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_embedding_adapter",
+                side_effect=_resolve,
+            ),
+            pytest.raises(ValueError, match="Cannot change to 'model-b'"),
+        ):
+            await manager.initialize_collection_embedding(collection_name, "model-b")
+
+    @pytest.mark.asyncio
     async def test_update_collection_stats_success(self, manager):
         """Test successful collection stats update in real storage."""
         collection_name = "stats_test"

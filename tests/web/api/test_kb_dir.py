@@ -2258,6 +2258,10 @@ def test_kb_ingest_cloud_denied_request_does_not_persist_collection_config(
             new_callable=AsyncMock,
             side_effect=HTTPException(status_code=403, detail="Forbidden"),
         ),
+        patch(
+            "xagent.web.api.kb._prepare_user_kb_ingestion",
+            new_callable=AsyncMock,
+        ) as prepare_ingestion,
     ):
         response = client.post(
             "/api/kb/ingest-cloud",
@@ -2275,6 +2279,7 @@ def test_kb_ingest_cloud_denied_request_does_not_persist_collection_config(
         )
 
     assert response.status_code == 403
+    prepare_ingestion.assert_not_awaited()
     metadata_store.save_collection_config.assert_not_awaited()
 
 

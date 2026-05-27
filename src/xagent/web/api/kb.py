@@ -49,6 +49,7 @@ from ...core.tools.core.RAG_tools.core.parser_registry import (
     validate_parser_compatibility,
 )
 from ...core.tools.core.RAG_tools.core.schemas import (
+    DEFAULT_EMBEDDING_MODEL_ID,
     ChunkStrategy,
     CollectionDocumentMetadata,
     CollectionOperationResult,
@@ -73,6 +74,10 @@ from ...core.tools.core.RAG_tools.management.collections import (
     delete_document,
     list_collections,
     list_documents,
+)
+from ...core.tools.core.RAG_tools.management.ingestion_prepare import (
+    PreparedKnowledgeBaseIngestion,
+    prepare_kb_ingestion,
 )
 from ...core.tools.core.RAG_tools.management.status import clear_ingestion_status
 from ...core.tools.core.RAG_tools.parse.parse_display import (
@@ -328,14 +333,26 @@ def _build_user_actionable_ingestion_message(
     embedding_model_id: Optional[str] = None,
 ) -> str:
     normalized = str(message).strip() or "Unknown ingestion failure"
+    resolved_model_id = (
+        embedding_model_id
+        or _extract_embedding_model_id_from_error(normalized)
+        or DEFAULT_EMBEDDING_MODEL_ID
+    )
     if "How to fix:" in normalized:
+        if (
+            _is_embedding_configuration_error(normalized)
+            and resolved_model_id
+            and "Current embedding_model_id:" not in normalized
+        ):
+            return normalized.replace(
+                " How to fix:",
+                f" Current embedding_model_id: '{resolved_model_id}'. How to fix:",
+                1,
+            )
         return normalized
     if not _is_embedding_configuration_error(normalized):
         return normalized
 
-    resolved_model_id = embedding_model_id or _extract_embedding_model_id_from_error(
-        normalized
-    )
     current_model_hint = (
         f" Current embedding_model_id: '{resolved_model_id}'."
         if resolved_model_id
@@ -1104,6 +1121,77 @@ def with_kb_user_scope(func: T) -> T:
 kb_router = APIRouter(prefix="/api/kb", tags=["kb"])
 
 
+def _get_user_default_embedding_model_id(user: User, db: Session) -> Optional[str]:
+    from ..models.model import Model as DBModel
+    from ..models.user import UserDefaultModel, UserModel
+    from ..services.model_service import (
+        _get_visible_user_ids,
+        _is_model_visible_to_user,
+    )
+
+    def _extract_model_id(default_model: Any) -> Optional[str]:
+        model = getattr(default_model, "model", None)
+        model_id = getattr(model, "model_id", None)
+        if isinstance(model_id, str) and model_id.strip():
+            return model_id
+        return None
+
+    user_id = int(user.id)
+    embedding_default = (
+        db.query(UserDefaultModel)
+        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+        .filter(
+            UserDefaultModel.user_id == user_id,
+            UserDefaultModel.config_type == "embedding",
+            DBModel.is_active,
+        )
+        .first()
+    )
+    embedding_default_model_id = _extract_model_id(embedding_default)
+    if (
+        embedding_default
+        and embedding_default_model_id
+        and getattr(embedding_default, "model", None)
+        and _is_model_visible_to_user(db, embedding_default.model.id, user_id)
+    ):
+        return embedding_default_model_id
+
+    admin_embedding_defaults = (
+        db.query(UserDefaultModel)
+        .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+        .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+        .filter(
+            UserDefaultModel.config_type == "embedding",
+            DBModel.is_active,
+            UserModel.is_shared.is_(True),
+            UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
+        )
+        .limit(1)
+        .all()
+    )
+    if isinstance(admin_embedding_defaults, list) and admin_embedding_defaults:
+        return _extract_model_id(admin_embedding_defaults[0])
+
+    return None
+
+
+async def _prepare_user_kb_ingestion(
+    *,
+    collection_name: str,
+    ingestion_config: IngestionConfig,
+    user: User,
+    db: Session,
+) -> PreparedKnowledgeBaseIngestion:
+    return await prepare_kb_ingestion(
+        collection_name=collection_name,
+        ingestion_config=ingestion_config,
+        user_id=int(user.id),
+        is_admin=bool(user.is_admin),
+        fallback_embedding_model_id=_get_user_default_embedding_model_id(user, db),
+        save_config=False,
+    )
+
+
 class CloudFile(BaseModel):
     provider: str
     fileId: str
@@ -1118,7 +1206,7 @@ class CloudIngestRequest(BaseModel):
     chunk_size: Optional[int] = None
     chunk_overlap: Optional[int] = None
     separators: Optional[List[str]] = None
-    embedding_model_id: str = "text-embedding-v4"
+    embedding_model_id: Optional[str] = None
     embedding_batch_size: Optional[int] = None
     max_retries: Optional[int] = None
     retry_delay: Optional[float] = None
@@ -1382,9 +1470,9 @@ async def ingest(
             "Omit or empty to use default separators."
         ),
     ),
-    embedding_model_id: str = Form(
-        "text-embedding-v4",
-        description="Embedding model ID (default: text-embedding-v4)",
+    embedding_model_id: Optional[str] = Form(
+        None,
+        description="Embedding model ID. Omit to use the user's default.",
     ),
     embedding_batch_size: Optional[int] = Form(
         None,
@@ -1587,15 +1675,25 @@ async def ingest(
 
     progress_manager = get_progress_manager()
 
-    try:
-        from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+    prepared_ingestion = await _prepare_user_kb_ingestion(
+        collection_name=safe_collection,
+        ingestion_config=config,
+        user=_user,
+        db=db,
+    )
+    config = prepared_ingestion.ingestion_config
+    collection_existed_before = (
+        collection_existed_before or prepared_ingestion.collection_existed_before
+    )
 
-        metadata_store = get_metadata_store()
-        await metadata_store.save_collection_config(
-            collection=safe_collection,
-            config_json=config.model_dump_json(exclude_unset=True),
-            user_id=int(_user.id),
-        )
+    try:
+        if prepared_ingestion.should_save_config:
+            metadata_store = get_metadata_store()
+            await metadata_store.save_collection_config(
+                collection=safe_collection,
+                config_json=config.model_dump_json(exclude_unset=True),
+                user_id=int(_user.id),
+            )
     except Exception as e:
         logger.warning("Failed to save collection config during ingest: %s", e)
 
@@ -1624,7 +1722,7 @@ async def ingest(
         result: IngestionResult = await loop.run_in_executor(None, _run_ingestion)
         result = _with_user_actionable_ingestion_message(
             result,
-            embedding_model_id=embedding_model_id,
+            embedding_model_id=config.embedding_model_id,
         )
 
         if result.status in {"error", "partial"}:
@@ -1639,7 +1737,7 @@ async def ingest(
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
-                embedding_model_id=embedding_model_id,
+                embedding_model_id=config.embedding_model_id,
             )
 
         if result.status == "error":
@@ -1690,7 +1788,7 @@ async def ingest(
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
-                embedding_model_id=embedding_model_id,
+                embedding_model_id=config.embedding_model_id,
             )
         elif not collection_existed_before:
             _restore_ingest_file_backup(
@@ -1726,6 +1824,8 @@ async def ingest_cloud(
             status_code=422, detail=f"Invalid collection name: {str(e)}"
         ) from e
 
+    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+
     results = []
 
     # Common configuration setup
@@ -1760,17 +1860,25 @@ async def ingest_cloud(
     except ValueError:
         collection_existed_before = False
 
-    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    prepared_ingestion = await _prepare_user_kb_ingestion(
+        collection_name=safe_collection,
+        ingestion_config=config,
+        user=_user,
+        db=db,
+    )
+    config = prepared_ingestion.ingestion_config
+    collection_existed_before = (
+        collection_existed_before or prepared_ingestion.collection_existed_before
+    )
 
     try:
-        from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
-
-        metadata_store = get_metadata_store()
-        await metadata_store.save_collection_config(
-            collection=safe_collection,
-            config_json=config.model_dump_json(exclude_unset=True),
-            user_id=int(_user.id),
-        )
+        if prepared_ingestion.should_save_config:
+            metadata_store = get_metadata_store()
+            await metadata_store.save_collection_config(
+                collection=safe_collection,
+                config_json=config.model_dump_json(exclude_unset=True),
+                user_id=int(_user.id),
+            )
     except Exception as e:
         logger.warning("Failed to save collection config during ingest_cloud: %s", e)
 
@@ -1905,7 +2013,7 @@ async def ingest_cloud(
                         )
                         result = _with_user_actionable_ingestion_message(
                             result,
-                            embedding_model_id=request.embedding_model_id,
+                            embedding_model_id=file_config.embedding_model_id,
                         )
                         if result.status in {"error", "partial"}:
                             await _rollback_failed_cloud_ingestion(
@@ -1919,7 +2027,7 @@ async def ingest_cloud(
                                 uploaded_file_existed_before=uploaded_file_existed_before,
                                 file_backup_path=file_backup_path,
                                 had_existing_file=had_existing_file,
-                                embedding_model_id=request.embedding_model_id,
+                                embedding_model_id=file_config.embedding_model_id,
                             )
                         elif file_backup_path is not None:
                             try:
@@ -1950,7 +2058,7 @@ async def ingest_cloud(
                             uploaded_file_existed_before=uploaded_file_existed_before,
                             file_backup_path=file_backup_path,
                             had_existing_file=had_existing_file,
-                            embedding_model_id=request.embedding_model_id,
+                            embedding_model_id=config.embedding_model_id,
                         )
                         return IngestionResult(
                             status="error",
@@ -2493,9 +2601,9 @@ async def ingest_web(
             "only used when chunk_strategy is recursive."
         ),
     ),
-    embedding_model_id: str = Form(
-        "text-embedding-v4",
-        description="Embedding model ID",
+    embedding_model_id: Optional[str] = Form(
+        None,
+        description="Embedding model ID. Omit to use the user's default.",
     ),
     embedding_batch_size: Optional[int] = Form(
         None,
@@ -2649,15 +2757,25 @@ async def ingest_web(
         except ValueError:
             collection_existed_before = False
 
-        try:
-            from ...core.tools.core.RAG_tools.storage.factory import get_metadata_store
+        prepared_ingestion = await _prepare_user_kb_ingestion(
+            collection_name=safe_collection,
+            ingestion_config=ingestion_config,
+            user=_user,
+            db=db,
+        )
+        ingestion_config = prepared_ingestion.ingestion_config
+        collection_existed_before = (
+            collection_existed_before or prepared_ingestion.collection_existed_before
+        )
 
-            metadata_store = get_metadata_store()
-            await metadata_store.save_collection_config(
-                collection=safe_collection,
-                config_json=ingestion_config.model_dump_json(exclude_unset=True),
-                user_id=int(_user.id),
-            )
+        try:
+            if prepared_ingestion.should_save_config:
+                metadata_store = get_metadata_store()
+                await metadata_store.save_collection_config(
+                    collection=safe_collection,
+                    config_json=ingestion_config.model_dump_json(exclude_unset=True),
+                    user_id=int(_user.id),
+                )
         except Exception as e:
             logger.warning("Failed to save collection config during ingest_web: %s", e)
 
@@ -2870,7 +2988,9 @@ async def ingest_web(
         )
         web_updated_message = _build_user_actionable_ingestion_message(
             result.message,
-            embedding_model_id=embedding_model_id,
+            embedding_model_id=(
+                ingestion_config.embedding_model_id or DEFAULT_EMBEDDING_MODEL_ID
+            ),
         )
         if web_updated_message != result.message:
             result = result.model_copy(update={"message": web_updated_message})

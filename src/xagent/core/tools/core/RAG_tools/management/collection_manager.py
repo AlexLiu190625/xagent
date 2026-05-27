@@ -158,6 +158,35 @@ def _get_collection_lock(collection_name: str) -> asyncio.Lock:
         return _collection_locks[lock_key]
 
 
+def embedding_model_ids_equivalent(
+    left_model_id: Optional[str], right_model_id: Optional[str]
+) -> bool:
+    """Return whether two model identifiers resolve to the same embedding model."""
+    if not left_model_id or not right_model_id:
+        return False
+
+    left = left_model_id.strip()
+    right = right_model_id.strip()
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+
+    try:
+        left_config, _ = resolve_embedding_adapter(left)
+        right_config, _ = resolve_embedding_adapter(right)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Failed to compare embedding model IDs %r and %r: %s",
+            left,
+            right,
+            exc,
+        )
+        return False
+
+    return bool(left_config.id and left_config.id == right_config.id)
+
+
 class CollectionManager:
     """Manager for collection metadata operations with LanceDB storage.
 
@@ -374,12 +403,14 @@ class CollectionManager:
 
             # Check if already initialized
             if collection.is_initialized:
-                if collection.embedding_model_id != embedding_model_id:
+                if not embedding_model_ids_equivalent(
+                    collection.embedding_model_id, embedding_model_id
+                ):
                     raise ValueError(
                         f"Collection '{collection_name}' already initialized with "
                         f"model '{collection.embedding_model_id}'. Cannot change to '{embedding_model_id}'."
                     )
-                # Already initialized with same model, return as-is
+                # Already initialized with the same model identity, return bound config.
                 return collection
 
             # Initialize embedding config
