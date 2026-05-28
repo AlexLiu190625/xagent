@@ -16,6 +16,7 @@ from .template_stats import TemplateStats, UserTemplateRelation
 from .tool_config import ToolConfig, ToolUsage
 from .uploaded_file import UploadedFile
 from .user import User, UserDefaultModel, UserModel
+from .user_api_key import UserApiKey
 from .user_channel import UserChannel
 from .user_oauth import UserOAuth
 from .workforce import Workforce, WorkforceAgent, WorkforceBuilderMessage, WorkforceRun
@@ -28,6 +29,7 @@ __all__ = [
     "User",
     "UserModel",
     "UserDefaultModel",
+    "UserApiKey",
     "UserOAuth",
     "UserChannel",
     "Model",

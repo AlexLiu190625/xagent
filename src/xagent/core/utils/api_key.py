@@ -33,7 +33,8 @@ Why ``verify_dummy`` exists:
 import logging
 import secrets
 import string
-from typing import Optional, Tuple
+from enum import Enum
+from typing import NamedTuple, Optional, Tuple
 
 import bcrypt
 from sqlalchemy.orm import Session
@@ -46,6 +47,22 @@ logger = logging.getLogger(__name__)
 # OpenAI's ``sk-*``, Anthropic's ``sk-ant-*`` pattern -- a stable token in
 # logs and CI scanners that says "this is an xagent credential".
 KEY_BRAND = "xag"
+
+
+class ApiKeyKind(str, Enum):
+    """Supported API key kinds and their wire-level auth responsibilities."""
+
+    AGENT = "agent"
+    PERSONAL = "personal"
+
+
+class ParsedApiKey(NamedTuple):
+    """Structured parse result for an xagent API key."""
+
+    kind: ApiKeyKind
+    prefix: str
+    secret: str
+
 
 # Length of the public-safe lookup handle. 6 chars over a 62-symbol alphabet
 # gives ~57 billion combinations; the partial unique index on
@@ -91,7 +108,9 @@ def _generate_random_string(length: int) -> str:
 _DUMMY_HASH = bcrypt.hashpw(b"dummy", bcrypt.gensalt(rounds=BCRYPT_COST))
 
 
-def generate_api_key(db: Optional[Session]) -> Tuple[str, str, str]:
+def generate_api_key(
+    db: Optional[Session], *, kind: ApiKeyKind = ApiKeyKind.AGENT
+) -> Tuple[str, str, str]:
     """Generate a new SDK API key and its bcrypt hash.
 
     The caller is responsible for INSERTing a row into ``agent_api_keys``
@@ -123,7 +142,12 @@ def generate_api_key(db: Optional[Session]) -> Tuple[str, str, str]:
     """
     # Import locally to avoid a circular dependency: core/utils/ shouldn't
     # depend on web/models/ at module-import time.
-    from xagent.web.models.agent_api_key import AgentApiKey
+    if kind == ApiKeyKind.AGENT:
+        from xagent.web.models.agent_api_key import AgentApiKey as KeyModel
+    elif kind == ApiKeyKind.PERSONAL:
+        from xagent.web.models.user_api_key import UserApiKey as KeyModel
+    else:
+        raise ValueError(f"Unsupported API key kind: {kind}")
 
     for attempt in range(PREFIX_COLLISION_RETRIES):
         prefix = _generate_random_string(KEY_PREFIX_LENGTH)
@@ -132,9 +156,7 @@ def generate_api_key(db: Optional[Session]) -> Tuple[str, str, str]:
         # authority; this just avoids the ugly path of catching
         # IntegrityError on the caller's INSERT.
         if db is not None:
-            existing = (
-                db.query(AgentApiKey).filter(AgentApiKey.key_prefix == prefix).first()
-            )
+            existing = db.query(KeyModel).filter(KeyModel.key_prefix == prefix).first()
             if existing is not None:
                 logger.warning(
                     f"API key prefix collision on attempt {attempt + 1}, "
@@ -143,7 +165,10 @@ def generate_api_key(db: Optional[Session]) -> Tuple[str, str, str]:
                 continue
 
         secret = _generate_random_string(KEY_SECRET_LENGTH)
-        full_key = f"{KEY_BRAND}_{prefix}_{secret}"
+        if kind == ApiKeyKind.PERSONAL:
+            full_key = f"{KEY_BRAND}_{kind.value}_{prefix}_{secret}"
+        else:
+            full_key = f"{KEY_BRAND}_{prefix}_{secret}"
 
         # bcrypt.hashpw expects bytes in, bytes out. We store utf-8 str
         # in the DB so callers don't have to remember to decode every
@@ -163,8 +188,8 @@ def generate_api_key(db: Optional[Session]) -> Tuple[str, str, str]:
     )
 
 
-def parse_api_key(raw: str) -> Optional[Tuple[str, str]]:
-    """Split a raw API key string into ``(prefix, secret)`` if well-formed.
+def parse_api_key(raw: str) -> Optional[ParsedApiKey]:
+    """Split a raw API key string into kind, prefix, and secret if well-formed.
 
     A well-formed key has shape ``xag_<6 chars>_<32 chars>`` where both
     char-class halves draw from ``KEY_ALPHABET``. Anything else returns
@@ -188,15 +213,21 @@ def parse_api_key(raw: str) -> Optional[Tuple[str, str]]:
     if not isinstance(raw, str) or not raw:
         return None
 
-    # ``rsplit`` with maxsplit=2 guards against any future tweak where
-    # the brand or prefix segments grow ``_`` characters; today the
-    # alphabet excludes ``_`` so an exact split into 3 parts is what we
-    # require.
     parts = raw.split("_")
-    if len(parts) != 3:
+    if len(parts) == 3:
+        brand, prefix, secret = parts
+        kind = ApiKeyKind.AGENT
+    elif len(parts) == 4:
+        brand, kind_value, prefix, secret = parts
+        try:
+            kind = ApiKeyKind(kind_value)
+        except ValueError:
+            return None
+        if kind != ApiKeyKind.PERSONAL:
+            return None
+    else:
         return None
 
-    brand, prefix, secret = parts
     if brand != KEY_BRAND:
         return None
     if len(prefix) != KEY_PREFIX_LENGTH or len(secret) != KEY_SECRET_LENGTH:
@@ -212,7 +243,7 @@ def parse_api_key(raw: str) -> Optional[Tuple[str, str]]:
     if any(c not in alphabet_set for c in secret):
         return None
 
-    return prefix, secret
+    return ParsedApiKey(kind=kind, prefix=prefix, secret=secret)
 
 
 def verify_api_key(raw: str, stored_hash: str) -> bool:

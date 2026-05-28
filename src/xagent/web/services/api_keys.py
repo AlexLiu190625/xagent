@@ -1,0 +1,194 @@
+"""API key services for SDK runtime and management credentials."""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from typing import NamedTuple
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from ...core.utils.api_key import ApiKeyKind, generate_api_key
+from ..models.agent_api_key import AgentApiKey
+from ..models.user_api_key import UserApiKey
+from ..schemas.agent_api_key import (
+    APIKeyGenerateResponse,
+    APIKeyMetadataResponse,
+    APIKeyRevokeResponse,
+)
+from ..schemas.user_api_key import (
+    PersonalAPIKeyCreateResponse,
+    PersonalAPIKeyMetadata,
+    PersonalAPIKeyRevokeResponse,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class KeyRotationConflict(RuntimeError):
+    """Raised when a concurrent key rotation wins the active-key race."""
+
+
+class AgentApiKeyService:
+    """Owns agent runtime API key rotation and metadata."""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def rotate_key(self, agent_id: int) -> APIKeyGenerateResponse:
+        now = datetime.now(timezone.utc)
+        existing = (
+            self.db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .first()
+        )
+        if existing is not None:
+            existing.revoked_at = now  # type: ignore[assignment]
+            existing.updated_at = now  # type: ignore[assignment]
+
+        full_key, key_prefix, key_hash = generate_api_key(
+            self.db, kind=ApiKeyKind.AGENT
+        )
+        new_row = AgentApiKey(
+            agent_id=agent_id,
+            key_prefix=key_prefix,
+            key_hash=key_hash,
+        )
+        self.db.add(new_row)
+
+        try:
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise KeyRotationConflict(str(exc)) from exc
+
+        self.db.refresh(new_row)
+        logger.info(
+            "Rotated runtime API key for agent %s (prefix=%s, rotated=%s)",
+            agent_id,
+            key_prefix,
+            existing is not None,
+        )
+        return APIKeyGenerateResponse(
+            full_key=full_key,
+            key_prefix=key_prefix,
+            created_at=new_row.created_at,
+        )
+
+    def get_metadata(self, agent_id: int) -> APIKeyMetadataResponse | None:
+        row = (
+            self.db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        return APIKeyMetadataResponse(
+            key_prefix=row.key_prefix,
+            masked_key=f"xag_{row.key_prefix}_••••••••",
+            created_at=row.created_at,
+        )
+
+    def revoke_key(self, agent_id: int) -> APIKeyRevokeResponse:
+        row = (
+            self.db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .first()
+        )
+        if row is None:
+            return APIKeyRevokeResponse(revoked=False, revoked_at=None)
+
+        now = datetime.now(timezone.utc)
+        row.revoked_at = now  # type: ignore[assignment]
+        row.updated_at = now  # type: ignore[assignment]
+        self.db.commit()
+        self.db.refresh(row)
+        logger.info("Revoked runtime API key for agent %s", agent_id)
+        return APIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)
+
+
+class PersonalKeySecret(NamedTuple):
+    full_key: str
+    key_prefix: str
+    key_hash: str
+
+
+class UserApiKeyService:
+    """Owns personal management API keys."""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def create_key(self, user_id: int) -> PersonalAPIKeyCreateResponse:
+        full_key, key_prefix, key_hash = generate_api_key(
+            self.db, kind=ApiKeyKind.PERSONAL
+        )
+        row = UserApiKey(
+            user_id=user_id,
+            key_prefix=key_prefix,
+            key_hash=key_hash,
+        )
+        self.db.add(row)
+        self.db.commit()
+        self.db.refresh(row)
+        logger.info(
+            "Created personal API key for user %s (prefix=%s)", user_id, key_prefix
+        )
+        return PersonalAPIKeyCreateResponse(
+            id=int(row.id),
+            full_key=full_key,
+            key_prefix=row.key_prefix,
+            created_at=row.created_at,
+            expires_at=row.expires_at,
+        )
+
+    def list_keys(self, user_id: int) -> list[PersonalAPIKeyMetadata]:
+        rows = (
+            self.db.query(UserApiKey)
+            .filter(UserApiKey.user_id == user_id)
+            .order_by(UserApiKey.created_at.desc())
+            .all()
+        )
+        return [
+            PersonalAPIKeyMetadata(
+                id=int(row.id),
+                key_prefix=row.key_prefix,
+                masked_key=f"xag_personal_{row.key_prefix}_••••••••",
+                revoked_at=row.revoked_at,
+                expires_at=row.expires_at,
+                last_used_at=row.last_used_at,
+                created_at=row.created_at,
+            )
+            for row in rows
+        ]
+
+    def revoke_key(self, user_id: int, key_id: int) -> PersonalAPIKeyRevokeResponse:
+        row = (
+            self.db.query(UserApiKey)
+            .filter(UserApiKey.id == key_id, UserApiKey.user_id == user_id)
+            .first()
+        )
+        if row is None:
+            return PersonalAPIKeyRevokeResponse(revoked=False, revoked_at=None)
+        if row.revoked_at is not None:
+            return PersonalAPIKeyRevokeResponse(
+                revoked=False, revoked_at=row.revoked_at
+            )
+
+        now = datetime.now(timezone.utc)
+        row.revoked_at = now  # type: ignore[assignment]
+        row.updated_at = now  # type: ignore[assignment]
+        self.db.commit()
+        self.db.refresh(row)
+        logger.info("Revoked personal API key %s for user %s", key_id, user_id)
+        return PersonalAPIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)

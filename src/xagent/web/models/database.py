@@ -58,6 +58,7 @@ def init_db(db_url: str | None = None) -> None:
         ToolUsage,
         UploadedFile,
         User,
+        UserApiKey,
         UserDefaultModel,
         UserModel,
         UserTemplateRelation,
