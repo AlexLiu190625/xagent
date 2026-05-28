@@ -3,12 +3,10 @@
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
@@ -16,10 +14,8 @@ from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
-from ...core.utils.api_key import generate_api_key
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent
-from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.user import User
@@ -34,6 +30,7 @@ from ..services.agent_access import (
     list_accessible_agents,
 )
 from ..services.agent_store import AgentStore
+from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
@@ -319,23 +316,6 @@ def _get_owned_agent_or_404(agent_id: int, current_user: User, db: Session) -> A
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
-
-
-def _mask_key(key_prefix: str) -> str:
-    """Render the display form ``xag_<prefix>_••••••••`` for read-only views.
-
-    The bullet count is fixed at eight on purpose. The actual secret is 32
-    characters; reflecting the real length in the UI would leak length
-    metadata in screenshots and screenshares. Eight bullets is short
-    enough to render compactly and long enough to read as "redacted".
-
-    Args:
-        key_prefix: The public-safe lookup handle (6 chars).
-
-    Returns:
-        Display string suitable for the web UI's "API Key" card.
-    """
-    return f"xag_{key_prefix}_••••••••"
 
 
 # ===== Endpoints =====
@@ -787,62 +767,15 @@ async def generate_agent_api_key(
         # not yours" vs "does not exist".
         _get_owned_agent_or_404(agent_id, current_user, db)
 
-        # Revoke any existing active key for this agent. We touch
-        # ``updated_at`` so audit queries can see the rotation moment on
-        # the old row as well as the new row.
-        now = datetime.now(timezone.utc)
-        existing = (
-            db.query(AgentApiKey)
-            .filter(
-                AgentApiKey.agent_id == agent_id,
-                AgentApiKey.revoked_at.is_(None),
-            )
-            .first()
-        )
-        if existing is not None:
-            existing.revoked_at = now  # type: ignore[assignment]
-            existing.updated_at = now  # type: ignore[assignment]
-
-        # Generate a fresh prefix+secret+hash. ``generate_api_key`` does
-        # its own prefix-collision probe against ``agent_api_keys`` so
-        # we don't have to.
-        full_key, key_prefix, key_hash = generate_api_key(db)
-
-        new_row = AgentApiKey(
-            agent_id=agent_id,
-            key_prefix=key_prefix,
-            key_hash=key_hash,
-        )
-        db.add(new_row)
-
-        # Single commit: revoke + insert are atomic. If a concurrent
-        # POST snuck in between our SELECT and INSERT, the partial
-        # unique index raises IntegrityError here and the outer except
-        # rolls back. The losing client sees 500, which the UI can retry.
-        db.commit()
-        db.refresh(new_row)
-
-        # ``key_prefix`` is the only safe field to log. Do NOT log
-        # full_key / secret / key_hash even in DEBUG.
-        logger.info(
-            f"Generated API key for agent {agent_id} "
-            f"(prefix={key_prefix}, rotated={existing is not None})"
-        )
-
-        return APIKeyGenerateResponse(
-            full_key=full_key,
-            key_prefix=key_prefix,
-            created_at=new_row.created_at,
-        )
+        return AgentApiKeyService(db).rotate_key(agent_id)
 
     except HTTPException:
         raise
-    except IntegrityError as e:
+    except KeyRotationConflict as e:
         # Partial unique constraint hit -- another POST won the race
         # between our SELECT and our COMMIT. Surface this as 409 rather
         # than a generic 500 so the client can retry without alarm.
         # Internal SQL message stays in the log only.
-        db.rollback()
         logger.warning(f"Concurrent API key rotation race for agent {agent_id}: {e}")
         raise HTTPException(status_code=409, detail="rotation_conflict")
     except Exception as e:
@@ -886,24 +819,13 @@ async def get_agent_api_key(
     try:
         _get_owned_agent_or_404(agent_id, current_user, db)
 
-        row = (
-            db.query(AgentApiKey)
-            .filter(
-                AgentApiKey.agent_id == agent_id,
-                AgentApiKey.revoked_at.is_(None),
-            )
-            .first()
-        )
-        if row is None:
+        metadata = AgentApiKeyService(db).get_metadata(agent_id)
+        if metadata is None:
             # "Has the owner generated a key yet?" answered with 404 so
             # the UI catches and renders the empty state.
             raise HTTPException(status_code=404, detail="no_active_key")
 
-        return APIKeyMetadataResponse(
-            key_prefix=row.key_prefix,
-            masked_key=_mask_key(row.key_prefix),  # type: ignore[arg-type]
-            created_at=row.created_at,
-        )
+        return metadata
 
     except HTTPException:
         raise
@@ -949,27 +871,7 @@ async def revoke_agent_api_key(
     try:
         _get_owned_agent_or_404(agent_id, current_user, db)
 
-        now = datetime.now(timezone.utc)
-        row = (
-            db.query(AgentApiKey)
-            .filter(
-                AgentApiKey.agent_id == agent_id,
-                AgentApiKey.revoked_at.is_(None),
-            )
-            .first()
-        )
-        if row is None:
-            # Idempotent no-op path; same HTTP shape as "yes we revoked".
-            logger.info(f"Revoke API key for agent {agent_id}: no active key (no-op)")
-            return APIKeyRevokeResponse(revoked=False, revoked_at=None)
-
-        row.revoked_at = now  # type: ignore[assignment]
-        row.updated_at = now  # type: ignore[assignment]
-        db.commit()
-        db.refresh(row)
-
-        logger.info(f"Revoked API key for agent {agent_id} (prefix={row.key_prefix})")
-        return APIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)
+        return AgentApiKeyService(db).revoke_key(agent_id)
 
     except HTTPException:
         raise
