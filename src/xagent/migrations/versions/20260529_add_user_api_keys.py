@@ -46,7 +46,6 @@ def upgrade() -> None:
             sa.Column("key_hash", sa.String(length=128), nullable=False),
             sa.Column("revoked_at", sa.DateTime(timezone=True), nullable=True),
             sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),
-            sa.Column("last_used_at", sa.DateTime(timezone=True), nullable=True),
             sa.Column(
                 "created_at",
                 sa.DateTime(timezone=True),

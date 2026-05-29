@@ -23,7 +23,6 @@ class UserApiKey(Base):  # type: ignore
     key_hash = Column(String(128), nullable=False)
     revoked_at = Column(DateTime(timezone=True), nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True)
-    last_used_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

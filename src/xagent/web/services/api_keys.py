@@ -97,24 +97,28 @@ class AgentApiKeyService:
         )
 
     def revoke_key(self, agent_id: int) -> APIKeyRevokeResponse:
-        row = (
+        now = datetime.now(timezone.utc)
+        updated_count = (
             self.db.query(AgentApiKey)
             .filter(
                 AgentApiKey.agent_id == agent_id,
                 AgentApiKey.revoked_at.is_(None),
             )
-            .first()
+            .update(
+                {AgentApiKey.revoked_at: now, AgentApiKey.updated_at: now},
+                synchronize_session=False,
+            )
         )
-        if row is None:
+        if updated_count == 0:
             return APIKeyRevokeResponse(revoked=False, revoked_at=None)
 
-        now = datetime.now(timezone.utc)
-        row.revoked_at = now  # type: ignore[assignment]
-        row.updated_at = now  # type: ignore[assignment]
-        self.db.commit()
-        self.db.refresh(row)
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         logger.info("Revoked runtime API key for agent %s", agent_id)
-        return APIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)
+        return APIKeyRevokeResponse(revoked=True, revoked_at=now)
 
 
 class PersonalKeySecret(NamedTuple):
@@ -139,7 +143,11 @@ class UserApiKeyService:
             key_hash=key_hash,
         )
         self.db.add(row)
-        self.db.commit()
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         self.db.refresh(row)
         logger.info(
             "Created personal API key for user %s (prefix=%s)", user_id, key_prefix
@@ -166,7 +174,6 @@ class UserApiKeyService:
                 masked_key=f"xag_personal_{row.key_prefix}_••••••••",
                 revoked_at=row.revoked_at,
                 expires_at=row.expires_at,
-                last_used_at=row.last_used_at,
                 created_at=row.created_at,
             )
             for row in rows
@@ -188,7 +195,11 @@ class UserApiKeyService:
         now = datetime.now(timezone.utc)
         row.revoked_at = now  # type: ignore[assignment]
         row.updated_at = now  # type: ignore[assignment]
-        self.db.commit()
+        try:
+            self.db.commit()
+        except Exception:
+            self.db.rollback()
+            raise
         self.db.refresh(row)
         logger.info("Revoked personal API key %s for user %s", key_id, user_id)
         return PersonalAPIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)

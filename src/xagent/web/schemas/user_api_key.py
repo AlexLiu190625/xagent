@@ -26,7 +26,6 @@ class PersonalAPIKeyMetadata(BaseModel):
     masked_key: str
     revoked_at: Optional[datetime] = None
     expires_at: Optional[datetime] = None
-    last_used_at: Optional[datetime] = None
     created_at: datetime
 
 

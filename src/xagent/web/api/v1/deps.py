@@ -171,6 +171,4 @@ async def get_user_from_personal_key(
     if user is None:
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
-    key_row.last_used_at = now  # type: ignore[assignment]
-    db.commit()
     return user, key_row
