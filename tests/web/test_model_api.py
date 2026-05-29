@@ -43,7 +43,12 @@ def ensure_system_initialized() -> None:
 
     if status_data.get("needs_setup", True):
         setup_response = client.post(
-            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
         )
         assert setup_response.status_code == 200
         assert setup_response.json().get("success") is True
@@ -100,7 +105,11 @@ def regular_user(test_db):
     """Create regular user for testing"""
     ensure_system_initialized()
 
-    user_data = {"username": "regularuser", "password": "password123"}
+    user_data = {
+        "username": "regularuser",
+        "email": "regularuser@example.com",
+        "password": "password123",
+    }
     response = client.post("/api/auth/register", json=user_data)
     assert response.status_code == 200
     assert response.json().get("success") is True
@@ -564,7 +573,11 @@ class TestModelAPI:
         assert response.status_code == 200
 
         # Create another user
-        user2_data = {"username": "user2", "password": "password2"}
+        user2_data = {
+            "username": "user2",
+            "email": "user2@example.com",
+            "password": "password2",
+        }
         user2_response = client.post("/api/auth/register", json=user2_data)
         assert user2_response.status_code == 200
 

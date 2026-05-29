@@ -1,7 +1,7 @@
 """add user personal api keys
 
 Revision ID: 20260529_add_user_api_keys
-Revises: 20260529_add_agent_origin
+Revises: 20260529_merge_email_reset_and_agent_origin_heads
 Create Date: 2026-05-29 00:00:00.000000
 
 """
@@ -13,7 +13,9 @@ from alembic import op
 
 # revision identifiers, used by Alembic.
 revision: str = "20260529_add_user_api_keys"
-down_revision: Union[str, tuple[str, str], None] = "20260529_add_agent_origin"
+down_revision: Union[str, tuple[str, str], None] = (
+    "20260529_merge_email_reset_and_agent_origin_heads"
+)
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

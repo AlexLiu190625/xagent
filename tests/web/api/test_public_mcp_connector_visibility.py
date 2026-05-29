@@ -47,7 +47,12 @@ def _setup_admin() -> None:
     assert status_response.status_code == 200
     if status_response.json().get("needs_setup", True):
         setup_response = client.post(
-            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
         )
         assert setup_response.status_code == 200
 
@@ -120,7 +125,11 @@ def test_hidden_public_mcp_app_is_excluded_from_remote_connector_list() -> None:
 
         register_response = client.post(
             "/api/auth/register",
-            json={"username": "regular", "password": "password123"},
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
         )
         assert register_response.status_code == 200
         regular_headers = _login("regular", "password123")
@@ -276,7 +285,11 @@ def test_connected_hidden_public_mcp_app_is_excluded_in_strong_hide_mode() -> No
 
         register_response = client.post(
             "/api/auth/register",
-            json={"username": "regular", "password": "password123"},
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
         )
         assert register_response.status_code == 200
         regular_headers = _login("regular", "password123")
