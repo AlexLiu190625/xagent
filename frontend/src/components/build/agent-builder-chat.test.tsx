@@ -81,15 +81,37 @@ vi.mock("@/components/chat/ChatInput", () => ({
 }))
 
 vi.mock("@/components/chat/ChatMessage", () => ({
-  ChatMessage: ({ onSendInteraction }: { onSendInteraction?: (text: string, files?: File[]) => Promise<void> | void }) => {
+  ChatMessage: ({
+    content,
+    onSendInteraction,
+    processStatus,
+    traceEvents,
+  }: {
+    content?: React.ReactNode
+    onSendInteraction?: (text: string, files?: File[]) => Promise<void> | void
+    processStatus?: string
+    traceEvents?: unknown[]
+  }) => {
     const [status, setStatus] = React.useState("idle")
 
     if (!onSendInteraction) {
-      return <div>message</div>
+      return (
+        <div
+          data-testid="chat-message"
+          data-process-status={processStatus || ""}
+          data-trace-count={traceEvents?.length ?? 0}
+        >
+          {content || "message"}
+        </div>
+      )
     }
 
     return (
-      <div>
+      <div
+        data-testid="chat-message"
+        data-process-status={processStatus || ""}
+        data-trace-count={traceEvents?.length ?? 0}
+      >
         <button
           type="button"
           onClick={async () => {
@@ -211,7 +233,7 @@ describe("AgentBuilderChat", () => {
     fireEvent.click(await screen.findByText("send-file-interaction"))
 
     await waitFor(() => {
-      expect(toastErrorMock).toHaveBeenCalledWith(
+      expect(toastErrorMock.mock.calls[0]?.[0]).toBe(
         "Startup file storage sync failed"
       )
     })
@@ -249,5 +271,94 @@ describe("AgentBuilderChat", () => {
       },
     ])
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("passes failed task completion status into the process renderer", async () => {
+    render(
+      <AgentBuilderChat
+        agentConfig={agentConfig}
+        onUpdateConfig={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+
+    await waitFor(() => {
+      expect(ws.sentMessages).toHaveLength(1)
+    })
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "trace_event",
+        event_id: "react-start",
+        event_type: "react_task_start",
+        step_id: "react-1",
+        timestamp: 1,
+        data: { pattern: "ReActPattern" },
+      }),
+    })
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "trace_event",
+        event_id: "llm-start",
+        event_type: "llm_call_start",
+        step_id: "react-1",
+        timestamp: 2,
+        data: { model_name: "demo-model" },
+      }),
+    })
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "task_completed",
+        success: false,
+        result: "All patterns failed",
+      }),
+    })
+
+    await waitFor(() => {
+      const messages = screen.getAllByTestId("chat-message")
+      expect(messages[messages.length - 1]).toHaveAttribute(
+        "data-process-status",
+        "failed"
+      )
+    })
+  })
+
+  it("handles null task completion results without crashing", async () => {
+    render(
+      <AgentBuilderChat
+        agentConfig={agentConfig}
+        onUpdateConfig={vi.fn()}
+      />
+    )
+
+    fireEvent.click(screen.getByText("send-chat-input"))
+
+    expect(MockWebSocket.instances).toHaveLength(1)
+    const ws = MockWebSocket.instances[0]
+    ws.open()
+
+    await waitFor(() => {
+      expect(ws.sentMessages).toHaveLength(1)
+    })
+
+    ws.onmessage?.({
+      data: JSON.stringify({
+        type: "task_completed",
+        success: true,
+        status: "completed",
+        result: null,
+      }),
+    })
+
+    await waitFor(() => {
+      const messages = screen.getAllByTestId("chat-message")
+      const latestMessage = messages[messages.length - 1]
+      expect(latestMessage).toHaveAttribute("data-process-status", "completed")
+    })
   })
 })

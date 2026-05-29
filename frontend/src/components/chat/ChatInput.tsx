@@ -8,6 +8,7 @@ import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
+import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
 import { toast } from "@/components/ui/sonner";
@@ -32,7 +33,7 @@ interface ChatInputProps {
   onModeChange?: (mode: "task" | "process") => void;
   inputValue?: string;
   onInputChange?: (value: string) => void;
-  taskStatus?: "pending" | "running" | "completed" | "failed" | "paused" | "waiting_for_user";
+  taskStatus?: TaskStatus | string;
   onPause?: () => void;
   onResume?: () => void;
   taskConfig?: {
@@ -454,8 +455,9 @@ export function ChatInput({
     setAgentConfig(config);
   };
 
-  const allowsInterruptedInput = taskStatus === 'paused' || taskStatus === 'waiting_for_user';
-  const isInputBusy = !!isLoading && !allowsInterruptedInput;
+  const normalizedTaskStatus = normalizeTaskStatus(taskStatus);
+  const allowsInterruptedInput = normalizedTaskStatus === 'paused' || normalizedTaskStatus === 'waiting_for_user';
+  const isInputBusy = !!isLoading && !allowsInterruptedInput && !isStoppedTaskStatus(normalizedTaskStatus);
 
   const canSubmit = () => {
     const hasText = message.trim().length > 0;
@@ -464,10 +466,9 @@ export function ChatInput({
     return (hasText || hasFiles) && !isInputBusy && !isUploadingFiles;
   };
   const canPauseTask =
-    taskStatus === 'running' ||
-    (isLoading &&
-      !!onPause &&
-      !['completed', 'failed', 'paused', 'waiting_for_user'].includes(taskStatus || ''));
+    !!isLoading &&
+    !!onPause &&
+    isPausableTaskStatus(normalizedTaskStatus);
 
   const handleDragEnter = (e: React.DragEvent<HTMLFormElement>) => {
     if (!isFileDragEvent(e) || isInputBusy || hideFileUpload) return;
@@ -880,6 +881,7 @@ export function ChatInput({
                     size="icon"
                     onClick={onPause}
                     className="h-8 w-8 rounded-full transition-all duration-300 bg-yellow-500 hover:bg-yellow-600 text-white"
+                    title={t('agent.input.actions.pauseTask')}
                   >
                     <Pause className="h-4 w-4" />
                   </Button>
@@ -903,7 +905,7 @@ export function ChatInput({
                         <ArrowUp className="h-4 w-4" />
                       )}
                     </Button>
-                    {taskStatus === 'paused' && onResume && (
+                    {normalizedTaskStatus === 'paused' && onResume && (
                       <Button
                         type="button"
                         size="icon"

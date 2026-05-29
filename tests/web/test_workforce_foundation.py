@@ -1,5 +1,3 @@
-import hashlib
-
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, inspect
@@ -162,12 +160,12 @@ def test_build_workforce_snapshot_for_active_workforce(db_session: Session) -> N
             "description": "Analyst description",
             "assignment_instructions": "Collect evidence and cite sources.",
             "execution_mode": "balanced",
-            "tool_name": build_worker_tool_name(worker.id, "Research Analyst"),
+            "tool_name": build_worker_tool_name(worker_agent.id, "Research Analyst"),
             "enabled": True,
         }
     ]
     assert overrides[worker_agent.id]["workforce_run_id"] == 123
-    assert overrides[worker_agent.id]["tool_name"].startswith("call_workforce_worker_")
+    assert overrides[worker_agent.id]["tool_name"] == f"agent_{worker_agent.id}"
 
 
 def test_validate_workforce_run_requires_active_enabled_workers(
@@ -331,13 +329,7 @@ def test_workforce_status_and_tool_name_normalization() -> None:
     assert normalize_workforce_run_status(None) == "pending"
     assert normalize_workforce_run_status(" Paused ") == "paused"
     assert normalize_workforce_run_status(" Completed ") == "completed"
-    assert len(tool_name) <= 64
-    assert tool_name.startswith("call_workforce_worker_99_")
-    assert tool_name.endswith(
-        hashlib.sha256(
-            "this_worker_alias_is_long_enough_to_require_stable_truncation".encode()
-        ).hexdigest()[:6]
-    )
+    assert tool_name == "agent_99"
 
     with pytest.raises(HTTPException) as status_error:
         normalize_workforce_status("unknown")

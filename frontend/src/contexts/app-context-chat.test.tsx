@@ -1,11 +1,11 @@
 import React from "react"
-import { act, render, screen, waitFor } from "@testing-library/react"
-import { beforeEach, describe, expect, it, vi } from "vitest"
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 type TestWebSocketMessage = {
   type: string
   timestamp: string
-  data: unknown
+  data?: unknown
 }
 
 const webSocketOptions = vi.hoisted(() => ({
@@ -81,13 +81,40 @@ function StateProbe() {
           })
         )}
       </div>
+      <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="processing">{String(state.isProcessing)}</div>
     </>
   )
+}
+
+function SeedRunningTask() {
+  const { dispatch } = useApp()
+
+  React.useEffect(() => {
+    dispatch({
+      type: "SET_CURRENT_TASK",
+      payload: {
+        id: "1",
+        title: "Test task",
+        status: "running",
+        description: "Test task",
+        createdAt: "2026-05-27T05:00:00Z",
+        updatedAt: "2026-05-27T05:00:00Z",
+      },
+    })
+    dispatch({ type: "SET_PROCESSING", payload: true })
+  }, [dispatch])
+
+  return null
 }
 
 describe("AppProvider websocket message routing", () => {
   beforeEach(() => {
     webSocketOptions.current = null
+  })
+
+  afterEach(() => {
+    cleanup()
   })
 
   it("routes historical assistant transcript rows to chat and progress events to trace", async () => {
@@ -148,5 +175,233 @@ describe("AppProvider websocket message routing", () => {
       )
     })
     expect(screen.getByTestId("messages").textContent).not.toContain("Searching")
+  })
+
+  it("handles top-level failed task completion payloads", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:02Z",
+        task: {
+          id: 1,
+          status: "failed",
+        },
+        success: false,
+        result: "Task failed",
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+      expect(screen.getByTestId("processing").textContent).toBe("false")
+    })
+  })
+
+  it("normalizes uppercase task info status before syncing processing state", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "trace_event",
+        timestamp: "2026-05-27T05:00:02Z",
+        data: {
+          event_id: "task-info-1",
+          event_type: "task_info",
+          data: {
+            id: 1,
+            title: "Test task",
+            description: "Test task",
+            status: "FAILED",
+            created_at: "2026-05-27T05:00:00Z",
+            updated_at: "2026-05-27T05:00:02Z",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+      expect(screen.getByTestId("processing").textContent).toBe("false")
+    })
+  })
+
+  it("shows websocket error payloads and syncs task status when provided", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "error",
+        timestamp: "2026-05-27T05:00:03Z",
+        message: "No live execution found to pause",
+        task: {
+          id: 1,
+          status: "failed",
+        },
+      } as TestWebSocketMessage)
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+      expect(screen.getByTestId("processing").textContent).toBe("false")
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "No live execution found to pause"
+      )
+    })
+  })
+
+  it("keeps running state for non-terminal agent errors without task status", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:04Z",
+        data: {
+          type: "agent_error",
+          message:
+            "Task is currently busy; please wait for the previous turn to finish before sending another message.",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Task is currently busy"
+      )
+    })
+  })
+
+  it("syncs terminal agent errors when task status is provided", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "agent_error",
+        timestamp: "2026-05-27T05:00:05Z",
+        data: {
+          type: "agent_error",
+          message: "Runtime error",
+          task: {
+            id: 1,
+            status: "failed",
+          },
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("failed")
+      expect(screen.getByTestId("processing").textContent).toBe("false")
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Runtime error"
+      )
+    })
+  })
+
+  it("stops processing when a task waits for user input", async () => {
+    render(
+      <AppProvider token="token">
+        <SeedRunningTask />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const onMessage = webSocketOptions.current?.onMessage
+    expect(onMessage).toBeDefined()
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe("running")
+      expect(screen.getByTestId("processing").textContent).toBe("true")
+    })
+
+    act(() => {
+      onMessage?.({
+        type: "task_waiting_for_user",
+        timestamp: "2026-05-27T05:00:06Z",
+        data: {
+          question: "Which file should I use?",
+          interactions: [],
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-status").textContent).toBe(
+        "waiting_for_user"
+      )
+      expect(screen.getByTestId("processing").textContent).toBe("false")
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Which file should I use?"
+      )
+    })
   })
 })

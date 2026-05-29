@@ -168,14 +168,14 @@ def test_tool_execution_pair_becomes_tool_call_with_args_and_result():
     assert "output" not in s["data"]
 
 
-def test_tool_execution_call_agent_becomes_agent_delegation():
-    """A tool_name starting with ``call_agent_`` routes to agent_delegation."""
+def test_tool_execution_agent_id_tool_becomes_agent_delegation():
+    """A canonical ``agent_<id>`` tool routes to agent_delegation."""
     events = [
         _ev(
             "tool_execution_start",
             step_id="s4",
             data={
-                "tool_name": "call_agent_translator",
+                "tool_name": "agent_42",
                 "tool_args": {"text": "hello"},
                 "tool_execution_id": "tx-2",
             },
@@ -184,7 +184,7 @@ def test_tool_execution_call_agent_becomes_agent_delegation():
             "tool_execution_end",
             step_id="s4",
             data={
-                "tool_name": "call_agent_translator",
+                "tool_name": "agent_42",
                 "tool_args": {"text": "hello"},
                 "tool_execution_id": "tx-2",
                 "result": {"translated": "你好"},
@@ -197,7 +197,7 @@ def test_tool_execution_call_agent_becomes_agent_delegation():
     assert len(steps) == 1
     s = steps[0]
     assert s["type"] == "agent_delegation"
-    assert s["data"]["sub_agent_name"] == "translator"
+    assert s["data"]["sub_agent_name"] == "agent_42"
     assert s["data"]["input"] == {"text": "hello"}
     # Contract: agent_delegation uses ``output`` on the public surface
     # (mirrors ``input`` on the start side). The internal field is
@@ -206,6 +206,39 @@ def test_tool_execution_call_agent_becomes_agent_delegation():
     # ``result`` must NOT appear on agent_delegation steps.
     assert s["data"]["output"] == {"translated": "你好"}
     assert "result" not in s["data"]
+
+
+def test_tool_execution_legacy_call_agent_trace_still_maps_to_delegation():
+    """Historical traces with ``call_agent_<name>`` remain readable."""
+    events = [
+        _ev(
+            "tool_execution_start",
+            step_id="s4",
+            data={
+                "tool_name": "call_agent_translator",
+                "tool_args": {"text": "hello"},
+                "tool_execution_id": "tx-legacy",
+            },
+        ),
+        _ev(
+            "tool_execution_end",
+            step_id="s4",
+            data={
+                "tool_name": "call_agent_translator",
+                "tool_args": {"text": "hello"},
+                "tool_execution_id": "tx-legacy",
+                "result": {"translated": "你好"},
+                "success": True,
+            },
+            timestamp=datetime(2026, 1, 1, 12, 0, 4, tzinfo=timezone.utc),
+        ),
+    ]
+
+    steps = map_trace_events_to_public_steps(events)
+
+    assert len(steps) == 1
+    assert steps[0]["type"] == "agent_delegation"
+    assert steps[0]["data"]["sub_agent_name"] == "translator"
 
 
 def test_tool_execution_failure_marks_failed_with_error():

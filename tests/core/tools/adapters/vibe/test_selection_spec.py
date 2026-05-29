@@ -152,6 +152,15 @@ class _FakeConfig:
     def get_workspace_config(self):  # noqa: D401
         return None
 
+    def get_max_output_length(self):  # noqa: D401
+        return None
+
+    def get_max_field_count(self):  # noqa: D401
+        return None
+
+    def get_max_recursion_depth(self):  # noqa: D401
+        return None
+
 
 async def test_registry_runs_all_creators_when_spec_none(isolated_registry):
     """Backward-compat path: ``spec=None`` (or no spec attribute) means
@@ -186,6 +195,81 @@ async def test_registry_skips_creator_when_categories_disjoint(isolated_registry
     assert basic.await_count == 1
     assert file_c.await_count == 0  # registry-level skip
     assert len(tools) == 1
+
+
+async def test_registry_runs_published_agent_creator_for_workforce_extras(
+    isolated_registry,
+):
+    """Workforce injects specific worker agent tools by name, without
+    selecting the whole ``agent`` category. The registry must still dispatch
+    only the published-agent creator so the final name filter can keep the
+    injected worker tool.
+    """
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic.__name__ = "basic_creator"
+    published_agents = AsyncMock(return_value=[_mock_tool("agent_42", "agent")])
+    published_agents.__name__ = "create_agent_tools"
+    agent_management = AsyncMock(return_value=[_mock_tool("create_agent", "agent")])
+    agent_management.__name__ = "create_create_agent_tool"
+    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(
+        published_agents,
+        categories={"agent"},
+        selection_gate="published_agent",
+    )
+    isolated_registry.register(agent_management, categories={"agent"})
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"],
+        workforce_extra_names={"agent_42"},
+    )
+    tools = await isolated_registry.create_registered_tools(_FakeConfig(spec))
+
+    assert basic.await_count == 1
+    assert published_agents.await_count == 1
+    assert agent_management.await_count == 0
+    assert [tool.name for tool in tools] == ["calc", "agent_42"]
+
+
+async def test_factory_worker_only_mode_keeps_only_injected_agent_tools(
+    isolated_registry,
+):
+    """Workforce managers with no ordinary categories should only expose
+    injected worker agent tools, not the full default tool set.
+    """
+    basic = AsyncMock(return_value=[_mock_tool("exa_web_search", "basic")])
+    basic.__name__ = "basic_creator"
+    published_agents = AsyncMock(
+        return_value=[
+            _mock_tool("agent_42", "agent"),
+            _mock_tool("agent_99", "agent"),
+        ]
+    )
+    published_agents.__name__ = "create_agent_tools"
+    agent_management = AsyncMock(return_value=[_mock_tool("create_agent", "agent")])
+    agent_management.__name__ = "create_create_agent_tool"
+    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(
+        published_agents,
+        categories={"agent"},
+        selection_gate="published_agent",
+    )
+    isolated_registry.register(agent_management, categories={"agent"})
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=[],
+        workforce_extra_names={"agent_42"},
+        extras_only_when_unconfigured=True,
+    )
+    tools = await ToolFactory.create_all_tools(
+        _FakeConfig(spec),
+        apply_user_override_filter=False,
+    )
+
+    assert basic.await_count == 0
+    assert published_agents.await_count == 1
+    assert agent_management.await_count == 0
+    assert [tool.name for tool in tools] == ["agent_42"]
 
 
 async def test_registry_always_runs_creator_without_declared_categories(
@@ -914,6 +998,47 @@ def test_from_raw_workforce_extras_ignored_in_all_mode():
     assert isinstance(spec, _SpecAll)
 
 
+def test_from_raw_can_restrict_unconfigured_agent_to_workforce_extras_only():
+    """Workforce manager runtime can opt out of legacy ALL semantics for
+    unconfigured categories, yielding only injected worker names.
+    """
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=[],
+        workforce_extra_names={"agent_42"},
+        extras_only_when_unconfigured=True,
+    )
+
+    assert isinstance(spec, _SpecByCategories)
+    assert spec.categories == frozenset()
+    assert spec.name_extras == frozenset({"agent_42"})
+    assert spec.includes_category("basic") is False
+    assert spec.includes_published_agent() is True
+    assert spec.compute_allowed_names(
+        [
+            _mock_tool("exa_web_search", "basic"),
+            _mock_tool("agent_42", "agent"),
+            _mock_tool("agent_99", "agent"),
+        ]
+    ) == frozenset({"agent_42"})
+
+
+def test_from_raw_unconfigured_extras_only_without_extras_yields_none_mode():
+    """A workforce manager with no configured categories and no worker
+    extras should get zero tools, not all ordinary tools.
+    """
+    from xagent.core.tools.adapters.vibe.selection_spec import _SpecNone
+
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=None,
+        workforce_extra_names=set(),
+        extras_only_when_unconfigured=True,
+    )
+
+    assert isinstance(spec, _SpecNone)
+
+
 def test_from_raw_workforce_extras_carried_in_by_categories():
     """In BY_CATEGORIES, ``workforce_extra_names`` lands on
     :attr:`_SpecByCategories.name_extras` for ``compute_allowed_names``
@@ -926,6 +1051,7 @@ def test_from_raw_workforce_extras_carried_in_by_categories():
     )
     assert isinstance(spec, _SpecByCategories)
     assert spec.name_extras == frozenset({"worker_tool_a", "worker_tool_b"})
+    assert spec.includes_published_agent() is True
 
 
 # ----- P2 fix: includes_custom_api with category restriction -------------
@@ -1009,6 +1135,26 @@ def test_compute_allowed_names_by_categories_filters_correctly():
         ]
     )
     assert result == frozenset({"calc", "injected_worker_tool"})
+
+
+def test_compute_allowed_names_workforce_extra_does_not_admit_agent_category():
+    """Injected workforce worker names must not broaden the user's category
+    selection to every agent-category tool.
+    """
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["basic"],
+        workforce_extra_names={"agent_42"},
+    )
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("calc", "basic"),
+            _mock_tool("agent_42", "agent"),
+            _mock_tool("agent_99", "agent"),
+        ]
+    )
+
+    assert spec.categories == frozenset({"basic"})
+    assert result == frozenset({"calc", "agent_42"})
 
 
 # ----- Factory L252 dispatch through spec.compute_allowed_names ---------

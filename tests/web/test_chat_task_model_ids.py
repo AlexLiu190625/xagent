@@ -752,6 +752,60 @@ def test_task_create_rejects_agent_id_from_another_user(
         db.close()
 
 
+def test_task_create_rejects_generated_workforce_manager_agent(
+    test_db,
+    user1_headers,
+):
+    from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
+    from xagent.web.models.database import get_db
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.models.user import User
+
+    db = next(get_db())
+    try:
+        user1 = db.query(User).filter(User.username == "user1").first()
+        assert user1 is not None
+
+        agent = Agent(
+            user_id=user1.id,
+            name="generated-workforce-manager",
+            description="private manager",
+            status=AgentStatus.PUBLISHED,
+            origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+
+        resp = client.post(
+            "/api/chat/task/create",
+            json={
+                "title": "generated-manager-task",
+                "description": "desc",
+                "agent_id": agent.id,
+            },
+            headers=user1_headers,
+        )
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Agent not found or access denied"
+
+        task = Task(
+            user_id=user1.id,
+            title="legacy generated manager task",
+            description="legacy",
+            status=TaskStatus.PENDING,
+            agent_id=agent.id,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+
+        assert _load_agent_for_task_runtime(db, task) is None
+    finally:
+        db.close()
+
+
 def test_task_create_allows_policy_visible_published_agent(
     test_db, user1_headers, user2_headers
 ):

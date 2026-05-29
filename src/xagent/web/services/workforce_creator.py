@@ -7,7 +7,7 @@ from typing import Any, cast
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
-from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.user import User
 from xagent.web.services.llm_utils import UserAwareModelStorage
 
@@ -261,8 +261,9 @@ def _create_manager_agent_from_plan(
         skills=[],
         tool_categories=[],
         suggested_prompts=[],
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
         status=AgentStatus.PUBLISHED,
-        widget_enabled=True,
+        widget_enabled=False,
         allowed_domains=[],
     )
 

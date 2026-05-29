@@ -126,4 +126,22 @@ describe("ChatInput", () => {
     })
     expect(screen.queryByText("chatPage.input.noModelAlert")).not.toBeInTheDocument()
   })
+
+  it("does not show pause for uppercase terminal task status", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="next request"
+        isLoading
+        onInputChange={vi.fn()}
+        onPause={vi.fn()}
+        onSend={vi.fn()}
+        taskStatus="FAILED"
+      />
+    )
+
+    expect(screen.queryByTitle("agent.input.actions.pauseTask")).not.toBeInTheDocument()
+    expect(container.querySelector('button[type="submit"]')).not.toBeDisabled()
+  })
 })

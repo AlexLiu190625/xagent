@@ -1,10 +1,9 @@
-import hashlib
-import re
 from typing import Any, Literal, cast, overload
 
 from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
+from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
 from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
 
@@ -54,35 +53,8 @@ def normalize_text(
     return normalized or None
 
 
-def slugify_name(value: str | None, fallback: str = "worker") -> str:
-    base = (value or "").strip().lower()
-    slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
-    return slug or fallback
-
-
-_MAX_TOOL_NAME_LENGTH = 64
-_TOOL_NAME_PREFIX = "call_workforce_worker_"
-
-
-def build_worker_tool_name(worker_id: int, alias: str) -> str:
-    slug = slugify_name(alias)
-    raw = f"{_TOOL_NAME_PREFIX}{worker_id}_{slug}"
-    if len(raw) <= _MAX_TOOL_NAME_LENGTH:
-        return raw
-
-    worker_id_str = str(worker_id)
-    hash_suffix = "_" + hashlib.sha256(slug.encode()).hexdigest()[:6]
-    available = (
-        _MAX_TOOL_NAME_LENGTH
-        - len(_TOOL_NAME_PREFIX)
-        - len(worker_id_str)
-        - len(hash_suffix)
-        - 1
-    )
-    if available < 4:
-        available = 4
-    truncated_slug = slug[:available]
-    return f"{_TOOL_NAME_PREFIX}{worker_id_str}_{truncated_slug}{hash_suffix}"
+def build_worker_tool_name(agent_id: int, alias: str | None = None) -> str:
+    return gen_agent_tool_name(agent_id)
 
 
 def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
@@ -191,7 +163,7 @@ def build_agent_tool_overrides(
         description_parts.append(f"Workforce role: {alias}.")
         description_parts.append(f"Assignment: {worker['assignment_instructions']}")
         overrides[int(worker["agent_id"])] = {
-            "tool_name": worker["tool_name"],
+            "tool_name": build_worker_tool_name(int(worker["agent_id"])),
             "description": " ".join(description_parts),
             "extra_system_prompt": build_worker_system_prompt(
                 workforce_name, worker["assignment_instructions"]
@@ -235,7 +207,7 @@ def build_workforce_snapshot(
                 "description": worker.agent.description,
                 "assignment_instructions": assignment_instructions,
                 "execution_mode": worker.agent.execution_mode,
-                "tool_name": build_worker_tool_name(cast(int, worker.id), alias),
+                "tool_name": build_worker_tool_name(cast(int, worker.agent_id), alias),
                 "enabled": bool(worker.enabled),
             }
         )

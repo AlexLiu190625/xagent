@@ -8,7 +8,7 @@ from typing import Any, Literal
 
 from sqlalchemy.orm import Session
 
-from ..models.agent import Agent, AgentStatus
+from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.user import User
 from .workforce_access import get_visible_agent_ids
 
@@ -83,12 +83,17 @@ def _is_published(agent: Agent) -> bool:
     return getattr(agent.status, "value", agent.status) == AgentStatus.PUBLISHED.value
 
 
+def _exclude_private_workforce_manager_agents(query: Any) -> Any:
+    return query.filter(Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value)
+
+
 def list_accessible_agents(
     db: Session,
     user: User,
     *,
     purpose: str = "agent_list",
     exclude_agent_ids: Iterable[int] | None = None,
+    include_private_workforce_manager_agents: bool = False,
 ) -> list[AccessibleAgent]:
     """List agents visible to the user, including owned and policy-visible drafts."""
     excluded = _normalize_excluded_agent_ids(exclude_agent_ids)
@@ -97,6 +102,8 @@ def list_accessible_agents(
     owned_query = db.query(Agent).filter(Agent.user_id == int(user.id))
     if excluded:
         owned_query = owned_query.filter(Agent.id.notin_(excluded))
+    if not include_private_workforce_manager_agents:
+        owned_query = _exclude_private_workforce_manager_agents(owned_query)
     for agent in owned_query.all():
         items_by_id[int(agent.id)] = _owned_accessible_agent(agent)
 
@@ -110,6 +117,8 @@ def list_accessible_agents(
 
     if excluded:
         policy_query = policy_query.filter(Agent.id.notin_(excluded))
+    if not include_private_workforce_manager_agents:
+        policy_query = _exclude_private_workforce_manager_agents(policy_query)
 
     for agent in policy_query.all():
         agent_id = int(agent.id)
@@ -126,6 +135,7 @@ def list_accessible_published_agent_items(
     *,
     purpose: str = "workforce_select",
     exclude_agent_ids: Iterable[int] | None = None,
+    include_private_workforce_manager_agents: bool = False,
 ) -> list[AccessibleAgent]:
     return sorted(
         [
@@ -135,6 +145,7 @@ def list_accessible_published_agent_items(
                 user,
                 purpose=purpose,
                 exclude_agent_ids=exclude_agent_ids,
+                include_private_workforce_manager_agents=include_private_workforce_manager_agents,
             )
             if _is_published(item.agent)
         ],
@@ -148,6 +159,7 @@ def list_accessible_published_agents(
     *,
     purpose: str = "workforce_select",
     exclude_agent_ids: Iterable[int] | None = None,
+    include_private_workforce_manager_agents: bool = False,
 ) -> list[Agent]:
     return [
         item.agent
@@ -156,5 +168,6 @@ def list_accessible_published_agents(
             user,
             purpose=purpose,
             exclude_agent_ids=exclude_agent_ids,
+            include_private_workforce_manager_agents=include_private_workforce_manager_agents,
         )
     ]

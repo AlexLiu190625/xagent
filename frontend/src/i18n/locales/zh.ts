@@ -38,6 +38,7 @@ const zh = {
     },
   },
   nav: {
+    home: "首页",
     settings: "系统设置",
     dashboard: "仪表盘",
     vibe: "Vibe",
@@ -58,6 +59,7 @@ const zh = {
     deploy: "部署",
     agentDev: "Agent 构建与部署",
     task: "任务",
+    workforces: "Workforces",
     history: "全部任务",
     search: "搜索任务",
     templates: "模板",
@@ -73,6 +75,55 @@ const zh = {
       title: "欢迎使用 {appName}",
       subtitle: "无需编写代码即可构建、部署并扩展属于你的智能体。",
       searchPlaceholder: "你想做点什么？",
+    },
+    revamp: {
+      greeting: "你好",
+      greetingMorning: "早上好",
+      greetingAfternoon: "下午好",
+      greetingEvening: "晚上好",
+      goalTitle: "这次想达成什么目标？",
+      start: "开始",
+      running: "{count} 个任务进行中",
+      liveView: "查看",
+      askPlaceholder: "你可以提问、调研、写作、生成、分析……",
+      fileOnlyPrompt: "请分析我上传的文件，并总结关键信息。",
+      capabilities: {
+        slides: {
+          label: "Slides",
+          prompt: "创建一个 10 页幻灯片，主题是：",
+        },
+        sheets: {
+          label: "Sheets",
+          prompt: "分析这个表格：",
+        },
+        docs: {
+          label: "Docs",
+          prompt: "写一篇关于以下主题的文档：",
+        },
+        pdf: {
+          label: "PDF",
+          prompt: "总结这个 PDF：",
+        },
+        image: {
+          label: "Image",
+          prompt: "生成一张这样的图片：",
+        },
+        research: {
+          label: "Research",
+          prompt: "对以下主题进行深度研究：",
+        },
+      },
+      followupTitle: "希望它以后能反复自动执行？",
+      followupDescription: "把这次流程沉淀成可复用 Agent，下次一句话就能调用。",
+      buildAgent: "构建一个 Agent",
+    },
+    agents: {
+      title: "你的 Agents",
+      subtitle: "点击聊天 — 这些是你可以直接运行、继续打磨和复用的工作助手。",
+      manageAll: "管理全部",
+      empty: "还没有 Agent，先创建一个把工作流沉淀下来。",
+      newAgent: "新建 Agent",
+      buildTime: "几分钟内即可搭建完成",
     },
     getStarted: {
       title: "开始使用",
@@ -94,13 +145,17 @@ const zh = {
       }
     },
     templates: {
-      title: "使用模板构建智能体",
+      title: "模板",
       viewAll: "查看全部",
       setupTime: "{time} 配置",
+      subtitle: "跳过空白页面，快速克隆预构建的智能体。",
+      browseLibrary: "浏览模板库",
       useTemplate: "使用模板"
     },
     recent: {
       title: "最近活动",
+      subtitle: "继续处理最近的任务，或查看最新执行结果。",
+      viewTask: "查看任务",
       untitledTask: "未命名任务",
       defaultAgent: "智能体"
     }
@@ -123,47 +178,21 @@ const zh = {
     cards: {
       research: {
         title: "深入研究一个话题",
-        prompt: "我需要研究人工智能领域的最新趋势。"
       },
       linkedin: {
         title: "撰写 LinkedIn 动态",
-        prompt: "帮我写一篇 LinkedIn 动态，宣布新功能发布。"
       },
       poster: {
         title: "设计活动海报",
-        prompt: "为即将举行的科技会议设计一张海报。"
       },
       compare: {
         title: "深度对比产品",
-        prompt: "对比市场上排名前 3 的电动汽车。"
       },
       visual: {
         title: "为话题创建可视化图表",
-        prompt: "创建一张神经网络工作原理的可视化图表。"
       },
       presentation: {
         title: "将话题转化为演示文稿",
-        prompt: "创建一个关于可再生能源的 5 页幻灯片。"
-      },
-      createPPT: {
-        title: "根据报告生成一个 PPT",
-        description: "销售报告，幻灯片",
-        prompt: "根据报告生成一个 PPT"
-      },
-      dataAnalysis: {
-        title: "分析数据集",
-        description: "趋势，反馈",
-        prompt: "分析数据集"
-      },
-      designPoster: {
-        title: "设计一张营销海报",
-        description: "社交媒体素材",
-        prompt: "设计一张营销海报"
-      },
-      automatic: {
-        title: "自动化一个工作流程",
-        description: "自定义工作流",
-        prompt: "自动化一个工作流程"
       }
     },
     input: {
@@ -1207,6 +1236,7 @@ Build when you need.`
     title: "模板中心",
     subtitle: "使用预构建的智能体快速启动工作流。",
     searchPlaceholder: "搜索模板...",
+    popular: "热门",
     useTemplate: "使用模板",
     countOne: "{count} 个模板",
     countOther: "{count} 个模板",
@@ -2851,7 +2881,12 @@ Build when you need.`
     queryPrefix: "查询:",
     pathPrefix: "路径:",
     bashPrefix: "Bash命令:",
-    searchPrefix: "搜索:"
+    searchPrefix: "搜索:",
+    workforceDelegation: "Workforce 委派",
+    delegateToWorker: "委派给 {worker}",
+    workerReturned: "Worker 已返回结果",
+    workerFailed: "Worker 执行失败",
+    unknownWorker: "未知 Worker"
   },
   deploy_agent: {
     title: "部署 Agent",
@@ -3050,11 +3085,14 @@ Build when you need.`
     },
     run: {
       testTitle: "测试 Workforce",
-      placeholder: "描述你希望 manager 协调完成的任务。"
+      placeholder: "描述你希望 manager 协调完成的任务。",
+      inactiveDisabled: "请先发布这个 Workforce 再运行。",
+      archivedDisabled: "已归档的 Workforce 不能运行。"
     },
     builder: {
       chatTitle: "Builder 对话",
       chatDescription: "描述你想要的 workforce 修改，builder 会生成可检查的 patch。",
+      archivedReadOnly: "已归档的 Workforce 是只读的，不能生成或应用 Builder 修改。",
       emptyPrompt: "可以这样开始：添加 Research Agent worker 来负责竞品调研。",
       roleBuilder: "Builder",
       roleYou: "你",

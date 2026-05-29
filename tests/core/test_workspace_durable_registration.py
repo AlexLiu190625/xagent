@@ -45,6 +45,7 @@ def test_workspace_register_file_writes_durable_storage(
         db.commit()
 
         record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        assert record.storage_path == str(output_path)
         assert record.storage_status == "available"
         assert record.storage_backend == "file"
         assert record.storage_key == (
@@ -96,10 +97,19 @@ def test_agent_workspace_register_file_uses_explicit_db_task_id(
         db.commit()
 
         record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        canonical_path = (
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
+        )
         assert workspace.current_task_id == 321
         assert record.user_id == user.id
         assert record.task_id == 321
-        assert record.storage_path == str(output_path)
+        assert record.storage_path == str(canonical_path)
+        assert canonical_path.read_text(encoding="utf-8") == "delegated output"
         assert record.storage_key == (
             f"users/{user.id}/tasks/321/outputs/{file_id}/output/report.txt"
         )
@@ -162,14 +172,160 @@ def test_agent_workspace_register_file_rebinds_existing_output_to_db_task_id(
 
         assert file_id == "worker-output"
         db.refresh(record)
+        canonical_path = (
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
+        )
         assert record.user_id == user.id
         assert record.task_id == 321
+        assert record.storage_path == str(canonical_path)
+        assert canonical_path.read_text(encoding="utf-8") == "parent-visible output"
         assert record.storage_key == (
             f"users/{user.id}/tasks/321/outputs/worker-output/output/report.txt"
         )
         assert record.workspace_relative_path == "output/report.txt"
         assert record.workspace_category == "output"
         assert record.file_size == len("parent-visible output")
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_agent_workspace_register_file_avoids_parent_output_name_collision(
+    monkeypatch, tmp_path, mock_workspace_db
+):
+    del mock_workspace_db
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_file_storage.cache_clear()
+
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="delegated-collision-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        task = Task(id=321, user_id=user.id, title="Parent task")
+        db.add(task)
+        db.commit()
+
+        parent_output_path = (
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
+        )
+        parent_output_path.parent.mkdir(parents=True)
+        parent_output_path.write_text("existing parent output", encoding="utf-8")
+        db.add(
+            UploadedFile(
+                file_id="existing-parent-output",
+                user_id=user.id,
+                task_id=321,
+                filename="report.txt",
+                storage_path=str(parent_output_path),
+                mime_type="text/plain",
+                file_size=len("existing parent output"),
+                workspace_relative_path="output/report.txt",
+                workspace_category="output",
+            )
+        )
+        db.commit()
+
+        workspace = TaskWorkspace(
+            id="agent_2_abcd1234",
+            base_dir=str(tmp_path / "workspaces"),
+            db_task_id=321,
+        )
+        output_path = workspace.output_dir / "report.txt"
+        output_path.write_text("delegated output", encoding="utf-8")
+
+        file_id = workspace.register_file(str(output_path), db_session=db)
+        db.commit()
+
+        record = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        canonical_path = parent_output_path.with_name("report_1.txt")
+        assert (
+            parent_output_path.read_text(encoding="utf-8") == "existing parent output"
+        )
+        assert canonical_path.read_text(encoding="utf-8") == "delegated output"
+        assert record.storage_path == str(canonical_path)
+        assert record.workspace_relative_path == "output/report_1.txt"
+        assert record.storage_key == (
+            f"users/{user.id}/tasks/321/outputs/{file_id}/output/report_1.txt"
+        )
+    finally:
+        db.close()
+        engine.dispose()
+
+
+def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
+    monkeypatch, tmp_path, mock_workspace_db
+):
+    del mock_workspace_db
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_file_storage.cache_clear()
+
+    engine = create_engine(
+        "sqlite:///:memory:", connect_args={"check_same_thread": False}
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    db = SessionLocal()
+    try:
+        user = User(username="delegated-idempotent-user", password_hash="hash")
+        db.add(user)
+        db.flush()
+        task = Task(id=321, user_id=user.id, title="Parent task")
+        db.add(task)
+        db.commit()
+
+        workspace = TaskWorkspace(
+            id="agent_2_abcd1234",
+            base_dir=str(tmp_path / "workspaces"),
+            db_task_id=321,
+        )
+        output_path = workspace.output_dir / "report.txt"
+        output_path.write_text("first delegated output", encoding="utf-8")
+
+        file_id = workspace.register_file(str(output_path), db_session=db)
+        db.commit()
+
+        output_path.write_text("updated delegated output", encoding="utf-8")
+        second_file_id = workspace.register_file(str(output_path), db_session=db)
+        db.commit()
+
+        assert second_file_id == file_id
+        records = db.query(UploadedFile).all()
+        assert len(records) == 1
+        record = records[0]
+        canonical_path = (
+            tmp_path
+            / "workspaces"
+            / f"user_{user.id}"
+            / "web_task_321"
+            / "output"
+            / "report.txt"
+        )
+        assert record.storage_path == str(canonical_path)
+        assert record.workspace_relative_path == "output/report.txt"
+        assert record.file_size == len("updated delegated output")
+        assert canonical_path.read_text(encoding="utf-8") == "updated delegated output"
+
+        object_files = [path for path in object_root.rglob("*") if path.is_file()]
+        assert len(object_files) == 1
+        assert object_files[0].read_text(encoding="utf-8") == "updated delegated output"
     finally:
         db.close()
         engine.dispose()

@@ -11,12 +11,14 @@ import type { WorkforceRunResponse } from "@/types/workforce"
 interface WorkforceTestPanelProps {
   workforceId: number
   disabled?: boolean
+  disabledReason?: string
   onRunCreated: (result: WorkforceRunResponse) => void
 }
 
 export function WorkforceTestPanel({
   workforceId,
   disabled = false,
+  disabledReason,
   onRunCreated,
 }: WorkforceTestPanelProps) {
   const { t } = useI18n()
@@ -52,6 +54,9 @@ export function WorkforceTestPanel({
           rows={8}
           disabled={disabled}
         />
+        {disabled && disabledReason ? (
+          <div className="text-sm text-muted-foreground">{disabledReason}</div>
+        ) : null}
         {error ? <div className="text-sm text-red-500">{error}</div> : null}
         <Button
           onClick={handleRun}

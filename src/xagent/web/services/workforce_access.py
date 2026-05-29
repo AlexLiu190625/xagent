@@ -4,7 +4,11 @@ from typing import Any
 from fastapi import HTTPException
 from sqlalchemy.orm import Query, Session
 
-from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.agent import (
+    Agent,
+    AgentStatus,
+    is_workforce_generated_manager_agent,
+)
 from xagent.web.models.user import User
 
 from ..models.workforce import Workforce
@@ -191,6 +195,8 @@ def ensure_agent_access(
     require_published: bool = False,
 ) -> Agent:
     if agent is None:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    if is_workforce_generated_manager_agent(agent):
         raise HTTPException(status_code=404, detail="Agent not found")
     if user.is_admin or int(agent.user_id) == int(user.id):
         if require_published and agent.status != AgentStatus.PUBLISHED:

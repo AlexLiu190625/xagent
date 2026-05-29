@@ -37,6 +37,7 @@ from xagent.web.api.auth import auth_router
 from xagent.web.api.me import router as me_router
 from xagent.web.api.v1 import v1_router
 from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
+from xagent.web.api.widget import widget_router
 from xagent.web.api.workforces import router as workforces_router
 from xagent.web.models.database import Base, get_db, get_engine
 
@@ -62,6 +63,7 @@ app_for_tests.include_router(auth_router)
 app_for_tests.include_router(me_router)
 app_for_tests.include_router(agents_router)
 app_for_tests.include_router(workforces_router)
+app_for_tests.include_router(widget_router)
 app_for_tests.include_router(v1_router)
 app_for_tests.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 

@@ -172,6 +172,24 @@ describe("workforce frontend core components", () => {
     })
   })
 
+  it("keeps builder chat read-only when the route disables editing", () => {
+    const onSubmit = vi.fn()
+    render(
+      <WorkforceBuilderChat
+        messages={[]}
+        readOnly
+        readOnlyReason="workforces.builder.archivedReadOnly"
+        onSubmit={onSubmit}
+      />,
+    )
+
+    expect(screen.getByPlaceholderText("workforces.builder.messagePlaceholder")).toBeDisabled()
+    expect(screen.getByText("workforces.builder.archivedReadOnly")).toBeInTheDocument()
+    expect(screen.getByText("workforces.actions.readOnly")).toBeDisabled()
+    fireEvent.click(screen.getByText("workforces.actions.readOnly"))
+    expect(onSubmit).not.toHaveBeenCalled()
+  })
+
   it("applies the exact stored builder patch", async () => {
     const patch: WorkforceBuilderPatch = {
       summary: "Add worker",
@@ -191,6 +209,28 @@ describe("workforce frontend core components", () => {
     fireEvent.click(screen.getByText("workforces.actions.applyChanges"))
 
     expect(onApply).toHaveBeenCalledWith(12, patch)
+  })
+
+  it("does not apply builder patches in read-only mode", () => {
+    const patch: WorkforceBuilderPatch = {
+      summary: "Add worker",
+      operations: [{ op: "add_existing_worker", agent_id: 8 }],
+      warnings: [],
+    }
+    const onApply = vi.fn()
+
+    render(
+      <ProposedPatchCard
+        patch={patch}
+        messageId={12}
+        readOnly
+        onApply={onApply}
+      />,
+    )
+
+    expect(screen.getByText("workforces.actions.readOnly")).toBeDisabled()
+    fireEvent.click(screen.getByText("workforces.actions.readOnly"))
+    expect(onApply).not.toHaveBeenCalled()
   })
 
   it("creates from prompt through callbacks instead of hardcoded routes", async () => {
@@ -240,6 +280,26 @@ describe("workforce frontend core components", () => {
       })
     })
     expect(onRunCreated).toHaveBeenCalledWith(runResult)
+  })
+
+  it("shows a disabled reason and does not run when the route disables execution", () => {
+    const onRunCreated = vi.fn()
+
+    render(
+      <WorkforceTestPanel
+        workforceId={42}
+        disabled
+        disabledReason="workforces.run.inactiveDisabled"
+        onRunCreated={onRunCreated}
+      />,
+    )
+
+    expect(screen.getByText("workforces.run.inactiveDisabled")).toBeInTheDocument()
+    expect(screen.getByPlaceholderText("workforces.run.placeholder")).toBeDisabled()
+    expect(screen.getByText("workforces.actions.runWorkforce")).toBeDisabled()
+    fireEvent.click(screen.getByText("workforces.actions.runWorkforce"))
+    expect(runWorkforceMock).not.toHaveBeenCalled()
+    expect(onRunCreated).not.toHaveBeenCalled()
   })
 
   it("does not link readonly workforce agents to the editor", () => {

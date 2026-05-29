@@ -43,6 +43,7 @@ type CombinedItem = {
   traceEvents?: any[]
   interactions?: any[]
   showEmptyStatus?: boolean
+  processStatus?: string
   timelineOrder?: number
 }
 
@@ -67,6 +68,13 @@ const toTimestampMs = (timestamp: unknown): number => {
 
   return time < 100000000000 ? time * 1000 : time
 }
+
+const getLastUserMessageIndex = (messages: Array<{ role?: string }>): number =>
+  messages.reduce(
+    (latestIndex, message, index) =>
+      message.role === "user" ? index : latestIndex,
+    -1
+  )
 
 const findWaitingPrompt = (currentTask: any, traceEvents: any[]) => {
   if (currentTask?.status !== "waiting_for_user") {
@@ -243,6 +251,7 @@ export function TaskConversationPanel({
     const groupEntries = Array.from(processGroups.entries()).sort((a, b) => a[0] - b[0])
     const latestGroupIndex =
       groupEntries.length > 0 ? groupEntries[groupEntries.length - 1][0] : -1
+    const lastUserMessageIndex = getLastUserMessageIndex(sortedMessages)
 
     groupEntries.forEach(([groupIndex, events]) => {
       if (events.length === 0) {
@@ -257,6 +266,11 @@ export function TaskConversationPanel({
         !hasFinalAssistantMessage &&
         groupIndex === latestGroupIndex &&
         groupIndex >= sortedMessages.length
+      const isCurrentTurnGroup = groupIndex > lastUserMessageIndex
+      const processStatus =
+        groupIndex === latestGroupIndex && isCurrentTurnGroup
+          ? state.currentTask?.status
+          : undefined
 
       items.push({
         id: `process-${groupIndex}-${firstEvent?.event_id || groupTimestamp}`,
@@ -266,6 +280,7 @@ export function TaskConversationPanel({
         status: shouldShowEmptyStatus ? state.currentTask?.status : undefined,
         traceEvents: events,
         showEmptyStatus: shouldShowEmptyStatus,
+        processStatus,
         timelineOrder: groupIndex * 2,
       })
     })
@@ -283,6 +298,23 @@ export function TaskConversationPanel({
     state.currentTask?.status,
     state.traceEvents,
   ])
+
+  const currentTurnTraceEvents = useMemo(() => {
+    if (!Array.isArray(state.traceEvents) || state.traceEvents.length === 0) {
+      return []
+    }
+
+    const sortedMessages = [...messageItems].sort((a, b) => a.timestamp - b.timestamp)
+    const lastUserMessageIndex = getLastUserMessageIndex(sortedMessages)
+    if (lastUserMessageIndex < 0) {
+      return state.traceEvents
+    }
+
+    return state.traceEvents.filter((event: any) => {
+      const eventTime = toTimestampMs(event?.timestamp)
+      return getProcessGroupIndex(sortedMessages, eventTime) > lastUserMessageIndex
+    })
+  }, [messageItems, state.traceEvents])
 
   const waitingPrompt = useMemo(
     () => findWaitingPrompt(state.currentTask, state.traceEvents as any[]),
@@ -559,6 +591,7 @@ export function TaskConversationPanel({
                         rawContent={item.rawContent}
                         traceEvents={item.traceEvents as any || []}
                         showProcessView={true}
+                        processStatus={item.processStatus}
                         taskStatus={
                           isFailedFinalAnswerStream
                             ? "failed"
@@ -578,9 +611,10 @@ export function TaskConversationPanel({
                     <ChatMessage
                       role="assistant"
                       content={state.currentTask?.status === "waiting_for_user" ? waitingPrompt : null}
-                      traceEvents={state.traceEvents as any || []}
+                      traceEvents={currentTurnTraceEvents as any || []}
                       showProcessView={true}
                       isVirtual
+                      processStatus={state.currentTask?.status}
                       taskStatus={state.currentTask?.status}
                       interactions={state.currentTask?.status === "waiting_for_user" ? waitingInteractions : undefined}
                       interactionsActive={state.currentTask?.status === "waiting_for_user"}

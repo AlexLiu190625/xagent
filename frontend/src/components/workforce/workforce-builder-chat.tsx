@@ -20,6 +20,8 @@ interface WorkforceBuilderChatProps {
   messages: WorkforceBuilderMessage[]
   loading?: boolean
   submitting?: boolean
+  readOnly?: boolean
+  readOnlyReason?: string
   onSubmit: (message: string) => Promise<void> | void
 }
 
@@ -31,6 +33,8 @@ export function WorkforceBuilderChat({
   messages,
   loading = false,
   submitting = false,
+  readOnly = false,
+  readOnlyReason,
   onSubmit,
 }: WorkforceBuilderChatProps) {
   const { t } = useI18n()
@@ -38,8 +42,8 @@ export function WorkforceBuilderChat({
   const containerRef = useRef<HTMLDivElement | null>(null)
 
   const canSubmit = useMemo(
-    () => message.trim().length > 0 && !submitting,
-    [message, submitting],
+    () => message.trim().length > 0 && !submitting && !readOnly,
+    [message, readOnly, submitting],
   )
 
   useEffect(() => {
@@ -53,7 +57,7 @@ export function WorkforceBuilderChat({
 
   const handleSubmit = async () => {
     const value = message.trim()
-    if (!value || submitting) return
+    if (!value || submitting || readOnly) return
     setMessage("")
     await onSubmit(value)
   }
@@ -144,6 +148,7 @@ export function WorkforceBuilderChat({
             value={message}
             onChange={(event) => setMessage(event.target.value)}
             rows={6}
+            disabled={readOnly}
             onKeyDown={(event) => {
               if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
                 event.preventDefault()
@@ -153,10 +158,12 @@ export function WorkforceBuilderChat({
           />
           <div className="flex items-center justify-between gap-3">
             <div className="text-xs text-muted-foreground">
-              {t("workforces.builder.sendHint")}
+              {readOnly && readOnlyReason ? readOnlyReason : t("workforces.builder.sendHint")}
             </div>
             <Button onClick={() => void handleSubmit()} disabled={!canSubmit}>
-              {submitting
+              {readOnly
+                ? t("workforces.actions.readOnly")
+                : submitting
                 ? t("workforces.loading.proposing")
                 : t("workforces.actions.proposeChanges")}
             </Button>

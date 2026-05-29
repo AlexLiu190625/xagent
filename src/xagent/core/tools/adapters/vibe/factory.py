@@ -38,13 +38,16 @@ class ToolRegistry:
     that ``create_registered_tools`` can skip the creator entirely when
     a :class:`ToolSelectionSpec` excludes those categories. Creators that
     produce tools across multiple categories or that produce categories
-    dynamically (MCP / Custom API / Published Agent) should leave
-    ``categories`` unset and short-circuit internally based on the spec.
+    dynamically (MCP / Custom API) should leave ``categories`` unset and
+    short-circuit internally based on the spec. Published-agent
+    delegation uses a creator-specific dispatch because workforce worker
+    tools can be injected by exact name without enabling the whole
+    ``agent`` category.
     """
 
-    # (creator, declared_categories) — declared_categories is None for
-    # dynamic creators that filter internally based on the spec.
-    _tool_creators: List[Tuple[Callable, Optional[FrozenSet[str]]]] = []
+    # (creator, declared_categories, selection_gate) — declared_categories is
+    # None for dynamic creators that filter internally based on the spec.
+    _tool_creators: List[Tuple[Callable, Optional[FrozenSet[str]], Optional[str]]] = []
     _modules_imported = False
 
     @classmethod
@@ -53,6 +56,7 @@ class ToolRegistry:
         creator: Optional[Callable] = None,
         *,
         categories: Optional[set] = None,
+        selection_gate: Optional[str] = None,
     ) -> Callable:
         """
         Register a tool creator function.
@@ -70,11 +74,16 @@ class ToolRegistry:
             @register_tool(categories={"basic"})
             def create_basic_tools(config: BaseToolConfig) -> List[Tool]:
                 return [BasicTool(...)]
+
+        Usage (with a creator-specific selection gate):
+            @register_tool(categories={"agent"}, selection_gate="published_agent")
+            def create_agent_tools(config: BaseToolConfig) -> List[Tool]:
+                return get_published_agents_tools(...)
         """
         declared = frozenset(categories) if categories else None
 
         def _do_register(fn: Callable) -> Callable:
-            cls._tool_creators.append((fn, declared))
+            cls._tool_creators.append((fn, declared, selection_gate))
             return fn
 
         # Bare form: ``@register_tool`` (no parens) — ``creator`` is the
@@ -119,6 +128,23 @@ class ToolRegistry:
         except Exception as e:
             logger.warning(f"Failed to import tool modules: {e}")
 
+    @staticmethod
+    def _should_run_creator(
+        declared_cats: Optional[FrozenSet[str]],
+        spec: Optional[ToolSelectionSpec],
+        selection_gate: Optional[str],
+    ) -> bool:
+        if spec is None or declared_cats is None or spec.categories is None:
+            return True
+
+        if selection_gate == "published_agent":
+            return spec.includes_published_agent()
+
+        if declared_cats & spec.categories:
+            return True
+
+        return False
+
     @classmethod
     async def create_registered_tools(cls, config: BaseToolConfig) -> List[Tool]:
         """Create tools from all registered creators.
@@ -127,8 +153,8 @@ class ToolRegistry:
         creators whose declared categories don't intersect
         ``spec.categories`` are skipped at the registry level (no
         creator call, no I/O). Creators with no declared categories
-        (dynamic ones: MCP / Custom API / Published Agent / Image /
-        Audio) are always dispatched and are responsible for
+        (dynamic ones: MCP / Custom API / Image / Audio) are always
+        dispatched and are responsible for
         short-circuiting internally based on the spec.
         """
         # Import tool modules on first call to trigger decorator registration
@@ -140,17 +166,11 @@ class ToolRegistry:
             else None
         )
         tools: List[Tool] = []
-        for creator, declared_cats in cls._tool_creators:
+        for creator, declared_cats, selection_gate in cls._tool_creators:
             # Registry-level skip: declared categories known and no
-            # intersection with the spec's allowed categories. ``spec``
-            # absent, or ``spec.categories`` absent, means "no restriction"
-            # and the creator runs.
-            if (
-                spec is not None
-                and declared_cats is not None
-                and spec.categories is not None
-                and not (declared_cats & spec.categories)
-            ):
+            # intersection with the spec's allowed categories. The helper
+            # keeps the published-agent workforce exception in one place.
+            if not cls._should_run_creator(declared_cats, spec, selection_gate):
                 continue
             try:
                 created_tools = await creator(config)

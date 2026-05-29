@@ -4,10 +4,11 @@ from typing import Any
 
 import pytest
 
-from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.models.workforce import Workforce
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -47,6 +48,9 @@ def _create_agent_row(
     user_id: int,
     name: str,
     status: AgentStatus = AgentStatus.DRAFT,
+    origin: str = AgentOrigin.USER.value,
+    widget_enabled: bool = True,
+    allowed_domains: list[str] | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
@@ -56,7 +60,10 @@ def _create_agent_row(
             description=f"{name} description",
             instructions=f"{name} instructions",
             execution_mode="balanced",
+            origin=origin,
             status=status,
+            widget_enabled=widget_enabled,
+            allowed_domains=allowed_domains or [],
         )
         db.add(agent)
         db.commit()
@@ -139,6 +146,123 @@ def test_list_agents_includes_owned_agents_and_policy_visible_agents() -> None:
     assert items_by_id[shared_draft_id]["access"] == "policy"
     assert items_by_id[shared_draft_id]["status"] == "draft"
     assert items_by_id[shared_draft_id]["readonly"] is True
+
+
+def test_agent_lists_keep_reusable_managers_and_hide_generated_managers() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    reusable_manager_id = _create_agent_row(
+        user_id=owner_id,
+        name="Reusable Manager",
+        status=AgentStatus.PUBLISHED,
+    )
+    generated_manager_id = _create_agent_row(
+        user_id=owner_id,
+        name="Generated Manager",
+        status=AgentStatus.PUBLISHED,
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+    worker_id = _create_agent_row(
+        user_id=owner_id,
+        name="Reusable Worker",
+        status=AgentStatus.PUBLISHED,
+    )
+
+    db = _direct_db_session()
+    try:
+        workforce = Workforce(
+            owner_user_id=owner_id,
+            scope_type="user",
+            scope_id=str(owner_id),
+            name="Reusable Manager Workforce",
+            manager_agent_id=reusable_manager_id,
+            status="draft",
+        )
+        db.add(workforce)
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get("/api/agents", headers=headers)
+    assert response.status_code == 200, response.text
+    agent_ids = {item["id"] for item in response.json()}
+    assert reusable_manager_id in agent_ids
+    assert generated_manager_id not in agent_ids
+    assert worker_id in agent_ids
+
+    options_response = client.get("/api/workforces/agent-options", headers=headers)
+    assert options_response.status_code == 200, options_response.text
+    option_ids = {item["id"] for item in options_response.json()}
+    assert reusable_manager_id in option_ids
+    assert generated_manager_id not in option_ids
+    assert worker_id in option_ids
+
+
+def test_agent_name_conflicts_ignore_generated_workforce_managers() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    generated_name = "Generated Manager Name"
+    generated_manager_id = _create_agent_row(
+        user_id=owner_id,
+        name=generated_name,
+        status=AgentStatus.PUBLISHED,
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+
+    create_response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": generated_name,
+            "description": "Reusable agent",
+            "instructions": "You are reusable.",
+            "execution_mode": "balanced",
+        },
+    )
+
+    assert create_response.status_code == 200, create_response.text
+    created_agent_id = create_response.json()["id"]
+    assert created_agent_id != generated_manager_id
+
+    update_target_id = _create_agent_row(user_id=owner_id, name="Update Target")
+    hidden_update_name = "Hidden Update Manager Name"
+    _create_agent_row(
+        user_id=owner_id,
+        name=hidden_update_name,
+        status=AgentStatus.PUBLISHED,
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+
+    update_response = client.put(
+        f"/api/agents/{update_target_id}",
+        headers=headers,
+        json={"name": hidden_update_name},
+    )
+
+    assert update_response.status_code == 200, update_response.text
+    assert update_response.json()["name"] == hidden_update_name
+
+
+def test_generated_workforce_manager_agents_cannot_authenticate_widget() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    generated_manager_id = _create_agent_row(
+        user_id=owner_id,
+        name="Generated Widget Manager",
+        status=AgentStatus.PUBLISHED,
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        widget_enabled=True,
+        allowed_domains=["*"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": generated_manager_id, "guest_id": "guest-1"},
+        headers={"origin": "https://example.com"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
 
 
 class TestDeleteAgent:

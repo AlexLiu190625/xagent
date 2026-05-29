@@ -65,8 +65,22 @@ def test_release_build_sanitizes_package_version_for_manual_runs() -> None:
 def test_backend_dockerfile_applies_package_specific_vcs_version() -> None:
     dockerfile = read_repo_file("docker/Dockerfile.backend")
 
-    assert 'ARG XAGENT_PACKAGE_VERSION="0.0.0+docker"' in dockerfile
-    assert 'SETUPTOOLS_SCM_PRETEND_VERSION="${XAGENT_PACKAGE_VERSION}"' in dockerfile
+    assert dockerfile.count('ARG XAGENT_PACKAGE_VERSION="0.0.0+docker"') == 2
+    assert (
+        dockerfile.count('SETUPTOOLS_SCM_PRETEND_VERSION="${XAGENT_PACKAGE_VERSION}"')
+        == 2
+    )
+    dependency_sync = (
+        'SETUPTOOLS_SCM_PRETEND_VERSION="${XAGENT_PACKAGE_VERSION}" \\\n'
+        "    VIRTUAL_ENV=/opt/venv uv sync --active --locked --no-dev "
+        "--no-install-project --no-editable"
+    )
+    build_sync = (
+        'SETUPTOOLS_SCM_PRETEND_VERSION="${XAGENT_PACKAGE_VERSION}" \\\n'
+        "    VIRTUAL_ENV=/opt/venv uv sync --active --locked --no-dev --no-editable"
+    )
+    assert dependency_sync in dockerfile
+    assert build_sync in dockerfile
     assert "COPY .git .git" not in dockerfile
 
 

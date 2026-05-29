@@ -12,7 +12,7 @@ import { ClarificationForm } from "@/components/chat/clarification-form"
 
 interface WebSocketMessage {
   type: string
-  data: unknown
+  data?: unknown
   timestamp: string
   task_id?: number
   step_id?: string
@@ -40,6 +40,8 @@ import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, pa
 import { useI18n } from "@/contexts/i18n-context"
 import { normalizeTimestampMs } from "@/lib/time-utils"
 import { unwrapFinalAnswerContent } from "@/lib/final-answer"
+import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import { isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status"
 import {
   getFinalAnswerStreamActionPayload,
   getFinalAnswerStreamMessageId,
@@ -334,7 +336,7 @@ interface Message {
 interface Task {
   id: string
   title: string
-  status: "pending" | "running" | "completed" | "failed" | "paused" | "waiting_for_user"
+  status: TaskStatus
   description: string
   createdAt: string | number
   updatedAt: string | number
@@ -389,6 +391,23 @@ const normalizeStepStatus = (status: unknown): StepExecution["status"] => {
 
 const getString = (value: unknown, fallback = ""): string => typeof value === "string" ? value : fallback
 const getStringArray = (value: unknown): string[] => Array.isArray(value) ? value.map(item => String(item)) : []
+
+const getWebSocketErrorMessage = (message: WebSocketMessage): string => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  return getString(data?.message) || getString(data?.error) || getString(root.message) || getString(root.error) || "Unknown error"
+}
+
+const getWebSocketTaskStatus = (message: WebSocketMessage): Task["status"] | null => {
+  const root = message as unknown as Record<string, unknown>
+  const data = isJsonRecord(message.data) ? message.data : null
+  const rootTask = isJsonRecord(root.task) ? root.task : null
+  const dataTask = isJsonRecord(data?.task) ? data.task : null
+  return normalizeTaskStatus(dataTask?.status) || normalizeTaskStatus(rootTask?.status) || normalizeTaskStatus(data?.status) || normalizeTaskStatus(root.status) || null
+}
+
+const shouldStopProcessingForTaskStatus = (status: unknown): boolean =>
+  isStoppedTaskStatus(status)
 
 const stepsFromPlanData = (planData: unknown, existingSteps: StepExecution[]): StepExecution[] | null => {
   const planRecord = planData && typeof planData === "object" ? planData as Record<string, unknown> : null
@@ -559,7 +578,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, isHistoryLoading: action.payload }
 
     case "SYNC_PROCESSING_STATUS":
-      if (state.currentTask?.status === 'completed' || state.currentTask?.status === 'failed') {
+      if (shouldStopProcessingForTaskStatus(state.currentTask?.status)) {
         return { ...state, isProcessing: false }
       }
       return state
@@ -679,25 +698,50 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: updatedMessages }
     }
 
-    case "SET_CURRENT_TASK":
+    case "SET_CURRENT_TASK": {
+      const incomingTask = action.payload
+        ? {
+          ...action.payload,
+          status:
+            normalizeTaskStatus(action.payload.status) ||
+            (state.currentTask?.id === action.payload.id
+              ? state.currentTask.status
+              : "pending"),
+        }
+        : null
+
+      const currentTask = (state.currentTask && incomingTask && state.currentTask.id === incomingTask.id)
+        ? { ...state.currentTask, ...incomingTask, agentName: incomingTask.agentName || state.currentTask.agentName, agentLogoUrl: incomingTask.agentLogoUrl || state.currentTask.agentLogoUrl }
+        : incomingTask
+
       return {
         ...state,
-        currentTask: (state.currentTask && action.payload && state.currentTask.id === action.payload.id)
-          ? { ...state.currentTask, ...action.payload, agentName: action.payload.agentName || state.currentTask.agentName, agentLogoUrl: action.payload.agentLogoUrl || state.currentTask.agentLogoUrl }
-          : action.payload
+        currentTask,
+        isProcessing: currentTask && shouldStopProcessingForTaskStatus(currentTask.status)
+          ? false
+          : state.isProcessing,
       }
+    }
 
-    case "UPDATE_TASK_STATUS":
+    case "UPDATE_TASK_STATUS": {
       if (!state.currentTask) {
         return state
       }
 
-      const isWaitingForUser = action.payload.status === "waiting_for_user"
+      const nextStatus = normalizeTaskStatus(action.payload.status)
+      if (!nextStatus) {
+        return state
+      }
+
+      const isWaitingForUser = nextStatus === "waiting_for_user"
       return {
         ...state,
+        isProcessing: shouldStopProcessingForTaskStatus(nextStatus)
+          ? false
+          : state.isProcessing,
         currentTask: {
           ...state.currentTask,
-          status: action.payload.status,
+          status: nextStatus,
           updatedAt: new Date().toISOString(),
           waitingQuestion: isWaitingForUser
             ? action.payload.waitingQuestion ?? state.currentTask.waitingQuestion
@@ -707,6 +751,7 @@ function appReducer(state: AppState, action: AppAction): AppState {
             : undefined,
         },
       }
+    }
 
     case "SET_DAG_EXECUTION":
       return { ...state, dagExecution: action.payload }
@@ -1261,6 +1306,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           // Handle structured trace events
           if (eventType === "task_info") {
             const taskData = eventData
+            const taskStatus = normalizeTaskStatus(taskData.status) || "pending"
             console.log('📥 Received task_info event:', {
               taskData,
               status: taskData.status,
@@ -1268,13 +1314,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
 
             // Store pending task for auto-execution
-            if (taskData.status === 'pending' && taskData.description) {
+            if (taskStatus === 'pending' && taskData.description) {
               pendingTaskToExecute = { description: taskData.description }
               console.log('💾 Stored pending task for auto-execution:', taskData.description)
             }
 
             // Check if status changed and trigger update if so
-            if (currentState.currentTask?.id === taskData.id.toString() && currentState.currentTask?.status !== taskData.status) {
+            if (currentState.currentTask?.id === taskData.id.toString() && currentState.currentTask?.status !== taskStatus) {
               dispatch({ type: "TRIGGER_TASK_UPDATE" })
             }
 
@@ -1284,7 +1330,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                 id: taskData.id.toString(),
                 title: taskData.title,
                 description: taskData.description,
-                status: taskData.status,
+                status: taskStatus,
                 createdAt: taskData.created_at,
                 updatedAt: taskData.updated_at,
                 modelId: taskData.model_id,
@@ -3614,10 +3660,10 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         break
 
       case "task_completed":
-        const taskData = message.data as { success?: boolean; result?: string | Record<string, unknown>; file_outputs?: string[] }
+        const taskData = normalizeTaskCompletedMessage(message)
         dispatch({
           type: "UPDATE_TASK_STATUS",
-          payload: { status: taskData.success ? "completed" : "failed" }
+          payload: { status: taskData.status }
         })
         dispatch({ type: "TRIGGER_TASK_UPDATE" })
         dispatch({ type: "SET_PROCESSING", payload: false })  // Stop processing on task completion
@@ -3626,13 +3672,13 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         if (state.dagExecution) {
           const updatedDAGExecution = {
             ...state.dagExecution,
-            phase: (taskData.success ? "completed" : "failed") as "completed" | "failed",
+            phase: taskData.status,
             updated_at: new Date().toISOString()
           }
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
         } else {
           const dagExecution: DAGExecution = {
-            phase: (taskData.success ? "completed" : "failed") as "completed" | "failed",
+            phase: taskData.status,
             current_plan: {},
             created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
@@ -3646,14 +3692,14 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
         }
 
         // Handle file outputs
-        if (taskData.file_outputs && taskData.file_outputs.length > 0) {
-          const fileCount = taskData.file_outputs.length
+        if (taskData.fileOutputs.length > 0) {
+          const fileCount = taskData.fileOutputs.length
           const fileContent = (
             <>
               <FileText className="h-4 w-4 inline mr-2 text-green-500" />
               {t('agent.logs.event.messages.fileOutputsGenerated', { count: fileCount })}:
               <div className="mt-2 space-y-1">
-                {taskData.file_outputs.map((file: string | any, index: number) => {
+                {taskData.fileOutputs.map((file: string | any, index: number) => {
                   let fileName, filePath
                   if (typeof file === 'object' && file !== null) {
                     fileName = file.filename || 'unknown'
@@ -3669,7 +3715,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
                       <button
                         onClick={() => {
                           // Dispatch custom event to open file preview with all files
-                          const allFiles = normalizeGeneratedPreviewFiles(taskData.file_outputs)
+                          const allFiles = normalizeGeneratedPreviewFiles(taskData.fileOutputs)
 
                           if (!filePath) {
                             return
@@ -3710,7 +3756,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             })
           }
 
-          dispatchAutoOpenPreview(taskData.file_outputs, dispatch)
+          dispatchAutoOpenPreview(taskData.fileOutputs, dispatch)
         }
 
         dispatch({ type: "SET_PROCESSING", payload: false })
@@ -3787,6 +3833,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
       case "task_paused":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (task_paused)')
         dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: "paused" } })
+        dispatch({ type: "SET_PROCESSING", payload: false })
         break
 
       case "task_waiting_for_user":
@@ -3802,6 +3849,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
             waitingInteractions: interactions.length > 0 ? interactions : undefined,
           }
         })
+        dispatch({ type: "SET_PROCESSING", payload: false })
         if (
           waitingMessage &&
           waitingMessage !== "Task waiting for user response" &&
@@ -3830,10 +3878,18 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
 
       case "agent_error":
         console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (agent_error)')
-        const errorData = message.data as { message?: string }
+        const agentErrorMessage = getWebSocketErrorMessage(message)
+        const agentErrorTaskStatus = getWebSocketTaskStatus(message)
 
-        // Update DAG execution status to failed
-        if (state.dagExecution) {
+        if (agentErrorTaskStatus) {
+          dispatch({
+            type: "UPDATE_TASK_STATUS",
+            payload: { status: agentErrorTaskStatus },
+          })
+          dispatch({ type: "TRIGGER_TASK_UPDATE" })
+        }
+
+        if (agentErrorTaskStatus === "failed" && state.dagExecution) {
           const updatedDAGExecution = {
             ...state.dagExecution,
             phase: "failed" as const,
@@ -3842,17 +3898,48 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           dispatch({ type: "SET_DAG_EXECUTION", payload: updatedDAGExecution })
         }
 
-        dispatch({ type: "SET_PROCESSING", payload: false })
+        if (shouldStopProcessingForTaskStatus(agentErrorTaskStatus)) {
+          dispatch({ type: "SET_PROCESSING", payload: false })
+        }
+
         dispatch({
           type: "ADD_MESSAGE",
           payload: {
             id: generateMessageId("msg"),
             role: "assistant",
-            content: `${t('agent.logs.event.messages.errorPrefix')} ${errorData.message || t('common.errors.unknownError')}`,
+            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknownError')}`,
             timestamp: message.timestamp,
             status: "failed",
           },
         })
+        break
+
+      case "error":
+      case "task_error":
+        console.trace('Original message:', JSON.stringify(message), 'Handler: handleMessage (error)')
+        const websocketErrorMessage = getWebSocketErrorMessage(message)
+        const websocketTaskStatus = getWebSocketTaskStatus(message)
+
+        if (websocketTaskStatus) {
+          dispatch({ type: "UPDATE_TASK_STATUS", payload: { status: websocketTaskStatus } })
+          dispatch({ type: "TRIGGER_TASK_UPDATE" })
+        }
+        if (shouldStopProcessingForTaskStatus(websocketTaskStatus)) {
+          dispatch({ type: "SET_PROCESSING", payload: false })
+        }
+
+        if (!isDuplicateMessage(websocketErrorMessage, "agent-error")) {
+          dispatch({
+            type: "ADD_MESSAGE",
+            payload: {
+              id: generateMessageId("msg-error"),
+              role: "assistant",
+              content: `${t('agent.logs.event.messages.errorPrefix')} ${websocketErrorMessage}`,
+              timestamp: message.timestamp,
+              status: "failed",
+            },
+          })
+        }
         break
 
       case "message_received":
@@ -4039,7 +4126,7 @@ export function AppProvider({ children, token }: { children: React.ReactNode; to
           const newTask: Task = {
             id: newTaskId.toString(),
             title: taskData.title,
-            status: taskData.status,
+            status: normalizeTaskStatus(taskData.status) || "pending",
             description: taskData.description || message,
             createdAt: taskData.created_at,
             updatedAt: taskData.updated_at,

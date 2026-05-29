@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
+import { resolveTraceProcessStatus } from "@/lib/trace-process-status";
 
 interface ToolArgs {
   code?: string;
@@ -67,6 +68,7 @@ export interface ChatMessageProps {
   showProcessView?: boolean;
   isVirtual?: boolean;
   taskStatus?: string;
+  processStatus?: string;
   timestamp?: number | string;
   interactions?: any[];
   interactionsActive?: boolean;
@@ -273,6 +275,7 @@ export function ChatMessage({
   traceEvents,
   showProcessView,
   taskStatus,
+  processStatus,
   timestamp,
   interactions,
   interactionsActive = true,
@@ -340,13 +343,18 @@ export function ChatMessage({
       ? traceEvents[traceEvents.length - 1]
       : undefined
   );
+  const resolvedProcessStatus = resolveTraceProcessStatus({
+    processStatus,
+    taskStatus,
+    traceEvents,
+  });
 
   let errorMessage = "";
-  if (taskStatus === "failed" && Array.isArray(traceEvents)) {
+  if (resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
     for (let i = traceEvents.length - 1; i >= 0; i--) {
       const event = traceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
-        errorMessage = (event.data?.error as string) || (event.data?.message as string) || "";
+        errorMessage = (event.data?.error as string) || (event.data?.message as string) || (event.data?.error_message as string) || "";
         if (errorMessage) break;
       }
     }
@@ -360,7 +368,7 @@ export function ChatMessage({
     <div className="w-full space-y-2 animate-fade-in group">
       {shouldShowProcess && !isUser && (
         <div className={cn("pl-7")}>
-          <TraceEventRenderer events={traceEvents} />
+          <TraceEventRenderer events={traceEvents} taskStatus={resolvedProcessStatus} />
         </div>
       )}
 
@@ -392,7 +400,7 @@ export function ChatMessage({
 
             {/* Message content */}
             <div className={cn("flex-1 min-w-0")}>
-              {!isUser && taskStatus === "failed" ? (
+              {!isUser && resolvedProcessStatus === "failed" ? (
                 <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
                   {failedMessageText}
                 </div>
@@ -412,7 +420,7 @@ export function ChatMessage({
                   <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
                 )
               ) : (
-                !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />
+                !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={resolvedProcessStatus || taskStatus} errorMessage={errorMessage} />
               )}
               {!isUser && interactions && interactions.length > 0 && (
                 <div className="mt-4 border-t pt-4">

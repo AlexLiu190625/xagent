@@ -1013,7 +1013,11 @@ def _load_agent_for_task_runtime(
     task_row: Any,
     workforce: Any,
 ) -> Any | None:
-    from ..models.agent import Agent, AgentStatus
+    from ..models.agent import (
+        Agent,
+        AgentStatus,
+        is_workforce_generated_manager_agent,
+    )
     from ..models.user import User
     from .agent_access import list_accessible_published_agents
 
@@ -1023,6 +1027,10 @@ def _load_agent_for_task_runtime(
 
     agent = session.query(Agent).filter(Agent.id == task_agent_id).first()
     if agent is None:
+        return None
+    if is_workforce_generated_manager_agent(agent):
+        if workforce is not None and workforce.manager_agent_id == task_agent_id:
+            return agent
         return None
     if int(agent.user_id) == int(task_row.user_id):
         return agent

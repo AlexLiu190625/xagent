@@ -66,12 +66,14 @@ vi.mock("@/components/chat/ChatMessage", () => ({
     interactionsActive,
     traceEvents,
     taskStatus,
+    processStatus,
     showEmptyStatus,
   }: {
     content?: string | null
     interactionsActive?: boolean
     traceEvents?: unknown[]
     taskStatus?: string
+    processStatus?: string
     showEmptyStatus?: boolean
   }) => (
     <div
@@ -79,6 +81,7 @@ vi.mock("@/components/chat/ChatMessage", () => ({
       data-active={interactionsActive ? "true" : "false"}
       data-trace-count={traceEvents?.length ?? 0}
       data-task-status={taskStatus || ""}
+      data-process-status={processStatus || ""}
       data-show-empty-status={showEmptyStatus ? "true" : "false"}
     >
       {content}
@@ -259,7 +262,121 @@ describe("TaskConversationPanel", () => {
     expect(renderedMessages).toHaveLength(3)
     expect(renderedMessages[0]).toHaveTextContent("Run analysis")
     expect(renderedMessages[1]).toHaveAttribute("data-trace-count", "1")
+    expect(renderedMessages[1]).toHaveAttribute("data-process-status", "completed")
     expect(renderedMessages[2]).toHaveTextContent("Done")
+  })
+
+  it("applies current task status only to the latest trace process group", () => {
+    appState.messages = [
+      {
+        id: "msg-user-1",
+        role: "user",
+        content: "First turn",
+        timestamp: "1000",
+      },
+      {
+        id: "msg-result-1",
+        role: "assistant",
+        content: "First result",
+        timestamp: "3000",
+        isResult: true,
+      },
+      {
+        id: "msg-user-2",
+        role: "user",
+        content: "Second turn",
+        timestamp: "4000",
+      },
+    ] as any
+    appState.traceEvents = [
+      {
+        event_id: "trace-old",
+        event_type: "tool_call",
+        timestamp: 2000,
+        data: { message: "Old turn work" },
+      },
+      {
+        event_id: "trace-latest",
+        event_type: "tool_call",
+        timestamp: 5000,
+        data: { message: "Latest turn work" },
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "completed",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const processMessages = screen
+      .getAllByTestId("chat-message")
+      .filter((message) => message.getAttribute("data-trace-count") === "1")
+    expect(processMessages).toHaveLength(2)
+    expect(processMessages[0]).toHaveAttribute("data-process-status", "")
+    expect(processMessages[1]).toHaveAttribute("data-process-status", "completed")
+  })
+
+  it("does not apply current task status to a previous turn when the new turn has no trace yet", () => {
+    appState.messages = [
+      {
+        id: "msg-user-1",
+        role: "user",
+        content: "First turn",
+        timestamp: "1000",
+      },
+      {
+        id: "msg-result-1",
+        role: "assistant",
+        content: "First result",
+        timestamp: "3000",
+        isResult: true,
+      },
+      {
+        id: "msg-user-2",
+        role: "user",
+        content: "Second turn",
+        timestamp: "4000",
+      },
+    ] as any
+    appState.traceEvents = [
+      {
+        event_id: "trace-old",
+        event_type: "tool_call",
+        timestamp: 2000,
+        data: { message: "Old turn work" },
+      },
+    ] as any
+    appState.currentTask = {
+      id: "42",
+      title: "Task",
+      description: "Task",
+      status: "running",
+      createdAt: "2026-01-01T00:00:00Z",
+      updatedAt: "2026-01-01T00:00:00Z",
+    } as any
+    appState.isProcessing = true
+
+    render(<TaskConversationPanel mode="page" />)
+
+    const historicalProcessMessages = screen
+      .getAllByTestId("chat-message")
+      .filter((message) => message.getAttribute("data-trace-count") === "1")
+    expect(historicalProcessMessages).toHaveLength(1)
+    expect(historicalProcessMessages[0]).toHaveAttribute("data-process-status", "")
+
+    const virtualProcessMessages = screen
+      .getAllByTestId("chat-message")
+      .filter((message) => message.getAttribute("data-trace-count") === "0")
+    expect(
+      virtualProcessMessages.some(
+        (message) => message.getAttribute("data-process-status") === "running"
+      )
+    ).toBe(true)
   })
 
   it("normalizes invalid timestamps to zero for deterministic ordering", () => {

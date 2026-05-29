@@ -1,7 +1,7 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
 import { cleanup, fireEvent, render, screen } from "@testing-library/react"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 
@@ -13,6 +13,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     t: (key: string, vars?: Record<string, string | number>) => {
       if (vars?.tool) return `${key}:${vars.tool}`
+      if (vars?.worker) return `${key}:${vars.worker}`
       return key
     },
   }),
@@ -58,6 +59,10 @@ vi.mock("@/components/file/pptx-preview-renderer", () => ({
 import { TraceEventRenderer } from "./TraceEventRenderer"
 
 describe("TraceEventRenderer", () => {
+  beforeEach(() => {
+    window.scrollTo = vi.fn()
+  })
+
   afterEach(() => {
     cleanup()
     apiRequestMock.mockReset()
@@ -487,5 +492,188 @@ describe("TraceEventRenderer", () => {
     expect(toggle).toHaveAttribute("aria-expanded", "true")
     expect(screen.getByText("traceEventRenderer.hideProcess")).toBeInTheDocument()
     expect(screen.getByText(/traceEventRenderer.executeTool:web_search/)).toBeInTheDocument()
+  })
+
+  it("stops running process spinners when the parent task has failed", () => {
+    const { container } = render(
+      <TraceEventRenderer
+        taskStatus="failed"
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "llm-start",
+            event_type: "llm_call_start",
+            step_id: "step-1",
+            timestamp: 2000,
+            data: { model_name: "gpt-test" },
+          },
+          {
+            event_id: "llm-failed",
+            event_type: "llm_call_failed",
+            step_id: "step-1",
+            timestamp: 3000,
+            data: { error: "OpenAI bad request" },
+          },
+        ]}
+      />,
+    )
+
+    expect(container.querySelector(".animate-spin")).toBeNull()
+  })
+
+  it("infers a failed process from terminal trace errors when task status is unavailable", () => {
+    const { container } = render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "step-1",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "llm-start",
+            event_type: "llm_call_start",
+            step_id: "step-1",
+            timestamp: 2000,
+            data: { model_name: "gpt-test" },
+          },
+          {
+            event_id: "trace-error",
+            event_type: "trace_error",
+            step_id: "step-1",
+            timestamp: 3000,
+            data: {
+              error_type: "agent_error",
+              status: "failed",
+              error_message: "All patterns failed",
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(container.querySelector(".animate-spin")).toBeNull()
+  })
+
+  it("stops spinning when a step-local trace error has no explicit status", () => {
+    const { container } = render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "react-step",
+            timestamp: 1000,
+            data: {},
+          },
+          {
+            event_id: "llm-start",
+            event_type: "llm_call_start",
+            step_id: "react-step",
+            timestamp: 2000,
+            data: { model_name: "gpt-test" },
+          },
+          {
+            event_id: "trace-error",
+            event_type: "trace_error",
+            step_id: "react-step",
+            timestamp: 3000,
+            data: {
+              error_type: "agent_pattern_error",
+              error_message: "OpenAI bad request",
+            },
+          },
+        ]}
+      />,
+    )
+
+    expect(container.querySelector(".animate-spin")).toBeNull()
+    expect(container).toHaveTextContent("OpenAI bad request")
+  })
+
+  it("renders workforce delegation trace events as a dedicated step", () => {
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "delegation-start",
+            event_type: "workforce_delegation_start",
+            timestamp: Date.now(),
+            data: {
+              workforce_run_id: 5,
+              worker_member_id: 7,
+              worker_task_id: 99,
+              worker_alias: "Researcher",
+              tool_name: "research_worker",
+            },
+          },
+          {
+            event_id: "delegation-end",
+            event_type: "workforce_delegation_end",
+            timestamp: Date.now(),
+            data: {
+              worker_task_id: 99,
+              output: "Research complete",
+            },
+          },
+        ]}
+      />,
+    )
+
+    const toggle = screen.getByRole("button", {
+      name: /traceEventRenderer.delegateToWorker:Researcher/,
+    })
+
+    expect(toggle).toHaveAttribute("aria-expanded", "false")
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute("aria-expanded", "true")
+    expect(screen.getByText(/Research complete/)).toBeInTheDocument()
+  })
+
+  it("renders workforce delegation failures as errors", () => {
+    render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "delegation-start",
+            event_type: "workforce_delegation_start",
+            timestamp: Date.now(),
+            data: {
+              worker_task_id: 99,
+              worker_alias: "Researcher",
+            },
+          },
+          {
+            event_id: "delegation-error",
+            event_type: "workforce_delegation_error",
+            timestamp: Date.now(),
+            data: {
+              worker_task_id: 99,
+              error: "Worker timed out",
+            },
+          },
+        ]}
+      />,
+    )
+
+    const stepToggle = screen.getByRole("button", {
+      name: /traceEventRenderer.delegateToWorker:Researcher/,
+    })
+    fireEvent.click(stepToggle)
+
+    const errorToggle = screen.getByRole("button", {
+      name: /traceEventRenderer.workerFailed/,
+    })
+    fireEvent.click(errorToggle)
+
+    expect(screen.getByText("Worker timed out")).toBeInTheDocument()
   })
 })

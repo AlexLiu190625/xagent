@@ -6,6 +6,11 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import {
+  normalizeTraceProcessStatus,
+  type TraceProcessStatus,
+} from "@/lib/trace-process-status"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
@@ -20,6 +25,21 @@ interface Message {
   traceEvents?: any[]
   timestamp?: number
   interactions?: Interaction[]
+  processStatus?: TraceProcessStatus
+}
+
+const updateLastAssistantMessage = (
+  messages: Message[],
+  update: (message: Message) => Message
+): Message[] => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") {
+      const updated = [...messages]
+      updated[i] = update(messages[i])
+      return updated
+    }
+  }
+  return messages
 }
 
 export interface AgentConfig {
@@ -244,15 +264,10 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
             if (data.type === "trace_event") {
               // Update the last message (assistant) with the new trace event
               setMessages(prev => {
-                const updated = [...prev]
-                const lastMsg = updated[updated.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant') {
-                  updated[updated.length - 1] = {
-                    ...lastMsg,
+                return updateLastAssistantMessage(prev, lastMsg => ({
+                  ...lastMsg,
                     traceEvents: [...(lastMsg.traceEvents || []), data]
-                  }
-                }
-                return updated
+                }))
               })
 
               if (data.event_type === "ai_message") {
@@ -381,21 +396,30 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               }
             } else if (data.type === "task_completed") {
               setIsLoading(false)
+              const taskCompletion = normalizeTaskCompletedMessage(data)
 
               // The backend no longer sends config_updates in task_completed.
               // We handle it in tool_execution_end.
 
-              let finalContent = typeof data.result === 'object' ? data.result.content : data.result;
+              let finalContent = taskCompletion.result && typeof taskCompletion.result === 'object' ? (taskCompletion.result as any).content : taskCompletion.result;
               finalContent = finalContent || currentReply;
 
               let cleanReply = typeof finalContent === 'string' ? finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim() : "";
               let interactions = undefined;
+              const resultRecord = taskCompletion.result && typeof taskCompletion.result === 'object'
+                ? taskCompletion.result as any
+                : null;
 
               // Check if we have chat_response structure
-              if (typeof data.result === 'object' && data.result.chat_response) {
-                interactions = data.result.chat_response.interactions;
-                if (data.result.chat_response.message) {
-                  cleanReply = data.result.chat_response.message;
+              if (taskCompletion.chatResponse && typeof taskCompletion.chatResponse === 'object') {
+                interactions = (taskCompletion.chatResponse as any).interactions;
+                if ((taskCompletion.chatResponse as any).message) {
+                  cleanReply = (taskCompletion.chatResponse as any).message;
+                }
+              } else if (resultRecord?.chat_response) {
+                interactions = resultRecord.chat_response.interactions;
+                if (resultRecord.chat_response.message) {
+                  cleanReply = resultRecord.chat_response.message;
                 }
               }
 
@@ -426,17 +450,27 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               }
 
               setMessages(prev => {
-                const updated = [...prev]
-                updated[updated.length - 1].content = cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request."
-                if (interactions) {
-                  updated[updated.length - 1].interactions = interactions;
-                }
-                return updated
+                return updateLastAssistantMessage(prev, message => ({
+                  ...message,
+                  content: cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request.",
+                  interactions: interactions || message.interactions,
+                  processStatus: taskCompletion.status,
+                }))
               })
 
               currentReply = ""
             } else if (data.type === "error" || data.type === "task_error") {
               setIsLoading(false)
+              const processStatus =
+                normalizeTraceProcessStatus(data.task?.status) ||
+                normalizeTraceProcessStatus(data.status) ||
+                "failed"
+              setMessages(prev => {
+                return updateLastAssistantMessage(prev, message => ({
+                  ...message,
+                  processStatus,
+                }))
+              })
               toast.error(data.message || data.error || t("builds.configForm.chat.errorCommunicate", { appName: branding.appName }))
               ws.close()
             }
@@ -493,6 +527,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               content={msg.content}
               traceEvents={msg.traceEvents}
               showProcessView={true}
+              processStatus={msg.processStatus}
               timestamp={msg.timestamp}
               interactions={msg.interactions}
               onSendInteraction={async (text, files, meta) => {

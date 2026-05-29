@@ -12,6 +12,7 @@ from ...core.agent.trace import (
     TraceHandler,
     TraceScope,
 )
+from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
 from .websocket import create_stream_event, manager
 
 
@@ -342,7 +343,7 @@ class WebSocketTraceHandler(TraceHandler):
         """
         # Server-only audit traces: drop early so we don't waste effort
         # serializing payloads we're about to discard.
-        if isinstance(event.data, dict) and event.data.get("__audit_only__") is True:
+        if is_audit_only_trace_data(event.data):
             logger.debug(
                 f"Dropping audit-only trace event from WS broadcast: "
                 f"step_id={event.step_id} task={self.task_id}"
@@ -358,6 +359,9 @@ class WebSocketTraceHandler(TraceHandler):
         data = self._serialize_data(event.data)
         if is_agent_checkpoint_data(data):
             return None
+        if self._task_description:
+            data["task_description"] = self._task_description
+        event_type_str, data = normalize_public_trace_event(event_type_str, data)
 
         # Create the base stream event
         stream_event = create_stream_event(
@@ -371,10 +375,6 @@ class WebSocketTraceHandler(TraceHandler):
         # Add parent_id if present (for event correlation)
         if event.parent_id:
             stream_event["parent_id"] = event.parent_id
-
-        # Add task description if available
-        if self._task_description:
-            stream_event["data"]["task_description"] = self._task_description
 
         return stream_event
 

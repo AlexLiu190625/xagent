@@ -18,6 +18,7 @@ from .....web.services.model_service import (
 from ....tracing import create_agent_tracer
 from ....utils.type_check import ensure_list
 from ...core.document_search import find_missing_knowledge_bases
+from .agent_tool_names import gen_agent_tool_name
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 
 logger = logging.getLogger(__name__)
@@ -126,6 +127,24 @@ def _apply_agent_visibility_filters(
     if not allow_cross_user_agent_ids or normalized_allowed_agent_ids is None:
         query = query.filter(agent_model.user_id == user_id)
 
+    query = _exclude_private_workforce_manager_agents(query, agent_model)
+
+    return query
+
+
+def _exclude_private_workforce_manager_agents(query: Any, agent_model: Any) -> Any:
+    from .....web.models.agent import AgentOrigin
+
+    return query.filter(
+        agent_model.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+    )
+
+
+def _apply_owned_agent_tool_filters(
+    query: Any, agent_model: Any, *, user_id: int
+) -> Any:
+    query = query.filter(agent_model.user_id == user_id)
+    query = _exclude_private_workforce_manager_agents(query, agent_model)
     return query
 
 
@@ -750,7 +769,7 @@ class CreateAgentTool(AbstractBaseTool):
             )
 
             # Generate the tool name and markdown link
-            tool_name = gen_agent_tool_name(agent_name)
+            tool_name = gen_agent_tool_name(agent.id)
             markdown_link = f"[{agent_name}](agent://{agent.id})"
 
             rename_note = ""
@@ -925,11 +944,13 @@ class UpdateAgentTool(AbstractBaseTool):
                 ).model_dump()
 
             # Find the agent
-            agent = (
-                self._db.query(Agent)
-                .filter(Agent.id == agent_id, Agent.user_id == self._user_id)
-                .first()
+            query = self._db.query(Agent).filter(Agent.id == agent_id)
+            query = _apply_owned_agent_tool_filters(
+                query,
+                Agent,
+                user_id=self._user_id,
             )
+            agent = query.first()
 
             if not agent:
                 return UpdateAgentToolResult(
@@ -945,7 +966,7 @@ class UpdateAgentTool(AbstractBaseTool):
                 return UpdateAgentToolResult(
                     agent_id=agent_id,
                     agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.name),
+                    tool_name=gen_agent_tool_name(agent.id),
                     markdown_link=f"[{agent.name}](agent://{agent.id})",
                     status="error",
                     message=(
@@ -962,15 +983,14 @@ class UpdateAgentTool(AbstractBaseTool):
             new_name = args.get("name", "").strip() if args.get("name") else None
             if new_name:
                 # Check for duplicate name (exclude current agent)
-                existing = (
-                    self._db.query(Agent)
-                    .filter(
-                        Agent.user_id == self._user_id,
+                existing = _apply_owned_agent_tool_filters(
+                    self._db.query(Agent).filter(
                         Agent.name == new_name,
                         Agent.id != agent_id,
-                    )
-                    .first()
-                )
+                    ),
+                    Agent,
+                    user_id=self._user_id,
+                ).first()
                 if existing:
                     return UpdateAgentToolResult(
                         agent_id=0,
@@ -1045,7 +1065,7 @@ class UpdateAgentTool(AbstractBaseTool):
                 return UpdateAgentToolResult(
                     agent_id=agent_id,
                     agent_name=agent.name,
-                    tool_name=gen_agent_tool_name(agent.name),
+                    tool_name=gen_agent_tool_name(agent.id),
                     markdown_link=f"[{agent.name}](agent://{agent.id})",
                     status="success",
                     message=f"ℹ️ No updates were made to agent '{agent.name}' (ID: {agent_id}). "
@@ -1062,7 +1082,7 @@ class UpdateAgentTool(AbstractBaseTool):
 
             # Generate the tool name and markdown link
             agent_name = str(agent.name)
-            tool_name = gen_agent_tool_name(agent_name)
+            tool_name = gen_agent_tool_name(agent.id)
             markdown_link = f"[{agent_name}](agent://{agent.id})"
 
             logger.info(
@@ -1205,7 +1225,11 @@ class ListAgentsTool(AbstractBaseTool):
                 ).model_dump()
 
             # Build query
-            query = self._db.query(Agent).filter(Agent.user_id == self._user_id)
+            query = _apply_owned_agent_tool_filters(
+                self._db.query(Agent),
+                Agent,
+                user_id=self._user_id,
+            )
 
             # Apply status filter if provided
             if status_filter:
@@ -1217,7 +1241,7 @@ class ListAgentsTool(AbstractBaseTool):
             # Build agent info list
             agent_infos = []
             for agent in agents:
-                tool_name = gen_agent_tool_name(agent.name)
+                tool_name = gen_agent_tool_name(agent.id)
                 markdown_link = f"[{agent.name}](agent://{agent.id})"
 
                 agent_info = AgentInfo(
@@ -1309,7 +1333,8 @@ class AgentTool(AbstractBaseTool):
             user_id: User ID for model access
             task_id: Task ID for workspace isolation
             workspace_base_dir: Base directory for workspace files
-            tool_name: Optional delegated tool name override
+            tool_name: Deprecated delegated tool name override. Agent tools always
+                expose the canonical agent_<id> name.
             tool_description: Optional delegated tool description override
             extra_system_prompt: Optional system prompt appended during execution
             parent_task_id: Parent task ID for delegation metadata
@@ -1360,7 +1385,7 @@ class AgentTool(AbstractBaseTool):
     @property
     def name(self) -> str:
         """Tool name."""
-        return self._tool_name or gen_agent_tool_name(self._agent_name)
+        return gen_agent_tool_name(self._agent_id)
 
     @property
     def description(self) -> str:
@@ -1393,7 +1418,6 @@ class AgentTool(AbstractBaseTool):
         file_outputs: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
         data: dict[str, Any] = {
-            "__audit_only__": True,
             "event_type": f"workforce_delegation_{status}",
             "status": status,
             "agent_id": self._agent_id,
@@ -1831,22 +1855,6 @@ class AgentTool(AbstractBaseTool):
             return AgentToolResult(response=error_msg).model_dump(exclude_none=True)
 
 
-def gen_agent_tool_name(agent_name: str) -> str:
-    """
-    Generate the tool name for a published agent.
-
-    This is a centralized function to ensure consistent naming across the codebase.
-    Tool name format: call_agent_{agent_name_lower_with_underscores}
-
-    Args:
-        agent_name: The name of the agent
-
-    Returns:
-        The tool name that will be used for this agent
-    """
-    return f"call_agent_{agent_name.lower().replace(' ', '_')}"
-
-
 def get_published_agents_tools(
     db: Any,
     user_id: int,
@@ -1938,15 +1946,15 @@ def get_published_agents_tools(
         elif include_draft:
             # Include both PUBLISHED and DRAFT agents
             query = db.query(Agent).filter(
-                Agent.user_id == user_id,
                 Agent.status.in_(["published", "draft"]),  # type: ignore[attr-defined]
             )
+            query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
         else:
             # Only PUBLISHED agents
             query = db.query(Agent).filter(
                 Agent.status == "published",
-                Agent.user_id == user_id,
             )
+            query = _apply_owned_agent_tool_filters(query, Agent, user_id=user_id)
 
         # Exclude the active delegation stack to prevent recursive self-calls.
         if excluded_agent_ids:
@@ -1964,15 +1972,14 @@ def get_published_agents_tools(
                 for agent_id in (normalized_draft_agent_ids or [])
                 if agent_id not in excluded_agent_ids
             ]
-            draft_agents = (
-                db.query(Agent)
-                .filter(
+            draft_agents = _apply_owned_agent_tool_filters(
+                db.query(Agent).filter(
                     Agent.id.in_(normalized_draft_agent_ids),
-                    Agent.user_id == user_id,
                     Agent.status == "draft",
-                )
-                .all()
-            )
+                ),
+                Agent,
+                user_id=user_id,
+            ).all()
             # Merge without duplicates
             existing_ids = {agent.id for agent in agents}
             for draft_agent in draft_agents:
@@ -2072,7 +2079,7 @@ if TYPE_CHECKING:
     from xagent.web.tools.config import WebToolConfig
 
 
-@register_tool(categories={"agent"})
+@register_tool(categories={"agent"}, selection_gate="published_agent")
 async def create_agent_tools(config: "WebToolConfig") -> list[AbstractBaseTool]:
     """Create tools from published agents.
 

@@ -15,7 +15,7 @@ from xagent.web.models import (
     WorkforceAgent,
     WorkforceBuilderMessage,
 )
-from xagent.web.models.agent import AgentStatus
+from xagent.web.models.agent import AgentOrigin, AgentStatus
 from xagent.web.services import workforce_builder as builder_module
 from xagent.web.services import workforce_creator as creator_module
 from xagent.web.services.agent_store import AgentStore
@@ -300,7 +300,11 @@ async def test_create_workforce_from_prompt_creates_draft_and_builder_messages(
     assert workforce.status == "draft"
     assert workforce.manager_agent.name == "launch manager 2"
     assert workforce.manager_agent.status == AgentStatus.PUBLISHED
+    assert (
+        workforce.manager_agent.origin == AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+    )
     assert workforce.manager_agent.published_at is not None
+    assert workforce.manager_agent.widget_enabled is False
     assert workforce.manager_agent.execution_mode == "think"
     assert len(workforce.workers) == 1
     assert workforce.workers[0].agent_id == worker_agent.id
@@ -310,7 +314,7 @@ async def test_create_workforce_from_prompt_creates_draft_and_builder_messages(
 
 
 @pytest.mark.asyncio
-async def test_create_workforce_from_prompt_invalidates_agent_list_cache(
+async def test_create_workforce_from_prompt_hides_generated_manager_from_agent_list(
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -363,7 +367,7 @@ async def test_create_workforce_from_prompt_invalidates_agent_list_cache(
             item["name"] for item in store.list_agent_items(int(owner.id))
         }
         assert result.workforce.manager_agent.name == "Launch Manager"
-        assert refreshed_agent_names == {"Analyst", "Launch Manager"}
+        assert refreshed_agent_names == {"Analyst"}
     finally:
         set_cache_backend_for_testing(None)
 

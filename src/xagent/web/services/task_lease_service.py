@@ -57,6 +57,7 @@ def has_agent_checkpoint(db: Session, task_id: int) -> bool:
         db.query(TraceEvent)
         .filter(
             TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
             TraceEvent.event_type == "system_update_general",
         )
         .order_by(TraceEvent.id.desc())

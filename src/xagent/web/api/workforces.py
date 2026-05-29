@@ -6,7 +6,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
 
 from ..auth_dependencies import get_current_user
-from ..models.agent import Agent
+from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.user import User
 from ..models.workforce import (
@@ -146,13 +146,15 @@ def _serialize_agent(agent: Agent, user: User | None = None) -> dict[str, Any]:
         return item
 
     is_owner = int(agent.user_id) == int(user.id)
+    is_generated_manager = is_workforce_generated_manager_agent(agent)
+    can_edit = is_owner and not is_generated_manager
     item.update(
         {
             "access": "owner" if is_owner else "policy",
-            "readonly": not is_owner,
-            "can_edit": is_owner,
-            "can_publish": is_owner,
-            "can_delete": is_owner,
+            "readonly": not can_edit,
+            "can_edit": can_edit,
+            "can_publish": can_edit,
+            "can_delete": can_edit,
         }
     )
     return item
@@ -519,21 +521,22 @@ async def update_workforce(
     if _field_supplied(request, "manager_agent_id"):
         if request.manager_agent_id is None:
             raise HTTPException(status_code=400, detail="manager_agent_id is required")
-        manager_agent = ensure_agent_access(
-            db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
-            user,
-            db,
-            require_published=True,
-        )
-        if any(
-            int(worker.agent_id) == int(manager_agent.id)
-            for worker in workforce.workers
-        ):
-            raise HTTPException(
-                status_code=400,
-                detail="Manager agent cannot also be a worker",
+        if int(request.manager_agent_id) != int(workforce.manager_agent_id):
+            manager_agent = ensure_agent_access(
+                db.query(Agent).filter(Agent.id == request.manager_agent_id).first(),
+                user,
+                db,
+                require_published=True,
             )
-        workforce_row.manager_agent_id = int(manager_agent.id)
+            if any(
+                int(worker.agent_id) == int(manager_agent.id)
+                for worker in workforce.workers
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Manager agent cannot also be a worker",
+                )
+            workforce_row.manager_agent_id = int(manager_agent.id)
 
     try:
         _validate_if_active(db, user, workforce)

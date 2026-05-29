@@ -26,7 +26,7 @@ from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.providers import is_placeholder_api_key
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
-from ..models.agent import Agent, AgentStatus
+from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
 from ..models.model import Model as DBModel
@@ -108,6 +108,8 @@ def _load_agent_for_task_create(
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if agent is None:
         return None
+    if is_workforce_generated_manager_agent(agent):
+        return None
     if int(agent.user_id) == int(user.id):
         return agent
     if not _is_published_agent(agent):
@@ -134,6 +136,13 @@ def _load_agent_for_task_runtime(
 
     agent = db.query(Agent).filter(Agent.id == task_agent_id).first()
     if agent is None:
+        return None
+    if is_workforce_generated_manager_agent(agent):
+        if (
+            workforce_runtime is not None
+            and workforce_runtime.manager_agent_id == task_agent_id
+        ):
+            return agent
         return None
     if int(agent.user_id) == int(task.user_id):
         return agent
@@ -345,6 +354,7 @@ def _build_tool_selection_spec_for_task(
         workforce_extra_names=(
             workforce_runtime.worker_tool_names if workforce_runtime else None
         ),
+        extras_only_when_unconfigured=workforce_runtime is not None,
     )
     if spec.is_all():
         logger.info(

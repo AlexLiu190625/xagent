@@ -57,10 +57,12 @@ RUN python -m venv /opt/venv \
 FROM backend-base AS backend-deps
 
 ARG PYPI_INDEX_URL=""
+ARG XAGENT_PACKAGE_VERSION="0.0.0+docker"
 
 COPY pyproject.toml uv.lock README.md ./
 
 RUN --mount=type=cache,target=/root/.cache/uv \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${XAGENT_PACKAGE_VERSION}" \
     VIRTUAL_ENV=/opt/venv uv sync --active --locked --no-dev --no-install-project --no-editable \
     --group backend-image \
     ${PYPI_INDEX_URL:+--default-index $PYPI_INDEX_URL}

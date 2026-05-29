@@ -23,6 +23,10 @@ import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
 import { InlineFilePreview } from '@/components/file/inline-file-preview';
+import {
+  isStoppedTraceProcessStatus,
+  resolveTraceProcessStatus,
+} from '@/lib/trace-process-status';
 
 // Types
 interface ToolArgs {
@@ -128,7 +132,7 @@ interface ProcessedStep {
   stepId: string;
   stepName: string;
   description: string;
-  status: 'pending' | 'running' | 'completed' | 'failed';
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'paused' | 'waiting_for_user';
   tools: Array<{ function: { name: string } }>;
   reasoning?: string;
   code: string;
@@ -139,7 +143,42 @@ interface ProcessedStep {
 
 interface TraceEventRendererProps {
   events: TraceEvent[];
+  taskStatus?: string;
 }
+
+function getTraceData(event: TraceEvent): NonNullable<TraceEvent['data']> {
+  if (event.data && typeof event.data === 'object') {
+    return event.data;
+  }
+  return event as unknown as NonNullable<TraceEvent['data']>;
+}
+
+const getWaitingQuestionFromEvents = (events: TraceEvent[]): string | null => {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.event_type === 'agent_message') {
+      const expectsResponse = event.data?.expect_response === true || event.data?.message_type === 'question';
+      if (!expectsResponse) {
+        continue;
+      }
+      const message = event.data?.message || event.data?.content;
+      if (typeof message === 'string' && message.trim()) {
+        return message;
+      }
+    }
+    if (event.event_type === 'react_task_end') {
+      const result = event.data?.result as any;
+      if (
+        result?.status === 'waiting_for_user' &&
+        typeof result.message === 'string' &&
+        result.message.trim()
+      ) {
+        return result.message;
+      }
+    }
+  }
+  return null;
+};
 
 const isAgentProgressEvent = (event: TraceEvent): boolean => (
   event.event_type === 'agent_progress' ||
@@ -151,7 +190,7 @@ const isAgentProgressEvent = (event: TraceEvent): boolean => (
 );
 
 // Process trace events into steps
-function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
+function useProcessedSteps(events: TraceEvent[], taskStatus?: string): ProcessedStep[] {
   const { t } = useI18n();
   return useMemo(() => {
     const stepsMap = new Map<string, ProcessedStep>();
@@ -182,8 +221,15 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         return;
       }
 
-      let stepId = event.step_id || (event.data?.step_id as string) || 'default';
+      const eventData = getTraceData(event);
+      let stepId = event.step_id || (eventData.step_id as string) || 'default';
       const isProgressMessage = isAgentProgressEvent(event);
+      if (event.event_type?.startsWith('workforce_delegation_')) {
+        stepId = String(
+          eventData.worker_task_id ||
+          `workforce-${eventData.workforce_run_id || 'run'}-${eventData.worker_member_id || eventData.agent_id || event.event_id || index}`
+        );
+      }
 
       if (event.event_type === 'react_task_start' || event.event_type === 'task_start_react') {
         currentReactStepId = stepId;
@@ -217,11 +263,11 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
 
       // Process different event types
       if (event.event_type === 'dag_step_start' || event.event_type === 'react_task_start') {
-        step.stepName = (event.data?.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
-        step.description = (event.data?.description as string) || (event.data?.task as string) || '';
+        step.stepName = (eventData.step_name as string) || (event.event_type === 'react_task_start' ? t('traceEventRenderer.taskExecution') : '');
+        step.description = (eventData.description as string) || (eventData.task as string) || '';
         step.status = 'running';
 
-        const tools = event.data?.tool_names || event.data?.tools;
+        const tools = eventData.tool_names || eventData.tools;
         if (tools && Array.isArray(tools)) {
           step.tools = tools.map((toolItem: any) => {
             if (typeof toolItem === 'string') return { function: { name: toolItem } };
@@ -235,26 +281,26 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         step.actions.push({
           id: eventId,
           type: 'llm',
-          title: t('traceEventRenderer.callLLM', { model: event.data?.model_name || t('traceEventRenderer.unknownModel') }),
+          title: t('traceEventRenderer.callLLM', { model: eventData.model_name || t('traceEventRenderer.unknownModel') }),
           status: 'running',
           timestamp,
-          data: { model: event.data?.model_name }
+          data: { model: eventData.model_name }
         });
       }
 
       if (event.event_type === 'llm_call_end' || event.event_type === 'llm_call_result') {
-        if (event.data?.response?.reasoning) {
-          step.reasoning = event.data.response.reasoning;
+        if (eventData.response?.reasoning) {
+          step.reasoning = eventData.response.reasoning;
         }
-        if (event.data?.tools) {
-          step.tools = event.data.tools;
+        if (eventData.tools) {
+          step.tools = eventData.tools;
         }
 
         const action = findLastRunningAction(step, 'llm');
         if (action) {
           action.status = 'completed';
-          action.data.reasoning = event.data?.response?.reasoning;
-          action.data.tool_calls = event.data?.tools;
+          action.data.reasoning = eventData.response?.reasoning;
+          action.data.tool_calls = eventData.tools;
         } else {
           // Fallback if no start event found
           step.actions.push({
@@ -264,8 +310,8 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
             status: 'completed',
             timestamp,
             data: {
-              reasoning: event.data?.response?.reasoning,
-              tool_calls: event.data?.tools
+              reasoning: eventData.response?.reasoning,
+              tool_calls: eventData.tools
             }
           });
         }
@@ -290,6 +336,74 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
               output: message.trim(),
               inline: true,
             }
+          });
+        }
+      }
+
+      if (event.event_type === 'workforce_delegation_start') {
+        const workerName = String(
+          eventData.worker_alias ||
+          eventData.agent_name ||
+          eventData.tool_name ||
+          t('traceEventRenderer.unknownWorker')
+        );
+        step.stepName = t('traceEventRenderer.workforceDelegation');
+        step.description = t('traceEventRenderer.delegateToWorker', { worker: workerName });
+        step.status = 'running';
+        step.actions.push({
+          id: eventId,
+          type: 'info',
+          title: t('traceEventRenderer.delegateToWorker', { worker: workerName }),
+          status: 'running',
+          timestamp,
+          data: {
+            tool: eventData.tool_name,
+            output: eventData,
+          }
+        });
+      }
+
+      if (event.event_type === 'workforce_delegation_end') {
+        const output = eventData.output || eventData.response || '';
+        step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
+        step.description = step.description || t('traceEventRenderer.workforceDelegation');
+        step.status = 'completed';
+        const action = step.actions.find((item) => item.type === 'info' && item.status === 'running');
+        if (action) {
+          action.status = 'completed';
+          action.data.output = output || eventData;
+        } else {
+          step.actions.push({
+            id: eventId,
+            type: 'info',
+            title: t('traceEventRenderer.workerReturned'),
+            status: 'completed',
+            timestamp,
+            data: { output: output || eventData }
+          });
+        }
+      }
+
+      if (event.event_type === 'workforce_delegation_error') {
+        const errorMessage = eventData.error || eventData.message || t('traceEventRenderer.unknownError');
+        step.stepName = step.stepName || t('traceEventRenderer.workforceDelegation');
+        step.description = step.description || t('traceEventRenderer.workforceDelegation');
+        step.status = 'failed';
+        const action = step.actions.find((item) => item.type === 'info' && item.status === 'running');
+        if (action) {
+          action.type = 'error';
+          action.title = t('traceEventRenderer.workerFailed');
+          action.status = 'failed';
+          action.data.output = undefined;
+          action.data.error = errorMessage;
+        } else {
+          step.actions.push({
+            id: eventId,
+            type: 'error',
+            title: t('traceEventRenderer.workerFailed'),
+            status: 'failed',
+            timestamp,
+            data: { error: errorMessage }
           });
         }
       }
@@ -436,7 +550,8 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
       }
 
       if (['dag_step_failed', 'tool_execution_failed', 'llm_call_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string)) {
-        const isTerminalFailure = ['dag_step_failed', 'react_task_failed', 'agent_error'].includes(event.event_type as string);
+        const isTerminalFailure =
+          ['dag_step_failed', 'react_task_failed', 'agent_error', 'trace_error'].includes(event.event_type as string);
         if (isTerminalFailure) {
           step.status = 'failed';
         } else if (step.status === 'pending') {
@@ -447,7 +562,8 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
         const errorData = event.data || {};
         let errorMessage =
           errorData.error ||
-          errorData.message;
+          errorData.message ||
+          errorData.error_message;
 
         if (!errorMessage && errorData.result) {
           errorMessage = (errorData.result as any).error || (errorData.result as any).message;
@@ -489,8 +605,42 @@ function useProcessedSteps(events: TraceEvent[]): ProcessedStep[] {
       }
     });
 
-    return Array.from(stepsMap.values()).filter(step => step.stepName);
-  }, [events, t]);
+    const steps = Array.from(stepsMap.values()).filter(step => step.stepName);
+
+    if (isStoppedTraceProcessStatus(taskStatus)) {
+      steps.forEach((step) => {
+        const runningActions = step.actions.filter(action => action.status === 'running');
+        if (taskStatus === 'failed' && (step.status !== 'completed' || runningActions.length > 0)) {
+          step.status = 'failed';
+          runningActions.forEach((action) => {
+            action.status = 'failed';
+            action.data.error = action.data.error || t('traceEventRenderer.unknownError');
+          });
+          return;
+        }
+
+        if (taskStatus === 'completed' && step.status !== 'failed') {
+          step.status = 'completed';
+          runningActions.forEach((action) => {
+            action.status = 'completed';
+          });
+          return;
+        }
+
+        if (
+          (taskStatus === 'paused' || taskStatus === 'waiting_for_user') &&
+          (step.status === 'pending' || step.status === 'running')
+        ) {
+          step.status = taskStatus;
+          runningActions.forEach((action) => {
+            action.status = 'completed';
+          });
+        }
+      });
+    }
+
+    return steps;
+  }, [events, taskStatus, t]);
 }
 
 
@@ -1050,6 +1200,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
   const { t } = useI18n();
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
+  const isPaused = step.status === 'paused' || step.status === 'waiting_for_user';
   const [isExpanded, setIsExpanded] = useState(() => !isCompleted);
   const wasCompletedRef = useRef(isCompleted);
   const rawTitle = step.description || step.stepName;
@@ -1087,6 +1238,8 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
           <CheckCircle2 className="w-5 h-5 text-green-500 mt-0.5" />
         ) : isFailed ? (
           <Info className="w-5 h-5 text-red-500 mt-0.5" />
+        ) : isPaused ? (
+          <Info className="w-5 h-5 text-yellow-500 mt-0.5" />
         ) : (
           <Loader2 className="w-5 h-5 text-primary animate-spin mt-0.5" />
         )}
@@ -1136,9 +1289,13 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
 }
 
 // Main TraceEventRenderer Component
-export function TraceEventRenderer({ events }: TraceEventRendererProps) {
+export function TraceEventRenderer({ events, taskStatus }: TraceEventRendererProps) {
   const { t } = useI18n();
-  const steps = useProcessedSteps(events);
+  const processStatus = resolveTraceProcessStatus({
+    taskStatus,
+    traceEvents: events,
+  });
+  const steps = useProcessedSteps(events, processStatus);
   const router = useRouter();
 
   const { openFilePreview, dispatch } = useApp();

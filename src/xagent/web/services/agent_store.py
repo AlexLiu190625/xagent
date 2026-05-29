@@ -8,7 +8,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from ...core.utils.type_check import ensure_list
-from ..models.agent import Agent, AgentStatus
+from ..models.agent import Agent, AgentOrigin, AgentStatus
 from ..models.agent_api_key import AgentApiKey
 from ..models.task import Task
 from .hot_path_cache import (
@@ -90,6 +90,7 @@ class AgentStore:
         agents = (
             self.db.query(Agent)
             .filter(Agent.user_id == user_id)
+            .filter(Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value)
             .order_by(Agent.created_at.desc())
             .all()
         )
@@ -114,7 +115,11 @@ class AgentStore:
     def get_owned_agent(self, user_id: int, agent_id: int) -> Agent | None:
         return (
             self.db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == user_id)
+            .filter(
+                Agent.id == agent_id,
+                Agent.user_id == user_id,
+                Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
             .first()
         )
 
@@ -122,7 +127,9 @@ class AgentStore:
         self, user_id: int, name: str, *, exclude_agent_id: int | None = None
     ) -> bool:
         query = self.db.query(Agent.id).filter(
-            Agent.user_id == user_id, Agent.name == name
+            Agent.user_id == user_id,
+            Agent.name == name,
+            Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
         )
         if exclude_agent_id is not None:
             query = query.filter(Agent.id != exclude_agent_id)
@@ -141,6 +148,7 @@ class AgentStore:
         skills: list[str] | None = None,
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
+        origin: str = AgentOrigin.USER.value,
         status: AgentStatus = AgentStatus.DRAFT,
         published_at: datetime | None = None,
         widget_enabled: bool = True,
@@ -157,6 +165,7 @@ class AgentStore:
             skills=skills,
             tool_categories=tool_categories,
             suggested_prompts=suggested_prompts,
+            origin=origin,
             status=status,
             published_at=published_at,
             widget_enabled=widget_enabled,
@@ -180,6 +189,7 @@ class AgentStore:
         skills: list[str] | None = None,
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
+        origin: str = AgentOrigin.USER.value,
         status: AgentStatus = AgentStatus.DRAFT,
         published_at: datetime | None = None,
         widget_enabled: bool = True,
@@ -198,6 +208,7 @@ class AgentStore:
             skills=skills or [],
             tool_categories=tool_categories or [],
             suggested_prompts=suggested_prompts or [],
+            origin=origin,
             status=status,
             published_at=published_at,
             widget_enabled=widget_enabled,

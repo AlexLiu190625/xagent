@@ -64,15 +64,17 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from xagent.core.tools.adapters.vibe.agent_tool_names import (
+    LEGACY_AGENT_TOOL_NAME_PREFIX,
+    is_agent_tool_name,
+)
+
 logger = logging.getLogger(__name__)
 
 
-# Tool name prefix used by the runtime when one agent invokes another
-# as a tool. Calls matching this prefix are routed to the public
-# ``agent_delegation`` type instead of ``tool_call`` so SDK consumers
-# can render them differently (e.g. nested timeline) without having
-# to pattern-match tool names client-side.
-_AGENT_DELEGATION_PREFIX = "call_agent_"
+# Agent tool names are routed to the public ``agent_delegation`` type
+# instead of ``tool_call`` so SDK consumers can render nested
+# timelines without pattern-matching tool names client-side.
 
 
 def map_trace_events_to_public_steps(
@@ -106,9 +108,9 @@ def map_trace_events_to_public_steps(
           - ``tool_call``: ``{"name", "args", "result"?, "error"?}``
             (``result`` populated on success, ``error`` on failure)
           - ``agent_delegation``: ``{"sub_agent_name", "input"?, "output"?}``
-            (``sub_agent_name`` is extracted from
-            ``call_agent_<name>``; ``input`` from ``tool_args`` if
-            available, ``output`` from end event's ``result``)
+            (``sub_agent_name`` is derived from the agent tool name;
+            ``input`` from ``tool_args`` if available, ``output`` from
+            end event's ``result``)
           - ``message``: ``{"role": "user"|"assistant", "content": str}``
 
     Notes:
@@ -206,9 +208,7 @@ def map_trace_events_to_public_steps(
             "tool_execution_failed",
         ):
             tool_name = _data_get(event, "tool_name")
-            is_delegation = isinstance(tool_name, str) and tool_name.startswith(
-                _AGENT_DELEGATION_PREFIX
-            )
+            is_delegation = is_agent_tool_name(tool_name)
             public_type = "agent_delegation" if is_delegation else "tool_call"
             # Pair on a per-invocation id (unique even when one step
             # invokes the same tool twice). v1 emits
@@ -379,9 +379,9 @@ def _build_tool_start(
 ) -> Dict[str, Any]:
     """Build the start side of a tool_call or agent_delegation step.
 
-    For ``agent_delegation`` we extract ``sub_agent_name`` from the
-    ``call_agent_<name>`` prefix so SDK consumers don't have to do
-    the string surgery themselves.
+    For legacy ``call_agent_<name>`` delegation tool names we extract
+    the suffix for backward-compatible display. Canonical ``agent_<id>``
+    names are already the stable public identifier.
 
     The args/input value lives under different keys depending on which
     runtime emitted the event: v1 uses ``tool_args``, v2 uses
@@ -398,7 +398,11 @@ def _build_tool_start(
         else None
     )
     if public_type == "agent_delegation" and isinstance(tool_name, str):
-        sub_agent_name = tool_name[len(_AGENT_DELEGATION_PREFIX) :] or tool_name
+        sub_agent_name = (
+            tool_name.removeprefix(LEGACY_AGENT_TOOL_NAME_PREFIX)
+            if tool_name.startswith(LEGACY_AGENT_TOOL_NAME_PREFIX)
+            else tool_name
+        )
         data = {
             "sub_agent_name": sub_agent_name,
             "input": args,

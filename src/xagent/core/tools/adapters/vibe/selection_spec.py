@@ -169,6 +169,7 @@ class ToolSelectionSpec(ABC):
         published_agent_ids: Optional[List[int]] = None,
         workforce_extra_names: Optional[Set[str]] = None,
         explicit_none: bool = False,
+        extras_only_when_unconfigured: bool = False,
     ) -> "ToolSelectionSpec":
         """Build a spec from raw ORM / dict / SDK fields.
 
@@ -182,16 +183,31 @@ class ToolSelectionSpec(ABC):
           - ``explicit_none=True`` → ``_SpecNone`` regardless of
             ``tool_categories`` (reserved for future "zero tools"
             product UI).
+          - ``extras_only_when_unconfigured=True`` with unset / empty
+            categories → only ``workforce_extra_names`` are admitted
+            (or ``_SpecNone`` when there are no extras). Workforce
+            manager tasks use this so an unconfigured manager can only
+            delegate to its workers by default, without inheriting the
+            full ordinary tool set.
           - Otherwise → ``_SpecByCategories``.
 
-        ``workforce_extra_names`` is only meaningful in
+        By default, ``workforce_extra_names`` is only meaningful in
         BY_CATEGORIES mode (ALL already includes everything; NONE
-        rejects everything). It is silently ignored in ALL / NONE
-        to avoid forcing callers to branch.
+        rejects everything). ``extras_only_when_unconfigured`` is the
+        opt-in exception for workforce manager runtime construction.
         """
         if explicit_none:
             return _SpecNone()
         if tool_categories is None or len(tool_categories) == 0:
+            if extras_only_when_unconfigured:
+                name_extras = frozenset(workforce_extra_names or ())
+                if not name_extras:
+                    return _SpecNone()
+                return _SpecByCategories(
+                    categories=frozenset(),
+                    name_extras=name_extras,
+                    _user_picked=frozenset(),
+                )
             return _SpecAll()
 
         # Agent-builder UI representation in ``tool_categories`` mixes
@@ -378,9 +394,9 @@ class _SpecNone(ToolSelectionSpec):
 class _SpecByCategories(ToolSelectionSpec):
     """BY_CATEGORIES mode — filtered build.
 
-    ``categories`` MUST be non-empty (the ``from_raw`` normalizer
-    routes empty input to ``_SpecAll``; direct construction with
-    empty categories raises ``ValueError`` at __post_init__).
+    ``categories`` is normally non-empty. The one valid empty-category
+    state is workforce manager injection: no ordinary categories, but
+    explicit ``name_extras`` worker-agent tools.
     """
 
     categories: frozenset[str] = field(default_factory=frozenset)
@@ -402,9 +418,10 @@ class _SpecByCategories(ToolSelectionSpec):
     _user_picked: Optional[frozenset[str]] = None
 
     def __post_init__(self) -> None:
-        if not self.categories:
+        if not self.categories and not self.name_extras:
             raise ValueError(
-                "_SpecByCategories requires non-empty categories. "
+                "_SpecByCategories requires non-empty categories or "
+                "name_extras. "
                 "Use ToolSelectionSpec.from_raw() with empty / None "
                 "categories to get _SpecAll, or pass "
                 "explicit_none=True for _SpecNone."
@@ -472,6 +489,8 @@ class _SpecByCategories(ToolSelectionSpec):
         return True
 
     def includes_published_agent(self) -> bool:
+        if self.name_extras:
+            return True
         if "agent" not in self.categories:
             return False
         if self.published_agent_ids is not None and len(self.published_agent_ids) == 0:

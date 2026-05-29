@@ -34,7 +34,7 @@ from ....core.utils.api_key import (
     verify_api_key,
     verify_dummy,
 )
-from ...models.agent import Agent
+from ...models.agent import Agent, is_workforce_generated_manager_agent
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
 from ...models.user import User
@@ -124,7 +124,7 @@ async def get_agent_from_api_key(
     # invalid_api_key rather than 404 so the client retries with a
     # fresh key instead of investigating an imaginary agent.
     agent = key_row.agent
-    if agent is None:
+    if agent is None or is_workforce_generated_manager_agent(agent):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     return agent, key_row

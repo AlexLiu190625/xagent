@@ -14,8 +14,9 @@ import bcrypt
 import pytest
 
 from xagent.core.utils.api_key import BCRYPT_COST
+from xagent.web.models.agent import Agent, AgentOrigin
 
-from ..conftest import _admin_headers, client
+from ..conftest import _admin_headers, _direct_db_session, client
 
 # Opt this file into the shared conftest ``_test_db`` fixture. See the
 # note in test_agent_api_keys.py for why we use ``usefixtures`` with a
@@ -55,6 +56,17 @@ def _create_personal_key() -> tuple[str, str]:
     assert key_resp.status_code == 200, key_resp.text
     body = key_resp.json()
     return body["full_key"], body["key_prefix"]
+
+
+def _mark_generated_manager(agent_id: int) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(Agent).filter(Agent.id == agent_id).update(
+            {"origin": AgentOrigin.WORKFORCE_GENERATED_MANAGER.value}
+        )
+        db.commit()
+    finally:
+        db.close()
 
 
 # ===== happy path =====
@@ -147,6 +159,22 @@ def test_revoked_key_returns_401():
     assert revoke.json()["revoked"] is True
 
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+    _assert_invalid_api_key(resp)
+
+
+def test_generated_manager_key_returns_401():
+    agent_id, full_key, _prefix = _create_agent_and_key()
+    _mark_generated_manager(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
     _assert_invalid_api_key(resp)
 
 

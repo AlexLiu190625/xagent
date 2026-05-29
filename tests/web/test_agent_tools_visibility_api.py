@@ -101,12 +101,12 @@ def test_published_agent_is_callable_for_owner_and_hidden_from_other_users() -> 
         owner_tools = client.get("/api/tools/available", headers=admin_headers)
         assert owner_tools.status_code == 200
         owner_names = {tool["name"] for tool in owner_tools.json()["tools"]}
-        assert "call_agent_admin_published_agent" in owner_names
+        assert f"agent_{agent_id}" in owner_names
 
         other_tools = client.get("/api/tools/available", headers=regular_headers)
         assert other_tools.status_code == 200
         other_names = {tool["name"] for tool in other_tools.json()["tools"]}
-        assert "call_agent_admin_published_agent" not in other_names
+        assert f"agent_{agent_id}" not in other_names
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -135,7 +135,7 @@ def test_unpublish_moves_agent_back_to_non_callable_state() -> None:
         names_after_publish = {
             tool["name"] for tool in tools_after_publish.json()["tools"]
         }
-        assert "call_agent_admin_toggle_agent" in names_after_publish
+        assert f"agent_{agent_id}" in names_after_publish
 
         unpublish_response = client.post(
             f"/api/agents/{agent_id}/unpublish",
@@ -150,7 +150,7 @@ def test_unpublish_moves_agent_back_to_non_callable_state() -> None:
         names_after_unpublish = {
             tool["name"] for tool in tools_after_unpublish.json()["tools"]
         }
-        assert "call_agent_admin_toggle_agent" not in names_after_unpublish
+        assert f"agent_{agent_id}" not in names_after_unpublish
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:

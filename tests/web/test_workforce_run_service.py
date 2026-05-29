@@ -9,7 +9,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
-from xagent.web.api.chat import AgentServiceManager, create_default_tools
+from xagent.web.api.chat import (
+    AgentServiceManager,
+    _build_tool_selection_spec_for_task,
+    create_default_tools,
+)
 from xagent.web.models import Agent, Base, Task, User, Workforce, WorkforceRun
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
@@ -20,6 +24,7 @@ from xagent.web.services.task_lease_service import acquire_task_lease
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 from xagent.web.services.workforce_runs import create_workforce_run
 from xagent.web.services.workforce_runtime import (
+    WorkforceTaskRuntime,
     _map_task_status,
     release_current_runner_task_lease_with_workforce_sync,
     release_task_lease_with_workforce_sync,
@@ -141,6 +146,28 @@ def _patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
 
     monkeypatch.setattr(task_orchestrator_module, "_schedule_bg", fake_schedule_bg)
     return scheduled
+
+
+def _mock_tool(name: str, category: str) -> Any:
+    tool = MagicMock()
+    tool.name = name
+    tool.metadata = MagicMock()
+    tool.metadata.category = MagicMock()
+    tool.metadata.category.value = category
+    return tool
+
+
+def _workforce_runtime_with_worker_tools(*tool_names: str) -> WorkforceTaskRuntime:
+    return WorkforceTaskRuntime(
+        workforce_run_id=1,
+        workforce_id=1,
+        snapshot={},
+        allowed_agent_ids=[idx + 1 for idx, _ in enumerate(tool_names)],
+        agent_tool_overrides={},
+        worker_tool_names=set(tool_names),
+        manager_system_prompt=None,
+        manager_agent_id=100,
+    )
 
 
 @pytest.mark.asyncio
@@ -631,7 +658,7 @@ async def test_create_default_tools_forwards_workforce_delegation_config(
     )
 
     user = _create_user(db_session, "owner")
-    overrides = {42: {"tool_name": "call_workforce_worker_1_research"}}
+    overrides = {42: {"tool_name": "agent_42"}}
 
     await create_default_tools(
         db_session,
@@ -653,3 +680,42 @@ async def test_create_default_tools_forwards_workforce_delegation_config(
         "parent_task_id": "123",
         "agent_call_stack": [7],
     }
+
+
+def test_workforce_manager_without_tool_categories_gets_only_worker_tools() -> None:
+    spec = _build_tool_selection_spec_for_task(
+        {"tool_categories": []},
+        _workforce_runtime_with_worker_tools("agent_1", "agent_2"),
+        task_id=123,
+    )
+
+    assert spec.is_by_categories()
+    assert spec.categories == frozenset()
+    assert spec.compute_allowed_names(
+        [
+            _mock_tool("exa_web_search", "basic"),
+            _mock_tool("write_file", "file"),
+            _mock_tool("agent_1", "agent"),
+            _mock_tool("agent_2", "agent"),
+            _mock_tool("agent_99", "agent"),
+        ]
+    ) == frozenset({"agent_1", "agent_2"})
+
+
+def test_workforce_manager_with_tool_categories_keeps_categories_and_workers() -> None:
+    spec = _build_tool_selection_spec_for_task(
+        {"tool_categories": ["browser"]},
+        _workforce_runtime_with_worker_tools("agent_1"),
+        task_id=123,
+    )
+
+    assert spec.is_by_categories()
+    assert spec.categories == frozenset({"browser"})
+    assert spec.compute_allowed_names(
+        [
+            _mock_tool("exa_web_search", "basic"),
+            _mock_tool("browser_use", "browser"),
+            _mock_tool("agent_1", "agent"),
+            _mock_tool("agent_99", "agent"),
+        ]
+    ) == frozenset({"browser_use", "agent_1"})

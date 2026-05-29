@@ -137,11 +137,20 @@ class TaskWorkspace:
 
         # Check if file already exists in database
         resolved_db_session = db_session or self.db_session
+        cached_file_id = self._recently_registered_files.get(str(resolved_path))
+        if cached_file_id:
+            self._sync_existing_file_record(
+                cached_file_id, resolved_path, resolved_db_session
+            )
+            self._remember_file_registration(cached_file_id, resolved_path)
+            return cached_file_id
+
         existing_file_id = self._get_file_id_from_db(resolved_path, resolved_db_session)
         if existing_file_id:
             self._sync_existing_file_record(
                 existing_file_id, resolved_path, resolved_db_session
             )
+            self._remember_file_registration(existing_file_id, resolved_path)
             return existing_file_id
 
         # Generate new file_id if not provided
@@ -151,8 +160,114 @@ class TaskWorkspace:
 
         # Create database record
         self._create_file_record(final_file_id, resolved_path, db_session)
+        self._remember_file_registration(final_file_id, resolved_path)
 
         return final_file_id
+
+    def _remember_file_registration(self, file_id: str, file_path: Path) -> None:
+        path_str = str(file_path)
+        resolved_str = str(file_path.resolve())
+        self._recently_registered_files[path_str] = file_id
+        self._recently_registered_files[resolved_str] = file_id
+        self._file_id_to_path[file_id] = file_path
+
+    def _is_delegated_db_task_workspace(self, task_id: int) -> bool:
+        if self.db_task_id is None:
+            return False
+        parsed_task_id = self._parse_task_id_from_workspace_id(self.id)
+        return parsed_task_id != int(task_id)
+
+    def _user_workspace_base_dir(self, user_id: int) -> Path:
+        user_segment = f"user_{user_id}"
+        if self.base_dir.name == user_segment:
+            return self.base_dir
+        return self.base_dir / user_segment
+
+    @staticmethod
+    def _storage_path_record(
+        db: Any, storage_path: Path, file_id: Optional[str] = None
+    ) -> Any:
+        from ..web.models.uploaded_file import UploadedFile
+
+        query = db.query(UploadedFile).filter(
+            UploadedFile.storage_path == str(storage_path)
+        )
+        record = query.first()
+        if record is None or file_id is None or str(record.file_id) == str(file_id):
+            return record
+        return record
+
+    @classmethod
+    def _unique_registration_path(
+        cls, target_path: Path, source_path: Path, db: Any, file_id: str
+    ) -> Path:
+        stem = target_path.stem
+        suffix = target_path.suffix
+        parent = target_path.parent
+        candidate = target_path
+        index = 1
+
+        source_resolved = source_path.resolve()
+        while True:
+            try:
+                candidate_resolved = candidate.resolve()
+            except OSError:
+                candidate_resolved = candidate.absolute()
+            record = cls._storage_path_record(db, candidate, file_id)
+            same_record = record is not None and str(record.file_id) == str(file_id)
+            record_conflicts = record is not None and str(record.file_id) != str(
+                file_id
+            )
+            path_conflicts = (
+                candidate.exists()
+                and candidate_resolved != source_resolved
+                and not same_record
+            )
+            if not record_conflicts and not path_conflicts:
+                return candidate
+            candidate = parent / f"{stem}_{index}{suffix}"
+            index += 1
+
+    def _canonicalize_delegated_output_registration(
+        self,
+        *,
+        db: Any,
+        file_id: str,
+        file_path: Path,
+        task_id: int,
+        user_id: int,
+        relative_path: str,
+        category: str,
+    ) -> tuple[Path, str, str]:
+        if category != "output" or not self._is_delegated_db_task_workspace(task_id):
+            return file_path, relative_path, category
+
+        relative_parts = Path(relative_path).parts
+        output_parts = [
+            part for part in relative_parts[1:] if part not in ("", ".", "..")
+        ]
+        if not output_parts:
+            output_parts = [file_path.name]
+
+        canonical_relative_path = Path("output", *output_parts).as_posix()
+        task_root = self._user_workspace_base_dir(user_id) / f"web_task_{task_id}"
+        output_root = (task_root / "output").resolve()
+        canonical_path = (task_root / canonical_relative_path).resolve()
+        try:
+            canonical_path.relative_to(output_root)
+        except ValueError:
+            canonical_relative_path = Path("output", file_path.name).as_posix()
+            canonical_path = (task_root / canonical_relative_path).resolve()
+
+        canonical_path = self._unique_registration_path(
+            canonical_path, file_path, db, file_id
+        )
+        canonical_relative_path = canonical_path.relative_to(task_root).as_posix()
+        if canonical_path.resolve() != file_path.resolve():
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file_path, canonical_path)
+
+        return canonical_path, canonical_relative_path, "output"
 
     def _create_file_record(
         self, file_id: str, file_path: Path, db_session: Any = None
@@ -209,6 +324,18 @@ class TaskWorkspace:
             except ValueError:
                 relative_path = file_path.name
             category = relative_path.split("/", 1)[0] if relative_path else "workspace"
+
+            file_path, relative_path, category = (
+                self._canonicalize_delegated_output_registration(
+                    db=db,
+                    file_id=file_id,
+                    file_path=file_path,
+                    task_id=int(task_id),
+                    user_id=int(task.user_id),
+                    relative_path=relative_path,
+                    category=category,
+                )
+            )
 
             from ..web.services.uploaded_file_store import UploadedFileStore
 
@@ -304,6 +431,17 @@ class TaskWorkspace:
                 user_id = task_user_id
 
             category = relative_path.split("/", 1)[0] if relative_path else "workspace"
+            file_path, relative_path, category = (
+                self._canonicalize_delegated_output_registration(
+                    db=db,
+                    file_id=file_id,
+                    file_path=file_path,
+                    task_id=int(task_id) if task_id is not None else 0,
+                    user_id=user_id,
+                    relative_path=relative_path,
+                    category=category,
+                )
+            )
             storage_key = _build_workspace_storage_key(
                 user_id,
                 int(task_id) if task_id is not None else 0,
@@ -313,16 +451,18 @@ class TaskWorkspace:
             if task_id is None:
                 storage_key = getattr(record, "storage_key", None) or storage_key
 
-            UploadedFileStore(db).upsert_by_storage_path(
-                user_id=user_id,
-                filename=file_path.name,
-                storage_path=file_path,
-                mime_type=mime_type,
-                file_size=file_path.stat().st_size,
+            record.user_id = user_id
+            record.task_id = int(task_id) if task_id is not None else None
+            record.filename = file_path.name
+            record.storage_path = str(file_path)
+            record.file_size = file_path.stat().st_size
+            record.mime_type = mime_type
+            record.workspace_relative_path = relative_path
+            record.workspace_category = category
+            UploadedFileStore(db).sync_existing(
+                record,
                 storage_key=storage_key,
-                task_id=int(task_id) if task_id is not None else None,
-                workspace_relative_path=relative_path,
-                workspace_category=category,
+                mime_type=mime_type,
             )
             if should_close:
                 db.commit()

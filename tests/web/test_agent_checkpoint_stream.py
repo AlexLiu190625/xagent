@@ -78,6 +78,55 @@ def test_action_llm_error_maps_to_llm_call_failed() -> None:
     assert get_event_type_mapping(event) == "llm_call_failed"
 
 
+def test_workforce_delegation_summary_maps_to_public_stream_event() -> None:
+    event = TraceEvent(
+        TraceEventType(TraceScope.TASK, TraceAction.UPDATE, TraceCategory.GENERAL),
+        task_id="365",
+        data={
+            "event_type": "workforce_delegation_start",
+            "status": "start",
+            "agent_id": 12,
+            "agent_name": "Researcher",
+            "worker_alias": "Research",
+            "worker_task_id": "agent_12_abcd1234",
+            "messages": [{"role": "user", "content": "raw prompt"}],
+        },
+    )
+
+    stream_event = WebSocketTraceHandler(365)._convert_trace_event_to_stream_event(
+        event
+    )
+
+    assert stream_event is not None
+    assert stream_event["event_type"] == "workforce_delegation_start"
+    assert stream_event["data"]["worker_alias"] == "Research"
+    assert stream_event["data"]["worker_task_id"] == "agent_12_abcd1234"
+    assert "messages" not in stream_event["data"]
+    assert "event_type" not in stream_event["data"]
+
+
+def test_non_task_update_event_with_delegation_payload_is_not_promoted() -> None:
+    event = TraceEvent(
+        TraceEventType(TraceScope.ACTION, TraceAction.END, TraceCategory.TOOL),
+        task_id="365",
+        step_id="step-1",
+        data={
+            "event_type": "workforce_delegation_end",
+            "tool_name": "agent_12",
+            "output": "worker response",
+        },
+    )
+
+    stream_event = WebSocketTraceHandler(365)._convert_trace_event_to_stream_event(
+        event
+    )
+
+    assert stream_event is not None
+    assert stream_event["event_type"] == "tool_execution_end"
+    assert stream_event["data"]["event_type"] == "workforce_delegation_end"
+    assert stream_event["data"]["output"] == "worker response"
+
+
 def test_historical_stream_identifies_agent_checkpoint_payload() -> None:
     assert _is_agent_checkpoint_data(
         {
@@ -591,6 +640,74 @@ async def test_historical_replay_skips_audit_only_trace_events(monkeypatch) -> N
 
     assert "audit-workforce" not in trace_event_ids
     assert "visible-tool" in trace_event_ids
+
+
+@pytest.mark.asyncio
+async def test_historical_replay_promotes_workforce_delegation_summary(
+    monkeypatch,
+) -> None:
+    SessionLocal, db, task = _create_trace_handler_test_task("delegation-history")
+    try:
+        task_id = int(task.id)
+        user_id = int(task.user_id)
+        base_time = datetime(2026, 5, 22, tzinfo=timezone.utc)
+        db.add(
+            DatabaseTraceEvent(
+                task_id=task_id,
+                event_id="delegation-end",
+                event_type="task_update_general",
+                timestamp=base_time + timedelta(seconds=1),
+                data={
+                    "event_type": "workforce_delegation_end",
+                    "status": "end",
+                    "worker_task_id": "agent_123_abcd1234",
+                    "worker_alias": "Writer",
+                    "output": "draft complete",
+                    "messages": [{"role": "user", "content": "raw prompt"}],
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    def get_test_db() -> Iterator[Session]:
+        session = SessionLocal()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    sent_events: list[dict] = []
+
+    async def send_personal_message(event: dict, websocket: object) -> None:
+        sent_events.append(event)
+
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr("xagent.web.api.websocket.cache_get", lambda *args: None)
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.cache_set", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        "xagent.web.api.websocket.manager.send_personal_message",
+        send_personal_message,
+    )
+
+    await send_historical_data_as_stream(
+        websocket=object(),
+        task_id=task_id,
+        user=SimpleNamespace(id=user_id, is_admin=False),
+    )
+
+    delegation_event = next(
+        event for event in sent_events if event.get("event_id") == "delegation-end"
+    )
+    assert delegation_event["event_type"] == "workforce_delegation_end"
+    assert delegation_event["data"]["worker_alias"] == "Writer"
+    assert delegation_event["data"]["worker_task_id"] == "agent_123_abcd1234"
+    assert delegation_event["data"]["output"] == "draft complete"
+    assert "messages" not in delegation_event["data"]
+    assert "event_type" not in delegation_event["data"]
 
 
 @pytest.mark.asyncio

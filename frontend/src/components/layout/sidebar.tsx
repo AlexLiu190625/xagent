@@ -180,6 +180,13 @@ export const getNavigationGroupsForUser = (user: any): NavigationGroup[] => [
         icon: LayoutTemplate,
         color: "text-purple-400"
       },
+      {
+        name: "Workforces",
+        nameKey: "nav.workforces",
+        href: "/workforces",
+        icon: Layers,
+        color: "text-cyan-500"
+      },
     ]
   },
   {

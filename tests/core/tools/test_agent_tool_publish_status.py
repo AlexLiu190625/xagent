@@ -93,7 +93,7 @@ def test_non_owner_cannot_see_other_users_published_agent_tools() -> None:
         tools_for_other = get_published_agents_tools(db=db, user_id=2)
         tool_names = {tool.name for tool in tools_for_other}
 
-        assert "call_agent_owner_published_agent" not in tool_names
+        assert f"agent_{published_agent.id}" not in tool_names
     finally:
         db.close()
         try:
@@ -128,8 +128,38 @@ def test_owner_sees_only_own_published_agents_not_drafts() -> None:
         tools_for_owner = get_published_agents_tools(db=db, user_id=1)
         tool_names = {tool.name for tool in tools_for_owner}
 
-        assert "call_agent_owner_published_agent" in tool_names
-        assert "call_agent_owner_draft_agent" not in tool_names
+        assert f"agent_{published_agent.id}" in tool_names
+        assert f"agent_{draft_agent.id}" not in tool_names
+    finally:
+        db.close()
+        try:
+            import os
+
+            os.remove(db_path)
+        except OSError:
+            pass
+
+
+def test_published_agent_tool_name_is_id_based_for_non_ascii_names() -> None:
+    db, db_path = _create_session()
+    try:
+        owner = User(username="owner_non_ascii", password_hash="x", is_admin=False)
+        db.add(owner)
+        db.commit()
+        db.refresh(owner)
+
+        published_agent = Agent(
+            user_id=owner.id,
+            name="中文整理助手",
+            status=AgentStatus.PUBLISHED,
+        )
+        db.add(published_agent)
+        db.commit()
+        db.refresh(published_agent)
+
+        tools = get_published_agents_tools(db=db, user_id=owner.id)
+
+        assert {tool.name for tool in tools} == {f"agent_{published_agent.id}"}
     finally:
         db.close()
         try:
@@ -191,10 +221,10 @@ def test_allowed_agent_ids_include_only_selected_published_user_agents() -> None
         )
         tool_names = {tool.name for tool in tools}
 
-        assert "call_agent_selected_published_agent" in tool_names
-        assert "call_agent_selected_draft_agent" not in tool_names
-        assert "call_agent_unselected_published_agent" not in tool_names
-        assert "call_agent_other_users_agent" not in tool_names
+        assert f"agent_{selected_published.id}" in tool_names
+        assert f"agent_{selected_draft.id}" not in tool_names
+        assert f"agent_{unselected_published.id}" not in tool_names
+        assert f"agent_{other_users_agent.id}" not in tool_names
     finally:
         db.close()
         try:
@@ -230,7 +260,7 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
             allowed_agent_ids=[published_agent.id],
             enable_global_agent_tools=False,
         )
-        assert "call_agent_shared_workforce_worker" not in {
+        assert f"agent_{published_agent.id}" not in {
             tool.name for tool in blocked_tools
         }
 
@@ -241,9 +271,7 @@ def test_allowed_agent_ids_can_cross_users_only_when_enabled() -> None:
             enable_global_agent_tools=False,
             allow_cross_user_agent_ids=True,
         )
-        assert "call_agent_shared_workforce_worker" in {
-            tool.name for tool in allowed_tools
-        }
+        assert f"agent_{published_agent.id}" in {tool.name for tool in allowed_tools}
     finally:
         db.close()
         try:
@@ -514,8 +542,8 @@ def test_agent_call_stack_prevents_recursive_agent_tools() -> None:
         )
         tool_names = {tool.name for tool in tools}
 
-        assert "call_agent_active_agent" not in tool_names
-        assert "call_agent_other_agent" in tool_names
+        assert f"agent_{active_agent.id}" not in tool_names
+        assert f"agent_{other_agent.id}" in tool_names
     finally:
         db.close()
         try:
@@ -565,7 +593,7 @@ def test_worker_overrides_inject_selected_agent_tool_metadata() -> None:
             },
         )
 
-        assert [tool.name for tool in tools] == ["call_workforce_worker_1_writer"]
+        assert [tool.name for tool in tools] == [f"agent_{worker.id}"]
         assert tools[0].description == "Write the workforce report."
     finally:
         db.close()
