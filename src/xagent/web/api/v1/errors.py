@@ -52,6 +52,9 @@ class V1ErrorCode(str, Enum):
     # Also 404 for the same leak-prevention reason.
     TASK_NOT_FOUND = "task_not_found"
 
+    # Template id is unknown or unavailable to the caller.
+    TEMPLATE_NOT_FOUND = "template_not_found"
+
     # The task is currently running and cannot accept new input.
     # 409 Conflict. Client should retry after polling task status.
     TASK_BUSY = "task_busy"
@@ -78,6 +81,7 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INVALID_API_KEY: "Invalid or revoked API key.",
     V1ErrorCode.AGENT_NOT_FOUND: "Agent not found or not accessible with this key.",
     V1ErrorCode.TASK_NOT_FOUND: "Task not found or not accessible with this key.",
+    V1ErrorCode.TEMPLATE_NOT_FOUND: "Template not found.",
     V1ErrorCode.TASK_BUSY: "Task is currently running; retry after it completes.",
     V1ErrorCode.INVALID_INPUT: "Request body failed validation.",
     V1ErrorCode.RATE_LIMITED: "Rate limit exceeded; retry later.",

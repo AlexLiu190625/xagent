@@ -19,11 +19,15 @@ Re-exports ``v1_router`` for ``web/app.py`` to mount under ``/v1``.
 
 from fastapi import APIRouter
 
+from .agents import router as _agents_router
 from .me import router as _me_router
 from .tasks import router as _tasks_router
+from .templates import router as _templates_router
 
 v1_router = APIRouter(prefix="/v1", tags=["sdk-v1"])
 v1_router.include_router(_me_router)
+v1_router.include_router(_templates_router)
+v1_router.include_router(_agents_router)
 v1_router.include_router(_tasks_router)
 
 __all__ = ["v1_router"]
