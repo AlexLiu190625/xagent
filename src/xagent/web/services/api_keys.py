@@ -193,8 +193,8 @@ class UserApiKeyService:
             )
 
         now = datetime.now(timezone.utc)
-        row.revoked_at = now  # type: ignore[assignment]
-        row.updated_at = now  # type: ignore[assignment]
+        row.revoked_at = now
+        row.updated_at = now
         try:
             self.db.commit()
         except Exception:

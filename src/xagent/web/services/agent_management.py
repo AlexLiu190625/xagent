@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from ...templates.manager import TemplateManager
 from ..models.agent import Agent
 from ..models.model import Model as DBModel
+from ..schemas.agent_api_key import APIKeyGenerateResponse
 from ..services.agent_store import AgentStore
 from .api_keys import AgentApiKeyService
 
@@ -132,7 +133,9 @@ class AgentManagementService:
             ),
         )
 
-    def generate_agent_runtime_key(self, *, user_id: int, agent_id: int):
+    def generate_agent_runtime_key(
+        self, *, user_id: int, agent_id: int
+    ) -> APIKeyGenerateResponse | None:
         agent = self.store.get_owned_agent(user_id, agent_id)
         if agent is None:
             return None

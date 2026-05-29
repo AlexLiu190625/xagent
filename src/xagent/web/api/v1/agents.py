@@ -5,9 +5,11 @@ from typing import Tuple
 from fastapi import APIRouter, Depends, Request
 from sqlalchemy.orm import Session
 
+from ...models.agent import Agent
 from ...models.database import get_db
 from ...models.user import User
 from ...models.user_api_key import UserApiKey
+from ...schemas.agent_api_key import APIKeyGenerateResponse
 from ...schemas.v1 import (
     RuntimeKeyResponse,
     V1AgentCreateRequest,
@@ -29,7 +31,7 @@ from .errors import V1ApiError, V1ErrorCode
 router = APIRouter(prefix="/agents")
 
 
-def _runtime_key_response(api_key) -> RuntimeKeyResponse:
+def _runtime_key_response(api_key: APIKeyGenerateResponse) -> RuntimeKeyResponse:
     return RuntimeKeyResponse(
         full_key=api_key.full_key,
         key_prefix=api_key.key_prefix,
@@ -37,7 +39,7 @@ def _runtime_key_response(api_key) -> RuntimeKeyResponse:
     )
 
 
-def _agent_response(service: AgentManagementService, agent) -> V1AgentResponse:
+def _agent_response(service: AgentManagementService, agent: Agent) -> V1AgentResponse:
     return V1AgentResponse.model_validate(service.store.agent_to_response_dict(agent))
 
 
