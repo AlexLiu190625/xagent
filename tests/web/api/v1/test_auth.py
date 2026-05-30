@@ -8,6 +8,7 @@ Test plumbing (client, _test_db fixture, auth helpers) is shared via
 """
 
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import bcrypt
@@ -15,6 +16,7 @@ import pytest
 
 from xagent.core.utils.api_key import BCRYPT_COST
 from xagent.web.models.agent import Agent, AgentOrigin
+from xagent.web.models.user_api_key import UserApiKey
 
 from ..conftest import _admin_headers, _direct_db_session, client
 
@@ -160,6 +162,45 @@ def test_revoked_key_returns_401():
 
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
     _assert_invalid_api_key(resp)
+
+
+def _set_key_expiry(prefix: str, expires_at) -> None:
+    """Force a personal key's ``expires_at`` to a fixed value via direct DB
+    write, bypassing HTTP (the create endpoint leaves it null)."""
+    db = _direct_db_session()
+    try:
+        db.query(UserApiKey).filter(UserApiKey.key_prefix == prefix).update(
+            {"expires_at": expires_at}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_expired_key_with_naive_expiry_returns_401_not_500():
+    """An expired key must yield 401, even when ``expires_at`` reads back
+    naive (as ``DateTime(timezone=True)`` does on SQLite).
+
+    Comparing a naive ``expires_at`` against an aware ``now`` raises
+    TypeError -- which would surface as a 500. The auth dep normalizes
+    to aware UTC first, so the expiry check stays a clean 401.
+    """
+    full_key, prefix = _create_personal_key()
+    naive_past = (datetime.now(timezone.utc) - timedelta(days=1)).replace(tzinfo=None)
+    _set_key_expiry(prefix, naive_past)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+    _assert_invalid_api_key(resp)
+
+
+def test_unexpired_key_with_naive_future_expiry_authenticates():
+    """A future, naive ``expires_at`` must not be misread as expired."""
+    full_key, prefix = _create_personal_key()
+    naive_future = (datetime.now(timezone.utc) + timedelta(days=1)).replace(tzinfo=None)
+    _set_key_expiry(prefix, naive_future)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+    assert resp.status_code == 200, resp.text
 
 
 def test_generated_manager_key_returns_401():

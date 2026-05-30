@@ -15,8 +15,8 @@ Design notes:
 
   - ``metadata`` is a free-form passthrough dict the SaaS caller can
     use to round-trip its own correlation IDs (trace_id, request_id,
-    etc). We don't interpret it server-side in Phase 1 but persist
-    enough of the SDK call shape to support future debugging.
+    etc). The server does not interpret it but persists enough of the
+    SDK call shape to support future debugging.
 
   - Timestamps are tz-aware ``datetime`` so SDK clients deserialize
     into proper datetimes (``datetime.fromisoformat`` works on both
@@ -74,8 +74,7 @@ class CreateTaskRequest(BaseModel):
         default=None,
         description=(
             "Free-form correlation data the SDK caller can pass through "
-            "(trace_id, request_id, etc). Not interpreted server-side "
-            "in Phase 1."
+            "(trace_id, request_id, etc). Not interpreted server-side."
         ),
     )
 

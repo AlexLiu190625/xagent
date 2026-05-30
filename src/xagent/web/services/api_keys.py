@@ -36,7 +36,20 @@ class AgentApiKeyService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
-    def rotate_key(self, agent_id: int) -> APIKeyGenerateResponse:
+    def stage_rotated_key(self, agent_id: int) -> tuple[AgentApiKey, str]:
+        """Revoke the active key (if any) and stage a new one, then flush.
+
+        Does NOT commit -- the caller owns the transaction boundary. This
+        is the composable building block (mirror of
+        ``AgentStore.add_agent``): single-step callers go through
+        :meth:`rotate_key` which commits, while multi-step workflows
+        (create-agent-with-key) stage this plus other writes and commit
+        once at the outer boundary.
+
+        Returns the staged ORM row and the one-shot plaintext key. The
+        row's ``created_at`` is only populated after the caller commits
+        and refreshes.
+        """
         now = datetime.now(timezone.utc)
         existing = (
             self.db.query(AgentApiKey)
@@ -59,7 +72,22 @@ class AgentApiKeyService:
             key_hash=key_hash,
         )
         self.db.add(new_row)
+        self.db.flush()
+        logger.info(
+            "Staged runtime API key for agent %s (prefix=%s, rotated=%s)",
+            agent_id,
+            key_prefix,
+            existing is not None,
+        )
+        return new_row, full_key
 
+    def rotate_key(self, agent_id: int) -> APIKeyGenerateResponse:
+        """Single-step rotate: stage + commit. Used by the JWT-gated
+        ``/api/agents/{id}/api-key`` endpoint, which owns its own
+        transaction: returns a one-shot key, commits itself, and maps a
+        unique-index race to :class:`KeyRotationConflict`.
+        """
+        new_row, full_key = self.stage_rotated_key(agent_id)
         try:
             self.db.commit()
         except IntegrityError as exc:
@@ -67,15 +95,9 @@ class AgentApiKeyService:
             raise KeyRotationConflict(str(exc)) from exc
 
         self.db.refresh(new_row)
-        logger.info(
-            "Rotated runtime API key for agent %s (prefix=%s, rotated=%s)",
-            agent_id,
-            key_prefix,
-            existing is not None,
-        )
         return APIKeyGenerateResponse(
             full_key=full_key,
-            key_prefix=key_prefix,
+            key_prefix=new_row.key_prefix,
             created_at=new_row.created_at,
         )
 

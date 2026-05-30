@@ -65,7 +65,9 @@ async def create_agent(
     user, _key = authed
     service = AgentManagementService(db)
     try:
-        agent = service.create_agent_for_user(
+        # Atomic: agent row + optional first runtime key commit together,
+        # so a key-step failure never leaves a persisted agent behind.
+        agent, api_key = service.create_agent_with_optional_key(
             user_id=int(user.id),
             name=request.name,
             description=request.description,
@@ -76,12 +78,8 @@ async def create_agent(
             skills=request.skills,
             tool_categories=request.tool_categories,
             suggested_prompts=request.suggested_prompts,
+            generate_runtime_key=request.generate_runtime_key,
         )
-        api_key = None
-        if request.generate_runtime_key:
-            api_key = service.generate_agent_runtime_key(
-                user_id=int(user.id), agent_id=int(agent.id)
-            )
     except DuplicateAgentNameError:
         raise V1ApiError(
             V1ErrorCode.INVALID_INPUT, 400, "Agent with this name already exists."
@@ -114,7 +112,9 @@ async def create_agent_from_template(
     template_manager = getattr(fastapi_request.app.state, "template_manager", None)
     service = AgentManagementService(db, template_manager=template_manager)
     try:
-        agent = await service.create_agent_from_template(
+        # Atomic: template-derived agent + optional first runtime key
+        # commit together, same boundary as the plain create path.
+        agent, api_key = await service.create_agent_from_template(
             user_id=int(user.id),
             template_id=request.template_id,
             name=request.name,
@@ -126,12 +126,8 @@ async def create_agent_from_template(
             skills=request.skills,
             tool_categories=request.tool_categories,
             suggested_prompts=request.suggested_prompts,
+            generate_runtime_key=request.generate_runtime_key,
         )
-        api_key = None
-        if request.generate_runtime_key:
-            api_key = service.generate_agent_runtime_key(
-                user_id=int(user.id), agent_id=int(agent.id)
-            )
     except TemplateNotFoundError:
         raise V1ApiError(V1ErrorCode.TEMPLATE_NOT_FOUND, 404)
     except DuplicateAgentNameError:

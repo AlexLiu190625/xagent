@@ -1,10 +1,12 @@
 """Integration tests for /v1 management endpoints."""
 
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
 from xagent.templates.manager import TemplateManager
+from xagent.web.models.agent import Agent
 from xagent.web.models.model import Model as DBModel
 from xagent.web.models.user import User, UserModel
 
@@ -115,6 +117,42 @@ def test_v1_create_agent_can_skip_runtime_key():
     )
     assert resp.status_code == 200, resp.text
     assert resp.json()["api_key"] is None
+
+
+def test_v1_create_agent_rolls_back_agent_when_key_step_fails():
+    """Agent + first runtime key commit atomically: if the key step
+    fails, the agent row must not persist, so a client retry with the
+    same name succeeds instead of hitting a stale duplicate-name."""
+    key = _personal_key()
+    name = "atomic-create agent"
+
+    with patch(
+        "xagent.web.services.agent_management.AgentApiKeyService.stage_rotated_key",
+        side_effect=RuntimeError("staged key write blew up"),
+    ):
+        resp = client.post(
+            "/v1/agents",
+            headers=_bearer(key),
+            json={"name": name, "instructions": "Be useful."},
+        )
+    assert resp.status_code == 500, resp.text
+
+    # The aborted create must leave no row behind.
+    db = _direct_db_session()
+    try:
+        leftover = db.query(Agent).filter(Agent.name == name).count()
+    finally:
+        db.close()
+    assert leftover == 0
+
+    # A clean retry with the same name now goes through.
+    retry = client.post(
+        "/v1/agents",
+        headers=_bearer(key),
+        json={"name": name, "instructions": "Be useful."},
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["agent"]["name"] == name
 
 
 def test_v1_create_agent_rejects_string_model_ids():
@@ -269,3 +307,36 @@ def test_unknown_template_returns_stable_error(template_manager):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "template_not_found"
+
+
+def test_from_template_rolls_back_agent_when_key_step_fails(template_manager):
+    """The from-template path shares the plain-create atomic boundary: a
+    key-step failure must not leave the template-derived agent behind."""
+    key = _personal_key()
+    name = "atomic-template agent"
+
+    with patch(
+        "xagent.web.services.agent_management.AgentApiKeyService.stage_rotated_key",
+        side_effect=RuntimeError("staged key write blew up"),
+    ):
+        resp = client.post(
+            "/v1/agents/from-template",
+            headers=_bearer(key),
+            json={"template_id": "qa", "name": name},
+        )
+    assert resp.status_code == 500, resp.text
+
+    db = _direct_db_session()
+    try:
+        leftover = db.query(Agent).filter(Agent.name == name).count()
+    finally:
+        db.close()
+    assert leftover == 0
+
+    retry = client.post(
+        "/v1/agents/from-template",
+        headers=_bearer(key),
+        json={"template_id": "qa", "name": name},
+    )
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["agent"]["name"] == name

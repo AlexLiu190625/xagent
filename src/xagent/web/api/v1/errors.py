@@ -65,8 +65,8 @@ class V1ErrorCode(str, Enum):
     # clients always switch on ``body.error.code``.
     INVALID_INPUT = "invalid_input"
 
-    # Phase 2 feature; reserved here so SDK clients can already encode
-    # the mapping. Phase 1 never emits this.
+    # Reserved for rate limiting. The server does not emit this yet, but
+    # it stays in the enum so SDK clients can encode the mapping now.
     RATE_LIMITED = "rate_limited"
 
     # Server-side bug. Detail is sanitized; the raw exception stays in

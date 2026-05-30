@@ -1,9 +1,8 @@
 """Public SDK ``/v1/*`` namespace.
 
 This subpackage holds endpoints exposed to external SDK clients
-(Python / TypeScript / JavaScript SDKs introduced in Phase 1) that
-authenticate with an ``xag_<prefix>_<secret>`` API key rather than a
-JWT session.
+(Python / TypeScript / JavaScript) that authenticate with an
+``xag_<prefix>_<secret>`` API key rather than a JWT session.
 
 The split from ``/api/*`` is deliberate (see SDK design doc §3):
 

@@ -39,6 +39,7 @@ from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
 from ...models.user import User
 from ...models.user_api_key import UserApiKey
+from ...utils.db_timezone import normalize_datetime_from_db
 from .errors import V1ApiError, V1ErrorCode
 
 # ``auto_error=False`` so we can raise our own V1ApiError envelope
@@ -160,7 +161,12 @@ async def get_user_from_personal_key(
 
     now = datetime.now(timezone.utc)
     expires_at = key_row.expires_at
-    if expires_at is not None and expires_at <= now:
+    # ``DateTime(timezone=True)`` reads back naive on SQLite; normalize
+    # to aware UTC before comparing so an expired key yields 401, not a
+    # 500 from comparing naive vs aware datetimes.
+    if (
+        expires_at is not None and normalize_datetime_from_db(expires_at) <= now  # type: ignore[arg-type]
+    ):
         verify_dummy()
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 

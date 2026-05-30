@@ -4,14 +4,15 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...templates.manager import TemplateManager
 from ..models.agent import Agent
 from ..models.model import Model as DBModel
 from ..schemas.agent_api_key import APIKeyGenerateResponse
-from ..services.agent_store import AgentStore
-from .api_keys import AgentApiKeyService
+from ..services.agent_store import AgentStore, invalidate_agent_cache
+from .api_keys import AgentApiKeyService, KeyRotationConflict
 
 
 class DuplicateAgentNameError(ValueError):
@@ -72,6 +73,76 @@ class AgentManagementService:
             suggested_prompts=suggested_prompts or [],
         )
 
+    def create_agent_with_optional_key(
+        self,
+        *,
+        user_id: int,
+        name: str,
+        description: str | None,
+        instructions: str | None,
+        execution_mode: str | None = "balanced",
+        models: dict[str, Any] | None = None,
+        knowledge_bases: list[str] | None = None,
+        skills: list[str] | None = None,
+        tool_categories: list[str] | None = None,
+        suggested_prompts: list[str] | None = None,
+        generate_runtime_key: bool = True,
+    ) -> tuple[Agent, APIKeyGenerateResponse | None]:
+        """Create an agent and (optionally) its first runtime key in a
+        single transaction.
+
+        Committing the agent and its first key separately would leave a
+        persisted agent behind if the key step fails, so a client retry
+        would hit duplicate-name even though the create appeared to
+        fail. This method stages both writes (flush, no commit) and
+        commits once at the boundary, rolling back atomically on any
+        failure. Both ``POST /v1/agents`` and
+        ``POST /v1/agents/from-template`` route their writes through here.
+        """
+        if self.store.agent_name_exists(user_id, name):
+            raise DuplicateAgentNameError(name)
+
+        models = self._validate_models(models, user_id=user_id)
+
+        agent = self.store.add_agent(  # flush, no commit
+            user_id=user_id,
+            name=name,
+            description=description,
+            instructions=instructions,
+            execution_mode=execution_mode or "balanced",
+            models=models,
+            knowledge_bases=knowledge_bases or [],
+            skills=skills or [],
+            tool_categories=tool_categories or [],
+            suggested_prompts=suggested_prompts or [],
+        )
+
+        staged_key = None
+        if generate_runtime_key:
+            staged_key = self.key_service.stage_rotated_key(
+                int(agent.id)
+            )  # flush, no commit
+
+        try:
+            self.db.commit()  # single transaction boundary for both writes
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise KeyRotationConflict(str(exc)) from exc
+
+        self.db.refresh(agent)
+        invalidate_agent_cache(user_id, int(agent.id))
+
+        key_resp: APIKeyGenerateResponse | None = None
+        if staged_key is not None:
+            new_row, full_key = staged_key
+            self.db.refresh(new_row)
+            key_resp = APIKeyGenerateResponse(
+                full_key=full_key,
+                key_prefix=new_row.key_prefix,
+                created_at=new_row.created_at,
+            )
+        return agent, key_resp
+
     async def create_agent_from_template(
         self,
         *,
@@ -86,7 +157,16 @@ class AgentManagementService:
         skills: list[str] | None = None,
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
-    ) -> Agent:
+        generate_runtime_key: bool = True,
+    ) -> tuple[Agent, APIKeyGenerateResponse | None]:
+        """Resolve a template (async I/O) then create the agent and its
+        optional first runtime key in a single transaction.
+
+        Template resolution stays async; the database writes go through
+        :meth:`create_agent_with_optional_key`, so the agent row and the
+        first key share one commit boundary here too -- a key-step
+        failure rolls the agent back instead of stranding it.
+        """
         if self.template_manager is None:
             raise TemplateNotFoundError(template_id)
 
@@ -104,8 +184,9 @@ class AgentManagementService:
             elif isinstance(descriptions, str):
                 final_description = descriptions
 
-        return self.create_agent_for_user(
+        return self.create_agent_with_optional_key(
             user_id=user_id,
+            generate_runtime_key=generate_runtime_key,
             name=final_name,
             description=final_description,
             instructions=(
