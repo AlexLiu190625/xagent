@@ -1,15 +1,21 @@
 """SDK API key generation, parsing, and bcrypt verification utilities.
 
-The SDK key format is ``xag_<6-char prefix>_<32-char secret>``.
+Two key kinds share this format and code path; the kind segment is what
+distinguishes them on the wire:
+
+  - agent key:    ``xag_<6-char prefix>_<32-char secret>``
+  - personal key: ``xag_personal_<6-char prefix>_<32-char secret>``
 
   - The **prefix** is a public-safe lookup handle. It is what we index in
-    ``agent_api_keys.key_prefix`` and what we allow callers (and logs) to
-    see in cleartext. It does NOT confer any auth power on its own.
+    the key table's ``key_prefix`` column (``agent_api_keys`` for agent
+    keys, ``user_api_keys`` for personal keys) and what we allow callers
+    (and logs) to see in cleartext. It does NOT confer any auth power on
+    its own.
 
   - The **secret** is the unguessable half. The server only ever stores
-    ``bcrypt(full_key, cost=12)`` in ``agent_api_keys.key_hash``; the
-    plaintext secret leaves the response of ``POST /api/agents/{id}/api-key``
-    exactly once and is never persisted server-side.
+    ``bcrypt(full_key, cost=12)`` in the key table's ``key_hash`` column;
+    the plaintext secret leaves the issuing endpoint's response exactly
+    once and is never persisted server-side.
 
 Why the alphabet excludes ``_`` (underscore):
     Parse logic splits on ``_`` to recover (prefix, secret). If either half
@@ -113,26 +119,31 @@ def generate_api_key(
 ) -> Tuple[str, str, str]:
     """Generate a new SDK API key and its bcrypt hash.
 
-    The caller is responsible for INSERTing a row into ``agent_api_keys``
-    using the returned ``key_prefix`` and ``key_hash``; this function is
-    stateless and does not write anything to the database itself. The
-    ``db`` parameter is only used to probe for prefix collisions so we
-    can re-roll before letting the INSERT hit the unique-index trap.
+    The caller is responsible for INSERTing a row into the key table for
+    this ``kind`` (``agent_api_keys`` for AGENT, ``user_api_keys`` for
+    PERSONAL) using the returned ``key_prefix`` and ``key_hash``; this
+    function is stateless and does not write anything to the database
+    itself. The ``db`` parameter is only used to probe that kind's table
+    for prefix collisions so we can re-roll before letting the INSERT hit
+    the unique-index trap.
 
     Args:
-        db: SQLAlchemy session, used to ``SELECT`` against
-            ``agent_api_keys.key_prefix``. Pass ``None`` to skip the
-            collision check (useful in unit tests where you don't have a
-            session and the keyspace makes a real collision impossible).
+        db: SQLAlchemy session, used to ``SELECT`` against the kind's
+            ``key_prefix`` column. Pass ``None`` to skip the collision
+            check (useful in unit tests where you don't have a session
+            and the keyspace makes a real collision impossible).
+        kind: which key kind to mint; selects both the wire format and
+            the table probed for collisions.
 
     Returns:
         Tuple ``(full_key, key_prefix, key_hash)`` where:
-          - ``full_key`` is the plaintext ``xag_<prefix>_<secret>``; show
-            this to the user once and never persist it.
-          - ``key_prefix`` is the 6-char lookup handle to store in
-            ``agent_api_keys.key_prefix``.
+          - ``full_key`` is the plaintext key (``xag_<prefix>_<secret>``
+            for AGENT, ``xag_personal_<prefix>_<secret>`` for PERSONAL);
+            show this to the user once and never persist it.
+          - ``key_prefix`` is the 6-char lookup handle to store in the
+            kind's ``key_prefix`` column.
           - ``key_hash`` is the bcrypt-hashed full key (utf-8 str) to
-            store in ``agent_api_keys.key_hash``.
+            store in the kind's ``key_hash`` column.
 
     Raises:
         RuntimeError: if we hit ``PREFIX_COLLISION_RETRIES`` consecutive
@@ -191,7 +202,8 @@ def generate_api_key(
 def parse_api_key(raw: str) -> Optional[ParsedApiKey]:
     """Split a raw API key string into kind, prefix, and secret if well-formed.
 
-    A well-formed key has shape ``xag_<6 chars>_<32 chars>`` where both
+    A well-formed key is either ``xag_<6 chars>_<32 chars>`` (AGENT) or
+    ``xag_personal_<6 chars>_<32 chars>`` (PERSONAL), where both
     char-class halves draw from ``KEY_ALPHABET``. Anything else returns
     ``None``; the caller treats that as ``invalid_api_key`` (same response
     we give for a wrong secret -- never tell the attacker which check
@@ -203,7 +215,8 @@ def parse_api_key(raw: str) -> Optional[ParsedApiKey]:
             HTTP layer).
 
     Returns:
-        ``(prefix, secret)`` on success; ``None`` on any format mismatch.
+        ``ParsedApiKey(kind, prefix, secret)`` on success; ``None`` on any
+        format mismatch.
 
     Notes:
         Never include ``raw`` in log lines. If you must log the failure,
