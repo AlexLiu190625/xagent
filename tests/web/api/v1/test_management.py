@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 from xagent.templates.manager import TemplateManager
 from xagent.web.models.agent import Agent
@@ -44,10 +45,29 @@ agent_config:
     - retrieval
   tool_categories:
     - web_search
-  knowledge_bases:
-    - template-kb
   suggested_prompts:
     - Ask anything
+  execution_mode: balanced
+""".strip(),
+        encoding="utf-8",
+    )
+    # Pre-sets a knowledge base without the knowledge tool category, so
+    # from-template must reject it -- exercises that template-sourced KB
+    # fields go through the same validation as user input.
+    (root / "kb-no-tool.yaml").write_text(
+        """
+id: kb-no-tool
+name: KB without tool
+category: General
+descriptions:
+  en: Pre-sets a knowledge base but not the knowledge tool category.
+connections: []
+agent_config:
+  instructions: Answer.
+  tool_categories:
+    - web_search
+  knowledge_bases:
+    - template-kb
   execution_mode: balanced
 """.strip(),
         encoding="utf-8",
@@ -153,6 +173,59 @@ def test_v1_create_agent_rolls_back_agent_when_key_step_fails():
     )
     assert retry.status_code == 200, retry.text
     assert retry.json()["agent"]["name"] == name
+
+
+def test_v1_create_agent_maps_commit_conflict_to_409():
+    """A unique-constraint IntegrityError at commit is translated to a
+    409 rotation conflict, not a 500."""
+    key = _personal_key()
+    with patch(
+        "sqlalchemy.orm.Session.commit",
+        side_effect=IntegrityError(
+            "INSERT", {}, Exception("uq_agent_api_keys_agent_active")
+        ),
+    ):
+        resp = client.post(
+            "/v1/agents",
+            headers=_bearer(key),
+            json={"name": "commit conflict agent", "instructions": "x"},
+        )
+    assert resp.status_code == 409, resp.text
+
+
+def test_v1_create_agent_rejects_kb_without_knowledge_category():
+    """KB selected but the knowledge tool category is not enabled -> 400,
+    same invariant /api/agents enforces."""
+    key = _personal_key()
+    resp = client.post(
+        "/v1/agents",
+        headers=_bearer(key),
+        json={
+            "name": "kb no tool",
+            "instructions": "x",
+            "knowledge_bases": ["some-kb"],
+            "tool_categories": ["web_search"],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+def test_v1_create_agent_rejects_invisible_kb():
+    """KB not visible to the user -> 400."""
+    key = _personal_key()
+    resp = client.post(
+        "/v1/agents",
+        headers=_bearer(key),
+        json={
+            "name": "kb invisible",
+            "instructions": "x",
+            "knowledge_bases": ["nonexistent-kb"],
+            "tool_categories": ["knowledge"],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
 
 
 def test_v1_create_agent_rejects_string_model_ids():
@@ -271,7 +344,7 @@ def test_from_template_creates_agent(template_manager):
     assert body["agent"]["instructions"] == "Answer clearly."
     assert body["agent"]["skills"] == ["retrieval"]
     assert body["agent"]["tool_categories"] == ["web_search"]
-    assert body["agent"]["knowledge_bases"] == ["template-kb"]
+    assert body["agent"]["knowledge_bases"] == []
     assert body["agent"]["suggested_prompts"] == ["Ask anything"]
     assert body["api_key"]["full_key"].startswith("xag_")
 
@@ -340,3 +413,37 @@ def test_from_template_rolls_back_agent_when_key_step_fails(template_manager):
     )
     assert retry.status_code == 200, retry.text
     assert retry.json()["agent"]["name"] == name
+
+
+def test_from_template_rejects_template_kb_without_knowledge_category(
+    template_manager,
+):
+    """Template-sourced KB fields go through the same validation as user
+    input: a template that pre-sets a KB without the knowledge category
+    is rejected, not silently persisted."""
+    key = _personal_key()
+    resp = client.post(
+        "/v1/agents/from-template",
+        headers=_bearer(key),
+        json={"template_id": "kb-no-tool", "name": "from bad template"},
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"
+
+
+def test_from_template_rejects_invisible_kb_override(template_manager):
+    """A KB override that is not visible to the user -> 400 on the
+    from-template path too."""
+    key = _personal_key()
+    resp = client.post(
+        "/v1/agents/from-template",
+        headers=_bearer(key),
+        json={
+            "template_id": "qa",
+            "name": "from template invisible kb",
+            "knowledge_bases": ["nonexistent-kb"],
+            "tool_categories": ["knowledge"],
+        },
+    )
+    assert resp.status_code == 400, resp.text
+    assert resp.json()["error"]["code"] == "invalid_input"

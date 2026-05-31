@@ -7,12 +7,17 @@ from typing import Any
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...templates.manager import TemplateManager
 from ..models.agent import Agent
 from ..models.model import Model as DBModel
 from ..schemas.agent_api_key import APIKeyGenerateResponse
 from ..services.agent_store import AgentStore, invalidate_agent_cache
 from .api_keys import AgentApiKeyService, KeyRotationConflict
+
+# Agent-builder tool category that gates knowledge-base access. A KB
+# selection is only valid when this category is also enabled.
+KNOWLEDGE_TOOL_CATEGORY = "knowledge"
 
 
 class DuplicateAgentNameError(ValueError):
@@ -25,6 +30,10 @@ class TemplateNotFoundError(LookupError):
 
 class InvalidAgentModelConfigError(ValueError):
     """Raised when the agent model slot payload does not match DB id shape."""
+
+
+class InvalidKnowledgeBaseError(ValueError):
+    """Raised when KB selection fails the knowledge-tool or visibility rule."""
 
 
 class AgentManagementService:
@@ -41,10 +50,44 @@ class AgentManagementService:
     def list_agents_for_user(self, user_id: int) -> list[dict[str, Any]]:
         return self.store.list_agent_items(user_id)
 
-    def create_agent_for_user(
+    async def validate_knowledge_bases(
+        self,
+        *,
+        knowledge_bases: list[str] | None,
+        tool_categories: list[str] | None,
+        user_id: int,
+        is_admin: bool,
+    ) -> None:
+        """Enforce the knowledge-base invariant shared with ``/api/agents``.
+
+        A non-empty KB selection requires the ``knowledge`` tool category
+        and every named KB must be visible to the user. Raises
+        :class:`InvalidKnowledgeBaseError` on either violation. This is
+        async (KB visibility is an I/O lookup), so it lives on the async
+        :meth:`create_agent` entry point rather than the sync transaction
+        executor.
+        """
+        if not knowledge_bases:
+            return
+        if KNOWLEDGE_TOOL_CATEGORY not in (tool_categories or []):
+            raise InvalidKnowledgeBaseError(
+                "Knowledge bases are selected but the Knowledge tool "
+                "category is not enabled."
+            )
+        missing = await find_missing_knowledge_bases(
+            knowledge_bases, user_id=user_id, is_admin=is_admin
+        )
+        if missing:
+            raise InvalidKnowledgeBaseError(
+                "Knowledge base(s) not found or not visible to this user: "
+                + ", ".join(missing)
+            )
+
+    async def create_agent(
         self,
         *,
         user_id: int,
+        is_admin: bool,
         name: str,
         description: str | None,
         instructions: str | None,
@@ -54,23 +97,31 @@ class AgentManagementService:
         skills: list[str] | None = None,
         tool_categories: list[str] | None = None,
         suggested_prompts: list[str] | None = None,
-    ) -> Agent:
-        if self.store.agent_name_exists(user_id, name):
-            raise DuplicateAgentNameError(name)
-
-        models = self._validate_models(models, user_id=user_id)
-
-        return self.store.create_agent(
+        generate_runtime_key: bool = True,
+    ) -> tuple[Agent, APIKeyGenerateResponse | None]:
+        """Sole external create entry point: validate KBs (async) then
+        run the transactional create. Every public create path
+        (``POST /v1/agents`` and ``POST /v1/agents/from-template``) goes
+        through here, so the KB invariant has a single enforcement point.
+        """
+        await self.validate_knowledge_bases(
+            knowledge_bases=knowledge_bases,
+            tool_categories=tool_categories,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        return self.create_agent_with_optional_key(
             user_id=user_id,
             name=name,
             description=description,
             instructions=instructions,
-            execution_mode=execution_mode or "balanced",
+            execution_mode=execution_mode,
             models=models,
-            knowledge_bases=knowledge_bases or [],
-            skills=skills or [],
-            tool_categories=tool_categories or [],
-            suggested_prompts=suggested_prompts or [],
+            knowledge_bases=knowledge_bases,
+            skills=skills,
+            tool_categories=tool_categories,
+            suggested_prompts=suggested_prompts,
+            generate_runtime_key=generate_runtime_key,
         )
 
     def create_agent_with_optional_key(
@@ -89,15 +140,25 @@ class AgentManagementService:
         generate_runtime_key: bool = True,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
         """Create an agent and (optionally) its first runtime key in a
-        single transaction.
+        single transaction. Internal transaction executor: assumes
+        knowledge-base inputs were already validated by the async
+        :meth:`create_agent` entry point; this method only validates
+        models and owns the commit boundary.
 
         Committing the agent and its first key separately would leave a
         persisted agent behind if the key step fails, so a client retry
         would hit duplicate-name even though the create appeared to
         fail. This method stages both writes (flush, no commit) and
         commits once at the boundary, rolling back atomically on any
-        failure. Both ``POST /v1/agents`` and
-        ``POST /v1/agents/from-template`` route their writes through here.
+        failure.
+
+        Conflict contract: the only IntegrityError this path can raise
+        comes from the runtime key's unique constraints (``key_prefix``
+        / ``uq_agent_api_keys_agent_active``); the agent table has no
+        unique constraint and therefore does not contribute one. If a
+        ``(user_id, name)`` unique constraint is ever added to agents,
+        the conflict translation here must be split by source (agent ->
+        duplicate-name 400, key -> 409).
         """
         if self.store.agent_name_exists(user_id, name):
             raise DuplicateAgentNameError(name)
@@ -117,13 +178,14 @@ class AgentManagementService:
             suggested_prompts=suggested_prompts or [],
         )
 
+        # The runtime key is the only write that can raise IntegrityError
+        # here (agent has no unique constraint), so the conflict-to-409
+        # translation wraps key staging + commit together. See the
+        # contract note in the docstring above.
         staged_key = None
-        if generate_runtime_key:
-            staged_key = self.key_service.stage_rotated_key(
-                int(agent.id)
-            )  # flush, no commit
-
         try:
+            if generate_runtime_key:
+                staged_key = self.key_service.stage_rotated_key(int(agent.id))
             self.db.commit()  # single transaction boundary for both writes
         except IntegrityError as exc:
             self.db.rollback()
@@ -147,6 +209,7 @@ class AgentManagementService:
         self,
         *,
         user_id: int,
+        is_admin: bool,
         template_id: str,
         name: str | None = None,
         description: str | None = None,
@@ -159,13 +222,9 @@ class AgentManagementService:
         suggested_prompts: list[str] | None = None,
         generate_runtime_key: bool = True,
     ) -> tuple[Agent, APIKeyGenerateResponse | None]:
-        """Resolve a template (async I/O) then create the agent and its
-        optional first runtime key in a single transaction.
-
-        Template resolution stays async; the database writes go through
-        :meth:`create_agent_with_optional_key`, so the agent row and the
-        first key share one commit boundary here too -- a key-step
-        failure rolls the agent back instead of stranding it.
+        """Resolve a template (async I/O) then create the agent through
+        :meth:`create_agent`, so KB validation and the single commit
+        boundary are shared with the plain create path.
         """
         if self.template_manager is None:
             raise TemplateNotFoundError(template_id)
@@ -184,8 +243,9 @@ class AgentManagementService:
             elif isinstance(descriptions, str):
                 final_description = descriptions
 
-        return self.create_agent_with_optional_key(
+        return await self.create_agent(
             user_id=user_id,
+            is_admin=is_admin,
             generate_runtime_key=generate_runtime_key,
             name=final_name,
             description=final_description,

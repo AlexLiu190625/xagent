@@ -22,6 +22,7 @@ from ...services.agent_management import (
     AgentManagementService,
     DuplicateAgentNameError,
     InvalidAgentModelConfigError,
+    InvalidKnowledgeBaseError,
     TemplateNotFoundError,
 )
 from ...services.api_keys import KeyRotationConflict
@@ -65,10 +66,11 @@ async def create_agent(
     user, _key = authed
     service = AgentManagementService(db)
     try:
-        # Atomic: agent row + optional first runtime key commit together,
-        # so a key-step failure never leaves a persisted agent behind.
-        agent, api_key = service.create_agent_with_optional_key(
+        # Atomic: KB validation + agent row + optional first runtime key,
+        # all behind the single async create entry point.
+        agent, api_key = await service.create_agent(
             user_id=int(user.id),
+            is_admin=bool(user.is_admin),
             name=request.name,
             description=request.description,
             instructions=request.instructions,
@@ -90,6 +92,8 @@ async def create_agent(
             400,
             "Agent models must use integer DB model ids for known model slots.",
         )
+    except InvalidKnowledgeBaseError as e:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 400, str(e))
     except KeyRotationConflict:
         raise V1ApiError(
             V1ErrorCode.INTERNAL_ERROR, 409, "Runtime key rotation conflict."
@@ -116,6 +120,7 @@ async def create_agent_from_template(
         # commit together, same boundary as the plain create path.
         agent, api_key = await service.create_agent_from_template(
             user_id=int(user.id),
+            is_admin=bool(user.is_admin),
             template_id=request.template_id,
             name=request.name,
             description=request.description,
@@ -140,6 +145,8 @@ async def create_agent_from_template(
             400,
             "Agent models must use integer DB model ids for known model slots.",
         )
+    except InvalidKnowledgeBaseError as e:
+        raise V1ApiError(V1ErrorCode.INVALID_INPUT, 400, str(e))
     except KeyRotationConflict:
         raise V1ApiError(
             V1ErrorCode.INTERNAL_ERROR, 409, "Runtime key rotation conflict."

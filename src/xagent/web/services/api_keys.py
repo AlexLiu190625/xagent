@@ -86,9 +86,13 @@ class AgentApiKeyService:
         ``/api/agents/{id}/api-key`` endpoint, which owns its own
         transaction: returns a one-shot key, commits itself, and maps a
         unique-index race to :class:`KeyRotationConflict`.
+
+        Staging and commit share one ``try`` so the
+        ``uq_agent_api_keys_agent_active`` / ``key_prefix`` conflict is
+        translated whether it surfaces at the staging flush or at commit.
         """
-        new_row, full_key = self.stage_rotated_key(agent_id)
         try:
+            new_row, full_key = self.stage_rotated_key(agent_id)
             self.db.commit()
         except IntegrityError as exc:
             self.db.rollback()
