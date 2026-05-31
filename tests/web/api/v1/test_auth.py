@@ -83,8 +83,10 @@ def test_valid_personal_key_returns_me_response():
     body = resp.json()
     assert body["principal_type"] == "user"
     assert body["user_id"] > 0
-    assert body["email"] == "admin"
-    assert body["name"] == "admin"
+    # admin fixture: username="admin", email="admin@example.com" -- the two
+    # differ, so this pins that each field carries its own value.
+    assert body["username"] == "admin"
+    assert body["email"] == "admin@example.com"
     assert body["key_prefix"] == prefix
 
 

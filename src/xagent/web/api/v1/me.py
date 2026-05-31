@@ -17,8 +17,10 @@ class MeResponse(BaseModel):
 
     principal_type: str = Field(default="user", description="Authenticated principal.")
     user_id: int = Field(..., description="User bound to the presented personal key.")
-    email: str = Field(..., description="User email or username.")
-    name: str = Field(..., description="User display name.")
+    username: str = Field(..., description="User's unique login name.")
+    email: str | None = Field(
+        default=None, description="User's email address, or null if unset."
+    )
     key_prefix: str = Field(
         ...,
         description=(
@@ -34,11 +36,10 @@ async def get_me(
 ) -> MeResponse:
     """Probe the user identity bound to the caller's personal key."""
     user, key = authed
-    username = str(user.username)
     return MeResponse(
         principal_type="user",
         user_id=int(user.id),
-        email=username,
-        name=username,
+        username=str(user.username),
+        email=str(user.email) if user.email is not None else None,
         key_prefix=key.key_prefix,
     )

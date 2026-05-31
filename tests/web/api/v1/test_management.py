@@ -104,7 +104,8 @@ def test_v1_me_uses_personal_key():
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["principal_type"] == "user"
-    assert body["email"] == "admin"
+    assert body["username"] == "admin"
+    assert body["email"] == "admin@example.com"
 
 
 def test_v1_create_agent_defaults_to_runtime_key():
