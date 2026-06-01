@@ -249,9 +249,16 @@ def _wire_execute_task_background(monkeypatch, db_session, manager):
     )
     monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
     monkeypatch.setattr(database_models, "get_db", fake_get_db)
+
+    def fake_persist_assistant_message(db, *args, **kwargs):
+        # The real helper commits the session; mirror that so the pending
+        # terminal status set by execute_task_background is durably landed
+        # (the status commit now rides on the assistant-message write).
+        db.commit()
+
     monkeypatch.setattr(
         "xagent.web.services.chat_history_service.persist_assistant_message",
-        lambda *args, **kwargs: None,
+        fake_persist_assistant_message,
     )
 
 
@@ -351,6 +358,61 @@ async def test_execution_failure_routes_real_error_to_terminal_payload(
 
     assert payload_calls == [(11, "agent boom xyz", "task_error")]
     assert "task_error" in sent_events
+
+
+@pytest.mark.asyncio
+async def test_assistant_persist_failure_surfaces_as_task_failure(
+    db_session, monkeypatch
+):
+    """Assistant-message persistence is a durable write, not best-effort.
+    If it fails after a successful agent result, the terminal status must
+    not have been committed (it is pending until the message lands), so
+    the failure is surfaced through _terminal_task_error_payload rather
+    than leaving a COMPLETED row with no message."""
+    user = _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=12, user_id=1, status=TaskStatus.RUNNING)
+    db_session.commit()
+
+    payload_calls: list[tuple] = []
+
+    class BroadcastManager:
+        async def broadcast_to_task(self, event, task_id):
+            pass
+
+    class AgentManager:
+        async def get_agent_for_task(self, task_id, db, **kwargs):
+            return _NoopAgentService()
+
+        async def execute_task(self, **kwargs):
+            return {"success": True, "output": "ok", "file_outputs": []}
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("durable persist failed")
+
+    def fake_payload(task_id, message, *, event_type="agent_error"):
+        payload_calls.append((task_id, event_type))
+        return {"type": event_type, "task_id": task_id}
+
+    _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
+    # Override the no-op persist with one that fails (durable write error).
+    monkeypatch.setattr(
+        "xagent.web.services.chat_history_service.persist_assistant_message", boom
+    )
+    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+
+    await execute_task_background(
+        task_id=12,
+        user_message="hi",
+        context={},
+        agent_manager=AgentManager(),
+        user_id=int(user.id),
+        llm_user_message="hi",
+    )
+
+    # The COMPLETED status was never committed (pending until the message
+    # write that failed), so the status probe still sees RUNNING and the
+    # failure is routed to the terminal payload writer.
+    assert payload_calls == [(12, "task_error")]
 
 
 def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():

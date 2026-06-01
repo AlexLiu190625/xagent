@@ -1442,9 +1442,18 @@ async def execute_task_background(
                     else:
                         task_updated.status = TaskStatus.FAILED
                     sync_workforce_run_status(db_new, task_updated, task_updated.status)
-                    db_new.commit()
+                    # Do NOT commit the terminal status here. Leave it
+                    # pending so the assistant-message persistence below
+                    # commits it atomically: the task is marked terminal
+                    # only once the turn is durably complete. If that write
+                    # fails, the status stays RUNNING and the outer except
+                    # surfaces a real failure -- instead of leaving a
+                    # COMPLETED row with no assistant message. Control
+                    # statuses (PAUSED / WAITING_FOR_USER) above commit
+                    # themselves; they have no assistant message to persist.
                     logger.info(
-                        f"Updated task {task_id} status to {task_updated.status.value}"
+                        f"Task {task_id} marked {task_updated.status.value} "
+                        "(pending commit with assistant message)"
                     )
                 else:
                     logger.info(
