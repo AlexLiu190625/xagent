@@ -348,7 +348,16 @@ def _build_tool_selection_spec_for_task(
     tool_categories = agent_config.get("tool_categories") if agent_config else None
     spec = ToolSelectionSpec.from_raw(
         tool_categories=tool_categories,
-        workforce_extra_names=(
+        # Two orthogonal inputs for the workforce delegation case:
+        #   - published_agent_ids declares the published-agent creator
+        #     should run, scoped to the worker agents (dispatch);
+        #   - name_allowlist narrows its output to the worker tool names
+        #     (filter). The creator's own config.allowed_agent_ids does
+        #     the per-agent DB filtering.
+        published_agent_ids=(
+            list(workforce_runtime.allowed_agent_ids) if workforce_runtime else None
+        ),
+        name_allowlist=(
             workforce_runtime.worker_tool_names if workforce_runtime else None
         ),
         extras_only_when_unconfigured=workforce_runtime is not None,

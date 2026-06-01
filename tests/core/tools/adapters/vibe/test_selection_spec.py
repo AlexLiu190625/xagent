@@ -222,7 +222,8 @@ async def test_registry_runs_published_agent_creator_for_workforce_extras(
 
     spec = ToolSelectionSpec.from_raw(
         tool_categories=["basic"],
-        workforce_extra_names={"agent_42"},
+        published_agent_ids=[42],  # dispatch: run the published-agent creator
+        workforce_extra_names={"agent_42"},  # filter: keep this worker tool
     )
     tools = await isolated_registry.create_registered_tools(_FakeConfig(spec))
 
@@ -259,7 +260,8 @@ async def test_factory_worker_only_mode_keeps_only_injected_agent_tools(
 
     spec = ToolSelectionSpec.from_raw(
         tool_categories=[],
-        workforce_extra_names={"agent_42"},
+        published_agent_ids=[42],  # dispatch: run the published-agent creator
+        workforce_extra_names={"agent_42"},  # filter: keep this worker tool
         extras_only_when_unconfigured=True,
     )
     tools = await ToolFactory.create_all_tools(
@@ -888,7 +890,7 @@ def test_by_categories_rejects_empty_categories():
     """
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
-    with pytest.raises(ValueError, match="non-empty categories"):
+    with pytest.raises(ValueError, match="non-empty selection"):
         _SpecByCategories(categories=frozenset())
 
 
@@ -1006,7 +1008,8 @@ def test_from_raw_can_restrict_unconfigured_agent_to_workforce_extras_only():
 
     spec = ToolSelectionSpec.from_raw(
         tool_categories=[],
-        workforce_extra_names={"agent_42"},
+        published_agent_ids=[42],  # dispatch: run the published-agent creator
+        workforce_extra_names={"agent_42"},  # filter: keep this worker tool
         extras_only_when_unconfigured=True,
     )
 
@@ -1014,6 +1017,7 @@ def test_from_raw_can_restrict_unconfigured_agent_to_workforce_extras_only():
     assert spec.categories == frozenset()
     assert spec.name_allowlist == frozenset({"agent_42"})
     assert spec.includes_category("basic") is False
+    # Dispatch comes from published_agent_ids, not from the name allow-list.
     assert spec.includes_published_agent() is True
     assert spec.compute_allowed_names(
         [
@@ -1039,19 +1043,22 @@ def test_from_raw_unconfigured_extras_only_without_extras_yields_none_mode():
     assert isinstance(spec, _SpecNone)
 
 
-def test_from_raw_workforce_extras_carried_in_by_categories():
-    """In BY_CATEGORIES, ``workforce_extra_names`` lands on
-    :attr:`_SpecByCategories.name_allowlist` for ``compute_allowed_names``
-    injection."""
+def test_name_allowlist_alone_does_not_trigger_published_dispatch():
+    """``name_allowlist`` (incl. workforce extras) lands on the spec as a
+    pure name-level filter; it MUST NOT by itself trigger the
+    published-agent creator. Dispatch is declared via ``"agent"`` category
+    or ``published_agent_ids`` (issue #539 -- filter vs dispatch are
+    orthogonal)."""
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
 
     spec = ToolSelectionSpec.from_raw(
         tool_categories=["basic"],
-        workforce_extra_names={"worker_tool_a", "worker_tool_b"},
+        name_allowlist={"worker_tool_a", "worker_tool_b"},
     )
     assert isinstance(spec, _SpecByCategories)
     assert spec.name_allowlist == frozenset({"worker_tool_a", "worker_tool_b"})
-    assert spec.includes_published_agent() is True
+    # No "agent" category and no published_agent_ids -> creator stays off.
+    assert spec.includes_published_agent() is False
 
 
 # ----- P2 fix: includes_custom_api with category restriction -------------

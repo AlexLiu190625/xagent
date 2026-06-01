@@ -209,10 +209,23 @@ class ToolSelectionSpec(ABC):
 
         if tool_categories is None or len(tool_categories) == 0:
             if extras_only_when_unconfigured:
-                if not merged_names:
+                # Workforce manager runtime: declare the published_agent
+                # dispatch via ``published_agent_ids`` (the worker agent
+                # ids) and the name-level filter via ``name_allowlist``
+                # (worker tool names). The two are orthogonal -- dispatch
+                # decides the creator runs, the allow-list narrows its
+                # output. Without the ids the creator would not run and
+                # the worker tools would never be produced.
+                pids = (
+                    frozenset(published_agent_ids)
+                    if published_agent_ids is not None
+                    else None
+                )
+                if not merged_names and not pids:
                     return _SpecNone()
                 return _SpecByCategories(
                     categories=frozenset(),
+                    published_agent_ids=pids,
                     name_allowlist=merged_names,
                 )
             return _SpecAll()
@@ -417,10 +430,17 @@ class _SpecByCategories(ToolSelectionSpec):
         # explicit name in the allow-list. All three empty means "select
         # nothing", which should be expressed as _SpecNone / _SpecAll via
         # from_raw instead.
-        if not self.categories and not self.mcp_servers and not self.name_allowlist:
+        if (
+            not self.categories
+            and not self.mcp_servers
+            and not self.name_allowlist
+            and not self.published_agent_ids
+            and not self.custom_api_ids
+        ):
             raise ValueError(
-                "_SpecByCategories requires non-empty categories, "
-                "mcp_servers, or name_allowlist. "
+                "_SpecByCategories requires a non-empty selection in at "
+                "least one dimension (categories, mcp_servers, "
+                "name_allowlist, published_agent_ids, or custom_api_ids). "
                 "Use ToolSelectionSpec.from_raw() with empty / None "
                 "categories to get _SpecAll, or pass "
                 "explicit_none=True for _SpecNone."
@@ -453,13 +473,15 @@ class _SpecByCategories(ToolSelectionSpec):
         return "other" in self.categories or bool(self.mcp_servers)
 
     def includes_published_agent(self) -> bool:
-        if self.name_allowlist:
-            return True
-        if "agent" not in self.categories:
-            return False
+        # Pure dispatch decision: whether the published-agent creator runs
+        # is declared by the "agent" category or by published_agent_ids --
+        # NOT by name_allowlist. name_allowlist is a name-level filter
+        # (applied after creators run), so letting it trigger this creator
+        # would conflate filter with dispatch (issue #539). An explicit
+        # empty published_agent_ids means "no delegation".
         if self.published_agent_ids is not None and len(self.published_agent_ids) == 0:
             return False
-        return True
+        return "agent" in self.categories or bool(self.published_agent_ids)
 
     def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
         """Filter ``all_tools`` by ``categories`` + ``mcp_servers``,
