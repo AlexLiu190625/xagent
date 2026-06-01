@@ -415,6 +415,56 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
     assert payload_calls == [(12, "task_error")]
 
 
+@pytest.mark.asyncio
+async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
+    """An empty assistant reply makes persist_assistant_message
+    early-return WITHOUT committing. The explicit terminal commit must
+    still land COMPLETED, so a successful empty turn is not left RUNNING
+    (and later flipped to FAILED by finish_turn)."""
+    user = _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=13, user_id=1, status=TaskStatus.RUNNING)
+    db_session.commit()
+
+    payload_calls: list[tuple] = []
+
+    class BroadcastManager:
+        async def broadcast_to_task(self, event, task_id):
+            pass
+
+    class AgentManager:
+        async def get_agent_for_task(self, task_id, db, **kwargs):
+            return _NoopAgentService()
+
+        async def execute_task(self, **kwargs):
+            return {"success": True, "output": "ok", "file_outputs": []}
+
+    def fake_payload(task_id, message, *, event_type="agent_error"):
+        payload_calls.append((task_id, event_type))
+        return {"type": event_type, "task_id": task_id}
+
+    _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
+    # Empty-content path: persist early-returns None without committing.
+    monkeypatch.setattr(
+        "xagent.web.services.chat_history_service.persist_assistant_message",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
+
+    await execute_task_background(
+        task_id=13,
+        user_message="hi",
+        context={},
+        agent_manager=AgentManager(),
+        user_id=int(user.id),
+        llm_user_message="hi",
+    )
+
+    db_session.expire_all()
+    task = db_session.query(Task).filter(Task.id == 13).first()
+    assert task.status == TaskStatus.COMPLETED
+    assert payload_calls == []
+
+
 def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():
     context = _build_uploaded_files_context(
         [

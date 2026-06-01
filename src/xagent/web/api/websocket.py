@@ -1491,6 +1491,17 @@ async def execute_task_background(
                         if isinstance(chat_response, dict)
                         else None,
                     )
+                    # Commit the pending terminal status. ``persist_assistant_message``
+                    # commits internally when it writes a row, but it
+                    # early-returns WITHOUT committing when the assistant
+                    # content is empty (a valid empty-reply turn). This
+                    # explicit commit lands the terminal status in that
+                    # case too, so an empty successful turn stays COMPLETED
+                    # rather than being left RUNNING (and later flipped to
+                    # FAILED by finish_turn). If persistence raised, control
+                    # never reaches here -- the status stays uncommitted and
+                    # the outer except surfaces a real failure.
+                    db_new.commit()
 
             # Materialize broadcast metadata into primitives BEFORE the
             # ``finally`` block closes ``db_new``. ``task_updated`` is
