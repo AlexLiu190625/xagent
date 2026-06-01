@@ -2082,7 +2082,10 @@ class TestCreateAndCallAgent:
                 "spec, not ALL/NONE -- otherwise the factory's name filter "
                 "won't restrict to LinkedIn MCP tools."
             )
-            assert "mcp:LinkedIn" in spec.categories
+            # Orthogonal model: the mcp:<server> scope lands in
+            # mcp_servers only, not in categories (no raw string leak).
+            assert "mcp:LinkedIn" not in spec.categories
+            assert "mcp" not in spec.categories
             assert spec.mcp_servers == frozenset({"LinkedIn"})
         finally:
             db.close()

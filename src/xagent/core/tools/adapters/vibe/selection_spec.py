@@ -62,7 +62,7 @@ class ToolSelectionSpec(ABC):
       - ``_SpecNone`` — explicit "zero tools"; factory returns ``[]``.
       - ``_SpecByCategories`` — filter by category, with optional
         ID-level scopes (mcp_servers / custom_api_ids /
-        published_agent_ids) and ``name_extras`` (workforce worker
+        published_agent_ids) and ``name_allowlist`` (workforce worker
         tool injection).
 
     Mode completeness is enforced by ``@abstractmethod``: each
@@ -150,7 +150,7 @@ class ToolSelectionSpec(ABC):
             ``frozenset()`` — caller returns ``[]`` (NONE mode).
             non-empty set  — caller filters ``all_tools`` to names
                              in the set (BY_CATEGORIES mode, plus
-                             :attr:`name_extras` injection).
+                             :attr:`name_allowlist` injection).
 
         The frozenset() vs None distinction is load-bearing:
         ``ToolFactory.create_all_tools`` reads this method and
@@ -168,6 +168,7 @@ class ToolSelectionSpec(ABC):
         custom_api_ids: Optional[List[int]] = None,
         published_agent_ids: Optional[List[int]] = None,
         workforce_extra_names: Optional[Set[str]] = None,
+        name_allowlist: Optional[Set[str]] = None,
         explicit_none: bool = False,
         extras_only_when_unconfigured: bool = False,
     ) -> "ToolSelectionSpec":
@@ -198,48 +199,49 @@ class ToolSelectionSpec(ABC):
         """
         if explicit_none:
             return _SpecNone()
+
+        # Two name-level allow-list sources feed the same field:
+        # workforce worker injection and the generic ``name_allowlist``.
+        # Workforce is just one source; merge them.
+        merged_names = frozenset(
+            (workforce_extra_names or set()) | (name_allowlist or set())
+        )
+
         if tool_categories is None or len(tool_categories) == 0:
             if extras_only_when_unconfigured:
-                name_extras = frozenset(workforce_extra_names or ())
-                if not name_extras:
+                if not merged_names:
                     return _SpecNone()
                 return _SpecByCategories(
                     categories=frozenset(),
-                    name_extras=name_extras,
-                    _user_picked=frozenset(),
+                    name_allowlist=merged_names,
                 )
             return _SpecAll()
 
-        # Agent-builder UI representation in ``tool_categories`` mixes
-        # two shapes:
+        # ``tool_categories`` mixes two orthogonal shapes:
         #   - plain category names (``"basic"``, ``"file"``, ``"mcp"``)
-        #   - ``"mcp:<server-name>"`` (selects a specific MCP server
-        #     OR a Custom-API tool that fronts it; both surface as
-        #     name patterns under the ``"mcp"`` / ``"other"`` categories)
+        #   - ``"mcp:<server>"`` — a specific MCP server (or the
+        #     Custom-API tool fronting it)
         #
-        # Normalize the mixed shape into the structured spec form:
-        #   - plain entries land in ``categories``
-        #   - ``mcp:<server>`` entries add ``"mcp"`` + ``"other"`` to
-        #     ``categories`` (so MCP / Custom-API creators run) and
-        #     ``<server>`` to ``mcp_servers`` (per-server filter)
+        # Keep them in separate fields, not one overloaded set:
+        #   - plain entries  -> ``categories``
+        #   - ``mcp:<server>`` -> ``mcp_servers`` ONLY
         #
-        # The ``categories`` frozenset retains the original
-        # ``mcp:<server>`` strings too — :meth:`compute_allowed_names`
-        # uses them to match tool names (``mcp_<server>_*`` /
-        # ``api_<server>_call``) at the name-filter step.
-        derived_cats: Set[str] = set()
+        # Whether the MCP / Custom-API creators run is derived from
+        # ``includes_mcp()`` / ``includes_custom_api()`` (which read
+        # ``mcp_servers`` too); ``compute_allowed_names`` reads
+        # ``mcp_servers`` directly for the per-server name match. No
+        # support categories are injected and no raw ``mcp:<server>``
+        # string leaks into ``categories``.
+        plain_cats: Set[str] = set()
         derived_mcp_servers: Set[str] = set()
         for entry in tool_categories:
             if isinstance(entry, str) and entry.startswith("mcp:"):
                 server_name = entry.split(":", 1)[1].replace(" ", "_").replace("-", "_")
-                derived_cats.add("mcp")
-                derived_cats.add("other")
-                derived_cats.add(entry)  # keep for name-filter step
                 derived_mcp_servers.add(server_name)
             else:
-                derived_cats.add(entry)
+                plain_cats.add(entry)
 
-        # Caller-supplied mcp_servers (if any) merge with the
+        # Caller-supplied mcp_servers (if any) take precedence over the
         # derived set; explicit empty stays empty.
         if mcp_servers is not None:
             final_mcp_servers: Optional[frozenset[str]] = frozenset(mcp_servers)
@@ -249,7 +251,7 @@ class ToolSelectionSpec(ABC):
             final_mcp_servers = None
 
         return _SpecByCategories(
-            categories=frozenset(derived_cats),
+            categories=frozenset(plain_cats),
             mcp_servers=final_mcp_servers,
             custom_api_ids=(
                 frozenset(custom_api_ids) if custom_api_ids is not None else None
@@ -259,12 +261,7 @@ class ToolSelectionSpec(ABC):
                 if published_agent_ids is not None
                 else None
             ),
-            name_extras=frozenset(workforce_extra_names or ()),
-            # Record the user's raw category list so
-            # ``compute_allowed_names`` can tell plain "mcp" / "other"
-            # admit-all from a derived "mcp" added solely for the
-            # registry-skip side of mcp:<server> sub-categories.
-            _user_picked=frozenset(tool_categories),
+            name_allowlist=merged_names,
         )
 
     # ── Backward-compat helper (kept from the original spec) ─────
@@ -396,7 +393,7 @@ class _SpecByCategories(ToolSelectionSpec):
 
     ``categories`` is normally non-empty. The one valid empty-category
     state is workforce manager injection: no ordinary categories, but
-    explicit ``name_extras`` worker-agent tools.
+    explicit ``name_allowlist`` worker-agent tools.
     """
 
     categories: frozenset[str] = field(default_factory=frozenset)
@@ -406,43 +403,27 @@ class _SpecByCategories(ToolSelectionSpec):
     # Workforce worker tool name injection. Only meaningful in
     # BY_CATEGORIES mode (in ALL the full set already includes
     # them; in NONE everything is rejected).
-    name_extras: frozenset[str] = field(default_factory=frozenset)
-    # The pre-derivation user input, used by ``compute_allowed_names``
-    # to tell apart "user picked plain 'mcp' (admit ALL mcp tools)"
-    # from "user picked only 'mcp:<server>' (from_raw added 'mcp' to
-    # categories for the registry skip, but the name filter should
-    # NOT broaden to every mcp tool)". Set by :meth:`from_raw`. For
-    # direct construction the default is the same as ``categories``
-    # (so direct-construction callers without sub-category derivation
-    # behave as the legacy single-dataclass spec did).
-    _user_picked: Optional[frozenset[str]] = None
+    # Extra tools admitted by exact name, unioned with the category
+    # matches in ``compute_allowed_names``. Two sources feed it via
+    # ``from_raw``: workforce worker-tool injection
+    # (``workforce_extra_names``) and the generic ``name_allowlist``.
+    # Only meaningful in BY_CATEGORIES mode (ALL already includes
+    # everything; NONE rejects everything).
+    name_allowlist: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
-        if not self.categories and not self.name_extras:
+        # A by-categories spec must select *something*: a plain category,
+        # a scoped MCP server (``mcp:<server>`` -> ``mcp_servers``), or an
+        # explicit name in the allow-list. All three empty means "select
+        # nothing", which should be expressed as _SpecNone / _SpecAll via
+        # from_raw instead.
+        if not self.categories and not self.mcp_servers and not self.name_allowlist:
             raise ValueError(
-                "_SpecByCategories requires non-empty categories or "
-                "name_extras. "
+                "_SpecByCategories requires non-empty categories, "
+                "mcp_servers, or name_allowlist. "
                 "Use ToolSelectionSpec.from_raw() with empty / None "
                 "categories to get _SpecAll, or pass "
                 "explicit_none=True for _SpecNone."
-            )
-        # Defense against direct-construction bypass: if categories
-        # carry the agent-builder ``mcp:<server>`` sub-category form,
-        # the parallel ``mcp_servers`` field must be populated for the
-        # MCP creator's per-server filter to work. ``from_raw`` derives
-        # both consistently; a caller that direct-constructs with
-        # ``mcp:<server>`` in categories but ``mcp_servers=None`` would
-        # land in an inconsistent state.
-        mcp_sub_categories = {
-            c for c in self.categories if isinstance(c, str) and c.startswith("mcp:")
-        }
-        if mcp_sub_categories and self.mcp_servers is None:
-            raise ValueError(
-                f"_SpecByCategories with mcp:<server> sub-categories "
-                f"({sorted(mcp_sub_categories)}) requires mcp_servers "
-                f"to be set (the parallel per-server filter). "
-                f"Construct via ToolSelectionSpec.from_raw(tool_categories=...) "
-                f"to derive both fields consistently."
             )
 
     def is_all(self) -> bool:
@@ -454,42 +435,25 @@ class _SpecByCategories(ToolSelectionSpec):
     def is_by_categories(self) -> bool:
         return True
 
-    def _user_categories(self) -> frozenset[str]:
-        """Return the pre-derivation user-picked category set.
-
-        ``from_raw`` records the user's original list here so the
-        name-filter step can tell "user said plain 'mcp'" (admit all
-        mcp tools) apart from "user said only 'mcp:<server>'" (admit
-        only that server's tools). For direct construction without
-        a ``_user_picked`` arg, fall back to ``categories`` — that
-        matches the legacy single-dataclass behaviour where
-        ``categories`` was the user input verbatim.
-        """
-        return self._user_picked if self._user_picked is not None else self.categories
-
     def includes_mcp(self) -> bool:
-        # Need "mcp" in categories; otherwise the registry-level
-        # skip would have caught it but creators with no static
-        # categories annotation can still consult this method.
-        if "mcp" not in self.categories:
-            return False
+        # Explicit empty server set means "no MCP" (legacy
+        # explicit-exclude shape). Otherwise the MCP creator runs when
+        # the plain "mcp" category is selected (all MCP) or a specific
+        # server was scoped via mcp:<server> (-> mcp_servers).
         if self.mcp_servers is not None and len(self.mcp_servers) == 0:
             return False
-        return True
+        return "mcp" in self.categories or bool(self.mcp_servers)
 
     def includes_custom_api(self) -> bool:
-        # P2 fix: Custom API tools live under the "other" category.
-        # If the caller restricts categories without including
-        # "other", custom API tools cannot survive the post-build
-        # name filter, so the creator's DB lookup is wasted I/O.
-        if "other" not in self.categories:
-            return False
+        # Custom API tools surface under the "other" category. A scoped
+        # mcp:<server> also fronts a Custom-API wrapper
+        # (api_<server>_call), so a server scope runs this creator too.
         if self.custom_api_ids is not None and len(self.custom_api_ids) == 0:
             return False
-        return True
+        return "other" in self.categories or bool(self.mcp_servers)
 
     def includes_published_agent(self) -> bool:
-        if self.name_extras:
+        if self.name_allowlist:
             return True
         if "agent" not in self.categories:
             return False
@@ -498,16 +462,25 @@ class _SpecByCategories(ToolSelectionSpec):
         return True
 
     def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
-        """Filter ``all_tools`` by ``categories`` + add ``name_extras``.
+        """Filter ``all_tools`` by ``categories`` + ``mcp_servers``,
+        then union ``name_allowlist``.
 
-        Folds the matching logic of the retired
-        ``select_allowed_tool_names_from_categories`` helper plus
-        the ``_merge_workforce_tool_names`` workforce-extra step
-        into a single dispatch.
+        Reads the orthogonal policy fields directly (no ``_user_picked``
+        reconstruction):
 
-        Duck-typed access to ``tool.metadata.category`` keeps this
-        module free of any Tool / AbstractBaseTool import.
+          - a tool whose category ∈ ``categories`` is admitted (plain
+            ``"mcp"`` admits all MCP tools, ``"other"`` all Custom-API
+            tools, etc.);
+          - otherwise an ``"mcp"`` tool is admitted when its name matches
+            a scoped server in ``mcp_servers`` (``mcp_<server>_*``);
+          - otherwise an ``"other"`` tool admits the scoped Custom-API
+            wrapper ``api_<server>_call``;
+          - finally ``name_allowlist`` names are unioned in.
+
+        Duck-typed access to ``tool.metadata.category`` keeps this module
+        free of any Tool / AbstractBaseTool import.
         """
+        norm_servers = {s.lower() for s in (self.mcp_servers or frozenset())}
         names: Set[str] = set()
         for tool in all_tools:
             if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):
@@ -517,64 +490,26 @@ class _SpecByCategories(ToolSelectionSpec):
                 continue
             category = str(tool.metadata.category.value)
 
-            # Plain category match. Note ``from_raw`` may add "mcp" /
-            # "other" to ``categories`` when the user picked a
-            # ``mcp:<server>`` sub-category — that is for the
-            # registry-level skip, not a name-level admit. The
-            # ``categories`` frozenset distinguishes the two cases by
-            # carrying the original raw strings:
-            #
-            #   from_raw(["mcp"])           -> {"mcp"}
-            #     → user explicitly asked for ALL mcp tools; admit
-            #   from_raw(["mcp:Gmail"])     -> {"mcp", "other", "mcp:Gmail"}
-            #     → user asked for one server; do NOT broaden to all mcp
-            #   from_raw(["mcp", "mcp:X"])  -> {"mcp", "other", "mcp:X"}
-            #     → "mcp" plain entry wins → admit all mcp tools
-            #
-            # So a tool whose category is "mcp" / "other" admits when
-            # the *plain* string is in ``categories``; a tool whose
-            # category is "mcp:<server>" wouldn't exist (servers don't
-            # have their own category) -- this branch only runs once
-            # per tool. ``_raw_user_categories`` is set by ``from_raw``
-            # to the pre-derivation user input; for direct construction
-            # it falls back to ``categories``.
-            user_picked = self._user_categories()
-            if category in ("mcp", "other"):
-                if category in user_picked:
-                    names.add(tool_name)
-                    continue
-                # No plain "mcp" / "other" picked; fall through to
-                # mcp:<server> sub-category matching below.
-            elif category in self.categories:
+            # Plain category admit (categories holds only plain names).
+            if category in self.categories:
                 names.add(tool_name)
                 continue
 
-            # "mcp:<server>" sub-category — match mcp_<server>_*
-            if category == "mcp":
-                for cat_spec in self.categories:
-                    if not cat_spec.startswith("mcp:"):
-                        continue
-                    server = (
-                        cat_spec.split(":", 1)[1].replace(" ", "_").replace("-", "_")
-                    )
-                    if tool_name.lower().startswith(f"mcp_{server.lower()}_"):
-                        names.add(tool_name)
-                        break
+            # Server-scoped MCP: mcp_<server>_* for a server in
+            # mcp_servers, even when plain "mcp" was not selected.
+            if category == "mcp" and norm_servers:
+                lname = tool_name.lower()
+                if any(lname.startswith(f"mcp_{server}_") for server in norm_servers):
+                    names.add(tool_name)
+                continue
 
-            # "mcp:<server>" sub-category — match api_<server>_call
-            # (Custom-API tools surface under the "other" category but
-            # the user expresses them through the same mcp:<server> tag.)
-            elif category == "other":
-                for cat_spec in self.categories:
-                    if not cat_spec.startswith("mcp:"):
-                        continue
-                    server = (
-                        cat_spec.split(":", 1)[1].replace(" ", "_").replace("-", "_")
-                    )
-                    if tool_name.lower() == f"api_{server.lower()}_call":
-                        names.add(tool_name)
-                        break
+            # Server-scoped Custom-API wrapper: api_<server>_call.
+            if category == "other" and norm_servers:
+                lname = tool_name.lower()
+                if any(lname == f"api_{server}_call" for server in norm_servers):
+                    names.add(tool_name)
+                continue
 
-        # Inject workforce worker tool names (only meaningful in
-        # this mode; ``from_raw`` zeroes out for ALL / NONE).
-        return frozenset(names | self.name_extras)
+        # Union the exact-name allow-list (workforce injection +
+        # generic name_allowlist; ``from_raw`` zeroes it for ALL / NONE).
+        return frozenset(names | self.name_allowlist)

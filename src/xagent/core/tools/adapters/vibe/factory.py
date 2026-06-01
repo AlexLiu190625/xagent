@@ -267,7 +267,7 @@ class ToolFactory:
         #   None             — ALL mode, keep every tool from the registry
         #   frozenset()      — NONE mode, drop every tool
         #   frozenset({...}) — BY_CATEGORIES mode, keep only matching names
-        #                      (plus any workforce ``name_extras`` injection)
+        #                      (plus any workforce ``name_allowlist`` injection)
         #
         # Sealed-type dispatch — the three modes are mutually exclusive
         # and impossible to confuse, unlike the older raw list whose
@@ -279,6 +279,23 @@ class ToolFactory:
             else None
         )
         if spec is not None:
+            # Prefer the spec. If a legacy concrete ``allowed_tools`` list
+            # is ALSO present, warn rather than silently intersecting with
+            # a possibly-stale list (issue #539): the spec is the source
+            # of truth once supplied.
+            legacy_when_spec = (
+                config.get_allowed_tools()
+                if hasattr(config, "get_allowed_tools")
+                else None
+            )
+            if legacy_when_spec is not None:
+                logger.warning(
+                    "Both a ToolSelectionSpec and a legacy allowed_tools "
+                    "list are set on %s; using the spec and ignoring the "
+                    "legacy list (%d name(s)).",
+                    type(config).__name__,
+                    len(legacy_when_spec),
+                )
             allowed_names = spec.compute_allowed_names(tools)
         else:
             # Legacy contract: ``BaseToolConfig.get_allowed_tools()`` is

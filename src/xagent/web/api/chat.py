@@ -316,19 +316,16 @@ def _spec_wants_mcp(tool_selection_spec: Optional[Any]) -> bool:
 
     Returns ``False`` for ``None`` (no spec / legacy caller),
     ``_SpecAll`` (no restriction means "build registered defaults",
-    NOT "ALL including MCP"), and ``_SpecNone`` (zero tools). Returns
-    ``True`` only when ``_SpecByCategories._user_categories()`` (the
-    pre-derivation user input) carries the ``mcp`` token or any
-    ``mcp:<server>`` form.
+    NOT "ALL including MCP"), and ``_SpecNone`` (zero tools). Only a
+    ``_SpecByCategories`` whose normalized policy includes MCP (plain
+    ``"mcp"`` category or a scoped ``mcp_servers``) wants MCP loading;
+    this defers to the spec's own ``includes_mcp()`` dispatch.
     """
     if tool_selection_spec is None:
         return False
     if not tool_selection_spec.is_by_categories():
         return False
-    user_picked = tool_selection_spec._user_categories()
-    return any(
-        c == "mcp" or (isinstance(c, str) and c.startswith("mcp:")) for c in user_picked
-    )
+    return bool(tool_selection_spec.includes_mcp())
 
 
 def _build_tool_selection_spec_for_task(
