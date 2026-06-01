@@ -33,11 +33,11 @@ Mode completeness:
 
 Backward compat:
     All three subclasses expose ``categories`` /``mcp_servers`` /
-    ``custom_api_ids`` / ``published_agent_ids`` fields (the original
-    spec shape). ``_SpecAll`` has them at None / ``_SpecNone`` at
-    None plus empty ``categories``, so existing callsites that read
-    ``spec.categories`` directly keep working. New code should
-    prefer the typed dispatch (``spec.is_by_categories()`` etc.).
+    ``published_agent_ids`` fields (the original spec shape).
+    ``_SpecAll`` has them at None / ``_SpecNone`` at None plus empty
+    ``categories``, so existing callsites that read ``spec.categories``
+    directly keep working. New code should prefer the typed dispatch
+    (``spec.is_by_categories()`` etc.).
 
 This module deliberately has no dependencies on the rest of the
 codebase so the spec can be imported by both the factory and the
@@ -61,9 +61,9 @@ class ToolSelectionSpec(ABC):
         default tool. Factory does not filter by name.
       - ``_SpecNone`` — explicit "zero tools"; factory returns ``[]``.
       - ``_SpecByCategories`` — filter by category, with optional
-        ID-level scopes (mcp_servers / custom_api_ids /
-        published_agent_ids) and ``name_allowlist`` (workforce worker
-        tool injection).
+        ID-level scopes (mcp_servers / published_agent_ids) and
+        ``name_allowlist`` (a pure name-level filter; workforce worker
+        tool injection is one source).
 
     Mode completeness is enforced by ``@abstractmethod``: each
     subclass must implement every predicate / dispatch method.
@@ -164,10 +164,7 @@ class ToolSelectionSpec(ABC):
         cls,
         *,
         tool_categories: Optional[List[str]] = None,
-        mcp_servers: Optional[List[str]] = None,
-        custom_api_ids: Optional[List[int]] = None,
         published_agent_ids: Optional[List[int]] = None,
-        workforce_extra_names: Optional[Set[str]] = None,
         name_allowlist: Optional[Set[str]] = None,
         explicit_none: bool = False,
         extras_only_when_unconfigured: bool = False,
@@ -185,48 +182,43 @@ class ToolSelectionSpec(ABC):
             ``tool_categories`` (reserved for future "zero tools"
             product UI).
           - ``extras_only_when_unconfigured=True`` with unset / empty
-            categories → only ``workforce_extra_names`` are admitted
-            (or ``_SpecNone`` when there are no extras). Workforce
-            manager tasks use this so an unconfigured manager can only
-            delegate to its workers by default, without inheriting the
-            full ordinary tool set.
+            categories → workforce manager runtime: ``published_agent_ids``
+            declares the published-agent dispatch and ``name_allowlist``
+            filters to the worker tool names (or ``_SpecNone`` when there
+            is no ``published_agent_ids``). Lets an unconfigured manager
+            delegate only to its workers without inheriting the full set.
           - Otherwise → ``_SpecByCategories``.
 
-        By default, ``workforce_extra_names`` is only meaningful in
-        BY_CATEGORIES mode (ALL already includes everything; NONE
-        rejects everything). ``extras_only_when_unconfigured`` is the
-        opt-in exception for workforce manager runtime construction.
+        ``name_allowlist`` is a pure name-level filter (only meaningful in
+        BY_CATEGORIES; ALL already includes everything, NONE rejects
+        everything). It does NOT trigger any creator -- dispatch is
+        declared by ``categories`` / ``published_agent_ids``.
         """
         if explicit_none:
             return _SpecNone()
 
-        # Two name-level allow-list sources feed the same field:
-        # workforce worker injection and the generic ``name_allowlist``.
-        # Workforce is just one source; merge them.
-        merged_names = frozenset(
-            (workforce_extra_names or set()) | (name_allowlist or set())
-        )
+        names = frozenset(name_allowlist or set())
 
         if tool_categories is None or len(tool_categories) == 0:
             if extras_only_when_unconfigured:
-                # Workforce manager runtime: declare the published_agent
-                # dispatch via ``published_agent_ids`` (the worker agent
-                # ids) and the name-level filter via ``name_allowlist``
-                # (worker tool names). The two are orthogonal -- dispatch
-                # decides the creator runs, the allow-list narrows its
-                # output. Without the ids the creator would not run and
-                # the worker tools would never be produced.
+                # Workforce manager runtime: ``published_agent_ids``
+                # declares the dispatch (run the published-agent creator,
+                # scoped to the worker agents); ``name_allowlist`` narrows
+                # its output to the worker tool names. They are orthogonal.
+                # ``name_allowlist`` alone is a pure filter -- with no
+                # dispatch there is no creator output to filter, so that
+                # collapses to NONE.
                 pids = (
                     frozenset(published_agent_ids)
                     if published_agent_ids is not None
                     else None
                 )
-                if not merged_names and not pids:
+                if not pids:
                     return _SpecNone()
                 return _SpecByCategories(
                     categories=frozenset(),
                     published_agent_ids=pids,
-                    name_allowlist=merged_names,
+                    name_allowlist=names,
                 )
             return _SpecAll()
 
@@ -254,27 +246,19 @@ class ToolSelectionSpec(ABC):
             else:
                 plain_cats.add(entry)
 
-        # Caller-supplied mcp_servers (if any) take precedence over the
-        # derived set; explicit empty stays empty.
-        if mcp_servers is not None:
-            final_mcp_servers: Optional[frozenset[str]] = frozenset(mcp_servers)
-        elif derived_mcp_servers:
-            final_mcp_servers = frozenset(derived_mcp_servers)
-        else:
-            final_mcp_servers = None
+        final_mcp_servers = (
+            frozenset(derived_mcp_servers) if derived_mcp_servers else None
+        )
 
         return _SpecByCategories(
             categories=frozenset(plain_cats),
             mcp_servers=final_mcp_servers,
-            custom_api_ids=(
-                frozenset(custom_api_ids) if custom_api_ids is not None else None
-            ),
             published_agent_ids=(
                 frozenset(published_agent_ids)
                 if published_agent_ids is not None
                 else None
             ),
-            name_allowlist=merged_names,
+            name_allowlist=names,
         )
 
     # ── Backward-compat helper (kept from the original spec) ─────
@@ -308,17 +292,16 @@ class ToolSelectionSpec(ABC):
 class _SpecAll(ToolSelectionSpec):
     """ALL mode — legacy "未配置" / no restriction.
 
-    Exposes ``categories`` / ``mcp_servers`` / ``custom_api_ids`` /
-    ``published_agent_ids`` at ``None`` for backward compat with
-    callsites that read those attributes directly (e.g. the
-    registry-level skip in ``factory.py:ToolRegistry``).
+    Exposes ``categories`` / ``mcp_servers`` / ``published_agent_ids``
+    at ``None`` for backward compat with callsites that read those
+    attributes directly (e.g. the registry-level skip in
+    ``factory.py:ToolRegistry``).
     """
 
     # Backward-compat fields (kept None to preserve existing
     # ``spec.categories is None`` truthiness in factory.py).
     categories: Optional[frozenset[str]] = None
     mcp_servers: Optional[frozenset[str]] = None
-    custom_api_ids: Optional[frozenset[int]] = None
     published_agent_ids: Optional[frozenset[int]] = None
 
     def is_all(self) -> bool:
@@ -341,10 +324,6 @@ class _SpecAll(ToolSelectionSpec):
         return True
 
     def includes_custom_api(self) -> bool:
-        # Backward-compat mirror of includes_mcp above for the
-        # explicit-exclude legacy shape.
-        if self.custom_api_ids is not None and len(self.custom_api_ids) == 0:
-            return False
         return True
 
     def includes_published_agent(self) -> bool:
@@ -372,7 +351,6 @@ class _SpecNone(ToolSelectionSpec):
 
     categories: Optional[frozenset[str]] = field(default_factory=lambda: frozenset())
     mcp_servers: Optional[frozenset[str]] = None
-    custom_api_ids: Optional[frozenset[int]] = None
     published_agent_ids: Optional[frozenset[int]] = None
 
     def is_all(self) -> bool:
@@ -411,17 +389,17 @@ class _SpecByCategories(ToolSelectionSpec):
 
     categories: frozenset[str] = field(default_factory=frozenset)
     mcp_servers: Optional[frozenset[str]] = None
-    custom_api_ids: Optional[frozenset[int]] = None
     published_agent_ids: Optional[frozenset[int]] = None
     # Workforce worker tool name injection. Only meaningful in
     # BY_CATEGORIES mode (in ALL the full set already includes
     # them; in NONE everything is rejected).
     # Extra tools admitted by exact name, unioned with the category
-    # matches in ``compute_allowed_names``. Two sources feed it via
-    # ``from_raw``: workforce worker-tool injection
-    # (``workforce_extra_names``) and the generic ``name_allowlist``.
-    # Only meaningful in BY_CATEGORIES mode (ALL already includes
-    # everything; NONE rejects everything).
+    # matches in ``compute_allowed_names``. A pure name-level filter fed
+    # via ``from_raw(name_allowlist=...)`` (workforce passes its worker
+    # tool names here). Does NOT trigger any creator -- dispatch is
+    # declared by ``categories`` / ``published_agent_ids``. Only
+    # meaningful in BY_CATEGORIES mode (ALL already includes everything;
+    # NONE rejects everything).
     name_allowlist: frozenset[str] = field(default_factory=frozenset)
 
     def __post_init__(self) -> None:
@@ -430,20 +408,23 @@ class _SpecByCategories(ToolSelectionSpec):
         # explicit name in the allow-list. All three empty means "select
         # nothing", which should be expressed as _SpecNone / _SpecAll via
         # from_raw instead.
+        # Only DISPATCH dimensions count as "selecting something":
+        # categories, mcp_servers, published_agent_ids. ``name_allowlist``
+        # is a pure filter (applied after creators run) -- a spec with only
+        # name_allowlist and no dispatch produces nothing, which is NONE,
+        # not a valid BY_CATEGORIES. So name_allowlist is excluded here.
         if (
             not self.categories
             and not self.mcp_servers
-            and not self.name_allowlist
             and not self.published_agent_ids
-            and not self.custom_api_ids
         ):
             raise ValueError(
                 "_SpecByCategories requires a non-empty selection in at "
-                "least one dimension (categories, mcp_servers, "
-                "name_allowlist, published_agent_ids, or custom_api_ids). "
-                "Use ToolSelectionSpec.from_raw() with empty / None "
-                "categories to get _SpecAll, or pass "
-                "explicit_none=True for _SpecNone."
+                "least one DISPATCH dimension (categories, mcp_servers, or "
+                "published_agent_ids). name_allowlist is a filter, not a "
+                "selection. Use ToolSelectionSpec.from_raw() with empty / "
+                "None categories to get _SpecAll, or explicit_none=True for "
+                "_SpecNone."
             )
 
     def is_all(self) -> bool:
@@ -468,8 +449,10 @@ class _SpecByCategories(ToolSelectionSpec):
         # Custom API tools surface under the "other" category. A scoped
         # mcp:<server> also fronts a Custom-API wrapper
         # (api_<server>_call), so a server scope runs this creator too.
-        if self.custom_api_ids is not None and len(self.custom_api_ids) == 0:
-            return False
+        # Filter happens in the creator via ``config.get_custom_api_configs``
+        # and ``compute_allowed_names``'s "other"/server matching -- there
+        # is no spec-level custom_api id list (ids can't be mapped to tool
+        # names in the spec layer).
         return "other" in self.categories or bool(self.mcp_servers)
 
     def includes_published_agent(self) -> bool:

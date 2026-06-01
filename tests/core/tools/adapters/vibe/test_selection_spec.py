@@ -96,18 +96,6 @@ def test_spec_excludes_mcp_on_empty_server_set():
     assert spec.includes_mcp() is False
 
 
-def test_spec_custom_api_empty_set_excludes():
-    spec = ToolSelectionSpec(custom_api_ids=frozenset())
-    assert spec.includes_custom_api() is False
-
-
-def test_spec_custom_api_none_includes():
-    """None means "no restriction" -- the creator still runs and falls
-    back to whatever DB-level filtering it does internally."""
-    spec = ToolSelectionSpec(custom_api_ids=None)
-    assert spec.includes_custom_api() is True
-
-
 def test_spec_published_agent_empty_set_excludes():
     spec = ToolSelectionSpec(published_agent_ids=frozenset())
     assert spec.includes_published_agent() is False
@@ -223,7 +211,7 @@ async def test_registry_runs_published_agent_creator_for_workforce_extras(
     spec = ToolSelectionSpec.from_raw(
         tool_categories=["basic"],
         published_agent_ids=[42],  # dispatch: run the published-agent creator
-        workforce_extra_names={"agent_42"},  # filter: keep this worker tool
+        name_allowlist={"agent_42"},  # filter: keep this worker tool
     )
     tools = await isolated_registry.create_registered_tools(_FakeConfig(spec))
 
@@ -261,7 +249,7 @@ async def test_factory_worker_only_mode_keeps_only_injected_agent_tools(
     spec = ToolSelectionSpec.from_raw(
         tool_categories=[],
         published_agent_ids=[42],  # dispatch: run the published-agent creator
-        workforce_extra_names={"agent_42"},  # filter: keep this worker tool
+        name_allowlist={"agent_42"},  # filter: keep this worker tool
         extras_only_when_unconfigured=True,
     )
     tools = await ToolFactory.create_all_tools(
@@ -986,14 +974,14 @@ def test_from_raw_explicit_none_yields_none_mode():
     assert isinstance(spec, _SpecNone)
 
 
-def test_from_raw_workforce_extras_ignored_in_all_mode():
-    """``workforce_extra_names`` is only meaningful in BY_CATEGORIES;
-    silently ignored in ALL (full set already includes everything)."""
+def test_from_raw_name_allowlist_ignored_in_all_mode():
+    """``name_allowlist`` is only meaningful in BY_CATEGORIES; silently
+    ignored in ALL (full set already includes everything)."""
     from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll
 
     spec = ToolSelectionSpec.from_raw(
         tool_categories=None,
-        workforce_extra_names={"some_worker_tool"},
+        name_allowlist={"some_worker_tool"},
     )
     # ALL mode: no name_allowlist field on _SpecAll, callsite that
     # asks for extras must have categories set.
@@ -1009,7 +997,7 @@ def test_from_raw_can_restrict_unconfigured_agent_to_workforce_extras_only():
     spec = ToolSelectionSpec.from_raw(
         tool_categories=[],
         published_agent_ids=[42],  # dispatch: run the published-agent creator
-        workforce_extra_names={"agent_42"},  # filter: keep this worker tool
+        name_allowlist={"agent_42"},  # filter: keep this worker tool
         extras_only_when_unconfigured=True,
     )
 
@@ -1036,7 +1024,7 @@ def test_from_raw_unconfigured_extras_only_without_extras_yields_none_mode():
 
     spec = ToolSelectionSpec.from_raw(
         tool_categories=None,
-        workforce_extra_names=set(),
+        name_allowlist=set(),
         extras_only_when_unconfigured=True,
     )
 
@@ -1083,19 +1071,6 @@ def test_by_categories_includes_custom_api_when_other_present():
 
     spec = _SpecByCategories(categories=frozenset({"other"}))
     assert spec.includes_custom_api() is True
-
-
-def test_by_categories_excludes_custom_api_when_other_present_but_ids_empty():
-    """Even with ``"other"`` in categories, an explicit empty
-    ``custom_api_ids=frozenset()`` skips the creator (legacy
-    'explicit exclude' shape preserved)."""
-    from xagent.core.tools.adapters.vibe.selection_spec import _SpecByCategories
-
-    spec = _SpecByCategories(
-        categories=frozenset({"other"}),
-        custom_api_ids=frozenset(),
-    )
-    assert spec.includes_custom_api() is False
 
 
 # ----- compute_allowed_names mode dispatch -------------------------------
@@ -1150,7 +1125,7 @@ def test_compute_allowed_names_workforce_extra_does_not_admit_agent_category():
     """
     spec = ToolSelectionSpec.from_raw(
         tool_categories=["basic"],
-        workforce_extra_names={"agent_42"},
+        name_allowlist={"agent_42"},
     )
     result = spec.compute_allowed_names(
         [
