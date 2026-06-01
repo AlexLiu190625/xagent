@@ -43,7 +43,12 @@ def ensure_system_initialized() -> None:
 
     if status_data.get("needs_setup", True):
         setup_response = client.post(
-            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
         )
         assert setup_response.status_code == 200
         assert setup_response.json().get("success") is True
@@ -427,7 +432,12 @@ class TestToolsGovernanceAPI:
 
     def _user_headers(self, username: str) -> dict[str, str]:
         register_response = client.post(
-            "/api/auth/register", json={"username": username, "password": "password123"}
+            "/api/auth/register",
+            json={
+                "username": username,
+                "email": f"{username}@example.com",
+                "password": "password123",
+            },
         )
         assert register_response.status_code == 200
 

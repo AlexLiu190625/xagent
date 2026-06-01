@@ -1,21 +1,31 @@
 import asyncio
 import logging
-import mimetypes
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, cast
+from urllib.parse import quote
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import (
+    FileResponse,
+    RedirectResponse,
+    Response,
+)
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from ...config import get_uploads_dir
-from ...core.tools.adapters.vibe.file_tool import read_file
-from ...core.tools.core.file_analysis import (
-    collect_pptx_slide_blocks,
-    iter_pptx_shapes,
+from ...config import (
+    get_file_delivery_accel_redirect_enabled,
+    get_file_delivery_accel_redirect_prefix,
+    get_file_delivery_redirect_enabled,
+    get_file_delivery_signed_url_ttl_seconds,
+    get_storage_root,
+    get_uploads_dir,
 )
+from ...core.file_storage.factory import get_file_storage
+from ...core.tools.adapters.vibe.file_tool import read_file
+from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ..auth_dependencies import get_current_user
 from ..config import (
     BINARY_EXTENSIONS,
@@ -28,6 +38,15 @@ from ..models.database import get_db
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.kb_file_service import aggregate_uploaded_file_statuses
+from ..services.managed_file_ref import (
+    FILE_INTEGRITY_REUPLOAD_MESSAGE,
+    DurableObjectIntegrityError,
+    DurableObjectMissingError,
+    DurableStorageOperationError,
+    ManagedFileRef,
+    guess_media_type,
+)
+from ..services.uploaded_file_store import UploadedFileStore, delete_pptx_pdf_cache
 from .legacy_file import (
     infer_user_id_from_legacy_path,
     is_valid_uuid,
@@ -35,19 +54,125 @@ from .legacy_file import (
     resolve_legacy_file_path_cross_user,
 )
 
-# Optional import for openpyxl
+# Optional import for python-pptx (used for upload-time text preview).
 pptx: ModuleType | None = None
+# Kept around as a defensive placeholder so future call sites can raise a
+# helpful error if python-pptx is missing instead of failing with
+# AttributeError. Currently unused — _pptx_text_preview just no-ops when
+# pptx is None.
+pptx_not_installed_exception = RuntimeError(
+    "python-pptx is not installed. "
+    "Install with: pip install 'xagent[document-processing]'"
+)
 try:
     import pptx
 except ImportError:
-    pptx_not_installed_exception = RuntimeError(
-        "python-pptx is not installed. "
-        "Install with: pip install 'xagent[document-processing]'"
-    )
+    pptx = None
 
 logger = logging.getLogger(__name__)
 
 file_router = APIRouter(prefix="/api/files", tags=["files"])
+
+
+def _durable_storage_unavailable() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail="Durable storage is temporarily unavailable",
+    )
+
+
+def _file_integrity_failed() -> HTTPException:
+    return HTTPException(
+        status_code=409,
+        detail=FILE_INTEGRITY_REUPLOAD_MESSAGE,
+    )
+
+
+def _content_disposition_header(disposition: str, filename: str) -> str:
+    safe_name = Path(filename).name or "file"
+    fallback_name = "".join(
+        character if 0x20 <= ord(character) <= 0x7E else "_" for character in safe_name
+    )
+    escaped_name = fallback_name.replace("\\", "\\\\").replace('"', '\\"')
+    encoded_name = quote(safe_name, safe="")
+    return (
+        f"{disposition}; filename=\"{escaped_name}\"; filename*=UTF-8''{encoded_name}"
+    )
+
+
+def _inline_download_disposition(media_type: str) -> str:
+    return (
+        "inline"
+        if media_type.startswith(("image/", "video/", "audio/", "text/"))
+        else "attachment"
+    )
+
+
+def _preview_can_redirect(path: Path, media_type: str) -> bool:
+    if path.suffix.lower() in {".pptx", ".ppt"}:
+        return False
+    return media_type not in {"text/html", "application/xhtml+xml", "image/svg+xml"}
+
+
+def _durable_redirect_response(
+    file_ref: ManagedFileRef,
+    *,
+    filename: str,
+    media_type: str,
+    disposition: str,
+) -> RedirectResponse | None:
+    if not get_file_delivery_redirect_enabled():
+        return None
+
+    try:
+        signed_url = file_ref.signed_access_url(
+            expires=get_file_delivery_signed_url_ttl_seconds(),
+            content_type=media_type,
+            content_disposition=_content_disposition_header(disposition, filename),
+        )
+    except DurableObjectIntegrityError as exc:
+        raise _file_integrity_failed() from exc
+    except DurableStorageOperationError as exc:
+        raise _durable_storage_unavailable() from exc
+
+    if not signed_url:
+        return None
+
+    return RedirectResponse(url=signed_url, status_code=307)
+
+
+def _accel_redirect_response(
+    path: Path,
+    *,
+    owner_user_id: int,
+    filename: str,
+    media_type: str,
+    disposition: str,
+) -> Response | None:
+    if not get_file_delivery_accel_redirect_enabled():
+        return None
+    if not path.exists() or not path.is_file():
+        return None
+
+    _ensure_under_uploads(path, owner_user_id)
+    uploads_root = get_uploads_dir().resolve()
+    try:
+        relative_path = path.resolve().relative_to(uploads_root)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="Access denied") from exc
+
+    internal_prefix = get_file_delivery_accel_redirect_prefix()
+    internal_uri = (
+        internal_prefix.rstrip("/") + "/" + quote(relative_path.as_posix(), safe="/")
+    )
+    return Response(
+        status_code=200,
+        media_type=media_type,
+        headers={
+            "X-Accel-Redirect": internal_uri,
+            "Content-Disposition": _content_disposition_header(disposition, filename),
+        },
+    )
 
 
 async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path) -> int:
@@ -93,14 +218,6 @@ def _is_admin_user(user: User) -> bool:
     return bool(getattr(user, "is_admin", False))
 
 
-def _file_storage_path_value(file_record: UploadedFile) -> str:
-    return str(getattr(file_record, "storage_path"))
-
-
-def _file_name_value(file_record: UploadedFile) -> str:
-    return str(getattr(file_record, "filename"))
-
-
 def _parse_task_id(task_id: Optional[str]) -> Optional[int]:
     if task_id is None or task_id == "":
         return None
@@ -108,11 +225,6 @@ def _parse_task_id(task_id: Optional[str]) -> Optional[int]:
         return int(task_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid task_id") from exc
-
-
-def _guess_media_type(filename: str) -> str:
-    media_type, _ = mimetypes.guess_type(filename)
-    return media_type or "application/octet-stream"
 
 
 def _build_unique_file_path(path: Path) -> Path:
@@ -158,6 +270,50 @@ def _resolve_public_preview_target(
 
     _ensure_under_uploads(candidate, user_id)
     return candidate
+
+
+def _find_registered_preview_asset(
+    db: Session,
+    *,
+    base_record: UploadedFile,
+    target_path: Path,
+    relative_path: str,
+) -> Optional[UploadedFile]:
+    target_path_candidates = {str(target_path)}
+    try:
+        target_path_candidates.add(str(target_path.resolve(strict=False)))
+    except OSError:
+        pass
+    try:
+        base_path = Path(str(base_record.storage_path))
+        target_path_candidates.add(str(base_path.parent / relative_path))
+    except (TypeError, ValueError):
+        pass
+    asset_record = (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.user_id == base_record.user_id,
+            UploadedFile.storage_path.in_(target_path_candidates),
+        )
+        .first()
+    )
+    if asset_record is not None:
+        return asset_record
+
+    base_workspace_path = str(base_record.workspace_relative_path or "")
+    if not base_workspace_path:
+        return None
+    base_dir = Path(base_workspace_path).parent
+    asset_workspace_path = str((base_dir / relative_path).as_posix())
+    return (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.user_id == base_record.user_id,
+            UploadedFile.task_id == base_record.task_id,
+            UploadedFile.workspace_relative_path == asset_workspace_path,
+        )
+        .first()
+    )
 
 
 def _to_unix_timestamp(path: Path, fallback: Any) -> int:
@@ -234,9 +390,9 @@ def _backfill_uploaded_file_records(db: Session, user: User) -> None:
     if not target_user_ids:
         return
 
-    existing_paths = {
-        row[0]
-        for row in db.query(UploadedFile.storage_path)
+    existing_records: dict[str, UploadedFile] = {
+        cast(str, row.storage_path): row
+        for row in db.query(UploadedFile)
         .filter(UploadedFile.user_id.in_(target_user_ids))
         .all()
     }
@@ -251,20 +407,28 @@ def _backfill_uploaded_file_records(db: Session, user: User) -> None:
             if not candidate.is_file():
                 continue
 
-            storage_path = str(candidate)
-            if storage_path in existing_paths:
+            storage_path: str = str(candidate)
+            existing_record = existing_records.get(storage_path)
+            if existing_record is not None:
+                if not existing_record.storage_key:
+                    setattr(existing_record, "user_id", target_user_id)
+                    setattr(existing_record, "storage_path", str(candidate))
+                    UploadedFileStore(db).sync_existing(
+                        existing_record, mime_type=guess_media_type(candidate.name)
+                    )
+                    created += 1
                 continue
 
-            file_record = UploadedFile(
+            file_id = str(uuid4())
+            file_record = UploadedFileStore(db).create_from_local_path(
+                local_path=candidate,
                 user_id=target_user_id,
+                file_id=file_id,
                 task_id=_infer_backfill_task_id(db, candidate, target_user_id),
                 filename=candidate.name,
-                storage_path=storage_path,
-                mime_type=_guess_media_type(candidate.name),
-                file_size=candidate.stat().st_size,
+                mime_type=guess_media_type(candidate.name),
             )
-            db.add(file_record)
-            existing_paths.add(storage_path)
+            existing_records[storage_path] = file_record
             created += 1
 
     if created > 0:
@@ -317,7 +481,7 @@ def _resolve_file_path(
         if file_record:
             return (
                 file_record,
-                Path(_file_storage_path_value(file_record)),
+                Path(str(file_record.storage_path)),
                 _file_user_id_value(file_record),
             )
 
@@ -369,45 +533,6 @@ def _check_file_access(file_record: UploadedFile, user: User) -> None:
         raise HTTPException(status_code=403, detail="Access denied")
 
 
-async def _try_convert_pptx_to_pdf(path: Path) -> Optional[StreamingResponse]:
-    if path.suffix.lower() != ".pptx":
-        return None
-    import tempfile
-
-    try:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            proc = await asyncio.create_subprocess_exec(
-                "soffice",
-                "--headless",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                temp_dir,
-                str(path),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-            )
-            try:
-                _, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.wait()
-                return None
-            if proc.returncode != 0:
-                return None
-            pdf_files = list(Path(temp_dir).glob("*.pdf"))
-            if not pdf_files:
-                return None
-            pdf_content = pdf_files[0].read_bytes()
-            return StreamingResponse(
-                iter([pdf_content]),
-                media_type="application/pdf",
-                headers={"Content-Disposition": f'inline; filename="{path.stem}.pdf"'},
-            )
-    except Exception:
-        return None
-
-
 def _pptx_text_preview(path: Path) -> str:
     """Extract a plain-text preview from a .pptx file for upload responses.
 
@@ -427,62 +552,130 @@ def _pptx_text_preview(path: Path) -> str:
     return "\n\n".join(blocks)
 
 
-def _pptx_fallback_html(path: Path) -> HTMLResponse:
-    if not pptx:
-        raise pptx_not_installed_exception
+def _pptx_pdf_cache_path(pptx_path: Path, file_id: Optional[str] = None) -> Path:
+    """Return the on-disk cache path for a converted PDF preview.
 
-    prs = pptx.Presentation(str(path))
-    html_content = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <meta charset="UTF-8">
-        <style>
-            body { font-family: Arial, sans-serif; margin: 40px; line-height: 1.6; }
-            h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
-            h2 { color: #555; margin-top: 30px; }
-            .slide { border: 1px solid #ddd; padding: 20px; margin: 20px 0; background: #f9f9f9; border-radius: 8px; }
-            .slide-number { color: #999; font-size: 12px; margin-top: 10px; }
-            .text-content { white-space: pre-wrap; }
-            .notes { color: #666; font-style: italic; margin-top: 10px; }
-        </style>
-    </head>
-    <body>
+    Caches are stored in ``<storage_root>/pptx_pdf_cache/`` — a dedicated
+    directory outside the uploads tree.  Keeping them out of uploads:
+
+    * prevents reconcile / backfill from treating ``.pptx.preview.pdf``
+      sidecars as normal user-uploaded files;
+    * avoids leaking derived content after a source upload is deleted
+      (delete_file() explicitly removes the cache entry by file_id);
+    * lets the uploads tree stay clean — only files written by users or
+      the upload endpoint live there.
+
+    For registered UUID files the cache key is the ``file_id``, which lets
+    ``delete_file()`` remove it with a single unlink.  For legacy / non-UUID
+    paths (no lifecycle management) we fall back to a SHA-256 prefix of the
+    resolved source path — entries there age out naturally.
     """
-    html_content += f"<h1>📊 {path.name}</h1>"
-    total_slides = len(prs.slides)
-    for slide_num, slide in enumerate(prs.slides, 1):
-        slide_text: list[str] = []
-        for shape in iter_pptx_shapes(slide.shapes):
-            shape_text = getattr(shape, "text", None)
-            if shape_text:
-                txt = str(shape_text).strip()
-                if txt:
-                    slide_text.append(txt)
-            elif getattr(shape, "has_table", False):
-                for row in shape.table.rows:
-                    for cell in row.cells:
-                        cell_text = cell.text_frame.text.strip()
-                        if cell_text:
-                            slide_text.append(cell_text)
-        notes_html = ""
-        if getattr(slide, "has_notes_slide", False):
-            notes_frame = getattr(slide.notes_slide, "notes_text_frame", None)
-            notes = getattr(notes_frame, "text", "").strip() if notes_frame else ""
-            if notes:
-                notes_html = f'<div class="notes">[Notes] {notes}</div>'
-        if slide_text or notes_html:
-            body_html = "<br>".join(slide_text)
-            html_content += f"""
-            <div class=\"slide\">
-                <h2>Slide {slide_num}</h2>
-                <div class=\"text-content\">{body_html}</div>
-                {notes_html}
-                <div class=\"slide-number\">Slide {slide_num} of {total_slides}</div>
-            </div>
-            """
-    html_content += "</body></html>"
-    return HTMLResponse(content=html_content)
+    import hashlib
+
+    cache_dir = get_storage_root() / "pptx_pdf_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if file_id:
+        return cache_dir / f"{file_id}.preview.pdf"
+    path_key = hashlib.sha256(str(pptx_path.resolve()).encode()).hexdigest()[:24]
+    return cache_dir / f"{path_key}.preview.pdf"
+
+
+async def _convert_pptx_to_pdf(
+    pptx_path: Path, file_id: Optional[str] = None
+) -> Optional[Path]:
+    """Convert a .pptx to PDF via LibreOffice with on-disk caching.
+
+    Returns the path to the cached PDF on success, or ``None`` when soffice
+    isn't available / conversion failed. The caller decides whether to
+    surface a 503 (so the frontend can fall back) or just keep going.
+
+    The fact that this can return ``None`` is the whole point of the
+    preview-pdf endpoint: on developer machines without LibreOffice we
+    don't break the UX — we let the frontend fall back to its canvas
+    renderer. Production images (Docker) pre-install libreoffice so this
+    path always succeeds there.
+
+    ``file_id`` is forwarded to ``_pptx_pdf_cache_path`` so the cache entry
+    lands in the managed cache directory (keyed by file_id) rather than as
+    a sidecar next to the source file.
+    """
+    if pptx_path.suffix.lower() != ".pptx":
+        return None
+
+    cache_path = _pptx_pdf_cache_path(pptx_path, file_id)
+    try:
+        if (
+            cache_path.exists()
+            and cache_path.stat().st_mtime >= pptx_path.stat().st_mtime
+        ):
+            return cache_path
+    except OSError:
+        pass
+
+    import tempfile
+
+    try:
+        # Pin the temp dir to the same directory as `cache_path` so the final
+        # rename is a single intra-filesystem syscall. Without `dir=...`,
+        # `tempfile.TemporaryDirectory()` uses the system default (typically
+        # /tmp), which on Docker/production layouts is a different mount than
+        # the uploads volume — the later `replace()` would then fail with
+        # EXDEV (Invalid cross-device link). Per PR #542 review.
+        with tempfile.TemporaryDirectory(dir=cache_path.parent) as temp_dir:
+            proc = await asyncio.create_subprocess_exec(
+                "soffice",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                temp_dir,
+                str(pptx_path),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                logger.warning("pptx→pdf conversion timed out for %s", pptx_path)
+                return None
+            if proc.returncode != 0:
+                logger.warning(
+                    "soffice exited %s for %s: %s",
+                    proc.returncode,
+                    pptx_path,
+                    stderr.decode("utf-8", "replace")[:200],
+                )
+                return None
+            pdf_files = list(Path(temp_dir).glob("*.pdf"))
+            if not pdf_files:
+                return None
+            # The PDF is already fully written and closed inside the temp dir,
+            # and the temp dir lives in the same filesystem as `cache_path`
+            # (see `dir=` above), so `replace()` is a single atomic rename.
+            # No `.tmp` intermediate needed — that previous two-step dance
+            # could leave orphans if a concurrent request raced. Per PR #542
+            # review.
+            try:
+                pdf_files[0].replace(cache_path)
+            except OSError as exc:
+                logger.warning(
+                    "Failed to cache pptx preview PDF at %s: %s", cache_path, exc
+                )
+                return None
+            return cache_path
+    except FileNotFoundError:
+        # soffice binary is missing — this is the expected "fallback" path
+        # on developer machines. Log once at INFO so it doesn't spam.
+        logger.info(
+            "soffice not on PATH; .pptx PDF previews will fall back to "
+            "client-side rendering"
+        )
+        return None
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("pptx→pdf conversion failed for %s: %s", pptx_path, exc)
+        return None
 
 
 @file_router.post("/upload")
@@ -510,6 +703,7 @@ async def upload_file(
     parsed_task_id = _parse_task_id(task_id)
     uploaded_files = []
     written_paths: list[Path] = []
+    written_storage_keys: list[str] = []
 
     try:
         for uploaded in upload_items:
@@ -536,16 +730,18 @@ async def upload_file(
 
             file_size = await _write_upload_with_size_limit(uploaded, target_path)
             written_paths.append(target_path)
-
-            file_record = UploadedFile(
+            file_id = str(uuid4())
+            file_record = UploadedFileStore(db).create_from_local_path(
+                local_path=target_path,
                 user_id=_user_id_value(user),
+                file_id=file_id,
                 task_id=parsed_task_id,
                 filename=Path(uploaded.filename).name,
-                storage_path=str(target_path),
                 mime_type=uploaded.content_type,
-                file_size=file_size,
             )
-            db.add(file_record)
+            if file_record.storage_key:
+                written_storage_keys.append(str(file_record.storage_key))
+            setattr(file_record, "file_size", file_size)
             db.flush()
 
             content_preview = ""
@@ -590,8 +786,28 @@ async def upload_file(
             )
 
         db.commit()
+    except DurableStorageOperationError as exc:
+        db.rollback()
+        for storage_key in written_storage_keys:
+            try:
+                get_file_storage().delete(storage_key)
+            except Exception:
+                logger.warning("Failed to clean up durable upload: %s", storage_key)
+        for path in written_paths:
+            try:
+                if path.exists():
+                    path.unlink()
+            except OSError:
+                pass
+        logger.warning("Durable storage unavailable during upload: %s", exc)
+        raise _durable_storage_unavailable() from exc
     except Exception:
         db.rollback()
+        for storage_key in written_storage_keys:
+            try:
+                get_file_storage().delete(storage_key)
+            except Exception:
+                logger.warning("Failed to clean up durable upload: %s", storage_key)
         for path in written_paths:
             try:
                 if path.exists():
@@ -638,13 +854,13 @@ async def list_files(
     )
     files = []
     for record in records:
-        path = Path(_file_storage_path_value(record))
+        path = Path(str(record.storage_path))
         record_user_id = _file_user_id_value(record)
         relative_path = _extract_relative_path(path, record_user_id)
         files.append(
             {
                 "file_id": record.file_id,
-                "filename": _file_name_value(record),
+                "filename": record.filename,
                 "file_size": record.file_size,
                 "modified_time": _to_unix_timestamp(path, record.created_at),
                 "file_type": path.suffix.lower().lstrip("."),
@@ -681,8 +897,9 @@ async def list_task_files(
 
     files = []
     for record in records:
-        path = Path(_file_storage_path_value(record))
-        if not path.exists():
+        file_ref = ManagedFileRef(record)
+        path = file_ref.local_path
+        if not path.exists() and not file_ref.has_durable_object:
             # Skip files that no longer exist on disk
             continue
 
@@ -700,7 +917,7 @@ async def list_task_files(
         files.append(
             {
                 "file_id": record.file_id,
-                "filename": _file_name_value(record),
+                "filename": record.filename,
                 "file_size": record.file_size,
                 "modified_time": _to_unix_timestamp(path, record.created_at),
                 "file_type": path.suffix.lower().lstrip("."),
@@ -727,14 +944,71 @@ async def download_file(
     # Check access permissions
     if file_record:
         _check_file_access(file_record, user)
-        file_name = _file_name_value(file_record)
-        media_type = _guess_media_type(file_name)
+        file_ref = ManagedFileRef(file_record)
+        file_name = str(file_record.filename)
+        media_type = guess_media_type(file_name)
+        _ensure_under_uploads(full_path, owner_user_id)
+        content_disposition = _inline_download_disposition(media_type)
+        redirect_response = _durable_redirect_response(
+            file_ref,
+            filename=file_name,
+            media_type=media_type,
+            disposition=content_disposition,
+        )
+        if redirect_response is not None:
+            return redirect_response
+        if full_path.exists() and full_path.is_file():
+            accel_response = _accel_redirect_response(
+                full_path,
+                owner_user_id=owner_user_id,
+                filename=file_name,
+                media_type=media_type,
+                disposition=content_disposition,
+            )
+            if accel_response is not None:
+                return accel_response
+            return FileResponse(
+                path=str(full_path),
+                filename=file_name,
+                media_type=media_type,
+                headers={
+                    "Content-Disposition": _content_disposition_header(
+                        content_disposition, file_name
+                    )
+                },
+            )
+        if file_ref.has_durable_object:
+            try:
+                restored_path = file_ref.ensure_local()
+                accel_response = _accel_redirect_response(
+                    restored_path,
+                    owner_user_id=owner_user_id,
+                    filename=file_name,
+                    media_type=media_type,
+                    disposition=content_disposition,
+                )
+                if accel_response is not None:
+                    return accel_response
+                return FileResponse(
+                    path=str(restored_path),
+                    filename=file_name,
+                    media_type=media_type,
+                    headers={
+                        "Content-Disposition": _content_disposition_header(
+                            content_disposition, file_name
+                        )
+                    },
+                )
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
     else:
         # For legacy files without records, check ownership
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
             raise HTTPException(status_code=403, detail="Access denied")
         file_name = full_path.name
-        media_type = _guess_media_type(file_name)
+        media_type = guess_media_type(file_name)
 
     _ensure_under_uploads(full_path, owner_user_id)
 
@@ -743,18 +1017,26 @@ async def download_file(
 
     # For images and other viewable content, set Content-Disposition to inline
     # to allow browser to display the file instead of downloading it
-    content_disposition = (
-        "inline"
-        if media_type.startswith(("image/", "video/", "audio/", "text/"))
-        else "attachment"
+    content_disposition = _inline_download_disposition(media_type)
+
+    accel_response = _accel_redirect_response(
+        full_path,
+        owner_user_id=owner_user_id,
+        filename=file_name,
+        media_type=media_type,
+        disposition=content_disposition,
     )
+    if accel_response is not None:
+        return accel_response
 
     return FileResponse(
         path=str(full_path),
         filename=file_name,
         media_type=media_type,
         headers={
-            "Content-Disposition": f'{content_disposition}; filename="{file_name}"'
+            "Content-Disposition": _content_disposition_header(
+                content_disposition, file_name
+            )
         },
     )
 
@@ -772,35 +1054,227 @@ async def preview_file(
     # Check access permissions
     if file_record:
         _check_file_access(file_record, user)
-        file_name = _file_name_value(file_record)
-        media_type = _guess_media_type(file_name)
+        file_ref = ManagedFileRef(file_record)
+        file_name = str(file_record.filename)
+        media_type = guess_media_type(file_name)
+        _ensure_under_uploads(full_path, owner_user_id)
+        if _preview_can_redirect(full_path, media_type):
+            redirect_response = _durable_redirect_response(
+                file_ref,
+                filename=file_name,
+                media_type=media_type,
+                disposition="inline",
+            )
+            if redirect_response is not None:
+                return redirect_response
+            accel_response = _accel_redirect_response(
+                full_path,
+                owner_user_id=owner_user_id,
+                filename=file_name,
+                media_type=media_type,
+                disposition="inline",
+            )
+            if accel_response is not None:
+                return accel_response
+        if file_ref.has_durable_object:
+            try:
+                materialized_path = file_ref.materialize()
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
+            except DurableObjectMissingError:
+                materialized_path = file_ref.local_path
+            return FileResponse(
+                path=str(materialized_path),
+                filename=file_name,
+                media_type=media_type,
+                headers={"Content-Disposition": "inline"},
+            )
     else:
         # For legacy files without records, check ownership
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
             raise HTTPException(status_code=403, detail="Access denied")
         file_name = full_path.name
-        media_type = _guess_media_type(file_name)
+        media_type = guess_media_type(file_name)
 
     _ensure_under_uploads(full_path, owner_user_id)
 
     if not full_path.exists():
         raise HTTPException(status_code=404, detail="File not found")
 
-    converted_pdf = await _try_convert_pptx_to_pdf(full_path)
-    if converted_pdf is not None:
-        return converted_pdf
-
-    if full_path.suffix.lower() == ".pptx":
-        try:
-            return _pptx_fallback_html(full_path)
-        except Exception:
-            pass
+    if _preview_can_redirect(full_path, media_type):
+        accel_response = _accel_redirect_response(
+            full_path,
+            owner_user_id=owner_user_id,
+            filename=file_name,
+            media_type=media_type,
+            disposition="inline",
+        )
+        if accel_response is not None:
+            return accel_response
 
     return FileResponse(
         path=str(full_path),
         filename=file_name,
         media_type=media_type,
         headers={"Content-Disposition": "inline"},
+    )
+
+
+@file_router.get("/preview-pdf/{file_id:path}", response_model=None)
+async def preview_pptx_as_pdf(
+    file_id: str,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Return a PDF rendering of a .pptx for high-fidelity in-browser preview.
+
+    The frontend hits this endpoint first; if it succeeds it shows the PDF
+    in an ``<iframe>`` (vector, text-selectable, perfect font metrics).
+    On a 503 response — meaning the server doesn't have LibreOffice on
+    PATH — the frontend falls back to the existing ``pptxviewjs`` canvas
+    renderer so the UX still works on developer machines without soffice
+    installed.
+
+    Mirrors the durable-storage restore path that ``/preview`` uses: for
+    files whose local copy was reaped but whose ``storage_key`` is still in
+    durable storage, we materialize before conversion (returning 409 on
+    checksum mismatch, 503 on durable backend failure — same semantics as
+    ``/preview``). Without this, durable-only ``.pptx`` files would 404 here
+    and silently fall back to the canvas renderer, which is exactly the
+    UX regression flagged in PR #542 review.
+    """
+    file_record, full_path, owner_user_id = _resolve_file_path(
+        db, file_id, _user_id_value(user)
+    )
+
+    # Resolve the local .pptx path. If the file is backed by durable
+    # storage and not currently on disk, restore it first.
+    pptx_path = full_path
+    if file_record:
+        _check_file_access(file_record, user)
+        file_name = str(file_record.filename)
+        _ensure_under_uploads(full_path, owner_user_id)
+        file_ref = ManagedFileRef(file_record)
+        if file_ref.has_durable_object:
+            try:
+                pptx_path = file_ref.materialize()
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
+            except DurableObjectMissingError:
+                # Durable record points at nothing; fall back to whatever
+                # is on disk (or 404 below if it's gone too).
+                pptx_path = file_ref.local_path
+    else:
+        if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
+            raise HTTPException(status_code=403, detail="Access denied")
+        file_name = full_path.name
+        _ensure_under_uploads(full_path, owner_user_id)
+
+    if pptx_path is None or not pptx_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    if pptx_path.suffix.lower() != ".pptx":
+        raise HTTPException(
+            status_code=400, detail="preview-pdf only supports .pptx files"
+        )
+
+    # Pass the UUID file_id so the cache entry lands in the managed
+    # cache directory (keyed by file_id) rather than as a sidecar next to
+    # the source file.  Legacy / non-UUID ids pass None and fall back to
+    # the path-hash key.
+    managed_file_id = file_id if is_valid_uuid(file_id) else None
+    pdf_path = await _convert_pptx_to_pdf(pptx_path, file_id=managed_file_id)
+    if pdf_path is None:
+        # Distinct 503 lets the frontend fall back gracefully instead of
+        # showing an error banner.
+        raise HTTPException(
+            status_code=503,
+            detail="LibreOffice unavailable; client should fall back to canvas renderer",
+        )
+
+    return FileResponse(
+        path=str(pdf_path),
+        filename=Path(file_name).stem + ".pdf",
+        media_type="application/pdf",
+        headers={"Content-Disposition": "inline"},
+    )
+
+
+@file_router.get("/public/download/{file_id:path}", response_model=None)
+async def public_download_file(
+    file_id: str,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Public source-download endpoint for the chat file-card 'Open' link.
+
+    Mirrors ``public_preview_file`` for resolution (UUID file id or
+    legacy cross-user path) but always returns
+    ``Content-Disposition: attachment; filename="..."`` so the browser
+    saves under the source filename instead of trying to render the
+    bytes inline. Used by ``InlineFilePreview`` 'Open' affordances
+    that render as plain ``<a href>``: those clicks — plus middle-
+    click / right-click "open in new tab" / "copy link" — don't carry
+    the frontend's bearer token, so the auth'd
+    ``/api/files/download/{file_id}`` route would 401 every plain
+    browser navigation.
+
+    The ``file_id`` is the only required capability, matching the
+    existing ``public/preview`` contract. ``relative_path`` is
+    intentionally NOT supported: 'Open' always targets the registered
+    source artifact, never a sub-path inside it.
+    """
+    file_record: Optional[UploadedFile] = None
+    target_path: Optional[Path] = None
+    file_name: str
+
+    if is_valid_uuid(file_id):
+        file_record = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+        )
+
+    if file_record:
+        file_ref = ManagedFileRef(file_record)
+        owner_user_id = _file_user_id_value(file_record)
+        _ensure_under_uploads(file_ref.local_path, owner_user_id)
+        file_name = str(file_record.filename)
+        if file_ref.has_durable_object:
+            try:
+                target_path = file_ref.ensure_local()
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
+            except DurableObjectMissingError:
+                target_path = file_ref.local_path
+        else:
+            target_path = file_ref.local_path
+    else:
+        # Legacy non-UUID file id: resolve across user directories
+        # (same fallback as public_preview_file).
+        result = resolve_legacy_file_path_cross_user(file_id)
+        if result is None:
+            raise HTTPException(status_code=404, detail="File not found")
+        target_path, owner_user_id = result
+        _ensure_under_uploads(target_path, owner_user_id)
+        file_name = target_path.name
+
+    if not target_path.exists() or not target_path.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+
+    # Pass filename= and let Starlette compose the Content-Disposition header.
+    # Starlette 0.36+ generates ``filename*=utf-8''<percent-encoded>`` for
+    # non-ASCII names (e.g. 报告.pptx) via urllib.parse.quote, so we must NOT
+    # set the header manually: a raw ``filename="报告.pptx"`` string would be
+    # latin-1 encoded by the ASGI layer and raise UnicodeEncodeError.
+    # The default content_disposition_type is already "attachment", so we
+    # only need to pass filename= here.
+    return FileResponse(
+        path=str(target_path),
+        filename=file_name,
+        media_type=guess_media_type(file_name),
     )
 
 
@@ -822,8 +1296,25 @@ async def public_preview_file(
         )
 
     if file_record:
-        base_path = Path(_file_storage_path_value(file_record))
+        file_ref = ManagedFileRef(file_record)
+        base_path = file_ref.local_path
         owner_user_id = _file_user_id_value(file_record)
+        _ensure_under_uploads(base_path, owner_user_id)
+        if file_ref.has_durable_object and not relative_path:
+            try:
+                target_path = file_ref.materialize()
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
+            except DurableObjectMissingError:
+                target_path = file_ref.local_path
+            return FileResponse(
+                path=str(target_path),
+                filename=str(file_record.filename),
+                media_type=guess_media_type(str(file_record.filename)),
+                headers={"Content-Disposition": "inline"},
+            )
     else:
         # Try to resolve as legacy path across all user directories
         result = resolve_legacy_file_path_cross_user(file_id)
@@ -838,23 +1329,36 @@ async def public_preview_file(
         owner_user_id,
     )
 
+    if (
+        file_record is not None
+        and relative_path
+        and (not target_path.exists() or not target_path.is_file())
+    ):
+        asset_record = _find_registered_preview_asset(
+            db,
+            base_record=file_record,
+            target_path=target_path,
+            relative_path=relative_path,
+        )
+        if asset_record is not None:
+            asset_ref = ManagedFileRef(asset_record)
+            try:
+                target_path = asset_ref.ensure_local()
+            except DurableObjectIntegrityError as exc:
+                raise _file_integrity_failed() from exc
+            except DurableStorageOperationError as exc:
+                raise _durable_storage_unavailable() from exc
+            except DurableObjectMissingError:
+                target_path = asset_ref.local_path
+            _ensure_under_uploads(target_path, owner_user_id)
+
     if not target_path.exists() or not target_path.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-
-    converted_pdf = await _try_convert_pptx_to_pdf(target_path)
-    if converted_pdf is not None:
-        return converted_pdf
-
-    if target_path.suffix.lower() == ".pptx":
-        try:
-            return _pptx_fallback_html(target_path)
-        except Exception:
-            pass
 
     return FileResponse(
         path=str(target_path),
         filename=target_path.name,
-        media_type=_guess_media_type(target_path.name),
+        media_type=guess_media_type(target_path.name),
         headers={"Content-Disposition": "inline"},
     )
 
@@ -893,7 +1397,7 @@ async def delete_file(
     # Check access permissions
     if file_record:
         _check_file_access(file_record, user)
-        file_name = _file_name_value(file_record)
+        file_name = str(file_record.filename)
     else:
         # For legacy files without records, check ownership
         if owner_user_id != _user_id_value(user) and not _is_admin_user(user):
@@ -902,13 +1406,34 @@ async def delete_file(
 
     _ensure_under_uploads(file_path, owner_user_id)
 
-    if file_path.exists() and file_path.is_file():
-        file_path.unlink()
-
-    # Delete database record if exists
     if file_record:
+        storage_key = str(file_record.storage_key or "")
+        storage_status = str(file_record.storage_status or "")
+        if storage_key and storage_status == "available":
+            try:
+                get_file_storage().delete(storage_key)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to clean up durable file before deleting row: %s",
+                    storage_key,
+                )
+                raise _durable_storage_unavailable() from exc
+
         db.delete(file_record)
         db.commit()
+        try:
+            if file_path.exists() and file_path.is_file():
+                file_path.unlink()
+        except OSError:
+            logger.warning("Failed to clean up deleted local file: %s", file_path)
+    elif file_path.exists() and file_path.is_file():
+        file_path.unlink()
+
+    # Remove any server-side PDF preview cache so derived content doesn't
+    # outlive the source upload.  Uses the same helper as UploadedFileStore.delete()
+    # so this HTTP route and every other deletion path (reconcile, orphan cleanup)
+    # behave identically.  Non-UUID ids are silently ignored by the helper.
+    delete_pptx_pdf_cache(file_id)
 
     return {
         "success": True,

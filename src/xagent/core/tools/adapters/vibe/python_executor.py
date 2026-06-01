@@ -10,6 +10,11 @@ from typing import Any, Dict, Mapping, Optional, Type
 from pydantic import BaseModel, Field
 
 from ....workspace import TaskWorkspace
+from ...artifacts import (
+    build_generated_file_metadata,
+    changed_generated_artifact_files,
+    snapshot_generated_artifact_files,
+)
 from ...core.python_executor import PythonExecutorCore
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .function import FunctionTool
@@ -35,6 +40,9 @@ class PythonExecutorResult(BaseModel):
     success: bool = Field(description="Whether the code executed successfully")
     output: str = Field(description="Output from the code execution")
     error: str = Field(default="", description="Error message if execution failed")
+    generated_files: list[str] = Field(default_factory=list)
+    file_refs: list[dict[str, Any]] = Field(default_factory=list)
+    artifacts: list[dict[str, Any]] = Field(default_factory=list)
 
 
 class PythonExecutorTool(AbstractBaseTool):
@@ -86,8 +94,19 @@ class PythonExecutorTool(AbstractBaseTool):
 
         # Execute code within auto_register context
         if self._workspace and working_directory:
+            files_before = snapshot_generated_artifact_files(working_directory)
             with self._workspace.auto_register_files():
                 result = executor.execute_code(full_code, exec_args.capture_output)
+            if result.get("success"):
+                files_after = snapshot_generated_artifact_files(working_directory)
+                result.update(
+                    build_generated_file_metadata(
+                        workspace=self._workspace,
+                        file_paths=changed_generated_artifact_files(
+                            files_before, files_after
+                        ),
+                    )
+                )
         else:
             result = executor.execute_code(full_code, exec_args.capture_output)
 

@@ -3,20 +3,22 @@
 import asyncio
 import logging
 import os
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Mapping, Optional, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import or_
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 from ...config import (
-    get_agent_pattern_for_execution_mode,
     get_default_task_execution_mode,
     get_external_upload_dirs,
     get_uploads_dir,
 )
 from ...core.agent.service import AgentService
+from ...core.memory.base import MemoryStore
+from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.model.chat.basic.base import BaseLLM
 from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
@@ -24,17 +26,29 @@ from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.providers import is_placeholder_api_key
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
-from ..models.agent import Agent
+from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
+from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
 from ..models.model import Model as DBModel
-from ..models.task import AgentType, Task, TaskStatus
+from ..models.task import AgentType, Task, TaskStatus, TraceEvent
 from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..services.agent_access import list_accessible_published_agents
 from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
 )
+from ..services.hot_path_cache import (
+    cache_get,
+    cache_set,
+    cache_version_token,
+    invalidate_task_cache,
+    task_cache_ttl_seconds,
+    web_task_detail_key,
+    web_task_status_key,
+)
 from ..services.llm_utils import resolve_llms_from_names
+from ..services.managed_file_ref import ensure_uploaded_file_local_path
 from ..services.model_service import _get_visible_user_ids
 from ..services.task_execution_context_service import (
     load_task_execution_recovery_state,
@@ -42,11 +56,20 @@ from ..services.task_execution_context_service import (
 from ..services.task_lease_service import (
     acquire_task_lease,
     mark_task_paused_if_stale,
-    release_task_lease,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
-from ..tools.config import WebToolConfig
+from ..services.task_setup_snapshot import (
+    TaskSetupSnapshot,
+    load_task_setup_snapshot_sync,
+)
+from ..services.trace_message_storage import decode_trace_events_data
+from ..services.workforce_runtime import (
+    WorkforceTaskRuntime,
+    release_task_lease_with_workforce_sync,
+    resolve_workforce_task_runtime,
+    sync_workforce_run_status,
+)
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
@@ -55,6 +78,8 @@ logger = logging.getLogger(__name__)
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
+
+_TERMINAL_CACHE_STATUSES = {TaskStatus.COMPLETED, TaskStatus.FAILED}
 
 
 def _build_task_agent_config(
@@ -69,6 +94,123 @@ def _build_task_agent_config(
     if selected_file_ids:
         task_agent_config["selected_file_ids"] = selected_file_ids
     return task_agent_config or None
+
+
+def _is_published_agent(agent: Agent) -> bool:
+    return getattr(agent.status, "value", agent.status) == AgentStatus.PUBLISHED.value
+
+
+def _load_agent_for_task_create(
+    db: Session,
+    user: User,
+    agent_id: int,
+) -> Agent | None:
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if agent is None:
+        return None
+    if is_workforce_generated_manager_agent(agent):
+        return None
+    if int(agent.user_id) == int(user.id):
+        return agent
+    if not _is_published_agent(agent):
+        return None
+    visible_agent_ids = {
+        int(item.id)
+        for item in list_accessible_published_agents(
+            db,
+            user,
+            purpose="agent_list",
+        )
+    }
+    return agent if int(agent.id) in visible_agent_ids else None
+
+
+def _load_agent_for_task_runtime(
+    db: Session,
+    task: Task,
+    workforce_runtime: WorkforceTaskRuntime | None = None,
+) -> Agent | None:
+    task_agent_id = _int_id_or_none(getattr(task, "agent_id", None))
+    if task_agent_id is None:
+        return None
+
+    agent = db.query(Agent).filter(Agent.id == task_agent_id).first()
+    if agent is None:
+        return None
+    if is_workforce_generated_manager_agent(agent):
+        if (
+            workforce_runtime is not None
+            and workforce_runtime.manager_agent_id == task_agent_id
+        ):
+            return agent
+        return None
+    if int(agent.user_id) == int(task.user_id):
+        return agent
+    if (
+        workforce_runtime is not None
+        and workforce_runtime.manager_agent_id == task_agent_id
+    ):
+        return agent
+    if not _is_published_agent(agent):
+        return None
+
+    user = db.query(User).filter(User.id == task.user_id).first()
+    if user is None:
+        return None
+    visible_agent_ids = {
+        int(item.id)
+        for item in list_accessible_published_agents(
+            db,
+            user,
+            purpose="agent_list",
+        )
+    }
+    return agent if int(agent.id) in visible_agent_ids else None
+
+
+def _get_task_activity_ids(db: Session, task_id: int) -> tuple[int, int]:
+    max_trace_event_id = (
+        db.query(func.max(TraceEvent.id))
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+        )
+        .scalar()
+        or 0
+    )
+    max_chat_message_id = (
+        db.query(func.max(TaskChatMessage.id))
+        .filter(TaskChatMessage.task_id == task_id)
+        .scalar()
+        or 0
+    )
+    return int(max_trace_event_id), int(max_chat_message_id)
+
+
+@dataclass(frozen=True)
+class AgentServiceMemoryPolicy:
+    memory: MemoryStore
+    memory_enabled: bool
+
+
+def resolve_agent_service_memory_policy(
+    *,
+    task: Optional[Task] = None,
+    agent_config: Optional[Mapping[str, Any]] = None,
+) -> AgentServiceMemoryPolicy:
+    """Resolve the memory store and enablement for an AgentService runtime."""
+    config = agent_config
+    if config is None:
+        task_config = getattr(task, "agent_config", None)
+        config = task_config if isinstance(task_config, Mapping) else {}
+
+    if config.get("is_preview") is True:
+        return AgentServiceMemoryPolicy(InMemoryMemoryStore(), False)
+
+    if task is not None and task.agent_id:
+        return AgentServiceMemoryPolicy(get_memory_store(), False)
+
+    return AgentServiceMemoryPolicy(get_memory_store(), True)
 
 
 def create_default_llm() -> Optional[BaseLLM]:
@@ -162,6 +304,71 @@ def create_default_llm() -> Optional[BaseLLM]:
         return None
 
 
+def _spec_wants_mcp(tool_selection_spec: Optional[Any]) -> bool:
+    """Whether the caller's spec actually asked for MCP tools.
+
+    Default agents (no spec, or ``_SpecAll``) should NOT trigger the
+    MCP server DB query + per-server session init in
+    ``WebToolConfig``. Only an explicit ``"mcp"`` plain entry or a
+    ``"mcp:<server>"`` sub-category entry in the user's selection
+    means MCP loading is wanted; anything else keeps the legacy
+    no-MCP behaviour for cost reasons.
+
+    Returns ``False`` for ``None`` (no spec / legacy caller),
+    ``_SpecAll`` (no restriction means "build registered defaults",
+    NOT "ALL including MCP"), and ``_SpecNone`` (zero tools). Returns
+    ``True`` only when ``_SpecByCategories._user_categories()`` (the
+    pre-derivation user input) carries the ``mcp`` token or any
+    ``mcp:<server>`` form.
+    """
+    if tool_selection_spec is None:
+        return False
+    if not tool_selection_spec.is_by_categories():
+        return False
+    user_picked = tool_selection_spec._user_categories()
+    return any(
+        c == "mcp" or (isinstance(c, str) and c.startswith("mcp:")) for c in user_picked
+    )
+
+
+def _build_tool_selection_spec_for_task(
+    agent_config: Optional[dict],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+    *,
+    task_id: int,
+) -> Any:
+    """Single SSOT normalizer for chat reconstruct + snapshot paths.
+
+    Both ``_build_tools_for_task`` (reconstruct) and
+    ``get_agent_for_task`` (snapshot) translate the same raw inputs
+    (``agent_config['tool_categories']`` + optional workforce worker
+    tool names) into a :class:`ToolSelectionSpec`. Centralising the
+    call here keeps the two paths in lockstep and avoids the 30-line
+    copy / paste that used to live in each.
+    """
+    from ...core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+
+    tool_categories = agent_config.get("tool_categories") if agent_config else None
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=tool_categories,
+        workforce_extra_names=(
+            workforce_runtime.worker_tool_names if workforce_runtime else None
+        ),
+        extras_only_when_unconfigured=workforce_runtime is not None,
+    )
+    if spec.is_all():
+        logger.info(
+            f"Task {task_id} has no tool_categories restriction "
+            "(legacy 'unconfigured' semantics) -- full default tool set will be built"
+        )
+    else:
+        logger.info(
+            f"Task {task_id} tool selection spec: "
+            f"{type(spec).__name__} with categories={tool_categories}"
+        )
+    return spec
+
+
 def _build_allowed_external_dirs(
     user_id: Optional[int], *, only_existing: bool = False
 ) -> list[str]:
@@ -187,6 +394,28 @@ def _build_allowed_external_dirs(
     return dirs
 
 
+def _build_workforce_system_prompt(
+    base_system_prompt: Optional[str],
+    workforce_runtime: Optional[WorkforceTaskRuntime],
+) -> Optional[str]:
+    prompts = []
+    if workforce_runtime and workforce_runtime.manager_system_prompt:
+        prompts.append(workforce_runtime.manager_system_prompt)
+    if base_system_prompt:
+        prompts.append(base_system_prompt)
+    return "\n\n".join(prompts) if prompts else None
+
+
+def _int_id_or_none(value: Any) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return None
+
+
 async def create_default_tools(
     db: Session,
     request: Any = None,
@@ -195,13 +424,27 @@ async def create_default_tools(
     workspace_owner_id: Optional[int] = None,
     allowed_collections: Optional[List[str]] = None,
     allowed_skills: Optional[List[str]] = None,
-    allowed_tools: Optional[List[str]] = None,
     excluded_agent_id: Optional[int] = None,
     vision_model: Optional[Any] = None,
     sandbox: Optional[Any] = None,
     llm: Optional[Any] = None,
+    tool_selection_spec: Optional[Any] = None,
+    allowed_agent_ids: Optional[List[int]] = None,
+    agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+    enable_global_agent_tools: bool = True,
+    allow_cross_user_agent_ids: bool = False,
+    parent_task_id: Optional[str] = None,
+    parent_tracer: Optional[Any] = None,
+    agent_call_stack: Optional[List[int]] = None,
 ) -> tuple[list[Any], Any]:
-    """Create default tools and tool_config for AgentService using ToolFactory"""
+    """Create default tools and tool_config for AgentService using ToolFactory.
+
+    ``selection_spec`` (a :class:`ToolSelectionSpec` or ``None``) is
+    propagated into the ``WebToolConfig`` so :func:`ToolFactory.create_all_tools`
+    can skip creators (and their internal DB / network I/O) for tool
+    categories / MCP servers the agent does not need. ``None`` preserves
+    the original "build everything" behavior for backward compat.
+    """
     if not user:
         raise ValueError("User is required for tool creation")
     if not task_id:
@@ -231,15 +474,26 @@ async def create_default_tools(
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
         },
-        include_mcp_tools=bool(
-            allowed_tools and any(t.startswith("mcp_") for t in allowed_tools)
-        ),
+        # Only load MCP servers (a DB query + per-server session init)
+        # when the caller actually picked MCP. Spec=None / _SpecAll
+        # default agents shouldn't pay that cost; only explicit
+        # ``mcp`` / ``mcp:<server>`` selection triggers MCP loading.
+        # Derived from the spec rather than re-deriving from a raw
+        # name list so the source of truth is in one place.
+        include_mcp_tools=_spec_wants_mcp(tool_selection_spec),
         task_id=task_id,  # Pass task_id for browser session tracking
         browser_tools_enabled=True,  # Enable browser automation tools
         allowed_collections=allowed_collections,  # Agent Builder knowledge bases
         allowed_skills=allowed_skills,  # Agent Builder skills
-        allowed_tools=allowed_tools,  # Agent Builder tool categories
         vision_model=vision_model,  # Pass task-specific vision model
+        tool_selection_spec=tool_selection_spec,  # Preferred SSOT typed spec
+        allowed_agent_ids=allowed_agent_ids,
+        agent_tool_overrides=agent_tool_overrides,
+        enable_global_agent_tools=enable_global_agent_tools,
+        allow_cross_user_agent_ids=allow_cross_user_agent_ids,
+        parent_task_id=parent_task_id,
+        parent_tracer=parent_tracer,
+        agent_call_stack=agent_call_stack,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -322,7 +576,7 @@ class AgentServiceManager:
 
     def __init__(self, request: Optional[Any] = None) -> None:
         self._agents: Dict[int, AgentService] = {}
-        self._sandboxes: Dict[int, Any] = {}  # user_id -> Sandbox instance
+        self._sandboxes: Dict[str, Any] = {}  # lifecycle scope -> Sandbox instance
         self._default_llm = create_default_llm()
         self.request = request
 
@@ -425,80 +679,252 @@ class AgentServiceManager:
         if skill_context:
             logger.info(f"Loaded recovered skill context for task {task_id}")
 
-    def _load_agent_builder_config(
-        self, agent: Agent, db: Session, user_id: int
-    ) -> dict:
-        """Load all Agent Builder configuration.
+    # NOTE: The legacy ``_load_agent_builder_config`` instance method
+    # used to live here; its body became a one-line delegate to
+    # ``llm_utils.load_agent_builder_config`` after the runtime-config
+    # refactor and no production caller remained (the snapshot loader
+    # and ``_resolve_task_runtime_config`` both call the module-level
+    # helper directly). Removed to avoid a zero-value wrapper that
+    # only existed as a test-mock surface; tests now patch
+    # ``llm_utils.load_agent_builder_config`` directly.
 
-        Returns dict with:
-        - llms: (default_llm, fast_llm, vision_llm, compact_llm)
-        - execution_mode: str
-        - instructions: str (system prompt)
-        - skills: List[str]
-        - knowledge_bases: List[str]
-        - tool_categories: List[str]
+    @staticmethod
+    def _pick_default_llm_with_warning(
+        default_llm: Optional[BaseLLM],
+        *,
+        task_id: int,
+        has_agent_builder_config: bool,
+        agent_id: Optional[int],
+        saved_model_ids: Optional[dict],
+        user_id: Optional[int],
+        saved_model_descriptors: Optional[dict] = None,
+    ) -> BaseLLM:
+        """Return the default LLM and log a context-rich WARNING.
+
+        Used when no per-task / per-agent LLM could be resolved (e.g. the
+        agent's saved model is unavailable or the caller has no access).
+
+        ``saved_model_descriptors`` (when provided) carries human-readable
+        ``model_id`` / ``model_name`` per slot, which is more useful in logs
+        than the bare ``DBModel.id`` pks recorded in ``saved_model_ids``.
         """
-        from ..services.llm_utils import UserAwareModelStorage
-
-        storage = UserAwareModelStorage(db)
-
-        default_llm = None
-        fast_llm = None
-        vision_llm = None
-        compact_llm = None
-
-        if agent.models:
-            if agent.models.get("general"):
-                general_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["general"])
-                    .first()
+        if default_llm is None:
+            if has_agent_builder_config:
+                saved_models_for_log = saved_model_descriptors or saved_model_ids or {}
+                logger.error(
+                    "Agent builder model unavailable and no global default LLM is configured. "
+                    "task_id=%s agent_id=%s agent_saved_models=%s user_id=%s",
+                    task_id,
+                    agent_id,
+                    saved_models_for_log,
+                    user_id,
                 )
-                if general_model:
-                    default_llm = storage.get_llm_by_name_with_access(
-                        str(general_model.model_id), user_id
-                    )
-
-            if agent.models.get("small_fast"):
-                fast_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["small_fast"])
-                    .first()
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        "Agent model configuration is unavailable and no global "
+                        "default model is configured."
+                    ),
                 )
-                if fast_model:
-                    fast_llm = storage.get_llm_by_name_with_access(
-                        str(fast_model.model_id), user_id
-                    )
+            logger.error(
+                "Task %s has no valid LLM configuration and no default LLM", task_id
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="No valid LLM configuration is available for this task.",
+            )
 
-            if agent.models.get("visual"):
-                visual_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["visual"])
-                    .first()
-                )
-                if visual_model:
-                    vision_llm = storage.get_llm_by_name_with_access(
-                        str(visual_model.model_id), user_id
-                    )
+        fallback_model = (
+            getattr(default_llm, "model_name", None) or type(default_llm).__name__
+        )
+        if has_agent_builder_config:
+            saved_models_for_log = saved_model_descriptors or saved_model_ids or {}
+            logger.warning(
+                "Agent builder model unavailable, falling back to default LLM. "
+                "task_id=%s agent_id=%s agent_saved_models=%s user_id=%s fallback_model=%s",
+                task_id,
+                agent_id,
+                saved_models_for_log,
+                user_id,
+                fallback_model,
+            )
+        else:
+            logger.warning(
+                "Task %s has no valid LLM configuration, using default LLM %s",
+                task_id,
+                fallback_model,
+            )
+        return default_llm
 
-            if agent.models.get("compact"):
-                compact_model = (
-                    db.query(DBModel)
-                    .filter(DBModel.id == agent.models["compact"])
-                    .first()
+    @staticmethod
+    def _merge_agent_builder_llms(
+        baseline_llms: tuple[
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+        ],
+        agent_llms: tuple[
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+            Optional[BaseLLM],
+        ],
+    ) -> tuple[
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+    ]:
+        """Overlay agent LLMs without discarding already resolved task LLMs."""
+        return cast(
+            tuple[
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+                Optional[BaseLLM],
+            ],
+            tuple(
+                agent_llm or baseline_llm
+                for baseline_llm, agent_llm in zip(baseline_llms, agent_llms)
+            ),
+        )
+
+    def _resolve_task_runtime_config(
+        self,
+        *,
+        task_id: int,
+        task: Task,
+        db: Session,
+        user: Optional[User],
+    ) -> dict[str, Any]:
+        """Resolve task / agent-builder LLMs and execution pattern.
+
+        Thin main-loop wrapper around
+        ``llm_utils.resolve_task_runtime_config_core``. Adds the
+        diagnostic logging and the
+        ``_pick_default_llm_with_warning`` fallback that the worker-
+        thread snapshot loader cannot run (the fallback raises
+        ``HTTPException``, which would propagate badly out of a
+        thread).
+
+        Used by ``_reconstruct_agent_from_history`` on the
+        main-loop reconstruct path. The normal-creation path
+        (``get_agent_for_task``) consumes a ``TaskSetupSnapshot``
+        which goes through the same core helper off-loop.
+        """
+        from ..services.llm_utils import resolve_task_runtime_config_core
+
+        logger.info(
+            "Task %s record: agent_type=%s, model_name=%s, compact_model_name=%s",
+            task_id,
+            task.agent_type,
+            task.model_name,
+            task.compact_model_name,
+        )
+
+        user_id_for_resolution: Optional[int] = (
+            int(user.id)
+            if user and user.id is not None
+            else int(task.user_id)
+            if task.user_id is not None
+            else None
+        )
+        core = resolve_task_runtime_config_core(
+            task, db, user_id=user_id_for_resolution
+        )
+
+        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
+
+        logger.info(
+            "Task %s execution_mode=%s -> pattern=%s",
+            task_id,
+            getattr(task, "execution_mode", None),
+            core.task_pattern,
+        )
+        if core.agent_fields is not None:
+            logger.info(
+                "Task %s using Agent Builder config: %s",
+                task_id,
+                core.agent_fields.name,
+            )
+            if core.workforce is not None:
+                # Workforce task keeps its own execution_mode rather
+                # than inheriting from agent_config; surface that so
+                # on-call doesn't confuse it with the legacy override.
+                logger.info(
+                    "Workforce task %s keeping task execution mode -> pattern=%s",
+                    task_id,
+                    core.task_pattern,
                 )
-                if compact_model:
-                    compact_llm = storage.get_llm_by_name_with_access(
-                        str(compact_model.model_id), user_id
-                    )
+            else:
+                logger.info(
+                    "Task %s using Agent Builder execution mode: %s -> pattern=%s",
+                    task_id,
+                    (core.agent_config or {}).get("execution_mode"),
+                    core.task_pattern,
+                )
+        elif core.agent_config is not None:
+            # Inline agent_config path (build-preview tasks routed
+            # through normal task flow with config embedded in the row).
+            logger.info(
+                "Task %s using inline Agent Builder config: execution_mode=%s -> pattern=%s",
+                task_id,
+                core.agent_config.get("execution_mode"),
+                core.task_pattern,
+            )
+
+        if not task_llm:
+            task_llm = self._pick_default_llm_with_warning(
+                self._default_llm,
+                task_id=task_id,
+                has_agent_builder_config=core.has_agent_builder_config,
+                agent_id=getattr(task, "agent_id", None),
+                saved_model_ids=(core.agent_config or {}).get("saved_model_ids"),
+                saved_model_descriptors=(core.agent_config or {}).get(
+                    "saved_model_descriptors"
+                ),
+                user_id=user_id_for_resolution,
+            )
+
+        logger.info(
+            "Successfully loaded LLM configuration for task %s: compact_llm=%s",
+            task_id,
+            task_compact_llm.model_name if task_compact_llm else None,
+        )
+        return {
+            "agent_config": core.agent_config,
+            "task_llm": task_llm,
+            "task_fast_llm": task_fast_llm,
+            "task_vision_llm": task_vision_llm,
+            "task_compact_llm": task_compact_llm,
+            "task_pattern": core.task_pattern,
+            "has_agent_builder_config": core.has_agent_builder_config,
+        }
+
+    def _load_task_inline_agent_config(self, task: Task) -> Optional[dict[str, Any]]:
+        if not isinstance(task.agent_config, dict):
+            return None
+
+        inline_config = task.agent_config
+        if not any(
+            key in inline_config
+            for key in ("instructions", "knowledge_bases", "skills", "tool_categories")
+        ):
+            return None
 
         return {
-            "llms": (default_llm, fast_llm, vision_llm, compact_llm),
-            "execution_mode": agent.execution_mode,
-            "instructions": agent.instructions,  # System prompt
-            "skills": agent.skills or [],
-            "knowledge_bases": agent.knowledge_bases or [],
-            "tool_categories": agent.tool_categories or [],
+            "llms": (None, None, None, None),
+            "execution_mode": getattr(task, "execution_mode", None) or "balanced",
+            "instructions": inline_config.get("instructions"),
+            "skills": inline_config.get("skills") or [],
+            "knowledge_bases": inline_config.get("knowledge_bases") or [],
+            "tool_categories": inline_config.get("tool_categories") or [],
+            "memory_similarity_threshold": inline_config.get(
+                "memory_similarity_threshold"
+            ),
+            "is_preview": inline_config.get("is_preview"),
+            "preview_agent_id": inline_config.get("preview_agent_id"),
         }
 
     async def _build_tools_for_task(
@@ -511,82 +937,50 @@ class AgentServiceManager:
         agent_config: Optional[dict],
         task_llm: Optional[BaseLLM],
         task_vision_llm: Optional[BaseLLM],
+        parent_tracer: Optional[Any] = None,
     ) -> tuple[list[Any], Any]:
         """Build the tool set configured for a web task."""
+        workforce_runtime = resolve_workforce_task_runtime(db, task)
         excluded_agent_id = None
-        if task.agent_id:
-            from ..models.agent import AgentStatus
-
+        current_agent = _load_agent_for_task_runtime(db, task, workforce_runtime)
+        if current_agent and _is_published_agent(current_agent):
+            excluded_agent_id = int(current_agent.id)
+            logger.info(
+                f"Task {task_id} is associated with published agent "
+                f"{current_agent.id} ({current_agent.name}), will exclude from "
+                "agent tools"
+            )
+        elif agent_config and agent_config.get("preview_agent_id"):
             current_agent = (
                 db.query(Agent)
-                .filter(Agent.id == task.agent_id, Agent.user_id == task.user_id)
+                .filter(
+                    Agent.id == agent_config["preview_agent_id"],
+                    Agent.user_id == task.user_id,
+                )
                 .first()
             )
             if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                 excluded_agent_id = int(current_agent.id)
                 logger.info(
-                    f"Task {task_id} is associated with published agent "
+                    f"Preview task {task_id} is for published agent "
                     f"{current_agent.id} ({current_agent.name}), will exclude from "
                     "agent tools"
                 )
 
-        allowed_tools = None
-        if agent_config and "tool_categories" in agent_config:
-            tool_categories = agent_config["tool_categories"]
+        workforce_runtime = resolve_workforce_task_runtime(db, task)
+        tool_selection_spec = _build_tool_selection_spec_for_task(
+            agent_config, workforce_runtime, task_id=task_id
+        )
+        workspace_owner_id = int(task.user_id)
+        sandbox_workspace_config = {
+            "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
+            "task_id": f"web_task_{task_id}",
+            "user_id": workspace_owner_id,
+            "allowed_external_dirs": _build_allowed_external_dirs(workspace_owner_id),
+        }
 
-            from ...core.tools.adapters.vibe.factory import ToolFactory
-
-            temp_config = WebToolConfig(
-                db=db,
-                request=self.request,
-                llm=task_llm,
-                user_id=int(user.id),
-                is_admin=bool(user.is_admin),
-                workspace_config=None,
-                include_mcp_tools=True,
-                task_id=None,
-                browser_tools_enabled=True,
-                allowed_collections=agent_config.get("knowledge_bases"),
-                allowed_skills=agent_config.get("skills"),
-            )
-            all_tools = await ToolFactory.create_all_tools(temp_config)
-            allowed_tools = []
-
-            for tool in all_tools:
-                if not (
-                    hasattr(tool, "metadata") and hasattr(tool.metadata, "category")
-                ):
-                    continue
-
-                category = str(tool.metadata.category.value)
-                tool_name = getattr(tool, "name", None)
-                if not tool_name:
-                    continue
-
-                if category in tool_categories:
-                    allowed_tools.append(tool_name)
-                    continue
-
-                if category == "mcp":
-                    for tool_category in tool_categories:
-                        if not tool_category.startswith("mcp:"):
-                            continue
-                        server_name = (
-                            tool_category.split(":", 1)[1]
-                            .replace(" ", "_")
-                            .replace("-", "_")
-                        )
-                        if tool_name.lower().startswith(f"mcp_{server_name.lower()}_"):
-                            allowed_tools.append(tool_name)
-                            break
-
-            logger.info(
-                f"Tool categories {tool_categories} mapped to "
-                f"{len(allowed_tools)} tools for task {task_id}"
-            )
-
-        user_id = int(user.id)
-        sandbox = self._sandboxes.get(user_id)
+        sandbox_key = f"user:{workspace_owner_id}"
+        sandbox = self._sandboxes.get(sandbox_key)
         if sandbox is None:
             from ..sandbox_manager import get_sandbox_manager
 
@@ -594,12 +988,14 @@ class AgentServiceManager:
             if sandbox_mgr:
                 try:
                     sandbox = await sandbox_mgr.get_or_create_sandbox(
-                        "user", str(user_id)
+                        "user",
+                        str(workspace_owner_id),
+                        workspace_config=sandbox_workspace_config,
                     )
-                    self._sandboxes[user_id] = sandbox
+                    self._sandboxes[sandbox_key] = sandbox
                 except Exception as e:
                     logger.warning(
-                        f"Sandbox creation failed for user {user_id}, "
+                        f"Sandbox creation failed for workspace owner {workspace_owner_id}, "
                         f"falling back to local execution: {e}"
                     )
 
@@ -613,11 +1009,28 @@ class AgentServiceManager:
             if agent_config
             else None,
             allowed_skills=agent_config["skills"] if agent_config else None,
-            allowed_tools=allowed_tools,
+            tool_selection_spec=tool_selection_spec,
             excluded_agent_id=excluded_agent_id,
             vision_model=task_vision_llm,
             sandbox=sandbox,
             llm=task_llm,
+            allowed_agent_ids=workforce_runtime.allowed_agent_ids
+            if workforce_runtime
+            else None,
+            agent_tool_overrides=workforce_runtime.agent_tool_overrides
+            if workforce_runtime
+            else None,
+            enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+            if workforce_runtime
+            else True,
+            allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+            if workforce_runtime
+            else False,
+            parent_task_id=str(task_id) if workforce_runtime else None,
+            parent_tracer=parent_tracer if workforce_runtime else None,
+            agent_call_stack=workforce_runtime.agent_call_stack
+            if workforce_runtime
+            else None,
         )
 
     async def get_agent_for_task(
@@ -625,12 +1038,28 @@ class AgentServiceManager:
         task_id: int,
         db: Optional[Session] = None,
         user: Optional[User] = None,
+        task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
     ) -> AgentService:
-        """Get or create AgentService instance for specific task"""
+        """Get or create AgentService instance for specific task.
+
+        ``task_setup_snapshot`` is an off-loop snapshot loaded by the
+        upstream caller (``_schedule_bg._runner``). When provided, the
+        in-method ``asyncio.to_thread(load_task_setup_snapshot_sync,
+        ...)`` is skipped -- the snapshot is reused directly. WS
+        callers and any caller that hasn't adopted the snapshot
+        plumbing pass ``None`` and the Step-3 in-method thread call
+        runs as before.
+        """
         if task_id not in self._agents:
             # Check if task exists in database
             task_exists = False
-            task = None
+            # ``task`` is widened to ``Task | _TaskFields | None`` because
+            # the LLM-config block below rebinds it from an ORM ``Task``
+            # to a frozen ``_TaskFields`` once the snapshot lands.
+            # Downstream consumers only read primitive attributes
+            # (``user_id``, ``agent_id``, ``agent_config``, ``status``)
+            # which both types expose identically.
+            task: Any = None
             if db is not None:
                 try:
                     task = db.query(Task).filter(Task.id == task_id).first()
@@ -668,6 +1097,28 @@ class AgentServiceManager:
                     TaskStatus.PAUSED,
                     TaskStatus.WAITING_FOR_USER,
                 ]
+                # Brand-new SDK task pre-check: ``begin_turn`` flips the
+                # task to RUNNING before this code runs, but a freshly
+                # created task has no trace events or DAG plan to
+                # recover -- ``_reconstruct_agent_from_history`` would
+                # run two queries, find nothing, and log a misleading
+                # "Failed to reconstruct" warning. Short-circuit the
+                # wasted path here. ``PAUSED`` / ``WAITING_FOR_USER``
+                # always have prior state by definition; only gate on
+                # ``RUNNING``.
+                if (
+                    should_reconstruct
+                    and task is not None
+                    and task.status == TaskStatus.RUNNING
+                    and db is not None
+                    and not self._has_reconstructable_history(task_id, db)
+                ):
+                    logger.info(
+                        f"Task {task_id} is RUNNING but has no reconstructable "
+                        "history (no trace events, no DAG plan); skipping "
+                        "reconstruct and going to normal creation."
+                    )
+                    should_reconstruct = False
                 # Task exists in database, try to reconstruct from history only for active executions
                 if db is not None and should_reconstruct:
                     try:
@@ -675,6 +1126,8 @@ class AgentServiceManager:
                         self._load_persisted_conversation_history(task_id, db)
                         await self._load_persisted_execution_context(task_id, db)
                         return self._agents[task_id]
+                    except HTTPException:
+                        raise
                     except Exception as e:
                         logger.warning(
                             f"Failed to reconstruct agent from history for task {task_id}: {e}"
@@ -690,103 +1143,136 @@ class AgentServiceManager:
             # Create tracer with all necessary handlers
             tracer = create_task_tracer(task_id, user)
 
-            # Get LLM configuration from task database record
+            # Load the contiguous synchronous DB block (Task row,
+            # per-task LLM resolution, optional Agent Builder lookup
+            # with its 0-4 ``DBModel`` queries and 0-4 user-aware LLM
+            # access checks) on a worker thread so the main event
+            # loop stays responsive. Same set of reads the inline
+            # code used to do; see ``load_task_setup_snapshot_sync``
+            # for the strict no-ORM-leak invariant.
             logger.info(f"Loading LLM configuration for task {task_id} from database")
-            agent_config = None  # Initialize agent_config to use later
-            # Default standalone tasks to DAG if no execution mode is available.
+            agent_config: Optional[dict] = None
             task_pattern = "dag_plan_execute"
             use_dag = True  # Default to DAG pattern (for backward compatibility)
+            excluded_agent_id: Optional[int] = None
+            snapshot: Optional[TaskSetupSnapshot] = None
             try:
                 if db is None:
                     raise ValueError("Database session is required")
 
-                task = db.query(Task).filter(Task.id == task_id).first()
-                if task:
-                    # Log the actual task record for debugging
-                    logger.info(
-                        f"Task {task_id} record: agent_type={task.agent_type}, model_name={task.model_name}, compact_model_name={task.compact_model_name}"
-                    )
-
-                    # Get task's execution_mode and map to pattern.
-                    task_execution_mode = getattr(task, "execution_mode", None)
-                    if not task_execution_mode:
-                        task_execution_mode = get_default_task_execution_mode(
-                            agent_id=getattr(task, "agent_id", None),
-                        )
-                    task_pattern = get_agent_pattern_for_execution_mode(
-                        task_execution_mode
-                    )
-                    logger.info(
-                        f"Task {task_id} execution_mode={task_execution_mode} -> pattern={task_pattern}"
-                    )
-
-                    llm_ids = self._get_task_llm_ids(task, db)
-                    logger.info(
-                        f"Loading LLM configuration from task {task_id}: {llm_ids}"
-                    )
-                    # Use user_id for model resolution if available
-                    user_id_for_resolution: Optional[int] = (
+                if task_setup_snapshot is not None:
+                    # Caller already loaded the snapshot off-loop
+                    # (typically ``_schedule_bg._runner``). Reuse it
+                    # instead of re-spinning a worker thread.
+                    snapshot = task_setup_snapshot
+                else:
+                    user_id_for_snapshot: Optional[int] = (
                         int(user.id) if user and user.id is not None else None
                     )
-                    task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                        resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
+                    snapshot = await asyncio.to_thread(
+                        load_task_setup_snapshot_sync,
+                        task_id,
+                        user_id_for_snapshot,
                     )
 
-                    # Override with Agent Builder configuration if task.agent_id exists
-                    if task and task.agent_id:
-                        agent = (
-                            db.query(Agent)
-                            .filter(
-                                Agent.id == task.agent_id, Agent.user_id == task.user_id
-                            )
-                            .first()
+                if snapshot is not None:
+                    task = snapshot.task
+                    logger.info(
+                        f"Task {task_id} record: agent_type={task.agent_type}, "
+                        f"model_name={task.model_name}, "
+                        f"compact_model_name={task.compact_model_name}"
+                    )
+                    task_pattern = snapshot.task_pattern
+                    logger.info(
+                        f"Task {task_id} execution_mode={task.execution_mode} "
+                        f"-> pattern={task_pattern}"
+                    )
+                    task_llm = snapshot.task_llm
+                    task_fast_llm = snapshot.task_fast_llm
+                    task_vision_llm = snapshot.task_vision_llm
+                    task_compact_llm = snapshot.task_compact_llm
+                    agent_config = snapshot.agent_config
+                    excluded_agent_id = snapshot.excluded_agent_id
+
+                    if snapshot.agent is not None:
+                        logger.info(
+                            f"Task {task_id} using Agent Builder config: "
+                            f"{snapshot.agent.name}"
                         )
-                        if agent:
+                        if agent_config is not None:
                             logger.info(
-                                f"Task {task_id} using Agent Builder config: {agent.name}"
-                            )
-                            agent_config = self._load_agent_builder_config(
-                                agent, db, int(task.user_id)
-                            )
-                            (
-                                task_llm,
-                                task_fast_llm,
-                                task_vision_llm,
-                                task_compact_llm,
-                            ) = agent_config["llms"]
-                            # Agent Builder execution_mode overrides task pattern.
-                            agent_execution_mode = agent_config.get(
-                                "execution_mode", "balanced"
-                            )
-                            task_pattern = get_agent_pattern_for_execution_mode(
-                                agent_execution_mode
-                            )
-                            logger.info(
-                                f"Task {task_id} using Agent Builder execution mode: {agent.execution_mode} -> pattern={task_pattern}"
+                                f"Task {task_id} using Agent Builder execution "
+                                f"mode: {agent_config.get('execution_mode')} "
+                                f"-> pattern={task_pattern}"
                             )
 
-                    # If no models were resolved, use defaults
                     if not task_llm:
-                        logger.warning(
-                            f"Task {task_id} has no valid LLM configuration, using defaults"
-                        )
-                        task_llm = self._default_llm
+                        # Two failure modes, two different policies:
+                        #
+                        # 1. Agent-builder agent whose configured models
+                        #    can't be resolved → fail-fast via the
+                        #    shared diagnostic helper. This is a real
+                        #    configuration error (the agent row points
+                        #    at models the runtime can't load); the
+                        #    helper raises HTTPException(500) with
+                        #    saved-model metadata in the log so
+                        #    on-call can trace back to the agent row.
+                        #
+                        # 2. Plain task with no agent-builder layer and
+                        #    no resolvable LLM (e.g. the deployment
+                        #    runs with no LLM env keys at all, or the
+                        #    task is tool-only and never calls an
+                        #    LLM) → silent fallback to ``self._default_llm``
+                        #    even if that itself is None. Some tasks
+                        #    legitimately never invoke an LLM; we
+                        #    cannot turn that case into a 500 without
+                        #    breaking those callers.
+                        if snapshot.agent is not None:
+                            user_id_for_fallback: Optional[int] = (
+                                int(user.id)
+                                if user and user.id is not None
+                                else task.user_id
+                            )
+                            task_llm = self._pick_default_llm_with_warning(
+                                self._default_llm,
+                                task_id=task_id,
+                                has_agent_builder_config=True,
+                                agent_id=task.agent_id,
+                                saved_model_ids=(agent_config or {}).get(
+                                    "saved_model_ids"
+                                ),
+                                saved_model_descriptors=(agent_config or {}).get(
+                                    "saved_model_descriptors"
+                                ),
+                                user_id=user_id_for_fallback,
+                            )
+                        else:
+                            logger.warning(
+                                f"Task {task_id} has no valid LLM configuration; "
+                                "using default LLM (may be None for tool-only tasks)"
+                            )
+                            task_llm = self._default_llm
 
                     logger.info(
-                        f"Successfully loaded LLM configuration for task {task_id}: compact_llm={task_compact_llm.model_name if task_compact_llm else None}"
+                        f"Successfully loaded LLM configuration for task {task_id}: "
+                        f"compact_llm="
+                        f"{task_compact_llm.model_name if task_compact_llm else None}"
                     )
                 else:
-                    # Task record not found
+                    # Task row vanished between the existence check and
+                    # the snapshot read. Fall back to the original
+                    # defaults so we still produce a usable AgentService.
                     logger.error(f"Task {task_id} not found in database!")
                     task_llm = self._default_llm
                     task_fast_llm = None
                     task_vision_llm = None
                     task_compact_llm = None
+            except HTTPException:
+                raise
             except Exception as e:
                 logger.error(
                     f"Failed to load LLM configuration from task {task_id} database: {e}"
                 )
-                # Fallback to defaults
                 task_llm = self._default_llm
                 task_fast_llm = None
                 task_vision_llm = None
@@ -803,28 +1289,75 @@ class AgentServiceManager:
                         "Database connection is required for agent creation"
                     )
 
-                # Check if task has an associated published agent that should be excluded from agent tools
-                excluded_agent_id = None
-                if task and task.agent_id:
-                    # Get the current agent to check if it's published
+                # ``excluded_agent_id`` for the legacy task-agent
+                # (published-agent) case is pre-computed by the snapshot
+                # loader (same SELECT as LLM resolution). Surface the log
+                # line here so on-call still sees the exclusion in
+                # production logs.
+                if (
+                    excluded_agent_id is not None
+                    and snapshot is not None
+                    and snapshot.agent is not None
+                ):
+                    logger.info(
+                        f"Task {task_id} is associated with published agent "
+                        f"{snapshot.agent.id} ({snapshot.agent.name}), "
+                        "will exclude from agent tools"
+                    )
+
+                # Inline preview_agent_id case (#459 build-preview): the
+                # snapshot path doesn't cover this because it resolves
+                # excluded_agent_id only through ``task.agent_id``; the
+                # preview agent is referenced inside the inline
+                # ``agent_config`` dict on tasks with ``agent_id=None``.
+                # Run this in addition to (not instead of) the snapshot
+                # value above -- they're mutually exclusive by design
+                # (either task has an agent_id OR has inline preview).
+                if (
+                    excluded_agent_id is None
+                    and agent_config
+                    and agent_config.get("preview_agent_id")
+                ):
                     from ..models.agent import AgentStatus
 
+                    if task is None:
+                        raise ValueError(
+                            f"Task {task_id} missing while resolving preview agent"
+                        )
                     current_agent = (
                         db.query(Agent)
                         .filter(
-                            Agent.id == task.agent_id, Agent.user_id == task.user_id
+                            Agent.id == agent_config["preview_agent_id"],
+                            Agent.user_id == task.user_id,
                         )
                         .first()
                     )
                     if current_agent and current_agent.status == AgentStatus.PUBLISHED:
                         excluded_agent_id = int(current_agent.id)
                         logger.info(
-                            f"Task {task_id} is associated with published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
+                            f"Preview task {task_id} is for published agent {current_agent.id} ({current_agent.name}), will exclude from agent tools"
                         )
 
-                # Get or create user sandbox for run task tools
-                user_id = int(user.id)
-                sandbox = self._sandboxes.get(user_id)
+                workforce_runtime = (
+                    resolve_workforce_task_runtime(db, task) if task else None
+                )
+                workspace_owner_id = (
+                    int(task.user_id)
+                    if task and task.user_id is not None
+                    else int(user.id)
+                )
+                sandbox_workspace_config = {
+                    "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
+                    "task_id": f"web_task_{task_id}",
+                    "user_id": workspace_owner_id,
+                    "allowed_external_dirs": _build_allowed_external_dirs(
+                        workspace_owner_id
+                    ),
+                }
+
+                # Get or create owner sandbox for run task tools
+                sandbox_key = f"user:{workspace_owner_id}"
+                sandbox = self._sandboxes.get(sandbox_key)
                 if sandbox is None:
                     from ..sandbox_manager import get_sandbox_manager
 
@@ -832,104 +1365,22 @@ class AgentServiceManager:
                     if sandbox_mgr:
                         try:
                             sandbox = await sandbox_mgr.get_or_create_sandbox(
-                                "user", str(user_id)
+                                "user",
+                                str(workspace_owner_id),
+                                workspace_config=sandbox_workspace_config,
                             )
-                            self._sandboxes[user_id] = sandbox
+                            self._sandboxes[sandbox_key] = sandbox
                         except Exception as e:
                             # Graceful degradation: tools will run locally without sandbox
                             logger.warning(
-                                f"Sandbox creation failed for user {user_id}, "
+                                f"Sandbox creation failed for workspace owner {workspace_owner_id}, "
                                 f"falling back to local execution: {e}"
                             )
 
-                # Filter tools by tool category using tool metadata
-                # Note: Tool names are stable, defined in code, no database storage needed
-                allowed_tools = None
-                if agent_config and "tool_categories" in agent_config:
-                    tool_categories = agent_config["tool_categories"]
-
-                    # Get tools by filtering using ToolFactory
-                    from ...core.tools.adapters.vibe.factory import ToolFactory
-
-                    # Create temporary config to get all tools
-                    temp_config = WebToolConfig(
-                        db=db,
-                        request=self.request,
-                        user=user,
-                        llm=task_llm,
-                        user_id=int(user.id),
-                        is_admin=bool(user.is_admin),
-                        workspace_config=None,
-                        include_mcp_tools=True,
-                        task_id=None,
-                        browser_tools_enabled=True,
-                        allowed_collections=agent_config.get("knowledge_bases"),
-                        allowed_skills=agent_config.get("skills"),
-                        sandbox=sandbox,
-                    )
-
-                    # Get all tools and filter by category
-                    all_tools = await ToolFactory.create_all_tools(temp_config)
-                    allowed_tools = []
-
-                    for tool in all_tools:
-                        if hasattr(tool, "metadata") and hasattr(
-                            tool.metadata, "category"
-                        ):
-                            category = str(tool.metadata.category.value)
-                            tool_name = getattr(tool, "name", None)
-
-                            # Standard category match
-                            if category in tool_categories:
-                                if tool_name:
-                                    allowed_tools.append(tool_name)
-                            # Support for specific MCP server selection ("mcp:ServerName")
-                            elif category == "mcp" and tool_name:
-                                for tc in tool_categories:
-                                    if tc.startswith("mcp:"):
-                                        # Use the exact raw server name for prefix comparison, just replace spaces with underscores
-                                        # as done in mcp_adapter.py (e.g. "LinkedIn" -> "LinkedIn", "Google Drive" -> "Google_Drive")
-                                        server_name = (
-                                            tc.split(":", 1)[1]
-                                            .replace(" ", "_")
-                                            .replace("-", "_")
-                                        )
-
-                                        # mcp_adapter prefix is f"mcp_{server_name}_" where server_name preserves original case
-                                        if tool_name.lower().startswith(
-                                            f"mcp_{server_name.lower()}_"
-                                        ):
-                                            allowed_tools.append(tool_name)
-                                            break
-                            elif category == "other" and tool_name:
-                                for tc in tool_categories:
-                                    if tc.startswith("mcp:"):
-                                        server_name = (
-                                            tc.split(":", 1)[1]
-                                            .replace(" ", "_")
-                                            .replace("-", "_")
-                                        )
-                                        logger.info(
-                                            f"Checking Custom API tool: '{tool_name}' vs 'api_{server_name}_call'"
-                                        )
-                                        if (
-                                            tool_name.lower()
-                                            == f"api_{server_name.lower()}_call"
-                                        ):
-                                            allowed_tools.append(tool_name)
-                                            break
-
-                    logger.info(
-                        f"Tool categories {tool_categories} mapped to {len(allowed_tools)} tools for task {task_id}"
-                    )
-
-                workspace_owner_id = (
-                    int(task.user_id)
-                    if task and task.user_id is not None
-                    else int(user.id)
+                tool_selection_spec = _build_tool_selection_spec_for_task(
+                    agent_config, workforce_runtime, task_id=task_id
                 )
 
-                # Create tools using ToolFactory
                 tools = await create_default_tools(
                     db,
                     request=self.request,
@@ -940,11 +1391,28 @@ class AgentServiceManager:
                     if agent_config
                     else None,
                     allowed_skills=agent_config["skills"] if agent_config else None,
-                    allowed_tools=allowed_tools,
+                    tool_selection_spec=tool_selection_spec,
                     excluded_agent_id=excluded_agent_id,
                     vision_model=task_vision_llm,  # Pass task-specific vision model
                     sandbox=sandbox,
                     llm=task_llm,  # Pass task-specific LLM
+                    allowed_agent_ids=workforce_runtime.allowed_agent_ids
+                    if workforce_runtime
+                    else None,
+                    agent_tool_overrides=workforce_runtime.agent_tool_overrides
+                    if workforce_runtime
+                    else None,
+                    enable_global_agent_tools=workforce_runtime.enable_global_agent_tools
+                    if workforce_runtime
+                    else True,
+                    allow_cross_user_agent_ids=workforce_runtime.allow_cross_user_agent_ids
+                    if workforce_runtime
+                    else False,
+                    parent_task_id=str(task_id) if workforce_runtime else None,
+                    parent_tracer=tracer if workforce_runtime else None,
+                    agent_call_stack=workforce_runtime.agent_call_stack
+                    if workforce_runtime
+                    else None,
                 )
 
                 with UserContext(int(user.id)):
@@ -963,6 +1431,9 @@ class AgentServiceManager:
                     system_prompt = enhance_system_prompt_with_kb(
                         system_prompt, kb_list
                     )
+                    system_prompt = _build_workforce_system_prompt(
+                        system_prompt, workforce_runtime
+                    )
 
                     # Extract memory similarity threshold from agent config
                     memory_similarity_threshold = None
@@ -970,9 +1441,10 @@ class AgentServiceManager:
                         memory_similarity_threshold = agent_config[
                             "memory_similarity_threshold"
                         ]
-                    # Agent Builder agents serve end users, so v2 task memory is
-                    # disabled until the product exposes an explicit opt-in.
-                    agent_builder_memory_enabled = not bool(task and task.agent_id)
+                    memory_policy = resolve_agent_service_memory_policy(
+                        task=task,
+                        agent_config=agent_config,
+                    )
 
                     # Build allowed external directories for the task owner's uploads.
                     allowed_external_dirs = _build_allowed_external_dirs(
@@ -989,7 +1461,7 @@ class AgentServiceManager:
                         compact_llm=task_compact_llm,
                         tools=tools_list,
                         tool_config=tool_config,  # Pass tool_config for proper multi-tenancy
-                        memory=get_memory_store(),  # Use dynamic memory store for auto-switching
+                        memory=memory_policy.memory,
                         pattern=task_pattern,  # Use pattern instead of use_dag_pattern
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
@@ -999,7 +1471,7 @@ class AgentServiceManager:
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
                         task_id=str(task_id),  # Pass task_id for proper tracing
                         memory_similarity_threshold=memory_similarity_threshold,  # Set from task config
-                        memory_enabled=agent_builder_memory_enabled,
+                        memory_enabled=memory_policy.memory_enabled,
                         system_prompt=system_prompt,  # Pass agent builder instructions
                     )
 
@@ -1036,7 +1508,7 @@ class AgentServiceManager:
                             if uploaded_file is None:
                                 continue
 
-                            source_path = Path(str(uploaded_file.storage_path))
+                            source_path = ensure_uploaded_file_local_path(uploaded_file)
                             if not source_path.exists() or not source_path.is_file():
                                 continue
 
@@ -1138,6 +1610,21 @@ class AgentServiceManager:
                     "status": "running_elsewhere",
                     "error": "Task is already running on another worker.",
                 }
+            try:
+                task_for_sync = (
+                    db_session.query(Task)
+                    .filter(Task.id == int(tracker_task_id))
+                    .first()
+                )
+                if task_for_sync is not None and sync_workforce_run_status(
+                    db_session, task_for_sync, TaskStatus.RUNNING
+                ):
+                    db_session.commit()
+            except Exception:
+                logger.debug(
+                    "Failed to sync workforce run status after lease acquisition",
+                    exc_info=True,
+                )
             lease_stop_event = asyncio.Event()
             lease_heartbeat_task = asyncio.create_task(
                 run_task_lease_heartbeat(lease, lease_stop_event)
@@ -1191,7 +1678,9 @@ class AgentServiceManager:
                         final_status = TaskStatus.COMPLETED
                     else:
                         final_status = TaskStatus.FAILED
-                release_task_lease(db_session, lease, status=final_status)
+                release_task_lease_with_workforce_sync(
+                    db_session, lease, status=final_status
+                )
             # Complete tracking if it was started
             if tracker:
                 try:
@@ -1242,6 +1731,52 @@ class AgentServiceManager:
                 f"No workspace directory found for task {task_id} (user {user_id})"
             )
 
+    def _has_reconstructable_history(self, task_id: int, db: Session) -> bool:
+        """Cheap pre-check: does the task have prior state that
+        ``_reconstruct_agent_from_history`` could actually recover?
+
+        Reconstruct depends on either:
+
+        * trace events from prior tool / LLM runs (``TraceEvent`` rows
+          for the task with ``build_id IS NULL`` -- VIBE phase only,
+          matches the same filter ``_reconstruct_agent_from_history``
+          uses)
+        * a ``DAGExecution.current_plan`` blob for the task
+
+        A brand-new SDK task whose status was just flipped to RUNNING
+        by ``begin_turn`` has neither -- ``_reconstruct_agent_from_history``
+        would run the same two queries, return empty, log a warning,
+        and fall through to normal creation. The check here saves the
+        wasted-work cost plus the noisy ``Failed to reconstruct agent
+        from history`` log line that misleads post-incident triage
+        into thinking something actually failed.
+
+        ``PAUSED`` / ``WAITING_FOR_USER`` tasks always have prior state
+        by definition; the caller in ``get_agent_for_task`` should only
+        gate on this check for ``RUNNING`` status.
+
+        Two ``.first()`` queries: trace short-circuits the plan check
+        when present (typical case for any agent that has run a step).
+        """
+        from ..models.task import DAGExecution, TraceEvent
+
+        has_trace = (
+            db.query(TraceEvent)
+            .filter(
+                TraceEvent.task_id == task_id,
+                TraceEvent.build_id.is_(None),
+            )
+            .first()
+            is not None
+        )
+        if has_trace:
+            return True
+        has_plan = (
+            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
+            is not None
+        )
+        return has_plan
+
     async def _reconstruct_agent_from_history(self, task_id: int, db: Session) -> None:
         """Reconstruct agent from historical data"""
         try:
@@ -1265,7 +1800,13 @@ class AgentServiceManager:
                 )
                 .all()
             )
-            for event in trace_events:
+            decoded_event_data = decode_trace_events_data(
+                db,
+                task_id=task_id,
+                data_items=[event.data for event in trace_events],
+                strict=False,
+            )
+            for event, event_data in zip(trace_events, decoded_event_data):
                 tracer_events.append(
                     {
                         "id": event.event_id,
@@ -1275,7 +1816,7 @@ class AgentServiceManager:
                         "timestamp": event.timestamp.timestamp()
                         if event.timestamp
                         else None,
-                        "data": event.data,
+                        "data": event_data,
                         "parent_id": event.parent_event_id,
                     }
                 )
@@ -1312,53 +1853,18 @@ class AgentServiceManager:
                                 "User context is required for agent reconstruction"
                             )
 
-                        task_execution_mode = getattr(task, "execution_mode", None)
-                        if not task_execution_mode:
-                            task_execution_mode = get_default_task_execution_mode(
-                                agent_id=getattr(task, "agent_id", None),
-                            )
-                        task_pattern = get_agent_pattern_for_execution_mode(
-                            task_execution_mode
+                        runtime_config = self._resolve_task_runtime_config(
+                            task_id=task_id,
+                            task=task,
+                            db=db,
+                            user=user,
                         )
-                        llm_ids = self._get_task_llm_ids(task, db)
-                        # Use user_id for model resolution if available
-                        user_id_for_resolution = (
-                            int(task.user_id) if task.user_id else None
-                        )
-                        task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
-                            resolve_llms_from_names(llm_ids, db, user_id_for_resolution)
-                        )
-
-                        agent_config = None
-                        if task.agent_id:
-                            agent = (
-                                db.query(Agent)
-                                .filter(
-                                    Agent.id == task.agent_id,
-                                    Agent.user_id == task.user_id,
-                                )
-                                .first()
-                            )
-                            if agent:
-                                agent_config = self._load_agent_builder_config(
-                                    agent, db, int(user.id)
-                                )
-                                (
-                                    task_llm,
-                                    task_fast_llm,
-                                    task_vision_llm,
-                                    task_compact_llm,
-                                ) = agent_config["llms"]
-                                agent_execution_mode = agent_config.get(
-                                    "execution_mode", "balanced"
-                                )
-                                task_pattern = get_agent_pattern_for_execution_mode(
-                                    agent_execution_mode
-                                )
-
-                        # If no models were resolved, use defaults
-                        if not task_llm:
-                            task_llm = self._default_llm
+                        agent_config = runtime_config["agent_config"]
+                        task_llm = runtime_config["task_llm"]
+                        task_fast_llm = runtime_config["task_fast_llm"]
+                        task_vision_llm = runtime_config["task_vision_llm"]
+                        task_compact_llm = runtime_config["task_compact_llm"]
+                        task_pattern = runtime_config["task_pattern"]
 
                         tools_list, tool_config = await self._build_tools_for_task(
                             task_id=task_id,
@@ -1368,6 +1874,7 @@ class AgentServiceManager:
                             agent_config=agent_config,
                             task_llm=task_llm,
                             task_vision_llm=task_vision_llm,
+                            parent_tracer=tracer,
                         )
                     else:
                         raise ValueError(
@@ -1402,6 +1909,10 @@ class AgentServiceManager:
                         system_prompt = enhance_system_prompt_with_kb(
                             system_prompt, kb_list
                         )
+                        system_prompt = _build_workforce_system_prompt(
+                            system_prompt,
+                            resolve_workforce_task_runtime(db, task),
+                        )
                         memory_similarity_threshold = None
                         if (
                             agent_config
@@ -1410,9 +1921,10 @@ class AgentServiceManager:
                             memory_similarity_threshold = agent_config[
                                 "memory_similarity_threshold"
                             ]
-                        # Agent Builder agents serve end users, so v2 task memory is
-                        # disabled until the product exposes an explicit opt-in.
-                        agent_builder_memory_enabled = not bool(task and task.agent_id)
+                        memory_policy = resolve_agent_service_memory_policy(
+                            task=task,
+                            agent_config=agent_config,
+                        )
                         self._agents[task_id] = AgentService(
                             name=f"reconstructed_agent_task_{task_id}",
                             id=f"web_task_{task_id}",  # Use task ID only for workspace
@@ -1422,7 +1934,7 @@ class AgentServiceManager:
                             compact_llm=task_compact_llm,
                             tools=tools_list,
                             tool_config=tool_config,
-                            memory=get_memory_store(),  # Use dynamic memory store for auto-switching
+                            memory=memory_policy.memory,
                             pattern=task_pattern,
                             tracer=tracer,
                             system_prompt=system_prompt,
@@ -1433,7 +1945,7 @@ class AgentServiceManager:
                             allowed_external_dirs=allowed_external_dirs,
                             task_id=str(task_id),
                             memory_similarity_threshold=memory_similarity_threshold,
-                            memory_enabled=agent_builder_memory_enabled,
+                            memory_enabled=memory_policy.memory_enabled,
                         )
                 else:
                     raise ValueError(
@@ -1546,7 +2058,7 @@ async def create_task(
 
                 selected_file_ids.append(str(file_id))
 
-                file_path = Path(str(uploaded_file.storage_path))
+                file_path = ensure_uploaded_file_local_path(uploaded_file)
                 file_paths.append(str(file_path))
 
                 if file_path.exists():
@@ -1669,10 +2181,10 @@ async def create_task(
 
         selected_agent: Optional[Agent] = None
         if request.agent_id:
-            selected_agent = (
-                db.query(Agent)
-                .filter(Agent.id == request.agent_id, Agent.user_id == user.id)
-                .first()
+            selected_agent = _load_agent_for_task_create(
+                db,
+                user,
+                int(request.agent_id),
             )
             if not selected_agent:
                 raise HTTPException(
@@ -1767,6 +2279,9 @@ async def create_task(
             request.agent_config,
             selected_file_ids,
         )
+        if request.is_preview:
+            task_agent_config = task_agent_config or {}
+            task_agent_config["is_preview"] = True
 
         task_execution_mode = request.execution_mode
         if not task_execution_mode:
@@ -1797,6 +2312,7 @@ async def create_task(
             process_description=request.process_description,
             examples=examples_data,
             agent_id=request.agent_id,  # Set agent_id if provided
+            is_visible=False if request.is_preview else request.is_visible,
         )
 
         # Set agent_type using the property to avoid Column type issues
@@ -1853,6 +2369,9 @@ async def create_task(
             execution_mode=task.execution_mode,
             channel_id=task.channel_id,
             channel_name=task.channel_name,
+            agent_id=task.agent_id,
+            agent_name=task.agent.name if task.agent else None,
+            agent_logo_url=task.agent.logo_url if task.agent else None,
         )
 
     except HTTPException:
@@ -1871,6 +2390,7 @@ async def get_tasks(
     exclude_agent_type: Optional[str] = None,
     execution_mode: Optional[str] = None,
     exclude_execution_mode: Optional[str] = None,
+    include_hidden: bool = False,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Dict[str, Any]:
@@ -1887,6 +2407,9 @@ async def get_tasks(
             else:
                 # Regular users can only see their own tasks
                 query = db.query(Task).filter(Task.user_id == user.id)
+
+            if not include_hidden:
+                query = query.filter(Task.is_visible.is_(True))
 
             # Apply search filter if provided
             if search:
@@ -1991,6 +2514,7 @@ async def get_tasks(
 
                     if task.agent_id and task.agent_id in agents_map:
                         task_data["agent_logo_url"] = agents_map[task.agent_id].logo_url
+                        task_data["agent_name"] = agents_map[task.agent_id].name
 
                     # Include user information for admin users
                     if user.is_admin:
@@ -2051,6 +2575,9 @@ async def get_task(
             mark_task_paused_if_stale(db, task)
             db.refresh(task)
 
+            cache_key = web_task_detail_key(task_id)
+            task_updated_at = cache_version_token(task.updated_at)
+
             # Get the raw status value safely
             if hasattr(task, "status") and task.status is not None:
                 if hasattr(task.status, "value"):
@@ -2067,6 +2594,27 @@ async def get_task(
             dag_execution = (
                 db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
             )
+            dag_updated_at = (
+                cache_version_token(dag_execution.updated_at) if dag_execution else None
+            )
+            activity_ids: tuple[int, int] | None = None
+            cached = cache_get(cache_key)
+            if (
+                isinstance(cached, dict)
+                and cached.get("updated_at") == task_updated_at
+                and cached.get("dag_updated_at") == dag_updated_at
+            ):
+                if task.status in _TERMINAL_CACHE_STATUSES:
+                    return cast(Dict[str, Any], cached["response"])
+                activity_ids = _get_task_activity_ids(db, task_id)
+                if cached.get("max_trace_event_id") == int(
+                    activity_ids[0]
+                ) and cached.get("max_chat_message_id") == int(activity_ids[1]):
+                    return cast(Dict[str, Any], cached["response"])
+
+            if task.status not in _TERMINAL_CACHE_STATUSES and activity_ids is None:
+                activity_ids = _get_task_activity_ids(db, task_id)
+
             if dag_execution:
                 dag_data = {
                     "phase": dag_execution.phase.value if dag_execution.phase else None,
@@ -2090,7 +2638,11 @@ async def get_task(
                     db, task_id
                 )
 
-            return {
+            # Fetch agent info if agent relationship is available
+            agent_name = task.agent.name if task.agent else None
+            agent_logo_url = task.agent.logo_url if task.agent else None
+
+            response = {
                 "task_id": task.id,
                 "title": task.title,
                 "description": task.description,
@@ -2110,11 +2662,30 @@ async def get_task(
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,
                 "llm_calls": task.llm_calls or 0,
+                "agent_id": task.agent_id,
+                "agent_name": agent_name,
+                "agent_logo_url": agent_logo_url,
                 "channel_id": task.channel_id,
                 "channel_name": task.channel_name,
                 "waiting_question": waiting_question,
                 "waiting_interactions": waiting_interactions,
             }
+            cache_set(
+                cache_key,
+                {
+                    "updated_at": task_updated_at,
+                    "dag_updated_at": dag_updated_at,
+                    "max_trace_event_id": (
+                        activity_ids[0] if activity_ids is not None else None
+                    ),
+                    "max_chat_message_id": (
+                        activity_ids[1] if activity_ids is not None else None
+                    ),
+                    "response": response,
+                },
+                ttl_seconds=task_cache_ttl_seconds(),
+            )
+            return response
 
         # Execute in thread pool to avoid blocking
         return await asyncio.to_thread(_get_task_sync)
@@ -2146,6 +2717,22 @@ async def get_task_status(
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
 
+            cache_key = web_task_status_key(task_id)
+            task_updated_at = cache_version_token(task.updated_at)
+            activity_ids: tuple[int, int] | None = None
+            cached = cache_get(cache_key)
+            if isinstance(cached, dict) and cached.get("updated_at") == task_updated_at:
+                if task.status in _TERMINAL_CACHE_STATUSES:
+                    return cast(Dict[str, Any], cached["response"])
+                activity_ids = _get_task_activity_ids(db, task_id)
+                if cached.get("max_trace_event_id") == int(
+                    activity_ids[0]
+                ) and cached.get("max_chat_message_id") == int(activity_ids[1]):
+                    return cast(Dict[str, Any], cached["response"])
+
+            if task.status not in _TERMINAL_CACHE_STATUSES and activity_ids is None:
+                activity_ids = _get_task_activity_ids(db, task_id)
+
             # Get the raw status value safely
             if hasattr(task, "status") and task.status is not None:
                 if hasattr(task.status, "value"):
@@ -2164,7 +2751,11 @@ async def get_task_status(
                     db, task_id
                 )
 
-            return {
+            # Fetch agent info if agent relationship is available
+            agent_name = task.agent.name if task.agent else None
+            agent_logo_url = task.agent.logo_url if task.agent else None
+
+            response = {
                 "task_id": task.id,
                 "title": task.title,
                 "status": status_value,
@@ -2182,11 +2773,29 @@ async def get_task_status(
                 "output_tokens": task.output_tokens or 0,
                 "total_tokens": task.total_tokens or 0,
                 "llm_calls": task.llm_calls or 0,
+                "agent_id": task.agent_id,
+                "agent_name": agent_name,
+                "agent_logo_url": agent_logo_url,
                 "channel_id": task.channel_id,
                 "channel_name": task.channel_name,
                 "waiting_question": waiting_question,
                 "waiting_interactions": waiting_interactions,
             }
+            cache_set(
+                cache_key,
+                {
+                    "updated_at": task_updated_at,
+                    "max_trace_event_id": (
+                        activity_ids[0] if activity_ids is not None else None
+                    ),
+                    "max_chat_message_id": (
+                        activity_ids[1] if activity_ids is not None else None
+                    ),
+                    "response": response,
+                },
+                ttl_seconds=task_cache_ttl_seconds(),
+            )
+            return response
 
         # Execute in thread pool to avoid blocking
         return await asyncio.to_thread(_get_task_status_sync)
@@ -2228,6 +2837,7 @@ async def update_task(
 
         task.title = title
         db.commit()
+        invalidate_task_cache(task_id)
 
         return {"status": "success", "message": "Task updated successfully"}
     except HTTPException:
@@ -2263,24 +2873,26 @@ async def delete_task(
             # Delete related data in correct order to respect foreign key constraints
             logger.info(f"Deleting task {task_id} and all related data")
 
-            # Delete DAG execution (if any)
-            from ..models.task import DAGExecution
-
-            dag_execution = (
-                db.query(DAGExecution).filter(DAGExecution.task_id == task_id).first()
+            # Delete task-owned rows that do not all have DB-level cascades.
+            from ..models.task import (
+                DAGExecution,
+                TraceCheckpointBlob,
+                TraceEvent,
+                TraceMessageBlob,
             )
-            if dag_execution:
-                db.delete(dag_execution)
 
-            # Note: execution_logs table has been removed - replaced by trace_events
-
-            # Delete trace events (only VIBE phase, BUILD sessions are separate)
-            from ..models.task import TraceEvent
-
-            db.query(TraceEvent).filter(
-                TraceEvent.task_id == task_id,
-                TraceEvent.build_id.is_(None),  # ← Only delete VIBE events
-            ).delete()
+            db.query(TraceCheckpointBlob).filter(
+                TraceCheckpointBlob.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.query(TraceMessageBlob).filter(
+                TraceMessageBlob.task_id == task_id
+            ).delete(synchronize_session=False)
+            db.query(TraceEvent).filter(TraceEvent.task_id == task_id).delete(
+                synchronize_session=False
+            )
+            db.query(DAGExecution).filter(DAGExecution.task_id == task_id).delete(
+                synchronize_session=False
+            )
 
             # Note: tool_usages, agents, and agent_tools tables have been removed
 
@@ -2292,6 +2904,7 @@ async def delete_task(
 
         # Execute database operations in thread pool to avoid blocking
         task = await asyncio.to_thread(_delete_task_sync)
+        invalidate_task_cache(task_id)
 
         # Remove agent from manager if it exists
         get_agent_manager(request).remove_agent(task_id, int(user.id))

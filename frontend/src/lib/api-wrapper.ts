@@ -9,6 +9,8 @@ const REFRESH_EXCLUDED_AUTH_ENDPOINTS = [
   "/api/auth/login",
   "/api/auth/register",
   "/api/auth/setup-admin",
+  "/api/auth/forgot-password",
+  "/api/auth/reset-password",
 ]
 
 function shouldSkipRefresh(url: string): boolean {
@@ -323,6 +325,30 @@ export function getUploadErrorMessage(
   }
 
   return messages.generic
+}
+
+export function getApiErrorMessage(
+  response: Response,
+  parsed: ParsedApiResponse,
+  generic: string
+): string {
+  if (isJsonRecord(parsed.data) && typeof parsed.data.detail === "string" && parsed.data.detail.trim()) {
+    return parsed.data.detail
+  }
+
+  if (isJsonRecord(parsed.data) && typeof parsed.data.message === "string" && parsed.data.message.trim()) {
+    return parsed.data.message
+  }
+
+  if (parsed.text?.trim() && !parsed.isHtml) {
+    return truncateUploadMessage(parsed.text)
+  }
+
+  if (response.statusText?.trim()) {
+    return response.statusText
+  }
+
+  return generic
 }
 
 // Convenience methods

@@ -27,6 +27,7 @@ from ..utils.string_utils import (
     build_user_id_filter_for_table,
     escape_lancedb_string,
 )
+from ..utils.user_permissions import UserPermissions
 from ..utils.user_scope import resolve_user_scope
 from .main_pointer_manager import get_main_pointer
 
@@ -106,6 +107,51 @@ def _build_document_filter(
     except Exception:
         # If table introspection fails, keep tenant-safe fallback.
         return build_lancedb_filter_expression(base, user_id=user_id, is_admin=is_admin)
+    finally:
+        _safe_close_table(table)
+
+
+def _doc_ids_filter(doc_ids: list[str]) -> str:
+    if len(doc_ids) == 1:
+        return f"doc_id == '{escape_lancedb_string(doc_ids[0])}'"
+    values = ", ".join(f"'{escape_lancedb_string(doc_id)}'" for doc_id in doc_ids)
+    return f"doc_id IN ({values})"
+
+
+def _build_documents_filter(
+    *,
+    conn: Any,
+    table_name: str,
+    collection: str,
+    doc_ids: list[str],
+    user_id: Optional[int],
+    is_admin: bool,
+) -> str:
+    """Build a safe filter for deleting multiple document-scoped rows."""
+    base_expr = build_lancedb_filter_expression(
+        {"collection": collection}, skip_user_filter=True
+    )
+    doc_expr = _doc_ids_filter(doc_ids)
+    scoped_expr = f"{base_expr} AND {doc_expr}"
+
+    if is_admin:
+        return scoped_expr
+    if user_id is None:
+        return f"{scoped_expr} AND ({UserPermissions.get_no_access_filter()})"
+
+    table = None
+    try:
+        table = conn.open_table(table_name)
+        if _table_has_column(table, "user_id"):
+            return (
+                f"{scoped_expr} AND "
+                f"{build_user_id_filter_for_table(table, int(user_id))}"
+            )
+        # Legacy schemas without user_id stay document-scoped by doc_id.
+        return scoped_expr
+    except Exception:
+        # If introspection fails, fail closed with an explicit user_id predicate.
+        return f"{scoped_expr} AND user_id == {int(user_id)}"
     finally:
         _safe_close_table(table)
 
@@ -443,6 +489,74 @@ def cascade_delete(
                 user_id=user_id,
                 is_admin=is_admin,
             )
+
+    if preview_only and not confirm:
+        return _plan_by_predicates(conn, predicates, model_tag=None)
+
+    return _delete_by_predicates(conn, predicates, model_tag=None)
+
+
+def cascade_delete_documents(
+    *,
+    collection: str,
+    doc_ids: list[str],
+    user_id: Optional[int] = None,
+    is_admin: Optional[bool] = None,
+    preview_only: bool = True,
+    confirm: bool = False,
+    conn: Any | None = None,
+) -> Dict[str, int]:
+    """Cascade delete several documents using one predicate set.
+
+    This keeps non-admin deletes document-scoped even for legacy tables that do
+    not expose user_id, avoiding collection-wide mutation while reducing the
+    number of full cascade passes.
+    """
+    normalized_doc_ids = sorted({str(doc_id) for doc_id in doc_ids if str(doc_id)})
+    if not normalized_doc_ids:
+        return {}
+
+    user_scope = resolve_user_scope(user_id=user_id, is_admin=is_admin)
+    user_id = user_scope.user_id
+    is_admin = user_scope.is_admin
+    if not is_admin and user_id is None:
+        return {}
+
+    if conn is None:
+        conn = get_vector_store_raw_connection()
+    ensure_documents_table(conn)
+    ensure_parses_table(conn)
+    ensure_chunks_table(conn)
+    ensure_main_pointers_table(conn)
+    ensure_ingestion_runs_table(conn)
+
+    table_names = _get_table_names(conn)
+    predicates: Dict[str, str] = {}
+
+    core_tables = ["documents", "parses", "chunks", "main_pointers", "ingestion_runs"]
+    for table_name in core_tables:
+        if table_name not in table_names:
+            continue
+        predicates[table_name] = _build_documents_filter(
+            conn=conn,
+            table_name=table_name,
+            collection=collection,
+            doc_ids=normalized_doc_ids,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    for table_name in table_names:
+        if not table_name.startswith("embeddings_"):
+            continue
+        predicates[table_name] = _build_documents_filter(
+            conn=conn,
+            table_name=table_name,
+            collection=collection,
+            doc_ids=normalized_doc_ids,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
 
     if preview_only and not confirm:
         return _plan_by_predicates(conn, predicates, model_tag=None)

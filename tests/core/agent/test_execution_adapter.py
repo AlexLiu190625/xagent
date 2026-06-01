@@ -89,9 +89,35 @@ class FakeTool:
         self.teardown_calls.append(task_id)
 
 
+class StartHandle:
+    task = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"status": "running"}
+
+
+class RecordingRegistry:
+    def __init__(self) -> None:
+        self.start_kwargs: dict[str, Any] | None = None
+
+    def start(self, *args: Any, **kwargs: Any) -> StartHandle:
+        self.start_kwargs = dict(kwargs)
+        return StartHandle()
+
+
 class NoSkillManager:
     async def select_skill(self, **_: Any) -> None:
         return None
+
+
+class ReusedExecutionAdapter:
+    def __init__(self, config: SimpleNamespace) -> None:
+        self.config = config
+        self.execute_kwargs: dict[str, Any] | None = None
+
+    async def execute(self, **kwargs: Any) -> dict[str, Any]:
+        self.execute_kwargs = dict(kwargs)
+        return {"success": True}
 
 
 def auto_decision(
@@ -106,6 +132,7 @@ def auto_decision(
                     "arguments": {
                         "action": action,
                         "reason": reason,
+                        "response_language": "English",
                         "answer": answer,
                         "requires_current_or_external_facts": False,
                         "existing_context_sufficient": True,
@@ -125,11 +152,53 @@ def dag_plan(steps: list[dict[str, Any]]) -> dict[str, Any]:
                 "id": "call-plan",
                 "function": {
                     "name": "generate_execution_plan",
-                    "arguments": {"steps": steps},
+                    "arguments": {"steps": steps, "response_language": "English"},
                 },
             }
         ]
     }
+
+
+def dag_completion(answer: str = "dag done") -> dict[str, Any]:
+    return {
+        "tool_calls": [
+            {
+                "id": "call-assess",
+                "function": {
+                    "name": "assess_dag_completion",
+                    "arguments": json.dumps(
+                        {
+                            "status": "completed",
+                            "reason": "Done.",
+                            "answer": answer,
+                            "missing_work": "",
+                            "replan_instruction": "",
+                        }
+                    ),
+                },
+            }
+        ]
+    }
+
+
+def test_execution_adapter_uses_service_id_as_runner_workspace_id() -> None:
+    registry = RecordingRegistry()
+    adapter = AgentExecutionAdapter(
+        AgentExecutionConfig(
+            name="web-task",
+            pattern="react",
+            llm=FakeLLM(["unused"]),
+            service_id="web_task_458",
+            registry=cast(Any, registry),
+            skill_manager=NoSkillManager(),
+        )
+    )
+
+    adapter.start(task="Generate a file", task_id="458")
+
+    assert registry.start_kwargs is not None
+    assert registry.start_kwargs["execution_id"] == "458"
+    assert registry.start_kwargs["workspace_id"] == "web_task_458"
 
 
 @pytest.mark.asyncio
@@ -172,7 +241,7 @@ async def test_execution_adapter_routes_single_call_to_one_tool_then_final_answe
     assert result["metadata"]["execution_type"] == "agent_single_call"
     assert tool.calls == [{"value": "from tool"}]
     assert llm.calls[0]["tools"][0]["function"]["name"] == "noop"
-    assert llm.calls[0]["tool_choice"] == "auto"
+    assert llm.calls[0]["tool_choice"] == "required"
     assert llm.calls[1]["tools"] is None
     assert llm.calls[1]["tool_choice"] is None
 
@@ -472,6 +541,53 @@ async def test_agent_service_passes_execution_context_to_execution_adapter() -> 
 
 
 @pytest.mark.asyncio
+async def test_agent_service_refreshes_compact_llm_on_reused_execution_adapter() -> (
+    None
+):
+    initial_llm = FakeLLM(["initial"])
+    updated_llm = FakeLLM(["updated"])
+    initial_compact_llm = FakeLLM(["initial compact"])
+    updated_compact_llm = FakeLLM(["updated compact"])
+    adapter = ReusedExecutionAdapter(
+        SimpleNamespace(
+            current_task_id=None,
+            tools=[],
+            llm=initial_llm,
+            compact_llm=initial_compact_llm,
+            pattern="react",
+            outbound_message_handler=None,
+            conversation_history=[],
+            execution_context_messages=[],
+            recovered_skill_context=None,
+            memory_store=None,
+            allowed_skills=None,
+        )
+    )
+    service = AgentService(
+        name="compact-refresh-service",
+        id="compact-refresh-service",
+        pattern="react",
+        llm=cast(Any, initial_llm),
+        compact_llm=cast(Any, initial_compact_llm),
+        tools=[],
+        tool_config=None,
+    )
+    service._execution_adapter = cast(Any, adapter)
+
+    service.llm = cast(Any, updated_llm)
+    service.compact_llm = cast(Any, updated_compact_llm)
+
+    result = await service._execute_agent_task(
+        "continue", task_id="task-compact-refresh"
+    )
+
+    assert result["success"] is True
+    assert adapter.config.current_task_id == "task-compact-refresh"
+    assert adapter.config.llm is updated_llm
+    assert adapter.config.compact_llm is updated_compact_llm
+
+
+@pytest.mark.asyncio
 async def test_execution_adapter_emits_visible_trace_events() -> None:
     tracer = RecordingTracer()
     adapter = AgentExecutionAdapter(
@@ -510,6 +626,7 @@ async def test_execution_adapter_routes_dag_to_dag() -> None:
         [
             dag_plan([{"id": "answer", "task": "Answer directly"}]),
             "dag done",
+            dag_completion("dag done"),
         ]
     )
     adapter = AgentExecutionAdapter(
@@ -621,6 +738,7 @@ async def test_execution_adapter_executes_auto_plan_execute() -> None:
             auto_decision("plan_execute", reason="Needs DAG."),
             dag_plan([{"id": "answer", "task": "Answer directly"}]),
             "dag done",
+            dag_completion("dag done"),
         ]
     )
     adapter = AgentExecutionAdapter(
@@ -753,16 +871,15 @@ async def test_execution_adapter_forwards_outbound_messages() -> None:
 
     assert result["success"] is True
     assert result["output"] == "done"
-    assert sent_messages == [
-        {
-            "type": "agent_message",
-            "execution_id": "outbound-exec",
-            "message": "Still working",
-            "message_type": "progress",
-            "expect_response": False,
-            "metadata": {},
-        }
-    ]
+    assert len(sent_messages) == 1
+    outbound_message = sent_messages[0]
+    assert outbound_message["type"] == "agent_message"
+    assert outbound_message["execution_id"] == "outbound-exec"
+    assert outbound_message["message"] == "Still working"
+    assert outbound_message["message_type"] == "progress"
+    assert outbound_message["expect_response"] is False
+    assert outbound_message["visible"] is True
+    assert outbound_message["step_id"] == outbound_message["metadata"]["step_id"]
 
 
 def test_execution_adapter_uses_last_assistant_message_when_output_missing() -> None:

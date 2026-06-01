@@ -17,6 +17,7 @@ import pytest
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from xagent.web.models.agent import Agent, AgentOrigin
 from xagent.web.models.agent_api_key import AgentApiKey
 
 from .conftest import (
@@ -51,6 +52,17 @@ def _create_agent(headers: dict[str, str], name: str = "Test Agent") -> int:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["id"]
+
+
+def _mark_generated_manager(agent_id: int) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(Agent).filter(Agent.id == agent_id).update(
+            {"origin": AgentOrigin.WORKFORCE_GENERATED_MANAGER.value}
+        )
+        db.commit()
+    finally:
+        db.close()
 
 
 # ===== POST /{agent_id}/api-key =====
@@ -201,6 +213,30 @@ class TestPostGenerateApiKey:
         assert resp.json()["detail"] == "Internal server error"
         assert secret_message not in resp.text
 
+    def test_generated_manager_returns_404_without_rotating_existing_key(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        first = client.post(f"/api/agents/{agent_id}/api-key", headers=headers).json()
+        _mark_generated_manager(agent_id)
+
+        resp = client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Agent not found"
+        db = _direct_db_session()
+        try:
+            rows = (
+                db.query(AgentApiKey)
+                .filter(AgentApiKey.agent_id == agent_id)
+                .order_by(AgentApiKey.id)
+                .all()
+            )
+            assert len(rows) == 1
+            assert rows[0].key_prefix == first["key_prefix"]
+            assert rows[0].revoked_at is None
+        finally:
+            db.close()
+
 
 # ===== GET /{agent_id}/api-key =====
 
@@ -254,6 +290,17 @@ class TestGetActiveApiKey:
         assert resp.status_code == 404
         # Same "agent not found" detail -- never reveals the existence
         # of admin's key, only that the agent itself isn't bob's.
+        assert resp.json()["detail"] == "Agent not found"
+
+    def test_generated_manager_returns_404_even_if_key_exists(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        client.post(f"/api/agents/{agent_id}/api-key", headers=headers)
+        _mark_generated_manager(agent_id)
+
+        resp = client.get(f"/api/agents/{agent_id}/api-key", headers=headers)
+
+        assert resp.status_code == 404
         assert resp.json()["detail"] == "Agent not found"
 
 
@@ -318,3 +365,21 @@ class TestDeleteApiKey:
             f"/api/agents/{admin_agent_id}/api-key", headers=bob_headers
         )
         assert resp.status_code == 404
+
+    def test_generated_manager_returns_404_without_revoking_existing_key(self):
+        headers = _headers()
+        agent_id = _create_agent(headers)
+        first = client.post(f"/api/agents/{agent_id}/api-key", headers=headers).json()
+        _mark_generated_manager(agent_id)
+
+        resp = client.delete(f"/api/agents/{agent_id}/api-key", headers=headers)
+
+        assert resp.status_code == 404
+        assert resp.json()["detail"] == "Agent not found"
+        db = _direct_db_session()
+        try:
+            row = db.query(AgentApiKey).filter(AgentApiKey.agent_id == agent_id).one()
+            assert row.key_prefix == first["key_prefix"]
+            assert row.revoked_at is None
+        finally:
+            db.close()

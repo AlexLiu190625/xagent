@@ -11,6 +11,10 @@ from xagent.core.model.model import (
     VectorDBConfig,
     VectorDBType,
 )
+from xagent.core.model.storage.error import (
+    ModelNotFoundError,
+    UnsupportedModelCategoryError,
+)
 
 
 class SQLAlchemyModelHub:
@@ -26,6 +30,16 @@ class SQLAlchemyModelHub:
         """
         self.db = db_session
         self.Model = model_class
+
+    def close(self) -> None:
+        """Close the underlying SQLAlchemy session."""
+        self.db.close()
+
+    def __enter__(self) -> "SQLAlchemyModelHub":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
 
     @staticmethod
     def _normalize_vector_db_type(raw_value: Any) -> str:
@@ -132,7 +146,7 @@ class SQLAlchemyModelHub:
                 .first()
             )
         if not db_model:
-            raise ValueError(f"Model not found: {model_id}")
+            raise ModelNotFoundError(model_id)
 
         common = {
             "id": db_model.model_id,
@@ -170,7 +184,7 @@ class SQLAlchemyModelHub:
         elif db_model.category == "vector_db":
             return self._load_vector_db_config(db_model, common)
         else:
-            raise ValueError(f"Unknown model category: {db_model.category}")
+            raise UnsupportedModelCategoryError(db_model.model_id, db_model.category)
 
     def list(self) -> dict[str, ModelConfig]:
         db_models = self.db.query(self.Model).filter(self.Model.is_active).all()
@@ -214,6 +228,10 @@ class SQLAlchemyModelHub:
                 config = RerankModelConfig(**common_fields)
             elif db_model.category == "vector_db":
                 config = self._load_vector_db_config(db_model, common_fields)
+            else:
+                raise UnsupportedModelCategoryError(
+                    db_model.model_id, db_model.category
+                )
 
             if config:
                 result[db_model.model_id] = config

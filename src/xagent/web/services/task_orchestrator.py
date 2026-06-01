@@ -47,28 +47,34 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
 from ..models.task import Task, TaskStatus
 from ..models.user import User
+from .hot_path_cache import invalidate_task_cache
 from .task_lease_service import (
-    acquire_task_lease,
+    acquire_task_lease_isolated,
     get_runner_id,
-    release_current_runner_task_lease,
     run_task_lease_heartbeat,
 )
+from .task_setup_snapshot import load_task_setup_snapshot_sync
+from .workforce_runtime import release_current_runner_task_lease_with_workforce_sync
 
 logger = logging.getLogger(__name__)
 
 
-# Terminal statuses for the "is the previous turn finished?" check. A
-# task in any of these is eligible for ``TurnKind.APPEND``. PENDING and
-# RUNNING both signal "previous turn not done yet" → 409 busy. PAUSED
-# is intentionally excluded for now (semantics unclear; revisit when
-# pause/resume becomes a first-class SDK feature).
-_TERMINAL_STATUSES = (TaskStatus.COMPLETED, TaskStatus.FAILED)
+# Statuses for the "can a user message start the next turn?" check. A
+# task in any of these is eligible for ``TurnKind.APPEND``. PENDING is
+# claimed by ``CREATE``; RUNNING is still busy; WAITING_FOR_USER is an
+# answer to an explicit pending agent question and resumes that execution.
+_APPENDABLE_STATUSES = (
+    TaskStatus.COMPLETED,
+    TaskStatus.FAILED,
+    TaskStatus.PAUSED,
+)
 
 
 @dataclass(frozen=True)
@@ -93,6 +99,16 @@ class TaskTurnPayload:
 
     transcript_message: str
     execution_message: Optional[str] = None
+    # Per-turn uploaded-file metadata persisted alongside the transcript
+    # row so historical replay can render the same clickable chips the
+    # user saw live. Each entry is the minimal chip shape (file_id,
+    # name, size, type) — already path-stripped by the websocket layer
+    # before reaching here.
+    attachments: Optional[List[Dict[str, Any]]] = None
+    # Stable identity shared by the transcript row and the user_message trace
+    # event for this user turn. Historical replay uses it to merge persisted
+    # transcript rows with trace rows without collapsing repeated text.
+    turn_id: str = field(default_factory=lambda: str(uuid4()))
 
     @property
     def for_agent(self) -> str:
@@ -118,7 +134,7 @@ class TurnKind(str, enum.Enum):
     """
 
     CREATE = "create"  # PENDING → RUNNING; new task's first turn
-    APPEND = "append"  # TERMINAL → RUNNING; new turn on an existing task
+    APPEND = "append"  # APPENDABLE → RUNNING; new turn on an existing task
 
 
 class TaskTurnError(Exception):
@@ -174,7 +190,7 @@ class TaskTurnOrchestrator:
              with filter:
 
              - ``kind == CREATE`` → ``status == PENDING``
-             - ``kind == APPEND`` → ``status IN TERMINAL_STATUSES``
+             - ``kind == APPEND`` → ``status IN APPENDABLE_STATUSES``
 
              rowcount 0 → ``TaskTurnError("busy")``.
           3. ``persist_user_message(payload.transcript_message)`` in the
@@ -266,7 +282,7 @@ class TaskTurnOrchestrator:
             if kind == TurnKind.CREATE:
                 status_filter = Task.status == TaskStatus.PENDING
             else:  # APPEND
-                status_filter = Task.status.in_(_TERMINAL_STATUSES)
+                status_filter = Task.status.in_(_APPENDABLE_STATUSES)
 
             claimed = (
                 db.query(Task)
@@ -292,6 +308,8 @@ class TaskTurnOrchestrator:
                 task_id=task_id,
                 user_id=int(user.id),
                 content=payload.transcript_message,
+                attachments=payload.attachments,
+                turn_id=payload.turn_id,
             )
             if persisted_message is not None:
                 db.flush()
@@ -299,6 +317,7 @@ class TaskTurnOrchestrator:
             else:
                 before_message_id = None
             db.commit()
+            invalidate_task_cache(task_id)
         except TaskTurnError:
             raise
         except Exception:
@@ -357,6 +376,48 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
+def _mark_task_failed_if_running(task_id: int, error_message: str) -> None:
+    """Setup/run-error sentinel for ``_schedule_bg._runner``.
+
+    ``acquire_task_lease_isolated`` sets ``task.status = RUNNING`` as
+    part of taking the lease. If a later step in ``_runner`` raises
+    (snapshot load, ``execute_task_background``) and no downstream
+    handler moves the task to a terminal status, the release block
+    would see ``status=RUNNING`` and write it back -- leaving the row
+    visible as running but with no active worker (zombie state). This
+    helper closes that window: ``_runner`` calls it from an outer
+    ``except`` so the task is forced to ``FAILED`` before release.
+
+    Guarded by ``status == RUNNING`` -- never overwrites a terminal /
+    control status (``PAUSED`` / ``WAITING_FOR_USER`` / ``FAILED`` /
+    ``COMPLETED``) that ``execute_task_background`` may have set
+    inside its own inner ``try/except``. Opens / commits / closes
+    its own session so the caller doesn't have to thread a session
+    through the exception path.
+    """
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    try:
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if task is None or task.status != TaskStatus.RUNNING:
+                return
+            task.status = TaskStatus.FAILED
+            task.error_message = error_message  # type: ignore[assignment]
+            db.commit()
+    except Exception as e:
+        # Defensive: do not let this helper raise out of the ``except``
+        # path that's already handling an error. Log loudly so the
+        # zombie state, if it survives, is traceable.
+        logger.error(
+            "Failed to mark task %s as FAILED during setup/run error: %s",
+            task_id,
+            e,
+            exc_info=True,
+        )
+
+
 # ===== finish_turn / _schedule_bg (new lifecycle API) =====
 
 
@@ -397,6 +458,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
       - other statuses (PAUSED / WAITING_FOR_USER): leave alone
     """
     from ..models.chat_message import TaskChatMessage
+    from .workforce_runtime import sync_workforce_run_status
 
     bg_db.expire_all()
 
@@ -420,7 +482,9 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         if latest_assistant is not None:
             fresh.output = latest_assistant.content
             fresh.error_message = None
+            sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
             bg_db.commit()
+            invalidate_task_cache(task_id)
             logger.info(
                 "finish_turn: task %s output written (%d chars)",
                 task_id,
@@ -431,6 +495,9 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
                 "finish_turn: task %s completed but no assistant message found",
                 task_id,
             )
+            if sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED):
+                bg_db.commit()
+                invalidate_task_cache(task_id)
         return
 
     if status == TaskStatus.FAILED:
@@ -445,8 +512,10 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
             # see a contradiction (status=failed + output populated).
             fresh.output = None
             changed = True
-        if changed:
+        run_changed = sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
+        if changed or run_changed:
             bg_db.commit()
+            invalidate_task_cache(task_id)
             logger.info(
                 "finish_turn: task %s marked failed (cleared stale output)",
                 task_id,
@@ -482,7 +551,9 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
         fresh.status = TaskStatus.FAILED
         fresh.error_message = "Task execution failed without status update; see /steps."
         fresh.output = None  # latest-turn snapshot invariant
+        sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
         bg_db.commit()
+        invalidate_task_cache(task_id)
         logger.warning(
             "finish_turn: task %s bg coroutine returned with status=RUNNING; "
             "flipping to FAILED",
@@ -527,16 +598,28 @@ async def _schedule_bg(
     user_id = int(user.id)
 
     async def _runner() -> None:
+        # ``bg_db`` is opened lazily inside the post-run finalize block
+        # only. We no longer keep a SessionLocal open across the entire
+        # agent run -- that previously held an idle connection-pool
+        # slot for tens of seconds to minutes (long-running agents)
+        # without doing any work. The lease acquire / heartbeat /
+        # snapshot load all open their own short-lived sessions, and
+        # ``finish_turn`` + release run inside a single ``with`` block
+        # below.
         from ..models.database import get_session_local
 
-        SessionLocal = get_session_local()
-        bg_db = SessionLocal()
         lease = None
         try:
             # Running-elsewhere short-circuit: acquire lease before
             # doing anything else. If another worker owns it, skip
             # execution entirely so finish_turn never touches the row.
-            lease = acquire_task_lease(bg_db, task_id)
+            #
+            # The acquire is a conditional UPDATE + commit that
+            # measured 3.75s of synchronous DB write on the main
+            # event loop (issue #427). ``acquire_task_lease_isolated``
+            # wraps the existing helper with its own SessionLocal so
+            # the work runs on a worker thread.
+            lease = await asyncio.to_thread(acquire_task_lease_isolated, task_id)
             if lease is None:
                 logger.info(
                     "task %s acquired by another worker; skipping "
@@ -545,38 +628,92 @@ async def _schedule_bg(
                 )
                 return
 
+            # INVARIANT: ``asyncio.create_task(run_task_lease_heartbeat(...))``
+            # MUST be scheduled before any ``await`` that yields the
+            # loop (snapshot to_thread, agent setup, execute_task_background).
+            # The lease has a bounded TTL; nothing downstream of acquire
+            # may ride bare past this point. If a future refactor moves
+            # the heartbeat creation below the snapshot load, a
+            # contended worker could drop the lease while snapshot is
+            # in-flight, hand the task to another runner mid-setup, and
+            # double-run the same turn. Do not reorder.
             stop_event = asyncio.Event()
             hb_task = asyncio.create_task(run_task_lease_heartbeat(lease, stop_event))
             try:
-                bg_task_row = bg_db.query(Task).filter(Task.id == task_id).first()
-                bg_user_row = bg_db.query(User).filter(User.id == user_id).first()
-                if bg_task_row is None or bg_user_row is None:
-                    logger.warning(
-                        "bg task %s aborted: task or user vanished (task=%s, user=%s)",
-                        task_id,
-                        bg_task_row,
-                        bg_user_row,
-                    )
-                    return
-
-                await execute_task_background(
-                    task_id=task_id,
-                    user_message=payload.transcript_message,
-                    context=context or {},
-                    agent_manager=_get_agent_manager(),
-                    user_id=int(bg_user_row.id),
-                    before_message_id=before_message_id,
-                    llm_user_message=payload.execution_message,
-                )
+                # Outer ``try/except`` is the lease-acquire-to-terminal
+                # safety net: ``acquire_task_lease_isolated`` already
+                # set ``status=RUNNING`` for this row, so any unhandled
+                # exception from snapshot load / execute_task_background
+                # would leave the task in a zombie state (visible as
+                # running, no active worker) once the release block
+                # below clears ``runner_id``. ``_mark_task_failed_if_running``
+                # closes the window. We swallow the exception so
+                # ``finish_turn`` + lease release still run cleanly with
+                # the now-terminal status.
                 try:
-                    finish_turn(bg_db, task_id)
-                except Exception as e:
+                    # Load the synchronous DB block on a worker thread
+                    # so the main loop stays responsive. The loader
+                    # opens / closes its own SessionLocal (no ORM
+                    # leak), and the snapshot is passed straight
+                    # through to execute_task_background →
+                    # get_agent_for_task. That turns the previous
+                    # chain of three redundant Task queries into a
+                    # single off-loop read.
+                    snapshot = await asyncio.to_thread(
+                        load_task_setup_snapshot_sync, task_id, user_id
+                    )
+                    if snapshot is None:
+                        logger.warning(
+                            "bg task %s aborted: task vanished before snapshot load",
+                            task_id,
+                        )
+                        _mark_task_failed_if_running(
+                            task_id, "task vanished before snapshot load"
+                        )
+                        return
+
+                    await execute_task_background(
+                        task_id=task_id,
+                        user_message=payload.transcript_message,
+                        context=_execution_context_with_turn_id(
+                            context, payload.turn_id
+                        ),
+                        agent_manager=_get_agent_manager(),
+                        user_id=user_id,
+                        before_message_id=before_message_id,
+                        llm_user_message=payload.execution_message,
+                        task_setup_snapshot=snapshot,
+                    )
+                except Exception as setup_or_run_err:
                     logger.error(
-                        "finish_turn failed for task %s: %s",
+                        "bg task %s setup/run failed: %s",
                         task_id,
-                        e,
+                        setup_or_run_err,
                         exc_info=True,
                     )
+                    _mark_task_failed_if_running(
+                        task_id,
+                        f"setup/run error: "
+                        f"{type(setup_or_run_err).__name__}: {setup_or_run_err}",
+                    )
+                    # Do not re-raise: ``finish_turn`` + release below
+                    # must run so the lease is freed and the row is
+                    # not stuck mid-lifecycle.
+
+                # Short-lived finalize session. ``finish_turn`` only
+                # reads / updates the task row once; opening here keeps
+                # the pool slot freed for the entire agent run above.
+                SessionLocal = get_session_local()
+                with SessionLocal() as finalize_db:
+                    try:
+                        finish_turn(finalize_db, task_id)
+                    except Exception as e:
+                        logger.error(
+                            "finish_turn failed for task %s: %s",
+                            task_id,
+                            e,
+                            exc_info=True,
+                        )
             finally:
                 stop_event.set()
                 try:
@@ -585,39 +722,50 @@ async def _schedule_bg(
                     pass
         finally:
             if lease is not None:
-                # Single owner of release. Defensive: if the session is
-                # invalid (e.g. execute_task_background aborted a
-                # transaction), the fresh-status read would also raise;
-                # rollback + default to FAILED so the lease still gets
-                # released instead of stuck-until-TTL.
-                final_status: TaskStatus = TaskStatus.FAILED
-                try:
-                    fresh = bg_db.query(Task).filter(Task.id == task_id).first()
-                    if fresh is not None:
-                        final_status = fresh.status
-                except Exception as query_err:
-                    logger.warning(
-                        "task %s status read failed during lease release "
-                        "(%s); rolling session back and defaulting to FAILED",
-                        task_id,
-                        query_err,
-                    )
+                # Single owner of release. Open a fresh short-lived
+                # session for both the status read and the release UPDATE
+                # so we don't hold a connection across the agent run.
+                # Defensive: if the read raises (DB connectivity issue),
+                # default to FAILED so the lease still gets released
+                # instead of stuck-until-TTL.
+                SessionLocal = get_session_local()
+                with SessionLocal() as release_db:
+                    final_status: TaskStatus = TaskStatus.FAILED
                     try:
-                        bg_db.rollback()
-                    except Exception:
-                        pass
-                try:
-                    release_current_runner_task_lease(
-                        bg_db, task_id, status=final_status
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "lease release failed for task %s: %s; "
-                        "TTL expiry will reclaim it",
-                        task_id,
-                        e,
-                    )
-            bg_db.close()
+                        fresh = (
+                            release_db.query(Task).filter(Task.id == task_id).first()
+                        )
+                        if fresh is not None:
+                            final_status = fresh.status
+                    except Exception as query_err:
+                        logger.warning(
+                            "task %s status read failed during lease release "
+                            "(%s); rolling session back and defaulting to FAILED",
+                            task_id,
+                            query_err,
+                        )
+                        try:
+                            release_db.rollback()
+                        except Exception:
+                            pass
+                    # Use the workforce-aware release helper: it wraps
+                    # ``release_current_runner_task_lease`` (signature
+                    # unchanged) and additionally syncs the workforce
+                    # run status when the released task belongs to one.
+                    # Both PR #461 (short-open/short-close release_db
+                    # pattern) and PR #528 (workforce sync) compose
+                    # cleanly here -- decorator-style, no perf regression.
+                    try:
+                        release_current_runner_task_lease_with_workforce_sync(
+                            release_db, task_id, status=final_status
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "lease release failed for task %s: %s; "
+                            "TTL expiry will reclaim it",
+                            task_id,
+                            e,
+                        )
 
     bg_task = asyncio.create_task(_runner())
     background_task_manager.register_task(task_id, bg_task)
@@ -628,3 +776,12 @@ async def _schedule_bg(
         force_fresh,
     )
     return bg_task
+
+
+def _execution_context_with_turn_id(
+    context: Optional[Dict[str, Any]], turn_id: str
+) -> Dict[str, Any]:
+    execution_context = dict(context or {})
+    if turn_id:
+        execution_context["turn_id"] = turn_id
+    return execution_context

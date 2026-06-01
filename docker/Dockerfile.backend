@@ -1,20 +1,28 @@
 # syntax=docker/dockerfile:1.6
 ARG PYTHON_VERSION=3.11
 ARG NODE_VERSION=22
+ARG UV_VERSION=0.11.10
 ARG PYPI_INDEX_URL=""
 ARG APT_MIRROR=""
 
 ############################
-# Backend build
+# Backend base
 ############################
-FROM python:${PYTHON_VERSION}-bookworm AS backend-build
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
+FROM python:${PYTHON_VERSION}-bookworm AS backend-base
 
 ARG PYPI_INDEX_URL=""
 ARG APT_MIRROR=""
 
 WORKDIR /opt/xagent
 
-# Use APT mirror if provided (for faster downloads in China)
+COPY --from=uv /uv /uvx /usr/local/bin/
+
+ENV UV_COMPILE_BYTECODE=1
+ENV UV_LINK_MODE=copy
+ENV UV_PYTHON_DOWNLOADS=0
+
 RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources \
         || sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list; \
@@ -26,7 +34,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     git \
     pkg-config \
-    python3-dev \
     curl \
     openssl \
     libssl-dev \
@@ -40,55 +47,75 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && git config --global http.postBuffer 524288000 \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy dependency files first for better layer caching
-COPY pyproject.toml .
-COPY README.md .
-
-# Copy .git directory for version detection (hatch-vcs)
-COPY .git .git
-
-# Create venv and install build tools
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/python -c "import ssl; print(ssl.OPENSSL_VERSION)" \
     && /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} --upgrade pip
 
-# Install torch CPU version first (to avoid CUDA version from docling dependency)
-RUN /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} --extra-index-url https://download.pytorch.org/whl/cpu torch
+############################
+# Backend dependencies
+############################
+FROM backend-base AS backend-deps
 
-# Copy source code (changes frequently)
+ARG PYPI_INDEX_URL=""
+ARG XAGENT_PACKAGE_VERSION="0.0.0+docker"
+
+COPY pyproject.toml uv.lock README.md ./
+
+RUN --mount=type=cache,target=/root/.cache/uv \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${XAGENT_PACKAGE_VERSION}" \
+    VIRTUAL_ENV=/opt/venv uv sync --active --locked --no-dev --no-install-project --no-editable \
+    --group backend-image \
+    ${PYPI_INDEX_URL:+--default-index $PYPI_INDEX_URL}
+
+############################
+# DeepDoc model assets
+############################
+FROM backend-deps AS deepdoc-models
+
+RUN --mount=type=cache,id=xagent-deepdoc-model-cache,target=/tmp/deepdoc-cache,sharing=locked \
+    DEEPDOC_MODEL_HOME=/tmp/deepdoc-cache \
+    DEEPDOC_NLTK_DATA_DIR=/tmp/deepdoc-cache/nltk_data \
+    DEEPDOC_TIKTOKEN_CACHE_DIR=/tmp/deepdoc-cache/tiktoken_cache \
+    /opt/venv/bin/deepdoc-download-models \
+    && mkdir -p /root/.cache/deepdoc \
+    && cp -a /tmp/deepdoc-cache/. /root/.cache/deepdoc/
+
+############################
+# Backend build
+############################
+FROM backend-deps AS backend-build
+
+ARG PYPI_INDEX_URL=""
+ARG XAGENT_PACKAGE_VERSION="0.0.0+docker"
+
 COPY src ./src
 COPY alembic.ini .
 
-# Install app + deepdoc into venv
-RUN /opt/venv/bin/pip install --no-cache-dir ${PYPI_INDEX_URL:+--index-url $PYPI_INDEX_URL} ".[all]" \
-    && /opt/venv/bin/deepdoc-download-models
+RUN --mount=type=cache,target=/root/.cache/uv \
+    SETUPTOOLS_SCM_PRETEND_VERSION="${XAGENT_PACKAGE_VERSION}" \
+    VIRTUAL_ENV=/opt/venv uv sync --active --locked --no-dev --no-editable \
+    --group backend-image \
+    ${PYPI_INDEX_URL:+--default-index $PYPI_INDEX_URL}
 
 ############################
 # Runtime
 ############################
-FROM python:${PYTHON_VERSION}-bookworm AS runtime
+FROM python:${PYTHON_VERSION}-bookworm AS runtime-base
 
 ARG NODE_VERSION=22
 ARG APT_MIRROR=""
-ARG XAGENT_VERSION=""
-ARG XAGENT_GIT_COMMIT=""
-ARG XAGENT_BUILD_TIME=""
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
-ENV XAGENT_VERSION=${XAGENT_VERSION}
-ENV XAGENT_GIT_COMMIT=${XAGENT_GIT_COMMIT}
-ENV XAGENT_BUILD_TIME=${XAGENT_BUILD_TIME}
+ENV NODE_PATH="/opt/xagent/frontend/node_modules"
 
 WORKDIR /opt/xagent
 
-# Use APT mirror if provided (for faster downloads in China)
 RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list.d/debian.sources \
         || sed -i "s|http://deb.debian.org/debian|$APT_MIRROR|g" /etc/apt/sources.list; \
     fi
 
-# System deps + Node.js + LibreOffice + Xvfb (for headless browser/screenshots)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -124,7 +151,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xauth \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Node.js
 RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /usr/share/keyrings/nodesource.gpg \
     && echo "deb [signed-by=/usr/share/keyrings/nodesource.gpg] https://deb.nodesource.com/node_${NODE_VERSION}.x nodistro main" \
         > /etc/apt/sources.list.d/nodesource.list \
@@ -132,25 +158,41 @@ RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg -
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy entrypoint script early (changes rarely)
 COPY docker/entrypoint.sh /opt/xagent/deploy/entrypoint.sh
+RUN chmod +x /opt/xagent/deploy/entrypoint.sh
 
-# Copy venv + app (exclude .git directory)
+FROM runtime-base AS runtime-frontend-tools
+
+COPY frontend/package.json frontend/package-lock.json /opt/xagent/frontend/
+RUN --mount=type=cache,target=/root/.npm \
+    cd /opt/xagent/frontend \
+    && npm config set fetch-retries 5 \
+    && npm config set fetch-retry-mintimeout 30000 \
+    && npm ci
+
+FROM runtime-base AS runtime-playwright
+
+COPY --from=backend-deps /opt/venv /opt/venv
+RUN python -m playwright install chromium
+
+FROM runtime-base AS runtime
+
+COPY --from=uv /uv /uvx /usr/local/bin/
+COPY --from=runtime-frontend-tools /opt/xagent/frontend /opt/xagent/frontend
+COPY --from=runtime-playwright /ms-playwright /ms-playwright
+
 COPY --from=backend-build /opt/venv /opt/venv
 COPY --from=backend-build /opt/xagent/src /opt/xagent/src
 COPY --from=backend-build /opt/xagent/pyproject.toml /opt/xagent/
 COPY --from=backend-build /opt/xagent/alembic.ini /opt/xagent/
-COPY --from=backend-build /root/.cache/deepdoc /root/.cache/deepdoc
+COPY --from=deepdoc-models /root/.cache/deepdoc /root/.cache/deepdoc
 
-# Copy frontend package files for npm tasks (e.g., PPTX generation)
-COPY frontend/package.json frontend/package-lock.json /opt/xagent/frontend/
-RUN cd /opt/xagent/frontend \
-    && npm config set fetch-retries 5 \
-    && npm config set fetch-retry-mintimeout 30000 \
-    && npm ci \
-    && npm install -g pptxgenjs@4.0.1 \
-    && python -m playwright install chromium \
-    && chmod +x /opt/xagent/deploy/entrypoint.sh
+ARG XAGENT_VERSION=""
+ARG XAGENT_GIT_COMMIT=""
+ARG XAGENT_BUILD_TIME=""
+ENV XAGENT_VERSION=${XAGENT_VERSION}
+ENV XAGENT_GIT_COMMIT=${XAGENT_GIT_COMMIT}
+ENV XAGENT_BUILD_TIME=${XAGENT_BUILD_TIME}
 
 EXPOSE 8000
 ENTRYPOINT ["/opt/xagent/deploy/entrypoint.sh"]

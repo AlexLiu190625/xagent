@@ -13,7 +13,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import List
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import ANY, AsyncMock, MagicMock, call, patch
 
 import pytest
 
@@ -35,6 +35,7 @@ from xagent.core.tools.core.RAG_tools.management.collections import (
 )
 from xagent.core.tools.core.RAG_tools.parse.parse_document import parse_document
 from xagent.core.tools.core.RAG_tools.retrieval.search_engine import search_dense_engine
+from xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from xagent.core.tools.core.RAG_tools.storage.factory import (
     get_vector_store_raw_connection,
 )
@@ -44,7 +45,11 @@ from xagent.core.tools.core.RAG_tools.vector_storage.vector_manager import (
     read_chunks_for_embedding,
     write_vectors_to_db,
 )
-from xagent.web.api.kb import delete_collection_api, list_collections_api
+from xagent.web.api.kb import (
+    delete_collection_api,
+    list_collections_api,
+    rename_collection_api,
+)
 
 
 class _FakeEmbeddingAdapter(BaseEmbedding):
@@ -938,6 +943,416 @@ class TestAPIMultiTenancy:
 
         mock_delete_collection.assert_called_once_with("test_collection", 999, True)
         assert isinstance(result, CollectionOperationResult)
+        assert result.status == "success"
+
+    @pytest.mark.asyncio
+    @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
+    @patch(
+        "xagent.web.api.kb.list_collection_uploaded_file_owner_ids",
+        return_value=set(),
+    )
+    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.web.api.kb.delete_collection_uploaded_files")
+    @patch("xagent.web.api.kb.delete_collection_physical_dir")
+    @patch("xagent.web.api.kb.delete_collection")
+    async def test_delete_collection_api_admin_cleans_all_owner_storage(
+        self,
+        mock_delete_collection,
+        mock_delete_collection_physical_dir,
+        mock_delete_collection_uploaded_files,
+        mock_get_metadata_store,
+        _mock_uploaded_owner_ids,
+        _mock_ensure_collection_access,
+        mock_get_vector_store,
+    ):
+        """Admin global delete should clean storage for every owner in the collection."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            CollectionOperationResult,
+        )
+        from xagent.web.models.user import User
+        from xagent.web.services.kb_collection_service import (
+            CollectionPhysicalDeleteResult,
+        )
+
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 999
+        mock_user.is_admin = True
+        mock_get_metadata_store.return_value.list_collection_config_owner_ids.return_value = set()
+
+        owner_one_dir = Path("/tmp/uploads/user_101/team")
+        owner_two_dir = Path("/tmp/uploads/user_202/team")
+        mock_get_vector_store.return_value.list_document_records.side_effect = [
+            [
+                DocumentRecord(doc_id="doc-a", file_id="file-a", user_id=101),
+                DocumentRecord(doc_id="doc-b", file_id="file-b", user_id=202),
+            ],
+            [],
+        ]
+        mock_delete_collection_physical_dir.side_effect = [
+            CollectionPhysicalDeleteResult(
+                status="success", collection_dir=owner_one_dir
+            ),
+            CollectionPhysicalDeleteResult(
+                status="success", collection_dir=owner_two_dir
+            ),
+        ]
+        mock_delete_collection_uploaded_files.return_value = 1
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="team",
+            message="Collection deleted",
+            warnings=[],
+            affected_documents=[],
+            deleted_counts={},
+        )
+
+        result = await delete_collection_api("team", _user=mock_user, db=MagicMock())
+
+        mock_delete_collection.assert_called_once_with("team", 999, True)
+        assert mock_delete_collection_physical_dir.call_args_list == [
+            call(user_id=101, collection_name="team"),
+            call(user_id=202, collection_name="team"),
+        ]
+        assert mock_delete_collection_uploaded_files.call_args_list == [
+            call(
+                ANY,
+                user_id=101,
+                collection_file_ids={"file-a"},
+                remaining_file_ids=set(),
+                collection_dir=owner_one_dir,
+            ),
+            call(
+                ANY,
+                user_id=202,
+                collection_file_ids={"file-b"},
+                remaining_file_ids=set(),
+                collection_dir=owner_two_dir,
+            ),
+        ]
+        assert result.status == "success"
+
+    @pytest.mark.asyncio
+    @patch("xagent.web.api.kb.get_ingestion_status_store")
+    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch("xagent.web.api.kb._list_collections_with_retry", new_callable=AsyncMock)
+    @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
+    @patch(
+        "xagent.web.api.kb.list_collection_uploaded_file_owner_ids",
+        return_value=set(),
+    )
+    @patch("xagent.web.api.kb.rename_collection_storage")
+    async def test_rename_collection_api_admin_renames_all_owner_storage(
+        self,
+        mock_rename_collection_storage,
+        _mock_uploaded_owner_ids,
+        _mock_ensure_collection_access,
+        mock_list_collections,
+        mock_get_vector_store,
+        mock_get_metadata_store,
+        mock_get_ingestion_status_store,
+        tmp_path,
+    ):
+        """Admin global rename should reuse tenant storage rename for every owner."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import ListCollectionsResult
+        from xagent.web.models.user import User
+        from xagent.web.services.kb_collection_service import (
+            CollectionPhysicalRenameResult,
+        )
+
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 999
+        mock_user.is_admin = True
+
+        mock_list_collections.return_value = ListCollectionsResult(
+            status="success",
+            total_count=0,
+            collections=[],
+            message="",
+            warnings=[],
+        )
+        vector_store = MagicMock()
+        vector_store.list_document_records.return_value = [
+            DocumentRecord(doc_id="doc-a", file_id="file-a", user_id=101),
+            DocumentRecord(doc_id="doc-b", file_id="file-b", user_id=202),
+        ]
+        vector_store.rename_collection_data.return_value = []
+        mock_get_vector_store.return_value = vector_store
+        metadata_store = MagicMock()
+        metadata_store.rename_collection = AsyncMock()
+        metadata_store.list_collection_config_owner_ids.return_value = set()
+        mock_get_metadata_store.return_value = metadata_store
+        status_store = MagicMock()
+        status_store.rename_collection_status.return_value = []
+        mock_get_ingestion_status_store.return_value = status_store
+        mock_rename_collection_storage.side_effect = [
+            CollectionPhysicalRenameResult(
+                status="not_found",
+                old_collection_dir=tmp_path / "user_101" / "old",
+                new_collection_dir=tmp_path / "user_101" / "new",
+            ),
+            CollectionPhysicalRenameResult(
+                status="not_found",
+                old_collection_dir=tmp_path / "user_202" / "old",
+                new_collection_dir=tmp_path / "user_202" / "new",
+            ),
+        ]
+
+        result = await rename_collection_api(
+            "old", new_name="new", _user=mock_user, db=MagicMock()
+        )
+
+        assert mock_rename_collection_storage.call_args_list == [
+            call(
+                ANY,
+                user_id=101,
+                old_collection_name="old",
+                new_collection_name="new",
+                collection_file_ids={"file-a"},
+            ),
+            call(
+                ANY,
+                user_id=202,
+                old_collection_name="old",
+                new_collection_name="new",
+                collection_file_ids={"file-b"},
+            ),
+        ]
+        vector_store.rename_collection_data.assert_called_once_with(
+            collection_name="old",
+            new_name="new",
+            user_id=999,
+            is_admin=True,
+        )
+        metadata_store.rename_collection.assert_awaited_once_with(
+            old_name="old",
+            new_name="new",
+            user_id=999,
+            is_admin=True,
+        )
+        status_store.rename_collection_status.assert_called_once_with(
+            old_name="old",
+            new_name="new",
+            user_id=999,
+            is_admin=True,
+        )
+        assert result["status"] == "partial_success"
+
+    @pytest.mark.asyncio
+    @patch("xagent.web.api.kb.get_ingestion_status_store")
+    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch("xagent.web.api.kb._list_collections_with_retry", new_callable=AsyncMock)
+    @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
+    @patch("xagent.web.api.kb.rename_collection_storage")
+    async def test_rename_collection_api_non_admin_is_tenant_scoped(
+        self,
+        mock_rename_collection_storage,
+        _mock_ensure_collection_access,
+        mock_list_collections,
+        mock_get_vector_store,
+        mock_get_metadata_store,
+        mock_get_ingestion_status_store,
+        tmp_path,
+    ):
+        """Regular rename should not mutate another user's same-name collection."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import ListCollectionsResult
+        from xagent.web.models.user import User
+        from xagent.web.services.kb_collection_service import (
+            CollectionPhysicalRenameResult,
+        )
+
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 101
+        mock_user.is_admin = False
+
+        mock_list_collections.return_value = ListCollectionsResult(
+            status="success",
+            total_count=0,
+            collections=[],
+            message="",
+            warnings=[],
+        )
+        vector_store = MagicMock()
+        vector_store.list_document_records.return_value = [
+            DocumentRecord(doc_id="doc-a", file_id="file-a", user_id=101),
+        ]
+        vector_store.rename_collection_data.return_value = []
+        mock_get_vector_store.return_value = vector_store
+        metadata_store = MagicMock()
+        metadata_store.rename_collection = AsyncMock()
+        mock_get_metadata_store.return_value = metadata_store
+        status_store = MagicMock()
+        status_store.rename_collection_status.return_value = []
+        mock_get_ingestion_status_store.return_value = status_store
+        mock_rename_collection_storage.return_value = CollectionPhysicalRenameResult(
+            status="not_found",
+            old_collection_dir=tmp_path / "user_101" / "old",
+            new_collection_dir=tmp_path / "user_101" / "new",
+        )
+
+        result = await rename_collection_api(
+            "old", new_name="new", _user=mock_user, db=MagicMock()
+        )
+
+        mock_rename_collection_storage.assert_called_once_with(
+            ANY,
+            user_id=101,
+            old_collection_name="old",
+            new_collection_name="new",
+            collection_file_ids={"file-a"},
+        )
+        vector_store.rename_collection_data.assert_called_once_with(
+            collection_name="old",
+            new_name="new",
+            user_id=101,
+            is_admin=False,
+        )
+        metadata_store.rename_collection.assert_awaited_once_with(
+            old_name="old",
+            new_name="new",
+            user_id=101,
+            is_admin=False,
+        )
+        status_store.rename_collection_status.assert_called_once_with(
+            old_name="old",
+            new_name="new",
+            user_id=101,
+            is_admin=False,
+        )
+        assert result["status"] == "partial_success"
+
+    @pytest.mark.asyncio
+    @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
+    @patch(
+        "xagent.web.api.kb.list_collection_uploaded_file_owner_ids",
+        return_value=set(),
+    )
+    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.web.api.kb.delete_collection_uploaded_files")
+    @patch("xagent.web.api.kb.delete_collection_physical_dir")
+    @patch("xagent.web.api.kb.delete_collection")
+    async def test_delete_collection_api_admin_cleans_stale_config_owner_storage(
+        self,
+        mock_delete_collection,
+        mock_delete_collection_physical_dir,
+        mock_delete_collection_uploaded_files,
+        mock_get_metadata_store,
+        _mock_uploaded_owner_ids,
+        _mock_ensure_collection_access,
+        mock_get_vector_store,
+    ):
+        """Admin delete should clean owners discovered only from stale config."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            CollectionOperationResult,
+        )
+        from xagent.web.models.user import User
+        from xagent.web.services.kb_collection_service import (
+            CollectionPhysicalDeleteResult,
+        )
+
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 999
+        mock_user.is_admin = True
+        mock_get_metadata_store.return_value.list_collection_config_owner_ids.return_value = {
+            101
+        }
+
+        owner_dir = Path("/tmp/uploads/user_101/team")
+        mock_get_vector_store.return_value.list_document_records.side_effect = [[], []]
+        mock_delete_collection_physical_dir.return_value = (
+            CollectionPhysicalDeleteResult(status="success", collection_dir=owner_dir)
+        )
+        mock_delete_collection_uploaded_files.return_value = 1
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="team",
+            message="Collection deleted",
+            warnings=[],
+            affected_documents=[],
+            deleted_counts={},
+        )
+
+        result = await delete_collection_api("team", _user=mock_user, db=MagicMock())
+
+        mock_delete_collection_physical_dir.assert_called_once_with(
+            user_id=101,
+            collection_name="team",
+        )
+        mock_delete_collection_uploaded_files.assert_called_once_with(
+            ANY,
+            user_id=101,
+            collection_file_ids=set(),
+            remaining_file_ids=set(),
+            collection_dir=owner_dir,
+        )
+        assert result.status == "success"
+
+    @pytest.mark.asyncio
+    @patch("xagent.web.api.kb.get_vector_index_store")
+    @patch("xagent.web.api.kb._ensure_collection_access", new_callable=AsyncMock)
+    @patch(
+        "xagent.web.api.kb.list_collection_uploaded_file_owner_ids",
+        return_value={101},
+    )
+    @patch("xagent.web.api.kb.get_metadata_store")
+    @patch("xagent.web.api.kb.delete_collection_uploaded_files")
+    @patch("xagent.web.api.kb.delete_collection_physical_dir")
+    @patch("xagent.web.api.kb.delete_collection")
+    async def test_delete_collection_api_admin_cleans_legacy_uploaded_file_owner(
+        self,
+        mock_delete_collection,
+        mock_delete_collection_physical_dir,
+        mock_delete_collection_uploaded_files,
+        mock_get_metadata_store,
+        _mock_uploaded_owner_ids,
+        _mock_ensure_collection_access,
+        mock_get_vector_store,
+    ):
+        """Admin delete should clean owners discovered only from UploadedFile paths."""
+        from xagent.core.tools.core.RAG_tools.core.schemas import (
+            CollectionOperationResult,
+        )
+        from xagent.web.models.user import User
+        from xagent.web.services.kb_collection_service import (
+            CollectionPhysicalDeleteResult,
+        )
+
+        mock_user = MagicMock(spec=User)
+        mock_user.id = 999
+        mock_user.is_admin = True
+        mock_get_metadata_store.return_value.list_collection_config_owner_ids.return_value = set()
+
+        owner_dir = Path("/tmp/uploads/user_101/team")
+        mock_get_vector_store.return_value.list_document_records.side_effect = [[], []]
+        mock_delete_collection_physical_dir.return_value = (
+            CollectionPhysicalDeleteResult(status="success", collection_dir=owner_dir)
+        )
+        mock_delete_collection_uploaded_files.return_value = 1
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="team",
+            message="Collection deleted",
+            warnings=[],
+            affected_documents=[],
+            deleted_counts={},
+        )
+
+        result = await delete_collection_api("team", _user=mock_user, db=MagicMock())
+
+        mock_delete_collection_physical_dir.assert_called_once_with(
+            user_id=101,
+            collection_name="team",
+        )
+        mock_delete_collection_uploaded_files.assert_called_once_with(
+            ANY,
+            user_id=101,
+            collection_file_ids=set(),
+            remaining_file_ids=set(),
+            collection_dir=owner_dir,
+        )
         assert result.status == "success"
 
 

@@ -1,19 +1,13 @@
-"""GET /v1/me -- SDK auth probe.
-
-Zero side-effect, read-only endpoint that returns the agent identity
-bound to the presented API key. SDK clients call this once at startup
-to verify their key is valid and to discover which agent they're
-addressing.
-"""
+"""GET /v1/me -- personal management key identity probe."""
 
 from typing import Tuple
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from ...models.agent import Agent
-from ...models.agent_api_key import AgentApiKey
-from .deps import get_agent_from_api_key
+from ...models.user import User
+from ...models.user_api_key import UserApiKey
+from .deps import get_user_from_personal_key
 
 router = APIRouter()
 
@@ -21,8 +15,12 @@ router = APIRouter()
 class MeResponse(BaseModel):
     """Response model for ``GET /v1/me``."""
 
-    agent_id: int = Field(..., description="The agent bound to the presented key.")
-    agent_name: str = Field(..., description="Display name of the bound agent.")
+    principal_type: str = Field(default="user", description="Authenticated principal.")
+    user_id: int = Field(..., description="User bound to the presented personal key.")
+    username: str = Field(..., description="User's unique login name.")
+    email: str | None = Field(
+        default=None, description="User's email address, or null if unset."
+    )
     key_prefix: str = Field(
         ...,
         description=(
@@ -34,32 +32,14 @@ class MeResponse(BaseModel):
 
 @router.get("/me", response_model=MeResponse)
 async def get_me(
-    authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
+    authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
 ) -> MeResponse:
-    """Probe the agent identity bound to the caller's API key.
-
-    Zero side-effect. SDK clients typically call this once on startup
-    to confirm their key is valid and to log which agent they're
-    targeting. The response shape is intentionally minimal -- richer
-    agent metadata (description, models, etc) is the owner's view and
-    lives behind JWT on ``/api/agents/{id}``.
-
-    Args:
-        authed: Resolved by ``get_agent_from_api_key``; the auth gate
-            handles every failure path uniformly as 401.
-
-    Returns:
-        :class:`MeResponse` with ``agent_id``, ``agent_name``, and
-        ``key_prefix``.
-
-    Raises:
-        V1ApiError 401: missing / malformed / unknown / revoked key.
-            Translated to ``{"error": {"code": "invalid_api_key", ...}}``
-            by the global exception handler.
-    """
-    agent, key = authed
+    """Probe the user identity bound to the caller's personal key."""
+    user, key = authed
     return MeResponse(
-        agent_id=agent.id,
-        agent_name=agent.name,
+        principal_type="user",
+        user_id=int(user.id),
+        username=str(user.username),
+        email=str(user.email) if user.email is not None else None,
         key_prefix=key.key_prefix,
     )

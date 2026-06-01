@@ -4,10 +4,15 @@ import remarkGfm from 'remark-gfm'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
 import type { Components } from 'react-markdown'
-import { getApiUrl, getFilePublicPreviewUrl } from '@/lib/utils'
 import { apiRequest } from '@/lib/api-wrapper'
 import { AgentCard } from '@/components/chat/AgentCard'
 import { useI18n } from '@/contexts/i18n-context'
+import { InlineFilePreview } from '@/components/file/inline-file-preview'
+import {
+  getInlineFilePreviewKind,
+  isPreviewableInlineFileKind,
+} from '@/components/file/inline-file-preview-utils'
+import { getApiUrl } from '@/lib/utils'
 
 
 interface AgentInfo {
@@ -161,94 +166,63 @@ function containsAgentCardElement(children: React.ReactNode): boolean {
   })
 }
 
-
-const UUID_PATTERN =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
-
-function MarkdownFileImage({
-  filePath,
-  alt,
-  title,
-  onFileClick,
-  className,
-  ...props
-}: {
-  filePath: string
-  alt?: string
-  title?: string
-  onFileClick?: (filePath: string, fileName: string) => void
-  className?: string
-  [key: string]: any
-}) {
-  const apiUrl = getApiUrl()
-  const publicUrl = getFilePublicPreviewUrl(filePath, apiUrl)
-  const [resolvedUrl, setResolvedUrl] = React.useState(publicUrl)
-
-  React.useEffect(() => {
-    let objectUrl: string | null = null
-    let isCancelled = false
-
-    setResolvedUrl(publicUrl)
-
-    const runFallback = async () => {
-      if (UUID_PATTERN.test(filePath)) return
-      try {
-        const response = await apiRequest(
-          `${apiUrl}/api/files/preview/${encodeURIComponent(filePath)}`,
-          {
-            cache: 'no-cache',
-            headers: {
-              'Cache-Control': 'no-cache',
-              Pragma: 'no-cache',
-            },
-          }
-        )
-        if (!response.ok) return
-        const blob = await response.blob()
-        objectUrl = URL.createObjectURL(blob)
-        if (!isCancelled) {
-          setResolvedUrl(objectUrl)
-        }
-      } catch {
-        return
-      }
+function containsBlockPreviewElement(children: React.ReactNode): boolean {
+  return React.Children.toArray(children).some((child) => {
+    if (!React.isValidElement(child)) {
+      return false
     }
 
-    void runFallback()
-
-    return () => {
-      isCancelled = true
-      if (objectUrl) {
-        URL.revokeObjectURL(objectUrl)
-      }
+    if (child.props?.['data-inline-file-preview-wrapper']) {
+      return true
     }
-  }, [apiUrl, filePath, publicUrl])
 
-  const fileName = filePath.split('/').pop() || filePath
-  const handleClick = (e: React.MouseEvent<HTMLImageElement>) => {
-    if (!onFileClick) return
-    e.preventDefault()
-    onFileClick(filePath, fileName)
+    return containsBlockPreviewElement(child.props?.children)
+  })
+}
+
+function hastText(node: any): string {
+  if (!node) return ''
+  if (typeof node.value === 'string') return node.value
+  if (!Array.isArray(node.children)) return ''
+  return node.children.map(hastText).join('')
+}
+
+function containsPreviewFileLinkNode(node: any): boolean {
+  if (!node) return false
+  const href = node.properties?.href
+  if (typeof href === 'string' && href.startsWith('file:')) {
+    const title = typeof node.properties?.title === 'string' ? node.properties.title : ''
+    const label = title || hastText(node)
+    if (isPreviewableInlineFileKind(getInlineFilePreviewKind({ filename: label }))) return true
   }
+  if (!Array.isArray(node.children)) return false
+  return node.children.some(containsPreviewFileLinkNode)
+}
 
-  return (
-    <img
-      src={resolvedUrl}
-      alt={alt || ''}
-      title={title || alt || ''}
-      data-file-path={filePath}
-      className={className || 'file-image cursor-pointer'}
-      onClick={handleClick}
-      {...props}
-    />
-  )
+const nodeText = (children: React.ReactNode): string => {
+  return React.Children.toArray(children)
+    .map((child) => {
+      if (typeof child === 'string' || typeof child === 'number') {
+        return String(child)
+      }
+      if (React.isValidElement(child)) {
+        return nodeText(child.props?.children)
+      }
+      return ''
+    })
+    .join('')
 }
 
 export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
+  const { t } = useI18n()
   const components = React.useMemo<Components>(
     () => ({
       p({ node: _node, children, ...props }) {
-        if (containsAgentCardElement(children)) {
+        if (
+          containsAgentCardElement(children) ||
+          containsBlockPreviewElement(children) ||
+          containsPreviewFileLinkNode(_node)
+        ) {
           return (
             <div className="my-4" {...props}>
               {children}
@@ -262,14 +236,26 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
         if (href && href.startsWith('file:')) {
           const filePath = href.replace(/^file:/, '')
           const fileNameFromPath = filePath.split('/').pop() || filePath
+          const linkText = nodeText(children).trim()
+          const fileName = title || linkText || fileNameFromPath
+
+          if (isPreviewableInlineFileKind(getInlineFilePreviewKind({ filename: fileName }))) {
+            return (
+              <InlineFilePreview
+                source={{
+                  fileId: filePath,
+                  filename: fileName,
+                }}
+                openLabel={t('files.previewDialog.buttons.open')}
+                loadErrorText={t('files.previewDialog.errors.loadFailed')}
+                onFileClick={onFileClick}
+              />
+            )
+          }
+
           const handleClick = (e: React.MouseEvent<HTMLAnchorElement>) => {
             if (onFileClick) {
               e.preventDefault()
-              const linkText =
-                (typeof children === 'string' ? children : undefined) ??
-                (Array.isArray(children)
-                  ? children.map((c: any) => (typeof c === 'string' ? c : '')).join('').trim() || undefined
-                  : undefined)
               const fallbackTitle = title || linkText || fileNameFromPath
               onFileClick(filePath, fallbackTitle)
             }
@@ -320,14 +306,18 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
       img({ node: _node, src, alt, title, ...props }) {
         if (src && src.startsWith('file:')) {
           const filePath = src.replace(/^file:/, '')
+          const fileName = title || alt || filePath.split('/').pop() || filePath
           return (
-            <MarkdownFileImage
-              filePath={filePath}
-              alt={alt || ''}
-              title={title || alt || ''}
+            <InlineFilePreview
+              source={{
+                fileId: filePath,
+                filename: fileName,
+                type: 'image',
+              }}
+              openLabel={t('files.previewDialog.buttons.open')}
+              loadErrorText={t('files.previewDialog.errors.loadFailed')}
               onFileClick={onFileClick}
-              className="file-image cursor-pointer"
-              {...props}
+              imageClassName="file-image cursor-pointer"
             />
           )
         }
@@ -335,7 +325,7 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
         return <img src={src || ''} alt={alt || ''} title={title || alt || ''} {...props} />
       }
     }),
-    [onFileClick, onAgentClick]
+    [onFileClick, onAgentClick, t]
   )
 
   return (

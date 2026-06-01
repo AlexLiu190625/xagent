@@ -19,9 +19,13 @@ configuration management with validation, type safety, and better structure.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import tempfile
 from pathlib import Path
+from typing import Any, Literal
+from urllib.parse import urlsplit, urlunsplit
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +34,20 @@ UPLOADS_DIR = "XAGENT_UPLOADS_DIR"
 WEB_DIR = "XAGENT_WEB_DIR"
 EXTERNAL_UPLOAD_DIRS = "XAGENT_EXTERNAL_UPLOAD_DIRS"
 EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
+AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
+FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
+FILE_STORAGE_OPTIONS = "XAGENT_FILE_STORAGE_OPTIONS"
+FILE_MATERIALIZE_DIR = "XAGENT_FILE_MATERIALIZE_DIR"
+PREVIEW_TMP_DIR = "XAGENT_PREVIEW_TMP_DIR"
+FILE_STORAGE_STARTUP_SYNC_ENABLED = "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
+FILE_DELIVERY_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_REDIRECT_ENABLED"
+FILE_DELIVERY_SIGNED_URL_TTL_SECONDS = "XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS"
+FILE_DELIVERY_ACCEL_REDIRECT_ENABLED = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
+FILE_DELIVERY_ACCEL_REDIRECT_PREFIX = "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
 SANDBOX_IMAGE = "SANDBOX_IMAGE"
 LANCEDB_PATH = "LANCEDB_PATH"
 DATABASE_URL = "DATABASE_URL"
@@ -41,8 +55,34 @@ SANDBOX_CPUS = "SANDBOX_CPUS"
 SANDBOX_MEMORY = "SANDBOX_MEMORY"
 SANDBOX_ENV = "SANDBOX_ENV"
 SANDBOX_VOLUMES = "SANDBOX_VOLUMES"
+SANDBOX_HOST_PROJECT_ROOT = "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
+SANDBOX_HOST_STORAGE_ROOT = "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 BOXLITE_HOME_DIR = "BOXLITE_HOME_DIR"
 WEB_SEARCH_PROVIDER = "XAGENT_WEB_SEARCH_PROVIDER"
+WEB_CRAWL_TLS_IMPERSONATE = "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
+REDIS_URL = "XAGENT_REDIS_URL"
+HOT_PATH_CACHE_ENABLED = "XAGENT_HOT_PATH_CACHE_ENABLED"
+HOT_PATH_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
+HOT_PATH_TASK_CACHE_TTL_SECONDS = "XAGENT_HOT_PATH_TASK_CACHE_TTL_SECONDS"
+CELERY_ENABLED = "XAGENT_CELERY_ENABLED"
+CELERY_BROKER_URL = "XAGENT_CELERY_BROKER_URL"
+CELERY_RESULT_BACKEND = "XAGENT_CELERY_RESULT_BACKEND"
+BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS = (
+    "XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS"
+)
+BACKGROUND_JOB_MAX_RETRIES = "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
+BACKGROUND_JOB_STALE_SECONDS = "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
+BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS = "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+PASSWORD_RESET_EXPIRE_MINUTES = "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
+APP_BASE_URL = "XAGENT_APP_BASE_URL"
+SMTP_HOST = "XAGENT_SMTP_HOST"
+SMTP_PORT = "XAGENT_SMTP_PORT"
+SMTP_USERNAME = "XAGENT_SMTP_USERNAME"
+SMTP_PASSWORD = "XAGENT_SMTP_PASSWORD"
+SMTP_USE_TLS = "XAGENT_SMTP_USE_TLS"
+SMTP_USE_SSL = "XAGENT_SMTP_USE_SSL"
+SMTP_FROM_EMAIL = "XAGENT_SMTP_FROM_EMAIL"
+SMTP_FROM_NAME = "XAGENT_SMTP_FROM_NAME"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -50,6 +90,25 @@ TOOL_MAX_FIELD_COUNT = "XAGENT_TOOL_MAX_FIELD_COUNT"
 MAX_TRACE_PAYLOAD_BYTES = "XAGENT_MAX_TRACE_PAYLOAD_BYTES"
 
 WEB_SEARCH_PROVIDERS = {"auto", "google", "tavily", "exa", "zhipu"}
+
+
+def get_agent_runtime() -> Literal["v1", "v2"]:
+    """Get the agent execution runtime version.
+
+    Priority:
+        1. XAGENT_AGENT_RUNTIME environment variable
+        2. "v1" default for compatibility
+
+    Returns:
+        "v1" or "v2"
+    """
+    runtime = os.getenv(AGENT_RUNTIME, "v1").strip().lower()
+    if runtime == "v1":
+        return "v1"
+    if runtime == "v2":
+        return "v2"
+    logger.warning("Invalid %s=%r; falling back to v1", AGENT_RUNTIME, runtime)
+    return "v1"
 
 
 def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
@@ -74,16 +133,26 @@ def get_agent_pattern_for_execution_mode(execution_mode: str | None) -> str:
 def get_default_task_execution_mode(
     *,
     agent_id: object | None = None,
+    agent_runtime: str | None = None,
 ) -> str:
     """Get the default UI execution mode for a newly-created task.
 
     Standalone tasks default to auto so simple prompts can answer directly while
-    complex prompts can still route into ReAct or DAG. Agent Builder tasks keep
-    balanced because the agent's explicit tool/KB setup is usually better served
-    by ReAct.
+    complex prompts can still route into ReAct or DAG. Explicit v1 deployments
+    keep the legacy standalone DAG default for compatibility. Agent Builder
+    tasks keep balanced because the agent's explicit tool/KB setup is usually
+    better served by ReAct.
     """
     if agent_id is not None:
         return "balanced"
+
+    if agent_runtime is not None:
+        runtime = agent_runtime.strip().lower()
+    else:
+        runtime = (os.getenv(AGENT_RUNTIME) or "").strip().lower()
+
+    if runtime == "v1":
+        return "think"
     return "auto"
 
 
@@ -144,6 +213,175 @@ def get_task_lease_heartbeat_seconds() -> int:
         )
         return default
     return min(seconds, max(1, get_task_lease_ttl_seconds() - 1))
+
+
+def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    if parsed < minimum:
+        logger.warning("Invalid %s=%r; falling back to %s", env_var, value, default)
+        return default
+    return parsed
+
+
+def _get_bool_env(env_var: str, default: bool) -> bool:
+    value = os.getenv(env_var)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_password_reset_expire_minutes() -> int:
+    """Return the password reset token expiry window in minutes."""
+    return _get_positive_int_env(PASSWORD_RESET_EXPIRE_MINUTES, 30)
+
+
+def get_app_base_url() -> str | None:
+    """Return the trusted frontend base URL used in email links."""
+    value = os.getenv(APP_BASE_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    return value.rstrip("/") or None
+
+
+def get_smtp_host() -> str:
+    return os.getenv(SMTP_HOST, "").strip()
+
+
+def get_smtp_port() -> int:
+    return _get_positive_int_env(SMTP_PORT, 587)
+
+
+def get_smtp_username() -> str:
+    return os.getenv(SMTP_USERNAME, "").strip()
+
+
+def get_smtp_password() -> str:
+    return os.getenv(SMTP_PASSWORD, "")
+
+
+def get_smtp_use_tls() -> bool:
+    return _get_bool_env(SMTP_USE_TLS, True)
+
+
+def get_smtp_use_ssl() -> bool:
+    return _get_bool_env(SMTP_USE_SSL, False)
+
+
+def get_smtp_from_email() -> str:
+    return os.getenv(SMTP_FROM_EMAIL, "").strip()
+
+
+def get_smtp_from_name(default: str) -> str:
+    return os.getenv(SMTP_FROM_NAME, default).strip() or default
+
+
+def _redis_url_with_database(url: str, database: int) -> str:
+    """Return a Redis URL pointing at a different logical database."""
+    parts = urlsplit(url)
+    if parts.scheme not in {"redis", "rediss", "redis+socket"}:
+        return url
+    return urlunsplit((parts.scheme, parts.netloc, f"/{database}", "", ""))
+
+
+def get_redis_url() -> str | None:
+    """Return the optional Redis URL used by hot-path cache backends."""
+    value = os.getenv(REDIS_URL)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_hot_path_cache_enabled() -> bool:
+    """Return whether optional hot-path caching is enabled.
+
+    Caching is inert unless ``XAGENT_REDIS_URL`` is configured or tests install
+    an explicit cache backend. This flag gives operators a kill switch without
+    changing the Redis URL.
+    """
+    value = os.getenv(HOT_PATH_CACHE_ENABLED, "true").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def get_hot_path_cache_ttl_seconds() -> int:
+    """Default TTL for agent/model hot-path response caches."""
+    return _get_positive_int_env(HOT_PATH_CACHE_TTL_SECONDS, 30)
+
+
+def get_hot_path_task_cache_ttl_seconds() -> int:
+    """Default TTL for task polling response caches."""
+    return _get_positive_int_env(HOT_PATH_TASK_CACHE_TTL_SECONDS, 30)
+
+
+def get_celery_enabled() -> bool:
+    """Return whether durable background jobs should be enqueued to Celery."""
+    return _get_bool_env(CELERY_ENABLED, False)
+
+
+def get_celery_broker_url() -> str | None:
+    """Return the Celery broker URL.
+
+    If only ``XAGENT_REDIS_URL`` is configured, derive DB 1 so Celery broker
+    traffic does not share the short-TTL hot-path cache database.
+    """
+    value = os.getenv(CELERY_BROKER_URL)
+    if value is not None:
+        value = value.strip()
+        return value or None
+
+    redis_url = get_redis_url()
+    if redis_url is None:
+        return None
+    return _redis_url_with_database(redis_url, 1)
+
+
+def get_celery_result_backend() -> str | None:
+    """Return the optional Celery result backend URL.
+
+    Background job state is persisted in the application database, so Celery
+    results are disabled unless explicitly configured.
+    """
+    value = os.getenv(CELERY_RESULT_BACKEND)
+    if value is None:
+        return None
+    value = value.strip()
+    return value or None
+
+
+def get_background_job_visibility_timeout_seconds() -> int:
+    """Return Celery broker visibility timeout for long-running jobs."""
+    return _get_positive_int_env(
+        BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
+        3600,
+        minimum=60,
+    )
+
+
+def get_background_job_max_retries() -> int:
+    """Return the default max attempts for durable background jobs."""
+    return _get_positive_int_env(BACKGROUND_JOB_MAX_RETRIES, 3)
+
+
+def get_background_job_stale_seconds() -> int:
+    """Return the age after which non-terminal jobs should be requeued."""
+    return _get_positive_int_env(BACKGROUND_JOB_STALE_SECONDS, 7200, minimum=60)
+
+
+def get_background_job_sweep_interval_seconds() -> int:
+    """Return how often the scheduler scans for stale background jobs."""
+    return _get_positive_int_env(
+        BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
+        300,
+        minimum=30,
+    )
 
 
 def get_web_dir() -> Path:
@@ -251,6 +489,159 @@ def get_max_upload_size_bytes() -> int:
         )
 
     return result
+
+
+def get_file_storage_uri() -> str:
+    """Get the durable file storage URI.
+
+    Priority:
+        1. XAGENT_FILE_STORAGE_URI environment variable
+        2. file://<storage-root>/files
+
+    Returns:
+        fsspec-compatible URI for durable user-visible file storage.
+    """
+    env_value = os.getenv(FILE_STORAGE_URI)
+    if env_value:
+        return env_value
+
+    return (get_storage_root().expanduser().resolve() / "files").as_uri()
+
+
+def get_file_storage_options() -> dict[str, Any]:
+    """Get fsspec provider options for durable file storage.
+
+    The value must be a JSON object. Provider-specific details such as S3
+    endpoint URL, region, or credentials profile live here to keep the config
+    surface small.
+    """
+    env_value = os.getenv(FILE_STORAGE_OPTIONS)
+    if not env_value:
+        return {}
+
+    try:
+        parsed = json.loads(env_value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"Invalid {FILE_STORAGE_OPTIONS} value: {env_value!r}"
+        ) from exc
+
+    if not isinstance(parsed, dict):
+        raise ValueError(f"Invalid {FILE_STORAGE_OPTIONS} value: must be a JSON object")
+
+    return parsed
+
+
+def get_file_materialize_dir() -> Path:
+    """Get the local directory used for temporary durable-file materialization."""
+    env_value = os.getenv(FILE_MATERIALIZE_DIR)
+    if env_value:
+        return Path(env_value)
+
+    return Path(tempfile.gettempdir()) / "xagent-materialized"
+
+
+def get_preview_tmp_dir() -> Path:
+    """Get the local directory used for temporary build-preview files."""
+    env_value = os.getenv(PREVIEW_TMP_DIR)
+    if env_value:
+        return Path(env_value).expanduser()
+
+    return Path(tempfile.gettempdir()) / "xagent-preview"
+
+
+def get_file_storage_startup_sync_enabled() -> bool:
+    """Return whether registered local files should sync to durable storage at startup."""
+    env_value = os.getenv(FILE_STORAGE_STARTUP_SYNC_ENABLED)
+    if env_value is None or not env_value.strip():
+        return True
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_STORAGE_STARTUP_SYNC_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_redirect_enabled() -> bool:
+    """Return whether private file endpoints may redirect to durable object URLs."""
+    env_value = os.getenv(FILE_DELIVERY_REDIRECT_ENABLED)
+    if env_value is None or not env_value.strip():
+        return False
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_DELIVERY_REDIRECT_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_signed_url_ttl_seconds() -> int:
+    """Get signed durable-object URL lifetime for private file delivery redirects."""
+    env_value = os.getenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS)
+    if env_value is None or not env_value.strip():
+        return 300
+
+    try:
+        ttl = int(env_value)
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_SIGNED_URL_TTL_SECONDS} value: {env_value!r}."
+        ) from exc
+
+    if ttl <= 0:
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_SIGNED_URL_TTL_SECONDS} value: {env_value!r}. "
+            "Value must be positive."
+        )
+
+    return ttl
+
+
+def get_file_delivery_accel_redirect_enabled() -> bool:
+    """Return whether private file endpoints may use nginx X-Accel-Redirect."""
+    env_value = os.getenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED)
+    if env_value is None or not env_value.strip():
+        return False
+
+    normalized = env_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+
+    raise ValueError(
+        f"Invalid {FILE_DELIVERY_ACCEL_REDIRECT_ENABLED} value: {env_value!r}. "
+        "Expected a boolean value."
+    )
+
+
+def get_file_delivery_accel_redirect_prefix() -> str:
+    """Get the internal nginx URI prefix used for X-Accel-Redirect."""
+    env_value = os.getenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX)
+    prefix = (
+        env_value.strip()
+        if env_value is not None and env_value.strip()
+        else "/_xagent_internal_files/"
+    )
+    if not prefix.startswith("/"):
+        raise ValueError(
+            f"Invalid {FILE_DELIVERY_ACCEL_REDIRECT_PREFIX} value: {env_value!r}. "
+            "Value must start with '/'."
+        )
+    if not prefix.endswith("/"):
+        prefix += "/"
+    return prefix
 
 
 def format_file_size(size_bytes: int) -> str:
@@ -483,13 +874,20 @@ def get_sandbox_env() -> dict[str, str]:
     return env
 
 
-def get_sandbox_volumes() -> list[tuple[str, str, str]]:
+def get_sandbox_volumes(
+    *, host_side_sources: bool = False
+) -> list[tuple[str, str, str]]:
     """Get the volume mappings for sandbox containers.
 
     Format: src:dst[:mode];src2:dst2[:mode2]
-    - src: source path on host (expanded ~ and env vars)
+    - src: source path on host
     - dst: destination path in container
     - mode: ro or rw (default: ro)
+
+    Args:
+        host_side_sources: When True, source paths are already Docker-host paths.
+            Only environment variables are expanded; relative paths and ``~`` are
+            rejected instead of being normalized inside the backend container.
 
     Returns:
         List of (src, dst, mode) tuples
@@ -509,14 +907,23 @@ def get_sandbox_volumes() -> list[tuple[str, str, str]]:
             logger.warning(f"Invalid sandbox volume config: {item}")
             continue
 
-        src = os.path.expanduser(os.path.expandvars(parts[0].strip()))
+        src = os.path.expandvars(parts[0].strip())
         dst = parts[1].strip()
         if not src or not dst:
             logger.warning(f"Invalid sandbox volume: {item}")
             continue
 
-        # Normalize paths to resolve any relative components
-        src = os.path.abspath(src)
+        if host_side_sources:
+            if src.startswith("~") or not Path(src).is_absolute():
+                logger.warning(
+                    "Invalid sandbox host volume source in Docker sibling mode: %s",
+                    item,
+                )
+                continue
+        else:
+            # Normalize paths to resolve any relative components
+            src = os.path.abspath(os.path.expanduser(src))
+
         mode = parts[2].strip().lower() if len(parts) > 2 else "ro"
         if mode not in ("ro", "rw"):
             logger.warning(f"Invalid sandbox volume mode: {item}, using 'ro'")
@@ -525,6 +932,40 @@ def get_sandbox_volumes() -> list[tuple[str, str, str]]:
         volumes.append((src, dst, mode))
 
     return volumes
+
+
+def get_sandbox_host_project_root() -> Path | None:
+    """Get the host project root used for Docker sibling sandbox code mounts.
+
+    Priority:
+    1. XAGENT_SANDBOX_HOST_PROJECT_ROOT environment variable
+    2. None, which lets callers use their local runtime project root
+
+    Returns:
+        Path to the project root as resolved from the Docker host's perspective,
+        or None when not configured.
+    """
+    env_str = os.getenv(SANDBOX_HOST_PROJECT_ROOT)
+    if env_str:
+        return Path(os.path.expandvars(env_str.strip()))
+    return None
+
+
+def get_sandbox_host_storage_root() -> Path | None:
+    """Get the Docker host storage root used for sibling sandbox bind mounts.
+
+    Priority:
+    1. XAGENT_SANDBOX_HOST_STORAGE_ROOT environment variable
+    2. None, which lets callers use backend paths directly
+
+    Returns:
+        Path to the Xagent storage root as seen by the Docker host, or None when
+        not configured.
+    """
+    env_str = os.getenv(SANDBOX_HOST_STORAGE_ROOT)
+    if env_str:
+        return Path(os.path.expandvars(env_str.strip()))
+    return None
 
 
 def get_boxlite_home_dir() -> Path | None:
@@ -577,6 +1018,28 @@ def get_web_search_provider() -> str:
         provider,
     )
     return "auto"
+
+
+def get_web_crawl_tls_impersonate() -> str | None:
+    """Get the optional TLS impersonation spec for website crawling.
+
+    Priority:
+        1. XAGENT_WEB_CRAWL_TLS_IMPERSONATE environment variable
+        2. None (plain httpx)
+
+    Values:
+        - unset, empty, "none", or "null": None
+        - "auto": built-in crawler fallback chain
+        - any other non-empty value: curl_cffi impersonate spec
+    """
+    value = os.getenv(WEB_CRAWL_TLS_IMPERSONATE)
+    if value is None:
+        return None
+
+    normalized = value.strip()
+    if not normalized or normalized.lower() in {"none", "null"}:
+        return None
+    return normalized
 
 
 def get_tool_max_recursion_depth() -> int:

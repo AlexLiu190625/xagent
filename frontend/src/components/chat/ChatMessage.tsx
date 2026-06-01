@@ -10,6 +10,7 @@ import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
+import { resolveTraceProcessStatus } from "@/lib/trace-process-status";
 
 interface ToolArgs {
   code?: string;
@@ -67,19 +68,21 @@ export interface ChatMessageProps {
   showProcessView?: boolean;
   isVirtual?: boolean;
   taskStatus?: string;
+  processStatus?: string;
   timestamp?: number | string;
   interactions?: any[];
   interactionsActive?: boolean;
+  showEmptyStatus?: boolean;
   onSendInteraction?: (message: string, files?: File[], metadata?: any) => Promise<void> | void;
 }
 
 function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latestTitle?: string, taskStatus?: string, errorMessage?: string }) {
   const { t } = useI18n();
 
-  if (taskStatus === 'failed' && errorMessage) {
+  if (taskStatus === 'failed') {
     return (
       <div className="py-3 text-sm leading-relaxed text-red-500">
-        <span>{errorMessage}</span>
+        <span>{errorMessage || t("common.errors.unknown")}</span>
       </div>
     );
   }
@@ -272,9 +275,11 @@ export function ChatMessage({
   traceEvents,
   showProcessView,
   taskStatus,
+  processStatus,
   timestamp,
   interactions,
   interactionsActive = true,
+  showEmptyStatus = true,
   onSendInteraction,
 }: ChatMessageProps) {
   const { t } = useI18n();
@@ -315,6 +320,8 @@ export function ChatMessage({
     !!showProcessView &&
     Array.isArray(traceEvents) &&
     traceEvents.length > 0;
+  const isProcessOnlyMessage =
+    shouldShowProcess && !isUser && !content && showEmptyStatus === false;
 
   // Map event/action to i18n key
   const getEventTitle = (e: TraceEvent | undefined) => {
@@ -336,79 +343,94 @@ export function ChatMessage({
       ? traceEvents[traceEvents.length - 1]
       : undefined
   );
+  const resolvedProcessStatus = resolveTraceProcessStatus({
+    processStatus,
+    taskStatus,
+    traceEvents,
+  });
 
   let errorMessage = "";
-  if (taskStatus === "failed" && Array.isArray(traceEvents)) {
+  if (resolvedProcessStatus === "failed" && Array.isArray(traceEvents)) {
     for (let i = traceEvents.length - 1; i >= 0; i--) {
       const event = traceEvents[i];
       if (['trace_error', 'task_failed', 'react_task_failed', 'dag_step_failed', 'agent_error'].includes(event.event_type || '')) {
-        errorMessage = (event.data?.error as string) || (event.data?.message as string) || "";
+        errorMessage = (event.data?.error as string) || (event.data?.message as string) || (event.data?.error_message as string) || "";
         if (errorMessage) break;
       }
     }
   }
+  const failedMessageText =
+    typeof content === "string" && content.trim()
+      ? content
+      : errorMessage || t("common.errors.unknown");
 
   return (
     <div className="w-full space-y-2 animate-fade-in group">
       {shouldShowProcess && !isUser && (
         <div className={cn("pl-7")}>
-          <TraceEventRenderer events={traceEvents} />
+          <TraceEventRenderer events={traceEvents} taskStatus={resolvedProcessStatus} />
         </div>
       )}
 
-      <div
-        className={cn(
-          "flex w-full",
-          isUser ? "justify-end" : "justify-start"
-        )}
-      >
+      {!isProcessOnlyMessage && (
         <div
           className={cn(
-            "flex gap-4 transition-all duration-300",
-            isUser
-              ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
-              : "bg-transparent p-0 w-full max-w-full"
+            "flex w-full",
+            isUser ? "justify-end" : "justify-start"
           )}
         >
-          {/* Avatar */}
-          {!isUser && (
-            <div
-              className={cn(
-                "flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center shadow-md bg-transparent"
-              )}
-            >
-              <Bot className="w-5 h-5 text-muted-foreground" />
-            </div>
-          )}
-
-          {/* Message content */}
-          <div className={cn("flex-1 min-w-0")}>
-            {content ? (
-              typeof content === "string" ? (
-                isUser ? (
-                  <ExpandableMessage content={content} />
-                ) : (
-                  <MarkdownRenderer
-                    content={content}
-                    className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
-                    onAgentClick={handleAgentClick}
-                    onFileClick={handleFileClick}
-                  />
-                )
-              ) : (
-                <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
-              )
-            ) : (
-              !isUser && <GeneratingIndicator latestTitle={latestTitle} taskStatus={taskStatus} errorMessage={errorMessage} />
+          <div
+            className={cn(
+              "flex gap-4 transition-all duration-300",
+              isUser
+                ? "max-w-[85%] bg-secondary text-secondary-foreground p-3 rounded-2xl flex-row-reverse items-center"
+                : "bg-transparent p-0 w-full max-w-full"
             )}
-            {!isUser && interactions && interactions.length > 0 && (
-              <div className="mt-4 border-t pt-4">
-                <ClarificationForm interactions={interactions} active={interactionsActive} onSend={onSendInteraction} />
+          >
+            {/* Avatar */}
+            {!isUser && (
+              <div
+                className={cn(
+                  "flex-shrink-0 w-10 h-10 rounded-xl flex items-center justify-center shadow-md bg-transparent"
+                )}
+              >
+                <Bot className="w-5 h-5 text-muted-foreground" />
               </div>
             )}
+
+            {/* Message content */}
+            <div className={cn("flex-1 min-w-0")}>
+              {!isUser && resolvedProcessStatus === "failed" ? (
+                <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
+                  {failedMessageText}
+                </div>
+              ) : content ? (
+                typeof content === "string" ? (
+                  isUser ? (
+                    <ExpandableMessage content={content} />
+                  ) : (
+                    <MarkdownRenderer
+                      content={content}
+                      className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
+                      onAgentClick={handleAgentClick}
+                      onFileClick={handleFileClick}
+                    />
+                  )
+                ) : (
+                  <div className="text-sm leading-relaxed break-words [overflow-wrap:anywhere]">{content}</div>
+                )
+              ) : (
+                !isUser && showEmptyStatus && <GeneratingIndicator latestTitle={latestTitle} taskStatus={resolvedProcessStatus || taskStatus} errorMessage={errorMessage} />
+              )}
+              {!isUser && interactions && interactions.length > 0 && (
+                <div className="mt-4 border-t pt-4">
+                  <ClarificationForm interactions={interactions} active={interactionsActive} onSend={onSendInteraction} />
+                </div>
+              )}
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
       {/* Action Row */}
       {copyableContent && (

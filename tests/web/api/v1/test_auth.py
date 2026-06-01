@@ -1,25 +1,24 @@
-"""Integration tests for the /v1/* auth dependency (get_agent_from_api_key).
+"""Integration tests for the /v1/* personal management auth dependency.
 
-Drives /v1/me (which only does auth + return identity) to verify each
-failure path returns the stable ``{"error": {"code": "invalid_api_key",
-...}}`` envelope. Also asserts timing-oracle symmetry: prefix-miss
-should not be measurably faster than secret-wrong, and that unhandled
-internal exceptions on the /v1/* surface still respond in the SDK
-envelope rather than FastAPI's default ``{"detail": ...}``.
+Drives /v1/me to verify each personal-key failure path returns the
+stable ``{"error": {"code": "invalid_api_key", ...}}`` envelope.
 
 Test plumbing (client, _test_db fixture, auth helpers) is shared via
 ``tests/web/api/conftest.py``.
 """
 
 import time
+from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
 import bcrypt
 import pytest
 
 from xagent.core.utils.api_key import BCRYPT_COST
+from xagent.web.models.agent import Agent, AgentOrigin
+from xagent.web.models.user_api_key import UserApiKey
 
-from ..conftest import _admin_headers, client
+from ..conftest import _admin_headers, _direct_db_session, client
 
 # Opt this file into the shared conftest ``_test_db`` fixture. See the
 # note in test_agent_api_keys.py for why we use ``usefixtures`` with a
@@ -52,19 +51,50 @@ def _create_agent_and_key() -> tuple[int, str, str]:
     return agent_id, body["full_key"], body["key_prefix"]
 
 
+def _create_personal_key() -> tuple[str, str]:
+    """Helper: create a personal management key for the admin user."""
+    headers = _admin_headers()
+    key_resp = client.post("/api/me/personal-keys", headers=headers)
+    assert key_resp.status_code == 200, key_resp.text
+    body = key_resp.json()
+    return body["full_key"], body["key_prefix"]
+
+
+def _mark_generated_manager(agent_id: int) -> None:
+    db = _direct_db_session()
+    try:
+        db.query(Agent).filter(Agent.id == agent_id).update(
+            {"origin": AgentOrigin.WORKFORCE_GENERATED_MANAGER.value}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 # ===== happy path =====
 
 
-def test_valid_key_returns_me_response():
-    """A freshly generated key authenticates /v1/me and returns identity."""
-    agent_id, full_key, prefix = _create_agent_and_key()
+def test_valid_personal_key_returns_me_response():
+    """A freshly generated personal key authenticates /v1/me."""
+    full_key, prefix = _create_personal_key()
 
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["agent_id"] == agent_id
-    assert body["agent_name"] == "v1 auth test agent"
+    assert body["principal_type"] == "user"
+    assert body["user_id"] > 0
+    # admin fixture: username="admin", email="admin@example.com" -- the two
+    # differ, so this pins that each field carries its own value.
+    assert body["username"] == "admin"
+    assert body["email"] == "admin@example.com"
     assert body["key_prefix"] == prefix
+
+
+def test_agent_runtime_key_cannot_authenticate_me():
+    """Runtime keys are not accepted by management identity endpoints."""
+    _agent_id, full_key, _prefix = _create_agent_and_key()
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+    _assert_invalid_api_key(resp)
 
 
 # ===== failure paths -- all must return the same envelope =====
@@ -105,17 +135,17 @@ def test_wrong_brand_prefix_returns_401():
 
 def test_unknown_prefix_returns_401():
     """A well-formed key with a prefix that's never been issued."""
-    fake_key = "xag_ZZZZZZ_" + "x" * 32
+    fake_key = "xag_personal_ZZZZZZ_" + "x" * 32
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {fake_key}"})
     _assert_invalid_api_key(resp)
 
 
 def test_known_prefix_wrong_secret_returns_401():
     """Prefix is real but the secret doesn't bcrypt-match."""
-    _agent_id, full_key, prefix = _create_agent_and_key()
+    full_key, _prefix = _create_personal_key()
     # Replace just the secret half with a different (but well-formed) value
     parts = full_key.split("_")
-    parts[2] = "y" * 32
+    parts[3] = "y" * 32
     wrong_key = "_".join(parts)
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {wrong_key}"})
     _assert_invalid_api_key(resp)
@@ -123,14 +153,71 @@ def test_known_prefix_wrong_secret_returns_401():
 
 def test_revoked_key_returns_401():
     """Once DELETE rotates / revokes, the old key must stop working."""
-    agent_id, full_key, _prefix = _create_agent_and_key()
-    # Revoke via admin endpoint
+    full_key, prefix = _create_personal_key()
     admin = _admin_headers()
-    revoke = client.delete(f"/api/agents/{agent_id}/api-key", headers=admin)
+    keys = client.get("/api/me/personal-keys", headers=admin)
+    assert keys.status_code == 200
+    key_id = next(row["id"] for row in keys.json() if row["key_prefix"] == prefix)
+    revoke = client.delete(f"/api/me/personal-keys/{key_id}", headers=admin)
     assert revoke.status_code == 200
     assert revoke.json()["revoked"] is True
 
     resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+    _assert_invalid_api_key(resp)
+
+
+def _set_key_expiry(prefix: str, expires_at) -> None:
+    """Force a personal key's ``expires_at`` to a fixed value via direct DB
+    write, bypassing HTTP (the create endpoint leaves it null)."""
+    db = _direct_db_session()
+    try:
+        db.query(UserApiKey).filter(UserApiKey.key_prefix == prefix).update(
+            {"expires_at": expires_at}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
+def test_expired_key_with_naive_expiry_returns_401_not_500():
+    """An expired key must yield 401, even when ``expires_at`` reads back
+    naive (as ``DateTime(timezone=True)`` does on SQLite).
+
+    Comparing a naive ``expires_at`` against an aware ``now`` raises
+    TypeError -- which would surface as a 500. The auth dep normalizes
+    to aware UTC first, so the expiry check stays a clean 401.
+    """
+    full_key, prefix = _create_personal_key()
+    naive_past = (datetime.now(timezone.utc) - timedelta(days=1)).replace(tzinfo=None)
+    _set_key_expiry(prefix, naive_past)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+    _assert_invalid_api_key(resp)
+
+
+def test_unexpired_key_with_naive_future_expiry_authenticates():
+    """A future, naive ``expires_at`` must not be misread as expired."""
+    full_key, prefix = _create_personal_key()
+    naive_future = (datetime.now(timezone.utc) + timedelta(days=1)).replace(tzinfo=None)
+    _set_key_expiry(prefix, naive_future)
+
+    resp = client.get("/v1/me", headers={"Authorization": f"Bearer {full_key}"})
+    assert resp.status_code == 200, resp.text
+
+
+def test_generated_manager_key_returns_401():
+    agent_id, full_key, _prefix = _create_agent_and_key()
+    _mark_generated_manager(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
     _assert_invalid_api_key(resp)
 
 
@@ -145,9 +232,9 @@ def test_unknown_prefix_takes_similar_time_to_wrong_secret():
     flake the test. The defense is to keep the order of magnitude the
     same, not to clock to the millisecond.
     """
-    _agent_id, full_key, _prefix = _create_agent_and_key()
+    full_key, _prefix = _create_personal_key()
     parts = full_key.split("_")
-    parts[2] = "z" * 32
+    parts[3] = "z" * 32
     wrong_secret_key = "_".join(parts)
 
     # Warm the bcrypt module a bit so first-call overhead doesn't skew
@@ -162,7 +249,7 @@ def test_unknown_prefix_takes_similar_time_to_wrong_secret():
     assert resp1.status_code == 401
 
     # Unknown prefix (index miss, then verify_dummy runs)
-    fake_key = "xag_ZZZZZZ_" + "x" * 32
+    fake_key = "xag_personal_ZZZZZZ_" + "x" * 32
     t0 = time.perf_counter()
     resp2 = client.get("/v1/me", headers={"Authorization": f"Bearer {fake_key}"})
     dummy_t = time.perf_counter() - t0
@@ -202,7 +289,8 @@ def test_internal_exception_returns_v1_envelope_not_fastapi_detail():
         side_effect=RuntimeError(secret_internal_msg),
     ):
         resp = client.get(
-            "/v1/me", headers={"Authorization": "Bearer xag_ABCDEF_" + "x" * 32}
+            "/v1/me",
+            headers={"Authorization": "Bearer xag_personal_ABCDEF_" + "x" * 32},
         )
 
     # Must be 500 in the V1 envelope, not 500 with FastAPI's detail key.

@@ -21,16 +21,25 @@ miss = prefix doesn't exist). See SDK design doc §7 (key format and
 auth flow) and §10 (security considerations).
 """
 
+from datetime import datetime, timezone
 from typing import Tuple
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session, joinedload
 
-from ....core.utils.api_key import parse_api_key, verify_api_key, verify_dummy
-from ...models.agent import Agent
+from ....core.utils.api_key import (
+    ApiKeyKind,
+    parse_api_key,
+    verify_api_key,
+    verify_dummy,
+)
+from ...models.agent import Agent, is_workforce_generated_manager_agent
 from ...models.agent_api_key import AgentApiKey
 from ...models.database import get_db
+from ...models.user import User
+from ...models.user_api_key import UserApiKey
+from ...utils.db_timezone import normalize_datetime_from_db
 from .errors import V1ApiError, V1ErrorCode
 
 # ``auto_error=False`` so we can raise our own V1ApiError envelope
@@ -75,7 +84,11 @@ async def get_agent_from_api_key(
         verify_dummy()
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
-    prefix, _secret = parsed
+    if parsed.kind != ApiKeyKind.AGENT:
+        verify_dummy()
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    prefix = parsed.prefix
 
     # Index lookup is O(1) on ix_agent_api_keys_key_prefix and excludes
     # revoked rows via the partial unique index path. ``joinedload``
@@ -112,7 +125,56 @@ async def get_agent_from_api_key(
     # invalid_api_key rather than 404 so the client retries with a
     # fresh key instead of investigating an imaginary agent.
     agent = key_row.agent
-    if agent is None:
+    if agent is None or is_workforce_generated_manager_agent(agent):
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     return agent, key_row
+
+
+async def get_user_from_personal_key(
+    credentials: HTTPAuthorizationCredentials | None = Depends(_bearer),
+    db: Session = Depends(get_db),
+) -> Tuple[User, UserApiKey]:
+    """Resolve a personal management API key to ``(User, UserApiKey)``."""
+    if credentials is None:
+        verify_dummy()
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    raw = credentials.credentials
+    parsed = parse_api_key(raw)
+    if parsed is None or parsed.kind != ApiKeyKind.PERSONAL:
+        verify_dummy()
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    key_row = (
+        db.query(UserApiKey)
+        .options(joinedload(UserApiKey.user))
+        .filter(
+            UserApiKey.key_prefix == parsed.prefix,
+            UserApiKey.revoked_at.is_(None),
+        )
+        .first()
+    )
+    if key_row is None:
+        verify_dummy()
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    now = datetime.now(timezone.utc)
+    expires_at = key_row.expires_at
+    # ``DateTime(timezone=True)`` reads back naive on SQLite; normalize
+    # to aware UTC before comparing so an expired key yields 401, not a
+    # 500 from comparing naive vs aware datetimes.
+    if (
+        expires_at is not None and normalize_datetime_from_db(expires_at) <= now  # type: ignore[arg-type]
+    ):
+        verify_dummy()
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    if not verify_api_key(raw, key_row.key_hash):  # type: ignore[arg-type]
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    user = key_row.user
+    if user is None:
+        raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
+
+    return user, key_row

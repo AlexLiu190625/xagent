@@ -6,6 +6,7 @@ import { render, screen, fireEvent, waitFor, cleanup } from '@testing-library/re
 const apiRequestMock = vi.hoisted(() => vi.fn())
 
 vi.mock('@/lib/utils', () => ({
+  cn: (...classes: Array<string | undefined | false>) => classes.filter(Boolean).join(' '),
   getApiUrl: () => 'http://api.local',
   getFilePublicPreviewUrl: (fileId: string, apiUrl = 'http://api.local') =>
     `${apiUrl}/api/files/public/preview/${encodeURIComponent(fileId)}`,
@@ -13,6 +14,35 @@ vi.mock('@/lib/utils', () => ({
 
 vi.mock('@/lib/api-wrapper', () => ({
   apiRequest: apiRequestMock,
+}))
+
+vi.mock('@/components/file/docx-preview-renderer', () => ({
+  DocxPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
+    <div data-testid="docx-preview">{base64Content}</div>
+  ),
+}))
+
+vi.mock('@/components/file/excel-preview-renderer', () => ({
+  ExcelPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
+    <div data-testid="excel-preview">{base64Content}</div>
+  ),
+}))
+
+vi.mock('@/components/file/pptx-preview-renderer', () => ({
+  PptxPreviewRenderer: ({ base64Content }: { base64Content: string }) => (
+    <div data-testid="pptx-preview">{base64Content}</div>
+  ),
+}))
+
+vi.mock('@/contexts/i18n-context', () => ({
+  useI18n: () => ({
+    t: (key: string) => {
+      if (key === 'files.previewDialog.buttons.open') return 'Open'
+      if (key === 'files.previewDialog.errors.loadFailed') return 'Failed to load preview.'
+      if (key === 'markdownRenderer.loadAgentDetailsFailed') return key
+      return key
+    },
+  }),
 }))
 
 import { MarkdownRenderer } from '../markdown-renderer'
@@ -66,6 +96,71 @@ describe('MarkdownRenderer', () => {
 
     expect(handleFileClick).toHaveBeenCalledTimes(1)
     expect(handleFileClick).toHaveBeenCalledWith('/tmp/test.txt', 'open file')
+  })
+
+  it('renders pptx file links as inline previews', async () => {
+    // Arbitrary sentinel bytes; base64 encodes to "AQI=". See
+    // inline-file-preview.test.tsx for why we avoid "PK" here.
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([0x01, 0x02]).buffer,
+    })
+
+    const content = '[example_presentation.pptx](file:99fb81ab-b995-4976-be18-21b02f748768)'
+    render(<MarkdownRenderer content={content} />)
+
+    // Browsers can't render raw .pptx in an iframe, and the backend's
+    // /api/files/public/preview endpoint now returns the raw bytes, so
+    // pptx inline previews are funnelled through PptxPreviewRenderer
+    // (canvas-based, pptxviewjs) — same fetch+base64 pattern as docx/xlsx.
+    expect(await screen.findByTestId('pptx-preview')).toHaveTextContent('AQI=')
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/99fb81ab-b995-4976-be18-21b02f748768',
+      expect.objectContaining({ cache: 'no-cache' })
+    )
+    expect(screen.queryByText('example_presentation.pptx')?.tagName.toLowerCase()).not.toBe('a')
+  })
+
+  it('opens pptx inline preview links with onFileClick when provided', () => {
+    const handleFileClick = vi.fn()
+    const content = '[example_presentation.pptx](file:pptx-file-id)'
+
+    render(<MarkdownRenderer content={content} onFileClick={handleFileClick} />)
+
+    fireEvent.click(screen.getByText('Open'))
+
+    expect(handleFileClick).toHaveBeenCalledWith(
+      'pptx-file-id',
+      'example_presentation.pptx'
+    )
+  })
+
+  it('renders docx file links with the document preview renderer', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([65, 66]).buffer,
+    })
+    const content = '[report.docx](file:doc-file-id)'
+
+    render(<MarkdownRenderer content={content} />)
+
+    expect(await screen.findByTestId('docx-preview')).toHaveTextContent('QUI=')
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      'http://api.local/api/files/public/preview/doc-file-id',
+      expect.objectContaining({ cache: 'no-cache' })
+    )
+  })
+
+  it('renders xlsx file links with the spreadsheet preview renderer', async () => {
+    apiRequestMock.mockResolvedValue({
+      ok: true,
+      arrayBuffer: async () => new Uint8Array([88, 89]).buffer,
+    })
+    const content = '[data.xlsx](file:sheet-file-id)'
+
+    render(<MarkdownRenderer content={content} />)
+
+    expect(await screen.findByTestId('excel-preview')).toHaveTextContent('WFk=')
   })
 
   it('preserves standard relative markdown links and images', () => {

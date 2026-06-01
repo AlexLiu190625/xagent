@@ -93,6 +93,34 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
     assert task.lease_expires_at is None
 
 
+def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
+    task = _create_task(db_session, status=TaskStatus.RUNNING)
+    task.runner_id = "dead-runner"
+    task.lease_expires_at = utc_now() - timedelta(seconds=1)
+    db_session.add(
+        TraceEvent(
+            task_id=task.id,
+            build_id="agent_123_child",
+            event_id="child-checkpoint-1",
+            event_type="system_update_general",
+            timestamp=utc_now(),
+            step_id=None,
+            parent_event_id=None,
+            data={
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"type": "checkpoint"},
+            },
+        )
+    )
+    db_session.commit()
+
+    assert mark_task_paused_if_stale(db_session, task) is True
+    db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
+    assert task.runner_id is None
+    assert task.lease_expires_at is None
+
+
 def test_stale_running_task_with_legacy_checkpoint_becomes_paused(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"

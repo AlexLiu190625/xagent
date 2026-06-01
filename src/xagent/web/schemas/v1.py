@@ -15,8 +15,8 @@ Design notes:
 
   - ``metadata`` is a free-form passthrough dict the SaaS caller can
     use to round-trip its own correlation IDs (trace_id, request_id,
-    etc). We don't interpret it server-side in Phase 1 but persist
-    enough of the SDK call shape to support future debugging.
+    etc). The server does not interpret it but persists enough of the
+    SDK call shape to support future debugging.
 
   - Timestamps are tz-aware ``datetime`` so SDK clients deserialize
     into proper datetimes (``datetime.fromisoformat`` works on both
@@ -74,10 +74,104 @@ class CreateTaskRequest(BaseModel):
         default=None,
         description=(
             "Free-form correlation data the SDK caller can pass through "
-            "(trace_id, request_id, etc). Not interpreted server-side "
-            "in Phase 1."
+            "(trace_id, request_id, etc). Not interpreted server-side."
         ),
     )
+
+
+class RuntimeKeyResponse(BaseModel):
+    """Runtime API key returned once after creation or rotation."""
+
+    full_key: str
+    key_prefix: str
+    created_at: datetime
+
+
+class V1AgentCreateRequest(BaseModel):
+    """Body for ``POST /v1/agents``."""
+
+    name: str = Field(..., min_length=1, max_length=200)
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+    execution_mode: Optional[str] = "balanced"
+    models: Optional[dict[str, Any]] = None
+    knowledge_bases: list[str] = Field(default_factory=list)
+    skills: list[str] = Field(default_factory=list)
+    tool_categories: list[str] = Field(default_factory=list)
+    suggested_prompts: list[str] = Field(default_factory=list)
+    generate_runtime_key: bool = True
+
+
+class V1AgentTemplateCreateRequest(BaseModel):
+    """Body for ``POST /v1/agents/from-template``."""
+
+    template_id: str = Field(..., min_length=1)
+    name: Optional[str] = Field(default=None, min_length=1, max_length=200)
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+    execution_mode: Optional[str] = None
+    models: Optional[dict[str, Any]] = None
+    knowledge_bases: Optional[list[str]] = None
+    skills: Optional[list[str]] = None
+    tool_categories: Optional[list[str]] = None
+    suggested_prompts: Optional[list[str]] = None
+    generate_runtime_key: bool = True
+
+
+class V1AgentSummary(BaseModel):
+    id: int
+    name: str
+    description: Optional[str] = None
+    logo_url: Optional[str] = None
+    status: str
+    created_at: str
+    updated_at: str
+    widget_enabled: bool
+    allowed_domains: list[str]
+
+
+class V1AgentResponse(BaseModel):
+    id: int
+    user_id: int
+    name: str
+    description: Optional[str] = None
+    instructions: Optional[str] = None
+    execution_mode: str
+    models: Optional[dict[str, Any]] = None
+    knowledge_bases: list[str]
+    skills: list[str]
+    tool_categories: list[str]
+    suggested_prompts: list[str]
+    logo_url: Optional[str] = None
+    status: str
+    published_at: Optional[str] = None
+    created_at: str
+    updated_at: str
+    widget_enabled: bool
+    allowed_domains: list[str]
+
+
+class V1AgentCreateResponse(BaseModel):
+    agent: V1AgentResponse
+    api_key: Optional[RuntimeKeyResponse] = None
+
+
+class V1TemplateSummary(BaseModel):
+    id: str
+    name: str
+    category: str = ""
+    featured: bool = False
+    description: str = ""
+    features: list[str] = Field(default_factory=list)
+    connections: list[dict[str, Any]] = Field(default_factory=list)
+    setup_time: str = "5 min setup"
+    tags: list[str] = Field(default_factory=list)
+    author: str = ""
+    version: str = ""
+
+
+class V1TemplateDetail(V1TemplateSummary):
+    agent_config: dict[str, Any]
 
 
 class CreateTaskResponse(BaseModel):

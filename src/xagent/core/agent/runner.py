@@ -97,7 +97,10 @@ class AgentRunner:
                 if role and content:
                     context.add_message(role, content)
             if task:
-                context.add_user_message(task)
+                context.add_user_message(
+                    task,
+                    metadata=self._initial_user_message_metadata(context),
+                )
 
         runtime = runtime or PatternRuntime(
             tracer=self.tracer,
@@ -289,8 +292,11 @@ class AgentRunner:
     async def inject_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -305,21 +311,169 @@ class AgentRunner:
             context = ExecutionContext.from_dict(checkpoint["context"])
             self.context_manager.set_context(context)
 
-        context.add_user_message(message)
+        # Display-vs-execution split: ``execution_message`` is the prompt
+        # the agent runtime sees (may be enriched with file refs / system
+        # context); ``display_message`` is what the chat bubble should
+        # show. Both fall back to ``message`` for legacy callers.
+        resolved_execution_message = (
+            execution_message if execution_message is not None else message
+        )
+        if resolved_execution_message is None:
+            raise ValueError(
+                "inject_user_message requires message or execution_message"
+            )
+        if display_message is None and message is None:
+            raise ValueError(
+                "inject_user_message requires display_message when "
+                "execution_message is provided without legacy message"
+            )
+        resolved_display_message = (
+            display_message if display_message is not None else message
+        )
+        # Attach files + display text to the new Message so they survive
+        # checkpoint round-trips: Message.metadata is serialized by
+        # ExecutionContext. The on_user_message_posted callback reads
+        # display_message back from metadata so the chat bubble shows the
+        # user-typed text rather than the LLM-augmented prompt.
+        metadata: dict[str, Any] = {"display_message": resolved_display_message}
+        if files is not None:
+            metadata["files"] = files
+        self._ensure_user_message_turn_id(metadata)
+
+        added = context.add_user_message(resolved_execution_message, metadata=metadata)
+        # Set a "this turn is waiting to be traced" pending marker before
+        # we persist. The resume catch-up logic uses this to disambiguate
+        # an old checkpoint that pre-dates this PR (no watermark, no
+        # pending marker — should NOT replay history) from a checkpoint
+        # that crashed mid-emit (pending marker present — replay this
+        # specific turn). Without this, ``_emit_untraced_user_messages``
+        # would treat any missing-watermark checkpoint as "everything
+        # untraced" and re-render historical user messages on resume.
+        self._set_pending_user_message_marker(context, added)
+        # Persist BEFORE emitting the trace so the message is durable even
+        # if the trace dispatch fails — the resume path's catch-up logic
+        # in TraceEventCallback.on_run_start will replay the marked turn.
         await self._persist_injected_context(
             execution_id=execution_id,
             context=context,
             label="user_message_injected",
         )
+        # Snapshot the watermark BEFORE the callback so we can detect a
+        # change (see comment below) and persist it.
+        watermark_before = self._read_trace_watermark(context)
+        traced_turn_ids_before = self._read_traced_turn_ids(context)
+        await self._dispatch_callback(
+            "on_user_message_posted",
+            runner=self,
+            context=context,
+            message=added,
+            files=files,
+        )
+        # Re-persist when the trace callback advanced the watermark —
+        # without this a worker crash between trace emission and the next
+        # checkpoint would let the resume path replay the same user_message
+        # event because the watermark was still living only in memory.
+        # The same persist also clears the pending marker since the trace
+        # has now been emitted; doing both in one persist keeps the
+        # invariant {pending => never traced yet} on every durable state.
+        watermark_after = self._read_trace_watermark(context)
+        traced_turn_ids_after = self._read_traced_turn_ids(context)
+        if (
+            watermark_after and watermark_after != watermark_before
+        ) or traced_turn_ids_after != traced_turn_ids_before:
+            self._clear_pending_user_message_marker(context)
+            await self._persist_injected_context(
+                execution_id=execution_id,
+                context=context,
+                label="user_message_trace_watermark",
+            )
         if request_interrupt:
             self.pause(execution_id, reason=reason or "new user message")
         return context
 
+    @staticmethod
+    def _read_trace_watermark(context: ExecutionContext) -> str | None:
+        """Read the user-message trace watermark off context metadata, if any.
+
+        Kept in-runner so we don't import the tracing module (which would
+        create a cycle) — the key is a stable contract spelled out in
+        ``core.agent.tracing.TRACE_WATERMARK_KEY``.
+        """
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("_user_message_trace_watermark")
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _read_traced_turn_ids(context: ExecutionContext) -> tuple[str, ...]:
+        metadata = getattr(context, "metadata", None)
+        if not isinstance(metadata, dict):
+            return ()
+        value = metadata.get("_user_message_trace_turn_ids")
+        if not isinstance(value, list):
+            return ()
+        return tuple(item for item in value if isinstance(item, str) and item)
+
+    @staticmethod
+    def _set_pending_user_message_marker(
+        context: ExecutionContext, message: Any
+    ) -> None:
+        """Stamp ``_pending_user_message_trace_timestamp`` on context.metadata.
+
+        Mirrored in ``core.agent.tracing.PENDING_MARKER_KEY``; kept in-runner
+        to avoid an import cycle. The timestamp is the just-added message's
+        normalized ISO-UTC timestamp so the catch-up loop can replay this
+        specific turn rather than scanning history.
+        """
+        ts = AgentRunner._message_iso_timestamp(message)
+        if ts is None:
+            return
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata["_pending_user_message_trace_timestamp"] = ts
+            turn_id = AgentRunner._message_turn_id(message)
+            if turn_id:
+                metadata["_pending_user_message_trace_turn_id"] = turn_id
+
+    @staticmethod
+    def _clear_pending_user_message_marker(context: ExecutionContext) -> None:
+        metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            metadata.pop("_pending_user_message_trace_timestamp", None)
+            metadata.pop("_pending_user_message_trace_turn_id", None)
+
+    @staticmethod
+    def _message_turn_id(message: Any) -> str | None:
+        metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            return None
+        value = metadata.get("turn_id")
+        return value if isinstance(value, str) and value else None
+
+    @staticmethod
+    def _message_iso_timestamp(message: Any) -> str | None:
+        """ISO-UTC string of ``message.timestamp`` — same normalization the
+        tracing module uses for its watermark, kept here to avoid a cycle.
+        """
+        from datetime import datetime, timezone
+
+        ts = getattr(message, "timestamp", None)
+        if isinstance(ts, datetime):
+            aware = ts.replace(tzinfo=timezone.utc) if ts.tzinfo is None else ts
+            return aware.astimezone(timezone.utc).isoformat()
+        if isinstance(ts, str) and ts:
+            return ts
+        return None
+
     async def post_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> ExecutionContext | None:
@@ -331,6 +485,9 @@ class AgentRunner:
         return await self.inject_user_message(
             execution_id,
             message,
+            execution_message=execution_message,
+            display_message=display_message,
+            files=files,
             request_interrupt=request_interrupt,
             reason=reason,
         )
@@ -384,6 +541,62 @@ class AgentRunner:
             context.attach_memory_session(memory_id, snapshot)
 
         return context
+
+    def _initial_user_message_metadata(
+        self, context: ExecutionContext
+    ) -> dict[str, Any]:
+        metadata: dict[str, Any] = {}
+        context_metadata = (
+            context.metadata if isinstance(context.metadata, dict) else {}
+        )
+        request_context = context_metadata.get("request_context")
+
+        candidates = []
+        if isinstance(request_context, dict):
+            candidates.append(request_context)
+        candidates.append(context_metadata)
+
+        for candidate in candidates:
+            turn_id = candidate.get("turn_id")
+            if isinstance(turn_id, str) and turn_id:
+                metadata["turn_id"] = turn_id
+                break
+        self._ensure_user_message_turn_id(metadata)
+
+        for candidate in candidates:
+            if "display_message" in candidate:
+                display_message = candidate.get("display_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+            if "display_user_message" in candidate:
+                display_message = candidate.get("display_user_message")
+                metadata["display_message"] = (
+                    display_message if isinstance(display_message, str) else ""
+                )
+                break
+
+        for candidate in candidates:
+            files = candidate.get("files")
+            if isinstance(files, list):
+                metadata["files"] = files
+                break
+            attachments = candidate.get("attachments")
+            if isinstance(attachments, list):
+                metadata["files"] = attachments
+                break
+
+        return metadata
+
+    @staticmethod
+    def _ensure_user_message_turn_id(metadata: dict[str, Any]) -> str:
+        value = metadata.get("turn_id")
+        if isinstance(value, str) and value:
+            return value
+        turn_id = str(uuid4())
+        metadata["turn_id"] = turn_id
+        return turn_id
 
     def _apply_request_context(
         self,
@@ -532,6 +745,7 @@ class AgentRunner:
             task=task,
             context=context,
             llm=getattr(self.agent, "llm", None),
+            compact_llm=getattr(self.agent, "compact_llm", None),
             tools=tools,
             tracer=self.tracer,
             runtime=runtime,

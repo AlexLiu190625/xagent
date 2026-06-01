@@ -15,6 +15,7 @@ from xagent.core.tools.core.RAG_tools.core.exceptions import (
 from xagent.core.tools.core.RAG_tools.core.schemas import (
     ChunkForEmbedding,
     ChunkStrategy,
+    CollectionInfo,
     DocumentProcessingStatus,
     EmbeddingReadResponse,
     EmbeddingWriteResponse,
@@ -261,6 +262,185 @@ def test_process_document_success(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.status == "success"
     assert result.embedding_count == 2
     assert result.vector_count == 2
+
+
+def test_process_document_initializes_with_canonical_embedding_model_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Alias/default embedding IDs are canonicalized before collection init."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    canonical_model_id = "text-embedding-v4-dashscope-1-37c6d7dd"
+    initialized_model_ids: List[str] = []
+
+    stub_config = EmbeddingModelConfig(
+        id=canonical_model_id,
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    stub_adapter = _StubEmbeddingAdapter()
+
+    def _resolve_effective_embedding_model_sync(
+        collection_name: str, config_model_id: str | None = None
+    ) -> str:
+        raise ValueError("collection not found")
+
+    def _resolve_adapter(
+        config: IngestionConfig,
+    ) -> tuple[EmbeddingModelConfig, BaseEmbedding]:
+        assert config.embedding_model_id == "text-embedding-v4"
+        return stub_config, stub_adapter
+
+    def _initialize_collection_embedding_sync(
+        *, collection_name: str, embedding_model_id: str
+    ) -> CollectionInfo:
+        initialized_model_ids.append(embedding_model_id)
+        return CollectionInfo(
+            name=collection_name,
+            embedding_model_id=embedding_model_id,
+            embedding_dimension=2,
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "resolve_effective_embedding_model_sync",
+        _resolve_effective_embedding_model_sync,
+    )
+    monkeypatch.setattr(
+        document_ingestion, "_resolve_embedding_adapter", _resolve_adapter
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "initialize_collection_embedding_sync",
+        _initialize_collection_embedding_sync,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(embedding_model_id="text-embedding-v4"),
+    )
+
+    assert result.status == "success"
+    assert initialized_model_ids == [canonical_model_id]
+    assert result.completed_steps[0].metadata["model_id"] == canonical_model_id
+
+
+def test_process_document_reuses_existing_collection_embedding_model_before_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Existing collection model wins over a caller-provided alias."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    canonical_model_id = "text-embedding-v4-dashscope-1-37c6d7dd"
+    initialized_model_ids: List[str] = []
+    resolved_config_model_ids: List[str | None] = []
+
+    stub_config = EmbeddingModelConfig(
+        id=canonical_model_id,
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    stub_adapter = _StubEmbeddingAdapter()
+
+    def _resolve_effective_embedding_model_sync(
+        collection_name: str, config_model_id: str | None = None
+    ) -> str:
+        resolved_config_model_ids.append(config_model_id)
+        return canonical_model_id
+
+    def _resolve_adapter(
+        config: IngestionConfig,
+    ) -> tuple[EmbeddingModelConfig, BaseEmbedding]:
+        assert config.embedding_model_id == canonical_model_id
+        return stub_config, stub_adapter
+
+    def _initialize_collection_embedding_sync(
+        *, collection_name: str, embedding_model_id: str
+    ) -> CollectionInfo:
+        initialized_model_ids.append(embedding_model_id)
+        return CollectionInfo(
+            name=collection_name,
+            embedding_model_id=embedding_model_id,
+            embedding_dimension=2,
+        )
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "resolve_effective_embedding_model_sync",
+        _resolve_effective_embedding_model_sync,
+    )
+    monkeypatch.setattr(
+        document_ingestion, "_resolve_embedding_adapter", _resolve_adapter
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "initialize_collection_embedding_sync",
+        _initialize_collection_embedding_sync,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(embedding_model_id="text-embedding-v4"),
+    )
+
+    assert result.status == "success"
+    assert resolved_config_model_ids == ["text-embedding-v4"]
+    assert initialized_model_ids == [canonical_model_id]
+
+
+def test_process_document_init_failure_after_resolve_is_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preflight model resolution should not make init failures partial."""
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    canonical_model_id = "text-embedding-v4-dashscope-1-37c6d7dd"
+    stub_config = EmbeddingModelConfig(
+        id=canonical_model_id,
+        model_name="text-embedding-v4",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    stub_adapter = _StubEmbeddingAdapter()
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "resolve_effective_embedding_model_sync",
+        lambda _collection, _model_id=None: canonical_model_id,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, stub_adapter),
+    )
+
+    def _raise_init_error(*, collection_name: str, embedding_model_id: str) -> None:
+        raise ValueError("collection already initialized with another model")
+
+    monkeypatch.setattr(
+        document_ingestion,
+        "initialize_collection_embedding_sync",
+        _raise_init_error,
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.pdf",
+        config=IngestionConfig(embedding_model_id="text-embedding-v4"),
+    )
+
+    assert result.status == "error"
+    assert result.failed_step == "initialize_collection"
+    assert result.completed_steps == []
+    assert result.doc_id is None
+    assert STATUS_EVENTS == []
 
 
 def test_process_document_applies_spreadsheet_safeguards(
@@ -607,7 +787,7 @@ def test_process_document_partial_on_write_failure(
 def test_process_document_failed_before_register(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Initialization errors should surface with failed_step='initialize'."""
+    """Adapter resolution errors before registration should surface as errors."""
 
     # Mock validate_document_processing_sync to pass validation
     from unittest.mock import AsyncMock
@@ -633,10 +813,8 @@ def test_process_document_failed_before_register(
         config=IngestionConfig(parse_method="deepdoc"),
     )
 
-    assert result.status == "partial"
-    # Failure can occur in initialize_collection (if resolve_embedding_adapter fails there)
-    # or in resolve_embedding_adapter step
-    assert result.failed_step in ("initialize_collection", "resolve_embedding_adapter")
+    assert result.status == "error"
+    assert result.failed_step == "resolve_embedding_adapter"
     assert "adapter missing" in result.message
     assert STATUS_EVENTS == []
 

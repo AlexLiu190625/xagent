@@ -18,9 +18,26 @@ from ...context.enrichment import (
     latest_user_text,
 )
 from ...frame import ExecutionFrame, ExecutionSnapshot, ExecutionStatus
+from ...language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    final_answer_language_rule,
+    normalize_response_language_label,
+    output_language_policy,
+)
 from ...runtime import LLMCallInterrupted, PatternRuntime
-from ..base import AgentPattern, PatternResult
+from ..base import (
+    REQUIRED_TOOL_CALL_FAILURE_REASON,
+    AgentPattern,
+    PatternResult,
+    RequiredToolCallError,
+    append_user_message_preserving_turns,
+    extract_required_tool_arguments,
+)
 from ..dag import DAGPattern
+from ..final_answer_stream import (
+    FinalAnswerStreamSession,
+    ToolCallStringFieldStreamer,
+)
 from ..react import ReActPattern
 
 logger = logging.getLogger(__name__)
@@ -45,6 +62,7 @@ class AutoDecision:
     existing_context_sufficient: bool = True
     evidence_basis: str = ""
     missing_verification: str = ""
+    response_language: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         payload = {
@@ -57,6 +75,8 @@ class AutoDecision:
             "evidence_basis": self.evidence_basis,
             "missing_verification": self.missing_verification,
         }
+        if self.response_language:
+            payload["response_language"] = self.response_language
         if self.answer is not None:
             payload["answer"] = self.answer
         return payload
@@ -82,11 +102,24 @@ class AutoDecision:
             ),
             evidence_basis=str(payload.get("evidence_basis", "")),
             missing_verification=str(payload.get("missing_verification", "")),
+            response_language=normalize_response_language_label(
+                str(payload.get("response_language", ""))
+            ),
         )
+
+
+@dataclass
+class AutoDecisionResult:
+    decision: AutoDecision
+    final_answer_stream: FinalAnswerStreamSession | None = None
 
 
 DECISION_TOOL_NAME = "select_execution_pattern"
 MAX_DECISION_PARSE_ATTEMPTS = 2
+AUTO_DECISION_REQUIRED_TOOL_MESSAGE = (
+    "Auto routing failed because the model did not return the required "
+    "decision tool call. Please retry."
+)
 
 
 class AutoDecisionArgumentsError(ValueError):
@@ -148,18 +181,48 @@ class _AutoChildRuntime:
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
 
+    async def stream_final_answer(self, llm: Any, **kwargs: Any) -> Any:
+        return await self.parent.stream_final_answer(llm, **kwargs)
+
+    async def start_final_answer_stream(self) -> str | None:
+        return await self.parent.start_final_answer_stream()
+
+    async def emit_final_answer_delta(self, message_id: str, delta: str) -> None:
+        await self.parent.emit_final_answer_delta(message_id, delta)
+
+    async def end_final_answer_stream(self, message_id: str, content: str) -> None:
+        await self.parent.end_final_answer_stream(message_id, content)
+
+    async def fail_final_answer_stream(self, message_id: str, error: str) -> None:
+        await self.parent.fail_final_answer_stream(message_id, error)
+
+    async def run_streaming_llm_call(
+        self,
+        llm: Any,
+        *,
+        on_chunk: Any | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        return await self.parent.run_streaming_llm_call(
+            llm,
+            on_chunk=on_chunk,
+            **kwargs,
+        )
+
     async def send_message(
         self,
         *,
         message: str,
         message_type: str = "info",
         expect_response: bool = False,
+        visible: bool = True,
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         return await self.parent.send_message(
             message=message,
             message_type=message_type,
             expect_response=expect_response,
+            visible=visible,
             metadata=metadata,
         )
 
@@ -353,7 +416,19 @@ class AutoPattern(AgentPattern):
                 allowed_skills=kwargs.get("allowed_skills"),
                 memory_store=kwargs.get("memory_store"),
                 memory_similarity_threshold=kwargs.get("memory_similarity_threshold"),
+                compact_llm=kwargs.get("compact_llm"),
             )
+        except RequiredToolCallError as exc:
+            result = await self._fail(
+                context=context,
+                runtime=runtime,
+                error=exc.user_message,
+                failure_reason=exc.failure_reason,
+                checkpoint_label="auto_decision_failed",
+                extra_metadata=exc.to_metadata(),
+            )
+            await runtime.on_pattern_end(context=context, pattern=self, result=result)
+            return result
         except Exception as exc:
             self.status = "failed"
             await runtime.on_pattern_error(context=context, pattern=self, error=exc)
@@ -372,9 +447,11 @@ class AutoPattern(AgentPattern):
         memory_similarity_threshold: float | None = None,
         skill_manager: Any | None = None,
         allowed_skills: list[str] | None = None,
+        compact_llm: Any | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         self._invalidate_stale_final_answer_decision(context)
+        final_answer_stream: FinalAnswerStreamSession | None = None
         if self.decision is None:
             self.status = "deciding"
             task_text = latest_user_text(context)
@@ -415,9 +492,15 @@ class AutoPattern(AgentPattern):
                 "auto_before_decision", context=context, pattern=self
             )
             try:
-                self.decision = await self._decide(
-                    context=context, tools=tools, llm=llm, runtime=runtime
+                decision_result = await self._decide(
+                    context=context,
+                    tools=tools,
+                    llm=llm,
+                    compact_llm=compact_llm,
+                    runtime=runtime,
                 )
+                self.decision = decision_result.decision
+                final_answer_stream = decision_result.final_answer_stream
             except LLMCallInterrupted:
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
@@ -430,6 +513,7 @@ class AutoPattern(AgentPattern):
             self._normalize_decision()
             if self.decision is None:
                 raise RuntimeError("AutoPattern decision was not set.")
+            self._apply_response_language(context)
             self.decision_user_messages = self._user_message_signature(context)
             self.selected_pattern = self.decision.action.value
             logger.info(
@@ -451,6 +535,8 @@ class AutoPattern(AgentPattern):
 
         if self.decision.action == AutoAction.FINAL_ANSWER:
             answer = self.decision.answer or ""
+            if final_answer_stream is not None:
+                await final_answer_stream.finish(answer)
             if answer:
                 context.add_assistant_message(answer)
             self.status = "completed"
@@ -492,6 +578,7 @@ class AutoPattern(AgentPattern):
             memory_similarity_threshold=memory_similarity_threshold,
             skill_manager=skill_manager,
             allowed_skills=allowed_skills,
+            compact_llm=compact_llm,
             **kwargs,
         )
         self._attach_decision_metadata(result)
@@ -531,6 +618,38 @@ class AutoPattern(AgentPattern):
         self.last_result = result
         return result
 
+    async def _fail(
+        self,
+        *,
+        context: Any,
+        runtime: PatternRuntime,
+        error: str,
+        failure_reason: str,
+        checkpoint_label: str,
+        extra_metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self.status = "failed"
+        metadata: dict[str, Any] = {
+            "status": self.status,
+            "failure_reason": failure_reason,
+        }
+        if extra_metadata:
+            metadata.update(extra_metadata)
+        result = PatternResult(
+            success=False,
+            error=error,
+            metadata=metadata,
+        ).to_dict()
+        self.last_result = result
+        await runtime.checkpoint(
+            checkpoint_label,
+            context=context,
+            pattern=self,
+            status=self.status,
+            metadata=metadata,
+        )
+        return result
+
     def _normalize_decision(self) -> None:
         if self.decision is None:
             return
@@ -558,6 +677,7 @@ class AutoPattern(AgentPattern):
                 existing_context_sufficient=False,
                 evidence_basis=self.decision.evidence_basis,
                 missing_verification=self.decision.missing_verification,
+                response_language=self.decision.response_language,
             )
         if (
             self.decision.action == AutoAction.FINAL_ANSWER
@@ -574,11 +694,41 @@ class AutoPattern(AgentPattern):
                     "AutoPattern selected final_answer without a non-empty answer; "
                     "falling back to react."
                 ),
+                response_language=self.decision.response_language,
             )
         if self.decision.action == AutoAction.PLAN_EXECUTE and self.dag_pattern is None:
             raise ValueError(
                 "AutoPattern selected plan_execute without a DAGPattern configured."
             )
+
+    def _apply_response_language(self, context: Any) -> None:
+        if self.decision is None:
+            return
+        response_language = normalize_response_language_label(
+            self.decision.response_language
+        )
+        if not response_language:
+            return
+        metadata = self._context_metadata(context)
+        if metadata is not None:
+            # Auto is the current-turn language authority; replace any
+            # request-scoped policy left by a previous turn.
+            metadata[OUTPUT_LANGUAGE_METADATA_KEY] = response_language
+
+    @staticmethod
+    def _context_metadata(context: Any) -> dict[str, Any] | None:
+        if isinstance(context, dict):
+            metadata = context.get("metadata")
+        else:
+            metadata = getattr(context, "metadata", None)
+        if isinstance(metadata, dict):
+            return metadata
+        return None
+
+    def _clear_response_language(self, context: Any) -> None:
+        metadata = self._context_metadata(context)
+        if metadata is not None:
+            metadata.pop(OUTPUT_LANGUAGE_METADATA_KEY, None)
 
     def _attach_decision_metadata(self, result: dict[str, Any]) -> None:
         if self.decision is None:
@@ -589,14 +739,23 @@ class AutoPattern(AgentPattern):
             metadata.setdefault("auto_decision", self.decision.to_dict())
 
     async def _decide(
-        self, *, context: Any, tools: list[Any], llm: Any, runtime: PatternRuntime
-    ) -> AutoDecision:
+        self,
+        *,
+        context: Any,
+        tools: list[Any],
+        llm: Any,
+        compact_llm: Any | None,
+        runtime: PatternRuntime,
+    ) -> AutoDecisionResult:
         if llm is None:
             raise RuntimeError("AutoPattern requires an LLM with tool calling support.")
 
+        # Re-derive the request-scoped language before routing so stale metadata
+        # cannot bias the current decision prompt.
+        self._clear_response_language(context)
         await runtime.compact_context_if_needed(
             context=context,
-            llm=llm,
+            llm=compact_llm,
             metadata={"phase": "auto_decision"},
         )
 
@@ -605,10 +764,17 @@ class AutoPattern(AgentPattern):
         decision_tools = [self._decision_tool_schema()]
         retry_feedback: str | None = None
         for attempt in range(MAX_DECISION_PARSE_ATTEMPTS):
-            messages = list(base_messages)
-            messages.append({"role": "user", "content": decision_prompt})
+            messages = append_user_message_preserving_turns(
+                base_messages,
+                content=decision_prompt,
+                section_title="Auto routing instruction",
+            )
             if retry_feedback:
-                messages.append({"role": "user", "content": retry_feedback})
+                messages = append_user_message_preserving_turns(
+                    messages,
+                    content=retry_feedback,
+                    section_title="Auto routing retry feedback",
+                )
             metadata: dict[str, Any] = {"phase": "auto_decision"}
             if attempt:
                 metadata["attempt"] = attempt + 1
@@ -618,15 +784,29 @@ class AutoPattern(AgentPattern):
                 tools=decision_tools,
                 metadata=metadata,
             )
+            answer_emitter = FinalAnswerStreamSession(
+                runtime,
+                enabled=True,
+            )
+            answer_streamer = ToolCallStringFieldStreamer(
+                runtime=runtime,
+                tool_name=DECISION_TOOL_NAME,
+                field_name="answer",
+                guard_field="action",
+                guard_value=AutoAction.FINAL_ANSWER.value,
+                emitter=answer_emitter,
+            )
             try:
-                response = await runtime.run_llm_call(
+                response = await runtime.run_streaming_llm_call(
                     llm,
                     messages=messages,
                     tools=decision_tools,
                     tool_choice="required",
                     thinking={"type": "disabled", "enable": False},
+                    on_chunk=answer_streamer.handle_chunk,
                 )
             except Exception as exc:
+                await answer_streamer.fail(str(exc))
                 await runtime.on_llm_error(
                     context=context, error=exc, metadata=metadata
                 )
@@ -635,7 +815,31 @@ class AutoPattern(AgentPattern):
                 context=context, response=response, metadata=metadata
             )
             try:
-                return self._parse_decision(response)
+                decision = self._parse_decision(response, attempts=attempt + 1)
+            except RequiredToolCallError:
+                if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
+                    raise
+                retry_feedback = self._required_tool_call_retry_feedback(
+                    DECISION_TOOL_NAME
+                )
+                logger.warning(
+                    "AutoPattern decision response omitted required %s tool call; "
+                    "retrying decision. execution_id=%s attempt=%s",
+                    DECISION_TOOL_NAME,
+                    getattr(context, "execution_id", None),
+                    attempt + 1,
+                )
+                await runtime.checkpoint(
+                    "auto_decision_retry",
+                    context=context,
+                    pattern=self,
+                    metadata={
+                        "attempt": attempt + 1,
+                        "failure_reason": REQUIRED_TOOL_CALL_FAILURE_REASON,
+                        "required_tool_name": DECISION_TOOL_NAME,
+                    },
+                )
+                continue
             except AutoDecisionArgumentsError as exc:
                 if attempt + 1 >= MAX_DECISION_PARSE_ATTEMPTS:
                     raise
@@ -655,7 +859,23 @@ class AutoPattern(AgentPattern):
                         "error": str(exc),
                     },
                 )
+                continue
+            return AutoDecisionResult(
+                decision=decision,
+                final_answer_stream=(
+                    answer_emitter
+                    if decision.action == AutoAction.FINAL_ANSWER
+                    else None
+                ),
+            )
         raise RuntimeError("AutoPattern decision retry loop exited unexpectedly.")
+
+    def _required_tool_call_retry_feedback(self, tool_name: str) -> str:
+        return (
+            f"The previous response did not call the required {tool_name} tool. "
+            f"Call {tool_name} exactly once with a complete routing decision. "
+            "Do not answer in natural language."
+        )
 
     def _decision_retry_feedback(self, error: AutoDecisionArgumentsError) -> str:
         argument_preview = self._truncate_retry_preview(error.arguments or "")
@@ -694,9 +914,17 @@ class AutoPattern(AgentPattern):
             f"action must be one of: {available_actions}. "
             "Use final_answer for simple conversational replies that need no tools; "
             "when action is final_answer, you must include a complete non-empty "
-            "answer field in the same tool call. You must also classify whether "
+            "answer field in the same tool call. Put action before answer in the "
+            "tool arguments. You must also classify whether "
             "the latest request requires current or external facts, and whether "
             "the existing context is sufficient evidence for those facts. "
+            "Set response_language to the natural language that user-facing prose "
+            "should use for this request, such as English, Simplified Chinese, "
+            "Traditional Chinese, Spanish, or the language explicitly requested "
+            "by the user. For Chinese requests, choose Simplified Chinese or "
+            "Traditional Chinese to match the request script; do not use generic "
+            "Chinese. This is a routing decision field only; do not translate or "
+            "rewrite the request. "
             "If the latest user message explicitly asks to call or use an available "
             "tool, to pause for user input, or to wait for a user choice, choose "
             "react; do not choose final_answer merely to restate or paraphrase the "
@@ -741,7 +969,8 @@ class AutoPattern(AgentPattern):
                 "description": (
                     "Select the execution pattern for this user request. If action "
                     "is final_answer, the answer argument is mandatory and must be "
-                    "a complete non-empty final response to the user."
+                    "a complete non-empty final response to the user. "
+                    f"{final_answer_language_rule()}"
                 ),
                 "parameters": {
                     "type": "object",
@@ -755,12 +984,26 @@ class AutoPattern(AgentPattern):
                             "type": "string",
                             "description": "Brief reason for the selected action.",
                         },
+                        "response_language": {
+                            "type": "string",
+                            "description": (
+                                "Natural language to use for all user-facing prose "
+                                "and persisted tool-argument prose for this request, "
+                                "for example English, Simplified Chinese, Traditional "
+                                "Chinese, or Spanish. For Chinese requests, choose "
+                                "Simplified Chinese or Traditional Chinese to match "
+                                "the request script; do not use generic Chinese. If "
+                                "the current user request explicitly asks to answer in "
+                                "another language, use that requested target language. "
+                                f"{output_language_policy()}"
+                            ),
+                        },
                         "answer": {
                             "type": "string",
                             "description": (
                                 "Mandatory when action is final_answer: complete "
                                 "non-empty final response to the user. Leave unset "
-                                "for react or plan_execute."
+                                f"for react or plan_execute. {final_answer_language_rule()}"
                             ),
                         },
                         "requires_current_or_external_facts": {
@@ -802,6 +1045,7 @@ class AutoPattern(AgentPattern):
                     "required": [
                         "action",
                         "reason",
+                        "response_language",
                         "requires_current_or_external_facts",
                         "existing_context_sufficient",
                         "evidence_basis",
@@ -818,39 +1062,29 @@ class AutoPattern(AgentPattern):
             actions.append(AutoAction.PLAN_EXECUTE.value)
         return actions
 
-    def _parse_decision(self, response: Any) -> AutoDecision:
-        payload = self._extract_tool_arguments(response, DECISION_TOOL_NAME)
+    def _parse_decision(self, response: Any, *, attempts: int = 1) -> AutoDecision:
+        payload = self._extract_tool_arguments(
+            response,
+            DECISION_TOOL_NAME,
+            attempts=attempts,
+        )
         return AutoDecision.from_dict(payload)
 
-    def _extract_tool_arguments(self, response: Any, tool_name: str) -> dict[str, Any]:
-        tool_calls = self._response_tool_calls(response)
-        for tool_call in tool_calls:
-            function_payload = self._function_payload(tool_call)
-            if not function_payload:
-                continue
-            if function_payload.get("name") != tool_name:
-                continue
-            return self._coerce_arguments(function_payload.get("arguments", {}))
-        raise ValueError(
-            f"AutoPattern decision requires a {tool_name} tool call response."
+    def _extract_tool_arguments(
+        self,
+        response: Any,
+        tool_name: str,
+        *,
+        attempts: int = 1,
+    ) -> dict[str, Any]:
+        arguments = extract_required_tool_arguments(
+            response,
+            tool_name=tool_name,
+            owner="AutoPattern decision",
+            attempts=attempts,
+            user_message=AUTO_DECISION_REQUIRED_TOOL_MESSAGE,
         )
-
-    def _response_tool_calls(self, response: Any) -> list[Any]:
-        if isinstance(response, dict):
-            return list(response.get("tool_calls") or [])
-        return list(getattr(response, "tool_calls", []) or [])
-
-    def _function_payload(self, tool_call: Any) -> dict[str, Any] | None:
-        if isinstance(tool_call, dict):
-            function_payload = tool_call.get("function")
-            return function_payload if isinstance(function_payload, dict) else None
-        function_payload = getattr(tool_call, "function", None)
-        if function_payload is None:
-            return None
-        return {
-            "name": getattr(function_payload, "name", None),
-            "arguments": getattr(function_payload, "arguments", {}),
-        }
+        return self._coerce_arguments(arguments)
 
     def _coerce_arguments(self, arguments: Any) -> dict[str, Any]:
         if isinstance(arguments, dict):

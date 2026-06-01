@@ -116,7 +116,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         data: Dict[str, Any],
         encoding: str = "utf-8",
         indent: int = 2,
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """Write JSON file in workspace"""
         return self.inner.write_json_file(file_path, data, encoding, indent)
 
@@ -132,7 +132,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
         data: List[Dict[str, str]],
         encoding: str = "utf-8",
         delimiter: str = ",",
-    ) -> bool:
+    ) -> Dict[str, Any]:
         """Write CSV file in workspace"""
         return self.inner.write_csv_file(file_path, data, encoding, delimiter)
 
@@ -217,7 +217,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.write_json_file,
                 name="write_json_file",
-                description="Write JSON file in workspace",
+                description="Write JSON file in workspace. Use relative paths (e.g., 'data.json'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.",
             ),
             FileTool(
                 self.read_csv_file,
@@ -227,7 +227,7 @@ class WorkspaceFileTools(WorkspaceFileOperations):
             FileTool(
                 self.write_csv_file,
                 name="write_csv_file",
-                description="Write CSV file in workspace",
+                description="Write CSV file in workspace. Use relative paths (e.g., 'data.csv'), not absolute paths. Returns a FileRef with file_id, preview_url, download_url, and markdown_link.",
             ),
             FileTool(
                 self.get_workspace_output_files,
@@ -274,7 +274,7 @@ if TYPE_CHECKING:
     from .config import BaseToolConfig
 
 
-@register_tool
+@register_tool(categories={"file"})
 async def create_file_tools(config: "BaseToolConfig") -> List[Any]:
     """Create workspace-bound file tools."""
     if not config.get_file_tools_enabled():

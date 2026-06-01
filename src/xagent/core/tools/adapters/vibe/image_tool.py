@@ -137,9 +137,24 @@ if TYPE_CHECKING:
     from .config import BaseToolConfig
 
 
-@register_tool
+@register_tool(categories={"image"})
 async def create_image_tools_from_config(config: "BaseToolConfig") -> List[Any]:
-    """Create image generation tools from configuration."""
+    """Create image generation tools from configuration.
+
+    Internal short-circuit on ``ToolSelectionSpec.includes_category("image")``
+    skips the image-model DB lookup (``config.get_image_models()``)
+    when the spec excludes the image category. Registry-level skip
+    via ``categories={"image"}`` handles the most common path where
+    ``spec.categories`` is set and doesn't include image; the internal
+    check covers the legacy spec=None backward-compat path.
+    """
+    spec = (
+        config.get_tool_selection_spec()
+        if hasattr(config, "get_tool_selection_spec")
+        else None
+    )
+    if spec is not None and not spec.includes_category("image"):
+        return []
     image_models = config.get_image_models()
     if not image_models:
         return []

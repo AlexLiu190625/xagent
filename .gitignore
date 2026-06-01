@@ -137,7 +137,7 @@ ipython_config.py
 __pypackages__/
 
 # Celery stuff
-celerybeat-schedule
+celerybeat-schedule*
 celerybeat.pid
 
 # SageMath parsed files
@@ -220,9 +220,6 @@ src/xagent/web/uploads/
 # test data
 examples/test_data.*
 examples/*.html
-
-# UV.lock
-uv.lock
 
 # filelock artifacts from tests (mock paths like <MagicMock ...>.lock)
 *MagicMock*.lock

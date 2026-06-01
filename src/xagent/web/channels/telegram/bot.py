@@ -1,9 +1,11 @@
 import asyncio
+import html
 import json
 import logging
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Coroutine, Dict, Optional, cast
+from uuid import uuid4
 
 if TYPE_CHECKING:
     from ....core.agent.service import AgentService
@@ -12,19 +14,34 @@ from aiogram import Bot, Dispatcher, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
+from aiogram.types import FSInputFile
 from sqlalchemy.orm import Session
 
 from ...api.chat import get_agent_manager
 from ...models.database import get_db
 from ...models.task import Task, TaskStatus
+from ...models.uploaded_file import UploadedFile
 from ...models.user import User
+from ...services.chat_history_service import persist_user_message
+from ...services.execution_result_projection import project_execution_result_for_channel
 from .handler import TelegramTraceHandler
-from .utils import markdown_to_tg_html
+from .utils import (
+    TelegramFileRef,
+    TelegramImageRef,
+    markdown_to_tg_html,
+    persist_telegram_assistant_turn,
+    restore_telegram_task_context,
+    strip_telegram_file_refs,
+    strip_telegram_image_refs,
+)
 
 logger = logging.getLogger(__name__)
 
 
 class TelegramBotInstance:
+    queue_flush_delay_seconds = 1.0
+    stop_text_aliases = {"/stop", "/pause", "stop", "pause", "停止", "暂停"}
+
     def __init__(
         self,
         token: str,
@@ -41,6 +58,9 @@ class TelegramBotInstance:
         self.polling_task: Optional[asyncio.Task] = None
         self.user_message_queues: Dict[int, list] = {}
         self.user_message_tasks: Dict[int, asyncio.Task] = {}
+        self.user_active_executions: Dict[int, tuple[int, object]] = {}
+        self.user_preparing_executions: set[int] = set()
+        self.user_stop_events: Dict[int, asyncio.Event] = {}
 
         # Load active tasks state
         self.active_tasks_file = Path(f"data/telegram_active_tasks_{instance_id}.json")
@@ -98,7 +118,7 @@ class TelegramBotInstance:
                 f"Received /start from {message.from_user.id} on bot {self.instance_id}"
             )
             await message.answer(
-                "Hello! I am Xagent Telegram Bot. You can send /new to start a new task."
+                "Hi, I'm Xagent. Send me anything you'd like help with, or use /new when you want a fresh start."
             )
 
         @self.dp.message(Command("new"))
@@ -106,11 +126,23 @@ class TelegramBotInstance:
             logger.info(
                 f"Received /new from {message.from_user.id} on bot {self.instance_id}"
             )
-            self.active_tasks[message.from_user.id] = -1
-            self._save_active_tasks()
+            self._start_new_conversation(message.from_user.id)
             await message.answer(
-                "Started a new session. Your next message will create a new task."
+                "Fresh start. Send me what you'd like to work on next."
             )
+
+        @self.dp.message(Command("stop", "pause"))
+        async def cmd_stop(message: types.Message) -> None:
+            logger.info(
+                f"Received stop command from {message.from_user.id} on bot {self.instance_id}"
+            )
+            stopped = self._stop_current_conversation(message.from_user.id)
+            if stopped:
+                await message.answer(
+                    "Stopped the current run. Send another message to continue here, or use /new for a fresh task."
+                )
+            else:
+                await message.answer("No active run to stop.")
 
         @self.dp.message()
         async def handle_message(message: types.Message) -> None:
@@ -131,6 +163,19 @@ class TelegramBotInstance:
             )
 
             user_id = message.from_user.id
+            if self._is_stop_request_text(msg_content):
+                logger.info(
+                    f"Received stop text from {user_id} on bot {self.instance_id}: {msg_content}"
+                )
+                stopped = self._stop_current_conversation(user_id)
+                if stopped:
+                    await message.answer(
+                        "Stopped the current run. Send another message to continue here, or use /new for a fresh task."
+                    )
+                else:
+                    await message.answer("No active run to stop.")
+                return
+
             if user_id not in self.user_message_queues:
                 self.user_message_queues[user_id] = []
             self.user_message_queues[user_id].append(message)
@@ -139,16 +184,140 @@ class TelegramBotInstance:
                 user_id not in self.user_message_tasks
                 or self.user_message_tasks[user_id].done()
             ):
-                self.user_message_tasks[user_id] = asyncio.create_task(
-                    self._process_user_queue(user_id)
+                self._schedule_user_queue(user_id)
+
+    def _schedule_user_queue(self, user_id: int) -> None:
+        self.user_message_tasks[user_id] = asyncio.create_task(
+            self._process_user_queue(user_id)
+        )
+
+    def _start_new_conversation(self, user_id: int) -> bool:
+        stopped = self._request_current_conversation_stop(
+            user_id, reason="new Telegram conversation requested"
+        )
+        self.active_tasks[user_id] = -1
+        self._save_active_tasks()
+        return stopped
+
+    def _stop_current_conversation(self, user_id: int) -> bool:
+        return self._request_current_conversation_stop(
+            user_id, reason="Telegram stop requested"
+        )
+
+    def _request_current_conversation_stop(self, user_id: int, *, reason: str) -> bool:
+        queued_messages = self.user_message_queues.pop(user_id, None)
+        stopped = self._stop_user_active_execution(user_id, reason=reason)
+        preparing = user_id in self.user_preparing_executions
+        if preparing and not stopped:
+            self._request_user_stop(user_id)
+        return bool(queued_messages) or stopped or preparing
+
+    def _stop_user_active_execution(self, user_id: int, *, reason: str) -> bool:
+        active_execution = self.user_active_executions.get(user_id)
+        if active_execution is None:
+            return False
+
+        task_id, agent_service = active_execution
+        pause_execution_by_id = getattr(agent_service, "pause_execution_by_id", None)
+        if not callable(pause_execution_by_id):
+            logger.warning(
+                "Telegram active task %s for user %s does not support pause",
+                task_id,
+                user_id,
+            )
+            return False
+
+        try:
+            return bool(pause_execution_by_id(str(task_id), reason=reason))
+        except Exception as e:
+            logger.warning(
+                "Failed to pause Telegram active task %s for user %s: %s",
+                task_id,
+                user_id,
+                e,
+            )
+            return False
+
+    def _get_user_stop_event(self, user_id: int) -> asyncio.Event:
+        event = self.user_stop_events.get(user_id)
+        if event is None:
+            event = asyncio.Event()
+            self.user_stop_events[user_id] = event
+        return event
+
+    def _request_user_stop(self, user_id: int) -> None:
+        self._get_user_stop_event(user_id).set()
+
+    def _consume_user_stop_request(self, user_id: int) -> bool:
+        event = self.user_stop_events.get(user_id)
+        if event is None or not event.is_set():
+            return False
+        event.clear()
+        return True
+
+    def _clear_user_stop_request(self, user_id: int) -> None:
+        event = self.user_stop_events.get(user_id)
+        if event is not None:
+            event.clear()
+
+    async def _await_execution_with_stop_monitor(
+        self,
+        user_id: int,
+        execution: Coroutine[Any, Any, dict[str, Any]],
+        *,
+        reason: str,
+    ) -> dict[str, Any]:
+        execution_task: asyncio.Task[dict[str, Any]] = asyncio.create_task(execution)
+        stop_event = self._get_user_stop_event(user_id)
+
+        try:
+            while True:
+                if execution_task.done():
+                    return await execution_task
+
+                if stop_event.is_set():
+                    while not execution_task.done():
+                        if self._stop_user_active_execution(user_id, reason=reason):
+                            stop_event.clear()
+                            break
+                        await asyncio.sleep(0.05)
+                    continue
+
+                done, _ = await asyncio.wait(
+                    {execution_task},
+                    timeout=0.05,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
+                if execution_task in done:
+                    return await execution_task
+        finally:
+            if not execution_task.done():
+                execution_task.cancel()
+
+    def _is_stop_request_text(self, text: str) -> bool:
+        normalized = text.strip().lower()
+        if normalized.startswith("/"):
+            normalized = normalized.split()[0].split("@", 1)[0]
+        return normalized in self.stop_text_aliases
 
     async def _process_user_queue(self, user_id: int) -> None:
-        await asyncio.sleep(1.0)
-        messages = self.user_message_queues.pop(user_id, [])
-        if not messages:
-            return
-        await self._process_user_messages_batch(user_id, messages)
+        while True:
+            await asyncio.sleep(self.queue_flush_delay_seconds)
+            messages = self.user_message_queues.pop(user_id, [])
+            if messages:
+                await self._process_user_messages_batch(user_id, messages)
+
+            if self.user_message_queues.get(user_id):
+                continue
+
+            current_task = cast(asyncio.Task, asyncio.current_task())
+            if self.user_message_tasks.get(user_id) is current_task:
+                self.user_message_tasks.pop(user_id, None)
+
+            if not self.user_message_queues.get(user_id):
+                return
+
+            self.user_message_tasks[user_id] = current_task
 
     async def _extract_message_content(
         self, message: types.Message
@@ -178,7 +347,7 @@ class TelegramBotInstance:
         import mimetypes
         from pathlib import Path
 
-        from ...models.uploaded_file import UploadedFile
+        from ...services.uploaded_file_store import UploadedFileStore
 
         uploaded_files_info: list[dict] = []
 
@@ -231,15 +400,14 @@ class TelegramBotInstance:
 
                 file_size = getattr(f, "file_size", target_path.stat().st_size)
 
-                file_record = UploadedFile(
+                file_record = UploadedFileStore(db).create_from_local_path(
+                    local_path=target_path,
                     user_id=user_id,
                     task_id=task_id,
                     filename=normalized_file_name,
-                    storage_path=str(target_path),
                     mime_type=mime_type,
-                    file_size=file_size,
                 )
-                db.add(file_record)
+                setattr(file_record, "file_size", int(file_size))
                 db.flush()
 
                 agent_service.workspace.register_file(
@@ -292,6 +460,8 @@ class TelegramBotInstance:
         if not text and not files:
             return
 
+        self.user_preparing_executions.add(user_id)
+        self._clear_user_stop_request(user_id)
         try:
             db_gen = get_db()
             db = next(db_gen)
@@ -320,6 +490,9 @@ class TelegramBotInstance:
                     await last_message.answer(
                         "Configuration error: Cannot find the owner of this bot."
                     )
+                    return
+
+                if self._consume_user_stop_request(user_id):
                     return
 
                 active_task_id = self.active_tasks.get(user_id)
@@ -365,21 +538,15 @@ class TelegramBotInstance:
                     user=user,  # type: ignore
                 )
 
-                from ...services.task_execution_context_service import (
-                    load_task_execution_recovery_state,
-                )
+                await restore_telegram_task_context(agent_service, db, int(task.id))
 
-                recovery_state = await load_task_execution_recovery_state(
-                    db, int(task.id)
-                )  # type: ignore
-                agent_service.set_execution_context_messages(
-                    recovery_state.get("messages", [])
-                )
-                agent_service.set_recovered_skill_context(
-                    recovery_state.get("skill_context")
-                )
+                message_turn_id = str(uuid4())
+                context: dict = {"turn_id": message_turn_id}
 
-                context: dict = {}
+                if self._consume_user_stop_request(user_id):
+                    task.status = TaskStatus.PAUSED
+                    db.commit()
+                    return
 
                 if files:
                     uploaded_info = await self._download_and_register_files(
@@ -410,8 +577,22 @@ class TelegramBotInstance:
                         context["state"] = context.get("state", {})
                         context["state"]["file_info"] = uploaded_info
 
+                if self._consume_user_stop_request(user_id):
+                    task.status = TaskStatus.PAUSED
+                    db.commit()
+                    return
+
+                persist_user_message(
+                    db=db,
+                    task_id=int(task.id),  # type: ignore
+                    user_id=int(user.id),  # type: ignore
+                    content=text,
+                    turn_id=message_turn_id,
+                )
+
                 loading_msg = await last_message.answer(
-                    f"⏳ <b>Task #{task.id} is processing...</b>\n<i>Please wait for the result.</i>",
+                    "Got it, I'm working on this now.\n"
+                    "<i>I'll update this message as I make progress.</i>",
                     parse_mode=ParseMode.HTML,
                 )
 
@@ -426,55 +607,52 @@ class TelegramBotInstance:
                 from ...user_isolated_memory import UserContext
 
                 actual_task_id = str(task.id)
+                active_execution = (int(task.id), agent_service)  # type: ignore[arg-type]
+                self.user_active_executions[user_id] = active_execution
 
-                with UserContext(int(user.id)):  # type: ignore
-                    result = await agent_manager.execute_task(
-                        agent_service=agent_service,
-                        task=text,
-                        context=context,
-                        task_id=actual_task_id,
-                        tracking_task_id=str(task.id),
-                        db_session=db,
-                    )
+                try:
+                    if self._consume_user_stop_request(user_id):
+                        task.status = TaskStatus.PAUSED
+                        db.commit()
+                        return
 
-                task.status = (
-                    TaskStatus.COMPLETED
-                    if result.get("success", False)
-                    else TaskStatus.FAILED
-                )
+                    with UserContext(int(user.id)):  # type: ignore
+                        result = await self._await_execution_with_stop_monitor(
+                            user_id,
+                            agent_manager.execute_task(
+                                agent_service=agent_service,
+                                task=text,
+                                context=context,
+                                task_id=actual_task_id,
+                                tracking_task_id=str(task.id),
+                                db_session=db,
+                            ),
+                            reason="Telegram stop requested",
+                        )
+                finally:
+                    if self.user_active_executions.get(user_id) == active_execution:
+                        self.user_active_executions.pop(user_id, None)
+                    if tg_handler in agent_service.tracer.handlers:
+                        agent_service.tracer.handlers.remove(tg_handler)
+
+                projection = project_execution_result_for_channel(result)
+                task.status = projection.task_status
                 db.commit()
 
-                output = result.get("output", "")
+                persist_telegram_assistant_turn(
+                    db=db,
+                    task_id=int(task.id),  # type: ignore
+                    user_id=int(user.id),  # type: ignore
+                    content=projection.transcript_content,
+                    interactions=projection.interactions,
+                    message_type=projection.message_type,
+                )
 
-                chat_response = result.get("chat_response")
-                if isinstance(chat_response, dict):
-                    interactions = chat_response.get("interactions", [])
-                    if interactions:
-                        interaction_texts = []
-                        for interaction in interactions:
-                            label = interaction.get("label") or interaction.get(
-                                "field", "Input"
-                            )
-                            options = interaction.get("options", [])
-                            if options:
-                                opts = []
-                                for opt in options:
-                                    if isinstance(opt, dict):
-                                        opts.append(
-                                            str(opt.get("label", opt.get("value", "")))
-                                        )
-                                    else:
-                                        opts.append(str(opt))
-                                interaction_texts.append(
-                                    f"• {label}\n  Options: {', '.join(opts)}"
-                                )
-                            else:
-                                interaction_texts.append(f"• {label}")
-                        if interaction_texts:
-                            output += "\n\n" + "\n".join(interaction_texts)
-
-                if not output or not str(output).strip():
-                    output = "Task completed, but no output was generated."
+                output, image_refs, file_refs = self._extract_telegram_output_refs(
+                    projection.visible_text,
+                )
+                if not output and (image_refs or file_refs):
+                    output = "Task completed."
 
                 max_len = 4000
                 text_chunks = [
@@ -499,6 +677,33 @@ class TelegramBotInstance:
                     except Exception:
                         await last_message.answer(chunk)
 
+                if image_refs:
+                    failed_image_refs = await self._send_output_images(
+                        image_refs=image_refs,
+                        user_id=int(user.id),  # type: ignore
+                        task_id=int(task.id),  # type: ignore
+                        db=db,
+                        reply_to=last_message,
+                    )
+                    if failed_image_refs:
+                        await self._send_image_fallback_message(
+                            image_refs=failed_image_refs,
+                            reply_to=last_message,
+                        )
+                if file_refs:
+                    failed_file_refs = await self._send_output_files(
+                        file_refs=file_refs,
+                        user_id=int(user.id),  # type: ignore
+                        task_id=int(task.id),  # type: ignore
+                        db=db,
+                        reply_to=last_message,
+                    )
+                    if failed_file_refs:
+                        await self._send_file_fallback_message(
+                            file_refs=failed_file_refs,
+                            reply_to=last_message,
+                        )
+
             finally:
                 try:
                     next(db_gen)
@@ -509,6 +714,225 @@ class TelegramBotInstance:
             await last_message.answer(
                 "Sorry, an error occurred while processing your request."
             )
+        finally:
+            self.user_preparing_executions.discard(user_id)
+            self._clear_user_stop_request(user_id)
+
+    async def _send_output_images(
+        self,
+        *,
+        image_refs: list[TelegramImageRef],
+        user_id: int,
+        task_id: int,
+        db: Session,
+        reply_to: types.Message,
+    ) -> list[TelegramImageRef]:
+        ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in image_refs))
+        failed_refs: list[TelegramImageRef] = []
+
+        file_records = (
+            db.query(UploadedFile)
+            .filter(
+                UploadedFile.file_id.in_(ordered_file_ids),
+                UploadedFile.user_id == user_id,
+                UploadedFile.task_id == task_id,
+            )
+            .all()
+            if ordered_file_ids
+            else []
+        )
+        file_record_by_id = {str(record.file_id): record for record in file_records}
+
+        sent_file_ids: set[str] = set()
+        for image_ref in image_refs:
+            if image_ref.file_id in sent_file_ids:
+                continue
+            sent_file_ids.add(image_ref.file_id)
+
+            file_record = file_record_by_id.get(image_ref.file_id)
+            if not file_record:
+                logger.warning(
+                    "Telegram output image not found: file_id=%s task_id=%s",
+                    image_ref.file_id,
+                    task_id,
+                )
+                failed_refs.append(image_ref)
+                continue
+
+            mime_type = file_record.mime_type or ""
+            if not mime_type.startswith("image/"):
+                logger.warning(
+                    "Telegram output file is not an image: file_id=%s mime_type=%s",
+                    image_ref.file_id,
+                    mime_type,
+                )
+                failed_refs.append(image_ref)
+                continue
+
+            image_path = Path(file_record.storage_path)
+            if not image_path.is_file():
+                logger.warning(
+                    "Telegram output image path missing: file_id=%s path=%s",
+                    image_ref.file_id,
+                    image_path,
+                )
+                failed_refs.append(image_ref)
+                continue
+
+            caption = (
+                html.escape(image_ref.alt_text[:512]) if image_ref.alt_text else None
+            )
+            try:
+                await reply_to.answer_photo(
+                    FSInputFile(image_path), caption=caption or None
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to send Telegram output image: file_id=%s error=%s",
+                    image_ref.file_id,
+                    e,
+                )
+                failed_refs.append(image_ref)
+
+        return failed_refs
+
+    def _extract_telegram_output_refs(
+        self, output: Optional[str]
+    ) -> tuple[str, list[TelegramImageRef], list[TelegramFileRef]]:
+        """Extract only local attachments explicitly referenced in the final answer."""
+        if not output:
+            return "", [], []
+
+        output, image_refs = strip_telegram_image_refs(output)
+        output, file_refs = strip_telegram_file_refs(output)
+        image_refs, file_refs = self._dedupe_telegram_output_refs(
+            image_refs,
+            file_refs,
+        )
+        return output, image_refs, file_refs
+
+    def _dedupe_telegram_output_refs(
+        self,
+        image_refs: list[TelegramImageRef],
+        file_refs: list[TelegramFileRef],
+    ) -> tuple[list[TelegramImageRef], list[TelegramFileRef]]:
+        deduped_images: list[TelegramImageRef] = []
+        image_file_ids: set[str] = set()
+        for image_ref in image_refs:
+            if image_ref.file_id in image_file_ids:
+                continue
+            image_file_ids.add(image_ref.file_id)
+            deduped_images.append(image_ref)
+
+        deduped_files: list[TelegramFileRef] = []
+        file_ids: set[str] = set()
+        for file_ref in file_refs:
+            if file_ref.file_id in image_file_ids or file_ref.file_id in file_ids:
+                continue
+            file_ids.add(file_ref.file_id)
+            deduped_files.append(file_ref)
+
+        return deduped_images, deduped_files
+
+    async def _send_image_fallback_message(
+        self, *, image_refs: list[TelegramImageRef], reply_to: types.Message
+    ) -> None:
+        subject = "image" if len(image_refs) == 1 else "images"
+        lines = [
+            f"I couldn't send the {subject} through Telegram, but the file reference is still available:"
+        ]
+        for image_ref in image_refs:
+            label = image_ref.alt_text or "image"
+            lines.append(f"- {label}: file:{image_ref.file_id}")
+        text = "\n".join(lines)
+        try:
+            await reply_to.answer(markdown_to_tg_html(text), parse_mode=ParseMode.HTML)
+        except Exception:
+            await reply_to.answer(text)
+
+    async def _send_output_files(
+        self,
+        *,
+        file_refs: list[TelegramFileRef],
+        user_id: int,
+        task_id: int,
+        db: Session,
+        reply_to: types.Message,
+    ) -> list[TelegramFileRef]:
+        ordered_file_ids = list(dict.fromkeys(ref.file_id for ref in file_refs))
+        failed_refs: list[TelegramFileRef] = []
+
+        file_records = (
+            db.query(UploadedFile)
+            .filter(
+                UploadedFile.file_id.in_(ordered_file_ids),
+                UploadedFile.user_id == user_id,
+                UploadedFile.task_id == task_id,
+            )
+            .all()
+            if ordered_file_ids
+            else []
+        )
+        file_record_by_id = {str(record.file_id): record for record in file_records}
+
+        sent_file_ids: set[str] = set()
+        for file_ref in file_refs:
+            if file_ref.file_id in sent_file_ids:
+                continue
+            sent_file_ids.add(file_ref.file_id)
+
+            file_record = file_record_by_id.get(file_ref.file_id)
+            if not file_record:
+                logger.warning(
+                    "Telegram output file not found: file_id=%s task_id=%s",
+                    file_ref.file_id,
+                    task_id,
+                )
+                failed_refs.append(file_ref)
+                continue
+
+            file_path = Path(file_record.storage_path)
+            if not file_path.is_file():
+                logger.warning(
+                    "Telegram output file path missing: file_id=%s path=%s",
+                    file_ref.file_id,
+                    file_path,
+                )
+                failed_refs.append(file_ref)
+                continue
+
+            record_filename = getattr(file_record, "filename", "")
+            caption_source = file_ref.label or str(record_filename or "file")
+            caption = html.escape(caption_source[:1024])
+            try:
+                await reply_to.answer_document(
+                    FSInputFile(file_path), caption=caption or None
+                )
+            except Exception as e:
+                logger.warning(
+                    "Failed to send Telegram output file: file_id=%s error=%s",
+                    file_ref.file_id,
+                    e,
+                )
+                failed_refs.append(file_ref)
+
+        return failed_refs
+
+    async def _send_file_fallback_message(
+        self, *, file_refs: list[TelegramFileRef], reply_to: types.Message
+    ) -> None:
+        subject = "file" if len(file_refs) == 1 else "files"
+        lines = [
+            f"I couldn't send the {subject} through Telegram, but the file reference is still available:"
+        ]
+        for file_ref in file_refs:
+            label = file_ref.label or "file"
+            lines.append(f"- {label}: file:{file_ref.file_id}")
+        text = "\n".join(lines)
+        try:
+            await reply_to.answer(markdown_to_tg_html(text), parse_mode=ParseMode.HTML)
+        except Exception:
+            await reply_to.answer(text)
 
     async def start(self) -> None:
         try:

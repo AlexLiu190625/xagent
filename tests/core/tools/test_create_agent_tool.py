@@ -1,6 +1,7 @@
 """Tests for CreateAgentTool - dynamically creating agents during task execution."""
 
 import tempfile
+from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -13,13 +14,17 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     CreateAgentTool,
     ListAgentsTool,
     UpdateAgentTool,
+    _coerce_db_task_id,
     gen_agent_tool_name,
     get_published_agents_tools,
 )
 from xagent.core.tracing.langfuse.handler import LangfuseTraceHandler
-from xagent.web.models.agent import Agent, AgentStatus
+from xagent.core.workspace import TaskWorkspace
+from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import Base
 from xagent.web.models.model import Model
+from xagent.web.models.task import Task
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
 
@@ -34,8 +39,45 @@ def _create_session() -> tuple[Session, str]:
     return SessionLocal(), temp_db.name
 
 
+@pytest.fixture
+def mock_workspace_db():
+    yield
+
+
 class TestCreateAgentTool:
     """Test suite for CreateAgentTool."""
+
+    def test_create_agent_tool_schema_anchors_persisted_text_language(self) -> None:
+        tool = CreateAgentTool(db=None, user_id=1)
+
+        assert (
+            "same natural language as the current output language policy"
+            in tool.description
+        )
+        assert "Do not inherit another language from DAG step text" in tool.description
+
+        schema = tool.args_type().model_json_schema()
+        description_schema = schema["properties"]["description"]["description"]
+        instructions_schema = schema["properties"]["instructions"]["description"]
+        assert (
+            "same natural language as the current output language policy"
+            in description_schema
+        )
+        assert (
+            "same natural language as the current output language policy"
+            in instructions_schema
+        )
+
+    def test_coerce_db_task_id_accepts_only_db_task_formats(self) -> None:
+        assert _coerce_db_task_id(12) == 12
+        assert _coerce_db_task_id("12") == 12
+        assert _coerce_db_task_id("web_task_12") == 12
+        assert _coerce_db_task_id("task_12") == 12
+
+        assert _coerce_db_task_id("agent_1_abcd1234") is None
+        assert _coerce_db_task_id("agent_1_12") is None
+        assert _coerce_db_task_id("web_task_abc") is None
+        assert _coerce_db_task_id(True) is None
 
     @pytest.mark.asyncio
     async def test_create_agent_success(self) -> None:
@@ -52,9 +94,14 @@ class TestCreateAgentTool:
             mock_llm = Mock()
             mock_llm.model_id = "gpt-4"
 
-            with patch(
-                "xagent.web.services.llm_utils.UserAwareModelStorage"
-            ) as mock_storage_class:
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.UserAwareModelStorage"
+                ) as mock_storage_class,
+                patch(
+                    "xagent.web.services.agent_store.invalidate_agent_cache"
+                ) as mock_invalidate_agent_cache,
+            ):
                 mock_storage = Mock()
                 mock_storage.get_configured_defaults.return_value = (
                     mock_llm,
@@ -80,9 +127,12 @@ class TestCreateAgentTool:
                 assert result["status"] == "success"
                 assert result["agent_name"] == "test_agent"
                 assert result["agent_id"] > 0
-                assert result["tool_name"] == "call_agent_test_agent"
+                assert result["tool_name"] == f"agent_{result['agent_id']}"
                 assert "test_agent" in result["markdown_link"]
                 assert "agent://" in result["markdown_link"]
+                mock_invalidate_agent_cache.assert_called_once_with(
+                    user.id, result["agent_id"]
+                )
 
                 # Verify agent was created in database
                 agent = (
@@ -94,6 +144,562 @@ class TestCreateAgentTool:
                 assert agent.status == AgentStatus.DRAFT
                 assert agent.instructions == "You are a test agent for unit testing."
 
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_rejects_generated_workforce_manager(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_generated_manager_run",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Generated Manager",
+                description="Private workforce manager",
+                instructions="Coordinate the workforce.",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add(generated_manager)
+            db.commit()
+            db.refresh(generated_manager)
+
+            tool = AgentTool(
+                agent_id=generated_manager.id,
+                agent_name=generated_manager.name,
+                agent_description=generated_manager.description or "",
+                db=db,
+                user_id=user.id,
+            )
+
+            with patch(
+                "xagent.core.agent.service.AgentService"
+            ) as mock_agent_service_class:
+                result = await tool.run_json_async({"task": "run private manager"})
+
+            assert (
+                result["response"] == f"Error: Agent {generated_manager.id} not found"
+            )
+            mock_agent_service_class.assert_not_called()
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_applies_workforce_runtime_overrides(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(username="testuser11", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="Worker Agent",
+                description="Nested workforce worker",
+                instructions="Base worker instructions.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            parent_handler = Mock()
+
+            class ParentTracer:
+                def __init__(self) -> None:
+                    self.handlers = [parent_handler]
+                    self.events = []
+
+                async def trace_event(
+                    self, event_type, task_id=None, step_id=None, data=None
+                ):
+                    self.events.append(
+                        {
+                            "event_type": event_type.value,
+                            "task_id": task_id,
+                            "step_id": step_id,
+                            "data": data or {},
+                        }
+                    )
+
+            parent_tracer = ParentTracer()
+
+            tool = AgentTool(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                agent_description=agent.description or "",
+                db=db,
+                user_id=user.id,
+                task_id="tool-session",
+                tool_name="call_workforce_worker_7_writer",
+                tool_description="Write the final report.",
+                extra_system_prompt="Workforce assignment: write only.",
+                parent_task_id="parent-task-2",
+                parent_tracer=parent_tracer,
+                agent_call_stack=[99],
+                delegation_allowed_agent_ids=[],
+                enable_global_agent_tools=False,
+                runtime_metadata={"workforce_id": 123, "worker_alias": "Writer"},
+            )
+
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.UserAwareModelStorage"
+                ) as mock_storage_class,
+                patch(
+                    "xagent.core.agent.service.AgentService"
+                ) as mock_agent_service_class,
+                patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+            ):
+                mock_storage = Mock()
+                mock_llm = Mock()
+                mock_storage.get_llm_by_name_with_access.return_value = mock_llm
+                mock_storage_class.return_value = mock_storage
+
+                mock_agent_service = mock_agent_service_class.return_value
+                mock_agent_service.execute_task = AsyncMock(
+                    return_value={
+                        "output": "worker response",
+                        "file_outputs": [{"filename": "report.txt"}],
+                    }
+                )
+
+                result = await tool.run_json_async({"task": "draft report"})
+
+            assert tool.name == f"agent_{agent.id}"
+            assert tool.description == "Write the final report."
+            assert result["response"] == "worker response"
+            assert result["file_outputs"] == []
+            assert [event["data"]["event_type"] for event in parent_tracer.events] == [
+                "workforce_delegation_start",
+                "workforce_delegation_end",
+            ]
+            assert [event["event_type"] for event in parent_tracer.events] == [
+                "task_update_general",
+                "task_update_general",
+            ]
+            assert parent_tracer.events[0]["task_id"] == "parent-task-2"
+            assert "__audit_only__" not in parent_tracer.events[0]["data"]
+            assert parent_tracer.events[0]["data"]["status"] == "start"
+            assert parent_tracer.events[0]["data"]["workforce_id"] == 123
+            assert parent_tracer.events[0]["data"]["worker_alias"] == "Writer"
+            assert "__audit_only__" not in parent_tracer.events[1]["data"]
+            assert parent_tracer.events[1]["data"]["status"] == "end"
+            assert parent_tracer.events[1]["data"]["output"] == "worker response"
+            assert parent_tracer.events[1]["data"]["output_length"] == len(
+                "worker response"
+            )
+            assert "file_outputs" not in parent_tracer.events[1]["data"]
+
+            tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+            assert tool_config.get_allowed_agent_ids() == []
+            assert tool_config.get_enable_global_agent_tools() is False
+            assert tool_config.get_parent_task_id() == "parent-task-2"
+            assert tool_config.get_parent_tracer() is parent_tracer
+            assert tool_config.get_agent_call_stack() == [99, agent.id]
+
+            tracer = mock_agent_service_class.call_args.kwargs["tracer"]
+            assert tracer is not parent_tracer
+            assert parent_handler not in tracer.handlers
+
+            execute_context = mock_agent_service.execute_task.call_args.kwargs[
+                "context"
+            ]
+            assert execute_context["system_prompt"] == (
+                "Base worker instructions.\n\nWorkforce assignment: write only."
+            )
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_agent_tool_returns_parent_owned_file_refs_for_worker_outputs(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="worker-output-user", password_hash="x", is_admin=False
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            task = Task(id=77, user_id=user.id, title="Parent task")
+            db.add(task)
+            db.commit()
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="File Worker",
+                description="Writes files",
+                instructions="Write a report.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            class ParentTracer:
+                def __init__(self) -> None:
+                    self.handlers = []
+                    self.events = []
+
+                async def trace_event(
+                    self, event_type, task_id=None, step_id=None, data=None
+                ):
+                    self.events.append(
+                        {
+                            "event_type": event_type.value,
+                            "task_id": task_id,
+                            "step_id": step_id,
+                            "data": data or {},
+                        }
+                    )
+
+            parent_tracer = ParentTracer()
+
+            with tempfile.TemporaryDirectory() as workspace_root:
+                worker_workspace = TaskWorkspace(
+                    id=f"agent_{agent.id}_abcd1234",
+                    base_dir=workspace_root,
+                    db_task_id=77,
+                )
+                output_path = worker_workspace.output_dir / "report.txt"
+                output_path.write_text("worker report", encoding="utf-8")
+
+                tool = AgentTool(
+                    agent_id=agent.id,
+                    agent_name=agent.name,
+                    agent_description=agent.description or "",
+                    db=db,
+                    user_id=user.id,
+                    task_id="77",
+                    parent_task_id="77",
+                    parent_tracer=parent_tracer,
+                    workspace_base_dir=workspace_root,
+                    runtime_metadata={"workforce_id": 1},
+                )
+
+                with (
+                    patch(
+                        "xagent.web.services.llm_utils.UserAwareModelStorage"
+                    ) as mock_storage_class,
+                    patch(
+                        "xagent.core.agent.service.AgentService"
+                    ) as mock_agent_service_class,
+                    patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+                ):
+                    mock_storage = Mock()
+                    mock_llm = Mock()
+                    mock_storage.get_llm_by_name_with_access.return_value = mock_llm
+                    mock_storage_class.return_value = mock_storage
+
+                    mock_agent_service = mock_agent_service_class.return_value
+                    mock_agent_service.workspace = worker_workspace
+                    mock_agent_service.execute_task = AsyncMock(
+                        return_value={
+                            "output": "worker response",
+                            "file_outputs": [
+                                {
+                                    "file_path": str(output_path),
+                                    "relative_path": "output/report.txt",
+                                    "filename": "report.txt",
+                                }
+                            ],
+                        }
+                    )
+
+                    result = await tool.run_json_async({"task": "draft report"})
+
+                file_outputs = result["file_outputs"]
+                assert len(file_outputs) == 1
+                assert file_outputs[0]["filename"] == "report.txt"
+                assert file_outputs[0]["download_url"].startswith(
+                    "/api/files/download/"
+                )
+                assert "file_path" not in file_outputs[0]
+                assert "relative_path" not in file_outputs[0]
+
+                file_record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == file_outputs[0]["file_id"])
+                    .one()
+                )
+                canonical_path = (
+                    Path(workspace_root)
+                    / f"user_{user.id}"
+                    / "web_task_77"
+                    / "output"
+                    / "report.txt"
+                )
+                assert file_record.user_id == user.id
+                assert file_record.task_id == 77
+                assert file_record.storage_path == str(canonical_path)
+                assert canonical_path.read_text(encoding="utf-8") == "worker report"
+                assert file_record.workspace_relative_path == "output/report.txt"
+                assert file_record.workspace_category == "output"
+
+                tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+                assert tool_config.get_workspace_config()["db_task_id"] == 77
+                assert parent_tracer.events[-1]["data"]["file_outputs"] == file_outputs
+
+                tracer = mock_agent_service_class.call_args.kwargs["tracer"]
+                execution_task_id = mock_agent_service_class.call_args.kwargs["task_id"]
+                db_handlers = [
+                    handler
+                    for handler in tracer.handlers
+                    if handler.__class__.__name__
+                    == "_DelegatedAgentDatabaseTraceHandler"
+                ]
+                assert len(db_handlers) == 1
+                assert db_handlers[0].task_id == 77
+                assert db_handlers[0].build_id == execution_task_id
+                assert db_handlers[0].metadata["worker_task_id"] == execution_task_id
+                assert db_handlers[0].metadata["parent_task_id"] == "77"
+                assert db_handlers[0].metadata["parent_db_task_id"] == 77
+                assert db_handlers[0].metadata["agent_id"] == agent.id
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_rebinds_worker_owned_file_ids_to_parent_task(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="worker-owned-output-user",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            parent_task = Task(id=77, user_id=user.id, title="Parent task")
+            worker_task = Task(id=88, user_id=user.id, title="Worker task")
+            db.add_all([parent_task, worker_task])
+            db.commit()
+
+            with tempfile.TemporaryDirectory() as workspace_root:
+                worker_workspace = TaskWorkspace(
+                    id="agent_1_abcd1234",
+                    base_dir=workspace_root,
+                    db_task_id=77,
+                )
+                output_path = worker_workspace.output_dir / "report.txt"
+                output_path.write_text("worker report", encoding="utf-8")
+
+                db.add(
+                    UploadedFile(
+                        file_id="worker-owned-output",
+                        user_id=user.id,
+                        task_id=88,
+                        filename="report.txt",
+                        storage_path=str(output_path),
+                        mime_type="text/plain",
+                        file_size=len("worker report"),
+                        workspace_relative_path="output/report.txt",
+                        workspace_category="output",
+                    )
+                )
+                db.commit()
+
+                tool = AgentTool(
+                    agent_id=1,
+                    agent_name="File Worker",
+                    agent_description="Writes files",
+                    db=db,
+                    user_id=user.id,
+                    task_id="77",
+                    parent_task_id="77",
+                    workspace_base_dir=workspace_root,
+                )
+
+                file_outputs = tool._parent_owned_file_outputs(
+                    [
+                        {
+                            "file_id": "worker-owned-output",
+                            "file_path": str(output_path),
+                            "filename": "report.txt",
+                        }
+                    ],
+                    worker_workspace,
+                )
+
+                assert file_outputs is not None
+                assert len(file_outputs) == 1
+                assert file_outputs[0]["file_id"] == "worker-owned-output"
+                file_record = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == "worker-owned-output")
+                    .one()
+                )
+                canonical_path = (
+                    Path(workspace_root)
+                    / f"user_{user.id}"
+                    / "web_task_77"
+                    / "output"
+                    / "report.txt"
+                )
+                assert file_record.task_id == 77
+                assert file_record.storage_path == str(canonical_path)
+                assert canonical_path.read_text(encoding="utf-8") == "worker report"
+                assert file_record.workspace_relative_path == "output/report.txt"
+                assert file_record.workspace_category == "output"
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_omits_workforce_file_outputs_without_parent_db_task_id(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                db=db,
+                user_id=1,
+                task_id="agent_1_abcd1234",
+                parent_task_id="agent_1_abcd1234",
+                runtime_metadata={"workforce_id": 1},
+            )
+
+            file_outputs = [{"file_path": "/tmp/worker-output.txt"}]
+
+            assert tool._parent_owned_file_outputs(file_outputs, workspace=None) == []
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_preserves_non_workforce_file_outputs_without_parent_db_task_id(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                db=db,
+                user_id=1,
+                task_id="agent_1_abcd1234",
+                parent_task_id="agent_1_abcd1234",
+            )
+            file_outputs = [{"file_path": "/tmp/legacy-output.txt"}]
+
+            assert (
+                tool._parent_owned_file_outputs(file_outputs, workspace=None)
+                is file_outputs
+            )
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_agent_tool_does_not_swallow_delegated_output_registration_errors(
+        self,
+        tmp_path,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            output_path = tmp_path / "report.txt"
+            output_path.write_text("worker report", encoding="utf-8")
+            workspace = Mock()
+            workspace.resolve_path.return_value = output_path
+            workspace.register_file.side_effect = RuntimeError("storage unavailable")
+
+            tool = AgentTool(
+                agent_id=1,
+                agent_name="File Worker",
+                agent_description="Writes files",
+                db=db,
+                user_id=1,
+                task_id="77",
+                parent_task_id="77",
+            )
+
+            with pytest.raises(RuntimeError, match="storage unavailable"):
+                tool._parent_owned_file_outputs(
+                    [{"file_path": str(output_path), "filename": "report.txt"}],
+                    workspace,
+                )
         finally:
             db.close()
             try:
@@ -417,16 +1023,22 @@ class TestUpdateAgentTool:
             db.commit()
             db.refresh(existing_agent)
 
-            tool = UpdateAgentTool(db=db, user_id=user.id, task_id="test_task")
+            with patch(
+                "xagent.web.services.agent_store.invalidate_agent_cache"
+            ) as mock_invalidate_agent_cache:
+                tool = UpdateAgentTool(db=db, user_id=user.id, task_id="test_task")
 
-            result = await tool.run_json_async(
-                {
-                    "agent_id": existing_agent.id,
-                    "name": "updated_name",
-                    "description": "Updated description",
-                    "instructions": "Updated instructions",
-                }
-            )
+                result = await tool.run_json_async(
+                    {
+                        "agent_id": existing_agent.id,
+                        "name": "updated_name",
+                        "description": "Updated description",
+                        "instructions": "Updated instructions",
+                    }
+                )
+                mock_invalidate_agent_cache.assert_called_once_with(
+                    user.id, existing_agent.id
+                )
 
             # Verify result
             assert result["status"] == "success"
@@ -517,6 +1129,106 @@ class TestUpdateAgentTool:
 
             assert result["status"] == "error"
             assert "not found" in result["message"].lower()
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_update_agent_rejects_generated_workforce_manager(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_update_generated_manager",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Generated Manager",
+                description="Private manager",
+                instructions="Coordinate the workforce.",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add(generated_manager)
+            db.commit()
+            db.refresh(generated_manager)
+
+            tool = UpdateAgentTool(db=db, user_id=user.id)
+
+            result = await tool.run_json_async(
+                {
+                    "agent_id": generated_manager.id,
+                    "name": "renamed_manager",
+                }
+            )
+
+            assert result["status"] == "error"
+            assert "not found" in result["message"].lower()
+            db.refresh(generated_manager)
+            assert generated_manager.name == "Generated Manager"
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_update_agent_name_conflict_ignores_generated_workforce_manager(
+        self,
+    ) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_update_generated_manager_name",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            visible_agent = Agent(
+                user_id=user.id,
+                name="Visible Agent",
+                status=AgentStatus.DRAFT,
+            )
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Hidden Manager Name",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add_all([visible_agent, generated_manager])
+            db.commit()
+            db.refresh(visible_agent)
+
+            tool = UpdateAgentTool(db=db, user_id=user.id)
+
+            result = await tool.run_json_async(
+                {
+                    "agent_id": visible_agent.id,
+                    "name": "Hidden Manager Name",
+                }
+            )
+
+            assert result["status"] == "success"
+            db.refresh(visible_agent)
+            assert visible_agent.name == "Hidden Manager Name"
 
         finally:
             db.close()
@@ -786,6 +1498,53 @@ class TestListAgentsTool:
                 pass
 
     @pytest.mark.asyncio
+    async def test_list_agents_hides_generated_workforce_managers(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_list_generated_manager",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            regular_agent = Agent(
+                user_id=user.id,
+                name="reusable_agent",
+                description="User reusable agent",
+                status=AgentStatus.PUBLISHED,
+            )
+            generated_manager = Agent(
+                user_id=user.id,
+                name="generated_manager",
+                description="Private workforce manager",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add_all([regular_agent, generated_manager])
+            db.commit()
+
+            tool = ListAgentsTool(db=db, user_id=user.id)
+
+            result = await tool.run_json_async({})
+
+            assert result["status"] == "success"
+            assert result["total_count"] == 1
+            agent_names = {agent["name"] for agent in result["agents"]}
+            assert agent_names == {"reusable_agent"}
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
     async def test_list_agents_with_status_filter(self) -> None:
         """Test listing agents with status filter."""
         db, db_path = _create_session()
@@ -902,19 +1661,19 @@ class TestAgentToolNameGeneration:
     """Test suite for agent tool name generation."""
 
     def test_gen_agent_tool_name_simple(self) -> None:
-        """Test tool name generation with simple name."""
-        result = gen_agent_tool_name("TestAgent")
-        assert result == "call_agent_testagent"  # No spaces, just lowercased
+        """Test tool name generation with an agent ID."""
+        result = gen_agent_tool_name(42)
+        assert result == "agent_42"
 
-    def test_gen_agent_tool_name_with_spaces(self) -> None:
-        """Test tool name generation with spaces."""
-        result = gen_agent_tool_name("Research Assistant")
-        assert result == "call_agent_research_assistant"
+    def test_gen_agent_tool_name_with_string_id(self) -> None:
+        """Test tool name generation with a string agent ID."""
+        result = gen_agent_tool_name("42")
+        assert result == "agent_42"
 
-    def test_gen_agent_tool_name_with_special_chars(self) -> None:
-        """Test tool name generation with special characters."""
-        result = gen_agent_tool_name("AI-Research-Agent_2024")
-        assert result == "call_agent_ai-research-agent_2024"
+    def test_gen_agent_tool_name_rejects_names(self) -> None:
+        """Test tool name generation rejects display names."""
+        with pytest.raises(ValueError):
+            gen_agent_tool_name("Research Assistant")
 
 
 class TestDraftAgentsInTools:
@@ -947,8 +1706,8 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools}
 
-            assert "call_agent_published_agent" in tool_names
-            assert "call_agent_draft_agent" not in tool_names
+            assert f"agent_{published_agent.id}" in tool_names
+            assert f"agent_{draft_agent.id}" not in tool_names
 
         finally:
             db.close()
@@ -986,9 +1745,59 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools}
 
-            assert "call_agent_published_agent" in tool_names
-            assert "call_agent_draft_agent" in tool_names
+            assert f"agent_{published_agent.id}" in tool_names
+            assert f"agent_{draft_agent.id}" in tool_names
 
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    def test_generated_workforce_managers_are_hidden_from_agent_tools(self) -> None:
+        db, db_path = _create_session()
+        try:
+            user = User(
+                username="testuser_generated_manager_tools",
+                password_hash="x",
+                is_admin=False,
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            reusable_agent = Agent(
+                user_id=user.id,
+                name="Reusable Agent",
+                status=AgentStatus.PUBLISHED,
+            )
+            generated_manager = Agent(
+                user_id=user.id,
+                name="Generated Manager",
+                status=AgentStatus.PUBLISHED,
+                origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+            )
+            db.add_all([reusable_agent, generated_manager])
+            db.commit()
+            db.refresh(reusable_agent)
+            db.refresh(generated_manager)
+
+            tools = get_published_agents_tools(db=db, user_id=user.id)
+            tool_names = {tool.name for tool in tools}
+
+            assert f"agent_{reusable_agent.id}" in tool_names
+            assert f"agent_{generated_manager.id}" not in tool_names
+
+            explicitly_allowed_tools = get_published_agents_tools(
+                db=db,
+                user_id=user.id,
+                allowed_agent_ids=[generated_manager.id],
+            )
+
+            assert explicitly_allowed_tools == []
         finally:
             db.close()
             try:
@@ -1024,7 +1833,7 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools_for_user2}
 
-            assert "call_agent_user1_draft" not in tool_names
+            assert f"agent_{draft_agent.id}" not in tool_names
 
         finally:
             db.close()
@@ -1089,7 +1898,7 @@ class TestCreateAndCallAgent:
                 )
                 tool_names = {tool.name for tool in tools}
 
-                assert "call_agent_simple_calculator" in tool_names
+                assert f"agent_{agent_id}" in tool_names
 
                 # Step 3: Verify agent can be loaded
                 agent = db.query(Agent).filter(Agent.id == agent_id).first()
@@ -1235,12 +2044,6 @@ class TestCreateAndCallAgent:
                 task_id="parent-task-mcp",
             )
 
-            fake_mcp_tool = Mock()
-            fake_mcp_tool.name = "mcp_LinkedIn_get_profile"
-            fake_mcp_tool.metadata = Mock()
-            fake_mcp_tool.metadata.category = Mock()
-            fake_mcp_tool.metadata.category.value = "mcp"
-
             with (
                 patch(
                     "xagent.web.services.llm_utils.UserAwareModelStorage"
@@ -1248,10 +2051,6 @@ class TestCreateAndCallAgent:
                 patch(
                     "xagent.core.agent.service.AgentService"
                 ) as mock_agent_service_class,
-                patch(
-                    "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
-                    new=AsyncMock(return_value=[fake_mcp_tool]),
-                ),
                 patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
             ):
                 mock_storage = Mock()
@@ -1266,9 +2065,25 @@ class TestCreateAndCallAgent:
 
                 result = await tool.run_json_async({"task": "get linkedin profile"})
 
+            # The delegation path now hands a typed ToolSelectionSpec to
+            # WebToolConfig (rather than a pre-computed allowed_tools
+            # list). The factory's spec.compute_allowed_names does the
+            # name-level filter at build time. Pin the spec shape here
+            # so a regression that drops mcp:<server> derivation surfaces.
+            from xagent.core.tools.adapters.vibe.selection_spec import (
+                _SpecByCategories,
+            )
+
             assert result["response"] == "nested response"
             tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
-            assert tool_config.get_allowed_tools() == ["mcp_LinkedIn_get_profile"]
+            spec = tool_config.get_tool_selection_spec()
+            assert isinstance(spec, _SpecByCategories), (
+                "mcp:LinkedIn tool_categories must produce a BY_CATEGORIES "
+                "spec, not ALL/NONE -- otherwise the factory's name filter "
+                "won't restrict to LinkedIn MCP tools."
+            )
+            assert "mcp:LinkedIn" in spec.categories
+            assert spec.mcp_servers == frozenset({"LinkedIn"})
         finally:
             db.close()
             try:

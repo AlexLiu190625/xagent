@@ -136,9 +136,22 @@ class WebToolConfig(BaseToolConfig):
         browser_tools_enabled: bool = True,
         allowed_collections: Optional[List[str]] = None,
         allowed_skills: Optional[List[str]] = None,
-        allowed_tools: Optional[List[str]] = None,
+        allowed_agent_ids: Optional[List[int]] = None,
+        agent_tool_overrides: Optional[Dict[int, Dict[str, Any]]] = None,
+        enable_global_agent_tools: bool = True,
+        allow_cross_user_agent_ids: bool = False,
+        parent_task_id: Optional[str] = None,
+        parent_tracer: Optional[Any] = None,
+        agent_call_stack: Optional[List[int]] = None,
         sandbox: Optional[Any] = None,
+        tool_selection_spec: Optional[Any] = None,
     ):
+        # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
+        # the tools adapter package; typed as ``Any`` here to avoid an
+        # import cycle (web.tools → core.tools.adapters). The factory
+        # reads ``config.get_tool_selection_spec()``. ``None`` defaults
+        # to the ``_SpecAll`` ALL-mode (build every default tool).
+        self._tool_selection_spec = tool_selection_spec
         self.db = db
         self.request = request
         self._user_id = (
@@ -166,7 +179,15 @@ class WebToolConfig(BaseToolConfig):
         self._browser_tools_enabled = browser_tools_enabled
         self._allowed_collections = allowed_collections
         self._allowed_skills = allowed_skills
-        self._allowed_tools = allowed_tools
+        self._allowed_agent_ids = allowed_agent_ids
+        self._agent_tool_overrides = (
+            agent_tool_overrides if isinstance(agent_tool_overrides, dict) else {}
+        )
+        self._enable_global_agent_tools = bool(enable_global_agent_tools)
+        self._allow_cross_user_agent_ids = bool(allow_cross_user_agent_ids)
+        self._parent_task_id = parent_task_id
+        self._parent_tracer = parent_tracer
+        self._agent_call_stack = list(agent_call_stack or [])
         self._excluded_agent_id: Optional[int] = None
 
         # Cache user object for hook queries.
@@ -324,9 +345,44 @@ class WebToolConfig(BaseToolConfig):
         """Get allowed skill names. None means all skills are allowed."""
         return self._allowed_skills
 
-    def get_allowed_tools(self) -> Optional[List[str]]:
-        """Get allowed tool names. None means all tools are allowed."""
-        return self._allowed_tools
+    def get_tool_selection_spec(self) -> Optional[Any]:
+        """Typed spec accessor (preferred over :meth:`get_allowed_tools`).
+
+        Returns a :class:`ToolSelectionSpec` instance when the caller
+        supplied one via ``tool_selection_spec=ToolSelectionSpec.from_raw(...)``.
+        ``ToolFactory.create_all_tools`` reads this first; falls back to
+        ``get_allowed_tools()`` only if this returns ``None`` (legacy
+        backward-compat).
+        """
+        return self._tool_selection_spec
+
+    def get_allowed_agent_ids(self) -> Optional[List[int]]:
+        """Get explicitly allowed published agent IDs. None means use defaults."""
+        return self._allowed_agent_ids
+
+    def get_agent_tool_overrides(self) -> Dict[int, Dict[str, Any]]:
+        """Get per-agent tool metadata/runtime overrides for delegation."""
+        return self._agent_tool_overrides
+
+    def get_enable_global_agent_tools(self) -> bool:
+        """Whether to include globally visible published agents as tools."""
+        return self._enable_global_agent_tools
+
+    def get_allow_cross_user_agent_ids(self) -> bool:
+        """Whether explicit allowed agent IDs may cross the current user boundary."""
+        return self._allow_cross_user_agent_ids
+
+    def get_parent_task_id(self) -> Optional[str]:
+        """Get parent task ID for delegated tool execution."""
+        return self._parent_task_id
+
+    def get_parent_tracer(self) -> Optional[Any]:
+        """Get parent tracer for delegated tool execution."""
+        return self._parent_tracer
+
+    def get_agent_call_stack(self) -> List[int]:
+        """Get active agent delegation call stack for recursion prevention."""
+        return self._agent_call_stack
 
     def get_user_tool_overrides(self) -> dict:
         """Return per-user tool overrides from the registered hook.
@@ -345,6 +401,12 @@ class WebToolConfig(BaseToolConfig):
             logger.exception("Failed to get user tool overrides")
             self._cached_tool_overrides = {}
         return self._cached_tool_overrides
+
+    def refresh_user_tool_overrides(self) -> dict:
+        """Reload per-user tool overrides from the registered hook."""
+        # The policy can change while an AgentService instance is reused.
+        self._cached_tool_overrides = None
+        return self.get_user_tool_overrides()
 
     def get_excluded_agent_id(self) -> Optional[int]:
         """Get agent ID to exclude from agent tools (to prevent self-calls)."""

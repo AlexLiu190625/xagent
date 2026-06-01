@@ -1,9 +1,8 @@
 """Test authentication API functionality"""
 
 import os
-
-# Test database setup - use file-based database for testing
 import tempfile
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 from fastapi import FastAPI
@@ -11,7 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.web.api.auth import auth_router
+from xagent.web.api.auth import auth_router, hash_password
 from xagent.web.models.database import Base, get_db
 from xagent.web.models.user import User
 
@@ -45,10 +44,13 @@ client = TestClient(test_app)
 
 
 def setup_first_admin(
-    username: str = "administrator", password: str = "admin123"
+    username: str = "administrator",
+    password: str = "admin123",
+    email: str = "administrator@example.com",
 ) -> None:
     response = client.post(
-        "/api/auth/setup-admin", json={"username": username, "password": password}
+        "/api/auth/setup-admin",
+        json={"username": username, "email": email, "password": password},
     )
     assert response.status_code == 200
     data = response.json()
@@ -112,13 +114,17 @@ def test_db():
 @pytest.fixture(scope="function")
 def test_user_data():
     """Test user data"""
-    return {"username": "testuser", "password": "testpassword123"}
+    return {
+        "username": "testuser",
+        "email": "testuser@example.com",
+        "password": "testpassword123",
+    }
 
 
 @pytest.fixture(scope="function")
 def test_admin_data():
     """Test admin user data"""
-    return {"username": "admin", "password": "admin123"}
+    return {"username": "admin", "email": "admin@example.com", "password": "admin123"}
 
 
 class TestAuthAPI:
@@ -138,8 +144,97 @@ class TestAuthAPI:
         assert data["success"] is True
         assert data["message"] == "Login successful"
         assert data["user"]["username"] == test_user_data["username"]
+        assert data["user"]["email"] == test_user_data["email"]
         assert "id" in data["user"]
         assert "loginTime" in data["user"]
+
+    def test_login_success_with_email(self, test_db, test_user_data):
+        """Test successful user login with email"""
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        response = client.post(
+            "/api/auth/login",
+            json={
+                "username": test_user_data["email"],
+                "password": test_user_data["password"],
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["user"]["username"] == test_user_data["username"]
+        assert data["user"]["email"] == test_user_data["email"]
+
+    def test_get_current_user_profile(self, test_db, test_user_data):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        response = client.get(
+            "/api/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["user"]["username"] == test_user_data["username"]
+        assert data["user"]["email"] == test_user_data["email"]
+
+    def test_update_current_user_email(self, test_db, test_user_data):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        token = login_and_get_token(
+            test_user_data["username"], test_user_data["password"]
+        )
+        response = client.patch(
+            "/api/auth/email",
+            json={"email": "updated@example.com"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert data["user"]["email"] == "updated@example.com"
+
+    def test_update_current_user_email_rejects_duplicate(self, test_db):
+        setup_first_admin()
+        response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "firstuser",
+                "email": "first@example.com",
+                "password": "password123",
+            },
+        )
+        assert response.status_code == 200
+
+        response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "seconduser",
+                "email": "second@example.com",
+                "password": "password123",
+            },
+        )
+        assert response.status_code == 200
+
+        token = login_and_get_token("seconduser", "password123")
+        response = client.patch(
+            "/api/auth/email",
+            json={"email": "first@example.com"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["message"] == "Email already exists"
 
     def test_login_invalid_credentials(self, test_db, test_user_data):
         """Test login with invalid credentials"""
@@ -217,6 +312,23 @@ class TestAuthAPI:
         assert data["success"] is False
         assert data["message"] == "Username already exists"
 
+    def test_register_duplicate_email(self, test_db, test_user_data):
+        """Test registration with duplicate email"""
+        setup_first_admin()
+        response1 = client.post("/api/auth/register", json=test_user_data)
+        assert response1.status_code == 200
+
+        duplicate_email_data = {
+            "username": "another-user",
+            "email": test_user_data["email"],
+            "password": "anotherpassword123",
+        }
+        response2 = client.post("/api/auth/register", json=duplicate_email_data)
+        assert response2.status_code == 200
+        data = response2.json()
+        assert data["success"] is False
+        assert data["message"] == "Email already exists"
+
     def test_register_missing_fields(self, test_db):
         """Test registration with missing fields"""
         incomplete_data = {
@@ -225,6 +337,17 @@ class TestAuthAPI:
         }
         response = client.post("/api/auth/register", json=incomplete_data)
         assert response.status_code == 422  # Validation error
+
+    def test_register_requires_email(self, test_db):
+        setup_first_admin()
+        response = client.post(
+            "/api/auth/register",
+            json={"username": "testuser", "password": "testpassword123"},
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["message"] == "Email is required"
 
     def test_auth_check_endpoint(self, test_db):
         """Test auth check endpoint"""
@@ -268,15 +391,28 @@ class TestAuthAPI:
         assert admin_user is not None
 
         assert bool(admin_user.is_admin) is True
+        assert admin_user.email == test_admin_data["email"]
         db.close()
 
     def test_multiple_users(self, test_db):
         """Test creating multiple users"""
         setup_first_admin()
         users = [
-            {"username": "user1", "password": "password1"},
-            {"username": "user2", "password": "password2"},
-            {"username": "user3", "password": "password3"},
+            {
+                "username": "user1",
+                "email": "user1@example.com",
+                "password": "password1",
+            },
+            {
+                "username": "user2",
+                "email": "user2@example.com",
+                "password": "password2",
+            },
+            {
+                "username": "user3",
+                "email": "user3@example.com",
+                "password": "password3",
+            },
         ]
 
         for user_data in users:
@@ -308,17 +444,281 @@ class TestAuthAPI:
     def test_setup_admin_rejected_after_initialized(self, test_db):
         setup_first_admin()
         response = client.post(
-            "/api/auth/setup-admin", json={"username": "root2", "password": "root234"}
+            "/api/auth/setup-admin",
+            json={
+                "username": "root2",
+                "email": "root2@example.com",
+                "password": "root234",
+            },
         )
         assert response.status_code == 200
         data = response.json()
         assert data["success"] is False
 
+    def test_forgot_password_and_reset_password(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+        assert register_response.json()["success"] is True
+
+        sent_payload: dict[str, str] = {}
+
+        def fake_send_password_reset_email(
+            to_email: str, reset_link: str, app_name: str
+        ) -> None:
+            sent_payload["to_email"] = to_email
+            sent_payload["reset_link"] = reset_link
+            sent_payload["app_name"] = app_name
+
+        monkeypatch.setattr(
+            "xagent.web.api.auth.send_password_reset_email",
+            fake_send_password_reset_email,
+        )
+        monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://app.example.com")
+
+        forgot_response = client.post(
+            "/api/auth/forgot-password", json={"email": test_user_data["email"]}
+        )
+        assert forgot_response.status_code == 200
+        forgot_data = forgot_response.json()
+        assert forgot_data["success"] is True
+        assert (
+            forgot_data["message"]
+            == "If the email exists, a password reset link has been sent"
+        )
+        assert sent_payload["to_email"] == test_user_data["email"]
+        assert (
+            sent_payload["reset_link"].startswith(
+                "https://app.example.com/reset-password?token="
+            )
+            is True
+        )
+
+        token = sent_payload["reset_link"].split("token=", 1)[1]
+        reset_response = client.post(
+            "/api/auth/reset-password",
+            json={"token": token, "new_password": "newpassword123"},
+        )
+        assert reset_response.status_code == 200
+        reset_data = reset_response.json()
+        assert reset_data["success"] is True
+
+        login_response = client.post(
+            "/api/auth/login",
+            json={
+                "username": test_user_data["username"],
+                "password": "newpassword123",
+            },
+        )
+        assert login_response.status_code == 200
+
+    def test_forgot_password_unknown_email_returns_generic_success(
+        self, test_db, monkeypatch
+    ):
+        setup_first_admin()
+
+        def fail_if_called(*args, **kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("email sender should not be called")
+
+        monkeypatch.setattr(
+            "xagent.web.api.auth.send_password_reset_email",
+            fail_if_called,
+        )
+
+        response = client.post(
+            "/api/auth/forgot-password", json={"email": "unknown@example.com"}
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert (
+            data["message"]
+            == "If the email exists, a password reset link has been sent"
+        )
+
+    def test_forgot_password_ignores_origin_header_for_reset_link(
+        self, test_db, test_user_data, monkeypatch
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        sent_payload: dict[str, str] = {}
+
+        def fake_send_password_reset_email(
+            to_email: str, reset_link: str, app_name: str
+        ) -> None:
+            sent_payload["to_email"] = to_email
+            sent_payload["reset_link"] = reset_link
+            sent_payload["app_name"] = app_name
+
+        monkeypatch.setattr(
+            "xagent.web.api.auth.send_password_reset_email",
+            fake_send_password_reset_email,
+        )
+        monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://trusted.example/app/")
+
+        response = client.post(
+            "/api/auth/forgot-password",
+            json={"email": test_user_data["email"]},
+            headers={"Origin": "https://evil.example"},
+        )
+        assert response.status_code == 200
+        assert sent_payload["to_email"] == test_user_data["email"]
+        parsed_link = urlparse(sent_payload["reset_link"])
+        assert parsed_link.scheme == "https"
+        assert parsed_link.netloc == "trusted.example"
+        assert parsed_link.path == "/app/reset-password"
+        assert "token" in parse_qs(parsed_link.query)
+
+    def test_forgot_password_delivery_failure_returns_generic_success(
+        self, test_db, test_user_data, monkeypatch, caplog
+    ):
+        setup_first_admin()
+        register_response = client.post("/api/auth/register", json=test_user_data)
+        assert register_response.status_code == 200
+
+        monkeypatch.delenv("XAGENT_APP_BASE_URL", raising=False)
+
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger="xagent.web.api.auth"):
+            response = client.post(
+                "/api/auth/forgot-password",
+                json={"email": test_user_data["email"]},
+            )
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is True
+        assert (
+            data["message"]
+            == "If the email exists, a password reset link has been sent"
+        )
+        assert any(
+            "Failed to send password reset email" in r.message for r in caplog.records
+        )
+
+    def test_register_rejects_email_shaped_username(self, test_db):
+        setup_first_admin()
+
+        response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "person@example.com",
+                "email": "newperson@example.org",
+                "password": "password123",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["success"] is False
+        assert data["message"] == "Username cannot be an email address"
+
+    def test_register_rejects_email_colliding_with_existing_legacy_username(
+        self, test_db
+    ):
+        setup_first_admin()
+        db = TestingSessionLocal()
+        db.add(
+            User(
+                username="legacy@example.com",
+                email="legacy-user@example.com",
+                password_hash=hash_password("password123"),
+                is_admin=False,
+            )
+        )
+        db.commit()
+        db.close()
+
+        conflict_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "another-user",
+                "email": "legacy@example.com",
+                "password": "password123",
+            },
+        )
+        assert conflict_response.status_code == 200
+        conflict_data = conflict_response.json()
+        assert conflict_data["success"] is False
+        assert conflict_data["message"] == "Email conflicts with an existing username"
+
+    def test_update_current_user_email_rejects_existing_legacy_username_namespace(
+        self, test_db
+    ):
+        setup_first_admin()
+        db = TestingSessionLocal()
+        db.add(
+            User(
+                username="legacy@example.com",
+                email="legacy-existing@example.com",
+                password_hash=hash_password("password123"),
+                is_admin=False,
+            )
+        )
+        db.commit()
+        db.close()
+
+        client.post(
+            "/api/auth/register",
+            json={
+                "username": "updater",
+                "email": "updater@example.com",
+                "password": "password123",
+            },
+        )
+
+        token = login_and_get_token("updater", "password123")
+        conflict_response = client.patch(
+            "/api/auth/email",
+            json={"email": "legacy@example.com"},
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert conflict_response.status_code == 200
+        conflict_data = conflict_response.json()
+        assert conflict_data["success"] is False
+        assert conflict_data["message"] == "Email conflicts with an existing username"
+
+    def test_login_prefers_email_lookup_when_identifier_is_email(self, test_db):
+        setup_first_admin()
+        db = TestingSessionLocal()
+        email_user = User(
+            username="email-owner",
+            email="shared@example.com",
+            password_hash=hash_password("email-password"),
+            is_admin=False,
+        )
+        conflicting_username_user = User(
+            username="shared@example.com",
+            email="other@example.com",
+            password_hash=hash_password("username-password"),
+            is_admin=False,
+        )
+        db.add(email_user)
+        db.add(conflicting_username_user)
+        db.commit()
+        db.close()
+
+        response = client.post(
+            "/api/auth/login",
+            json={"username": "shared@example.com", "password": "email-password"},
+        )
+        assert response.status_code == 200
+        assert response.json()["user"]["username"] == "email-owner"
+
     def test_register_switch_requires_admin(self, test_db):
         setup_first_admin()
 
         client.post(
-            "/api/auth/register", json={"username": "normal", "password": "normal123"}
+            "/api/auth/register",
+            json={
+                "username": "normal",
+                "email": "normal@example.com",
+                "password": "normal123",
+            },
         )
         normal_token = login_and_get_token("normal", "normal123")
 
@@ -342,7 +742,12 @@ class TestAuthAPI:
         assert disable_response.json()["registration_enabled"] is False
 
         register_response = client.post(
-            "/api/auth/register", json={"username": "blocked", "password": "blocked123"}
+            "/api/auth/register",
+            json={
+                "username": "blocked",
+                "email": "blocked@example.com",
+                "password": "blocked123",
+            },
         )
         assert register_response.status_code == 200
         data = register_response.json()

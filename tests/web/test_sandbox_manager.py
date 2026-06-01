@@ -2,7 +2,7 @@
 
 import os
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -385,6 +385,40 @@ class TestSandboxConfigParsing:
         assert config.volumes[0][1] == "/data"
         assert config.volumes[0][2] == "ro"
 
+    def test_sibling_mode_rejects_tilde_sandbox_volume_source(self):
+        """Docker sibling mode must not expand backend-container home paths."""
+        mock_service = MagicMock()
+        manager = SandboxManager(mock_service)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/host/.xagent",
+                "SANDBOX_VOLUMES": "~/data:/data:ro",
+            },
+            clear=True,
+        ):
+            _, config = manager._get_sandbox_image_and_config()
+
+        assert config.volumes is None
+
+    def test_sibling_mode_rejects_relative_sandbox_volume_source(self):
+        """Docker sibling mode requires host-side absolute volume sources."""
+        mock_service = MagicMock()
+        manager = SandboxManager(mock_service)
+
+        with patch.dict(
+            "os.environ",
+            {
+                "XAGENT_SANDBOX_HOST_STORAGE_ROOT": "/host/.xagent",
+                "SANDBOX_VOLUMES": "relative:/data:ro",
+            },
+            clear=True,
+        ):
+            _, config = manager._get_sandbox_image_and_config()
+
+        assert config.volumes is None
+
     def test_volume_parsing_empty(self):
         """Test empty volumes string results in None."""
         mock_service = MagicMock()
@@ -478,6 +512,68 @@ class TestSandboxConfigParsing:
 
         assert config.env == {"KEY": "val"}
         assert config.volumes == [("/host", "/container", "ro")]
+
+
+class TestSandboxLifecycleConfig:
+    """Test sandbox lifecycle identity and runtime config consistency."""
+
+    @pytest.mark.asyncio
+    async def test_same_lifecycle_rejects_different_workspace_config(self, tmp_path):
+        """Same sandbox name should not be deleted/recreated for another workspace."""
+        service = AsyncMock()
+        service.get_or_create = AsyncMock(return_value=MagicMock())
+        service.delete = AsyncMock()
+        manager = SandboxManager(service)
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            await manager.get_or_create_sandbox(
+                "user",
+                "42",
+                workspace_config={"base_dir": str(tmp_path / "user_42")},
+            )
+            with pytest.raises(RuntimeError, match="different runtime configuration"):
+                await manager.get_or_create_sandbox(
+                    "user",
+                    "42",
+                    workspace_config={"base_dir": str(tmp_path / "build_preview")},
+                )
+
+        service.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_distinct_lifecycles_allow_distinct_workspace_configs(self, tmp_path):
+        """Build preview and chat should not compete for the same sandbox name."""
+        service = AsyncMock()
+        service.get_or_create = AsyncMock(side_effect=[MagicMock(), MagicMock()])
+        manager = SandboxManager(service)
+
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[("/repo/src", "/app/src", "ro")],
+            ),
+        ):
+            await manager.get_or_create_sandbox(
+                "user",
+                "42",
+                workspace_config={"base_dir": str(tmp_path / "user_42")},
+            )
+            await manager.get_or_create_sandbox(
+                "build_preview",
+                "42",
+                workspace_config={"base_dir": str(tmp_path / "build_preview")},
+            )
+
+        assert service.get_or_create.await_count == 2
+        assert service.get_or_create.await_args_list[0].args[0] == "user::42"
+        assert service.get_or_create.await_args_list[1].args[0] == "build_preview::42"
 
 
 class TestSandboxManagerWarmup:

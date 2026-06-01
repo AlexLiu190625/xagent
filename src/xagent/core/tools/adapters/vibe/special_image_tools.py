@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool
+@register_tool(categories={"image"})
 async def create_special_image_tools(config: "BaseToolConfig") -> List[Any]:
     """Create special image tools (image web search, logo overlay)."""
     tools = []

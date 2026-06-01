@@ -8,9 +8,9 @@ import { Switch } from "@/components/ui/switch"
 import { Label } from "@/components/ui/label"
 import { Input } from "@/components/ui/input"
 import { Badge } from "@/components/ui/badge"
-import { Rocket, LayoutGrid, Code2, Share, Webhook, ArrowRight, Copy, Check, MoreVertical } from "lucide-react"
+import { Rocket, LayoutGrid, Code2, Share, Webhook, ArrowRight, Copy, Check } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
 
@@ -24,6 +24,11 @@ export interface Agent {
   updated_at: string
   widget_enabled: boolean
   allowed_domains: string[]
+  access?: string
+  readonly?: boolean
+  can_edit?: boolean
+  can_publish?: boolean
+  can_delete?: boolean
 }
 
 interface DeployAgentDialogProps {

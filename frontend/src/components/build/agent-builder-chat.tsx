@@ -5,9 +5,14 @@ import { ChatInput } from "@/components/chat/ChatInput"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { useAuth } from "@/contexts/auth-context"
 import { getApiUrl, getUploadApiUrl } from "@/lib/utils"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
+import { normalizeTaskCompletedMessage } from "@/lib/task-completion"
+import {
+  normalizeTraceProcessStatus,
+  type TraceProcessStatus,
+} from "@/lib/trace-process-status"
 import { useI18n } from "@/contexts/i18n-context"
-import { toast } from "sonner"
+import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 
 import { Interaction } from "@/contexts/app-context-chat"
@@ -20,6 +25,21 @@ interface Message {
   traceEvents?: any[]
   timestamp?: number
   interactions?: Interaction[]
+  processStatus?: TraceProcessStatus
+}
+
+const updateLastAssistantMessage = (
+  messages: Message[],
+  update: (message: Message) => Message
+): Message[] => {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i].role === "assistant") {
+      const updated = [...messages]
+      updated[i] = update(messages[i])
+      return updated
+    }
+  }
+  return messages
 }
 
 export interface AgentConfig {
@@ -60,6 +80,13 @@ interface BuildChatPayload {
   files?: { file_id: string; name: string; size: number; type: string }[]
 }
 
+type UploadedBuildFile = {
+  file_id: string
+  name: string
+  size: number
+  type: string
+}
+
 interface AgentBuilderChatProps {
   agentConfig: AgentConfig
   onUpdateConfig: (config: Partial<AgentConfig>) => void
@@ -71,6 +98,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   const { t } = useI18n()
   const { token } = useAuth()
   const [messages, setMessages] = useState<Message[]>([])
+  const [files, setFiles] = useState<File[]>([])
   const branding = getBrandingFromEnv()
 
   // Set initial message on mount to avoid hydration mismatch and get translation
@@ -114,7 +142,7 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
   }, [messages])
 
   const handleSendMessage = useCallback(async (text: string, files?: File[], metadata?: any) => {
-    if ((!text.trim() && (!files || files.length === 0)) || isLoading) return
+    if ((!text.trim() && (!files || files.length === 0)) || isLoading) return false
 
     let displayMessage: string | React.ReactNode = text || t("chatPage.clarification.uploadedFiles")
     if (files && files.length > 0) {
@@ -138,36 +166,58 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
     let currentReply = ""
     let finalMessage = text;
-    let uploadedFileIds: { file_id: string; name: string; size: number; type: string }[] = [];
+    let uploadedFileIds: UploadedBuildFile[] = [];
 
     if (files && files.length > 0) {
       try {
-        const formData = new FormData();
-        files.forEach(f => formData.append('files', f));
-        formData.append('task_type', 'task');
+        const filesToUpload = files.filter((file) => typeof (file as File & { file_id?: string }).file_id !== "string")
+        uploadedFileIds = files
+          .map((file) => {
+            const fileId = (file as File & { file_id?: string }).file_id
+            if (typeof fileId !== "string") return null
+            return {
+              file_id: fileId,
+              name: file.name,
+              size: file.size,
+              type: file.type || "",
+            }
+          })
+          .filter((file): file is UploadedBuildFile => file !== null)
 
-        const uploadResponse = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
-          method: 'POST',
-          body: formData,
-        });
-        if (!uploadResponse.ok) {
-          throw new Error(`Upload failed: ${uploadResponse.statusText}`);
-        }
-        const uploadData = await uploadResponse.json();
-        if (uploadData.success && Array.isArray(uploadData.files)) {
-          uploadedFileIds = uploadData.files.map((f: any) => ({
-            file_id: f.file_id,
-            name: f.filename || '',
-            size: f.file_size || 0,
-            type: f.mime_type || '',
-          }));
+        if (filesToUpload.length > 0) {
+          const formData = new FormData();
+          filesToUpload.forEach(f => formData.append('files', f));
+          formData.append('task_type', 'task');
+
+          const uploadResponse = await apiRequest(`${getUploadApiUrl()}/api/files/upload`, {
+            method: 'POST',
+            body: formData,
+          });
+          const parsed = await parseApiResponse(uploadResponse);
+          if (!uploadResponse.ok) {
+            throw new Error(getUploadErrorMessage(uploadResponse, parsed, {
+              generic: "Failed to upload files",
+              ...UPLOAD_ERROR_MESSAGES,
+            }));
+          }
+          const uploadData = parsed.data;
+          if (isJsonRecord(uploadData) && uploadData.success && Array.isArray(uploadData.files)) {
+            uploadedFileIds.push(
+              ...uploadData.files.map((f: any) => ({
+                file_id: f.file_id,
+                name: f.filename || '',
+                size: f.file_size || 0,
+                type: f.mime_type || '',
+              }))
+            );
+          }
         }
       } catch (err) {
         console.error("Failed to upload files", err);
-        toast.error("Failed to upload files");
+        toast.error(err instanceof Error ? err.message : "Failed to upload files");
         setIsLoading(false);
         setMessages(prev => prev.slice(0, -1));
-        return;
+        return false;
       }
     } else if (metadata?.url) {
       const url = metadata.url;
@@ -214,15 +264,10 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
             if (data.type === "trace_event") {
               // Update the last message (assistant) with the new trace event
               setMessages(prev => {
-                const updated = [...prev]
-                const lastMsg = updated[updated.length - 1]
-                if (lastMsg && lastMsg.role === 'assistant') {
-                  updated[updated.length - 1] = {
-                    ...lastMsg,
+                return updateLastAssistantMessage(prev, lastMsg => ({
+                  ...lastMsg,
                     traceEvents: [...(lastMsg.traceEvents || []), data]
-                  }
-                }
-                return updated
+                }))
               })
 
               if (data.event_type === "ai_message") {
@@ -280,9 +325,10 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               } else if (data.event_type === "agent_message") {
                 const displayReply = data.data?.message || ""
                 const interactions = data.data?.metadata?.interactions
-                if (data.data?.expect_response) {
-                  setIsLoading(false)
+                if (!data.data?.expect_response && data.data?.message_type !== "question") {
+                  return
                 }
+                setIsLoading(false)
                 setMessages(prev => {
                   const updated = [...prev]
                   const lastMsg = updated[updated.length - 1]
@@ -350,21 +396,30 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               }
             } else if (data.type === "task_completed") {
               setIsLoading(false)
+              const taskCompletion = normalizeTaskCompletedMessage(data)
 
               // The backend no longer sends config_updates in task_completed.
               // We handle it in tool_execution_end.
 
-              let finalContent = typeof data.result === 'object' ? data.result.content : data.result;
+              let finalContent = taskCompletion.result && typeof taskCompletion.result === 'object' ? (taskCompletion.result as any).content : taskCompletion.result;
               finalContent = finalContent || currentReply;
 
               let cleanReply = typeof finalContent === 'string' ? finalContent.replace(/```json[\s\S]*?(```|$)/gi, "").trim() : "";
               let interactions = undefined;
+              const resultRecord = taskCompletion.result && typeof taskCompletion.result === 'object'
+                ? taskCompletion.result as any
+                : null;
 
               // Check if we have chat_response structure
-              if (typeof data.result === 'object' && data.result.chat_response) {
-                interactions = data.result.chat_response.interactions;
-                if (data.result.chat_response.message) {
-                  cleanReply = data.result.chat_response.message;
+              if (taskCompletion.chatResponse && typeof taskCompletion.chatResponse === 'object') {
+                interactions = (taskCompletion.chatResponse as any).interactions;
+                if ((taskCompletion.chatResponse as any).message) {
+                  cleanReply = (taskCompletion.chatResponse as any).message;
+                }
+              } else if (resultRecord?.chat_response) {
+                interactions = resultRecord.chat_response.interactions;
+                if (resultRecord.chat_response.message) {
+                  cleanReply = resultRecord.chat_response.message;
                 }
               }
 
@@ -395,17 +450,27 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               }
 
               setMessages(prev => {
-                const updated = [...prev]
-                updated[updated.length - 1].content = cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request."
-                if (interactions) {
-                  updated[updated.length - 1].interactions = interactions;
-                }
-                return updated
+                return updateLastAssistantMessage(prev, message => ({
+                  ...message,
+                  content: cleanReply || t("builds.configForm.chat.defaultReply") || "I have updated the configuration based on your request.",
+                  interactions: interactions || message.interactions,
+                  processStatus: taskCompletion.status,
+                }))
               })
 
               currentReply = ""
             } else if (data.type === "error" || data.type === "task_error") {
               setIsLoading(false)
+              const processStatus =
+                normalizeTraceProcessStatus(data.task?.status) ||
+                normalizeTraceProcessStatus(data.status) ||
+                "failed"
+              setMessages(prev => {
+                return updateLastAssistantMessage(prev, message => ({
+                  ...message,
+                  processStatus,
+                }))
+              })
               toast.error(data.message || data.error || t("builds.configForm.chat.errorCommunicate", { appName: branding.appName }))
               ws.close()
             }
@@ -429,7 +494,9 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
       console.error(error)
       toast.error(t("builds.configForm.chat.errorInit") || "Failed to initialize connection.")
       setIsLoading(false)
+      return false
     }
+    return true
   }, [messages, isLoading, token, agentConfig, onUpdateConfig])
 
   const handleStop = () => {
@@ -460,9 +527,15 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
               content={msg.content}
               traceEvents={msg.traceEvents}
               showProcessView={true}
+              processStatus={msg.processStatus}
               timestamp={msg.timestamp}
               interactions={msg.interactions}
-              onSendInteraction={(text, files, meta) => handleSendMessage(text, files, meta)}
+              onSendInteraction={async (text, files, meta) => {
+                const didSend = await handleSendMessage(text, files, meta)
+                if (!didSend) {
+                  throw new Error("Failed to send interaction")
+                }
+              }}
             />
           ))}
         </div>
@@ -470,11 +543,17 @@ export function AgentBuilderChat({ agentConfig, onUpdateConfig, availableOptions
 
       <div className="p-4 bg-background border-t">
         <ChatInput
-          onSend={(text) => handleSendMessage(text)}
+          onSend={async (text) => {
+            const didSend = await handleSendMessage(text, files)
+            if (didSend) {
+              setFiles([])
+            }
+          }}
           isLoading={isLoading}
           hideConfig={true}
-          hideFileUpload={true}
           compact={true}
+          files={files}
+          onFilesChange={setFiles}
         />
       </div>
     </div>

@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 
+from xagent.config import WEB_CRAWL_TLS_IMPERSONATE
 from xagent.core.tools.adapters.vibe.agent_kb_service import (
     AgentKnowledgeBaseError,
     AgentKnowledgeBaseService,
@@ -119,7 +120,9 @@ async def test_agent_kb_service_refresh_collection_metadata_raises_on_failure():
 
 
 @pytest.mark.asyncio
-async def test_create_kb_from_url_uses_shared_service():
+async def test_create_kb_from_url_uses_shared_service(monkeypatch):
+    monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, "auto")
+
     ingest_result = WebIngestionResult(
         status="success",
         collection="agent_url_kb",
@@ -138,6 +141,7 @@ async def test_create_kb_from_url_uses_shared_service():
     service = MagicMock()
     service.prepare_collection = AsyncMock(return_value="agent_url_kb")
     service.refresh_collection_metadata = AsyncMock()
+    run_web_ingestion_mock = AsyncMock(return_value=ingest_result)
 
     with (
         patch(
@@ -146,7 +150,7 @@ async def test_create_kb_from_url_uses_shared_service():
         ),
         patch(
             "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.run_web_ingestion",
-            new=AsyncMock(return_value=ingest_result),
+            new=run_web_ingestion_mock,
         ),
     ):
         tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
@@ -163,6 +167,9 @@ async def test_create_kb_from_url_uses_shared_service():
         == DEFAULT_EMBEDDING_MODEL_ID
     )
     service.refresh_collection_metadata.assert_awaited_once_with("agent_url_kb")
+    run_web_ingestion_mock.assert_awaited_once()
+    _, run_kwargs = run_web_ingestion_mock.await_args
+    assert run_kwargs["crawl_config"].tls_impersonate == "auto"
 
 
 @pytest.mark.asyncio
@@ -184,6 +191,30 @@ async def test_create_kb_from_url_returns_error_when_shared_service_fails():
 
     assert result["success"] is False
     assert result["message"] == "config save failed"
+
+
+@pytest.mark.asyncio
+async def test_create_kb_from_url_rejects_invalid_start_url():
+    service = MagicMock()
+    service.prepare_collection = AsyncMock()
+    service.refresh_collection_metadata = AsyncMock()
+
+    with patch(
+        "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
+        return_value=service,
+    ):
+        tool = CreateKnowledgeBaseFromUrlTool(user_id=71, is_admin=False)
+        result = await tool.run_json_async(
+            {"url": "www.example.com", "collection_name": "agent_url_kb"}
+        )
+
+    assert result["success"] is False
+    assert (
+        result["message"]
+        == "Invalid start_url: URL must start with http:// or https://"
+    )
+    service.prepare_collection.assert_not_awaited()
+    service.refresh_collection_metadata.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -248,6 +279,74 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
         == DEFAULT_EMBEDDING_MODEL_ID
     )
     service.refresh_collection_metadata.assert_awaited_once_with("agent_file_kb")
+    db.close.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion(
+    tmp_path,
+):
+    missing_source = tmp_path / "missing-notes.txt"
+    restored_source = tmp_path / "restored-notes.txt"
+    restored_source.write_text("restored", encoding="utf-8")
+    file_record = SimpleNamespace(
+        filename="notes.txt",
+        storage_path=str(missing_source),
+        file_id="file-1",
+    )
+
+    query = MagicMock()
+    query.filter.return_value = query
+    query.all.return_value = [file_record]
+
+    db = MagicMock()
+    db.query.return_value = query
+
+    def fake_get_db():
+        yield db
+
+    ingest_result = IngestionResult(
+        status="success",
+        doc_id="doc-1",
+        parse_hash="parse-1",
+        chunk_count=2,
+        embedding_count=2,
+        vector_count=2,
+        completed_steps=[],
+        failed_step=None,
+        message="ok",
+        warnings=[],
+        file_id="file-1",
+    )
+    service = MagicMock()
+    service.prepare_collection = AsyncMock(return_value="agent_file_kb")
+    service.refresh_collection_metadata = AsyncMock()
+    run_ingestion = Mock(return_value=ingest_result)
+
+    with (
+        patch("xagent.web.models.database.get_db", side_effect=fake_get_db),
+        patch(
+            "xagent.core.tools.adapters.vibe.agent_kb_service.AgentKnowledgeBaseService",
+            return_value=service,
+        ),
+        patch(
+            "xagent.web.services.managed_file_ref.ensure_uploaded_file_local_path",
+            return_value=restored_source,
+        ) as ensure_local,
+        patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.document_ingestion.run_document_ingestion",
+            new=run_ingestion,
+        ),
+    ):
+        tool = CreateKnowledgeBaseFromFileTool(user_id=71, is_admin=False)
+        result = await tool.run_json_async(
+            {"file_ids": ["file-1"], "collection_name": "agent_file_kb"}
+        )
+
+    assert result["success"] is True
+    ensure_local.assert_called_once_with(file_record)
+    _, ingestion_kwargs = run_ingestion.call_args
+    assert ingestion_kwargs["source_path"] == str(restored_source)
     db.close.assert_called_once()
 
 

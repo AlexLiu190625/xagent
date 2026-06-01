@@ -7,7 +7,17 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
-from ...artifact_refs.observation import format_tool_result_for_observation
+from ...file_ref import FILE_REF_OUTPUT_INSTRUCTIONS
+from ...tools.artifacts import (
+    format_tool_result_for_observation,
+    sanitize_tool_result_for_public_context,
+)
+from ..language import (
+    OUTPUT_LANGUAGE_METADATA_KEY,
+    dag_step_language_rules,
+    output_language_policy,
+    response_language_rules,
+)
 from .components import (
     COMPONENT_LOADERS,
     ExecutionComponent,
@@ -20,6 +30,8 @@ from .enrichment import MEMORY_CONTEXT_METADATA_KEY, SKILL_CONTEXT_METADATA_KEY
 from .message import LLMCallRecord, Message
 
 READ_FILE_CONTEXT_LIMIT = 12_000
+COMPACT_SUMMARY_MAX_TOKENS = 1024
+COMPACT_SUMMARY_MIN_TOKENS = 256
 
 
 def _utcnow() -> datetime:
@@ -39,7 +51,7 @@ class CompactConfig:
     """Compaction policy for message history."""
 
     enabled: bool = True
-    threshold: int = 8000
+    threshold: int = 32000
     strategy: str = "truncate"
     max_messages: int = 20
 
@@ -192,11 +204,8 @@ class ExecutionContext:
         return f"Tool {tool_name} returned: {formatted}"
 
     def _sanitize_tool_result_for_context(self, tool_name: str, result: Any) -> Any:
-        if isinstance(result, dict) and isinstance(result.get("artifacts"), list):
-            sanitized = dict(result)
-            if sanitized.get("file_id"):
-                sanitized.pop("image_path", None)
-            return sanitized
+        if isinstance(result, dict):
+            return sanitize_tool_result_for_public_context(result)
 
         if tool_name != "read_file" or not isinstance(result, str):
             return result
@@ -336,11 +345,29 @@ class ExecutionContext:
             "latest, yesterday, and tomorrow."
         )
 
+    def _current_user_request_text(self) -> str:
+        for message in reversed(self.messages):
+            if message.hidden or message.role != "user":
+                continue
+            if message.metadata.get("response_to_waiting_for_user"):
+                continue
+            content = str(message.content or "").strip()
+            if content:
+                return content
+        return str(self.metadata.get("task") or "").strip()
+
     def _system_context(self) -> str:
-        parts = [self._current_time_context()]
+        parts = [self._current_time_context(), FILE_REF_OUTPUT_INSTRUCTIONS]
         dag_step_id = self.metadata.get("dag_step_id")
-        current_task = str(self.metadata.get("task") or "").strip()
+        current_task = self._current_user_request_text()
         if current_task and not dag_step_id:
+            language_policy = ""
+            output_language = self.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+            if output_language:
+                language_policy = (
+                    "\n\nOutput language policy:\n"
+                    f"{output_language_policy(output_language)}"
+                )
             parts.append(
                 "Current user request:\n"
                 f"{current_task}\n\n"
@@ -349,7 +376,9 @@ class ExecutionContext:
                 "resolve references and preserve continuity, but do not re-answer "
                 "previous requests or repeat previous final answers unless the "
                 "current user request explicitly asks to revise, continue, compare, "
-                "or summarize them."
+                "or summarize them.\n\n"
+                f"{response_language_rules()}"
+                f"{language_policy}"
             )
         process_description = str(
             self.metadata.get("process_description") or ""
@@ -377,6 +406,9 @@ class ExecutionContext:
                     "Task input/output examples:\n" + "\n".join(formatted_examples)
                 )
         if dag_step_id:
+            language_policy = output_language_policy(
+                self.metadata.get(OUTPUT_LANGUAGE_METADATA_KEY)
+            ).strip()
             dag_step_name = str(self.metadata.get("dag_step_name") or "").strip()
             dag_step_description = str(
                 self.metadata.get("dag_step_description") or dag_step_name
@@ -396,6 +428,7 @@ class ExecutionContext:
                 "- Overall user goal is background context only and is already "
                 "available in the conversation when needed; do not treat it as "
                 "the executable goal for this step.\n"
+                f"- {language_policy}\n"
                 f"- Current step id: {dag_step_id}\n"
                 f"- Current step title: {dag_step_name or dag_step_id}\n"
                 f"- Current step description: "
@@ -403,7 +436,8 @@ class ExecutionContext:
                 f"- Current step dependencies: {dag_dependencies}\n"
                 f"- Suggested tools for this step: {suggested_tools}\n\n"
                 "Only execute the current DAG step. Detailed step boundary rules are "
-                "provided in the latest DAG step instruction message."
+                "provided in the latest DAG step instruction message.\n\n"
+                f"{dag_step_language_rules()}"
             )
         memory_context = self.metadata.get(MEMORY_CONTEXT_METADATA_KEY)
         if memory_context:
@@ -726,7 +760,7 @@ class ExecutionContext:
         compact = data.get("compact_config", {})
         compact_config = CompactConfig(
             enabled=compact.get("enabled", True),
-            threshold=compact.get("threshold", 8000),
+            threshold=compact.get("threshold", CompactConfig().threshold),
             strategy=compact.get("strategy", "truncate"),
             max_messages=compact.get("max_messages", 20),
         )
@@ -789,9 +823,7 @@ class ExecutionContext:
         total_tokens = self._get_total_tokens()
         if total_tokens > self.compact_config.threshold:
             result = self._compact(llm)
-            result.metadata.setdefault("original_tokens", total_tokens)
-            result.metadata.setdefault("threshold", self.compact_config.threshold)
-            return result
+            return self._annotate_compact_result(result, total_tokens)
 
         return CompactResult(
             compacted=False,
@@ -799,6 +831,30 @@ class ExecutionContext:
             final_count=len(self.messages),
             strategy="none",
         )
+
+    def build_llm_compact_request_if_needed(self) -> dict[str, Any] | None:
+        if not self.compact_config.enabled:
+            return None
+
+        total_tokens = self._get_total_tokens()
+        if total_tokens <= self.compact_config.threshold:
+            return None
+
+        visible_messages = [message for message in self.messages if not message.hidden]
+        if not visible_messages:
+            return None
+
+        max_tokens = self._llm_compact_max_tokens()
+        return {
+            "messages": self._build_llm_compact_prompt(visible_messages),
+            "original_tokens": total_tokens,
+            "max_tokens": max_tokens,
+            "metadata": {
+                "original_tokens": total_tokens,
+                "threshold": self.compact_config.threshold,
+                "max_summary_tokens": max_tokens,
+            },
+        }
 
     def _compact(self, llm: Any = None) -> CompactResult:
         original_count = len(self.messages)
@@ -820,6 +876,135 @@ class ExecutionContext:
             final_count=len(self.messages),
             strategy="none",
         )
+
+    def _annotate_compact_result(
+        self, result: CompactResult, original_tokens: int
+    ) -> CompactResult:
+        result.metadata.setdefault("original_tokens", original_tokens)
+        result.metadata.setdefault("threshold", self.compact_config.threshold)
+        if result.compacted:
+            compacted_tokens = self._estimate_message_tokens(self.messages)
+            result.metadata.setdefault("compacted_tokens", compacted_tokens)
+            if original_tokens > 0:
+                ratio = compacted_tokens / original_tokens * 100
+                result.metadata.setdefault("compression_ratio", f"{ratio:.1f}%")
+        return result
+
+    def compact_with_llm_response(
+        self,
+        response: Any,
+        *,
+        llm: Any = None,
+        original_tokens: int | None = None,
+    ) -> CompactResult:
+        original_count = len(self.messages)
+        summary = self._compact_response_text(response).strip()
+        if not summary:
+            return CompactResult(
+                compacted=False,
+                original_count=original_count,
+                final_count=original_count,
+                strategy="none",
+            )
+
+        latest_user = self._latest_visible_user_message()
+        summary_message = Message.role_system(
+            "Compacted conversation summary:\n"
+            f"{summary}\n\n"
+            "Use this summary as continuity context. Current system instructions "
+            "and the latest user request take precedence.",
+            metadata={"compacted_context": True},
+        )
+        next_messages = [summary_message]
+        if latest_user is not None:
+            next_messages.append(latest_user)
+        self.messages = next_messages
+        result = CompactResult(
+            compacted=True,
+            original_count=original_count,
+            final_count=len(self.messages),
+            strategy="llm_summary",
+            metadata={
+                "removed_count": max(0, original_count - len(self.messages)),
+                "summary_chars": len(summary),
+                "compact_model": getattr(llm, "model_name", None),
+            },
+        )
+        if original_tokens is not None:
+            return self._annotate_compact_result(result, original_tokens)
+        return result
+
+    def _latest_visible_user_message(self) -> Message | None:
+        for message in reversed(self.messages):
+            if message.hidden or message.role != "user":
+                continue
+            return message
+        return None
+
+    def _build_llm_compact_prompt(
+        self, messages: list[Message]
+    ) -> list[dict[str, str]]:
+        transcript = self._compact_transcript(messages)
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "Compress agent conversation history for a ReAct agent. "
+                    "Preserve the user's goal, important constraints, completed "
+                    "tool calls, tool observations, files or URLs mentioned, "
+                    "decisions made, and open work. Drop duplicated search noise, "
+                    "irrelevant raw payloads, and verbose intermediate text. "
+                    "Preserve the language of user-facing requests and constraints; "
+                    "if the history is multilingual, keep important details in their "
+                    "original language instead of translating them. "
+                    "Return only the compact summary."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "Conversation history to compact:\n"
+                    f"{transcript}\n\n"
+                    "Write a concise but complete continuity summary for the next "
+                    "LLM call."
+                ),
+            },
+        ]
+
+    def _llm_compact_max_tokens(self) -> int:
+        return max(
+            COMPACT_SUMMARY_MIN_TOKENS,
+            min(COMPACT_SUMMARY_MAX_TOKENS, self.compact_config.threshold // 4),
+        )
+
+    def _compact_transcript(self, messages: list[Message]) -> str:
+        chunks: list[str] = []
+        for index, message in enumerate(messages, start=1):
+            header = f"{index}. {message.role.upper()}"
+            if message.tool_call_id:
+                header += f" tool_call_id={message.tool_call_id}"
+            chunks.append(f"{header}:")
+            if message.tool_calls:
+                chunks.append(
+                    "tool_calls="
+                    + json.dumps(message.tool_calls, ensure_ascii=False, default=str)
+                )
+            chunks.append(message.content)
+        return "\n".join(chunks)
+
+    def _compact_response_text(self, response: Any) -> str:
+        if isinstance(response, str):
+            return response
+        if isinstance(response, dict):
+            for key in ("summary", "content", "output", "message"):
+                value = response.get(key)
+                if value:
+                    return str(value)
+            return ""
+        content = getattr(response, "content", None)
+        if content:
+            return str(content)
+        return str(response) if response is not None else ""
 
     def _get_total_tokens(self) -> int:
         if self.llm_calls:

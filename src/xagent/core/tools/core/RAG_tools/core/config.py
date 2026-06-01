@@ -65,6 +65,9 @@ DEFAULT_VECTOR_STORE_SCAN_LIMIT: Final[int] = 10_000
 DEFAULT_VECTOR_STORE_EXTENDED_SCAN_LIMIT: Final[int] = 1_000_000
 """Higher limit for operations like listing all documents in a collection or deleting a collection."""
 
+DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE: Final[int] = 100
+"""Default doc_id batch size for vector-store delete predicates."""
+
 DEFAULT_BACKFILL_BATCH_SIZE: Final[int] = 1000
 """Default batch size for backfill operations (rows per iteration).
 

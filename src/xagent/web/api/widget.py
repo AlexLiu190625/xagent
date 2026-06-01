@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
-from ..models.agent import Agent
+from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.task import Task, TaskStatus
 from ..models.user import User
@@ -100,10 +100,15 @@ async def authenticate_widget(
     agent_id = request.agent_id
     user = None
     target_channel = None
+    agent = None
 
     # Authenticate via agent_id directly (since web widget channel is deprecated)
     if agent_id:
-        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        candidate_agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        if candidate_agent and not is_workforce_generated_manager_agent(
+            candidate_agent
+        ):
+            agent = candidate_agent
         if agent:
             if not agent.widget_enabled:
                 raise HTTPException(
@@ -155,11 +160,9 @@ async def authenticate_widget(
     # Get agent name if available
     agent_name = None
     agent_logo = None
-    if agent_id:
-        agent = db.query(Agent).filter(Agent.id == agent_id).first()
-        if agent:
-            agent_name = agent.name
-            agent_logo = agent.logo_url
+    if agent:
+        agent_name = agent.name
+        agent_logo = agent.logo_url
 
     channel_id = target_channel.id if target_channel else None
 

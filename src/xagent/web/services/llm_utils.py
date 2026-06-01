@@ -2,6 +2,7 @@
 
 import logging
 import os
+from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Tuple, Union
 
 from sqlalchemy.orm import Session
@@ -948,3 +949,360 @@ def make_normalize_model_id(core_storage: CoreStorage) -> Callable:
         return None
 
     return normalize_model_id
+
+
+@dataclass(frozen=True)
+class AgentRuntimeFields:
+    """Primitive subset of the ``Agent`` row produced by
+    ``resolve_task_runtime_config_core``.
+
+    Snapshot consumers (``load_task_setup_snapshot_sync``) expose
+    this directly on ``TaskSetupSnapshot.agent``; main-loop
+    consumers (``_reconstruct_agent_from_history``) read the same
+    fields off the resolved ``RuntimeConfig``. One dataclass, both
+    code paths -- no parallel definitions to drift.
+    """
+
+    id: int
+    name: str
+    status: Any  # AgentStatus enum (typed loosely to avoid an import cycle)
+    instructions: Optional[str]
+
+
+@dataclass(frozen=True)
+class RuntimeConfig:
+    """Resolved task runtime configuration: the LLM tuple, execution
+    pattern, and optional agent-builder overlay returned by
+    ``resolve_task_runtime_config_core``.
+
+    Frozen dataclass instead of a free-form dict because:
+
+      - typo'd field access fails at type-check time, not silently
+        returning ``None`` at runtime
+      - the contract is greppable / introspectable
+      - both consumers (main-loop wrapper + off-loop snapshot loader)
+        access fields by name; the dataclass lets ``mypy`` follow
+        the type through both branches
+
+    ``agent_config`` stays a ``dict | None`` because it carries
+    ``saved_model_ids`` / ``saved_model_descriptors`` (downstream
+    diagnostics) plus ``skills`` / ``knowledge_bases`` / etc.;
+    promoting that to a dataclass is a separate refactor.
+    """
+
+    llms: Tuple[
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+        Optional[BaseLLM],
+    ]
+    task_pattern: str
+    agent_config: Optional[dict]
+    has_agent_builder_config: bool
+    excluded_agent_id: Optional[int]
+    agent_fields: Optional[AgentRuntimeFields]
+    # Workforce runtime if the task carries ``workforce_run_id`` in its
+    # ``agent_config``. ``Any`` instead of ``WorkforceTaskRuntime`` to
+    # keep this module free of the workforce import cycle -- callers
+    # that need the typed view import it themselves.
+    workforce: Any = None
+
+
+def _load_agent_for_task_runtime(
+    session: Session,
+    task_row: Any,
+    workforce: Any,
+) -> Any | None:
+    from ..models.agent import (
+        Agent,
+        AgentStatus,
+        is_workforce_generated_manager_agent,
+    )
+    from ..models.user import User
+    from .agent_access import list_accessible_published_agents
+
+    task_agent_id = getattr(task_row, "agent_id", None)
+    if task_agent_id is None:
+        return None
+
+    agent = session.query(Agent).filter(Agent.id == task_agent_id).first()
+    if agent is None:
+        return None
+    if is_workforce_generated_manager_agent(agent):
+        if workforce is not None and workforce.manager_agent_id == task_agent_id:
+            return agent
+        return None
+    if int(agent.user_id) == int(task_row.user_id):
+        return agent
+    if workforce is not None and workforce.manager_agent_id == task_agent_id:
+        return agent
+    if getattr(agent.status, "value", agent.status) != AgentStatus.PUBLISHED.value:
+        return None
+
+    user = session.query(User).filter(User.id == task_row.user_id).first()
+    if user is None:
+        return None
+    visible_agent_ids = {
+        int(item.id)
+        for item in list_accessible_published_agents(
+            session,
+            user,
+            purpose="agent_list",
+        )
+    }
+    return agent if int(agent.id) in visible_agent_ids else None
+
+
+def resolve_task_runtime_config_core(
+    task_row: Any,
+    session: Session,
+    *,
+    user_id: Optional[int],
+) -> RuntimeConfig:
+    """Resolve a task's LLM tuple, agent-builder overlay, and execution
+    pattern in one shot. Pure function over an open SQLAlchemy session
+    -- no event loop, no logging, no fallback.
+
+    Single source of truth shared by both paths that need to bootstrap
+    a task's runtime configuration:
+
+      - ``AgentServiceManager._resolve_task_runtime_config`` (main
+        loop, used by ``_reconstruct_agent_from_history``) -- wraps
+        this with logging + the ``_pick_default_llm_with_warning``
+        fallback.
+      - ``load_task_setup_snapshot_sync`` (worker thread, used by
+        ``_schedule_bg._runner`` on the normal-creation path) --
+        wraps this with primitive ``_TaskFields`` snapshotting so no
+        ORM ``Task`` row escapes the loader's session.
+
+    Does NOT apply the ``_pick_default_llm_with_warning`` fallback --
+    that helper raises ``HTTPException``, which is unsafe to call from
+    a worker thread. Callers handle the fallback step.
+    """
+    from ...config import (
+        get_agent_pattern_for_execution_mode,
+        get_default_task_execution_mode,
+    )
+    from ..models.agent import AgentStatus
+
+    task_execution_mode = getattr(task_row, "execution_mode", None)
+    if not task_execution_mode:
+        task_execution_mode = get_default_task_execution_mode(
+            agent_id=getattr(task_row, "agent_id", None),
+        )
+    task_pattern = get_agent_pattern_for_execution_mode(task_execution_mode)
+
+    # Inline LLM-id normalization (the legacy
+    # ``AgentServiceManager._get_task_llm_ids`` body).
+    core_storage = CoreStorage(session, Model)
+    normalize = make_normalize_model_id(core_storage)
+    llm_ids = [
+        normalize(
+            getattr(task_row, "model_id", None),
+            getattr(task_row, "model_name", None),
+        ),
+        normalize(
+            getattr(task_row, "small_fast_model_id", None),
+            getattr(task_row, "small_fast_model_name", None),
+        ),
+        normalize(
+            getattr(task_row, "visual_model_id", None),
+            getattr(task_row, "visual_model_name", None),
+        ),
+        normalize(
+            getattr(task_row, "compact_model_id", None),
+            getattr(task_row, "compact_model_name", None),
+        ),
+    ]
+    storage = UserAwareModelStorage(session)
+    task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
+        storage.resolve_llms_from_names(llm_ids, user_id)
+    )
+
+    agent_config: Optional[dict] = None
+    has_agent_builder_config = False
+    excluded_agent_id: Optional[int] = None
+    agent_fields: Optional[AgentRuntimeFields] = None
+
+    # Workforce runtime resolution -- pure query against the same
+    # session, no side effect. Workforce and policy-visible agent modes
+    # change two things below: (1) the Agent access check can allow a
+    # cross-user manager/shared agent, and (2) workforce tasks keep their
+    # own execution_mode instead of inheriting from agent_config.
+    from .workforce_runtime import resolve_workforce_task_runtime
+
+    workforce = resolve_workforce_task_runtime(session, task_row)
+
+    if task_row.agent_id is not None:
+        agent_row = _load_agent_for_task_runtime(session, task_row, workforce)
+        if agent_row is not None:
+            agent_config = load_agent_builder_config(
+                agent_row, session, int(task_row.user_id)
+            )
+            has_agent_builder_config = True
+            # Slot-wise overlay -- an agent slot wins when set,
+            # otherwise the task's own LLM stays. Mirrors the legacy
+            # ``_merge_agent_builder_llms``.
+            baseline_llms = (
+                task_llm,
+                task_fast_llm,
+                task_vision_llm,
+                task_compact_llm,
+            )
+            task_llm, task_fast_llm, task_vision_llm, task_compact_llm = (
+                agent_llm or baseline
+                for baseline, agent_llm in zip(baseline_llms, agent_config["llms"])
+            )
+
+            if workforce is None:
+                # Non-workforce: agent_config.execution_mode overrides
+                # the task's own mode (legacy agent-builder behavior).
+                agent_execution_mode = agent_config.get("execution_mode", "balanced")
+                task_pattern = get_agent_pattern_for_execution_mode(
+                    agent_execution_mode
+                )
+            # workforce mode: keep task_pattern computed above from
+            # task.execution_mode; do not let agent_config override.
+
+            if agent_row.status == AgentStatus.PUBLISHED:
+                excluded_agent_id = int(agent_row.id)
+
+            agent_fields = AgentRuntimeFields(
+                id=int(agent_row.id),
+                name=str(agent_row.name),
+                status=agent_row.status,
+                instructions=(
+                    str(agent_row.instructions)
+                    if agent_row.instructions is not None
+                    else None
+                ),
+            )
+    else:
+        # Inline agent_config path: task carries its own agent config
+        # dict (no Agent row reference). Used by build-preview tasks
+        # routed through normal task flow.
+        inline_agent_config = load_task_inline_agent_config(task_row)
+        if inline_agent_config is not None:
+            agent_config = inline_agent_config
+            inline_execution_mode = agent_config.get("execution_mode") or "balanced"
+            task_pattern = get_agent_pattern_for_execution_mode(inline_execution_mode)
+
+    return RuntimeConfig(
+        llms=(task_llm, task_fast_llm, task_vision_llm, task_compact_llm),
+        task_pattern=task_pattern,
+        agent_config=agent_config,
+        has_agent_builder_config=has_agent_builder_config,
+        excluded_agent_id=excluded_agent_id,
+        agent_fields=agent_fields,
+        workforce=workforce,
+    )
+
+
+def load_task_inline_agent_config(task: Any) -> Optional[dict]:
+    """Build an inline agent_config dict from ``task.agent_config`` JSON.
+
+    Returns ``None`` when the task carries no inline agent fields (the
+    common case: the task references an Agent row by ``agent_id``).
+
+    Inline configs are used by build-preview tasks (#459) that get
+    routed through normal task flow with their config embedded in the
+    Task row rather than a separate Agent row.
+
+    Shape matches ``load_agent_builder_config`` so downstream consumers
+    can treat them uniformly.
+    """
+    raw = getattr(task, "agent_config", None)
+    if not isinstance(raw, dict):
+        return None
+
+    if not any(
+        key in raw
+        for key in ("instructions", "knowledge_bases", "skills", "tool_categories")
+    ):
+        return None
+
+    return {
+        "llms": (None, None, None, None),
+        "execution_mode": getattr(task, "execution_mode", None) or "balanced",
+        "instructions": raw.get("instructions"),
+        "skills": raw.get("skills") or [],
+        "knowledge_bases": raw.get("knowledge_bases") or [],
+        "tool_categories": raw.get("tool_categories") or [],
+        "memory_similarity_threshold": raw.get("memory_similarity_threshold"),
+        "is_preview": raw.get("is_preview"),
+        "preview_agent_id": raw.get("preview_agent_id"),
+    }
+
+
+def load_agent_builder_config(agent: Any, db: Session, user_id: int) -> dict:
+    """Eagerly load Agent Builder configuration into a primitive dict.
+
+    Single source of truth shared by:
+
+      - ``AgentServiceManager._load_agent_builder_config`` (the
+        legacy in-method caller in ``chat.py``)
+      - ``load_task_setup_snapshot_sync._load_agent_builder_config_sync``
+        (the off-loop snapshot loader)
+
+    The two used to keep nearly-identical copies of this logic, which
+    risked drift -- e.g. the snapshot version had a defensive non-
+    dict ``agent.models`` guard the in-method copy lacked. Centralizing
+    here keeps the LLM-resolution contract in one place.
+
+    Returns:
+        dict with keys: ``llms`` (tuple of 4 BaseLLM | None for
+        ``general`` / ``small_fast`` / ``visual`` / ``compact``),
+        ``execution_mode``, ``instructions``, ``skills``,
+        ``knowledge_bases``, ``tool_categories``.
+    """
+    storage = UserAwareModelStorage(db)
+
+    raw_models: Any = agent.models or {}
+    if raw_models and not isinstance(raw_models, dict):
+        # JSON column with a dict-shaped contract (slot -> DBModel.id).
+        # A non-dict here means upstream data corruption or hand-edit;
+        # log loudly so on-call can trace it back instead of seeing a
+        # silent "no LLMs resolved" downstream.
+        logger.warning(
+            "Agent %s has non-dict models field (%s); treating as empty",
+            agent.id,
+            type(raw_models).__name__,
+        )
+    models: dict[str, Any] = dict(raw_models) if isinstance(raw_models, dict) else {}
+
+    # Captures the resolved ``DBModel`` row per slot so downstream
+    # fallback diagnostics (``_pick_default_llm_with_warning``) can log
+    # human-readable model identifiers instead of opaque PKs.
+    saved_model_descriptors: dict[str, dict[str, Any]] = {}
+
+    def _resolve(slot: str) -> Optional[BaseLLM]:
+        db_row_id = models.get(slot)
+        if not db_row_id:
+            return None
+        db_model = db.query(Model).filter(Model.id == db_row_id).first()
+        if not db_model:
+            return None
+        saved_model_descriptors[slot] = {
+            "pk": db_model.id,
+            "model_id": str(db_model.model_id),
+            "model_name": getattr(db_model, "model_name", None),
+        }
+        return storage.get_llm_by_name_with_access(str(db_model.model_id), user_id)
+
+    llms = (
+        _resolve("general"),
+        _resolve("small_fast"),
+        _resolve("visual"),
+        _resolve("compact"),
+    )
+
+    return {
+        "llms": llms,
+        "saved_model_ids": dict(models),
+        "saved_model_descriptors": saved_model_descriptors,
+        "execution_mode": agent.execution_mode,
+        "instructions": agent.instructions,
+        "skills": list(agent.skills or []),
+        "knowledge_bases": list(agent.knowledge_bases or []),
+        "tool_categories": list(agent.tool_categories or []),
+    }

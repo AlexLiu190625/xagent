@@ -43,7 +43,12 @@ def ensure_system_initialized() -> None:
 
     if status_data.get("needs_setup", True):
         setup_response = client.post(
-            "/api/auth/setup-admin", json={"username": "admin", "password": "admin123"}
+            "/api/auth/setup-admin",
+            json={
+                "username": "admin",
+                "email": "admin@example.com",
+                "password": "admin123",
+            },
         )
         assert setup_response.status_code == 200
         assert setup_response.json().get("success") is True
@@ -100,7 +105,11 @@ def regular_user(test_db):
     """Create regular user for testing"""
     ensure_system_initialized()
 
-    user_data = {"username": "regularuser", "password": "password123"}
+    user_data = {
+        "username": "regularuser",
+        "email": "regularuser@example.com",
+        "password": "password123",
+    }
     response = client.post("/api/auth/register", json=user_data)
     assert response.status_code == 200
     assert response.json().get("success") is True
@@ -162,6 +171,36 @@ def sample_embedding_model_data():
         "dimension": 1536,
         "abilities": ["embedding"],
         "description": "Test embedding model",
+        "share_with_users": False,
+    }
+
+
+@pytest.fixture(scope="function")
+def sample_speech_model_data():
+    return {
+        "model_id": "test-speech-model",
+        "category": "speech",
+        "model_provider": "xinference",
+        "model_name": "speech-dual-model",
+        "api_key": "test-api-key",
+        "base_url": "http://localhost:9997",
+        "abilities": ["asr", "tts"],
+        "description": "Test speech model",
+        "share_with_users": False,
+    }
+
+
+@pytest.fixture(scope="function")
+def sample_image_model_data():
+    return {
+        "model_id": "test-image-model",
+        "category": "image",
+        "model_provider": "dashscope",
+        "model_name": "qwen-image",
+        "api_key": "test-api-key",
+        "base_url": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+        "abilities": ["generate"],
+        "description": "Test image model",
         "share_with_users": False,
     }
 
@@ -534,7 +573,11 @@ class TestModelAPI:
         assert response.status_code == 200
 
         # Create another user
-        user2_data = {"username": "user2", "password": "password2"}
+        user2_data = {
+            "username": "user2",
+            "email": "user2@example.com",
+            "password": "password2",
+        }
         user2_response = client.post("/api/auth/register", json=user2_data)
         assert user2_response.status_code == 200
 
@@ -609,6 +652,97 @@ class TestModelAPI:
 
         assert default_response.status_code == 200
         assert default_response.json()["config_type"] == "embedding"
+
+    def test_allow_dual_speech_model_for_individual_asr_and_tts_defaults(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_speech_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        speech_model_id = create_response.json()["id"]
+
+        asr_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "asr"},
+            headers=regular_headers,
+        )
+        assert asr_response.status_code == 200
+        assert asr_response.json()["config_type"] == "asr"
+
+        tts_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "tts"},
+            headers=regular_headers,
+        )
+        assert tts_response.status_code == 200
+        assert tts_response.json()["config_type"] == "tts"
+
+        defaults_response = client.get(
+            "/api/models/user-default", headers=regular_headers
+        )
+        assert defaults_response.status_code == 200
+        defaults = {
+            item["config_type"]: item["model"]["model_id"]
+            for item in defaults_response.json()
+        }
+        assert defaults["asr"] == sample_speech_model_data["model_id"]
+        assert defaults["tts"] == sample_speech_model_data["model_id"]
+
+    def test_reject_asr_only_speech_model_as_tts_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_speech_model_data,
+    ):
+        sample_speech_model_data["abilities"] = ["asr"]
+        create_response = client.post(
+            "/api/models/",
+            json=sample_speech_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        speech_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": speech_model_id, "config_type": "tts"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
+
+    def test_reject_generate_only_image_model_as_image_edit_default(
+        self,
+        test_db,
+        regular_user,
+        regular_headers,
+        sample_image_model_data,
+    ):
+        create_response = client.post(
+            "/api/models/",
+            json=sample_image_model_data,
+            headers=regular_headers,
+        )
+        assert create_response.status_code == 200
+        image_model_id = create_response.json()["id"]
+
+        default_response = client.post(
+            "/api/models/user-default",
+            json={"model_id": image_model_id, "config_type": "image_edit"},
+            headers=regular_headers,
+        )
+
+        assert default_response.status_code == 400
+        assert "incompatible" in default_response.json()["detail"]
 
     def test_list_supported_providers_includes_deepseek(
         self, test_db, regular_user, regular_headers

@@ -60,8 +60,30 @@ def _recreate_uploaded_files_sqlite(
 
     # Copy data from old table to new table
     op.execute("""
-        INSERT INTO uploaded_files_new
-        SELECT * FROM uploaded_files
+        INSERT INTO uploaded_files_new (
+            id,
+            file_id,
+            user_id,
+            task_id,
+            filename,
+            storage_path,
+            mime_type,
+            file_size,
+            created_at,
+            updated_at
+        )
+        SELECT
+            id,
+            file_id,
+            user_id,
+            task_id,
+            filename,
+            storage_path,
+            mime_type,
+            file_size,
+            created_at,
+            updated_at
+        FROM uploaded_files
     """)
 
     # Drop old table

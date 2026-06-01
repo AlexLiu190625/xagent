@@ -7,6 +7,7 @@ ensuring that each agent has its own isolated workspace context.
 
 import contextvars
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -23,6 +24,23 @@ logger = logging.getLogger(__name__)
 
 # Context variable for auto-registration mode
 _auto_register = contextvars.ContextVar("_auto_register", default=False)
+
+
+def _safe_storage_relative_path(relative_path: str) -> str:
+    path = Path(relative_path)
+    safe_parts = [part for part in path.parts if part not in ("", ".", "..")]
+    if not safe_parts:
+        return "file"
+    return "/".join(safe_parts)
+
+
+def _build_workspace_storage_key(
+    user_id: int, task_id: int, file_id: str, relative_path: str
+) -> str:
+    return (
+        f"users/{user_id}/tasks/{task_id}/outputs/"
+        f"{file_id}/{_safe_storage_relative_path(relative_path)}"
+    )
 
 
 @dataclass
@@ -51,8 +69,10 @@ class TaskWorkspace:
         id: str,
         base_dir: Optional[str] = None,
         allowed_external_dirs: Optional[List[str]] = None,
+        db_task_id: Optional[int] = None,
     ):
         self.id = id
+        self.db_task_id = db_task_id
         if base_dir is None:
             base_dir = str(get_uploads_dir())
         self.base_dir = (
@@ -62,7 +82,11 @@ class TaskWorkspace:
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self.owner_user_id: Optional[int] = None
-        self.current_task_id: Optional[int] = self._parse_task_id_from_workspace_id(id)
+        self.current_task_id: Optional[int] = (
+            db_task_id
+            if db_task_id is not None
+            else self._parse_task_id_from_workspace_id(id)
+        )
 
         # Create workspace directory
         self.workspace_dir = self.base_dir / id
@@ -112,8 +136,21 @@ class TaskWorkspace:
             )
 
         # Check if file already exists in database
-        existing_file_id = self._get_file_id_from_db(resolved_path, db_session)
+        resolved_db_session = db_session or self.db_session
+        cached_file_id = self._recently_registered_files.get(str(resolved_path))
+        if cached_file_id:
+            self._sync_existing_file_record(
+                cached_file_id, resolved_path, resolved_db_session
+            )
+            self._remember_file_registration(cached_file_id, resolved_path)
+            return cached_file_id
+
+        existing_file_id = self._get_file_id_from_db(resolved_path, resolved_db_session)
         if existing_file_id:
+            self._sync_existing_file_record(
+                existing_file_id, resolved_path, resolved_db_session
+            )
+            self._remember_file_registration(existing_file_id, resolved_path)
             return existing_file_id
 
         # Generate new file_id if not provided
@@ -123,8 +160,114 @@ class TaskWorkspace:
 
         # Create database record
         self._create_file_record(final_file_id, resolved_path, db_session)
+        self._remember_file_registration(final_file_id, resolved_path)
 
         return final_file_id
+
+    def _remember_file_registration(self, file_id: str, file_path: Path) -> None:
+        path_str = str(file_path)
+        resolved_str = str(file_path.resolve())
+        self._recently_registered_files[path_str] = file_id
+        self._recently_registered_files[resolved_str] = file_id
+        self._file_id_to_path[file_id] = file_path
+
+    def _is_delegated_db_task_workspace(self, task_id: int) -> bool:
+        if self.db_task_id is None:
+            return False
+        parsed_task_id = self._parse_task_id_from_workspace_id(self.id)
+        return parsed_task_id != int(task_id)
+
+    def _user_workspace_base_dir(self, user_id: int) -> Path:
+        user_segment = f"user_{user_id}"
+        if self.base_dir.name == user_segment:
+            return self.base_dir
+        return self.base_dir / user_segment
+
+    @staticmethod
+    def _storage_path_record(
+        db: Any, storage_path: Path, file_id: Optional[str] = None
+    ) -> Any:
+        from ..web.models.uploaded_file import UploadedFile
+
+        query = db.query(UploadedFile).filter(
+            UploadedFile.storage_path == str(storage_path)
+        )
+        record = query.first()
+        if record is None or file_id is None or str(record.file_id) == str(file_id):
+            return record
+        return record
+
+    @classmethod
+    def _unique_registration_path(
+        cls, target_path: Path, source_path: Path, db: Any, file_id: str
+    ) -> Path:
+        stem = target_path.stem
+        suffix = target_path.suffix
+        parent = target_path.parent
+        candidate = target_path
+        index = 1
+
+        source_resolved = source_path.resolve()
+        while True:
+            try:
+                candidate_resolved = candidate.resolve()
+            except OSError:
+                candidate_resolved = candidate.absolute()
+            record = cls._storage_path_record(db, candidate, file_id)
+            same_record = record is not None and str(record.file_id) == str(file_id)
+            record_conflicts = record is not None and str(record.file_id) != str(
+                file_id
+            )
+            path_conflicts = (
+                candidate.exists()
+                and candidate_resolved != source_resolved
+                and not same_record
+            )
+            if not record_conflicts and not path_conflicts:
+                return candidate
+            candidate = parent / f"{stem}_{index}{suffix}"
+            index += 1
+
+    def _canonicalize_delegated_output_registration(
+        self,
+        *,
+        db: Any,
+        file_id: str,
+        file_path: Path,
+        task_id: int,
+        user_id: int,
+        relative_path: str,
+        category: str,
+    ) -> tuple[Path, str, str]:
+        if category != "output" or not self._is_delegated_db_task_workspace(task_id):
+            return file_path, relative_path, category
+
+        relative_parts = Path(relative_path).parts
+        output_parts = [
+            part for part in relative_parts[1:] if part not in ("", ".", "..")
+        ]
+        if not output_parts:
+            output_parts = [file_path.name]
+
+        canonical_relative_path = Path("output", *output_parts).as_posix()
+        task_root = self._user_workspace_base_dir(user_id) / f"web_task_{task_id}"
+        output_root = (task_root / "output").resolve()
+        canonical_path = (task_root / canonical_relative_path).resolve()
+        try:
+            canonical_path.relative_to(output_root)
+        except ValueError:
+            canonical_relative_path = Path("output", file_path.name).as_posix()
+            canonical_path = (task_root / canonical_relative_path).resolve()
+
+        canonical_path = self._unique_registration_path(
+            canonical_path, file_path, db, file_id
+        )
+        canonical_relative_path = canonical_path.relative_to(task_root).as_posix()
+        if canonical_path.resolve() != file_path.resolve():
+            canonical_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(file_path, canonical_path)
+
+        return canonical_path, canonical_relative_path, "output"
 
     def _create_file_record(
         self, file_id: str, file_path: Path, db_session: Any = None
@@ -151,17 +294,19 @@ class TaskWorkspace:
             if existing:
                 return
 
-            # Extract task_id from workspace id (e.g., 'web_task_265' -> 265)
-            # Handle test environment workspaces (e.g., 'test_task')
-            try:
-                task_id = int(self.id.split("_")[-1])
-            except (ValueError, IndexError):
-                # Not a valid task ID, likely a test workspace
-                # Skip database registration in test environments
-                logger.debug(
-                    f"Skipping database registration for test workspace '{self.id}', file_id={file_id}"
-                )
-                return
+            task_id = self.db_task_id
+            if task_id is None:
+                # Extract task_id from workspace id (e.g., 'web_task_265' -> 265).
+                # Delegated agent workspaces use non-DB ids such as
+                # 'agent_2_abcd1234', so callers should pass db_task_id explicitly.
+                try:
+                    task_id = int(self.id.split("_")[-1])
+                except (ValueError, IndexError):
+                    logger.debug(
+                        f"Skipping database registration for workspace '{self.id}' "
+                        f"without db_task_id, file_id={file_id}"
+                    )
+                    return
 
             # Get user_id from task
             task = db.query(Task).filter(Task.id == task_id).first()
@@ -170,23 +315,43 @@ class TaskWorkspace:
                 return
 
             # Guess MIME type
-            import mimetypes
-
             mime_type, _ = mimetypes.guess_type(file_path.name)
             if not mime_type:
                 mime_type = "application/octet-stream"
 
-            # Create file record
-            file_record = UploadedFile(
+            try:
+                relative_path = str(file_path.relative_to(self.workspace_dir))
+            except ValueError:
+                relative_path = file_path.name
+            category = relative_path.split("/", 1)[0] if relative_path else "workspace"
+
+            file_path, relative_path, category = (
+                self._canonicalize_delegated_output_registration(
+                    db=db,
+                    file_id=file_id,
+                    file_path=file_path,
+                    task_id=int(task_id),
+                    user_id=int(task.user_id),
+                    relative_path=relative_path,
+                    category=category,
+                )
+            )
+
+            from ..web.services.uploaded_file_store import UploadedFileStore
+
+            UploadedFileStore(db).create_from_local_path(
+                local_path=file_path,
+                user_id=int(task.user_id),
                 file_id=file_id,
-                user_id=task.user_id,
                 task_id=task_id,
                 filename=file_path.name,
-                storage_path=str(file_path),
+                storage_key=_build_workspace_storage_key(
+                    int(task.user_id), task_id, file_id, relative_path
+                ),
+                workspace_relative_path=relative_path,
+                workspace_category=category,
                 mime_type=mime_type,
-                file_size=file_path.stat().st_size,
             )
-            db.add(file_record)
             if should_close:
                 db.commit()
             else:
@@ -197,6 +362,117 @@ class TaskWorkspace:
             if should_close:
                 db.rollback()
             raise  # Re-raise so caller knows registration failed
+        finally:
+            if should_close and db is not None:
+                db.close()
+
+    def _sync_existing_file_record(
+        self, file_id: str, file_path: Path, db_session: Any = None
+    ) -> None:
+        """Sync an existing UploadedFile row with current local bytes."""
+        from .storage.manager import create_db_session
+
+        if db_session:
+            db = db_session
+            should_close = False
+        else:
+            db = self.db_session if self.db_session else create_db_session()
+            should_close = self.db_session is None
+
+        try:
+            from ..web.models.uploaded_file import UploadedFile
+            from ..web.services.uploaded_file_store import UploadedFileStore
+
+            record = (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+            )
+            if record is None:
+                return
+
+            mime_type, _ = mimetypes.guess_type(file_path.name)
+            if not mime_type:
+                mime_type = "application/octet-stream"
+
+            task_id = getattr(record, "task_id", None)
+            user_id = int(getattr(record, "user_id"))
+
+            try:
+                relative_path = str(file_path.relative_to(self.workspace_dir))
+            except ValueError:
+                UploadedFileStore(db).sync_existing(
+                    record,
+                    storage_key=getattr(record, "storage_key", None),
+                    mime_type=getattr(record, "mime_type", None) or mime_type,
+                )
+                if should_close:
+                    db.commit()
+                else:
+                    db.flush()
+                return
+
+            if self.db_task_id is not None:
+                from ..web.models.task import Task
+
+                task = db.query(Task).filter(Task.id == self.db_task_id).first()
+                if not task:
+                    logger.warning(
+                        f"Task {self.db_task_id} not found, cannot rebind file record"
+                    )
+                    return
+                task_user_id = int(task.user_id)
+                if user_id != task_user_id:
+                    logger.warning(
+                        "Skipping file record rebind across users: "
+                        f"file_id={file_id}, record_user_id={user_id}, "
+                        f"task_user_id={task_user_id}"
+                    )
+                    return
+                task_id = self.db_task_id
+                user_id = task_user_id
+
+            category = relative_path.split("/", 1)[0] if relative_path else "workspace"
+            file_path, relative_path, category = (
+                self._canonicalize_delegated_output_registration(
+                    db=db,
+                    file_id=file_id,
+                    file_path=file_path,
+                    task_id=int(task_id) if task_id is not None else 0,
+                    user_id=user_id,
+                    relative_path=relative_path,
+                    category=category,
+                )
+            )
+            storage_key = _build_workspace_storage_key(
+                user_id,
+                int(task_id) if task_id is not None else 0,
+                file_id,
+                relative_path,
+            )
+            if task_id is None:
+                storage_key = getattr(record, "storage_key", None) or storage_key
+
+            record.user_id = user_id
+            record.task_id = int(task_id) if task_id is not None else None
+            record.filename = file_path.name
+            record.storage_path = str(file_path)
+            record.file_size = file_path.stat().st_size
+            record.mime_type = mime_type
+            record.workspace_relative_path = relative_path
+            record.workspace_category = category
+            UploadedFileStore(db).sync_existing(
+                record,
+                storage_key=storage_key,
+                mime_type=mime_type,
+            )
+            if should_close:
+                db.commit()
+            else:
+                db.flush()
+        except Exception as e:
+            logger.error(f"Failed to sync existing file record: {e}")
+            if should_close:
+                db.rollback()
+            raise
         finally:
             if should_close and db is not None:
                 db.close()
@@ -247,13 +523,16 @@ class TaskWorkspace:
         except (TypeError, ValueError, IndexError):
             return None
 
-    def _file_record_allowed_for_workspace(self, record: Any, path: Path) -> bool:
-        workspace_abs = self.workspace_dir.resolve()
-        resolved_path = path.resolve()
-        if resolved_path == workspace_abs or resolved_path.is_relative_to(
-            workspace_abs
-        ):
-            return True
+    def _file_record_allowed_for_workspace(
+        self, record: Any, path: Optional[Path] = None
+    ) -> bool:
+        if path is not None:
+            workspace_abs = self.workspace_dir.resolve()
+            resolved_path = path.resolve()
+            if resolved_path == workspace_abs or resolved_path.is_relative_to(
+                workspace_abs
+            ):
+                return True
 
         owner_user_id = self.owner_user_id
         if owner_user_id is None:
@@ -296,7 +575,12 @@ class TaskWorkspace:
         try:
             from ..web.models.uploaded_file import UploadedFile
 
-            db = create_db_session()
+            if self.db_session is not None:
+                db = self.db_session
+                should_close = False
+            else:
+                db = create_db_session()
+                should_close = True
             try:
                 record = (
                     db.query(UploadedFile)
@@ -315,9 +599,24 @@ class TaskWorkspace:
                             )
                             return None
                         return resolved_path
+                if (
+                    record
+                    and getattr(record, "storage_key", None)
+                    and getattr(record, "storage_status", None) == "available"
+                ):
+                    if not self._file_record_allowed_for_workspace(record):
+                        logger.warning(
+                            "Rejected durable file_id outside workspace scope: %s",
+                            file_id,
+                        )
+                        return None
+                    from ..web.services.managed_file_ref import ManagedFileRef
+
+                    return ManagedFileRef(record).materialize()
                 return None
             finally:
-                db.close()
+                if should_close:
+                    db.close()
         except Exception as e:
             logger.warning(f"Failed to resolve file_id from database: {e}")
             return None
@@ -690,11 +989,16 @@ class TaskWorkspace:
         try:
             yield self
         finally:
-            # Scan files after operation and register new ones
+            # Scan files after operation and register new/modified files.
             files_after = self._scan_all_files()
-            new_files = files_after - files_before
+            changed_files = files_after - files_before
+            changed_files.update(
+                file_path
+                for file_path in files_after & files_before
+                if self._get_file_id_from_db(file_path, self.db_session) is not None
+            )
 
-            for file_path in new_files:
+            for file_path in changed_files:
                 try:
                     file_id = self.register_file(str(file_path))
                     # Store path -> file_id mapping
@@ -827,7 +1131,12 @@ class TaskWorkspace:
                 # Build file list from database
                 for file_record in files:
                     file_path = Path(file_record.storage_path)
-                    if file_path.exists():
+                    has_local_file = file_path.exists()
+                    has_durable_file = bool(
+                        file_record.storage_key
+                        and file_record.storage_status == "available"
+                    )
+                    if has_local_file or has_durable_file:
                         result_files.append(
                             {
                                 "file_id": file_record.file_id,
@@ -843,7 +1152,7 @@ class TaskWorkspace:
                                 "in_current_workspace": file_path.is_relative_to(
                                     self.workspace_dir
                                 )
-                                if file_path.exists()
+                                if has_local_file
                                 else False,
                             }
                         )
@@ -915,6 +1224,7 @@ def create_workspace(
     id: str,
     base_dir: Optional[str] = None,
     allowed_external_dirs: Optional[List[str]] = None,
+    db_task_id: Optional[int] = None,
 ) -> TaskWorkspace:
     """
     Create a new workspace for the given id.
@@ -929,7 +1239,7 @@ def create_workspace(
     """
     if base_dir is None:
         base_dir = str(get_uploads_dir())
-    return TaskWorkspace(id, base_dir, allowed_external_dirs)
+    return TaskWorkspace(id, base_dir, allowed_external_dirs, db_task_id=db_task_id)
 
 
 def get_workspace_output_files(
@@ -967,6 +1277,7 @@ class WorkspaceManager:
         base_dir: str,
         task_id: str,
         allowed_external_dirs: Optional[List[str]] = None,
+        db_task_id: Optional[int] = None,
     ) -> TaskWorkspace:
         """
         Get existing workspace or create new one.
@@ -982,8 +1293,16 @@ class WorkspaceManager:
         cache_key = f"{base_dir}:{task_id}"
 
         if cache_key not in self._workspaces:
-            workspace = TaskWorkspace(task_id, base_dir, allowed_external_dirs)
+            workspace = TaskWorkspace(
+                task_id,
+                base_dir,
+                allowed_external_dirs,
+                db_task_id=db_task_id,
+            )
             self._workspaces[cache_key] = workspace
+        elif db_task_id is not None and self._workspaces[cache_key].db_task_id is None:
+            self._workspaces[cache_key].db_task_id = db_task_id
+            self._workspaces[cache_key].current_task_id = db_task_id
 
         return self._workspaces[cache_key]
 

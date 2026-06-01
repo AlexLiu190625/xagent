@@ -15,6 +15,11 @@ from ...web.models.database import get_db
 from ...web.models.task import Task
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
 from ...web.models.tool_config import ToolUsage
+from ...web.services.trace_message_storage import (
+    CheckpointMessageDecodeError,
+    decode_trace_event_data,
+    encode_checkpoint_data_for_storage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -101,13 +106,17 @@ class DatabaseTraceHandler(BaseTraceHandler):
     ) -> Optional[Dict[str, Any]]:
         db = next(get_db())
         try:
+            query = db.query(DatabaseTraceEvent).filter(
+                DatabaseTraceEvent.task_id == self.task_id,
+                DatabaseTraceEvent.event_type == "system_update_general",
+            )
+            if self.build_id is None:
+                query = query.filter(DatabaseTraceEvent.build_id.is_(None))
+            else:
+                query = query.filter(DatabaseTraceEvent.build_id == self.build_id)
+
             rows = (
-                db.query(DatabaseTraceEvent)
-                .filter(
-                    DatabaseTraceEvent.task_id == self.task_id,
-                    DatabaseTraceEvent.event_type == "system_update_general",
-                )
-                .order_by(
+                query.order_by(
                     DatabaseTraceEvent.timestamp.desc(),
                     DatabaseTraceEvent.id.desc(),
                 )
@@ -121,6 +130,21 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 if str(
                     data.get("root_execution_id") or data.get("execution_id")
                 ) != str(execution_id):
+                    continue
+                try:
+                    data = decode_trace_event_data(
+                        db,
+                        task_id=self.task_id,
+                        data=data,
+                        strict=True,
+                    )
+                except CheckpointMessageDecodeError as exc:
+                    logger.warning(
+                        "Skipping unreadable checkpoint trace event %s for task %s: %s",
+                        row.event_id,
+                        self.task_id,
+                        exc,
+                    )
                     continue
                 snapshot = data.get("snapshot")
                 return dict(snapshot) if isinstance(snapshot, dict) else None
@@ -151,6 +175,23 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             # Serialize data to ensure JSON compatibility
             data = self._serialize_data_for_json(event.data or {})
+            if self._is_duplicate_user_message_turn(db, event_type_str, data):
+                logger.debug(
+                    "Skipping duplicate user_message turn_id=%s for task %s",
+                    data.get("turn_id") if isinstance(data, dict) else None,
+                    self.task_id,
+                )
+                return
+            if (
+                event_type_str == "system_update_general"
+                and isinstance(data, dict)
+                and data.get("checkpoint_type") == CHECKPOINT_TYPE
+            ):
+                data = encode_checkpoint_data_for_storage(
+                    db,
+                    task_id=self.task_id,
+                    data=data,
+                )
 
             # Create trace event record
             trace_event = DatabaseTraceEvent(
@@ -170,6 +211,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 event_type_str == "system_update_general"
                 and isinstance(data, dict)
                 and data.get("checkpoint_type") == CHECKPOINT_TYPE
+                and self.build_id is None
             ):
                 task = db.query(Task).filter(Task.id == self.task_id).first()
                 if task:
@@ -237,6 +279,34 @@ class DatabaseTraceHandler(BaseTraceHandler):
             logger.error(f"Failed to save trace event to database: {e}")
             db.rollback()
             raise
+
+    def _is_duplicate_user_message_turn(
+        self,
+        db: Session,
+        event_type: str,
+        data: Any,
+    ) -> bool:
+        if event_type != "user_message" or not isinstance(data, dict):
+            return False
+        turn_id = data.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            return False
+        build_filter = (
+            DatabaseTraceEvent.build_id == self.build_id
+            if self.build_id is not None
+            else DatabaseTraceEvent.build_id.is_(None)
+        )
+        return (
+            db.query(DatabaseTraceEvent.id)
+            .filter(
+                DatabaseTraceEvent.task_id == self.task_id,
+                build_filter,
+                DatabaseTraceEvent.event_type == "user_message",
+                DatabaseTraceEvent.data["turn_id"].as_string() == turn_id,
+            )
+            .first()
+            is not None
+        )
 
     def _serialize_data_for_json(self, data: Any) -> Any:
         """Recursively serialize data to ensure JSON compatibility and clean problematic characters."""

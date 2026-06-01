@@ -26,6 +26,8 @@ export interface AgentCard {
   description?: string | null;
   logo_url?: string | null;
   status?: string;
+  readonly?: boolean;
+  can_edit?: boolean;
 }
 
 interface ChatStartScreenProps {

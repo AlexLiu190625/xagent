@@ -1,6 +1,7 @@
 name: Test Database Migrations
 
 on:
+  workflow_dispatch:
   push:
     branches: [main]
     paths:

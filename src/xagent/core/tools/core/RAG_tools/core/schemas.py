@@ -11,7 +11,10 @@ from enum import Enum
 from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from ......config import get_web_crawl_tls_impersonate
+from .web_url_utils import validate_and_normalize_web_url
 
 # Default configurable values (avoid scattering literals)
 DEFAULT_SEARCH_TOP_K: int = 5
@@ -265,6 +268,13 @@ class RegisterDocumentRequest(BaseModel):
         None, description="UploadedFile file_id for stable file association"
     )
     source_path: str = Field(..., description="Absolute path to uploaded file")
+    metadata_source_path: Optional[str] = Field(
+        None,
+        description=(
+            "Canonical source path to store in metadata when ingestion reads from "
+            "a temporary immutable input path"
+        ),
+    )
 
     file_type: Optional[str] = Field(
         None, description="File type (auto-detected if not provided)"
@@ -1746,10 +1756,11 @@ class WebCrawlConfig(BaseModel):
         ),
     )
     tls_impersonate: Optional[str] = Field(
-        default=None,
+        default_factory=get_web_crawl_tls_impersonate,
         description=(
             "TLS fingerprint to impersonate via curl_cffi. "
-            "Defaults to None (plain httpx -- fastest, but no WAF bypass). "
+            "Defaults to XAGENT_WEB_CRAWL_TLS_IMPERSONATE when set, otherwise "
+            "None (plain httpx -- fastest, but no WAF bypass). "
             "Pass 'auto' to try a built-in fallback chain in order until one "
             "succeeds. "
             "Pass a specific impersonate spec (e.g. 'safari17_0', 'chrome120') "
@@ -1768,6 +1779,12 @@ class WebCrawlConfig(BaseModel):
         default=True,
         description="Whether to respect robots.txt rules",
     )
+
+    @field_validator("start_url", mode="before")
+    @classmethod
+    def validate_start_url(cls, value: Any) -> str:
+        """Normalize the crawl entrypoint once at the shared config boundary."""
+        return validate_and_normalize_web_url(value)
 
 
 class CrawlResult(BaseModel):

@@ -11,7 +11,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool
+@register_tool(categories={"browser"})
 async def create_browser_tools(config: "BaseToolConfig") -> List[Any]:
     """Create browser automation tools."""
     if not config.get_browser_tools_enabled():

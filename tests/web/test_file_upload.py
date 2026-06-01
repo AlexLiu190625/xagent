@@ -11,10 +11,12 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.file_storage.factory import get_file_storage
 from xagent.web.api.auth import hash_password
-from xagent.web.api.files import file_router
+from xagent.web.api.files import _content_disposition_header, file_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 
 
@@ -135,14 +137,32 @@ def temp_uploads_dir(monkeypatch):
         import xagent.web.api.files
         import xagent.web.config
 
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (temp_path / "objects").as_uri())
+        get_file_storage.cache_clear()
         monkeypatch.setattr(xagent.web.config, "get_uploads_dir", lambda: temp_path)
         monkeypatch.setattr(xagent.web.api.files, "get_uploads_dir", lambda: temp_path)
 
         yield temp_path
 
 
+def _corrupt_durable_copy_and_remove_local(
+    object_root: Path, uploads_dir: Path, filename: str
+) -> None:
+    object_file = next(path for path in object_root.rglob(filename) if path.is_file())
+    object_file.write_bytes(b"corrupted durable content")
+    for path in uploads_dir.rglob(filename):
+        if path.is_file():
+            path.unlink()
+
+
 class TestFileUpload:
     """Test file upload functionality"""
+
+    def test_content_disposition_header_escapes_filename_and_adds_utf8_parameter(self):
+        assert _content_disposition_header("attachment", 'quo"te\\文\r\n.txt') == (
+            'attachment; filename="quo\\"te\\\\___.txt"; '
+            "filename*=UTF-8''quo%22te%5C%E6%96%87%0D%0A.txt"
+        )
 
     def test_upload_text_file_success(
         self, client, test_db, sample_files, temp_uploads_dir, auth_headers
@@ -161,6 +181,749 @@ class TestFileUpload:
 
         # File upload returns 200 on success
         assert response.status_code == 200
+
+    def test_upload_download_uses_durable_storage_after_local_file_deleted(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        """Uploaded files should download from durable storage, not local uploads."""
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        get_file_storage.cache_clear()
+
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("durable.txt", b"durable content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+
+        object_files = [path for path in object_root.rglob("*") if path.is_file()]
+        assert len(object_files) == 1
+        assert object_files[0].read_bytes() == b"durable content"
+
+        for path in temp_uploads_dir.rglob("*"):
+            if path.is_file():
+                path.unlink()
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+        )
+
+        assert download.status_code == 200
+        assert download.content == b"durable content"
+
+    def test_download_redirects_to_signed_durable_url_when_enabled(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS", "42")
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("redirect.txt", b"redirect content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+        calls = []
+
+        def signed_access_url(
+            self,
+            *,
+            expires,
+            content_type=None,
+            content_disposition=None,
+        ):
+            calls.append(
+                (
+                    self.storage_key,
+                    expires,
+                    content_type,
+                    content_disposition,
+                )
+            )
+            return "https://cdn.example.com/private/redirect.txt?sig=abc"
+
+        monkeypatch.setattr(ManagedFileRef, "signed_access_url", signed_access_url)
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert download.status_code == 307
+        assert (
+            download.headers["location"]
+            == "https://cdn.example.com/private/redirect.txt?sig=abc"
+        )
+        assert len(calls) == 1
+        storage_key, expires, content_type, content_disposition = calls[0]
+        assert storage_key.endswith(f"/{file_id}/redirect.txt")
+        assert expires == 42
+        assert content_type == "text/plain"
+        assert (
+            content_disposition
+            == "inline; filename=\"redirect.txt\"; filename*=UTF-8''redirect.txt"
+        )
+
+    def test_preview_redirects_to_signed_durable_url_when_enabled(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        from xagent.web.services.managed_file_ref import ManagedFileRef
+
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("preview.txt", b"preview content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+
+        def signed_access_url(
+            self,
+            *,
+            expires,
+            content_type=None,
+            content_disposition=None,
+        ):
+            del self, expires, content_type, content_disposition
+            return "https://cdn.example.com/private/preview.txt?sig=abc"
+
+        monkeypatch.setattr(ManagedFileRef, "signed_access_url", signed_access_url)
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert preview.status_code == 307
+        assert (
+            preview.headers["location"]
+            == "https://cdn.example.com/private/preview.txt?sig=abc"
+        )
+
+    def test_download_uses_accel_redirect_for_local_file_when_enabled(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        del temp_uploads_dir
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED", "true")
+        monkeypatch.setenv(
+            "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX", "/private-files"
+        )
+        response = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "local accel.txt",
+                    b"local accel content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert download.status_code == 200
+        assert download.content == b""
+        assert "location" not in download.headers
+        assert download.headers["x-accel-redirect"].endswith(
+            f"/user_1/{quote('local accel.txt')}"
+        )
+        assert download.headers["content-type"].startswith("text/plain")
+        assert (
+            download.headers["content-disposition"]
+            == 'inline; filename="local accel.txt"; '
+            "filename*=UTF-8''local%20accel.txt"
+        )
+
+    def test_preview_uses_accel_redirect_for_local_text_when_enabled(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        del temp_uploads_dir
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED", "true")
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("preview-accel.txt", b"preview accel", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert preview.status_code == 200
+        assert preview.content == b""
+        assert preview.headers["x-accel-redirect"].endswith("/user_1/preview-accel.txt")
+        assert (
+            preview.headers["content-disposition"]
+            == 'inline; filename="preview-accel.txt"; '
+            "filename*=UTF-8''preview-accel.txt"
+        )
+
+    def test_preview_does_not_accel_redirect_html(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        del temp_uploads_dir
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED", "true")
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("index.html", b"<h1>preview</h1>", "text/html")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200
+        file_id = response.json()["file_id"]
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert preview.status_code == 200
+        assert "x-accel-redirect" not in preview.headers
+        assert preview.content == b"<h1>preview</h1>"
+
+    def test_upload_remote_storage_outage_returns_503_and_rolls_back(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        admin_user, test_app = test_db
+
+        def fail_put_file(self, source, key, content_type=None):
+            raise RuntimeError("simulated remote write outage")
+
+        monkeypatch.setattr(FsspecFileStorage, "put_file", fail_put_file)
+
+        response = client.post(
+            "/api/files/upload",
+            files={"file": ("outage.txt", b"outage content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 503
+        assert "durable storage" in response.json()["detail"].lower()
+        assert not list(temp_uploads_dir.rglob("outage.txt"))
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            assert (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.user_id == admin_user.id,
+                    UploadedFile.filename == "outage.txt",
+                )
+                .first()
+                is None
+            )
+        finally:
+            db.close()
+
+    def test_download_serves_existing_local_file_during_remote_outage(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("local-copy.txt", b"local content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+
+        def fail_open_read(self, key):
+            raise RuntimeError("simulated remote read outage")
+
+        monkeypatch.setattr(FsspecFileStorage, "open_read", fail_open_read)
+
+        download = client.get(
+            f"/api/files/download/{upload.json()['file_id']}",
+            headers=auth_headers,
+        )
+
+        assert download.status_code == 200
+        assert download.content == b"local content"
+
+    def test_download_remote_storage_outage_returns_503_when_local_missing(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("remote-only.txt", b"remote content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        for path in temp_uploads_dir.rglob("remote-only.txt"):
+            path.unlink()
+
+        def fail_open_read(self, key):
+            raise RuntimeError("simulated remote read outage")
+
+        monkeypatch.setattr(FsspecFileStorage, "open_read", fail_open_read)
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+        )
+
+        assert download.status_code == 503
+        assert "durable storage" in download.json()["detail"].lower()
+
+    def test_download_checksum_mismatch_asks_user_to_reupload(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        get_file_storage.cache_clear()
+
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "integrity-download.txt",
+                    b"expected download content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        _corrupt_durable_copy_and_remove_local(
+            object_root, temp_uploads_dir, "integrity-download.txt"
+        )
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+        )
+
+        assert download.status_code == 409
+        assert "re-upload" in download.json()["detail"]
+        assert not list(temp_uploads_dir.rglob("integrity-download.txt"))
+
+    def test_download_redirect_enabled_checksum_mismatch_asks_user_to_reupload(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        get_file_storage.cache_clear()
+
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "integrity-redirect-download.txt",
+                    b"expected redirect download content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        _corrupt_durable_copy_and_remove_local(
+            object_root, temp_uploads_dir, "integrity-redirect-download.txt"
+        )
+
+        def fail_signed_url(self, key, **kwargs):
+            del self, key, kwargs
+            raise AssertionError("signed URL should not be generated")
+
+        monkeypatch.setattr(FsspecFileStorage, "signed_url", fail_signed_url)
+
+        download = client.get(
+            f"/api/files/download/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert download.status_code == 409
+        assert "re-upload" in download.json()["detail"]
+        assert not list(temp_uploads_dir.rglob("integrity-redirect-download.txt"))
+
+    def test_download_registered_file_rejects_local_path_outside_uploads(
+        self, client, test_db, tmp_path, auth_headers
+    ):
+        """DB-backed download must still enforce the uploads path boundary."""
+        admin_user, test_app = test_db
+        outside_path = tmp_path / "outside.txt"
+        outside_path.write_text("outside uploads", encoding="utf-8")
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(
+                UploadedFile(
+                    file_id="11111111-1111-4111-8111-111111111111",
+                    user_id=admin_user.id,
+                    filename="outside.txt",
+                    storage_path=str(outside_path),
+                    storage_status="legacy",
+                    mime_type="text/plain",
+                    file_size=outside_path.stat().st_size,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get(
+            "/api/files/download/11111111-1111-4111-8111-111111111111",
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 403
+
+    def test_preview_registered_file_rejects_local_path_outside_uploads(
+        self, client, test_db, tmp_path, auth_headers
+    ):
+        """DB-backed preview must still enforce the uploads path boundary."""
+        admin_user, test_app = test_db
+        outside_path = tmp_path / "outside-preview.txt"
+        outside_path.write_text("outside uploads", encoding="utf-8")
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(
+                UploadedFile(
+                    file_id="22222222-2222-4222-8222-222222222222",
+                    user_id=admin_user.id,
+                    filename="outside-preview.txt",
+                    storage_path=str(outside_path),
+                    storage_status="legacy",
+                    mime_type="text/plain",
+                    file_size=outside_path.stat().st_size,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get(
+            "/api/files/preview/22222222-2222-4222-8222-222222222222",
+            headers=auth_headers,
+        )
+
+        assert response.status_code == 403
+
+    def test_public_preview_registered_file_rejects_local_path_outside_uploads(
+        self, client, test_db, tmp_path
+    ):
+        """Public preview must not expose registered paths outside uploads."""
+        admin_user, test_app = test_db
+        outside_path = tmp_path / "outside-public.txt"
+        outside_path.write_text("outside uploads", encoding="utf-8")
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(
+                UploadedFile(
+                    file_id="33333333-3333-4333-8333-333333333333",
+                    user_id=admin_user.id,
+                    filename="outside-public.txt",
+                    storage_path=str(outside_path),
+                    storage_status="legacy",
+                    mime_type="text/plain",
+                    file_size=outside_path.stat().st_size,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get(
+            "/api/files/public/preview/33333333-3333-4333-8333-333333333333"
+        )
+
+        assert response.status_code == 403
+
+    def test_preview_remote_storage_outage_returns_503_when_local_missing(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("preview-remote.txt", b"preview content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        for path in temp_uploads_dir.rglob("preview-remote.txt"):
+            path.unlink()
+
+        def fail_open_read(self, key):
+            raise RuntimeError("simulated remote preview outage")
+
+        monkeypatch.setattr(FsspecFileStorage, "open_read", fail_open_read)
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+        )
+
+        assert preview.status_code == 503
+        assert "durable storage" in preview.json()["detail"].lower()
+
+    def test_preview_checksum_mismatch_asks_user_to_reupload(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        get_file_storage.cache_clear()
+
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "integrity-preview.txt",
+                    b"expected preview content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        _corrupt_durable_copy_and_remove_local(
+            object_root, temp_uploads_dir, "integrity-preview.txt"
+        )
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+        )
+
+        assert preview.status_code == 409
+        assert "re-upload" in preview.json()["detail"]
+
+    def test_preview_redirect_enabled_checksum_mismatch_asks_user_to_reupload(
+        self, client, temp_uploads_dir, auth_headers, monkeypatch, tmp_path
+    ):
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
+        get_file_storage.cache_clear()
+
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "integrity-redirect-preview.txt",
+                    b"expected redirect preview content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        _corrupt_durable_copy_and_remove_local(
+            object_root, temp_uploads_dir, "integrity-redirect-preview.txt"
+        )
+
+        def fail_signed_url(self, key, **kwargs):
+            del self, key, kwargs
+            raise AssertionError("signed URL should not be generated")
+
+        monkeypatch.setattr(FsspecFileStorage, "signed_url", fail_signed_url)
+
+        preview = client.get(
+            f"/api/files/preview/{file_id}",
+            headers=auth_headers,
+            follow_redirects=False,
+        )
+
+        assert preview.status_code == 409
+        assert "re-upload" in preview.json()["detail"]
+        assert not list(temp_uploads_dir.rglob("integrity-redirect-preview.txt"))
+
+    def test_public_preview_checksum_mismatch_asks_user_to_reupload(
+        self, client, temp_uploads_dir, monkeypatch, tmp_path, auth_headers
+    ):
+        object_root = tmp_path / "objects"
+        monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+        get_file_storage.cache_clear()
+
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "integrity-public.txt",
+                    b"expected public content",
+                    "text/plain",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+        _corrupt_durable_copy_and_remove_local(
+            object_root, temp_uploads_dir, "integrity-public.txt"
+        )
+
+        preview = client.get(f"/api/files/public/preview/{file_id}")
+
+        assert preview.status_code == 409
+        assert "re-upload" in preview.json()["detail"]
+
+    def test_public_download_serves_source_bytes_without_auth(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """Public download must serve the source bytes for plain
+        ``<a href>`` navigation that does NOT carry a bearer token —
+        otherwise the chat file-card 'Open' link, middle-click
+        'open in new tab', and right-click 'copy link' all 401."""
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("source.txt", b"source content", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+
+        # Deliberately omit ``headers=auth_headers``: the whole point of
+        # the public route is that it works without a token.
+        download = client.get(f"/api/files/public/download/{file_id}")
+
+        assert download.status_code == 200
+        assert download.content == b"source content"
+
+    def test_public_download_sets_attachment_content_disposition(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """Public download must send Content-Disposition: attachment
+        with the source filename so the browser saves under the real
+        name (e.g. ``slides.pptx``) instead of the bare file id."""
+        upload = client.post(
+            "/api/files/upload",
+            files={"file": ("slides.pptx", b"slide bytes", "application/octet-stream")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200
+        file_id = upload.json()["file_id"]
+
+        download = client.get(f"/api/files/public/download/{file_id}")
+
+        assert download.status_code == 200
+        disposition = download.headers.get("content-disposition", "")
+        assert disposition.startswith("attachment"), disposition
+        assert 'filename="slides.pptx"' in disposition, disposition
+
+    def test_public_download_sets_rfc5987_content_disposition_for_non_ascii_filenames(
+        self, client, temp_uploads_dir, auth_headers
+    ):
+        """Non-ASCII filenames (e.g. Chinese) must be percent-encoded as
+        ``filename*=utf-8''<encoded>`` in the Content-Disposition header.
+        A manually composed ``filename="报告.pptx"`` would be encoded as
+        latin-1 by the ASGI layer, raising UnicodeEncodeError.  Delegating
+        header generation to Starlette's FileResponse avoids this."""
+        upload = client.post(
+            "/api/files/upload",
+            files={
+                "file": (
+                    "报告.pptx",
+                    b"slide bytes",
+                    "application/octet-stream",
+                )
+            },
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload.status_code == 200, upload.json()
+        file_id = upload.json()["file_id"]
+
+        download = client.get(f"/api/files/public/download/{file_id}")
+
+        assert download.status_code == 200, download.text
+        disposition = download.headers.get("content-disposition", "")
+        assert disposition.startswith("attachment"), disposition
+        # Starlette percent-encodes non-ASCII names with the RFC 5987
+        # ``filename*=utf-8''<encoded>`` form.  The raw multi-byte string
+        # must NOT appear literally in the header value.
+        assert "filename*=" in disposition, disposition
+        assert "报告" not in disposition, disposition  # '报告'
+
+    def test_public_download_returns_404_for_unknown_id(self, client):
+        download = client.get(
+            "/api/files/public/download/00000000-0000-4000-8000-000000000000"
+        )
+        assert download.status_code == 404
+
+    def test_public_download_registered_file_rejects_local_path_outside_uploads(
+        self, client, test_db, tmp_path
+    ):
+        """Public download must not expose registered paths outside the
+        uploads root (mirror of the same guard on public_preview)."""
+        admin_user, test_app = test_db
+        outside_path = tmp_path / "outside-public-download.txt"
+        outside_path.write_text("outside uploads", encoding="utf-8")
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            db.add(
+                UploadedFile(
+                    file_id="44444444-4444-4444-8444-444444444444",
+                    user_id=admin_user.id,
+                    filename="outside-public-download.txt",
+                    storage_path=str(outside_path),
+                    storage_status="legacy",
+                    mime_type="text/plain",
+                    file_size=outside_path.stat().st_size,
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get(
+            "/api/files/public/download/44444444-4444-4444-8444-444444444444"
+        )
+
+        assert response.status_code == 403
 
     def test_upload_python_file_success(
         self, client, test_db, sample_files, temp_uploads_dir, auth_headers
@@ -491,6 +1254,59 @@ class TestFileManagement:
         else:
             # If upload failed, skip delete test
             pytest.skip("Upload failed, skipping delete test")
+
+    def test_delete_file_keeps_record_when_durable_cleanup_fails(
+        self, client, test_db, temp_uploads_dir, auth_headers, monkeypatch
+    ):
+        """Durable cleanup failure should not orphan the object by deleting the row."""
+        from xagent.core.file_storage.storage import FsspecFileStorage
+
+        admin_user, test_app = test_db
+        upload_response = client.post(
+            "/api/files/upload",
+            files={"file": ("delete-fails.txt", b"delete fails", "text/plain")},
+            data={"task_type": "general"},
+            headers=auth_headers,
+        )
+        assert upload_response.status_code == 200
+        file_id = upload_response.json()["file_id"]
+
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            record = (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.user_id == admin_user.id,
+                    UploadedFile.file_id == file_id,
+                )
+                .one()
+            )
+            storage_key = str(record.storage_key)
+            local_path = Path(str(record.storage_path))
+        finally:
+            db.close()
+
+        real_delete = FsspecFileStorage.delete
+
+        def fail_target_delete(self, key):
+            if key == storage_key:
+                raise RuntimeError("simulated durable delete failure")
+            real_delete(self, key)
+
+        monkeypatch.setattr(FsspecFileStorage, "delete", fail_target_delete)
+
+        response = client.delete(f"/api/files/{file_id}", headers=auth_headers)
+
+        assert response.status_code == 503
+        assert local_path.exists()
+        db = next(test_app.dependency_overrides[get_db]())
+        try:
+            assert (
+                db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+                is not None
+            )
+        finally:
+            db.close()
 
     def test_delete_file_not_found(self, client, test_db, auth_headers):
         """Test deleting non-existent file"""

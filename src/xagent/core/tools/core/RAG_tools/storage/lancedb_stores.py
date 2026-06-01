@@ -15,7 +15,11 @@ from lancedb.db import DBConnection
 
 from xagent.providers.vector_store.lancedb import get_connection_from_env
 
-from ..core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT, IndexPolicy
+from ..core.config import (
+    DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE,
+    DEFAULT_VECTOR_STORE_SCAN_LIMIT,
+    IndexPolicy,
+)
 from ..core.schemas import CollectionInfo, IndexResult
 from ..LanceDB.schema_manager import ensure_documents_table
 from ..utils.lancedb_query_utils import list_table_names, query_to_list
@@ -80,7 +84,13 @@ class LanceDBMetadataStore(MetadataStore):
         except Exception as exc:
             logger.debug("Failed to delete collection metadata: %s", exc)
 
-    async def rename_collection(self, old_name: str, new_name: str) -> None:
+    async def rename_collection(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> None:
         """Rename ``collection_config`` and ``collection_metadata`` keys.
 
         See :meth:`MetadataStore.rename_collection`.
@@ -96,12 +106,18 @@ class LanceDBMetadataStore(MetadataStore):
 
         safe_old = escape_lancedb_string(old_name)
         now = datetime.now(timezone.utc).replace(tzinfo=None)
+        if is_admin:
+            config_where = f"collection = '{safe_old}'"
+        elif user_id is None:
+            config_where = f"collection = '{safe_old}' AND user_id = 0"
+        else:
+            config_where = f"collection = '{safe_old}' AND user_id = {user_id}"
 
         config_table = None
         try:
             config_table = conn.open_table("collection_config")
             config_table.update(
-                f"collection = '{safe_old}'",
+                config_where,
                 {"collection": new_name, "updated_at": now},
             )
         finally:
@@ -110,10 +126,15 @@ class LanceDBMetadataStore(MetadataStore):
         meta_table = None
         try:
             meta_table = conn.open_table("collection_metadata")
-            meta_table.update(
-                f"name = '{safe_old}'",
-                {"name": new_name, "updated_at": now},
-            )
+            if is_admin:
+                meta_table.update(
+                    f"name = '{safe_old}'",
+                    {"name": new_name, "updated_at": now},
+                )
+            else:
+                # Tenant-scoped rename invalidates the global cache for the old
+                # name; admin/global list can rebuild accurate aggregate stats.
+                meta_table.delete(f"name = '{safe_old}'")
         finally:
             _safe_close_table(meta_table)
 
@@ -415,6 +436,47 @@ class LanceDBMetadataStore(MetadataStore):
         finally:
             _safe_close_table(table)
 
+    def list_collection_config_owner_ids(self, collection_name: str) -> set[int]:
+        """List owners with collection_config rows for a collection."""
+        from ..LanceDB.schema_manager import (
+            _safe_close_table,
+            ensure_collection_config_table,
+        )
+
+        owner_ids: set[int] = set()
+        table = None
+        try:
+            conn = self.get_raw_connection()
+            ensure_collection_config_table(conn)
+            table = conn.open_table("collection_config")
+            safe_collection = escape_lancedb_string(collection_name)
+            rows = query_to_list(
+                table.search()
+                .where(f"collection = '{safe_collection}'")
+                .select(["user_id"])
+                .limit(-1)
+            )
+            for row in rows:
+                raw_user_id = row.get("user_id")
+                if raw_user_id is None:
+                    continue
+                try:
+                    owner_ids.add(int(raw_user_id))
+                except (TypeError, ValueError):
+                    logger.debug(
+                        "Skipping invalid collection_config user_id: %r",
+                        raw_user_id,
+                    )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to list collection_config owners for %s: %s",
+                collection_name,
+                exc,
+            )
+        finally:
+            _safe_close_table(table)
+        return owner_ids
+
     def get_raw_connection(self) -> DBConnection:
         """Get the underlying LanceDB connection.
 
@@ -552,6 +614,17 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                 raw_doc_id = item.get("doc_id")
                 if not raw_doc_id:
                     continue
+                raw_user_id = item.get("user_id")
+                user_id_value = None
+                if raw_user_id is not None:
+                    try:
+                        user_id_value = int(raw_user_id)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Skipping invalid user_id on document record %s: %r",
+                            raw_doc_id,
+                            raw_user_id,
+                        )
                 records.append(
                     DocumentRecord(
                         doc_id=str(raw_doc_id),
@@ -561,6 +634,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
                             if item.get("source_path")
                             else None
                         ),
+                        user_id=user_id_value,
                     )
                 )
             return records
@@ -612,11 +686,21 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         self,
         collection_name: str,
         new_name: str,
+        user_id: Optional[int],
+        is_admin: bool,
     ) -> List[str]:
         from ..LanceDB.schema_manager import _safe_close_table
 
         warnings: List[str] = []
         safe_old_name = escape_lancedb_string(collection_name)
+        filters = FilterCondition("collection", FilterOperator.EQ, collection_name)
+        where_expr = self.build_filter_expression(
+            filters=filters,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+        if not where_expr:
+            where_expr = f"collection = '{safe_old_name}'"
         conn = self._get_connection()
         for table_name in self.list_table_names():
             if table_name not in {
@@ -629,7 +713,7 @@ class LanceDBVectorIndexStore(VectorIndexStore):
             try:
                 table = conn.open_table(table_name)
                 table.update(
-                    f"collection = '{safe_old_name}'",
+                    where_expr,
                     {"collection": new_name},
                 )
             except Exception as exc:  # noqa: BLE001
@@ -776,6 +860,66 @@ class LanceDBVectorIndexStore(VectorIndexStore):
         # Ensure subsequent reads don't observe stale cached table handles.
         self.invalidate_table_cache()
         return counts
+
+    def delete_documents_data(
+        self,
+        collection_name: str,
+        doc_ids: Sequence[str],
+        user_id: Optional[int],
+        is_admin: bool,
+        warnings_out: Optional[List[str]] = None,
+    ) -> Dict[str, int]:
+        """Delete vector-side data for multiple documents in batches."""
+        normalized_doc_ids = sorted({str(doc_id) for doc_id in doc_ids if str(doc_id)})
+        if not normalized_doc_ids:
+            return {}
+
+        conn = self._get_connection()
+        from ..version_management.cascade_cleaner import cascade_delete_documents
+
+        batch_size = DEFAULT_VECTOR_STORE_DELETE_BATCH_SIZE
+        merged: Dict[str, int] = {}
+        deleted_doc_ids: List[str] = []
+        try:
+            for start in range(0, len(normalized_doc_ids), batch_size):
+                batch = normalized_doc_ids[start : start + batch_size]
+                try:
+                    counts = cascade_delete_documents(
+                        collection=collection_name,
+                        doc_ids=batch,
+                        user_id=user_id,
+                        is_admin=is_admin,
+                        preview_only=False,
+                        confirm=True,
+                        conn=conn,
+                    )
+                except Exception as exc:
+                    if warnings_out is not None:
+                        warnings_out.append(
+                            "Failed to delete document batch "
+                            f"{start // batch_size + 1}: {exc}"
+                        )
+                    from ..core.exceptions import DatabaseOperationError
+
+                    raise DatabaseOperationError(
+                        "Failed to delete document batch",
+                        details={
+                            "deleted_counts": dict(merged),
+                            "deleted_doc_ids": list(deleted_doc_ids),
+                            "failed_batch_index": start // batch_size + 1,
+                        },
+                    ) from exc
+                for key, value in counts.items():
+                    deleted_count = int(value)
+                    if deleted_count <= 0:
+                        continue
+                    merged[str(key)] = merged.get(str(key), 0) + deleted_count
+                deleted_doc_ids.extend(batch)
+
+            return merged
+        finally:
+            # Ensure subsequent reads don't observe stale cached table handles.
+            self.invalidate_table_cache()
 
     def _count_collections_fast(
         self,
@@ -2166,6 +2310,39 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         finally:
             _safe_close_table(table)
 
+    def rename_collection_status(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Rename ingestion status rows for a collection."""
+        from ..LanceDB.schema_manager import _safe_close_table
+
+        warnings: List[str] = []
+        table = None
+        try:
+            conn = self._get_sync_connection()
+            self._ensure_ingestion_runs_table(conn)
+            table = conn.open_table("ingestion_runs")
+            where_expr = self._build_load_filter(old_name, None, user_id, is_admin)
+            if where_expr:
+                table.update(
+                    where_expr,
+                    {
+                        "collection": new_name,
+                        "updated_at": datetime.now(timezone.utc),
+                    },
+                )
+        except Exception as exc:  # noqa: BLE001
+            message = f"Failed to rename ingestion status: {exc}"
+            logger.warning(message)
+            warnings.append(message)
+        finally:
+            _safe_close_table(table)
+        return warnings
+
     # --- Async methods ---
 
     async def write_ingestion_status_async(
@@ -2229,6 +2406,21 @@ class LanceDBIngestionStatusStore(IngestionStatusStore):
         return self.clear_ingestion_status(
             collection=collection,
             doc_id=doc_id,
+            user_id=user_id,
+            is_admin=is_admin,
+        )
+
+    async def rename_collection_status_async(
+        self,
+        old_name: str,
+        new_name: str,
+        user_id: Optional[int],
+        is_admin: bool = False,
+    ) -> List[str]:
+        """Async version of rename_collection_status."""
+        return self.rename_collection_status(
+            old_name=old_name,
+            new_name=new_name,
             user_id=user_id,
             is_admin=is_admin,
         )

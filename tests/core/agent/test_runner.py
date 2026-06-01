@@ -611,6 +611,60 @@ async def test_runner_resume_restores_from_latest_checkpoint_after_restart(
 
 
 @pytest.mark.asyncio
+async def test_runner_inject_user_message_with_files_dispatches_trace_callback(
+    tmp_path: Path,
+) -> None:
+    """End-to-end coverage of the continuation chip path: a websocket-style
+    ``post_user_message`` call with attachments must (a) attach the files to
+    the new Message so they survive checkpoints and (b) fire the trace
+    callback so the chip is broadcast live (instead of only appearing after
+    a page reload via historical replay)."""
+    tracer = RecordingTraceEventTracer()
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    await runner.run(task="Original task", execution_id="exec-cont-files")
+
+    files = [
+        {
+            "file_id": "fid-cont",
+            "name": "follow-up.pdf",
+            "size": 2048,
+            "type": "application/pdf",
+        }
+    ]
+    context = await runner.post_user_message(
+        "exec-cont-files",
+        "Use the attached PDF.",
+        request_interrupt=False,
+        files=files,
+    )
+
+    assert context is not None
+    new_user_message = next(
+        msg for msg in reversed(context.messages) if msg.role == "user"
+    )
+    assert new_user_message.metadata.get("files") == files
+    turn_id = new_user_message.metadata.get("turn_id")
+    assert isinstance(turn_id, str) and turn_id
+
+    user_message_events = [
+        event
+        for event in tracer.events
+        if event["event_type"] == "task_start_message"
+        and event["data"].get("message") == "Use the attached PDF."
+    ]
+    assert len(user_message_events) == 1
+    assert user_message_events[0]["data"]["turn_id"] == turn_id
+    assert user_message_events[0]["data"]["files"] == files
+    assert user_message_events[0]["data"]["attachments"] == files
+
+
+@pytest.mark.asyncio
 async def test_runner_post_user_message_alias_matches_inject_behavior(
     tmp_path: Path,
 ) -> None:
@@ -645,6 +699,133 @@ async def test_runner_post_user_message_alias_matches_inject_behavior(
         message.content for message in context.messages if message.role == "user"
     ]
     assert user_messages == ["Original task", "Follow-up from user."]
+
+
+@pytest.mark.asyncio
+async def test_runner_post_user_message_preserves_display_and_execution_contract(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    checkpoint_context = ExecutionContext(execution_id="exec-display-contract")
+    checkpoint_context.add_user_message("Original task")
+    await tracer.checkpoint(
+        type="checkpoint",
+        execution_id="exec-display-contract",
+        pattern="FakePattern",
+        label="before_llm",
+        status="interrupted",
+        context=checkpoint_context.to_dict(),
+        pattern_state={},
+        metadata={},
+    )
+
+    execution_message = "Read file\n\n## UPLOADED FILES\nfile_id=file-123"
+    files = [{"file_id": "file-123", "name": "notes.txt"}]
+    context = await runner.post_user_message(
+        "exec-display-contract",
+        execution_message=execution_message,
+        display_message="Read file",
+        files=files,
+        request_interrupt=False,
+    )
+
+    assert context is not None
+    latest_user = [message for message in context.messages if message.role == "user"][
+        -1
+    ]
+    assert latest_user.content == execution_message
+    assert latest_user.metadata["display_message"] == "Read file"
+    assert latest_user.metadata["files"] == files
+    turn_id = latest_user.metadata.get("turn_id")
+    assert isinstance(turn_id, str) and turn_id
+
+    checkpoint_messages = tracer.by_execution_id["exec-display-contract"]["context"][
+        "messages"
+    ]
+    latest_checkpoint_user = [
+        message for message in checkpoint_messages if message["role"] == "user"
+    ][-1]
+    assert latest_checkpoint_user["content"] == execution_message
+    assert latest_checkpoint_user["metadata"]["display_message"] == "Read file"
+    assert latest_checkpoint_user["metadata"]["files"] == files
+    assert latest_checkpoint_user["metadata"]["turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
+async def test_runner_initial_user_message_preserves_display_metadata(
+    tmp_path: Path,
+) -> None:
+    tracer = RecordingTraceEventTracer()
+    agent = Agent(
+        name="writer",
+        patterns=[FakePattern({"success": True, "response": "Done"})],
+    )
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        callbacks=[TraceEventCallback()],
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+
+    execution_message = "Read file\n\n## UPLOADED FILES\nfile_id=file-123"
+    files = [{"file_id": "file-123", "name": "notes.txt"}]
+    result = await runner.run(
+        task=execution_message,
+        execution_id="exec-initial-display",
+        metadata={"request_context": {"display_message": "Read file", "files": files}},
+    )
+
+    first_user = next(
+        message for message in result["context"].messages if message.role == "user"
+    )
+    assert first_user.content == execution_message
+    assert first_user.metadata["display_message"] == "Read file"
+    assert first_user.metadata["files"] == files
+    turn_id = first_user.metadata.get("turn_id")
+    assert isinstance(turn_id, str) and turn_id
+    user_event = next(
+        event for event in tracer.events if event["event_type"] == "task_start_message"
+    )
+    assert user_event["data"]["message"] == "Read file"
+    assert user_event["data"]["turn_id"] == turn_id
+
+
+@pytest.mark.asyncio
+async def test_runner_post_user_message_rejects_execution_without_display(
+    tmp_path: Path,
+) -> None:
+    tracer = TracerCheckpointStore()
+    agent = Agent(name="writer", patterns=[FakePattern({"success": True})])
+    runner = AgentRunner(
+        agent=agent,
+        tracer=tracer,
+        workspace_manager=FakeWorkspaceManager(tmp_path),
+    )
+    checkpoint_context = ExecutionContext(execution_id="exec-display-required")
+    checkpoint_context.add_user_message("Original task")
+    await tracer.checkpoint(
+        type="checkpoint",
+        execution_id="exec-display-required",
+        pattern="FakePattern",
+        label="before_llm",
+        status="interrupted",
+        context=checkpoint_context.to_dict(),
+        pattern_state={},
+        metadata={},
+    )
+
+    with pytest.raises(ValueError, match="requires display_message"):
+        await runner.post_user_message(
+            "exec-display-required",
+            execution_message="Read file\n\n## UPLOADED FILES\nfile_id=file-123",
+            request_interrupt=False,
+        )
 
 
 @pytest.mark.asyncio

@@ -742,7 +742,7 @@ async def list_collections(
 
         # Step 2: Get stats. Try metadata cache first; fallback to realtime scan.
         stats: Dict[str, Dict[str, int]] = {}
-        if not force_realtime:
+        if not force_realtime and is_admin:
             try:
                 for info in metadata_collections:
                     if info.name in collection_keys or is_admin:
@@ -841,7 +841,7 @@ async def list_collections(
                 if key not in stats:
                     if key in realtime_stats:
                         stats[key] = realtime_stats[key]
-                    elif key in metadata_stats_by_name:
+                    elif is_admin and key in metadata_stats_by_name:
                         stats[key] = metadata_stats_by_name[key]
                     else:
                         stats[key] = {
@@ -915,7 +915,11 @@ async def list_collections(
                     processed_documents=(
                         stats[collection]["parses"]
                         if stats[collection]["parses"] > 0
-                        else metadata_processed_documents_by_name.get(collection, 0)
+                        else (
+                            metadata_processed_documents_by_name.get(collection, 0)
+                            if is_admin
+                            else 0
+                        )
                     ),
                     timestamp_now=realtime_timestamp if used_realtime else None,
                 )
@@ -1257,6 +1261,18 @@ def delete_collection(
 
     warnings: List[str] = []
     metadata_cleanup_counts: dict[str, int] = {}
+    deleted_counts: Dict[str, int] = {}
+    doc_ids: List[str] = []
+
+    def _merge_deleted_counts(counts: Dict[str, int]) -> None:
+        for key, value in dict(counts).items():
+            deleted_count = int(value)
+            if deleted_count <= 0:
+                continue
+            table_name = str(key)
+            deleted_counts[table_name] = (
+                deleted_counts.get(table_name, 0) + deleted_count
+            )
 
     try:
         # Use storage abstraction for deletion
@@ -1272,18 +1288,6 @@ def delete_collection(
         )
         doc_ids = sorted({r.doc_id for r in doc_records})
 
-        deleted_counts: Dict[str, int] = {}
-
-        def _merge_deleted_counts(counts: Dict[str, int]) -> None:
-            for key, value in dict(counts).items():
-                deleted_count = int(value)
-                if deleted_count <= 0:
-                    continue
-                table_name = str(key)
-                deleted_counts[table_name] = (
-                    deleted_counts.get(table_name, 0) + deleted_count
-                )
-
         if is_admin:
             _merge_deleted_counts(
                 vector_store.delete_collection_data(
@@ -1293,30 +1297,16 @@ def delete_collection(
                     warnings_out=warnings,
                 )
             )
-        else:
-            for doc_id in doc_ids:
-                _merge_deleted_counts(
-                    vector_store.delete_document_data(
-                        collection_name=collection,
-                        doc_id=doc_id,
-                        user_id=user_id,
-                        is_admin=is_admin,
-                    )
-                )
-
-        # Clear ingestion status for all documents
-        for doc_id in doc_ids:
-            try:
-                clear_ingestion_status(
-                    collection,
-                    doc_id,
+        elif doc_ids:
+            _merge_deleted_counts(
+                vector_store.delete_documents_data(
+                    collection_name=collection,
+                    doc_ids=doc_ids,
                     user_id=user_id,
                     is_admin=is_admin,
+                    warnings_out=warnings,
                 )
-            except Exception as exc:  # noqa: BLE001
-                warning = f"Failed to clear ingestion status for '{doc_id}': {exc}"
-                logger.warning(warning)
-                warnings.append(warning)
+            )
 
         remaining_collection_records = vector_store.list_document_records(
             collection_name=collection,
@@ -1333,9 +1323,36 @@ def delete_collection(
         )
 
     except Exception as exc:  # noqa: BLE001 - convert to structured failure
+        details = getattr(exc, "details", {})
+        partial_doc_ids: list[str] = []
+        if isinstance(details, dict):
+            raw_counts = details.get("deleted_counts")
+            if isinstance(raw_counts, dict):
+                _merge_deleted_counts(raw_counts)
+            raw_doc_ids = details.get("deleted_doc_ids")
+            if isinstance(raw_doc_ids, list):
+                partial_doc_ids = [str(doc_id) for doc_id in raw_doc_ids]
+
         logger.error(
             "Failed to delete collection '%s': %s", collection, exc, exc_info=True
         )
+        if deleted_counts:
+            partial_affected = [
+                CollectionOperationDetail(
+                    doc_id=doc_id,
+                    status=DocumentProcessingStatus.FAILED,
+                    message="Document deleted successfully before cleanup stopped.",
+                )
+                for doc_id in partial_doc_ids
+            ]
+            return CollectionOperationResult(
+                status="partial_success",
+                collection=collection,
+                message=f"Partially deleted collection '{collection}': {exc}",
+                warnings=warnings,
+                affected_documents=partial_affected,
+                deleted_counts=dict(deleted_counts),
+            )
         return CollectionOperationResult(
             status="error",
             collection=collection,

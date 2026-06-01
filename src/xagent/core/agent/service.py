@@ -48,11 +48,15 @@ class AgentService:
         tool_config: Any | None = None,
         agent_type: str = "standard",
         system_prompt: str | None = None,
+        tools_initialized: bool | None = None,
         **agent_kwargs: Any,
     ) -> None:
         self.name = name
         self.memory = memory or InMemoryMemoryStore()
-        self.tools = tools or []
+        # ``tools is not None`` (not ``bool(tools)``) — an explicitly empty
+        # list is a legitimate "no tools allowed" result from the caller's
+        # build path, distinct from "caller did not build tools yet".
+        self.tools = list(tools) if tools is not None else []
         self.llm = llm
         self.fast_llm = fast_llm
         self.vision_llm = vision_llm
@@ -62,7 +66,37 @@ class AgentService:
         self.memory_enabled = memory_enabled
         self.tool_config = tool_config
         self.tracer = tracer or Tracer()
-        self._tools_initialized = False
+        # Default infer: if the caller passed ``tools`` (even ``[]``) the
+        # constructed AgentService already has its final tool list, so
+        # subsequent ``execute_task`` calls must not trigger a redundant
+        # ``_ensure_tools_initialized`` rebuild against ``tool_config``.
+        # Passing ``tools_initialized`` explicitly overrides the default
+        # — only needed by tests / specialized callers that want to
+        # retain the lazy-supplement path while also pre-supplying tools.
+        if tools_initialized is None:
+            self._tools_initialized = tools is not None
+        else:
+            self._tools_initialized = tools_initialized
+        # Upstream's ``_ensure_tools_initialized`` gates the rebuild on
+        # ``policy_signature == self._tool_policy_signature``. When the
+        # caller pre-supplies tools (the PR1 fast path above) we also
+        # need to capture the current signature, otherwise the very
+        # first ``execute_task`` would see ``None != current`` and
+        # rebuild anyway — re-introducing the duplicate factory call
+        # PR1 was meant to eliminate. Re-reading the hook here is
+        # cheap; the signature naturally invalidates when policy
+        # changes later, restoring upstream's rebuild semantics.
+        self._tool_policy_signature: Any | None = None
+        if self._tools_initialized and self.tool_config:
+            try:
+                self._tool_policy_signature = self._current_tool_policy_signature()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to capture initial tool policy signature for "
+                    "AgentService '%s': %s; first execute may rebuild tools",
+                    name,
+                    exc,
+                )
         self._is_paused = False
         self._pause_event = None
         self._current_runner = None
@@ -104,6 +138,7 @@ class AgentService:
                 ws_config.get("base_dir", self.workspace_base_dir),
                 ws_config.get("task_id", self.id),
                 self.allowed_external_dirs,
+                db_task_id=ws_config.get("db_task_id"),
             )
         elif self.enable_workspace:
             self._setup_workspace()
@@ -143,7 +178,11 @@ class AgentService:
             if not has_files:
                 raise ValueError("Task cannot be empty or whitespace-only")
         await self._ensure_tools_initialized()
-        return await self._execute_agent_task(task, context, task_id)
+        result = await self._execute_agent_task(task, context, task_id)
+        file_outputs = self.get_output_files()
+        if file_outputs:
+            result["file_outputs"] = file_outputs
+        return result
 
     async def pause_execution(self) -> bool:
         if self._is_paused:
@@ -203,8 +242,11 @@ class AgentService:
     async def post_user_message(
         self,
         execution_id: str,
-        message: str,
+        message: str | None = None,
         *,
+        execution_message: str | None = None,
+        display_message: str | None = None,
+        files: list[dict[str, Any]] | None = None,
         request_interrupt: bool = True,
         reason: str | None = None,
     ) -> bool:
@@ -214,6 +256,9 @@ class AgentService:
             await self._execution_adapter.post_user_message(
                 execution_id,
                 message,
+                execution_message=execution_message,
+                display_message=display_message,
+                files=files,
                 request_interrupt=request_interrupt,
                 reason=reason,
             )
@@ -343,6 +388,7 @@ class AgentService:
             self._execution_adapter.config.current_task_id = self._current_task_id
             self._execution_adapter.config.tools = self.tools
             self._execution_adapter.config.llm = self.llm
+            self._execution_adapter.config.compact_llm = self.compact_llm
             self._execution_adapter.config.pattern = self.pattern
             self._execution_adapter.config.outbound_message_handler = (
                 self._outbound_message_handler
@@ -391,6 +437,7 @@ class AgentService:
                 name=self.name,
                 tools=self.tools,
                 llm=self.llm,
+                compact_llm=self.compact_llm,
                 pattern=self.pattern,
                 tracer=tracer,
                 system_prompt=self.system_prompt,
@@ -532,7 +579,7 @@ class AgentService:
             return None
 
     async def _ensure_tools_initialized(self) -> None:
-        if self.tool_config and not self._tools_initialized:
+        if self.tool_config:
             try:
                 from ..tools.adapters.vibe.factory import ToolFactory
 
@@ -542,16 +589,16 @@ class AgentService:
                 ):
                     self.tool_config._workspace_config["task_id"] = self.id
 
+                policy_signature = self._current_tool_policy_signature()
+                if (
+                    self._tools_initialized
+                    and policy_signature == self._tool_policy_signature
+                ):
+                    return
+
+                # Rebuild the tool list so disabled tools disappear from reused agents.
                 new_tools = await ToolFactory.create_all_tools(self.tool_config)
-                existing_tool_names = {
-                    tool.name for tool in self.tools if hasattr(tool, "name")
-                }
-                for tool in new_tools:
-                    if (
-                        not hasattr(tool, "name")
-                        or tool.name not in existing_tool_names
-                    ):
-                        self.tools.append(tool)
+                self.tools = list(new_tools)
 
                 if hasattr(self.tool_config, "get_allowed_tools"):
                     allowed_tools = self.tool_config.get_allowed_tools()
@@ -567,11 +614,97 @@ class AgentService:
                 if self._execution_adapter is not None:
                     self._execution_adapter.config.tools = self.tools
                 self._tools_initialized = True
+                self._tool_policy_signature = policy_signature
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)
                 raise RuntimeError(
                     f"Tool initialization failed for AgentService '{self.name}': {exc}"
                 ) from exc
+
+    def _current_tool_policy_signature(self) -> tuple[Any, ...]:
+        if not self.tool_config:
+            return ()
+
+        def _get_conf(attr: str, default: Any = None) -> Any:
+            getter = getattr(self.tool_config, attr, None)
+            return getter() if callable(getter) else default
+
+        refresh_overrides = getattr(
+            self.tool_config, "refresh_user_tool_overrides", None
+        )
+        if callable(refresh_overrides):
+            # Re-read the hook-backed policy before comparing signatures.
+            refresh_overrides()
+
+        overrides: Any = _get_conf("get_user_tool_overrides", {})
+        if isinstance(overrides, dict):
+            override_items = tuple(
+                sorted(
+                    (
+                        str(name),
+                        override.get("enabled") if isinstance(override, dict) else None,
+                    )
+                    for name, override in overrides.items()
+                )
+            )
+        else:
+            override_items = ()
+
+        allowed_tools = _get_conf("get_allowed_tools")
+        allowed_items = (
+            None
+            if allowed_tools is None
+            else tuple(str(name) for name in allowed_tools)
+        )
+
+        allowed_agent_ids = _get_conf("get_allowed_agent_ids")
+        allowed_agent_items = (
+            None
+            if allowed_agent_ids is None
+            else tuple(str(agent_id) for agent_id in allowed_agent_ids)
+        )
+
+        agent_tool_overrides = _get_conf("get_agent_tool_overrides", {})
+        if isinstance(agent_tool_overrides, dict):
+            agent_override_items = tuple(
+                sorted(
+                    (
+                        str(agent_id),
+                        tuple(
+                            sorted(
+                                (str(key), repr(value))
+                                for key, value in override.items()
+                            )
+                        )
+                        if isinstance(override, dict)
+                        else repr(override),
+                    )
+                    for agent_id, override in agent_tool_overrides.items()
+                )
+            )
+        else:
+            agent_override_items = ()
+
+        enable_global_agent_tools = _get_conf("get_enable_global_agent_tools", True)
+        allow_cross_user_agent_ids = _get_conf("get_allow_cross_user_agent_ids", False)
+        parent_task_id = _get_conf("get_parent_task_id")
+        parent_tracer = _get_conf("get_parent_tracer")
+        parent_tracer_identity = None if parent_tracer is None else id(parent_tracer)
+
+        agent_call_stack = _get_conf("get_agent_call_stack", [])
+        agent_call_stack_items = tuple(str(agent_id) for agent_id in agent_call_stack)
+
+        return (
+            override_items,
+            allowed_items,
+            allowed_agent_items,
+            agent_override_items,
+            bool(enable_global_agent_tools),
+            bool(allow_cross_user_agent_ids),
+            None if parent_task_id is None else str(parent_task_id),
+            parent_tracer_identity,
+            agent_call_stack_items,
+        )
 
     def _execution_type(self) -> str:
         if self.pattern == "dag_plan_execute":

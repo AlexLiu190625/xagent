@@ -7,7 +7,7 @@ enabling MCP tools to be used in DAG plan-execute patterns and other agent workf
 import asyncio
 import logging
 import os
-from typing import Any, Dict, List, Mapping, Optional, Type
+from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
@@ -193,25 +193,147 @@ class MCPToolAdapter(AbstractBaseTool):
         return MCPToolResult
 
     def _json_schema_to_python_type(self, schema: Dict[str, Any]) -> Type:
-        """Convert JSON schema type to Python type."""
-        schema_type = schema.get("type", "string")
+        """Convert JSON schema type to a Python type for Pydantic model creation."""
+        if not isinstance(schema, dict):
+            return Any
 
-        # Handle list types (e.g. ["string", "null"])
+        for union_key in ("anyOf", "oneOf"):
+            options = schema.get(union_key)
+            if isinstance(options, list) and options:
+                non_null_options = [
+                    option for option in options if not self._is_null_schema(option)
+                ]
+                if len(non_null_options) == 1:
+                    return self._json_schema_to_python_type(non_null_options[0])
+                resolved_types: list[Type[Any]] = []
+                for option in non_null_options:
+                    resolved_type = self._json_schema_to_python_type(option)
+                    if resolved_type is not Any and resolved_type not in resolved_types:
+                        resolved_types.append(resolved_type)
+                return self._build_union_type(resolved_types)
+
+        all_of = schema.get("allOf")
+        if isinstance(all_of, list) and all_of:
+            for option in all_of:
+                resolved_type = self._json_schema_to_python_type(option)
+                if resolved_type is not Any:
+                    return resolved_type
+
+        schema_type = schema.get("type")
         if isinstance(schema_type, list):
-            # Pick the first non-null type
-            types = [t for t in schema_type if t != "null"]
-            schema_type = types[0] if types else "string"
+            concrete_types = [item for item in schema_type if item != "null"]
+            concrete_resolved_types: list[Type[Any]] = []
+            for concrete_type in concrete_types:
+                resolved_type = self._json_schema_to_python_type(
+                    {"type": concrete_type}
+                )
+                if (
+                    resolved_type is not Any
+                    and resolved_type not in concrete_resolved_types
+                ):
+                    concrete_resolved_types.append(resolved_type)
+            return self._build_union_type(concrete_resolved_types)
 
-        type_mapping = {
-            "string": str,
-            "integer": int,
-            "number": float,
-            "boolean": bool,
-            "array": List[Any],
-            "object": Dict[str, Any],
-        }
+        if schema_type == "array":
+            return list
+        if schema_type == "object":
+            return Dict[str, Any]
+        if schema_type == "string":
+            return str
+        if schema_type == "integer":
+            return int
+        if schema_type == "number":
+            return float
+        if schema_type == "boolean":
+            return bool
+        return Any
 
-        return type_mapping.get(schema_type, Any)
+    def _build_union_type(self, resolved_types: list[Type[Any]]) -> Type[Any]:
+        """Build a runtime union for multiple candidate schema types."""
+        if not resolved_types:
+            return Any
+        if len(resolved_types) == 1:
+            return resolved_types[0]
+        return cast(Type[Any], Union.__getitem__(tuple(resolved_types)))
+
+    def _is_null_schema(self, schema: Any) -> bool:
+        """Return True when the schema represents a JSON null type."""
+        if not isinstance(schema, dict):
+            return False
+        schema_type = schema.get("type")
+        if schema_type == "null":
+            return True
+        if isinstance(schema_type, list):
+            return all(item == "null" for item in schema_type)
+        return False
+
+    def _normalize_args_by_schema(self, args: Mapping[str, Any]) -> Dict[str, Any]:
+        """Normalize common LLM argument shape mistakes using the MCP input schema."""
+        normalized_args = dict(args)
+        schema = self.mcp_tool.inputSchema
+        if not isinstance(schema, dict):
+            return normalized_args
+
+        properties = schema.get("properties", {})
+        if not isinstance(properties, dict):
+            return normalized_args
+
+        for field_name, field_schema in properties.items():
+            if field_name not in normalized_args:
+                continue
+            value = normalized_args[field_name]
+            if value is None:
+                continue
+            if self._schema_is_array_only(field_schema) and not isinstance(value, list):
+                normalized_args[field_name] = [value]
+
+        return normalized_args
+
+    def _schema_accepts_array(self, schema: Any) -> bool:
+        """Return True when a JSON schema allows array input."""
+        if not isinstance(schema, dict):
+            return False
+
+        schema_type = schema.get("type")
+        if schema_type == "array":
+            return True
+        if isinstance(schema_type, list) and "array" in schema_type:
+            return True
+
+        for composite_key in ("anyOf", "oneOf", "allOf"):
+            variants = schema.get(composite_key)
+            if isinstance(variants, list) and any(
+                self._schema_accepts_array(variant) for variant in variants
+            ):
+                return True
+
+        return False
+
+    def _schema_is_array_only(self, schema: Any) -> bool:
+        """Return True when array is the only accepted non-null JSON shape."""
+        if not isinstance(schema, dict):
+            return False
+
+        schema_type = schema.get("type")
+        if schema_type == "array":
+            return True
+        if isinstance(schema_type, list):
+            concrete_types = [item for item in schema_type if item != "null"]
+            return bool(concrete_types) and all(
+                concrete_type == "array" for concrete_type in concrete_types
+            )
+
+        for union_key in ("anyOf", "oneOf"):
+            options = schema.get(union_key)
+            if isinstance(options, list) and options:
+                non_null_options = [
+                    option for option in options if not self._is_null_schema(option)
+                ]
+                return bool(non_null_options) and all(
+                    self._schema_is_array_only(option) for option in non_null_options
+                )
+
+        return False
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         """Execute MCP tool asynchronously with user validation and context."""
@@ -229,7 +351,8 @@ class MCPToolAdapter(AbstractBaseTool):
                 }
 
             # Validate arguments
-            parsed_args = self._args_type(**args)
+            normalized_args = self._normalize_args_by_schema(args)
+            parsed_args = self._args_type(**normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
 
             logger.debug(

@@ -3,12 +3,10 @@
 import logging
 import os
 import uuid
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel, Field
-from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
@@ -16,11 +14,8 @@ from ...core.agent.service import AgentService
 from ...core.memory.in_memory import InMemoryMemoryStore
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...core.tracing import create_agent_tracer
-from ...core.utils.api_key import generate_api_key
-from ...core.utils.type_check import ensure_list
 from ..auth_dependencies import get_current_user
-from ..models.agent import Agent, AgentStatus
-from ..models.agent_api_key import AgentApiKey
+from ..models.agent import Agent, AgentOrigin
 from ..models.database import get_db
 from ..models.model import Model as DBModel
 from ..models.user import User
@@ -29,6 +24,13 @@ from ..schemas.agent_api_key import (
     APIKeyMetadataResponse,
     APIKeyRevokeResponse,
 )
+from ..services.agent_access import (
+    AccessibleAgent,
+    accessible_agent_permissions,
+    list_accessible_agents,
+)
+from ..services.agent_store import AgentStore
+from ..services.api_keys import AgentApiKeyService, KeyRotationConflict
 from ..services.llm_utils import UserAwareModelStorage
 from ..tools.config import WebToolConfig
 from ..user_isolated_memory import UserContext
@@ -124,6 +126,11 @@ class AgentListItem(BaseModel):
     updated_at: str
     widget_enabled: bool
     allowed_domains: List[str]
+    access: str = "owner"
+    readonly: bool = False
+    can_edit: bool = True
+    can_publish: bool = True
+    can_delete: bool = True
 
 
 class PublishResponse(BaseModel):
@@ -214,6 +221,15 @@ async def _validate_knowledge_bases_exist(
         )
 
 
+def _serialize_agent_list_item(
+    store: AgentStore,
+    accessible_agent: AccessibleAgent,
+) -> dict[str, Any]:
+    item = store.agent_to_list_item_dict(accessible_agent.agent)
+    item.update(accessible_agent_permissions(accessible_agent))
+    return item
+
+
 def _save_logo(base64_data: Optional[str], agent_id: int) -> Optional[str]:
     """Save logo image and return URL."""
     if not base64_data:
@@ -270,30 +286,6 @@ def _delete_logo(logo_url: str) -> None:
         logger.error(f"Failed to delete logo {logo_url}: {e}")
 
 
-def _agent_to_response(agent: Agent, db: Session) -> AgentResponse:
-    """Convert Agent model to response."""
-    return AgentResponse(
-        id=agent.id,
-        user_id=agent.user_id,
-        name=agent.name,
-        description=agent.description,
-        instructions=agent.instructions,
-        execution_mode=agent.execution_mode or "graph",
-        models=agent.models,
-        knowledge_bases=ensure_list(agent.knowledge_bases) or [],
-        skills=ensure_list(agent.skills) or [],
-        tool_categories=ensure_list(agent.tool_categories) or [],
-        suggested_prompts=ensure_list(agent.suggested_prompts) or [],
-        logo_url=agent.logo_url,
-        status=agent.status.value,
-        published_at=agent.published_at.isoformat() if agent.published_at else None,
-        created_at=agent.created_at.isoformat(),
-        updated_at=agent.updated_at.isoformat(),
-        widget_enabled=agent.widget_enabled,
-        allowed_domains=ensure_list(agent.allowed_domains) or [],
-    )
-
-
 def _get_owned_agent_or_404(agent_id: int, current_user: User, db: Session) -> Agent:
     """Resolve an agent_id against the caller's ownership, raising 404 otherwise.
 
@@ -318,29 +310,16 @@ def _get_owned_agent_or_404(agent_id: int, current_user: User, db: Session) -> A
     """
     agent = (
         db.query(Agent)
-        .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
+        .filter(
+            Agent.id == agent_id,
+            Agent.user_id == current_user.id,
+            Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        )
         .first()
     )
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
-
-
-def _mask_key(key_prefix: str) -> str:
-    """Render the display form ``xag_<prefix>_••••••••`` for read-only views.
-
-    The bullet count is fixed at eight on purpose. The actual secret is 32
-    characters; reflecting the real length in the UI would leak length
-    metadata in screenshots and screenshares. Eight bullets is short
-    enough to render compactly and long enough to read as "redacted".
-
-    Args:
-        key_prefix: The public-safe lookup handle (6 chars).
-
-    Returns:
-        Display string suitable for the web UI's "API Key" card.
-    """
-    return f"xag_{key_prefix}_••••••••"
 
 
 # ===== Endpoints =====
@@ -416,13 +395,10 @@ async def create_agent(
 ) -> AgentResponse:
     """Create a new custom agent."""
     try:
+        store = AgentStore(db)
+        user_id = int(current_user.id)
         # Check for duplicate name
-        existing = (
-            db.query(Agent)
-            .filter(Agent.user_id == current_user.id, Agent.name == agent_data.name)
-            .first()
-        )
-        if existing:
+        if store.agent_name_exists(user_id, agent_data.name):
             raise HTTPException(
                 status_code=400, detail="Agent with this name already exists"
             )
@@ -432,9 +408,8 @@ async def create_agent(
         )
         await _validate_knowledge_bases_exist(agent_data.knowledge_bases, current_user)
 
-        # Create agent
-        agent = Agent(
-            user_id=current_user.id,
+        agent = store.create_agent(
+            user_id=user_id,
             name=agent_data.name,
             description=agent_data.description,
             instructions=agent_data.instructions,
@@ -444,25 +419,21 @@ async def create_agent(
             skills=agent_data.skills,
             tool_categories=agent_data.tool_categories,
             suggested_prompts=agent_data.suggested_prompts,
-            status=AgentStatus.DRAFT,
-            widget_enabled=True,
-            allowed_domains=[],
         )
-
-        db.add(agent)
-        db.commit()
-        db.refresh(agent)
 
         # Save logo if provided
         if agent_data.logo_base64:
             logo_url = _save_logo(agent_data.logo_base64, agent.id)  # type: ignore[arg-type]
             if logo_url:
-                agent.logo_url = logo_url  # type: ignore[assignment]
-                db.commit()
-                db.refresh(agent)
+                agent = (
+                    store.update_agent_fields(
+                        user_id, int(agent.id), {"logo_url": logo_url}
+                    )
+                    or agent
+                )
 
         logger.info(f"Created agent {agent.id} for user {current_user.id}")
-        return _agent_to_response(agent, db)
+        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
 
     except HTTPException:
         raise
@@ -477,31 +448,18 @@ async def list_agents(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ) -> List[AgentListItem]:
-    """List all agents for the current user."""
+    """List agents visible to the current user."""
     try:
-        agents = (
-            db.query(Agent)
-            .filter(Agent.user_id == current_user.id)
-            .order_by(Agent.created_at.desc())
-            .all()
-        )
-
-        return [
-            AgentListItem(
-                id=agent.id,
-                name=agent.name,
-                description=agent.description,
-                logo_url=agent.logo_url,
-                status=agent.status.value,
-                created_at=agent.created_at.isoformat(),
-                updated_at=agent.updated_at.isoformat()
-                if agent.updated_at
-                else agent.created_at.isoformat(),
-                widget_enabled=agent.widget_enabled,
-                allowed_domains=agent.allowed_domains or [],
+        store = AgentStore(db)
+        items = [
+            _serialize_agent_list_item(store, item)
+            for item in list_accessible_agents(
+                db,
+                current_user,
+                purpose="agent_list",
             )
-            for agent in agents
         ]
+        return [AgentListItem.model_validate(item) for item in items]
 
     except Exception as e:
         logger.error(f"Failed to list agents: {e}")
@@ -516,16 +474,10 @@ async def get_agent(
 ) -> AgentResponse:
     """Get agent details."""
     try:
-        agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
-        )
-
-        if not agent:
+        response = AgentStore(db).get_agent_response(int(current_user.id), agent_id)
+        if response is None:
             raise HTTPException(status_code=404, detail="Agent not found")
-
-        return _agent_to_response(agent, db)
+        return AgentResponse.model_validate(response)
 
     except HTTPException:
         raise
@@ -543,11 +495,9 @@ async def update_agent(
 ) -> AgentResponse:
     """Update an existing agent."""
     try:
-        agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
-        )
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -567,43 +517,37 @@ async def update_agent(
         await _validate_knowledge_bases_exist(effective_kb, current_user)  # type: ignore[arg-type]
 
         # Update fields
+        updates: dict[str, object] = {}
         if agent_data.name is not None:
             # Check for duplicate name (excluding current agent)
-            existing = (
-                db.query(Agent)
-                .filter(
-                    Agent.user_id == current_user.id,
-                    Agent.name == agent_data.name,
-                    Agent.id != agent_id,
-                )
-                .first()
-            )
-            if existing:
+            if store.agent_name_exists(
+                user_id, agent_data.name, exclude_agent_id=agent_id
+            ):
                 raise HTTPException(
                     status_code=400, detail="Agent with this name already exists"
                 )
-            agent.name = agent_data.name  # type: ignore[assignment]
+            updates["name"] = agent_data.name
 
         if agent_data.description is not None:
-            agent.description = agent_data.description  # type: ignore[assignment]
+            updates["description"] = agent_data.description
         if agent_data.instructions is not None:
-            agent.instructions = agent_data.instructions  # type: ignore[assignment]
+            updates["instructions"] = agent_data.instructions
         if agent_data.models is not None:
-            agent.models = agent_data.models  # type: ignore[assignment]
+            updates["models"] = agent_data.models
         if agent_data.knowledge_bases is not None:
-            agent.knowledge_bases = agent_data.knowledge_bases  # type: ignore[assignment]
+            updates["knowledge_bases"] = agent_data.knowledge_bases
         if agent_data.skills is not None:
-            agent.skills = agent_data.skills  # type: ignore[assignment]
+            updates["skills"] = agent_data.skills
         if agent_data.tool_categories is not None:
-            agent.tool_categories = agent_data.tool_categories  # type: ignore[assignment]
+            updates["tool_categories"] = agent_data.tool_categories
         if agent_data.execution_mode is not None:
-            agent.execution_mode = agent_data.execution_mode  # type: ignore[assignment]
+            updates["execution_mode"] = agent_data.execution_mode
         if agent_data.suggested_prompts is not None:
-            agent.suggested_prompts = agent_data.suggested_prompts  # type: ignore[assignment]
+            updates["suggested_prompts"] = agent_data.suggested_prompts
         if agent_data.widget_enabled is not None:
-            agent.widget_enabled = agent_data.widget_enabled  # type: ignore[assignment]
+            updates["widget_enabled"] = agent_data.widget_enabled
         if agent_data.allowed_domains is not None:
-            agent.allowed_domains = agent_data.allowed_domains  # type: ignore[assignment]
+            updates["allowed_domains"] = agent_data.allowed_domains
 
         # Handle logo
         if agent_data.logo_base64 is not None:
@@ -613,13 +557,13 @@ async def update_agent(
 
             # Save new logo
             logo_url = _save_logo(agent_data.logo_base64, agent.id)  # type: ignore[arg-type]
-            agent.logo_url = logo_url  # type: ignore[assignment]
+            updates["logo_url"] = logo_url
 
-        db.commit()
-        db.refresh(agent)
+        if updates:
+            agent = store.update_agent_fields(user_id, agent_id, updates) or agent
 
         logger.info(f"Updated agent {agent_id} for user {current_user.id}")
-        return _agent_to_response(agent, db)
+        return AgentResponse.model_validate(store.agent_to_response_dict(agent))
 
     except HTTPException:
         raise
@@ -637,11 +581,9 @@ async def delete_agent(
 ) -> dict:
     """Delete an agent."""
     try:
-        agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
-        )
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -650,9 +592,7 @@ async def delete_agent(
         if agent.logo_url:
             _delete_logo(agent.logo_url)  # type: ignore[arg-type]
 
-        db.delete(agent)
-        db.commit()
-
+        store.delete_agent(user_id, agent_id)
         logger.info(f"Deleted agent {agent_id} for user {current_user.id}")
         return {"message": "Agent deleted successfully"}
 
@@ -672,29 +612,24 @@ async def publish_agent(
 ) -> PublishResponse:
     """Publish an agent (make it publicly accessible)."""
     try:
-        agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
-        )
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
 
-        if agent.status == AgentStatus.PUBLISHED:
+        if agent.status.value == "published":
             return PublishResponse(
                 message="Agent is already published",
-                agent=_agent_to_response(agent, db),
+                agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
             )
 
-        agent.status = AgentStatus.PUBLISHED
-        agent.published_at = datetime.now()  # type: ignore[assignment]
-        db.commit()
-        db.refresh(agent)
+        agent = store.publish_agent(int(current_user.id), agent_id) or agent
 
         logger.info(f"Published agent {agent_id} for user {current_user.id}")
         return PublishResponse(
-            message="Agent published successfully", agent=_agent_to_response(agent, db)
+            message="Agent published successfully",
+            agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
         )
 
     except HTTPException:
@@ -713,29 +648,24 @@ async def unpublish_agent(
 ) -> PublishResponse:
     """Unpublish an agent (revert to draft status)."""
     try:
-        agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
-        )
+        store = AgentStore(db)
+        agent = store.get_owned_agent(int(current_user.id), agent_id)
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
 
-        if agent.status != AgentStatus.PUBLISHED:
+        if agent.status.value != "published":
             return PublishResponse(
-                message="Agent is not published", agent=_agent_to_response(agent, db)
+                message="Agent is not published",
+                agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
             )
 
-        agent.status = AgentStatus.DRAFT
-        agent.published_at = None  # type: ignore[assignment]
-        db.commit()
-        db.refresh(agent)
+        agent = store.unpublish_agent(int(current_user.id), agent_id) or agent
 
         logger.info(f"Unpublished agent {agent_id} for user {current_user.id}")
         return PublishResponse(
             message="Agent unpublished successfully",
-            agent=_agent_to_response(agent, db),
+            agent=AgentResponse.model_validate(store.agent_to_response_dict(agent)),
         )
 
     except HTTPException:
@@ -755,11 +685,9 @@ async def upload_agent_logo(
 ) -> dict:
     """Upload or update agent logo."""
     try:
-        agent = (
-            db.query(Agent)
-            .filter(Agent.id == agent_id, Agent.user_id == current_user.id)
-            .first()
-        )
+        store = AgentStore(db)
+        user_id = int(current_user.id)
+        agent = store.get_owned_agent(user_id, agent_id)
 
         if not agent:
             raise HTTPException(status_code=404, detail="Agent not found")
@@ -773,9 +701,7 @@ async def upload_agent_logo(
         if not logo_url:
             raise HTTPException(status_code=400, detail="Failed to save logo")
 
-        agent.logo_url = logo_url  # type: ignore[assignment]
-        db.commit()
-        db.refresh(agent)
+        store.update_agent_fields(user_id, agent_id, {"logo_url": logo_url})
 
         logger.info(f"Updated logo for agent {agent_id}")
         return {"logo_url": logo_url}
@@ -845,62 +771,15 @@ async def generate_agent_api_key(
         # not yours" vs "does not exist".
         _get_owned_agent_or_404(agent_id, current_user, db)
 
-        # Revoke any existing active key for this agent. We touch
-        # ``updated_at`` so audit queries can see the rotation moment on
-        # the old row as well as the new row.
-        now = datetime.now(timezone.utc)
-        existing = (
-            db.query(AgentApiKey)
-            .filter(
-                AgentApiKey.agent_id == agent_id,
-                AgentApiKey.revoked_at.is_(None),
-            )
-            .first()
-        )
-        if existing is not None:
-            existing.revoked_at = now  # type: ignore[assignment]
-            existing.updated_at = now  # type: ignore[assignment]
-
-        # Generate a fresh prefix+secret+hash. ``generate_api_key`` does
-        # its own prefix-collision probe against ``agent_api_keys`` so
-        # we don't have to.
-        full_key, key_prefix, key_hash = generate_api_key(db)
-
-        new_row = AgentApiKey(
-            agent_id=agent_id,
-            key_prefix=key_prefix,
-            key_hash=key_hash,
-        )
-        db.add(new_row)
-
-        # Single commit: revoke + insert are atomic. If a concurrent
-        # POST snuck in between our SELECT and INSERT, the partial
-        # unique index raises IntegrityError here and the outer except
-        # rolls back. The losing client sees 500, which the UI can retry.
-        db.commit()
-        db.refresh(new_row)
-
-        # ``key_prefix`` is the only safe field to log. Do NOT log
-        # full_key / secret / key_hash even in DEBUG.
-        logger.info(
-            f"Generated API key for agent {agent_id} "
-            f"(prefix={key_prefix}, rotated={existing is not None})"
-        )
-
-        return APIKeyGenerateResponse(
-            full_key=full_key,
-            key_prefix=key_prefix,
-            created_at=new_row.created_at,
-        )
+        return AgentApiKeyService(db).rotate_key(agent_id)
 
     except HTTPException:
         raise
-    except IntegrityError as e:
+    except KeyRotationConflict as e:
         # Partial unique constraint hit -- another POST won the race
         # between our SELECT and our COMMIT. Surface this as 409 rather
         # than a generic 500 so the client can retry without alarm.
         # Internal SQL message stays in the log only.
-        db.rollback()
         logger.warning(f"Concurrent API key rotation race for agent {agent_id}: {e}")
         raise HTTPException(status_code=409, detail="rotation_conflict")
     except Exception as e:
@@ -944,24 +823,13 @@ async def get_agent_api_key(
     try:
         _get_owned_agent_or_404(agent_id, current_user, db)
 
-        row = (
-            db.query(AgentApiKey)
-            .filter(
-                AgentApiKey.agent_id == agent_id,
-                AgentApiKey.revoked_at.is_(None),
-            )
-            .first()
-        )
-        if row is None:
+        metadata = AgentApiKeyService(db).get_metadata(agent_id)
+        if metadata is None:
             # "Has the owner generated a key yet?" answered with 404 so
             # the UI catches and renders the empty state.
             raise HTTPException(status_code=404, detail="no_active_key")
 
-        return APIKeyMetadataResponse(
-            key_prefix=row.key_prefix,
-            masked_key=_mask_key(row.key_prefix),  # type: ignore[arg-type]
-            created_at=row.created_at,
-        )
+        return metadata
 
     except HTTPException:
         raise
@@ -1007,27 +875,7 @@ async def revoke_agent_api_key(
     try:
         _get_owned_agent_or_404(agent_id, current_user, db)
 
-        now = datetime.now(timezone.utc)
-        row = (
-            db.query(AgentApiKey)
-            .filter(
-                AgentApiKey.agent_id == agent_id,
-                AgentApiKey.revoked_at.is_(None),
-            )
-            .first()
-        )
-        if row is None:
-            # Idempotent no-op path; same HTTP shape as "yes we revoked".
-            logger.info(f"Revoke API key for agent {agent_id}: no active key (no-op)")
-            return APIKeyRevokeResponse(revoked=False, revoked_at=None)
-
-        row.revoked_at = now  # type: ignore[assignment]
-        row.updated_at = now  # type: ignore[assignment]
-        db.commit()
-        db.refresh(row)
-
-        logger.info(f"Revoked API key for agent {agent_id} (prefix={row.key_prefix})")
-        return APIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)
+        return AgentApiKeyService(db).revoke_key(agent_id)
 
     except HTTPException:
         raise

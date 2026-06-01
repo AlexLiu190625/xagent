@@ -6,19 +6,29 @@ import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Set
+from typing import TYPE_CHECKING, Optional, Set
 
 from filelock import Timeout
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...config import get_uploads_dir
-from ..config import get_upload_path
+from ..config import get_upload_path, sanitize_path_component
 from ..kb_physical_sync import collection_physical_lock, move_collection_dir_to_trash
 from ..models.uploaded_file import UploadedFile
 from .kb_file_service import delete_uploaded_file_if_orphaned
+from .uploaded_file_store import UploadedFileStore
+
+if TYPE_CHECKING:
+    from ...core.tools.core.RAG_tools.kb import KBFileCompatibilityFacade
 
 logger = logging.getLogger(__name__)
+
+
+def _get_file_compatibility_facade() -> "KBFileCompatibilityFacade":
+    from ...core.tools.core.RAG_tools.kb import get_kb_coordinator
+
+    return get_kb_coordinator().file_compatibility
 
 
 @dataclass(frozen=True)
@@ -40,7 +50,82 @@ class CollectionPhysicalRenameResult:
     new_collection_dir: Optional[Path] = None
 
 
-def delete_collection_physical_dir(
+def _path_belongs_to_collection_dir(
+    storage_path: str,
+    *,
+    owner_id: int,
+    collection_name: str,
+) -> bool:
+    """Return True when a stored path is under the owner's collection dir."""
+    try:
+        collection_dir = get_upload_path(
+            "",
+            user_id=owner_id,
+            collection=collection_name,
+            create_if_not_exists=False,
+            collection_is_sanitized=True,
+        ).resolve()
+        file_path = Path(storage_path).resolve()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "Skipping collection owner discovery for invalid path %s: %s",
+            storage_path,
+            exc,
+        )
+        return False
+    return file_path == collection_dir or collection_dir in file_path.parents
+
+
+def _list_collection_uploaded_file_owner_ids_impl(
+    db: Session,
+    *,
+    collection_name: str,
+) -> Set[int]:
+    """List UploadedFile owners with files under a collection directory."""
+    owner_ids: Set[int] = set()
+    try:
+        safe_collection = sanitize_path_component(collection_name, "collection")
+    except ValueError:
+        logger.debug("Invalid collection name for UploadedFile owner discovery")
+        return owner_ids
+
+    try:
+        candidates = (
+            db.query(UploadedFile.user_id, UploadedFile.storage_path)
+            .filter(
+                UploadedFile.user_id.isnot(None),
+                UploadedFile.storage_path.contains(safe_collection),
+            )
+            .all()
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to list UploadedFile owner candidates for %s: %s",
+            collection_name,
+            exc,
+        )
+        return owner_ids
+
+    for row in candidates:
+        raw_user_id = getattr(row, "user_id", None)
+        storage_path = getattr(row, "storage_path", None)
+        if raw_user_id is None or not storage_path:
+            continue
+        try:
+            owner_id = int(raw_user_id)
+        except (TypeError, ValueError):
+            logger.debug("Skipping invalid UploadedFile user_id: %r", raw_user_id)
+            continue
+        if _path_belongs_to_collection_dir(
+            str(storage_path),
+            owner_id=owner_id,
+            collection_name=safe_collection,
+        ):
+            owner_ids.add(owner_id)
+    return owner_ids
+
+
+def _delete_collection_physical_dir_impl(
     *,
     user_id: int,
     collection_name: str,
@@ -104,7 +189,7 @@ def delete_collection_physical_dir(
         )
 
 
-def delete_collection_uploaded_files(
+def _delete_collection_uploaded_files_impl(
     db: Session,
     *,
     user_id: int,
@@ -139,8 +224,10 @@ def delete_collection_uploaded_files(
         # Exclude file_ids already deleted in the first pass to avoid double-count
         if deleted_file_ids:
             query = query.filter(UploadedFile.file_id.notin_(deleted_file_ids))
-        deleted = query.delete(synchronize_session=False)
-        deleted_uploaded_files += int(deleted or 0)
+        store = UploadedFileStore(db)
+        for file_record in query.all():
+            store.delete(file_record, delete_local=False)
+            deleted_uploaded_files += 1
 
     if deleted_uploaded_files:
         db.commit()
@@ -148,7 +235,7 @@ def delete_collection_uploaded_files(
     return deleted_uploaded_files
 
 
-def rename_collection_storage(
+def _rename_collection_storage_impl(
     db: Session,
     *,
     user_id: int,
@@ -317,3 +404,63 @@ def rename_collection_storage(
             old_collection_dir=old_collection_dir,
             new_collection_dir=new_collection_dir,
         )
+
+
+def list_collection_uploaded_file_owner_ids(
+    db: Session,
+    *,
+    collection_name: str,
+) -> Set[int]:
+    """List UploadedFile owners with files under a collection directory."""
+    return _get_file_compatibility_facade().list_collection_uploaded_file_owner_ids(
+        db,
+        collection_name=collection_name,
+    )
+
+
+def delete_collection_physical_dir(
+    *,
+    user_id: int,
+    collection_name: str,
+) -> CollectionPhysicalDeleteResult:
+    """Move a collection directory to trash if it exists."""
+    return _get_file_compatibility_facade().delete_collection_physical_dir(
+        user_id=user_id,
+        collection_name=collection_name,
+    )
+
+
+def delete_collection_uploaded_files(
+    db: Session,
+    *,
+    user_id: int,
+    collection_file_ids: Set[str],
+    remaining_file_ids: Set[str],
+    collection_dir: Optional[Path],
+) -> int:
+    """Delete orphan UploadedFile rows for a collection, with legacy path fallback."""
+    return _get_file_compatibility_facade().delete_collection_uploaded_files(
+        db,
+        user_id=user_id,
+        collection_file_ids=collection_file_ids,
+        remaining_file_ids=remaining_file_ids,
+        collection_dir=collection_dir,
+    )
+
+
+def rename_collection_storage(
+    db: Session,
+    *,
+    user_id: int,
+    old_collection_name: str,
+    new_collection_name: str,
+    collection_file_ids: Set[str],
+) -> CollectionPhysicalRenameResult:
+    """Rename collection directory and update UploadedFile storage paths."""
+    return _get_file_compatibility_facade().rename_collection_storage(
+        db,
+        user_id=user_id,
+        old_collection_name=old_collection_name,
+        new_collection_name=new_collection_name,
+        collection_file_ids=collection_file_ids,
+    )

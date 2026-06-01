@@ -19,12 +19,29 @@ logger = logging.getLogger(__name__)
 async def create_db_custom_api_tools(config: BaseToolConfig) -> Sequence[Tool]:
     """Create Custom API tools from database configurations.
 
+    Internal short-circuit via ``ToolSelectionSpec.includes_custom_api()``:
+    when the spec explicitly excludes Custom APIs (empty
+    ``custom_api_ids`` frozenset), this creator returns early WITHOUT
+    calling ``config.get_custom_api_configs()`` — that call goes
+    through the DB to enumerate the user's Custom API rows. No
+    ``categories=`` is declared on the registration because Custom
+    API tools currently surface under multiple operative categories
+    in the UI; registry-level skip therefore relies on the per-
+    creator short-circuit rather than a static category annotation.
+
     Args:
         config: The tool configuration containing user/workspace context.
 
     Returns:
         List of Tool instances for each configured Custom API.
     """
+    spec = (
+        config.get_tool_selection_spec()
+        if hasattr(config, "get_tool_selection_spec")
+        else None
+    )
+    if spec is not None and not spec.includes_custom_api():
+        return []
     try:
         user_id = config.get_user_id()
         if not user_id:

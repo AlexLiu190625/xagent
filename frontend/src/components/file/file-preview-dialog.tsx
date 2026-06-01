@@ -34,10 +34,10 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
         try {
           const apiUrl = getApiUrl()
 
-          // Check if this is a PPTX file that needs preview conversion
-          const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
-            filePreview.fileName.toLowerCase().endsWith('.ppt')
-          const isDocxFile = filePreview.fileName.toLowerCase().endsWith('.docx')
+          // .pptx is routed through /preview (raw bytes for PptxPreviewRenderer
+          // to render in-browser); everything else (including legacy .ppt, which
+          // pptxviewjs does not support) streams via /download.
+          const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx')
 
           let url: string
           if (isPptxFile) {
@@ -143,17 +143,21 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
 
   const handleOpenInNewWindow = () => {
     if (filePreview.fileId) {
-      // Check if this is a PPTX file
-      const isPptxFile = filePreview.fileName.toLowerCase().endsWith('.pptx') ||
-        filePreview.fileName.toLowerCase().endsWith('.ppt')
-
-      let fileUrl: string
+      // Browser-renderable kinds (images, PDFs, plain text, …) go
+      // through the public preview URL so a standalone tab can display
+      // them inline. .pptx is intentionally routed to /download
+      // instead: the public-preview URL would return the raw OOXML
+      // package with ``Content-Disposition: inline``, which a browser
+      // tab cannot render. By using /download we make the affordance
+      // explicit — the user gets the .pptx file, not a "preview" of
+      // raw bytes pretending to be one. Browser-rendered .pptx
+      // previews live inside PptxPreviewRenderer (canvas-based),
+      // mounted by the in-app dialog rather than a standalone tab.
       const apiUrl = getApiUrl()
-      if (isPptxFile) {
-        fileUrl = `${apiUrl}/api/files/preview/${encodeURIComponent(filePreview.fileId)}`
-      } else {
-        fileUrl = getFilePublicPreviewUrl(filePreview.fileId, apiUrl)
-      }
+      const isPptx = filePreview.fileName.toLowerCase().endsWith('.pptx')
+      const fileUrl = isPptx
+        ? `${apiUrl}/api/files/download/${encodeURIComponent(filePreview.fileId)}`
+        : getFilePublicPreviewUrl(filePreview.fileId, apiUrl)
 
       // Open in new window/tab
       window.open(fileUrl, '_blank')

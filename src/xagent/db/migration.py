@@ -33,7 +33,7 @@ def try_upgrade_db(engine: Engine) -> None:
         if version is None:
             if is_database_empty(engine):
                 logger.info("Creating new database, stamping to latest revision.")
-                with engine.connect() as conn:
+                with engine.begin() as conn:
                     alembic_cfg.attributes["connection"] = conn
                     command.stamp(alembic_cfg, "head")
             else:
@@ -42,7 +42,7 @@ def try_upgrade_db(engine: Engine) -> None:
                 )
         else:
             logger.info(f"Current version: {version}, upgrading to head")
-            with engine.connect() as conn:
+            with engine.begin() as conn:
                 alembic_cfg.attributes["connection"] = conn
                 command.upgrade(alembic_cfg, "head")
     except Exception as e:

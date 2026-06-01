@@ -1,0 +1,338 @@
+"""Regression test: ``get_agent_for_task`` skips reconstruct for fresh
+RUNNING tasks but still runs it when prior state actually exists.
+
+Background:
+    ``begin_turn`` atomically flips a newly created SDK task's status
+    to ``RUNNING`` before ``get_agent_for_task`` is called. A naive
+    ``should_reconstruct = status in {RUNNING, PAUSED,
+    WAITING_FOR_USER}`` test would route every brand-new SDK task
+    into ``_reconstruct_agent_from_history``, which queries
+    ``TraceEvent`` and ``DAGExecution.current_plan``, finds nothing,
+    logs a misleading "Failed to reconstruct agent from history"
+    warning, and falls through to normal creation. The full
+    reconstruct path is 1-2s of wasted DB work plus a noisy log line
+    that confuses incident triage.
+
+    ``_has_reconstructable_history`` gates the reconstruct branch
+    for ``RUNNING`` tasks: if neither a ``TraceEvent`` row nor a
+    ``DAGExecution`` row exists for the task, the reconstruct branch
+    is skipped and the function goes straight to normal creation.
+
+    ``PAUSED`` / ``WAITING_FOR_USER`` tasks are NOT gated on the
+    pre-check -- those states by definition have prior runtime state
+    that must be recovered.
+
+What this test pins:
+
+    * RUNNING + empty history => reconstruct NOT called.
+    * RUNNING + trace events present => reconstruct called (regression
+      guard against accidentally widening the skip condition).
+    * PAUSED => reconstruct called even with empty history (the pre-
+      check intentionally doesn't gate non-RUNNING active statuses).
+"""
+
+from __future__ import annotations
+
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from xagent.web.api.chat import AgentServiceManager
+from xagent.web.models.agent import Agent, AgentStatus
+from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
+from xagent.web.models.user import User
+
+
+def _make_user() -> User:
+    return User(
+        id=1,
+        username="reconstruct_test_user",
+        password_hash="hash",
+        is_admin=False,
+    )
+
+
+def _make_task(status: TaskStatus, agent_id: int | None = None) -> Task:
+    return Task(
+        id=42,
+        user_id=1,
+        title="reconstruct test",
+        description="reconstruct",
+        status=status,
+        agent_id=agent_id,
+        agent_type="standard",
+    )
+
+
+def _make_agent() -> Agent:
+    return Agent(
+        id=7,
+        user_id=1,
+        name="reconstruct test agent",
+        instructions="be terse",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["basic"],
+        knowledge_bases=[],
+        skills=[],
+        execution_mode="flash",
+    )
+
+
+class _Fake:
+    """Sentinel for a non-None trace event / DAG plan row -- the
+    pre-check only does ``.first() is not None``, the row's contents
+    are not inspected by the pre-check itself."""
+
+
+def _build_db(
+    task: Task,
+    *,
+    trace_event: Any | None = None,
+    dag_execution: Any | None = None,
+    agent: Agent | None = None,
+    user: User | None = None,
+) -> MagicMock:
+    """Wire a MagicMock ``db`` whose ``.query(model).filter(...).first()``
+    returns whichever fixture row the test supplied.
+
+    All other models default to ``None`` from ``.first()`` and ``[]``
+    from ``.all()``, which is what an in-memory SQLAlchemy session
+    would do for an empty table.
+    """
+    by_model: dict[type, Any] = {
+        Task: task,
+        TraceEvent: trace_event,
+        DAGExecution: dag_execution,
+        Agent: agent,
+        User: user,
+    }
+
+    def _query(model: type) -> Any:
+        result = MagicMock()
+        result.filter = MagicMock(return_value=result)
+        result.first = MagicMock(return_value=by_model.get(model))
+        result.all = MagicMock(
+            return_value=[by_model.get(model)] if by_model.get(model) else []
+        )
+        result.order_by = MagicMock(return_value=result)
+        return result
+
+    db = MagicMock()
+    db.query = _query
+    return db
+
+
+def _stub_downstream(manager: AgentServiceManager):
+    """Patch the heavy work past the reconstruct decision so the test
+    asserts only on whether reconstruct was called.
+
+    LLM resolution + agent-builder config loading moved to module-
+    level helpers in ``llm_utils``; patches target those source
+    locations so the lazy imports inside the snapshot loader and
+    ``_resolve_task_runtime_config`` pick them up.
+    """
+    return [
+        patch(
+            "xagent.web.services.llm_utils.UserAwareModelStorage."
+            "resolve_llms_from_names",
+            return_value=(None, None, None, None),
+        ),
+        patch(
+            "xagent.web.services.llm_utils.make_normalize_model_id",
+            return_value=lambda mid, mname: mname,
+        ),
+        patch(
+            "xagent.web.services.llm_utils.load_agent_builder_config",
+            return_value={
+                "llms": (None, None, None, None),
+                "saved_model_ids": {},
+                "saved_model_descriptors": {},
+                "execution_mode": "flash",
+                "instructions": "",
+                "knowledge_bases": [],
+                "skills": [],
+                "tool_categories": ["basic"],
+            },
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch(
+            "xagent.web.api.chat.create_task_tracer",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.api.chat.create_default_tools",
+            new=AsyncMock(return_value=([], MagicMock())),
+        ),
+        patch(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            return_value=None,
+        ),
+        patch("xagent.web.api.chat.AgentService"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_running_with_no_history_skips_reconstruct() -> None:
+    """The pre-check hot case: brand-new SDK task is RUNNING but has zero
+    prior state, so reconstruct must be skipped.
+    """
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    agent_row = _make_agent()
+
+    db = _build_db(
+        task,
+        trace_event=None,  # no prior trace events
+        dag_execution=None,  # no DAG plan
+        agent=agent_row,
+        user=user,
+    )
+
+    reconstruct = AsyncMock()
+    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+        with _Patches(_stub_downstream(manager)):
+            try:
+                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+            except Exception:
+                # Downstream stubs may raise during agent assembly; the
+                # reconstruct-call assertion below records its state
+                # before the failure point.
+                pass
+
+    reconstruct.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
+    """Regression guard: if a RUNNING task has prior trace events,
+    reconstruct must still run (the pre-check must not widen the skip
+    too aggressively).
+    """
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    agent_row = _make_agent()
+
+    db = _build_db(
+        task,
+        trace_event=_Fake(),  # prior trace event exists
+        dag_execution=None,
+        agent=agent_row,
+        user=user,
+    )
+
+    reconstruct = AsyncMock()
+    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+        with _Patches(_stub_downstream(manager)):
+            try:
+                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+            except Exception:
+                pass
+
+    reconstruct.assert_awaited_once_with(42, db)
+
+
+@pytest.mark.asyncio
+async def test_running_with_dag_plan_runs_reconstruct() -> None:
+    """Either signal is sufficient: a DAG plan (no trace event) also
+    keeps reconstruct enabled."""
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    agent_row = _make_agent()
+
+    db = _build_db(
+        task,
+        trace_event=None,
+        dag_execution=_Fake(),  # DAG plan exists
+        agent=agent_row,
+        user=user,
+    )
+
+    reconstruct = AsyncMock()
+    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+        with _Patches(_stub_downstream(manager)):
+            try:
+                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+            except Exception:
+                pass
+
+    reconstruct.assert_awaited_once_with(42, db)
+
+
+@pytest.mark.asyncio
+async def test_paused_with_no_history_still_runs_reconstruct() -> None:
+    """The pre-check intentionally only gates ``RUNNING``. A task in
+    ``PAUSED`` state has prior runtime state by definition (something
+    paused it); even if the DB queries inside reconstruct return empty
+    (e.g. due to test fixtures), we must not short-circuit here.
+    """
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.PAUSED, agent_id=7)
+    agent_row = _make_agent()
+
+    db = _build_db(
+        task,
+        trace_event=None,
+        dag_execution=None,
+        agent=agent_row,
+        user=user,
+    )
+
+    reconstruct = AsyncMock()
+    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+        with _Patches(_stub_downstream(manager)):
+            try:
+                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+            except Exception:
+                pass
+
+    reconstruct.assert_awaited_once_with(42, db)
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None:
+    """Same invariant as the PAUSED case above for ``WAITING_FOR_USER``."""
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.WAITING_FOR_USER, agent_id=7)
+    agent_row = _make_agent()
+
+    db = _build_db(
+        task,
+        trace_event=None,
+        dag_execution=None,
+        agent=agent_row,
+        user=user,
+    )
+
+    reconstruct = AsyncMock()
+    with patch.object(manager, "_reconstruct_agent_from_history", reconstruct):
+        with _Patches(_stub_downstream(manager)):
+            try:
+                await manager.get_agent_for_task(task_id=42, db=db, user=user)
+            except Exception:
+                pass
+
+    reconstruct.assert_awaited_once_with(42, db)
+
+
+class _Patches:
+    """Compose a list of ``patch`` objects into a single context
+    manager. Equivalent to ``with patch(a), patch(b), ...`` but
+    accepts the patch list as a variable.
+    """
+
+    def __init__(self, patches: list[Any]) -> None:
+        self._patches = patches
+
+    def __enter__(self) -> None:
+        for p in self._patches:
+            p.start()
+
+    def __exit__(self, *exc_info: Any) -> None:
+        for p in reversed(self._patches):
+            p.stop()

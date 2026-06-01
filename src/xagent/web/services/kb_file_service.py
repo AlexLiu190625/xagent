@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import time
 from collections import OrderedDict
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from sqlalchemy.orm import Session
 
@@ -34,12 +36,49 @@ from ...core.tools.core.RAG_tools.version_management.cascade_cleaner import (
 )
 from ...providers.vector_store.lancedb import get_connection_from_env
 from ..models.uploaded_file import UploadedFile
+from .uploaded_file_store import UploadedFileStore
+
+if TYPE_CHECKING:
+    from ...core.tools.core.RAG_tools.kb import KBFileCompatibilityFacade
 
 logger = logging.getLogger(__name__)
 
 _FILE_STATUS_BATCH_SIZE = 200
 _STALE_FILE_STATUSES = {"FAILED", "UNKNOWN", "RUNNING"}
 _DEFAULT_DELETABLE_STALE_STATUSES = {"FAILED"}
+
+
+def _get_file_compatibility_facade() -> "KBFileCompatibilityFacade":
+    from ...core.tools.core.RAG_tools.kb import get_kb_coordinator
+
+    return get_kb_coordinator().file_compatibility
+
+
+@dataclass(frozen=True)
+class FileCompensationResult:
+    """Result for idempotent file compensation helpers."""
+
+    status: str
+    side_effects_may_remain: bool = False
+    errors: tuple[str, ...] = ()
+    effects: tuple[str, ...] = ()
+
+    @property
+    def complete(self) -> bool:
+        return self.status == "complete" and not self.side_effects_may_remain
+
+
+@dataclass(frozen=True)
+class UploadedFileRefreshSnapshot:
+    """Previous UploadedFile state captured before refreshing a durable file."""
+
+    file_id: str
+    user_id: Optional[int]
+    row_fields: Dict[str, Any]
+    previous_path: Path
+    backup_path: Optional[Path]
+    had_local_file: bool
+    reindex_marker_applied: bool = False
 
 
 class _FileStatusCache:
@@ -91,7 +130,7 @@ class _FileStatusCache:
 _file_status_cache = _FileStatusCache(ttl_seconds=5)
 
 
-def upsert_uploaded_file_record(
+def _upsert_uploaded_file_record_impl(
     db: Session,
     *,
     user_id: Optional[int],
@@ -99,35 +138,21 @@ def upsert_uploaded_file_record(
     storage_path: Path,
     mime_type: Optional[str],
     file_size: int,
+    file_id: Optional[str] = None,
 ) -> UploadedFile:
     """Create or refresh an ``UploadedFile`` row for a stored file."""
     scope = resolve_user_scope(user_id=user_id, is_admin=False)
     if scope.user_id is None:
         raise ValueError("user_id is required for UploadedFile upsert")
 
-    storage_path_str = str(storage_path)
-    existing = (
-        db.query(UploadedFile)
-        .filter(UploadedFile.storage_path == storage_path_str)
-        .first()
+    file_record = UploadedFileStore(db).upsert_by_storage_path(
+        user_id=scope.user_id,
+        filename=filename,
+        storage_path=storage_path,
+        mime_type=mime_type,
+        file_size=file_size,
+        file_id=file_id,
     )
-    if existing:
-        existing.filename = filename  # type: ignore[assignment]
-        existing.file_size = int(file_size)  # type: ignore[assignment]
-        if mime_type is not None:
-            existing.mime_type = mime_type  # type: ignore[assignment]
-        db.flush()
-        file_record = existing
-    else:
-        file_record = UploadedFile(
-            user_id=scope.user_id,
-            filename=filename,
-            storage_path=storage_path_str,
-            mime_type=mime_type,
-            file_size=int(file_size),
-        )
-        db.add(file_record)
-        db.flush()
     db.commit()
     db.refresh(file_record)
 
@@ -137,7 +162,7 @@ def upsert_uploaded_file_record(
     return file_record
 
 
-def list_documents_for_user(
+def _list_documents_for_user_impl(
     *,
     user_id: Optional[int] = None,
     is_admin: bool,
@@ -172,7 +197,7 @@ def list_documents_for_user(
         _safe_close_table(table)
 
 
-def build_uploaded_filename_map(
+def _build_uploaded_filename_map_impl(
     db: Session, *, user_id: Optional[int], file_ids: List[str]
 ) -> Dict[str, str]:
     """Resolve ``file_id`` values to current uploaded filenames."""
@@ -194,7 +219,7 @@ def build_uploaded_filename_map(
     return {str(record.file_id): str(record.filename) for record in records}
 
 
-def get_document_record_file_id(
+def _get_document_record_file_id_impl(
     record: Union[Dict[str, Any], DocumentRecord],
 ) -> Optional[str]:
     """Extract a normalized ``file_id`` from a KB document record.
@@ -218,7 +243,7 @@ def get_document_record_file_id(
     return file_id or None
 
 
-def resolve_document_filename(
+def _resolve_document_filename_impl(
     record: Union[Dict[str, Any], DocumentRecord], filename_map: Dict[str, str]
 ) -> Optional[str]:
     """Resolve a user-facing filename from ``file_id`` first, then legacy path.
@@ -230,7 +255,7 @@ def resolve_document_filename(
     Returns:
         Resolved filename or None.
     """
-    file_id = get_document_record_file_id(record)
+    file_id = _get_document_record_file_id_impl(record)
     if file_id and filename_map.get(file_id):
         return filename_map[file_id]
 
@@ -246,7 +271,7 @@ def resolve_document_filename(
     return None
 
 
-def delete_uploaded_file_if_orphaned(
+def _delete_uploaded_file_if_orphaned_impl(
     db: Session,
     *,
     file_id: str,
@@ -297,13 +322,248 @@ def delete_uploaded_file_if_orphaned(
             resolved_path.unlink()
             logger.info("Deleted orphaned physical file: %s", resolved_path)
 
-    db.delete(file_record)
-    db.flush()
-
+    UploadedFileStore(db).delete(file_record, delete_local=False)
     # Invalidate cache for this user since file list changed
     _file_status_cache.invalidate_user(scope.user_id)
-
     return True
+
+
+def _compensation_complete(*effects: str) -> FileCompensationResult:
+    return FileCompensationResult(status="complete", effects=tuple(effects))
+
+
+def _compensation_incomplete(
+    error: BaseException | str,
+    *,
+    effects: tuple[str, ...] = (),
+) -> FileCompensationResult:
+    return FileCompensationResult(
+        status="incomplete",
+        side_effects_may_remain=True,
+        errors=(str(error),),
+        effects=effects,
+    )
+
+
+def _compensate_new_uploaded_file_impl(
+    db: Session,
+    *,
+    file_id: str,
+    user_id: Optional[int] = None,
+    delete_local: bool = True,
+    local_root: Optional[Path] = None,
+) -> FileCompensationResult:
+    """Idempotently remove a newly created UploadedFile row and artifacts.
+
+    The caller owns commit/rollback timing. This helper flushes through
+    ``UploadedFileStore.delete`` but intentionally does not commit.
+    """
+    normalized_file_id = str(file_id or "").strip()
+    if not normalized_file_id:
+        return _compensation_complete("missing_file_id")
+
+    query = db.query(UploadedFile).filter(UploadedFile.file_id == normalized_file_id)
+    if user_id is not None:
+        scope = resolve_user_scope(user_id=user_id, is_admin=False)
+        if scope.user_id is None:
+            return _compensation_complete("missing_user")
+        query = query.filter(UploadedFile.user_id == scope.user_id)
+    file_record = query.first()
+    if file_record is None:
+        return _compensation_complete("already_removed")
+
+    try:
+        effective_local_root = local_root
+        if delete_local and effective_local_root is None:
+            effective_local_root = get_uploads_dir()
+        UploadedFileStore(db).delete(
+            file_record,
+            delete_local=delete_local,
+            local_root=effective_local_root,
+        )
+        record_user_id = getattr(file_record, "user_id", None)
+        if record_user_id is not None:
+            _file_status_cache.invalidate_user(int(record_user_id))
+        return _compensation_complete("uploaded_file_removed")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to compensate UploadedFile creation: file_id=%s error=%s",
+            normalized_file_id,
+            exc,
+        )
+        return _compensation_incomplete(exc)
+
+
+def _cleanup_local_copied_file_impl(
+    *,
+    file_path: Path,
+    local_root: Optional[Path] = None,
+) -> FileCompensationResult:
+    """Idempotently remove a staged local file created for KB ingestion."""
+    try:
+        resolved_path = file_path.resolve()
+        if local_root is not None:
+            resolved_root = local_root.resolve()
+            try:
+                resolved_path.relative_to(resolved_root)
+            except ValueError:
+                return _compensation_incomplete(
+                    f"refusing to delete file outside local_root: {file_path}"
+                )
+        if not resolved_path.exists():
+            return _compensation_complete("already_removed")
+        if not resolved_path.is_file():
+            return _compensation_incomplete(f"not a file: {file_path}")
+        resolved_path.unlink()
+        return _compensation_complete("local_file_removed")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Failed to clean up copied file %s: %s", file_path, exc)
+        return _compensation_incomplete(exc)
+
+
+_UPLOADED_FILE_REFRESH_FIELDS = (
+    "filename",
+    "storage_path",
+    "mime_type",
+    "file_size",
+    "storage_backend",
+    "storage_key",
+    "storage_uri",
+    "checksum",
+    "etag",
+    "storage_status",
+    "workspace_relative_path",
+    "workspace_category",
+    "task_id",
+)
+
+
+def _capture_uploaded_file_refresh_snapshot_impl(
+    file_record: UploadedFile,
+    *,
+    backup_path: Optional[Path] = None,
+    reindex_marker_applied: bool = False,
+) -> UploadedFileRefreshSnapshot:
+    """Capture UploadedFile row and local-file state before a refresh."""
+    row_fields = {
+        field_name: getattr(file_record, field_name, None)
+        for field_name in _UPLOADED_FILE_REFRESH_FIELDS
+    }
+    previous_path = Path(str(getattr(file_record, "storage_path")))
+    raw_user_id = getattr(file_record, "user_id", None)
+    user_id = int(raw_user_id) if raw_user_id is not None else None
+    return UploadedFileRefreshSnapshot(
+        file_id=str(getattr(file_record, "file_id")),
+        user_id=user_id,
+        row_fields=row_fields,
+        previous_path=previous_path,
+        backup_path=backup_path,
+        had_local_file=previous_path.exists() and previous_path.is_file(),
+        reindex_marker_applied=reindex_marker_applied,
+    )
+
+
+def _restore_uploaded_file_refresh_snapshot_impl(
+    db: Session,
+    snapshot: UploadedFileRefreshSnapshot,
+) -> FileCompensationResult:
+    """Restore UploadedFile row, local file, durable bytes, and cache state."""
+    effects: list[str] = []
+    errors: list[str] = []
+
+    if snapshot.backup_path is not None:
+        try:
+            if snapshot.had_local_file:
+                snapshot.previous_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(snapshot.backup_path, snapshot.previous_path)
+                effects.append("local_file_restored")
+            else:
+                snapshot.previous_path.unlink(missing_ok=True)
+                effects.append("local_file_removed")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to restore local UploadedFile backup for file_id=%s: %s",
+                snapshot.file_id,
+                exc,
+            )
+            errors.append(str(exc))
+
+    try:
+        db.rollback()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to roll back database session before UploadedFile refresh restore "
+            "for file_id=%s: %s",
+            snapshot.file_id,
+            exc,
+        )
+        errors.append(str(exc))
+        return FileCompensationResult(
+            status="incomplete",
+            side_effects_may_remain=True,
+            errors=tuple(errors),
+            effects=tuple(effects),
+        )
+
+    try:
+        query = db.query(UploadedFile).filter(UploadedFile.file_id == snapshot.file_id)
+        if snapshot.user_id is not None:
+            query = query.filter(UploadedFile.user_id == snapshot.user_id)
+        file_record = query.first()
+        if file_record is None:
+            errors.append(
+                f"UploadedFile missing during refresh restore: {snapshot.file_id}"
+            )
+            return FileCompensationResult(
+                status="incomplete",
+                side_effects_may_remain=True,
+                errors=tuple(errors),
+                effects=tuple(effects),
+            )
+
+        for field_name, value in snapshot.row_fields.items():
+            setattr(file_record, field_name, value)
+        effects.append("uploaded_file_row_restored")
+
+        if snapshot.user_id is not None:
+            _file_status_cache.invalidate_user(snapshot.user_id)
+            effects.append("file_status_cache_invalidated")
+
+        storage_key = snapshot.row_fields.get("storage_key")
+        if storage_key and snapshot.had_local_file and snapshot.previous_path.exists():
+            from .managed_file_ref import ManagedFileRef
+
+            ManagedFileRef(file_record).sync_to_durable(
+                storage_key=str(storage_key),
+                mime_type=snapshot.row_fields.get("mime_type"),
+            )
+            effects.append("durable_object_restored")
+
+        db.flush()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "Failed to restore UploadedFile refresh snapshot for file_id=%s: %s",
+            snapshot.file_id,
+            exc,
+        )
+        errors.append(str(exc))
+        return FileCompensationResult(
+            status="incomplete",
+            side_effects_may_remain=True,
+            errors=tuple(errors),
+            effects=tuple(effects),
+        )
+
+    if snapshot.reindex_marker_applied:
+        effects.append("reindex_marker_was_applied")
+    if errors:
+        return FileCompensationResult(
+            status="incomplete",
+            side_effects_may_remain=True,
+            errors=tuple(errors),
+            effects=tuple(effects),
+        )
+    return _compensation_complete(*effects)
 
 
 def _build_file_id_in_filter(file_ids: List[str]) -> str:
@@ -409,7 +669,7 @@ def _load_indexed_doc_refs(
     return indexed_refs
 
 
-def aggregate_uploaded_file_statuses(
+def _aggregate_uploaded_file_statuses_impl(
     *,
     file_ids: List[str],
     user_id: int,
@@ -530,7 +790,7 @@ def aggregate_uploaded_file_statuses(
     return status_map
 
 
-def reconcile_uploaded_files(
+def _reconcile_uploaded_files_impl(
     db: Session,
     *,
     user_id: int,
@@ -555,7 +815,7 @@ def reconcile_uploaded_files(
 
     uploaded_files = query.order_by(UploadedFile.created_at.asc()).all()
     file_ids = [str(record.file_id) for record in uploaded_files if record.file_id]
-    status_map = aggregate_uploaded_file_statuses(
+    status_map = _aggregate_uploaded_file_statuses_impl(
         file_ids=file_ids,
         user_id=user_id,
         is_admin=is_admin,
@@ -681,33 +941,20 @@ def reconcile_uploaded_files(
             )
             continue
 
-        # After relational/vector cleanup succeeds, delete physical file.
-        file_path = Path(str(record.storage_path))
-        uploads_root = get_uploads_dir().resolve()
         try:
-            resolved_path = file_path.resolve()
-            resolved_path.relative_to(uploads_root)
-        except ValueError:
-            logger.warning(
-                "Skipping stale file cleanup outside uploads root: %s",
-                file_path,
+            UploadedFileStore(db).delete(
+                record,
+                delete_local=True,
+                local_root=get_uploads_dir(),
             )
-        else:
-            if resolved_path.exists() and resolved_path.is_file():
-                try:
-                    resolved_path.unlink()
-                except OSError as exc:
-                    cleanup_errors += 1
-                    logger.error(
-                        "Failed to delete stale file %s for file_id=%s: %s",
-                        resolved_path,
-                        file_id,
-                        exc,
-                    )
-                    continue
-
-        # Finally delete the UploadedFile record
-        db.delete(record)
+        except Exception as exc:  # noqa: BLE001
+            cleanup_errors += 1
+            logger.error(
+                "Failed to delete stale UploadedFile storage for file_id=%s: %s",
+                file_id,
+                exc,
+            )
+            continue
         deleted += 1
         logger.info(
             "Deleted stale UploadedFile record: file_id=%s (cascade deleted %d related rows)",
@@ -724,3 +971,174 @@ def reconcile_uploaded_files(
         "deleted": deleted,
         "cleanup_errors": cleanup_errors,
     }
+
+
+def upsert_uploaded_file_record(
+    db: Session,
+    *,
+    user_id: Optional[int],
+    filename: str,
+    storage_path: Path,
+    mime_type: Optional[str],
+    file_size: int,
+    file_id: Optional[str] = None,
+) -> UploadedFile:
+    """Create or refresh an ``UploadedFile`` row for a stored file."""
+    return _get_file_compatibility_facade().upsert_uploaded_file_record(
+        db,
+        user_id=user_id,
+        filename=filename,
+        storage_path=storage_path,
+        mime_type=mime_type,
+        file_size=file_size,
+        file_id=file_id,
+    )
+
+
+def list_documents_for_user(
+    *,
+    user_id: Optional[int] = None,
+    is_admin: bool,
+    collection_name: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    """Load KB document metadata rows for a user."""
+    return _get_file_compatibility_facade().list_documents_for_user(
+        user_id=user_id,
+        is_admin=is_admin,
+        collection_name=collection_name,
+    )
+
+
+def build_uploaded_filename_map(
+    db: Session, *, user_id: Optional[int], file_ids: List[str]
+) -> Dict[str, str]:
+    """Resolve ``file_id`` values to current uploaded filenames."""
+    return _get_file_compatibility_facade().build_uploaded_filename_map(
+        db,
+        user_id=user_id,
+        file_ids=file_ids,
+    )
+
+
+def get_document_record_file_id(
+    record: Union[Dict[str, Any], DocumentRecord],
+) -> Optional[str]:
+    """Extract a normalized ``file_id`` from a KB document record."""
+    return _get_file_compatibility_facade().get_document_record_file_id(record)
+
+
+def resolve_document_filename(
+    record: Union[Dict[str, Any], DocumentRecord], filename_map: Dict[str, str]
+) -> Optional[str]:
+    """Resolve a user-facing filename from ``file_id`` first, then legacy path."""
+    return _get_file_compatibility_facade().resolve_document_filename(
+        record,
+        filename_map,
+    )
+
+
+def delete_uploaded_file_if_orphaned(
+    db: Session,
+    *,
+    file_id: str,
+    user_id: Optional[int],
+    remaining_file_ids: set[str],
+) -> bool:
+    """Delete uploaded file row and local file when no documents still reference it."""
+    return _get_file_compatibility_facade().delete_uploaded_file_if_orphaned(
+        db,
+        file_id=file_id,
+        user_id=user_id,
+        remaining_file_ids=remaining_file_ids,
+    )
+
+
+def aggregate_uploaded_file_statuses(
+    *,
+    file_ids: List[str],
+    user_id: int,
+    is_admin: bool,
+    use_cache: bool = True,
+) -> Dict[str, str]:
+    """Aggregate file status by joining documents + ingestion status records."""
+    return _get_file_compatibility_facade().aggregate_uploaded_file_statuses(
+        file_ids=file_ids,
+        user_id=user_id,
+        is_admin=is_admin,
+        use_cache=use_cache,
+    )
+
+
+def reconcile_uploaded_files(
+    db: Session,
+    *,
+    user_id: int,
+    is_admin: bool,
+    stale_ttl_hours: int = 24 * 7,
+    delete_stale: bool = True,
+    deletable_statuses: Optional[set[str]] = None,
+) -> Dict[str, int]:
+    """Reconcile uploaded files with document + ingestion status state."""
+    return _get_file_compatibility_facade().reconcile_uploaded_files(
+        db,
+        user_id=user_id,
+        is_admin=is_admin,
+        stale_ttl_hours=stale_ttl_hours,
+        delete_stale=delete_stale,
+        deletable_statuses=deletable_statuses,
+    )
+
+
+def compensate_new_uploaded_file(
+    db: Session,
+    *,
+    file_id: str,
+    user_id: Optional[int] = None,
+    delete_local: bool = True,
+    local_root: Optional[Path] = None,
+) -> FileCompensationResult:
+    """Idempotently remove a newly created UploadedFile row and artifacts."""
+    return _get_file_compatibility_facade().compensate_new_uploaded_file(
+        db,
+        file_id=file_id,
+        user_id=user_id,
+        delete_local=delete_local,
+        local_root=local_root,
+    )
+
+
+def cleanup_local_copied_file(
+    *,
+    file_path: Path,
+    local_root: Optional[Path] = None,
+) -> FileCompensationResult:
+    """Idempotently remove a staged local file created for KB ingestion."""
+    return _get_file_compatibility_facade().cleanup_local_copied_file(
+        file_path=file_path,
+        local_root=local_root,
+    )
+
+
+def capture_uploaded_file_refresh_snapshot(
+    file_record: UploadedFile,
+    *,
+    backup_path: Optional[Path] = None,
+    reindex_marker_applied: bool = False,
+) -> UploadedFileRefreshSnapshot:
+    """Capture UploadedFile row and local-file state before a refresh."""
+    return _get_file_compatibility_facade().capture_uploaded_file_refresh_snapshot(
+        file_record,
+        backup_path=backup_path,
+        reindex_marker_applied=reindex_marker_applied,
+    )
+
+
+def restore_uploaded_file_refresh_snapshot(
+    db: Session,
+    snapshot: UploadedFileRefreshSnapshot,
+) -> FileCompensationResult:
+    """Restore UploadedFile row, local file, durable bytes, and cache state."""
+    return _get_file_compatibility_facade().restore_uploaded_file_refresh_snapshot(
+        db,
+        snapshot,
+    )

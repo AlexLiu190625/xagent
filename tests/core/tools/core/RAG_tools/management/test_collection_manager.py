@@ -115,6 +115,78 @@ class TestCollectionManager:
         assert saved.embedding_model_id == "text-embedding-ada-002"
 
     @pytest.mark.asyncio
+    async def test_initialize_collection_embedding_migrates_alias_to_canonical(
+        self, manager
+    ):
+        """Existing alias bindings should migrate when they match the canonical ID."""
+        collection_name = "alias_migration_test"
+        alias_model_id = "text-embedding-v4"
+        canonical_model_id = "text-embedding-v4-dashscope-1-37c6d7dd"
+        initial = CollectionInfo(
+            name=collection_name,
+            embedding_model_id=alias_model_id,
+            embedding_dimension=2,
+        )
+        await manager.save_collection(initial)
+
+        def _resolve_embedding(model_id: str):
+            mock_config = Mock()
+            mock_config.id = canonical_model_id
+            mock_config.dimension = 2
+            mock_config.model_name = alias_model_id
+            return mock_config, Mock()
+
+        mock_resolve = Mock(side_effect=_resolve_embedding)
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_embedding_adapter",
+            mock_resolve,
+        ):
+            result = await manager.initialize_collection_embedding(
+                collection_name, canonical_model_id
+            )
+
+        assert result.embedding_model_id == canonical_model_id
+        assert result.embedding_dimension == 2
+        saved = await manager.get_collection(collection_name)
+        assert saved.embedding_model_id == canonical_model_id
+        assert [call.args[0] for call in mock_resolve.call_args_list] == [
+            alias_model_id,
+            canonical_model_id,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_initialize_collection_embedding_rejects_different_model(
+        self, manager
+    ):
+        """Non-equivalent model changes should still be rejected."""
+        collection_name = "model_change_test"
+        initial = CollectionInfo(
+            name=collection_name,
+            embedding_model_id="embedding-old",
+            embedding_dimension=2,
+        )
+        await manager.save_collection(initial)
+
+        def _resolve_embedding(model_id: str):
+            mock_config = Mock()
+            mock_config.id = f"{model_id}-canonical"
+            mock_config.dimension = 2
+            return mock_config, Mock()
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.management.collection_manager.resolve_embedding_adapter",
+            Mock(side_effect=_resolve_embedding),
+        ):
+            with pytest.raises(ValueError, match="Cannot change to 'embedding-new'"):
+                await manager.initialize_collection_embedding(
+                    collection_name, "embedding-new"
+                )
+
+        saved = await manager.get_collection(collection_name)
+        assert saved.embedding_model_id == "embedding-old"
+
+    @pytest.mark.asyncio
     async def test_update_collection_stats_success(self, manager):
         """Test successful collection stats update in real storage."""
         collection_name = "stats_test"

@@ -31,6 +31,7 @@ from xagent.core.utils.api_key import (
     KEY_PREFIX_LENGTH,
     KEY_SECRET_LENGTH,
     PREFIX_COLLISION_RETRIES,
+    ApiKeyKind,
     generate_api_key,
     parse_api_key,
     verify_api_key,
@@ -116,11 +117,27 @@ def test_parse_valid() -> None:
     full, prefix, _hash = generate_api_key(db=None)
     parsed = parse_api_key(full)
     assert parsed is not None
-    parsed_prefix, parsed_secret = parsed
-    assert parsed_prefix == prefix
-    assert len(parsed_secret) == KEY_SECRET_LENGTH
+    assert parsed.kind == ApiKeyKind.AGENT
+    assert parsed.prefix == prefix
+    assert len(parsed.secret) == KEY_SECRET_LENGTH
     # Reassembly round-trip
-    assert f"{KEY_BRAND}_{parsed_prefix}_{parsed_secret}" == full
+    assert f"{KEY_BRAND}_{parsed.prefix}_{parsed.secret}" == full
+
+
+def test_generate_and_parse_personal_key() -> None:
+    """Personal keys include an explicit kind segment."""
+    full, prefix, key_hash = generate_api_key(db=None, kind=ApiKeyKind.PERSONAL)
+    assert full.startswith(f"{KEY_BRAND}_{ApiKeyKind.PERSONAL.value}_")
+    parts = full.split("_")
+    assert len(parts) == 4
+    assert parts[2] == prefix
+    assert verify_api_key(full, key_hash) is True
+
+    parsed = parse_api_key(full)
+    assert parsed is not None
+    assert parsed.kind == ApiKeyKind.PERSONAL
+    assert parsed.prefix == prefix
+    assert len(parsed.secret) == KEY_SECRET_LENGTH
 
 
 @pytest.mark.parametrize(

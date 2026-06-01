@@ -1,9 +1,8 @@
 """Public SDK ``/v1/*`` namespace.
 
 This subpackage holds endpoints exposed to external SDK clients
-(Python / TypeScript / JavaScript SDKs introduced in Phase 1) that
-authenticate with an ``xag_<prefix>_<secret>`` API key rather than a
-JWT session.
+(Python / TypeScript / JavaScript) that authenticate with an
+``xag_<prefix>_<secret>`` API key rather than a JWT session.
 
 The split from ``/api/*`` is deliberate (see SDK design doc §3):
 
@@ -19,11 +18,15 @@ Re-exports ``v1_router`` for ``web/app.py`` to mount under ``/v1``.
 
 from fastapi import APIRouter
 
+from .agents import router as _agents_router
 from .me import router as _me_router
 from .tasks import router as _tasks_router
+from .templates import router as _templates_router
 
 v1_router = APIRouter(prefix="/v1", tags=["sdk-v1"])
 v1_router.include_router(_me_router)
+v1_router.include_router(_templates_router)
+v1_router.include_router(_agents_router)
 v1_router.include_router(_tasks_router)
 
 __all__ = ["v1_router"]

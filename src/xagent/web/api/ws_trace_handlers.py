@@ -12,6 +12,7 @@ from ...core.agent.trace import (
     TraceHandler,
     TraceScope,
 )
+from .public_trace_events import is_audit_only_trace_data, normalize_public_trace_event
 from .websocket import create_stream_event, manager
 
 
@@ -258,6 +259,15 @@ class WebSocketTraceHandler(TraceHandler):
 
             # Convert trace event to unified stream format
             stream_event = self._convert_trace_event_to_stream_event(event)
+            if stream_event:
+                stream_data = stream_event.get("data")
+                if isinstance(stream_data, dict) and await asyncio.to_thread(
+                    self._has_prior_user_message_turn,
+                    str(stream_event.get("event_type") or ""),
+                    stream_data,
+                    str(event.id),
+                ):
+                    stream_event = None
 
             # Send to all connected WebSocket clients for this task
             if stream_event:
@@ -333,7 +343,7 @@ class WebSocketTraceHandler(TraceHandler):
         """
         # Server-only audit traces: drop early so we don't waste effort
         # serializing payloads we're about to discard.
-        if isinstance(event.data, dict) and event.data.get("__audit_only__") is True:
+        if is_audit_only_trace_data(event.data):
             logger.debug(
                 f"Dropping audit-only trace event from WS broadcast: "
                 f"step_id={event.step_id} task={self.task_id}"
@@ -349,6 +359,9 @@ class WebSocketTraceHandler(TraceHandler):
         data = self._serialize_data(event.data)
         if is_agent_checkpoint_data(data):
             return None
+        if self._task_description:
+            data["task_description"] = self._task_description
+        event_type_str, data = normalize_public_trace_event(event_type_str, data)
 
         # Create the base stream event
         stream_event = create_stream_event(
@@ -363,11 +376,47 @@ class WebSocketTraceHandler(TraceHandler):
         if event.parent_id:
             stream_event["parent_id"] = event.parent_id
 
-        # Add task description if available
-        if self._task_description:
-            stream_event["data"]["task_description"] = self._task_description
-
         return stream_event
+
+    def _has_prior_user_message_turn(
+        self,
+        event_type: str,
+        data: Dict[str, Any],
+        event_id: str,
+    ) -> bool:
+        if event_type != "user_message" or not isinstance(data, dict):
+            return False
+        turn_id = data.get("turn_id")
+        if not isinstance(turn_id, str) or not turn_id:
+            return False
+
+        try:
+            from contextlib import closing
+
+            from ..models.database import get_db
+            from ..models.task import TraceEvent as DatabaseTraceEvent
+
+            with closing(get_db()) as db_gen:
+                db = next(db_gen)
+                return (
+                    db.query(DatabaseTraceEvent.id)
+                    .filter(
+                        DatabaseTraceEvent.task_id == self.task_id,
+                        DatabaseTraceEvent.event_type == "user_message",
+                        DatabaseTraceEvent.event_id != event_id,
+                        DatabaseTraceEvent.data["turn_id"].as_string() == turn_id,
+                    )
+                    .first()
+                    is not None
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "Could not check prior user_message turn_id=%s for task %s: %s",
+                turn_id,
+                self.task_id,
+                exc,
+            )
+            return False
 
     def _serialize_data(self, data: Dict[str, Any]) -> Dict[str, Any]:
         """Recursively serialize data to ensure JSON compatibility."""

@@ -5,13 +5,26 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-from typing import TYPE_CHECKING, Any, Callable, Optional, Tuple, Type, TypeVar, Union
+import threading
+from contextlib import contextmanager
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Optional,
+    Tuple,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 if TYPE_CHECKING:
     from langchain_core.language_models import BaseChatModel
     from langchain_core.runnables import Runnable
 
 from sqlalchemy import create_engine
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.exc import OperationalError as SAOperationalError
 from sqlalchemy.orm import declarative_base, sessionmaker
 
@@ -31,6 +44,7 @@ from xagent.core.model.rerank.adapter import create_rerank_adapter
 from xagent.core.model.rerank.base import BaseRerank
 from xagent.core.model.storage.db.adapter import SQLAlchemyModelHub
 from xagent.core.model.storage.db.db_models import create_model_table
+from xagent.core.model.storage.error import ModelNotFoundError
 from xagent.core.storage.manager import get_default_db_url
 
 from ..core.exceptions import EmbeddingAdapterError, RagCoreException
@@ -44,6 +58,31 @@ ExceptionType = TypeVar("ExceptionType", bound=RagCoreException)
 
 # Special placeholder values
 _PLACEHOLDER_NONE = {"none", ""}
+_MODEL_HUB_ENGINE: Any = None
+_MODEL_HUB_SESSION_LOCAL: Any = None
+_MODEL_HUB_MODEL: Any = None
+_MODEL_HUB_DB_URL: Optional[str] = None
+_MODEL_HUB_LOCK = threading.Lock()
+
+
+def _reset_model_hub_cache() -> None:
+    """Reset cached model hub DB resources.
+
+    This is primarily useful for tests that switch database URLs. Production
+    code normally keeps the engine/sessionmaker for the process lifetime.
+    """
+    global _MODEL_HUB_ENGINE
+    global _MODEL_HUB_SESSION_LOCAL
+    global _MODEL_HUB_MODEL
+    global _MODEL_HUB_DB_URL
+
+    with _MODEL_HUB_LOCK:
+        if _MODEL_HUB_ENGINE is not None:
+            _MODEL_HUB_ENGINE.dispose()
+        _MODEL_HUB_ENGINE = None
+        _MODEL_HUB_SESSION_LOCAL = None
+        _MODEL_HUB_MODEL = None
+        _MODEL_HUB_DB_URL = None
 
 
 def _hub_init_failure_is_benign_optional_sqlite(exc: BaseException) -> bool:
@@ -63,6 +102,24 @@ def _hub_init_failure_is_benign_optional_sqlite(exc: BaseException) -> bool:
     if "unable to open database file" not in msg:
         return False
     return isinstance(exc, (SAOperationalError, sqlite3.OperationalError))
+
+
+def _is_recoverable_model_hub_db_error(exc: BaseException) -> bool:
+    """Return True for DB connection failures where env fallback is appropriate."""
+    if isinstance(exc, sqlite3.OperationalError):
+        return True
+    if isinstance(exc, SAOperationalError):
+        return True
+    if isinstance(exc, DBAPIError):
+        return bool(getattr(exc, "connection_invalidated", False))
+    return False
+
+
+def _is_recoverable_model_hub_init_error(exc: BaseException) -> bool:
+    """Return True for model hub init failures that may use env fallback."""
+    return _hub_init_failure_is_benign_optional_sqlite(
+        exc
+    ) or _is_recoverable_model_hub_db_error(exc)
 
 
 def _is_placeholder_default(model_id: Optional[str]) -> bool:
@@ -100,30 +157,56 @@ def _get_or_init_model_hub() -> Any:
     Returns:
         Initialized model hub instance or None if database is not available
     """
+    global _MODEL_HUB_ENGINE
+    global _MODEL_HUB_SESSION_LOCAL
+    global _MODEL_HUB_MODEL
+    global _MODEL_HUB_DB_URL
+
     try:
-        # Create database engine
         database_url = get_default_db_url()
-        engine = create_engine(
-            database_url,
-            connect_args={"check_same_thread": False}
-            if "sqlite" in database_url
-            else {},
-        )
-        # Create session factory
-        SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-        # Create base model class
-        Base = declarative_base()
-        Model = create_model_table(Base)
-        db = SessionLocal()
-        Base.metadata.create_all(engine)
-        return SQLAlchemyModelHub(db, Model)
+        if _MODEL_HUB_ENGINE is None or _MODEL_HUB_DB_URL != database_url:
+            with _MODEL_HUB_LOCK:
+                if _MODEL_HUB_ENGINE is None or _MODEL_HUB_DB_URL != database_url:
+                    old_engine = _MODEL_HUB_ENGINE
+                    engine = create_engine(
+                        database_url,
+                        connect_args={"check_same_thread": False}
+                        if "sqlite" in database_url
+                        else {},
+                        pool_pre_ping="sqlite" not in database_url,
+                    )
+                    Base = declarative_base()
+                    Model = create_model_table(Base)
+                    try:
+                        Base.metadata.create_all(engine)
+                    except Exception:
+                        engine.dispose()
+                        raise
+                    session_local = sessionmaker(
+                        autocommit=False, autoflush=False, bind=engine
+                    )
+                    _MODEL_HUB_ENGINE = engine
+                    _MODEL_HUB_SESSION_LOCAL = session_local
+                    _MODEL_HUB_MODEL = Model
+                    _MODEL_HUB_DB_URL = database_url
+                    if old_engine is not None:
+                        old_engine.dispose()
+
+        session_local = _MODEL_HUB_SESSION_LOCAL
+        model = _MODEL_HUB_MODEL
+        if session_local is None or model is None:
+            raise RuntimeError("Model hub cache was not initialized")
+
+        db = session_local()
+        return SQLAlchemyModelHub(db, model)
     except Exception as e:
         if _hub_init_failure_is_benign_optional_sqlite(e):
             logger.debug(
                 "Model hub SQLite not available yet (optional component): %s",
                 e,
             )
-        else:
+            return None
+        if _is_recoverable_model_hub_db_error(e):
             logger.warning(
                 "Model hub database initialization failed; hub-backed model "
                 "resolution is disabled until this is fixed. "
@@ -132,7 +215,71 @@ def _get_or_init_model_hub() -> Any:
                 e,
                 exc_info=True,
             )
-        return None
+            return None
+
+        logger.exception(
+            "Model hub initialization failed due to a non-recoverable error; "
+            "not falling back to environment configuration: %s",
+            e,
+        )
+        raise
+
+
+def _close_model_hub(hub: Any) -> None:
+    close = getattr(hub, "close", None)
+    if callable(close):
+        close()
+        return
+
+    db = getattr(hub, "db", None)
+    db_close = getattr(db, "close", None)
+    if callable(db_close):
+        db_close()
+
+
+@contextmanager
+def _managed_model_hub(model_type_name: str) -> Any:
+    """Yield a model hub and always close its DB session after use."""
+    hub = None
+    unavailable_error: Optional[str] = None
+    try:
+        try:
+            hub = _get_or_init_model_hub()
+        except Exception as hub_error:
+            if not _is_recoverable_model_hub_init_error(hub_error):
+                raise
+            logger.warning(
+                "Model hub not available for %s: %s. Falling back to environment configuration.",
+                model_type_name,
+                hub_error,
+                exc_info=True,
+            )
+            unavailable_error = str(hub_error)
+
+        if hub is None and unavailable_error is None:
+            unavailable_error = "model hub database unavailable"
+        yield hub, unavailable_error
+    finally:
+        if hub is not None:
+            _close_model_hub(hub)
+
+
+def _list_model_hub_configs() -> dict[str, ModelConfig]:
+    """List hub configs through a short-lived managed DB session."""
+    with _managed_model_hub("model hub list") as (hub, _unavailable_error):
+        if hub is None:
+            return {}
+        try:
+            return cast(dict[str, ModelConfig], hub.list())
+        except Exception as exc:
+            if _is_recoverable_model_hub_db_error(exc):
+                logger.warning(
+                    "Model hub database unavailable while listing configs: %s",
+                    exc,
+                    exc_info=True,
+                )
+                return {}
+            raise
 
 
 def _load_model_from_hub(
@@ -153,27 +300,46 @@ def _load_model_from_hub(
     Raises:
         exception_cls: If model loading or type validation fails
     """
-    # Get or initialize hub
-    hub = _get_or_init_model_hub()
-    if hub is None:
-        raise exception_cls(
-            f"Failed to load {config_type.__name__}: model hub database not available",
-            details={"model_id": model_id, "error": "Database not available"},
-        )
+    with _managed_model_hub(config_type.__name__) as (hub, unavailable_error):
+        if hub is None:
+            raise exception_cls(
+                f"Failed to load {config_type.__name__}: model hub database unavailable",
+                details={
+                    "model_id": model_id,
+                    "error": unavailable_error or "Database unavailable",
+                },
+            )
 
-    # Load model configuration first
-    try:
-        cfg = hub.load(model_id)
-    except ValueError as exc:
-        # SQLAlchemyModelHub may raise ValueError (model not found or unknown category)
-        raise exception_cls(
-            f"Failed to load {config_type.__name__} from model hub",
-            details={
-                "model_id": model_id,
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-            },
-        ) from exc
+        # Load model configuration first
+        try:
+            cfg = hub.load(model_id)
+        except ModelNotFoundError as exc:
+            raise exception_cls(
+                f"Failed to load {config_type.__name__} from model hub",
+                details={
+                    "model_id": model_id,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            ) from exc
+        except Exception as exc:
+            if _is_recoverable_model_hub_db_error(exc):
+                raise exception_cls(
+                    f"Failed to load {config_type.__name__}: model hub database unavailable",
+                    details={
+                        "model_id": model_id,
+                        "error": str(exc),
+                        "error_type": type(exc).__name__,
+                    },
+                ) from exc
+            raise exception_cls(
+                f"Failed to load {config_type.__name__} from model hub",
+                details={
+                    "model_id": model_id,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            ) from exc
 
     # Validate configuration type
     if not isinstance(cfg, config_type):
@@ -351,161 +517,100 @@ def _resolve_adapter_generic(
     """
     adapter_kwargs = adapter_kwargs or {}
 
-    # Try to get hub, but fallback to env if hub is not available
-    hub = None
-    try:
-        hub = _get_or_init_model_hub()
-    except Exception as hub_error:
-        # Hub not available, will fallback to environment
-        logger.warning(
-            "Model hub not available for %s: %s. Falling back to environment configuration.",
-            model_type_name,
-            hub_error,
-        )
-        hub = None
+    hub_unavailable_error: Optional[str] = None
+    hub_missing_model = False
+    lookup_id = "default"
+    if not (_is_placeholder_default(model_id) or _is_placeholder_none(model_id)):
+        assert model_id is not None
+        lookup_id = model_id
 
-    # Strategy 1: "default" placeholder
-    # Priority: "default" ID in Hub -> Environment (no auto-selection)
-    if _is_placeholder_default(model_id):
+    with _managed_model_hub(model_type_name) as (hub, unavailable_error):
+        hub_unavailable_error = unavailable_error
         if hub is not None:
             try:
-                cfg = hub.load("default")
-                if isinstance(cfg, config_type):
-                    adapter = _create_adapter_safe(
-                        cfg, adapter_factory, exception_type, **adapter_kwargs
-                    )
-                    return cfg, adapter
-                else:
-                    # Found "default" but wrong type
-                    raise exception_type(
-                        f"Model 'default' exists but is not a {config_type.__name__}",
-                        details={
-                            "model_id": "default",
-                            "actual_type": type(cfg).__name__,
-                        },
-                    )
-            except ValueError:
-                # "default" model not found in hub, fallback to env
-                logger.warning(
-                    "Model 'default' not found in hub for %s, falling back to environment",
-                    model_type_name,
-                )
-
-        # Fallback to Environment
-        env_cfg = env_resolver(**env_kwargs)
-        if env_cfg:
-            adapter = _create_adapter_safe(
-                env_cfg,
-                adapter_factory,
-                exception_type,
-                " from environment configuration",
-                **adapter_kwargs,
-            )
-            return env_cfg, adapter
-
-        # All failed
-        raise exception_type(
-            f"No {model_type_name} model available: 'default' not found in hub and no environment configuration"
-        )
-
-    # Strategy 2: "none" or empty placeholder
-    # Priority: "default" ID in Hub -> Environment (same as "default", no auto-selection)
-    if _is_placeholder_none(model_id):
-        if hub is not None:
-            try:
-                cfg = hub.load("default")
-                if isinstance(cfg, config_type):
-                    adapter = _create_adapter_safe(
-                        cfg, adapter_factory, exception_type, **adapter_kwargs
-                    )
-                    return cfg, adapter
-                else:
-                    # Found "default" but wrong type
-                    raise exception_type(
-                        f"Model 'default' exists but is not a {config_type.__name__}",
-                        details={
-                            "model_id": "default",
-                            "actual_type": type(cfg).__name__,
-                        },
-                    )
-            except ValueError:
-                # "default" model not found in hub, fallback to env
-                logger.warning(
-                    "Model 'default' not found in hub for %s, falling back to environment",
-                    model_type_name,
-                )
-
-        # Fallback to Environment
-        env_cfg = env_resolver(**env_kwargs)
-        if env_cfg:
-            adapter = _create_adapter_safe(
-                env_cfg,
-                adapter_factory,
-                exception_type,
-                " from environment configuration",
-                **adapter_kwargs,
-            )
-            return env_cfg, adapter
-
-        # All failed
-        raise exception_type(
-            f"No {model_type_name} model available: 'default' not found in hub and no environment configuration"
-        )
-
-    # Strategy 3: Explicit ID Intent
-    # Priority: Explicit ID in Hub -> Environment (fallback)
-    # Note: We do NOT auto-select here. If user asks for "my-model", we don't give them "other-model".
-    else:
-        # 3.1 Try Explicit ID in Hub
-        if hub is not None:
-            try:
-                # We use _load_model_from_hub here mainly for its error wrapping/handling logic,
-                # but we can also just use hub.load directly since we have hub.
-                # Using try-except block to catch load errors.
-                cfg = hub.load(model_id)
-                if isinstance(cfg, config_type):
-                    adapter = _create_adapter_safe(
-                        cfg, adapter_factory, exception_type, **adapter_kwargs
-                    )
-                    return cfg, adapter
-                else:
-                    # Found model but wrong type
-                    raise exception_type(
-                        f"Model '{model_id}' exists but is not a {config_type.__name__}",
-                        details={
-                            "model_id": model_id,
-                            "actual_type": type(cfg).__name__,
-                        },
-                    )
-            except ValueError as hub_error:
-                # Explicit ID not found in Hub
+                cfg = hub.load(lookup_id)
+            except ModelNotFoundError as hub_error:
+                hub_missing_model = True
                 logger.warning(
                     "Model '%s' not found in hub for %s: %s. Falling back to environment configuration.",
-                    model_id,
+                    lookup_id,
                     model_type_name,
                     hub_error,
                 )
+            except Exception as hub_error:
+                if not _is_recoverable_model_hub_db_error(hub_error):
+                    raise exception_type(
+                        f"Failed to resolve {model_type_name} model from model hub",
+                        details={
+                            "model_id": lookup_id,
+                            "error": str(hub_error),
+                            "error_type": type(hub_error).__name__,
+                        },
+                    ) from hub_error
 
-        # 3.2 Fallback to Environment
-        # Logic: If the explicit ID isn't in the hub, maybe the env vars are set up
-        # to provide a model that the user *intends* to use, or maybe the code that called this
-        # passed a model_id that is actually meant to be used with env vars (though less likely in this design).
-        # We allow env fallback to be safe, but we don't auto-select a random model from Hub.
-        env_cfg = env_resolver(**env_kwargs)
-        if env_cfg:
-            adapter = _create_adapter_safe(
-                env_cfg,
-                adapter_factory,
-                exception_type,
-                " from environment configuration",
-                **adapter_kwargs,
-            )
-            return env_cfg, adapter
+                hub_unavailable_error = str(hub_error)
+                logger.warning(
+                    "Model hub database unavailable while resolving %s model '%s': %s. Falling back to environment configuration.",
+                    model_type_name,
+                    lookup_id,
+                    hub_error,
+                    exc_info=True,
+                )
+            else:
+                if isinstance(cfg, config_type):
+                    adapter = _create_adapter_safe(
+                        cfg, adapter_factory, exception_type, **adapter_kwargs
+                    )
+                    return cfg, adapter
 
-        # All failed
-        raise exception_type(
-            f"Model '{model_id}' not found in hub and no environment configuration available for {model_type_name}."
+                raise exception_type(
+                    f"Model '{lookup_id}' exists but is not a {config_type.__name__}",
+                    details={
+                        "model_id": lookup_id,
+                        "actual_type": type(cfg).__name__,
+                    },
+                )
+
+    env_cfg = env_resolver(**env_kwargs)
+    if env_cfg:
+        adapter = _create_adapter_safe(
+            env_cfg,
+            adapter_factory,
+            exception_type,
+            " from environment configuration",
+            **adapter_kwargs,
         )
+        return env_cfg, adapter
+
+    if hub_unavailable_error:
+        logger.warning(
+            "No environment configuration available for %s after model hub database was unavailable.",
+            model_type_name,
+        )
+        raise exception_type(
+            f"No {model_type_name} model available: model hub database unavailable and no environment configuration available",
+            details={"model_id": model_id, "hub_error": hub_unavailable_error},
+        )
+
+    if _is_placeholder_default(model_id) or _is_placeholder_none(model_id):
+        logger.warning(
+            "No environment configuration available for %s after default model was not found in hub.",
+            model_type_name,
+        )
+        raise exception_type(
+            f"No {model_type_name} model available: 'default' not found in hub and no environment configuration",
+            details={"model_id": model_id, "hub_missing_model": hub_missing_model},
+        )
+
+    logger.warning(
+        "No environment configuration available for %s after model '%s' was not found in hub.",
+        model_type_name,
+        model_id,
+    )
+    raise exception_type(
+        f"Model '{model_id}' not found in hub and no environment configuration available for {model_type_name}.",
+        details={"model_id": model_id, "hub_missing_model": hub_missing_model},
+    )
 
 
 def resolve_embedding_adapter(

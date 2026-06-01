@@ -2,44 +2,113 @@
 
 import tempfile
 from pathlib import Path
+from tempfile import gettempdir
 
 import pytest
 
 from xagent.config import (
+    AGENT_RUNTIME,
+    APP_BASE_URL,
+    BACKGROUND_JOB_MAX_RETRIES,
+    BACKGROUND_JOB_STALE_SECONDS,
+    BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS,
+    BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS,
     BOXLITE_HOME_DIR,
+    CELERY_BROKER_URL,
+    CELERY_ENABLED,
+    CELERY_RESULT_BACKEND,
     DATABASE_URL,
     EXTERNAL_SKILLS_LIBRARY_DIRS,
     EXTERNAL_UPLOAD_DIRS,
+    FILE_DELIVERY_ACCEL_REDIRECT_ENABLED,
+    FILE_DELIVERY_ACCEL_REDIRECT_PREFIX,
+    FILE_DELIVERY_REDIRECT_ENABLED,
+    FILE_DELIVERY_SIGNED_URL_TTL_SECONDS,
+    FILE_MATERIALIZE_DIR,
+    FILE_STORAGE_OPTIONS,
+    FILE_STORAGE_STARTUP_SYNC_ENABLED,
+    FILE_STORAGE_URI,
+    HOT_PATH_CACHE_ENABLED,
+    HOT_PATH_CACHE_TTL_SECONDS,
+    HOT_PATH_TASK_CACHE_TTL_SECONDS,
     LANCEDB_PATH,
     MAX_TRACE_PAYLOAD_BYTES,
     MAX_UPLOAD_SIZE,
+    PASSWORD_RESET_EXPIRE_MINUTES,
+    PREVIEW_TMP_DIR,
+    REDIS_URL,
     SANDBOX_CPUS,
     SANDBOX_ENV,
+    SANDBOX_HOST_PROJECT_ROOT,
+    SANDBOX_HOST_STORAGE_ROOT,
     SANDBOX_IMAGE,
     SANDBOX_MEMORY,
     SANDBOX_VOLUMES,
+    SMTP_FROM_EMAIL,
+    SMTP_FROM_NAME,
+    SMTP_HOST,
+    SMTP_PASSWORD,
+    SMTP_PORT,
+    SMTP_USE_SSL,
+    SMTP_USE_TLS,
+    SMTP_USERNAME,
     STORAGE_ROOT,
     UPLOADS_DIR,
+    WEB_CRAWL_TLS_IMPERSONATE,
     WEB_DIR,
     WEB_SEARCH_PROVIDER,
     format_file_size,
     get_agent_pattern_for_execution_mode,
+    get_agent_runtime,
+    get_app_base_url,
+    get_background_job_max_retries,
+    get_background_job_stale_seconds,
+    get_background_job_sweep_interval_seconds,
+    get_background_job_visibility_timeout_seconds,
     get_boxlite_home_dir,
+    get_celery_broker_url,
+    get_celery_enabled,
+    get_celery_result_backend,
     get_database_url,
     get_default_sqlite_db_path,
     get_default_task_execution_mode,
     get_external_skills_dirs,
     get_external_upload_dirs,
+    get_file_delivery_accel_redirect_enabled,
+    get_file_delivery_accel_redirect_prefix,
+    get_file_delivery_redirect_enabled,
+    get_file_delivery_signed_url_ttl_seconds,
+    get_file_materialize_dir,
+    get_file_storage_options,
+    get_file_storage_startup_sync_enabled,
+    get_file_storage_uri,
+    get_hot_path_cache_enabled,
+    get_hot_path_cache_ttl_seconds,
+    get_hot_path_task_cache_ttl_seconds,
     get_lancedb_path,
     get_max_trace_payload_bytes,
     get_max_upload_size_bytes,
+    get_password_reset_expire_minutes,
+    get_preview_tmp_dir,
+    get_redis_url,
     get_sandbox_cpus,
     get_sandbox_env,
+    get_sandbox_host_project_root,
+    get_sandbox_host_storage_root,
     get_sandbox_image,
     get_sandbox_memory,
     get_sandbox_volumes,
+    get_smtp_from_email,
+    get_smtp_from_name,
+    get_smtp_host,
+    get_smtp_password,
+    get_smtp_port,
+    get_smtp_use_ssl,
+    get_smtp_use_tls,
+    get_smtp_username,
     get_storage_root,
     get_uploads_dir,
+    get_web_crawl_tls_impersonate,
     get_web_dir,
     get_web_search_provider,
 )
@@ -60,11 +129,20 @@ class TestEnvironmentVariableConstants:
     def test_external_skills_dirs_constant(self):
         assert EXTERNAL_SKILLS_LIBRARY_DIRS == "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 
+    def test_agent_runtime_constant(self):
+        assert AGENT_RUNTIME == "XAGENT_AGENT_RUNTIME"
+
     def test_storage_root_constant(self):
         assert STORAGE_ROOT == "XAGENT_STORAGE_ROOT"
 
     def test_sandbox_image_constant(self):
         assert SANDBOX_IMAGE == "SANDBOX_IMAGE"
+
+    def test_sandbox_host_project_root_constant(self):
+        assert SANDBOX_HOST_PROJECT_ROOT == "XAGENT_SANDBOX_HOST_PROJECT_ROOT"
+
+    def test_sandbox_host_storage_root_constant(self):
+        assert SANDBOX_HOST_STORAGE_ROOT == "XAGENT_SANDBOX_HOST_STORAGE_ROOT"
 
     def test_lancedb_path_constant(self):
         assert LANCEDB_PATH == "LANCEDB_PATH"
@@ -77,6 +155,217 @@ class TestEnvironmentVariableConstants:
 
     def test_web_search_provider_constant(self):
         assert WEB_SEARCH_PROVIDER == "XAGENT_WEB_SEARCH_PROVIDER"
+
+    def test_web_crawl_tls_impersonate_constant(self):
+        assert WEB_CRAWL_TLS_IMPERSONATE == "XAGENT_WEB_CRAWL_TLS_IMPERSONATE"
+
+    def test_file_storage_uri_constant(self):
+        assert FILE_STORAGE_URI == "XAGENT_FILE_STORAGE_URI"
+
+    def test_file_storage_options_constant(self):
+        assert FILE_STORAGE_OPTIONS == "XAGENT_FILE_STORAGE_OPTIONS"
+
+    def test_file_materialize_dir_constant(self):
+        assert FILE_MATERIALIZE_DIR == "XAGENT_FILE_MATERIALIZE_DIR"
+
+    def test_preview_tmp_dir_constant(self):
+        assert PREVIEW_TMP_DIR == "XAGENT_PREVIEW_TMP_DIR"
+
+    def test_file_storage_startup_sync_enabled_constant(self):
+        assert (
+            FILE_STORAGE_STARTUP_SYNC_ENABLED
+            == "XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
+        )
+
+    def test_file_delivery_accel_redirect_constants(self):
+        assert (
+            FILE_DELIVERY_ACCEL_REDIRECT_ENABLED
+            == "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
+        )
+        assert (
+            FILE_DELIVERY_ACCEL_REDIRECT_PREFIX
+            == "XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
+        )
+
+    def test_redis_url_constant(self):
+        assert REDIS_URL == "XAGENT_REDIS_URL"
+
+    def test_hot_path_cache_constants(self):
+        assert HOT_PATH_CACHE_ENABLED == "XAGENT_HOT_PATH_CACHE_ENABLED"
+        assert HOT_PATH_CACHE_TTL_SECONDS == "XAGENT_HOT_PATH_CACHE_TTL_SECONDS"
+        assert (
+            HOT_PATH_TASK_CACHE_TTL_SECONDS == "XAGENT_HOT_PATH_TASK_CACHE_TTL_SECONDS"
+        )
+
+    def test_celery_background_job_constants(self):
+        assert CELERY_ENABLED == "XAGENT_CELERY_ENABLED"
+        assert CELERY_BROKER_URL == "XAGENT_CELERY_BROKER_URL"
+        assert CELERY_RESULT_BACKEND == "XAGENT_CELERY_RESULT_BACKEND"
+        assert (
+            BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS
+            == "XAGENT_BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS"
+        )
+        assert BACKGROUND_JOB_MAX_RETRIES == "XAGENT_BACKGROUND_JOB_MAX_RETRIES"
+        assert BACKGROUND_JOB_STALE_SECONDS == "XAGENT_BACKGROUND_JOB_STALE_SECONDS"
+        assert (
+            BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS
+            == "XAGENT_BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS"
+        )
+
+    def test_auth_email_config_constants(self):
+        assert PASSWORD_RESET_EXPIRE_MINUTES == "XAGENT_PASSWORD_RESET_EXPIRE_MINUTES"
+        assert APP_BASE_URL == "XAGENT_APP_BASE_URL"
+        assert SMTP_HOST == "XAGENT_SMTP_HOST"
+        assert SMTP_PORT == "XAGENT_SMTP_PORT"
+        assert SMTP_USERNAME == "XAGENT_SMTP_USERNAME"
+        assert SMTP_PASSWORD == "XAGENT_SMTP_PASSWORD"
+        assert SMTP_USE_TLS == "XAGENT_SMTP_USE_TLS"
+        assert SMTP_USE_SSL == "XAGENT_SMTP_USE_SSL"
+        assert SMTP_FROM_EMAIL == "XAGENT_SMTP_FROM_EMAIL"
+        assert SMTP_FROM_NAME == "XAGENT_SMTP_FROM_NAME"
+
+
+class TestAuthEmailConfig:
+    def test_password_reset_expire_minutes_defaults_to_30(self, monkeypatch):
+        monkeypatch.delenv(PASSWORD_RESET_EXPIRE_MINUTES, raising=False)
+        assert get_password_reset_expire_minutes() == 30
+
+    @pytest.mark.parametrize("value", ["abc", "0", "-5"])
+    def test_password_reset_expire_minutes_invalid_values_fall_back(
+        self, monkeypatch, value
+    ):
+        monkeypatch.setenv(PASSWORD_RESET_EXPIRE_MINUTES, value)
+        assert get_password_reset_expire_minutes() == 30
+
+    def test_app_base_url_returns_none_when_unset_or_blank(self, monkeypatch):
+        monkeypatch.delenv(APP_BASE_URL, raising=False)
+        assert get_app_base_url() is None
+
+        monkeypatch.setenv(APP_BASE_URL, "   ")
+        assert get_app_base_url() is None
+
+    def test_app_base_url_strips_and_removes_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(APP_BASE_URL, " https://app.example.com/base/ ")
+        assert get_app_base_url() == "https://app.example.com/base"
+
+    def test_smtp_host_and_credentials_strip_expected_values(self, monkeypatch):
+        monkeypatch.setenv(SMTP_HOST, " smtp.example.com ")
+        monkeypatch.setenv(SMTP_USERNAME, " user ")
+        monkeypatch.setenv(SMTP_PASSWORD, "secret ")
+        monkeypatch.setenv(SMTP_FROM_EMAIL, " noreply@example.com ")
+
+        assert get_smtp_host() == "smtp.example.com"
+        assert get_smtp_username() == "user"
+        assert get_smtp_password() == "secret "
+        assert get_smtp_from_email() == "noreply@example.com"
+
+    def test_smtp_port_defaults_and_invalid_values_fall_back(self, monkeypatch):
+        monkeypatch.delenv(SMTP_PORT, raising=False)
+        assert get_smtp_port() == 587
+
+        monkeypatch.setenv(SMTP_PORT, "abc")
+        assert get_smtp_port() == 587
+
+        monkeypatch.setenv(SMTP_PORT, "0")
+        assert get_smtp_port() == 587
+
+    @pytest.mark.parametrize(
+        "env_var,getter,default,true_value,false_value",
+        [
+            (SMTP_USE_TLS, get_smtp_use_tls, True, "true", "false"),
+            (SMTP_USE_SSL, get_smtp_use_ssl, False, "yes", "off"),
+        ],
+    )
+    def test_smtp_bool_settings(
+        self, monkeypatch, env_var, getter, default, true_value, false_value
+    ):
+        monkeypatch.delenv(env_var, raising=False)
+        assert getter() is default
+
+        monkeypatch.setenv(env_var, true_value)
+        assert getter() is True
+
+        monkeypatch.setenv(env_var, false_value)
+        assert getter() is False
+
+    def test_smtp_from_name_uses_default_and_trimmed_override(self, monkeypatch):
+        monkeypatch.delenv(SMTP_FROM_NAME, raising=False)
+        assert get_smtp_from_name("Xagent") == "Xagent"
+
+        monkeypatch.setenv(SMTP_FROM_NAME, " Support Team ")
+        assert get_smtp_from_name("Xagent") == "Support Team"
+
+
+class TestHotPathCacheConfig:
+    def test_redis_url_empty_is_none(self, monkeypatch):
+        monkeypatch.delenv(REDIS_URL, raising=False)
+        assert get_redis_url() is None
+        monkeypatch.setenv(REDIS_URL, "  ")
+        assert get_redis_url() is None
+
+    def test_redis_url_strips_value(self, monkeypatch):
+        monkeypatch.setenv(REDIS_URL, " redis://localhost:6379/0 ")
+        assert get_redis_url() == "redis://localhost:6379/0"
+
+    def test_hot_path_cache_enabled_defaults_true(self, monkeypatch):
+        monkeypatch.delenv(HOT_PATH_CACHE_ENABLED, raising=False)
+        assert get_hot_path_cache_enabled() is True
+
+    def test_hot_path_cache_enabled_false(self, monkeypatch):
+        monkeypatch.setenv(HOT_PATH_CACHE_ENABLED, "false")
+        assert get_hot_path_cache_enabled() is False
+
+    def test_hot_path_ttls(self, monkeypatch):
+        monkeypatch.delenv(HOT_PATH_CACHE_TTL_SECONDS, raising=False)
+        monkeypatch.delenv(HOT_PATH_TASK_CACHE_TTL_SECONDS, raising=False)
+        assert get_hot_path_cache_ttl_seconds() == 30
+        assert get_hot_path_task_cache_ttl_seconds() == 30
+
+        monkeypatch.setenv(HOT_PATH_CACHE_TTL_SECONDS, "45")
+        monkeypatch.setenv(HOT_PATH_TASK_CACHE_TTL_SECONDS, "3")
+        assert get_hot_path_cache_ttl_seconds() == 45
+        assert get_hot_path_task_cache_ttl_seconds() == 3
+
+
+class TestCeleryBackgroundJobConfig:
+    def test_celery_disabled_by_default(self, monkeypatch):
+        monkeypatch.delenv(CELERY_ENABLED, raising=False)
+        assert get_celery_enabled() is False
+
+    def test_celery_enabled_true_values(self, monkeypatch):
+        monkeypatch.setenv(CELERY_ENABLED, "yes")
+        assert get_celery_enabled() is True
+
+    def test_celery_broker_explicit(self, monkeypatch):
+        monkeypatch.setenv(CELERY_BROKER_URL, " redis://localhost:6379/7 ")
+        monkeypatch.setenv(REDIS_URL, "redis://localhost:6379/0")
+        assert get_celery_broker_url() == "redis://localhost:6379/7"
+
+    def test_celery_broker_derives_from_redis_url_db1(self, monkeypatch):
+        monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+        monkeypatch.setenv(REDIS_URL, "redis://localhost:6379/0")
+        assert get_celery_broker_url() == "redis://localhost:6379/1"
+
+    def test_celery_broker_none_without_redis(self, monkeypatch):
+        monkeypatch.delenv(CELERY_BROKER_URL, raising=False)
+        monkeypatch.delenv(REDIS_URL, raising=False)
+        assert get_celery_broker_url() is None
+
+    def test_celery_result_backend_optional(self, monkeypatch):
+        monkeypatch.delenv(CELERY_RESULT_BACKEND, raising=False)
+        assert get_celery_result_backend() is None
+        monkeypatch.setenv(CELERY_RESULT_BACKEND, " redis://localhost:6379/2 ")
+        assert get_celery_result_backend() == "redis://localhost:6379/2"
+
+    def test_background_job_tuning_defaults(self, monkeypatch):
+        monkeypatch.delenv(BACKGROUND_JOB_VISIBILITY_TIMEOUT_SECONDS, raising=False)
+        monkeypatch.delenv(BACKGROUND_JOB_MAX_RETRIES, raising=False)
+        monkeypatch.delenv(BACKGROUND_JOB_STALE_SECONDS, raising=False)
+        monkeypatch.delenv(BACKGROUND_JOB_SWEEP_INTERVAL_SECONDS, raising=False)
+        assert get_background_job_visibility_timeout_seconds() == 3600
+        assert get_background_job_max_retries() == 3
+        assert get_background_job_stale_seconds() == 7200
+        assert get_background_job_sweep_interval_seconds() == 300
 
 
 class TestGetWebSearchProvider:
@@ -93,6 +382,27 @@ class TestGetWebSearchProvider:
     def test_invalid_web_search_provider_falls_back_to_auto(self, monkeypatch):
         monkeypatch.setenv(WEB_SEARCH_PROVIDER, "bing")
         assert get_web_search_provider() == "auto"
+
+
+class TestGetWebCrawlTlsImpersonate:
+    """Test get_web_crawl_tls_impersonate() function."""
+
+    def test_default_web_crawl_tls_impersonate(self, monkeypatch):
+        monkeypatch.delenv(WEB_CRAWL_TLS_IMPERSONATE, raising=False)
+        assert get_web_crawl_tls_impersonate() is None
+
+    @pytest.mark.parametrize("value", ["", "   ", "none", "None", "NULL"])
+    def test_empty_like_web_crawl_tls_impersonate(self, monkeypatch, value):
+        monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, value)
+        assert get_web_crawl_tls_impersonate() is None
+
+    def test_auto_web_crawl_tls_impersonate(self, monkeypatch):
+        monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, " auto ")
+        assert get_web_crawl_tls_impersonate() == "auto"
+
+    def test_specific_web_crawl_tls_impersonate(self, monkeypatch):
+        monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, "safari17_0")
+        assert get_web_crawl_tls_impersonate() == "safari17_0"
 
 
 class TestGetMaxUploadSizeBytes:
@@ -140,6 +450,210 @@ class TestFormatFileSize:
         assert format_file_size(1048575) == "1MB"
 
 
+class TestFileStorageConfig:
+    def test_default_file_storage_uri_uses_storage_root(self, monkeypatch):
+        monkeypatch.delenv(FILE_STORAGE_URI, raising=False)
+        monkeypatch.setenv(STORAGE_ROOT, "/custom/storage")
+
+        assert get_file_storage_uri() == "file:///custom/storage/files"
+
+    def test_default_file_storage_uri_resolves_relative_storage_root(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.delenv(FILE_STORAGE_URI, raising=False)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv(STORAGE_ROOT, ".xagent")
+
+        assert get_file_storage_uri() == (tmp_path / ".xagent" / "files").as_uri()
+
+    def test_file_storage_uri_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(FILE_STORAGE_URI, "s3://bucket/prefix")
+
+        assert get_file_storage_uri() == "s3://bucket/prefix"
+
+    def test_file_storage_options_default_to_empty_dict(self, monkeypatch):
+        monkeypatch.delenv(FILE_STORAGE_OPTIONS, raising=False)
+
+        assert get_file_storage_options() == {}
+
+    def test_file_storage_options_parse_json_object(self, monkeypatch):
+        monkeypatch.setenv(
+            FILE_STORAGE_OPTIONS,
+            '{"endpoint_url":"https://s3.example.com","region_name":"us-east-1"}',
+        )
+
+        assert get_file_storage_options() == {
+            "endpoint_url": "https://s3.example.com",
+            "region_name": "us-east-1",
+        }
+
+    def test_file_storage_options_reject_non_object_json(self, monkeypatch):
+        monkeypatch.setenv(FILE_STORAGE_OPTIONS, '["not", "an", "object"]')
+
+        with pytest.raises(ValueError, match="XAGENT_FILE_STORAGE_OPTIONS"):
+            get_file_storage_options()
+
+    def test_file_materialize_dir_default(self, monkeypatch):
+        monkeypatch.delenv(FILE_MATERIALIZE_DIR, raising=False)
+
+        assert get_file_materialize_dir() == Path(gettempdir()) / "xagent-materialized"
+
+    def test_file_materialize_dir_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(FILE_MATERIALIZE_DIR, "/custom/materialized")
+
+        assert get_file_materialize_dir() == Path("/custom/materialized")
+
+    def test_preview_tmp_dir_default(self, monkeypatch):
+        monkeypatch.delenv(PREVIEW_TMP_DIR, raising=False)
+
+        assert get_preview_tmp_dir() == Path(gettempdir()) / "xagent-preview"
+
+    def test_preview_tmp_dir_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(PREVIEW_TMP_DIR, "/custom/preview-tmp")
+
+        assert get_preview_tmp_dir() == Path("/custom/preview-tmp")
+
+    def test_file_storage_startup_sync_enabled_defaults_true(self, monkeypatch):
+        monkeypatch.delenv(FILE_STORAGE_STARTUP_SYNC_ENABLED, raising=False)
+
+        assert get_file_storage_startup_sync_enabled() is True
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_file_storage_startup_sync_enabled_parses_bool(
+        self, monkeypatch, value, expected
+    ):
+        monkeypatch.setenv(FILE_STORAGE_STARTUP_SYNC_ENABLED, value)
+
+        assert get_file_storage_startup_sync_enabled() is expected
+
+    def test_file_storage_startup_sync_enabled_rejects_invalid(self, monkeypatch):
+        monkeypatch.setenv(FILE_STORAGE_STARTUP_SYNC_ENABLED, "maybe")
+
+        with pytest.raises(
+            ValueError, match="XAGENT_FILE_STORAGE_STARTUP_SYNC_ENABLED"
+        ):
+            get_file_storage_startup_sync_enabled()
+
+    def test_file_delivery_redirect_enabled_defaults_false(self, monkeypatch):
+        monkeypatch.delenv(FILE_DELIVERY_REDIRECT_ENABLED, raising=False)
+
+        assert get_file_delivery_redirect_enabled() is False
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_file_delivery_redirect_enabled_parses_bool(
+        self, monkeypatch, value, expected
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_REDIRECT_ENABLED, value)
+
+        assert get_file_delivery_redirect_enabled() is expected
+
+    def test_file_delivery_redirect_enabled_rejects_invalid(self, monkeypatch):
+        monkeypatch.setenv(FILE_DELIVERY_REDIRECT_ENABLED, "maybe")
+
+        with pytest.raises(ValueError, match="XAGENT_FILE_DELIVERY_REDIRECT_ENABLED"):
+            get_file_delivery_redirect_enabled()
+
+    def test_file_delivery_signed_url_ttl_defaults_to_300(self, monkeypatch):
+        monkeypatch.delenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, raising=False)
+
+        assert get_file_delivery_signed_url_ttl_seconds() == 300
+
+    def test_file_delivery_signed_url_ttl_with_env_var(self, monkeypatch):
+        monkeypatch.setenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, "60")
+
+        assert get_file_delivery_signed_url_ttl_seconds() == 60
+
+    @pytest.mark.parametrize("value", ["0", "-1", "abc"])
+    def test_file_delivery_signed_url_ttl_rejects_invalid(self, monkeypatch, value):
+        monkeypatch.setenv(FILE_DELIVERY_SIGNED_URL_TTL_SECONDS, value)
+
+        with pytest.raises(
+            ValueError, match="XAGENT_FILE_DELIVERY_SIGNED_URL_TTL_SECONDS"
+        ):
+            get_file_delivery_signed_url_ttl_seconds()
+
+    def test_file_delivery_accel_redirect_enabled_defaults_false(self, monkeypatch):
+        monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, raising=False)
+
+        assert get_file_delivery_accel_redirect_enabled() is False
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("true", True),
+            ("1", True),
+            ("yes", True),
+            ("on", True),
+            ("false", False),
+            ("0", False),
+            ("no", False),
+            ("off", False),
+        ],
+    )
+    def test_file_delivery_accel_redirect_enabled_parses_bool(
+        self, monkeypatch, value, expected
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, value)
+
+        assert get_file_delivery_accel_redirect_enabled() is expected
+
+    def test_file_delivery_accel_redirect_enabled_rejects_invalid(self, monkeypatch):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_ENABLED, "maybe")
+
+        with pytest.raises(
+            ValueError, match="XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_ENABLED"
+        ):
+            get_file_delivery_accel_redirect_enabled()
+
+    def test_file_delivery_accel_redirect_prefix_defaults_to_internal_uri(
+        self, monkeypatch
+    ):
+        monkeypatch.delenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX, raising=False)
+
+        assert get_file_delivery_accel_redirect_prefix() == "/_xagent_internal_files/"
+
+    def test_file_delivery_accel_redirect_prefix_normalizes_trailing_slash(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX, "/private-files")
+
+        assert get_file_delivery_accel_redirect_prefix() == "/private-files/"
+
+    def test_file_delivery_accel_redirect_prefix_requires_absolute_uri(
+        self, monkeypatch
+    ):
+        monkeypatch.setenv(FILE_DELIVERY_ACCEL_REDIRECT_PREFIX, "private-files")
+
+        with pytest.raises(
+            ValueError, match="XAGENT_FILE_DELIVERY_ACCEL_REDIRECT_PREFIX"
+        ):
+            get_file_delivery_accel_redirect_prefix()
+
+
 class TestGetUploadsDir:
     """Test get_uploads_dir() function."""
 
@@ -182,6 +696,26 @@ class TestGetWebDir:
         assert result == Path("/custom/web")
 
 
+class TestGetAgentRuntime:
+    """Test get_agent_runtime() function."""
+
+    def test_default_agent_runtime(self, monkeypatch):
+        monkeypatch.delenv(AGENT_RUNTIME, raising=False)
+        assert get_agent_runtime() == "v1"
+
+    def test_agent_runtime_v2(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v2")
+        assert get_agent_runtime() == "v2"
+
+    def test_agent_runtime_normalizes_case_and_spaces(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, " V2 ")
+        assert get_agent_runtime() == "v2"
+
+    def test_invalid_agent_runtime_falls_back_to_v1(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "unknown")
+        assert get_agent_runtime() == "v1"
+
+
 class TestGetAgentPatternForExecutionMode:
     """Test get_agent_pattern_for_execution_mode() function."""
 
@@ -202,11 +736,24 @@ class TestGetAgentPatternForExecutionMode:
 class TestGetDefaultTaskExecutionMode:
     """Test default task execution mode selection."""
 
-    def test_standalone_defaults_to_auto(self):
+    def test_default_standalone_defaults_to_auto(self, monkeypatch):
+        monkeypatch.delenv(AGENT_RUNTIME, raising=False)
         assert get_default_task_execution_mode() == "auto"
 
-    def test_agent_tasks_default_to_balanced(self):
+    def test_v1_standalone_defaults_to_think(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v1")
+        assert get_default_task_execution_mode() == "think"
+
+    def test_v2_standalone_defaults_to_auto(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v2")
+        assert get_default_task_execution_mode() == "auto"
+
+    def test_agent_tasks_default_to_balanced_in_v2(self, monkeypatch):
+        monkeypatch.setenv(AGENT_RUNTIME, "v2")
         assert get_default_task_execution_mode(agent_id=123) == "balanced"
+
+    def test_explicit_runtime_can_be_passed(self):
+        assert get_default_task_execution_mode(agent_runtime="v2") == "auto"
 
 
 class TestGetExternalUploadDirs:
@@ -488,6 +1035,70 @@ class TestGetSandboxVolumes:
         assert len(result) == 2
         assert result[0] == ("/host1", "/container1", "ro")
         assert result[1] == ("/host2", "/container2", "rw")
+
+    def test_host_side_sources_preserve_absolute_paths(self, monkeypatch):
+        """Docker sibling volume sources are already host paths."""
+        monkeypatch.setenv(SANDBOX_VOLUMES, "/host/data:/container:rw")
+        result = get_sandbox_volumes(host_side_sources=True)
+        assert result == [("/host/data", "/container", "rw")]
+
+    def test_host_side_sources_reject_relative_paths(self, monkeypatch):
+        """Docker sibling mode should not absolutize relative paths in backend."""
+        monkeypatch.setenv(SANDBOX_VOLUMES, "relative/path:/container:ro")
+        result = get_sandbox_volumes(host_side_sources=True)
+        assert result == []
+
+    def test_host_side_sources_reject_tilde_paths(self, monkeypatch):
+        """Docker sibling mode should not expand backend-container home paths."""
+        monkeypatch.setenv(SANDBOX_VOLUMES, "~/data:/container:ro")
+        result = get_sandbox_volumes(host_side_sources=True)
+        assert result == []
+
+
+class TestGetSandboxHostProjectRoot:
+    """Test get_sandbox_host_project_root() function."""
+
+    def test_no_env_var_returns_none(self, monkeypatch):
+        """Test that missing env var returns None."""
+        monkeypatch.delenv(SANDBOX_HOST_PROJECT_ROOT, raising=False)
+        result = get_sandbox_host_project_root()
+        assert result is None
+
+    def test_project_root_with_env_var(self, monkeypatch):
+        """Test project root with environment variable."""
+        monkeypatch.setenv(SANDBOX_HOST_PROJECT_ROOT, "/host/xagent")
+        result = get_sandbox_host_project_root()
+        assert result == Path("/host/xagent")
+
+    def test_project_root_expands_env_vars_without_user_or_abspath(self, monkeypatch):
+        """Host paths should not be resolved against the backend container."""
+        monkeypatch.setenv("HOST_PROJECT_ROOT", "/host/xagent")
+        monkeypatch.setenv(SANDBOX_HOST_PROJECT_ROOT, "$HOST_PROJECT_ROOT/../xagent")
+        result = get_sandbox_host_project_root()
+        assert result == Path("/host/xagent/../xagent")
+
+
+class TestGetSandboxHostStorageRoot:
+    """Test get_sandbox_host_storage_root() function."""
+
+    def test_no_env_var_returns_none(self, monkeypatch):
+        """Test that missing env var returns None."""
+        monkeypatch.delenv(SANDBOX_HOST_STORAGE_ROOT, raising=False)
+        result = get_sandbox_host_storage_root()
+        assert result is None
+
+    def test_storage_root_with_env_var(self, monkeypatch):
+        """Test storage root with environment variable."""
+        monkeypatch.setenv(SANDBOX_HOST_STORAGE_ROOT, "/host/.xagent")
+        result = get_sandbox_host_storage_root()
+        assert result == Path("/host/.xagent")
+
+    def test_storage_root_expands_env_vars_without_user_or_abspath(self, monkeypatch):
+        """Host paths should not be resolved against the backend container."""
+        monkeypatch.setenv("HOST_STORAGE_ROOT", "/host/.xagent")
+        monkeypatch.setenv(SANDBOX_HOST_STORAGE_ROOT, "$HOST_STORAGE_ROOT/../.xagent")
+        result = get_sandbox_host_storage_root()
+        assert result == Path("/host/.xagent/../.xagent")
 
 
 class TestGetBoxliteHomeDir:

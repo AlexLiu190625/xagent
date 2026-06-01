@@ -287,29 +287,27 @@ def _infer_embedding_config_from_collection(
         try:
             from xagent.core.model.model import EmbeddingModelConfig
 
-            from .model_resolver import _get_or_init_model_hub
+            from .model_resolver import _list_model_hub_configs
 
-            hub = _get_or_init_model_hub()
-            if hub is not None:
-                hub_tag_to_id: Dict[str, str] = {}
-                for cfg in hub.list().values():
-                    if not isinstance(cfg, EmbeddingModelConfig):
-                        continue
-                    register_tag_mapping(
-                        hub_tag_to_id,
-                        to_model_tag(cfg.id),
-                        cfg.id,
-                        get_identity=lambda item: item,
-                        logger=logger,
-                    )
-                    register_tag_mapping(
-                        hub_tag_to_id,
-                        to_model_tag(cfg.model_name),
-                        cfg.id,
-                        get_identity=lambda item: item,
-                        logger=logger,
-                    )
-                embedding_model_id = hub_tag_to_id.get(model_tag)
+            hub_tag_to_id: Dict[str, str] = {}
+            for cfg in _list_model_hub_configs().values():
+                if not isinstance(cfg, EmbeddingModelConfig):
+                    continue
+                register_tag_mapping(
+                    hub_tag_to_id,
+                    to_model_tag(cfg.id),
+                    cfg.id,
+                    get_identity=lambda item: item,
+                    logger=logger,
+                )
+                register_tag_mapping(
+                    hub_tag_to_id,
+                    to_model_tag(cfg.model_name),
+                    cfg.id,
+                    get_identity=lambda item: item,
+                    logger=logger,
+                )
+            embedding_model_id = hub_tag_to_id.get(model_tag)
         except Exception as e:
             logger.warning(
                 "Model hub initialization failed during embedding config inference: "

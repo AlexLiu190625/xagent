@@ -7,12 +7,25 @@ import json
 import logging
 import mimetypes
 import os
+import re
 import shutil
 import threading
 import time
+import unicodedata
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TypedDict, TypeVar, cast
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Optional,
+    TypedDict,
+    TypeVar,
+    cast,
+)
 
 from fastapi import (
     APIRouter,
@@ -27,7 +40,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse
 from googleapiclient.discovery import build  # type: ignore
 from googleapiclient.http import MediaIoBaseDownload  # type: ignore
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
@@ -52,6 +65,7 @@ from ...core.tools.core.RAG_tools.core.schemas import (
     WebIngestionResult,
 )
 from ...core.tools.core.RAG_tools.management.collection_manager import (
+    delete_collection_metadata_sync,
     get_collection_sync,
 )
 from ...core.tools.core.RAG_tools.management.collections import (
@@ -75,29 +89,54 @@ from ...core.tools.core.RAG_tools.pipelines.web_ingestion import (
 )
 from ...core.tools.core.RAG_tools.progress import get_progress_manager
 from ...core.tools.core.RAG_tools.storage.contracts import DocumentRecord
-from ...core.tools.core.RAG_tools.storage.factory import get_vector_index_store
+from ...core.tools.core.RAG_tools.storage.factory import (
+    get_ingestion_status_store,
+    get_metadata_store,
+    get_vector_index_store,
+)
 from ...core.tools.core.RAG_tools.utils.string_utils import (
     generate_deterministic_doc_id,
 )
 from ...core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from ..auth_dependencies import get_current_user
 from ..config import (
+    MAX_COLLECTION_NAME_LENGTH,
     MAX_FILE_SIZE,
     MAX_FILE_SIZE_LABEL,
     get_upload_path,
     is_allowed_file,
     sanitize_path_component,
 )
+from ..models.background_job import (
+    BackgroundJob,
+    BackgroundJobStatus,
+    BackgroundJobType,
+)
 from ..models.database import get_db, get_session_local
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..schemas.background_job import BackgroundJobResponse
+from ..services.background_jobs import (
+    QUEUE_DEFAULT,
+    create_background_job,
+    get_non_terminal_background_job_by_idempotency_key,
+    is_background_job_enqueue_available,
+    mark_job_failed,
+)
 from ..services.kb_collection_service import (
     delete_collection_physical_dir,
     delete_collection_uploaded_files,
+    list_collection_uploaded_file_owner_ids,
     rename_collection_storage,
 )
 from ..services.kb_file_service import (
     build_uploaded_filename_map as _build_uploaded_filename_map,
+)
+from ..services.kb_file_service import (
+    capture_uploaded_file_refresh_snapshot as _capture_uploaded_file_refresh_snapshot,
+)
+from ..services.kb_file_service import (
+    compensate_new_uploaded_file as _compensate_new_uploaded_file,
 )
 from ..services.kb_file_service import (
     delete_uploaded_file_if_orphaned as _delete_uploaded_file_if_orphaned,
@@ -112,8 +151,19 @@ from ..services.kb_file_service import (
     resolve_document_filename as _resolve_document_filename,
 )
 from ..services.kb_file_service import (
+    restore_uploaded_file_refresh_snapshot as _restore_uploaded_file_refresh_snapshot,
+)
+from ..services.kb_file_service import (
     upsert_uploaded_file_record as _upsert_uploaded_file_record,
 )
+from ..services.kb_ingest_targets import (
+    admit_kb_ingest_target,
+    release_kb_ingest_target_generation,
+    tombstone_kb_ingest_target,
+    tombstone_kb_ingest_targets_for_collection,
+)
+from ..services.managed_file_ref import DurableObjectMissingError, ManagedFileRef
+from ..services.uploaded_file_store import UploadedFileStore
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -128,6 +178,19 @@ _PDF_ONLY_PARSE_METHODS = {
 # lock_key -> (lock, active waiter/holder count)
 _WEB_FILE_LOCKS: Dict[str, tuple[threading.Lock, int]] = {}
 _WEB_FILE_LOCKS_GUARD = threading.Lock()
+_WEB_FILENAME_HASH_LENGTH = 16
+_WEB_FILENAME_SUFFIX = ".md"
+_MAX_FILESYSTEM_FILENAME_BYTES = 255
+_MAX_WEB_TITLE_FILENAME_BYTES = _MAX_FILESYSTEM_FILENAME_BYTES - len(
+    f"{'0' * _WEB_FILENAME_HASH_LENGTH}_{_WEB_FILENAME_SUFFIX}".encode("utf-8")
+)
+_BACKGROUND_INGEST_STAGING_DIR = ".background-ingest"
+
+
+@dataclass(frozen=True)
+class UploadCopyResult:
+    total_size: int
+    sha256: str
 
 
 def _like_contains_pattern(value: str) -> str:
@@ -153,6 +216,44 @@ def _normalize_parse_method_for_filename(
         )
         return ParseMethod.DEFAULT
     return normalized
+
+
+def _normalize_web_title_for_filename(title: str) -> str:
+    """Convert arbitrary web page titles into filesystem-safe filename parts."""
+    normalized = unicodedata.normalize("NFKC", title).strip()
+    if not normalized:
+        return "untitled"
+
+    # Replace separators and punctuation-heavy runs with underscores so
+    # ordinary article titles ("How to edit a completed job?") remain usable.
+    normalized = normalized.replace("/", " ").replace("\\", " ")
+    normalized = re.sub(r"[^\w.-]", "_", normalized)
+    normalized = re.sub(r"_+", "_", normalized).strip("._-")
+
+    if not normalized:
+        return "untitled"
+
+    trimmed = normalized[:MAX_COLLECTION_NAME_LENGTH]
+    while trimmed and len(trimmed.encode("utf-8")) > _MAX_WEB_TITLE_FILENAME_BYTES:
+        trimmed = trimmed[:-1]
+    trimmed = trimmed.rstrip("._-")
+    return trimmed or "untitled"
+
+
+def _truncate_utf8_bytes(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _build_ingest_backup_path(file_path: Path) -> Path:
+    suffix = f".rollback-{uuid.uuid4().hex}"
+    max_name_bytes = _MAX_FILESYSTEM_FILENAME_BYTES - len(suffix.encode("utf-8"))
+    truncated_name = _truncate_utf8_bytes(file_path.name, max_name_bytes).rstrip(" ._-")
+    if not truncated_name:
+        truncated_name = hashlib.sha256(file_path.name.encode("utf-8")).hexdigest()[:16]
+    return file_path.with_name(f"{truncated_name}{suffix}")
 
 
 def _validate_parser_for_file(
@@ -253,6 +354,69 @@ def _ensure_cleanup_succeeded(operation_name: str, result_obj: Any) -> None:
     raise RuntimeError(f"{operation_name} failed: {message}")
 
 
+def _extract_embedding_model_id_from_error(message: str) -> Optional[str]:
+    match = re.search(r"Model '([^']+)' not found in hub", message)
+    if match:
+        return match.group(1).strip() or None
+    return None
+
+
+def _is_embedding_configuration_error(message: str) -> bool:
+    normalized = message.lower()
+    return (
+        "no embedding model available" in normalized
+        or (
+            "not found in hub" in normalized
+            and "environment configuration available for embedding" in normalized
+        )
+        or ("no environment configuration" in normalized and "embedding" in normalized)
+    )
+
+
+def _build_user_actionable_ingestion_message(
+    message: str,
+    *,
+    embedding_model_id: Optional[str] = None,
+) -> str:
+    normalized = str(message).strip() or "Unknown ingestion failure"
+    if "How to fix:" in normalized:
+        return normalized
+    if not _is_embedding_configuration_error(normalized):
+        return normalized
+
+    resolved_model_id = embedding_model_id or _extract_embedding_model_id_from_error(
+        normalized
+    )
+    current_model_hint = (
+        f" Current embedding_model_id: '{resolved_model_id}'."
+        if resolved_model_id
+        else ""
+    )
+    return (
+        f"{normalized} Cause: knowledge-base ingestion requires a resolvable "
+        f"embedding model, but the current model configuration could not be loaded."
+        f"{current_model_hint} How to fix: configure a visible default embedding "
+        "model in the model settings, or pass a valid embedding_model_id in the "
+        "ingest request. If you rely on environment variables, set "
+        "DASHSCOPE_EMBEDDING_MODEL and DASHSCOPE_EMBEDDING_API_KEY "
+        "(or DASHSCOPE_API_KEY)."
+    )
+
+
+def _with_user_actionable_ingestion_message(
+    result: IngestionResult,
+    *,
+    embedding_model_id: Optional[str] = None,
+) -> IngestionResult:
+    updated_message = _build_user_actionable_ingestion_message(
+        result.message,
+        embedding_model_id=embedding_model_id,
+    )
+    if updated_message == result.message:
+        return result
+    return result.model_copy(update={"message": updated_message})
+
+
 async def _cleanup_failed_new_collection_metadata(
     *,
     collection_name: str,
@@ -287,8 +451,10 @@ async def _rollback_failed_ingestion(
     uploaded_file_existed_before: bool,
     file_backup_path: Optional[Path],
     had_existing_file: bool,
+    embedding_model_id: Optional[str] = None,
 ) -> None:
     user_id = int(user.id)
+    file_record_id = str(file_record.file_id)
     vector_store = get_vector_index_store()
     register_metadata = _get_completed_step_metadata(result, "register_document") or {}
     register_created = bool(register_metadata.get("created"))
@@ -352,13 +518,17 @@ async def _rollback_failed_ingestion(
                 collection_dir=physical_cleanup.collection_dir,
             )
             if not uploaded_file_existed_before:
+                # The collection cleanup above may already delete+commit the UploadedFile
+                # row, so reuse the stable file_id instead of touching a deleted ORM instance.
                 refreshed_file_record = (
                     db.query(UploadedFile)
-                    .filter(UploadedFile.file_id == file_record.file_id)
+                    .filter(UploadedFile.file_id == file_record_id)
                     .first()
                 )
                 if refreshed_file_record is not None:
-                    db.delete(refreshed_file_record)
+                    UploadedFileStore(db).delete(
+                        refreshed_file_record, delete_local=False
+                    )
             await _cleanup_failed_new_collection_metadata(
                 collection_name=collection_name,
                 user=user,
@@ -396,7 +566,7 @@ async def _rollback_failed_ingestion(
             }
             _delete_uploaded_file_if_orphaned(
                 db,
-                file_id=str(file_record.file_id),
+                file_id=file_record_id,
                 user_id=user_id,
                 remaining_file_ids=remaining_file_ids,
             )
@@ -410,7 +580,7 @@ async def _rollback_failed_ingestion(
                     is_admin=bool(user.is_admin),
                 )
             if not uploaded_file_existed_before:
-                db.delete(file_record)
+                UploadedFileStore(db).delete(file_record, delete_local=False)
                 db.commit()
 
         _restore_ingest_file_backup(
@@ -436,6 +606,12 @@ async def _rollback_failed_ingestion(
             exc,
         )
         message = f"Failed to fully roll back ingest for {collection_name}/{file_path.name}: {exc}"
+        original_error_message = _build_user_actionable_ingestion_message(
+            result.message,
+            embedding_model_id=embedding_model_id,
+        )
+        if original_error_message:
+            message = f"{message}. Original ingestion error: {original_error_message}"
         if restore_error is not None:
             message = f"{message}; backup restore also failed: {restore_error}"
         raise RollbackFailureError(message) from exc
@@ -453,8 +629,10 @@ async def _rollback_failed_cloud_ingestion(
     uploaded_file_existed_before: bool,
     file_backup_path: Optional[Path],
     had_existing_file: bool,
+    embedding_model_id: Optional[str] = None,
 ) -> None:
     user_id = int(user.id)
+    file_record_id = str(file_record.file_id) if file_record is not None else None
     vector_store = get_vector_index_store()
     register_metadata = _get_completed_step_metadata(result, "register_document") or {}
     register_created = bool(register_metadata.get("created"))
@@ -493,10 +671,10 @@ async def _rollback_failed_cloud_ingestion(
             if current_file_id
         }
 
-        if file_record is not None:
+        if file_record_id is not None:
             _delete_uploaded_file_if_orphaned(
                 db,
-                file_id=str(file_record.file_id),
+                file_id=file_record_id,
                 user_id=user_id,
                 remaining_file_ids=remaining_file_ids,
             )
@@ -553,6 +731,12 @@ async def _rollback_failed_cloud_ingestion(
             "Failed to fully roll back cloud ingest for "
             f"{collection_name}/{file_path.name}: {exc}"
         )
+        original_error_message = _build_user_actionable_ingestion_message(
+            result.message,
+            embedding_model_id=embedding_model_id,
+        )
+        if original_error_message:
+            message = f"{message}. Original ingestion error: {original_error_message}"
         if restore_error is not None:
             message = f"{message}; backup restore also failed: {restore_error}"
         raise RollbackFailureError(message) from exc
@@ -634,6 +818,133 @@ def _get_file_sha256(file_path: Path) -> str:
                 break
             hash_obj.update(chunk)
     return hash_obj.hexdigest()
+
+
+def _background_job_idempotency_key(namespace: str, payload: Dict[str, Any]) -> str:
+    """Build a bounded idempotency key from stable request payload fields."""
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    digest = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return f"{namespace}:{digest}"
+
+
+def _copy_upload_file_to_path(
+    file: UploadFile,
+    file_path: Path,
+    *,
+    max_size: int | None = None,
+) -> UploadCopyResult:
+    effective_max_size = MAX_FILE_SIZE if max_size is None else max_size
+    total_size = 0
+    hash_obj = hashlib.sha256()
+    file_read_buffer_size = 1024 * 1024
+    file.file.seek(0)
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(file_path, "wb") as buffer:
+        while True:
+            chunk = file.file.read(file_read_buffer_size)
+            if not chunk:
+                break
+            total_size += len(chunk)
+            if total_size > effective_max_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}",
+                )
+            hash_obj.update(chunk)
+            buffer.write(chunk)
+    return UploadCopyResult(total_size=total_size, sha256=hash_obj.hexdigest())
+
+
+def _build_background_ingest_staging_path(*, user_id: int, filename: str) -> Path:
+    user_root = get_upload_path(
+        _BACKGROUND_INGEST_STAGING_DIR,
+        user_id=user_id,
+        create_if_not_exists=True,
+    ).parent
+    staging_dir = user_root / _BACKGROUND_INGEST_STAGING_DIR / uuid.uuid4().hex
+    staging_dir.mkdir(parents=True, exist_ok=False)
+    return staging_dir / Path(filename).name
+
+
+def _background_ingest_file_id(*, user_id: int, storage_path: Path) -> str:
+    stable_key = f"xagent-kb-ingest:{user_id}:{storage_path}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, stable_key))
+
+
+def _cleanup_background_ingest_staging_file(staging_path: Path | str | None) -> None:
+    if not staging_path:
+        return
+    path = Path(str(staging_path))
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        logger.warning("Failed to remove background ingest staging file %s", path)
+        return
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+
+
+async def _ensure_background_job_queue_available_async() -> None:
+    if not await asyncio.to_thread(
+        is_background_job_enqueue_available,
+        check_worker=True,
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail="Background job queue is unavailable",
+        )
+
+
+async def _enqueue_background_job_or_503_async(
+    db: Session,
+    job: BackgroundJob,
+) -> BackgroundJob:
+    if not await asyncio.to_thread(
+        is_background_job_enqueue_available,
+        check_worker=True,
+    ):
+        mark_job_failed(
+            db,
+            job,
+            error_message="Background job queue is unavailable",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail="Background job queue is unavailable",
+        )
+
+    try:
+        from ..jobs.tasks import execute_background_job
+
+        setattr(job, "status", BackgroundJobStatus.ENQUEUED.value)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+
+        async_result = await asyncio.to_thread(
+            execute_background_job.apply_async,
+            args=[job.id],
+            queue=str(job.queue or QUEUE_DEFAULT),
+        )
+        db.refresh(job)
+        setattr(job, "celery_task_id", async_result.id)
+        db.add(job)
+        db.commit()
+        db.refresh(job)
+        return job
+    except Exception as exc:  # noqa: BLE001
+        mark_job_failed(
+            db,
+            job,
+            error_message=f"Background job queue is unavailable: {exc}",
+        )
+        raise HTTPException(
+            status_code=503,
+            detail=f"Background job queue is unavailable: {exc}",
+        ) from exc
 
 
 def _atomic_replace_file(source_path: Path, target_path: Path) -> None:
@@ -756,7 +1067,20 @@ def _refresh_existing_file_if_changed(
     """
     existing_path = Path(str(existing_record.storage_path))
     if not existing_path.exists():
-        return None
+        try:
+            existing_path = ManagedFileRef(existing_record).ensure_local()
+        except DurableObjectMissingError:
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to restore durable web-ingestion file before refresh: "
+                "url=%s, file_id=%s, context=%s, error=%s",
+                url,
+                existing_record.file_id,
+                context,
+                exc,
+            )
+            return None
 
     old_hash = _get_file_sha256(existing_path)
     new_hash = _get_file_sha256(temp_file_path)
@@ -784,15 +1108,49 @@ def _refresh_existing_file_if_changed(
         )
 
     # Mark succeeded - now atomically replace the file
-    _atomic_replace_file(temp_file_path, existing_path)
-    file_record = _upsert_uploaded_file_record(
-        db_session,
-        user_id=user_id,
-        filename=filename,
-        storage_path=existing_path,
-        mime_type="text/markdown",
-        file_size=existing_path.stat().st_size,
+    backup_path = _build_ingest_backup_path(existing_path)
+    shutil.copy2(existing_path, backup_path)
+    remove_backup = True
+    refresh_snapshot = _capture_uploaded_file_refresh_snapshot(
+        existing_record,
+        backup_path=backup_path,
+        reindex_marker_applied=True,
     )
+    try:
+        _atomic_replace_file(temp_file_path, existing_path)
+        file_record = _upsert_uploaded_file_record(
+            db_session,
+            user_id=user_id,
+            filename=filename,
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+    except Exception as exc:
+        try:
+            db_session.rollback()
+        except Exception as rollback_exc:  # noqa: BLE001
+            logger.warning(
+                "Failed to roll back database session before restoring refreshed "
+                "web file for url=%s, file_id=%s: %s",
+                url,
+                existing_record.file_id,
+                rollback_exc,
+            )
+        restore_result = _restore_uploaded_file_refresh_snapshot(
+            db_session,
+            refresh_snapshot,
+        )
+        if restore_result.side_effects_may_remain:
+            remove_backup = False
+            raise RollbackFailureError(
+                "Failed to fully restore refreshed web file "
+                f"for {url}: {'; '.join(restore_result.errors) or exc}"
+            ) from exc
+        raise
+    finally:
+        if remove_backup and backup_path.exists():
+            backup_path.unlink()
     processed_urls[url_hash] = str(file_record.file_id)
 
     logger.info(
@@ -806,6 +1164,82 @@ def _refresh_existing_file_if_changed(
         file_path=str(existing_record.storage_path),
         file_id=str(existing_record.file_id),
     )
+
+
+def _recreate_missing_existing_file(
+    *,
+    existing_record: Any,
+    temp_file_path: Path,
+    db_session: Session,
+    user_id: int,
+    filename: str,
+    url_hash: str,
+    processed_urls: Dict[str, str],
+) -> FileHandlerResult:
+    existing_path = Path(str(existing_record.storage_path))
+    backup_path: Optional[Path] = None
+    had_existing_file = existing_path.exists()
+    if had_existing_file:
+        backup_path = _build_ingest_backup_path(existing_path)
+        shutil.copy2(existing_path, backup_path)
+
+    try:
+        _atomic_replace_file(temp_file_path, existing_path)
+        file_record = _upsert_uploaded_file_record(
+            db_session,
+            user_id=user_id,
+            filename=filename,
+            storage_path=existing_path,
+            mime_type="text/markdown",
+            file_size=existing_path.stat().st_size,
+        )
+    except Exception:
+        db_session.rollback()
+        _restore_ingest_file_backup(
+            file_path=existing_path,
+            backup_path=backup_path,
+            had_existing_file=had_existing_file,
+        )
+        raise
+    finally:
+        if backup_path is not None and backup_path.exists():
+            backup_path.unlink()
+
+    processed_urls[url_hash] = str(file_record.file_id)
+    return FileHandlerResult(
+        file_path=str(existing_record.storage_path),
+        file_id=str(existing_record.file_id),
+    )
+
+
+def _compensate_new_web_ingest_files(
+    db: Session,
+    *,
+    file_ids: set[str],
+    user_id: int,
+) -> tuple[bool, list[str]]:
+    cleanup_incomplete = False
+    cleanup_errors: list[str] = []
+    for file_id in sorted(file_ids):
+        cleanup_result = _compensate_new_uploaded_file(
+            db,
+            file_id=file_id,
+            user_id=user_id,
+        )
+        if cleanup_result.side_effects_may_remain:
+            cleanup_incomplete = True
+            cleanup_errors.extend(cleanup_result.errors)
+            db.rollback()
+            continue
+        try:
+            db.commit()
+        except Exception as commit_exc:  # noqa: BLE001
+            cleanup_incomplete = True
+            cleanup_errors.append(
+                f"Database commit failed for file {file_id}: {commit_exc}"
+            )
+            db.rollback()
+    return cleanup_incomplete, cleanup_errors
 
 
 class _WebFileLock:
@@ -853,9 +1287,12 @@ def handle_kb_exceptions(func: T) -> T:
             return await func(*args, **kwargs)
         except HTTPException:
             raise
+        except RollbackFailureError as e:
+            logger.error("KB rollback failure in %s: %s", func.__name__, e)
+            raise HTTPException(status_code=500, detail=str(e))
         except (ValueError, KeyError, TypeError) as e:
             logger.error("Data format error in %s: %s", func.__name__, e)
-            raise HTTPException(status_code=400, detail=f"数据格式错误: {str(e)}")
+            raise HTTPException(status_code=400, detail=f"Data format error: {str(e)}")
         except (PermissionError, OSError) as e:
             logger.error("File system error in %s: %s", func.__name__, e)
             raise HTTPException(status_code=403, detail=f"File system error: {str(e)}")
@@ -1264,29 +1701,14 @@ async def ingest(
     had_existing_file = file_path.exists()
     file_backup_path: Optional[Path] = None
     if had_existing_file:
-        file_backup_path = file_path.with_name(
-            f"{file_path.name}.rollback-{uuid.uuid4().hex}"
-        )
-        shutil.copy2(file_path, file_backup_path)
+        file_backup_path = _build_ingest_backup_path(file_path)
+        await asyncio.to_thread(shutil.copy2, file_path, file_backup_path)
 
     try:
-        total_size = 0
-        # Must not shadow the Form parameter ``chunk_size`` (see issue #199).
-        file_read_buffer_size = 1024 * 1024  # 1MB streaming read buffer only
-        with open(file_path, "wb") as buffer:
-            while True:
-                chunk = await file.read(file_read_buffer_size)
-                if not chunk:
-                    break
-                total_size += len(chunk)
-                if total_size > MAX_FILE_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
-                        ),
-                    )
-                buffer.write(chunk)
+        copy_result = await asyncio.to_thread(
+            _copy_upload_file_to_path, file, file_path
+        )
+        total_size = copy_result.total_size
         logger.info(
             "File uploaded: %s -> %s (user: %s, collection: %s)",
             safe_filename,
@@ -1410,6 +1832,10 @@ async def ingest(
 
         loop = asyncio.get_running_loop()
         result: IngestionResult = await loop.run_in_executor(None, _run_ingestion)
+        result = _with_user_actionable_ingestion_message(
+            result,
+            embedding_model_id=embedding_model_id,
+        )
 
         if result.status in {"error", "partial"}:
             await _rollback_failed_ingestion(
@@ -1423,6 +1849,7 @@ async def ingest(
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
+                embedding_model_id=embedding_model_id,
             )
 
         if result.status == "error":
@@ -1473,6 +1900,7 @@ async def ingest(
                 uploaded_file_existed_before=uploaded_file_existed_before,
                 file_backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
+                embedding_model_id=embedding_model_id,
             )
         elif not collection_existed_before:
             _restore_ingest_file_backup(
@@ -1489,6 +1917,234 @@ async def ingest(
                 file_path=file_path,
                 backup_path=file_backup_path,
                 had_existing_file=had_existing_file,
+            )
+        raise
+
+
+@kb_router.post(
+    "/ingest/jobs",
+    response_model=BackgroundJobResponse,
+    status_code=202,
+)
+@with_kb_user_scope
+@handle_kb_exceptions
+async def create_ingest_job(
+    collection: str = Form(None),
+    file: UploadFile = File(...),
+    *,
+    parse_method: Optional[ParseMethod] = Form(None),
+    chunk_strategy: Optional[ChunkStrategy] = Form(None),
+    chunk_size: Optional[int] = Form(None, gt=0),
+    chunk_overlap: Optional[int] = Form(None, ge=0),
+    separators: Optional[str] = Form(None),
+    embedding_model_id: str = Form("text-embedding-v4"),
+    embedding_batch_size: Optional[int] = Form(None, gt=0),
+    max_retries: Optional[int] = Form(None, ge=0),
+    retry_delay: Optional[float] = Form(None, ge=0.0),
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Upload a document and enqueue durable KB ingestion."""
+    if not file.filename or not file.filename.strip():
+        raise HTTPException(status_code=422, detail="No filename provided")
+
+    safe_filename = Path(file.filename).name
+    if not is_allowed_file(safe_filename, "general"):
+        raise HTTPException(
+            status_code=422,
+            detail=f"File type {Path(safe_filename).suffix.lower()} not supported",
+        )
+    _validate_parser_for_file(
+        safe_filename, parse_method, user_id=getattr(_user, "id", None)
+    )
+
+    if not collection or not collection.strip():
+        collection = Path(safe_filename).stem
+
+    try:
+        safe_collection = sanitize_path_component(collection, "collection")
+        file_path = Path(
+            get_upload_path(
+                safe_filename,
+                user_id=int(_user.id),
+                collection=safe_collection,
+                collection_is_sanitized=True,
+            )
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
+    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+    await _ensure_background_job_queue_available_async()
+
+    try:
+        get_collection_sync(safe_collection)
+        collection_existed_before = True
+    except ValueError:
+        collection_existed_before = False
+
+    existing_file_record = (
+        db.query(UploadedFile)
+        .filter(UploadedFile.storage_path == str(file_path))
+        .first()
+    )
+    file_id = (
+        str(existing_file_record.file_id)
+        if existing_file_record is not None
+        else _background_ingest_file_id(user_id=int(_user.id), storage_path=file_path)
+    )
+    staged_file_path = _build_background_ingest_staging_path(
+        user_id=int(_user.id),
+        filename=safe_filename,
+    )
+
+    try:
+        copy_result = await asyncio.to_thread(
+            _copy_upload_file_to_path,
+            file,
+            staged_file_path,
+        )
+        total_size = copy_result.total_size
+        file_sha256 = copy_result.sha256
+    except HTTPException:
+        _cleanup_background_ingest_staging_file(staged_file_path)
+        raise
+    except Exception as upload_exc:
+        _cleanup_background_ingest_staging_file(staged_file_path)
+        raise upload_exc
+
+    mime_type = (
+        getattr(file, "content_type", None)
+        or mimetypes.guess_type(safe_filename)[0]
+        or "application/octet-stream"
+    )
+
+    final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
+    final_chunk_overlap = (
+        chunk_overlap if chunk_overlap is not None and chunk_overlap >= 0 else 200
+    )
+    if final_chunk_overlap >= final_chunk_size:
+        final_chunk_overlap = min(int(final_chunk_size * 0.2), final_chunk_size - 1)
+
+    parsed_separators = _parse_separators(separators)
+    final_strategy = (
+        chunk_strategy if chunk_strategy is not None else ChunkStrategy.RECURSIVE
+    )
+    normalized_parse_method = _normalize_parse_method_for_filename(
+        parse_method, safe_filename
+    )
+    config = IngestionConfig(
+        parse_method=normalized_parse_method,
+        chunk_strategy=final_strategy,
+        chunk_size=final_chunk_size,
+        chunk_overlap=final_chunk_overlap,
+        separators=parsed_separators,
+        embedding_model_id=embedding_model_id,
+        embedding_batch_size=embedding_batch_size
+        if embedding_batch_size is not None and embedding_batch_size > 0
+        else 10,
+        max_retries=max_retries if max_retries is not None and max_retries >= 0 else 3,
+        retry_delay=retry_delay
+        if retry_delay is not None and retry_delay >= 0
+        else 1.0,
+    )
+
+    idempotency_key = _background_job_idempotency_key(
+        "kb.ingest.document",
+        {
+            "collection": safe_collection,
+            "filename": safe_filename,
+            "file_sha256": file_sha256,
+            "ingestion_config": config.model_dump(mode="json"),
+            "user_id": int(_user.id),
+        },
+    )
+    existing_job = get_non_terminal_background_job_by_idempotency_key(
+        db,
+        idempotency_key,
+    )
+    if existing_job is not None:
+        _cleanup_background_ingest_staging_file(staged_file_path)
+        return existing_job
+
+    generation_id = str(uuid.uuid4())
+
+    saved_collection_config = False
+    try:
+        metadata_store = get_metadata_store()
+        await metadata_store.save_collection_config(
+            collection=safe_collection,
+            config_json=config.model_dump_json(exclude_unset=True),
+            user_id=int(_user.id),
+        )
+        saved_collection_config = True
+    except Exception as e:
+        logger.warning("Failed to save collection config during async ingest: %s", e)
+
+    job_payload = {
+        "collection": safe_collection,
+        "source_path": str(staged_file_path),
+        "target_path": str(file_path),
+        "file_id": file_id,
+        "generation_id": generation_id,
+        "file_sha256": file_sha256,
+        "filename": safe_filename,
+        "mime_type": mime_type,
+        "file_size": int(total_size),
+        "user_id": int(_user.id),
+        "is_admin": bool(_user.is_admin),
+        "ingestion_config": config.model_dump(mode="json"),
+        "collection_existed_before": collection_existed_before,
+    }
+
+    try:
+        job = create_background_job(
+            db,
+            user_id=int(_user.id),
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT,
+            payload=job_payload,
+            idempotency_key=idempotency_key,
+            reuse_terminal_idempotency_key=False,
+        )
+        if dict(job.payload or {}).get("source_path") != str(staged_file_path):
+            _cleanup_background_ingest_staging_file(staged_file_path)
+            return job
+        admit_kb_ingest_target(
+            db,
+            user_id=int(_user.id),
+            collection=safe_collection,
+            target_path=str(file_path),
+            file_id=file_id,
+            generation_id=generation_id,
+            job_id=str(job.id),
+            file_sha256=file_sha256,
+        )
+    except Exception:
+        db.rollback()
+        _cleanup_background_ingest_staging_file(staged_file_path)
+        if saved_collection_config and not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
+            )
+        raise
+    try:
+        return await _enqueue_background_job_or_503_async(db, job)
+    except Exception:
+        release_kb_ingest_target_generation(
+            db,
+            user_id=int(_user.id),
+            collection=safe_collection,
+            target_path=str(file_path),
+            generation_id=generation_id,
+        )
+        _cleanup_background_ingest_staging_file(staged_file_path)
+        if saved_collection_config and not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
             )
         raise
 
@@ -1605,10 +2261,10 @@ async def ingest_cloud(
                     # Save to local path
                     had_existing_file = file_path.exists()
                     if had_existing_file:
-                        file_backup_path = file_path.with_name(
-                            f"{file_path.name}.rollback-{uuid.uuid4().hex}"
+                        file_backup_path = _build_ingest_backup_path(file_path)
+                        await asyncio.to_thread(
+                            shutil.copy2, file_path, file_backup_path
                         )
-                        shutil.copy2(file_path, file_backup_path)
 
                     # Download file directly to disk
                     try:
@@ -1685,6 +2341,10 @@ async def ingest_cloud(
                             is_admin=bool(_user.is_admin),
                             file_id=str(file_record.file_id),
                         )
+                        result = _with_user_actionable_ingestion_message(
+                            result,
+                            embedding_model_id=request.embedding_model_id,
+                        )
                         if result.status in {"error", "partial"}:
                             await _rollback_failed_cloud_ingestion(
                                 db=db,
@@ -1697,6 +2357,7 @@ async def ingest_cloud(
                                 uploaded_file_existed_before=uploaded_file_existed_before,
                                 file_backup_path=file_backup_path,
                                 had_existing_file=had_existing_file,
+                                embedding_model_id=request.embedding_model_id,
                             )
                         elif file_backup_path is not None:
                             try:
@@ -1727,6 +2388,7 @@ async def ingest_cloud(
                             uploaded_file_existed_before=uploaded_file_existed_before,
                             file_backup_path=file_backup_path,
                             had_existing_file=had_existing_file,
+                            embedding_model_id=request.embedding_model_id,
                         )
                         return IngestionResult(
                             status="error",
@@ -2341,24 +3003,31 @@ async def ingest_web(
             else None
         )
 
-        crawl_config = WebCrawlConfig(
-            start_url=start_url,
-            max_pages=max_pages or 100,
-            max_depth=max_depth or 3,
-            url_patterns=url_patterns_list,
-            exclude_patterns=exclude_patterns_list,
-            same_domain_only=(
-                same_domain_only if same_domain_only is not None else True
-            ),
-            content_selector=content_selector,
-            remove_selectors=remove_selectors_list,
-            concurrent_requests=concurrent_requests or 3,
-            request_delay=request_delay or 1.0,
-            timeout=timeout or 30,
-            respect_robots_txt=(
-                respect_robots_txt if respect_robots_txt is not None else True
-            ),
-        )
+        try:
+            crawl_config = WebCrawlConfig(
+                start_url=start_url,
+                max_pages=max_pages or 100,
+                max_depth=max_depth or 3,
+                url_patterns=url_patterns_list,
+                exclude_patterns=exclude_patterns_list,
+                same_domain_only=(
+                    same_domain_only if same_domain_only is not None else True
+                ),
+                content_selector=content_selector,
+                remove_selectors=remove_selectors_list,
+                concurrent_requests=concurrent_requests or 3,
+                request_delay=request_delay or 1.0,
+                timeout=timeout or 30,
+                respect_robots_txt=(
+                    respect_robots_txt if respect_robots_txt is not None else True
+                ),
+            )
+        except ValidationError as exc:
+            errors = exc.errors()
+            detail = errors[0]["msg"] if errors else "Invalid start_url"
+            if isinstance(detail, str) and detail.startswith("Value error, "):
+                detail = detail.removeprefix("Value error, ")
+            raise HTTPException(status_code=422, detail=detail) from exc
 
         final_chunk_size = (
             chunk_size if chunk_size is not None and chunk_size > 0 else 1000
@@ -2435,6 +3104,7 @@ async def ingest_web(
         # Note: For large-scale web ingestion (>10000 pages), consider using
         # a bounded-size dict (e.g., with maxitems) to control memory usage.
         _processed_urls: Dict[str, str] = {}
+        _new_web_file_ids: set[str] = set()
 
         # Define file handler for persistent storage and UploadedFile record creation
         def _handle_web_file(
@@ -2468,9 +3138,7 @@ async def ingest_web(
             url_hash = hashlib.sha256(f"{collection_name}:{url}".encode()).hexdigest()[
                 :16
             ]
-            safe_title = (
-                sanitize_path_component(title, "filename") if title else "untitled"
-            )
+            safe_title = _normalize_web_title_for_filename(title)
             filename = f"{url_hash}_{safe_title}.md"
             lock_key = f"{int(_user.id)}:{url_hash}"
 
@@ -2542,27 +3210,21 @@ async def ingest_web(
                         return result
 
                     # result is None means file doesn't exist - recreate it
-                    existing_path = Path(str(existing_record.storage_path))
-                    existing_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(temp_file_path, existing_path)
-                    file_record = _upsert_uploaded_file_record(
-                        db_session,
+                    result = _recreate_missing_existing_file(
+                        existing_record=existing_record,
+                        temp_file_path=temp_file_path,
+                        db_session=db_session,
                         user_id=int(_user.id),
                         filename=filename,
-                        storage_path=existing_path,
-                        mime_type="text/markdown",
-                        file_size=existing_path.stat().st_size,
+                        url_hash=url_hash,
+                        processed_urls=_processed_urls,
                     )
-                    _processed_urls[url_hash] = str(file_record.file_id)
                     logger.info(
                         "Recreated missing persistent file for existing UploadedFile record: url=%s, file_id=%s",
                         url,
-                        file_record.file_id,
+                        existing_record.file_id,
                     )
-                    return FileHandlerResult(
-                        file_path=str(existing_record.storage_path),
-                        file_id=str(existing_record.file_id),
-                    )
+                    return result
 
                 persistent_file = get_upload_path(
                     filename,
@@ -2596,6 +3258,7 @@ async def ingest_web(
                     )
 
                     _processed_urls[url_hash] = str(file_record.file_id)
+                    _new_web_file_ids.add(str(file_record.file_id))
                     return FileHandlerResult(
                         file_path=str(persistent_file),
                         file_id=str(file_record.file_id),
@@ -2645,13 +3308,42 @@ async def ingest_web(
                 )
             ),
         )
+        web_updated_message = _build_user_actionable_ingestion_message(
+            result.message,
+            embedding_model_id=embedding_model_id,
+        )
+        if web_updated_message != result.message:
+            result = result.model_copy(update={"message": web_updated_message})
 
         if result.status == "error":
-            if not collection_existed_before:
-                await _cleanup_failed_new_collection_metadata(
-                    collection_name=safe_collection,
-                    user=_user,
+            cleanup_incomplete = False
+            cleanup_errors: list[str] = []
+            if result.documents_created == 0:
+                cleanup_incomplete, cleanup_errors = _compensate_new_web_ingest_files(
+                    db,
+                    file_ids=_new_web_file_ids,
+                    user_id=int(_user.id),
                 )
+
+            if cleanup_incomplete:
+                cleanup_message = "Web ingest rollback incomplete: " + "; ".join(
+                    cleanup_errors or ["side effects may remain"]
+                )
+                result = result.model_copy(
+                    update={"warnings": [*result.warnings, cleanup_message]}
+                )
+            if not collection_existed_before:
+                if cleanup_incomplete:
+                    logger.warning(
+                        "Skipping failed web-ingest collection metadata cleanup for %s "
+                        "because file rollback is incomplete",
+                        safe_collection,
+                    )
+                else:
+                    await _cleanup_failed_new_collection_metadata(
+                        collection_name=safe_collection,
+                        user=_user,
+                    )
             return JSONResponse(status_code=500, content=result.model_dump())
         if result.status == "partial":
             logger.warning(
@@ -2687,6 +3379,173 @@ async def ingest_web(
             status_code=500,
             detail=f"Server internal error: {str(e)}",
         ) from e
+
+
+@kb_router.post(
+    "/ingest-web/jobs",
+    response_model=BackgroundJobResponse,
+    status_code=202,
+)
+@with_kb_user_scope
+@handle_kb_exceptions
+async def create_ingest_web_job(
+    collection: str = Form(..., description="Target collection name"),
+    start_url: str = Form(..., description="Starting URL for crawling"),
+    max_pages: Optional[int] = Form(100),
+    max_depth: Optional[int] = Form(3),
+    url_patterns: Optional[str] = Form(None),
+    exclude_patterns: Optional[str] = Form(None),
+    same_domain_only: Optional[bool] = Form(True),
+    content_selector: Optional[str] = Form(None),
+    remove_selectors: Optional[str] = Form(None),
+    concurrent_requests: Optional[int] = Form(3, ge=1, le=10),
+    request_delay: Optional[float] = Form(1.0, ge=0),
+    timeout: Optional[int] = Form(30, ge=1),
+    respect_robots_txt: Optional[bool] = Form(True),
+    parse_method: Optional[ParseMethod] = Form(None),
+    chunk_strategy: Optional[ChunkStrategy] = Form(None),
+    chunk_size: Optional[int] = Form(None, gt=0),
+    chunk_overlap: Optional[int] = Form(None, ge=0),
+    separators: Optional[str] = Form(None),
+    embedding_model_id: str = Form("text-embedding-v4"),
+    embedding_batch_size: Optional[int] = Form(None, gt=0),
+    max_retries: Optional[int] = Form(None, ge=0),
+    retry_delay: Optional[float] = Form(None, ge=0.0),
+    _user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Any:
+    """Enqueue durable website ingestion into the knowledge base."""
+    try:
+        safe_collection = sanitize_path_component(collection, "collection")
+    except ValueError as e:
+        raise HTTPException(
+            status_code=422, detail=f"Invalid collection name: {str(e)}"
+        ) from e
+
+    await _ensure_collection_access(safe_collection, _user, allow_create=True)
+
+    url_patterns_list = (
+        [p.strip() for p in url_patterns.split(",")] if url_patterns else None
+    )
+    exclude_patterns_list = (
+        [p.strip() for p in exclude_patterns.split(",")] if exclude_patterns else None
+    )
+    remove_selectors_list = (
+        [s.strip() for s in remove_selectors.split(",")] if remove_selectors else None
+    )
+
+    try:
+        crawl_config = WebCrawlConfig(
+            start_url=start_url,
+            max_pages=max_pages or 100,
+            max_depth=max_depth or 3,
+            url_patterns=url_patterns_list,
+            exclude_patterns=exclude_patterns_list,
+            same_domain_only=same_domain_only if same_domain_only is not None else True,
+            content_selector=content_selector,
+            remove_selectors=remove_selectors_list,
+            concurrent_requests=concurrent_requests or 3,
+            request_delay=request_delay or 1.0,
+            timeout=timeout or 30,
+            respect_robots_txt=(
+                respect_robots_txt if respect_robots_txt is not None else True
+            ),
+        )
+    except ValidationError as exc:
+        errors = exc.errors()
+        detail = errors[0]["msg"] if errors else "Invalid start_url"
+        if isinstance(detail, str) and detail.startswith("Value error, "):
+            detail = detail.removeprefix("Value error, ")
+        raise HTTPException(status_code=422, detail=detail) from exc
+    await _ensure_background_job_queue_available_async()
+
+    try:
+        get_collection_sync(safe_collection)
+        collection_existed_before = True
+    except ValueError:
+        collection_existed_before = False
+
+    final_chunk_size = chunk_size if chunk_size is not None and chunk_size > 0 else 1000
+    final_chunk_overlap = (
+        chunk_overlap if chunk_overlap is not None and chunk_overlap >= 0 else 200
+    )
+    if final_chunk_overlap >= final_chunk_size:
+        final_chunk_overlap = min(int(final_chunk_size * 0.2), final_chunk_size - 1)
+
+    web_parsed_separators = _parse_separators(separators)
+    web_final_strategy = (
+        chunk_strategy if chunk_strategy is not None else ChunkStrategy.RECURSIVE
+    )
+    ingestion_config = IngestionConfig(
+        parse_method=parse_method if parse_method is not None else ParseMethod.DEFAULT,
+        chunk_strategy=web_final_strategy,
+        chunk_size=final_chunk_size,
+        chunk_overlap=final_chunk_overlap,
+        separators=web_parsed_separators,
+        embedding_model_id=embedding_model_id,
+        embedding_batch_size=embedding_batch_size
+        if embedding_batch_size is not None and embedding_batch_size > 0
+        else 10,
+        max_retries=max_retries if max_retries is not None and max_retries >= 0 else 3,
+        retry_delay=retry_delay
+        if retry_delay is not None and retry_delay >= 0
+        else 1.0,
+    )
+
+    idempotency_key = _background_job_idempotency_key(
+        "kb.ingest.web",
+        {
+            "collection": safe_collection,
+            "crawl_config": crawl_config.model_dump(mode="json"),
+            "ingestion_config": ingestion_config.model_dump(mode="json"),
+            "user_id": int(_user.id),
+        },
+    )
+    existing_job = get_non_terminal_background_job_by_idempotency_key(
+        db,
+        idempotency_key,
+    )
+    if existing_job is not None:
+        return existing_job
+
+    saved_collection_config = False
+    try:
+        metadata_store = get_metadata_store()
+        await metadata_store.save_collection_config(
+            collection=safe_collection,
+            config_json=ingestion_config.model_dump_json(exclude_unset=True),
+            user_id=int(_user.id),
+        )
+        saved_collection_config = True
+    except Exception as e:
+        logger.warning(
+            "Failed to save collection config during async web ingest: %s", e
+        )
+
+    try:
+        job = create_background_job(
+            db,
+            user_id=int(_user.id),
+            job_type=BackgroundJobType.KB_INGEST_WEB,
+            payload={
+                "collection": safe_collection,
+                "crawl_config": crawl_config.model_dump(mode="json"),
+                "ingestion_config": ingestion_config.model_dump(mode="json"),
+                "user_id": int(_user.id),
+                "is_admin": bool(_user.is_admin),
+                "collection_existed_before": collection_existed_before,
+            },
+            idempotency_key=idempotency_key,
+            reuse_terminal_idempotency_key=False,
+        )
+        return await _enqueue_background_job_or_503_async(db, job)
+    except Exception:
+        if saved_collection_config and not collection_existed_before:
+            await _cleanup_failed_new_collection_metadata(
+                collection_name=safe_collection,
+                user=_user,
+            )
+        raise
 
 
 class BatchDeleteCollectionsRequest(BaseModel):
@@ -2729,6 +3588,24 @@ class ResolvedDocumentMatch(TypedDict):
     source_path: Optional[str]
 
 
+_CONFIG_ONLY_SENTINEL_KEY = "__config_only__"
+_DeleteMode = Literal["full", "config_only"]
+_CollectionMutationMode = Literal["tenant", "global"]
+
+
+@dataclass
+class CollectionMutationScope:
+    """Resolved collection mutation boundary for tenant/global operations."""
+
+    mode: _CollectionMutationMode
+    collection_name: str
+    requester_user_id: int
+    is_admin: bool
+    owner_user_ids: set[int]
+    document_records: List[DocumentRecord]
+    file_ids_by_owner: Dict[int, set[str]]
+
+
 def _http_detail_to_str(detail: Any) -> str:
     """Normalize FastAPI/Starlette ``HTTPException.detail`` to a string."""
     if isinstance(detail, str):
@@ -2739,16 +3616,14 @@ def _http_detail_to_str(detail: Any) -> str:
         return str(detail)
 
 
-def _check_can_delete_collection(
+def _get_collection_document_counts(
     collection_name: str,
     user_id: int,
     is_admin: bool,
-) -> None:
-    """Validate collection name and non-admin delete permission."""
+) -> tuple[int, int]:
+    """Return total and caller-owned document counts for a collection."""
     if not collection_name or not collection_name.strip():
         raise HTTPException(status_code=422, detail="Collection name cannot be empty")
-    if is_admin:
-        return
     try:
         vector_store = get_vector_index_store()
         total_count = int(
@@ -2767,24 +3642,272 @@ def _check_can_delete_collection(
             detail="Failed to verify collection delete permission (documents table).",
         ) from exc
 
-    if total_count > 0 and own_count < total_count:
-        raise HTTPException(
-            status_code=403,
-            detail=(
-                "Only admin users can delete collections containing documents "
-                "from other users."
-            ),
+    return total_count, own_count
+
+
+def _resolve_delete_mode_from_counts(
+    total_count: int,
+    own_count: int,
+    is_admin: bool,
+) -> _DeleteMode:
+    """Decide full|config_only from precomputed total/own counts."""
+    if is_admin:
+        return "full"
+    if total_count > 0 and own_count == 0:
+        return "config_only"
+    return "full"
+
+
+def _get_collection_delete_mode(
+    collection_name: str,
+    user_id: int,
+    is_admin: bool,
+) -> _DeleteMode:
+    """Return full|config_only for collection delete."""
+    if not collection_name or not collection_name.strip():
+        raise HTTPException(status_code=422, detail="Collection name cannot be empty")
+    if is_admin:
+        return "full"
+
+    total_count, own_count = _get_collection_document_counts(
+        collection_name, user_id, is_admin=False
+    )
+    return _resolve_delete_mode_from_counts(total_count, own_count, is_admin=False)
+
+
+def _get_document_record_owner_id(
+    record: DocumentRecord,
+    *,
+    fallback_user_id: int,
+) -> int:
+    """Return the owner for storage cleanup, falling back for legacy projections."""
+    raw_user_id = getattr(record, "user_id", None)
+    if raw_user_id is None:
+        return fallback_user_id
+    try:
+        return int(raw_user_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid user_id on document record %s: %r; falling back to user_%s",
+            getattr(record, "doc_id", "<unknown>"),
+            raw_user_id,
+            fallback_user_id,
+        )
+        return fallback_user_id
+
+
+def _group_document_file_ids_by_owner(
+    records: List[DocumentRecord],
+    *,
+    fallback_user_id: int,
+) -> Dict[int, set[str]]:
+    """Group uploaded file ids by document owner for tenant storage cleanup."""
+    grouped: Dict[int, set[str]] = {}
+    for record in records:
+        owner_id = _get_document_record_owner_id(
+            record, fallback_user_id=fallback_user_id
+        )
+        grouped.setdefault(owner_id, set())
+        file_id = _get_document_record_file_id(record)
+        if file_id:
+            grouped[owner_id].add(file_id)
+    return grouped
+
+
+def _get_collection_storage_owner_ids(
+    records: List[DocumentRecord],
+    *,
+    fallback_user_id: int,
+) -> set[int]:
+    """Return owners whose physical KB storage may need collection-level cleanup."""
+    if not records:
+        return {fallback_user_id}
+    return {
+        _get_document_record_owner_id(record, fallback_user_id=fallback_user_id)
+        for record in records
+    }
+
+
+def _resolve_collection_mutation_scope(
+    *,
+    collection_name: str,
+    requester_user_id: int,
+    is_admin: bool,
+    db: Session,
+    vector_store: Any = None,
+) -> CollectionMutationScope:
+    """Resolve tenant/global mutation ownership once for delete and rename."""
+    if vector_store is None:
+        vector_store = get_vector_index_store()
+    document_records = vector_store.list_document_records(
+        collection_name=collection_name,
+        user_id=requester_user_id,
+        is_admin=is_admin,
+    )
+    file_ids_by_owner = _group_document_file_ids_by_owner(
+        document_records,
+        fallback_user_id=requester_user_id,
+    )
+
+    if not is_admin:
+        owner_user_ids = {requester_user_id}
+        file_ids_by_owner.setdefault(requester_user_id, set())
+        return CollectionMutationScope(
+            mode="tenant",
+            collection_name=collection_name,
+            requester_user_id=requester_user_id,
+            is_admin=False,
+            owner_user_ids=owner_user_ids,
+            document_records=document_records,
+            file_ids_by_owner=file_ids_by_owner,
         )
 
+    owner_user_ids = (
+        {
+            _get_document_record_owner_id(record, fallback_user_id=requester_user_id)
+            for record in document_records
+        }
+        if document_records
+        else set()
+    )
+    owner_user_ids.update(
+        get_metadata_store().list_collection_config_owner_ids(collection_name)
+    )
+    owner_user_ids.update(
+        list_collection_uploaded_file_owner_ids(db, collection_name=collection_name)
+    )
+    if not owner_user_ids:
+        owner_user_ids = {requester_user_id}
+    for owner_id in owner_user_ids:
+        file_ids_by_owner.setdefault(owner_id, set())
 
-def _preflight_batch_delete_permissions(
+    return CollectionMutationScope(
+        mode="global",
+        collection_name=collection_name,
+        requester_user_id=requester_user_id,
+        is_admin=True,
+        owner_user_ids=owner_user_ids,
+        document_records=document_records,
+        file_ids_by_owner=file_ids_by_owner,
+    )
+
+
+def _remove_user_collection_config(
+    collection_name: str,
+    user_id: int,
+    *,
+    delete_orphaned_metadata: bool = False,
+) -> dict[str, int]:
+    """Remove only the caller's collection config entry.
+
+    Returns the number of rows removed so the caller can distinguish a real
+    stale-list cleanup from a delete request for a collection the user never
+    had in their KB list.
+    """
+    try:
+        cleanup_counts = delete_collection_metadata_sync(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=False,
+            delete_orphaned_metadata=delete_orphaned_metadata,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to delete collection config for %s/user_%s",
+            collection_name,
+            user_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete collection configuration: {exc}",
+        ) from exc
+
+    return cleanup_counts
+
+
+def _cleanup_collection_config_if_no_owned_documents(
+    collection_name: str,
+    user_id: int,
+) -> dict[str, int]:
+    """Clear user's config once they no longer own documents in the collection."""
+    total_count, own_count = _get_collection_document_counts(
+        collection_name, user_id, is_admin=False
+    )
+    if own_count > 0:
+        return {}
+
+    try:
+        cleanup_counts = delete_collection_metadata_sync(
+            collection_name=collection_name,
+            user_id=user_id,
+            is_admin=False,
+            delete_orphaned_metadata=total_count == 0,
+        )
+    except Exception as exc:
+        logger.exception(
+            "Failed to delete collection config after document deletion for %s/user_%s",
+            collection_name,
+            user_id,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to delete collection configuration: {exc}",
+        ) from exc
+    if int(cleanup_counts.get("config_rows", 0)) <= 0:
+        return {}
+
+    logger.info(
+        "Removed collection config for %s/user_%s after last owned document deletion: %s",
+        collection_name,
+        user_id,
+        cleanup_counts,
+    )
+    return cleanup_counts
+
+
+def _is_config_only_delete_result(result: CollectionOperationResult) -> bool:
+    """Return True when collection delete only removed user visibility config."""
+    return bool((result.deleted_counts or {}).get(_CONFIG_ONLY_SENTINEL_KEY))
+
+
+def _strip_config_only_sentinel(
+    result: CollectionOperationResult,
+) -> CollectionOperationResult:
+    """Return ``result`` without the internal config-only sentinel key."""
+    deleted_counts = dict(result.deleted_counts or {})
+    if _CONFIG_ONLY_SENTINEL_KEY not in deleted_counts:
+        return result
+    deleted_counts.pop(_CONFIG_ONLY_SENTINEL_KEY, None)
+    return CollectionOperationResult(
+        status=result.status,
+        collection=result.collection,
+        message=result.message,
+        warnings=list(result.warnings or []),
+        affected_documents=list(result.affected_documents or []),
+        deleted_counts=deleted_counts,
+    )
+
+
+def _validate_and_prefetch_batch_delete_counts(
     unique_names: List[str],
     user_id: int,
     is_admin: bool,
-) -> tuple[List[str], List[BatchDeleteFailureItem]]:
-    """Preflight validation for batch delete permissions and empty names."""
+) -> tuple[
+    List[str],
+    List[BatchDeleteFailureItem],
+    Dict[str, tuple[int, int]],
+]:
+    """Validate batch delete names and prefetch count hints.
+
+    Returns ``(valid_names, failed_items, counts_by_name)``. For non-admin
+    callers ``counts_by_name`` maps the trimmed collection name to its
+    ``(total, own)`` document counts so callers can reuse them when invoking
+    ``_perform_kb_collection_delete`` (avoids redundant LanceDB scans).
+    Admin callers receive an empty dict because counts are not needed.
+    """
     failed: List[BatchDeleteFailureItem] = []
     allowed: List[str] = []
+    counts_by_name: Dict[str, tuple[int, int]] = {}
 
     if is_admin:
         for name in unique_names:
@@ -2797,7 +3920,7 @@ def _preflight_batch_delete_permissions(
                 )
             else:
                 allowed.append(name)
-        return allowed, failed
+        return allowed, failed, counts_by_name
 
     non_empty: List[str] = []
     for name in unique_names:
@@ -2812,7 +3935,7 @@ def _preflight_batch_delete_permissions(
             non_empty.append(name)
 
     if not non_empty:
-        return [], failed
+        return [], failed, counts_by_name
 
     vector_store = get_vector_index_store()
     try:
@@ -2824,30 +3947,57 @@ def _preflight_batch_delete_permissions(
         )
     except Exception as exc:
         logger.error(
-            "Batch permission scan failed (vector store grouped counts): %s",
+            "Batch delete count prefetch failed (vector store grouped counts): %s",
             exc,
             exc_info=True,
         )
         raise HTTPException(
             status_code=500,
-            detail="Failed to scan documents table for batch delete permission.",
+            detail="Failed to scan documents table for batch delete.",
         ) from exc
 
-    forbidden_detail = (
-        "Only admin users can delete collections containing documents from other users."
-    )
-    for name in unique_names:
-        if not name or not name.strip():
-            continue
+    for name in non_empty:
         key = str(name).strip()
         total = int(totals.get(key, 0))
         own = int(owns.get(key, 0))
-        if total > 0 and own < total:
-            failed.append(BatchDeleteFailureItem(name=name, error=forbidden_detail))
-        else:
-            allowed.append(name)
+        allowed.append(name)
+        counts_by_name[key] = (total, own)
 
-    return allowed, failed
+    return allowed, failed, counts_by_name
+
+
+def _build_config_only_delete_result(
+    safe_collection: str,
+    cleanup_counts: dict[str, int],
+) -> CollectionOperationResult:
+    """Construct a CollectionOperationResult for config-only delete paths."""
+    removed_rows = int(cleanup_counts.get("config_rows", 0))
+    if removed_rows > 0:
+        message = (
+            f"Removed collection '{safe_collection}' from your knowledge base list."
+        )
+    else:
+        message = f"Collection '{safe_collection}' is not in your knowledge base list."
+    return CollectionOperationResult(
+        status="success",
+        collection=safe_collection,
+        message=message,
+        deleted_counts={**cleanup_counts, _CONFIG_ONLY_SENTINEL_KEY: 1},
+    )
+
+
+def _perform_config_only_collection_delete(
+    safe_collection: str,
+    user_id: int,
+) -> CollectionOperationResult:
+    """Remove a stale user KB-list entry without touching collection documents."""
+    cleanup_counts = _remove_user_collection_config(safe_collection, user_id)
+    if int(cleanup_counts.get("config_rows", 0)) <= 0:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Collection '{safe_collection}' is not in your knowledge base list.",
+        )
+    return _build_config_only_delete_result(safe_collection, cleanup_counts)
 
 
 def _perform_kb_collection_delete(
@@ -2855,8 +4005,15 @@ def _perform_kb_collection_delete(
     user_id: int,
     is_admin: bool,
     db: Session,
+    *,
+    preflight_counts: Optional[tuple[int, int]] = None,
 ) -> CollectionOperationResult:
-    """Delete one KB collection (same pipeline as single-delete API)."""
+    """Delete one KB collection (same pipeline as single-delete API).
+
+    ``preflight_counts`` is an optional ``(total, own)`` pair already computed
+    by an upstream batch preflight. It is used only as a stale-preflight hint;
+    non-admin callers always get a live delete-mode recheck before mutation.
+    """
     try:
         try:
             safe_collection = sanitize_path_component(collection_name, "collection")
@@ -2865,87 +4022,128 @@ def _perform_kb_collection_delete(
                 status_code=422, detail=f"Invalid collection name: {str(e)}"
             ) from e
 
-        _check_can_delete_collection(safe_collection, user_id, is_admin)
-
-        collection_dir = get_upload_path(
-            "", user_id=user_id, collection=safe_collection
-        )
-
-        vector_store = get_vector_index_store()
-        collection_records = vector_store.list_document_records(
-            collection_name=safe_collection,
-            user_id=user_id,
-            is_admin=is_admin,
-        )
-        collection_file_ids = {
-            file_id
-            for file_id in (
-                _get_document_record_file_id(record) for record in collection_records
+        preflight_delete_mode: Optional[_DeleteMode] = None
+        if preflight_counts is not None:
+            total_count, own_count = preflight_counts
+            preflight_delete_mode = _resolve_delete_mode_from_counts(
+                int(total_count), int(own_count), is_admin
             )
-            if file_id
-        }
+        elif not is_admin:
+            preflight_delete_mode = _get_collection_delete_mode(
+                safe_collection, user_id, is_admin=False
+            )
 
-        # Re-check right before vector deletion to reduce TOCTTOU window.
-        _check_can_delete_collection(safe_collection, user_id, is_admin)
+        if is_admin:
+            delete_mode = "full"
+        else:
+            delete_mode = _get_collection_delete_mode(
+                safe_collection, user_id, is_admin=False
+            )
+            if (
+                preflight_delete_mode is not None
+                and preflight_delete_mode != delete_mode
+            ):
+                logger.info(
+                    "Collection delete mode changed after preflight for %s/user_%s: "
+                    "preflight=%s live=%s",
+                    safe_collection,
+                    user_id,
+                    preflight_delete_mode,
+                    delete_mode,
+                )
+
+        if delete_mode == "config_only":
+            return _perform_config_only_collection_delete(safe_collection, user_id)
+
+        mutation_scope = _resolve_collection_mutation_scope(
+            collection_name=safe_collection,
+            requester_user_id=user_id,
+            is_admin=is_admin,
+            db=db,
+        )
+        for owner_id in sorted(mutation_scope.owner_user_ids):
+            tombstone_kb_ingest_targets_for_collection(
+                db,
+                user_id=owner_id,
+                collection=safe_collection,
+            )
+
         result = delete_collection(safe_collection, user_id, is_admin)
 
-        physical_cleanup = delete_collection_physical_dir(
-            user_id=user_id,
-            collection_name=safe_collection,
-        )
-        physical_cleanup_status = physical_cleanup.status
-        physical_cleanup_error = physical_cleanup.error
-        if physical_cleanup.collection_dir is not None:
-            collection_dir = physical_cleanup.collection_dir
+        physical_cleanup_by_owner = {}
+        for owner_id in sorted(mutation_scope.owner_user_ids):
+            physical_cleanup_by_owner[owner_id] = delete_collection_physical_dir(
+                user_id=owner_id,
+                collection_name=safe_collection,
+            )
 
         if result.status == "error":
             cleanup_warnings = list(result.warnings) if result.warnings else []
-            if physical_cleanup_status == "success":
-                cleanup_warnings.append(
-                    f"Physical directory moved to trash: {collection_dir} "
-                    "(trash cleanup requires external scheduler/cron)"
+            for owner_id, physical_cleanup in physical_cleanup_by_owner.items():
+                collection_dir = physical_cleanup.collection_dir or get_upload_path(
+                    "", user_id=owner_id, collection=safe_collection
                 )
-            elif physical_cleanup_status == "not_found":
-                cleanup_warnings.append(
-                    "Physical directory cleanup: No physical directory found (collection had no files)"
-                )
+                physical_cleanup_status = physical_cleanup.status
+                if physical_cleanup_status == "success":
+                    cleanup_warnings.append(
+                        f"Physical directory moved to trash for user_{owner_id}: "
+                        f"{collection_dir} "
+                        "(trash cleanup requires external scheduler/cron)"
+                    )
+                elif physical_cleanup_status == "not_found":
+                    cleanup_warnings.append(
+                        f"Physical directory cleanup for user_{owner_id}: "
+                        "No physical directory found (collection had no files)"
+                    )
+                elif physical_cleanup.error:
+                    cleanup_warnings.append(
+                        f"Physical directory cleanup for user_{owner_id}: "
+                        f"{physical_cleanup.status} - {physical_cleanup.error}"
+                    )
 
             return CollectionOperationResult(
                 status="error",
-                collection=result.collection,
+                collection=safe_collection,
                 message=result.message,
                 warnings=cleanup_warnings,
                 affected_documents=result.affected_documents,
                 deleted_counts=result.deleted_counts,
             )
 
-        remaining_records = vector_store.list_document_records(
+        remaining_records = get_vector_index_store().list_document_records(
             collection_name=None,
             user_id=user_id,
             is_admin=is_admin,
         )
-        remaining_file_ids = {
-            file_id
-            for file_id in (
-                _get_document_record_file_id(record) for record in remaining_records
-            )
-            if file_id
-        }
+        remaining_file_ids_by_owner = _group_document_file_ids_by_owner(
+            remaining_records,
+            fallback_user_id=user_id,
+        )
         deleted_uploaded_files = 0
-        if physical_cleanup_status in {"success", "not_found"}:
-            deleted_uploaded_files = delete_collection_uploaded_files(
-                db,
-                user_id=user_id,
-                collection_file_ids=collection_file_ids,
-                remaining_file_ids=remaining_file_ids,
-                collection_dir=collection_dir,
+        for owner_id in sorted(mutation_scope.owner_user_ids):
+            physical_cleanup = physical_cleanup_by_owner[owner_id]
+            physical_cleanup_status = physical_cleanup.status
+            collection_dir = physical_cleanup.collection_dir or get_upload_path(
+                "", user_id=owner_id, collection=safe_collection
             )
-        else:
-            logger.warning(
-                "Preserving UploadedFile records for collection %s because physical cleanup status is %s",
-                safe_collection,
-                physical_cleanup_status,
-            )
+            if physical_cleanup_status in {"success", "not_found"}:
+                deleted_uploaded_files += delete_collection_uploaded_files(
+                    db,
+                    user_id=owner_id,
+                    collection_file_ids=mutation_scope.file_ids_by_owner.get(
+                        owner_id, set()
+                    ),
+                    remaining_file_ids=remaining_file_ids_by_owner.get(owner_id, set()),
+                    collection_dir=collection_dir,
+                )
+            else:
+                logger.warning(
+                    "Preserving UploadedFile records for collection %s/user_%s "
+                    "because physical cleanup status is %s",
+                    safe_collection,
+                    owner_id,
+                    physical_cleanup_status,
+                )
         if deleted_uploaded_files:
             logger.info(
                 "Deleted %s UploadedFile record(s) for collection %s",
@@ -2954,35 +4152,55 @@ def _perform_kb_collection_delete(
             )
 
         cleanup_warnings = list(result.warnings) if result.warnings else []
-        cleanup_info_message = ""
+        cleanup_info_messages: List[str] = []
+        has_physical_cleanup_issue = False
 
-        if physical_cleanup_status == "success":
-            cleanup_info = (
-                f"Physical directory moved to trash: {collection_dir} "
-                "(trash cleanup requires external scheduler/cron)"
+        for owner_id, physical_cleanup in physical_cleanup_by_owner.items():
+            physical_cleanup_status = physical_cleanup.status
+            physical_cleanup_error = physical_cleanup.error
+            collection_dir = physical_cleanup.collection_dir or get_upload_path(
+                "", user_id=owner_id, collection=safe_collection
             )
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}."
-        elif physical_cleanup_status == "not_found":
-            cleanup_info = "Physical directory cleanup: No physical directory found (collection had no files)"
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}."
-        elif physical_cleanup_status == "error" and physical_cleanup_error:
-            cleanup_info = f"Physical directory cleanup: Warning - {physical_cleanup_error}. Database deletion proceeded, but physical file cleanup status is uncertain."
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}"
-        elif physical_cleanup_status == "failed" and physical_cleanup_error:
-            cleanup_info = (
-                f"Physical directory cleanup: Failed - {physical_cleanup_error}"
-            )
-            cleanup_warnings.append(cleanup_info)
-            cleanup_info_message = f" {cleanup_info}"
+
+            if physical_cleanup_status == "success":
+                cleanup_info = (
+                    f"Physical directory moved to trash for user_{owner_id}: "
+                    f"{collection_dir} "
+                    "(trash cleanup requires external scheduler/cron)"
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+            elif physical_cleanup_status == "not_found":
+                cleanup_info = (
+                    f"Physical directory cleanup for user_{owner_id}: "
+                    "No physical directory found (collection had no files)"
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+            elif physical_cleanup_status == "error" and physical_cleanup_error:
+                has_physical_cleanup_issue = True
+                cleanup_info = (
+                    f"Physical directory cleanup for user_{owner_id}: Warning - "
+                    f"{physical_cleanup_error}. Database deletion proceeded, but "
+                    "physical file cleanup status is uncertain."
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+            elif physical_cleanup_status == "failed" and physical_cleanup_error:
+                has_physical_cleanup_issue = True
+                cleanup_info = (
+                    f"Physical directory cleanup for user_{owner_id}: Failed - "
+                    f"{physical_cleanup_error}"
+                )
+                cleanup_warnings.append(cleanup_info)
+                cleanup_info_messages.append(cleanup_info)
+
+        cleanup_info_message = ""
+        if cleanup_info_messages:
+            cleanup_info_message = f" {'; '.join(cleanup_info_messages)}."
 
         final_status = result.status
-        if result.status == "success" and physical_cleanup_status in (
-            "error",
-            "failed",
-        ):
+        if result.status == "success" and has_physical_cleanup_issue:
             final_status = "partial_success"
             if not cleanup_info_message:
                 cleanup_info_message = " Database deletion succeeded, but physical file cleanup encountered issues."
@@ -2993,7 +4211,7 @@ def _perform_kb_collection_delete(
 
         updated_result = CollectionOperationResult(
             status=final_status,
-            collection=result.collection,
+            collection=safe_collection,
             message=updated_message,
             warnings=cleanup_warnings,
             affected_documents=result.affected_documents,
@@ -3043,7 +4261,7 @@ async def delete_collection_api(
         bool(_user.is_admin),
         db,
     )
-    return result
+    return _strip_config_only_sentinel(result)
 
 
 @kb_router.post(
@@ -3079,14 +4297,21 @@ async def batch_delete_collections_api(
         seen.add(key)
         unique_names.append(raw_name)
 
-    allowed, failed = _preflight_batch_delete_permissions(
+    allowed, failed, counts_by_name = _validate_and_prefetch_batch_delete_counts(
         unique_names, user_id, is_admin
     )
 
     try:
         for name in allowed:
             try:
-                result = _perform_kb_collection_delete(name, user_id, is_admin, db)
+                preflight_counts = counts_by_name.get(str(name).strip())
+                result = _perform_kb_collection_delete(
+                    name,
+                    user_id,
+                    is_admin,
+                    db,
+                    preflight_counts=preflight_counts,
+                )
                 if result.status in ("success", "partial_success"):
                     deleted.append(name)
                 else:
@@ -3747,6 +4972,8 @@ async def delete_document_api(
     deleted_doc_ids = []
     deletion_errors = []
     cleanup_candidate_file_ids: set[str] = set()
+    config_cleanup_counts: dict[str, int] = {}
+    config_cleanup_error: Optional[str] = None
 
     for doc_info in matching_docs:
         resolved_doc_id = doc_info["doc_id"]
@@ -3813,12 +5040,46 @@ async def delete_document_api(
             )
         else:
             for cleanup_file_id in cleanup_candidate_file_ids:
+                if cleanup_file_id not in remaining_file_ids:
+                    cleanup_record = (
+                        db.query(UploadedFile)
+                        .filter(
+                            UploadedFile.user_id == user_id_int,
+                            UploadedFile.file_id == cleanup_file_id,
+                        )
+                        .first()
+                    )
+                    if cleanup_record is not None:
+                        tombstone_kb_ingest_target(
+                            db,
+                            user_id=user_id_int,
+                            collection=safe_collection_name,
+                            target_path=str(cleanup_record.storage_path),
+                            file_id=str(cleanup_record.file_id),
+                            commit=False,
+                        )
                 _delete_uploaded_file_if_orphaned(
                     db,
                     file_id=cleanup_file_id,
                     user_id=user_id_int,
                     remaining_file_ids=remaining_file_ids,
                 )
+
+    if deleted_doc_ids:
+        try:
+            config_cleanup_counts = _cleanup_collection_config_if_no_owned_documents(
+                safe_collection_name,
+                user_id_int,
+            )
+        except HTTPException as exc:
+            config_cleanup_error = _http_detail_to_str(exc.detail)
+            logger.warning(
+                "Failed to clean collection config after deleting document(s) "
+                "(collection=%s, user_id=%s): %s",
+                safe_collection_name,
+                user_id_int,
+                exc.detail,
+            )
 
     # Commit all orphan file cleanups in a single batch after the loop
     try:
@@ -3833,7 +5094,7 @@ async def delete_document_api(
         )
 
     if deletion_errors:
-        return {
+        partial_response: dict[str, Any] = {
             "status": "partial_success" if deleted_doc_ids else "failed",
             "message": f"Deleted {len(deleted_doc_ids)} of {len(matching_docs)} documents",
             "collection": safe_collection_name,
@@ -3841,14 +5102,24 @@ async def delete_document_api(
             "deleted_doc_ids": deleted_doc_ids,
             "errors": deletion_errors,
         }
+        if config_cleanup_counts:
+            partial_response["collection_config_cleanup"] = config_cleanup_counts
+        if config_cleanup_error:
+            partial_response["collection_config_cleanup_error"] = config_cleanup_error
+        return partial_response
 
-    return {
+    response: dict[str, Any] = {
         "status": "success",
         "message": f"Successfully deleted {len(deleted_doc_ids)} document(s)",
         "collection": safe_collection_name,
         "filename": filename,
         "deleted_doc_ids": deleted_doc_ids,
     }
+    if config_cleanup_counts:
+        response["collection_config_cleanup"] = config_cleanup_counts
+    if config_cleanup_error:
+        response["collection_config_cleanup_error"] = config_cleanup_error
+    return response
 
 
 @kb_router.put(
@@ -3870,16 +5141,6 @@ async def rename_collection_api(
     Returns:
         Success message
     """
-    from ...core.tools.core.RAG_tools.management.status import (
-        clear_ingestion_status,
-        load_ingestion_status,
-        write_ingestion_status,
-    )
-    from ...core.tools.core.RAG_tools.storage.factory import (
-        get_metadata_store,
-        get_vector_index_store,
-    )
-
     vector_store = get_vector_index_store()
 
     if not new_name or not new_name.strip():
@@ -3929,35 +5190,76 @@ async def rename_collection_api(
                 detail=f"Access denied for collection: {safe_new_collection}",
             )
 
-    physical_rename_status = "not_found"
-    physical_rename_error: Optional[str] = None
-    old_collection_dir: Optional[Path] = None
-    new_collection_dir: Optional[Path] = None
-    collection_records = vector_store.list_document_records(
+    mutation_scope = _resolve_collection_mutation_scope(
         collection_name=safe_old_collection,
-        user_id=int(_user.id),
+        requester_user_id=int(_user.id),
         is_admin=bool(_user.is_admin),
+        db=db,
+        vector_store=vector_store,
     )
-    collection_file_ids = {
-        file_id
-        for file_id in (
-            _get_document_record_file_id(record) for record in collection_records
-        )
-        if file_id
-    }
 
-    physical_rename = rename_collection_storage(
-        db,
-        user_id=int(_user.id),
-        old_collection_name=safe_old_collection,
-        new_collection_name=safe_new_collection,
-        collection_file_ids=collection_file_ids,
-    )
-    physical_rename_status = physical_rename.status
-    physical_rename_error = physical_rename.error
-    old_collection_dir = physical_rename.old_collection_dir
-    new_collection_dir = physical_rename.new_collection_dir
-    if physical_rename_status == "failed":
+    for owner_id in sorted(mutation_scope.owner_user_ids):
+        old_dir = get_upload_path(
+            "",
+            user_id=owner_id,
+            collection=safe_old_collection,
+            create_if_not_exists=False,
+            collection_is_sanitized=True,
+        )
+        new_dir = get_upload_path(
+            "",
+            user_id=owner_id,
+            collection=safe_new_collection,
+            create_if_not_exists=False,
+            collection_is_sanitized=True,
+        )
+        if old_dir.exists() and old_dir.is_dir() and new_dir.exists():
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Failed to rename collection: target physical directory already "
+                    f"exists for user_{owner_id}. A collection named "
+                    f"'{safe_new_collection}' already has physical files."
+                ),
+            )
+
+    physical_rename_results = {}
+    renamed_owner_ids: list[int] = []
+    for owner_id in sorted(mutation_scope.owner_user_ids):
+        physical_rename = rename_collection_storage(
+            db,
+            user_id=owner_id,
+            old_collection_name=safe_old_collection,
+            new_collection_name=safe_new_collection,
+            collection_file_ids=mutation_scope.file_ids_by_owner.get(owner_id, set()),
+        )
+        physical_rename_results[owner_id] = physical_rename
+        if physical_rename.status == "success":
+            renamed_owner_ids.append(owner_id)
+        if physical_rename.status != "failed":
+            continue
+
+        for rollback_owner_id in reversed(renamed_owner_ids):
+            rollback = rename_collection_storage(
+                db,
+                user_id=rollback_owner_id,
+                old_collection_name=safe_new_collection,
+                new_collection_name=safe_old_collection,
+                collection_file_ids=mutation_scope.file_ids_by_owner.get(
+                    rollback_owner_id, set()
+                ),
+            )
+            if rollback.status != "success":
+                logger.error(
+                    "Failed to roll back physical collection rename for user_%s "
+                    "%s -> %s: %s",
+                    rollback_owner_id,
+                    safe_new_collection,
+                    safe_old_collection,
+                    rollback.error,
+                )
+
+        physical_rename_error = physical_rename.error
         if (
             physical_rename_error
             == "Another operation is in progress; please try again later."
@@ -3974,11 +5276,12 @@ async def rename_collection_api(
 
     # Step 2: Update collection name in all tables (documents, parses, chunks, embeddings)
     # Use storage abstraction layer which handles all tables including embeddings
-    vector_store = get_vector_index_store()
     warnings.extend(
         vector_store.rename_collection_data(
             collection_name=safe_old_collection,
             new_name=safe_new_collection,
+            user_id=int(_user.id),
+            is_admin=bool(_user.is_admin),
         )
     )
 
@@ -3987,58 +5290,78 @@ async def rename_collection_api(
         await metadata_store.rename_collection(
             old_name=safe_old_collection,
             new_name=safe_new_collection,
+            user_id=int(_user.id),
+            is_admin=bool(_user.is_admin),
         )
     except Exception as e:
         logger.warning("Failed to rename metadata store keys: %s", e)
         warnings.append(f"Failed to rename collection metadata: {e}")
 
-    # Migrate ingestion status from old collection name to new
+    # Best-effort scoped ingestion status rename. The status store owns how
+    # collection/user filters map to its backend tables.
     try:
-        status_entries = load_ingestion_status(collection=safe_old_collection)
-        for entry in status_entries:
-            doc_id = entry.get("doc_id")
-            if doc_id:
-                write_ingestion_status(
-                    safe_new_collection,
-                    doc_id,
-                    status=entry.get("status", "pending"),
-                    message=entry.get("message", ""),
-                    parse_hash=entry.get("parse_hash", ""),
-                )
-                clear_ingestion_status(safe_old_collection, doc_id)
+        warnings.extend(
+            get_ingestion_status_store().rename_collection_status(
+                old_name=safe_old_collection,
+                new_name=safe_new_collection,
+                user_id=int(_user.id),
+                is_admin=bool(_user.is_admin),
+            )
+        )
     except Exception as e:
         logger.warning("Failed to update ingestion status: %s", e)
         warnings.append(f"Failed to update ingestion status: {e}")
 
     # Step 3: Add physical rename status to warnings and message for visibility
+    rename_info_messages: list[str] = []
+    has_physical_rename_issue = False
+    for owner_id, physical_rename in physical_rename_results.items():
+        physical_rename_status = physical_rename.status
+        physical_rename_error = physical_rename.error
+        if (
+            physical_rename_status == "success"
+            and physical_rename.old_collection_dir is not None
+            and physical_rename.new_collection_dir is not None
+        ):
+            rename_info = (
+                f"Physical directory renamed for user_{owner_id}: "
+                f"{physical_rename.old_collection_dir.name} -> "
+                f"{physical_rename.new_collection_dir.name}"
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+        elif physical_rename_status == "not_found":
+            rename_info = (
+                f"Physical directory rename for user_{owner_id}: "
+                "No physical directory found (collection had no files)"
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+        elif physical_rename_status == "error" and physical_rename_error:
+            has_physical_rename_issue = True
+            rename_info = (
+                f"Physical directory rename for user_{owner_id}: Warning - "
+                f"{physical_rename_error}. Database rename proceeded, but physical "
+                "directory rename status is uncertain."
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+        elif physical_rename_status == "failed" and physical_rename_error:
+            has_physical_rename_issue = True
+            rename_info = (
+                f"Physical directory rename for user_{owner_id}: Failed - "
+                f"{physical_rename_error}"
+            )
+            warnings.append(rename_info)
+            rename_info_messages.append(rename_info)
+
     rename_info_message = ""
-    if (
-        physical_rename_status == "success"
-        and old_collection_dir is not None
-        and new_collection_dir is not None
-    ):
-        rename_info = f"Physical directory renamed: {old_collection_dir.name} -> {new_collection_dir.name}"
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}."
-    elif physical_rename_status == "not_found":
-        rename_info = "Physical directory rename: No physical directory found (collection had no files)"
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}."
-    elif physical_rename_status == "error" and physical_rename_error:
-        rename_info = (
-            f"Physical directory rename: Warning - {physical_rename_error}. "
-            "Database rename proceeded, but physical directory rename status is uncertain."
-        )
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}"
-    elif physical_rename_status == "failed" and physical_rename_error:
-        rename_info = f"Physical directory rename: Failed - {physical_rename_error}"
-        warnings.append(rename_info)
-        rename_info_message = f" {rename_info}"
+    if rename_info_messages:
+        rename_info_message = f" {'; '.join(rename_info_messages)}."
 
     # Step 4: Determine final status
     final_status = "success" if not warnings else "partial_success"
-    if physical_rename_status in ("error", "failed"):
+    if has_physical_rename_issue:
         final_status = "partial_success"
         if not rename_info_message:
             rename_info_message = " Database rename succeeded, but physical directory rename encountered issues."
@@ -4047,7 +5370,7 @@ async def rename_collection_api(
     base_message = (
         f"Collection renamed from '{safe_old_collection}' to '{safe_new_collection}'"
     )
-    if warnings and len(warnings) > (1 if physical_rename_status != "not_found" else 0):
+    if warnings:
         final_message = f"{base_message} with some warnings"
     else:
         final_message = base_message

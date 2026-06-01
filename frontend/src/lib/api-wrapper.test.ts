@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 
-import { getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
+import { getApiErrorMessage, getUploadErrorMessage, parseApiResponse } from "@/lib/api-wrapper"
 
 const MESSAGES = {
   generic: "Upload failed",
@@ -108,5 +108,18 @@ describe("api-wrapper upload helpers", () => {
     }, MESSAGES)
 
     expect(message).toBe("Upload failed")
+  })
+})
+
+describe("api-wrapper API error helpers", () => {
+  it("prefers detail messages from parsed json", () => {
+    const response = new Response(null, { status: 503 })
+    const message = getApiErrorMessage(response, {
+      data: { detail: "Startup file storage sync failed" },
+      text: null,
+      isHtml: false,
+    }, "Request failed")
+
+    expect(message).toBe("Startup file storage sync failed")
   })
 })

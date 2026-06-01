@@ -1,6 +1,6 @@
 "use client"
 
-import { ReactNode } from "react"
+import React, { type ReactNode } from "react"
 import { Button } from "@/components/ui/button"
 import { XIcon } from "lucide-react"
 

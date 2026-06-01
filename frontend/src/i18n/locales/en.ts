@@ -38,6 +38,7 @@ const en = {
     },
   },
   nav: {
+    home: "Home",
     settings: "Settings",
     dashboard: "Dashboard",
     vibe: "Vibe",
@@ -58,6 +59,7 @@ const en = {
     deploy: "Deploy",
     agentDev: "Agent Development",
     task: "Task",
+    workforces: "Workforces",
     history: "All Tasks",
     search: "Search Tasks",
     templates: "Templates",
@@ -73,6 +75,55 @@ const en = {
       title: "Welcome to {appName}",
       subtitle: "Build, deploy, and scale intelligent agents that work for you — no code required.",
       searchPlaceholder: "What would you like to do?",
+    },
+    revamp: {
+      greeting: "Hello",
+      greetingMorning: "Good morning",
+      greetingAfternoon: "Good afternoon",
+      greetingEvening: "Good evening",
+      goalTitle: "What's the goal?",
+      start: "Start",
+      running: "{count} task running",
+      liveView: "View",
+      askPlaceholder: "Ask anything — research, write, generate, analyze...",
+      fileOnlyPrompt: "Analyze the attached files and summarize the key findings.",
+      capabilities: {
+        slides: {
+          label: "Slides",
+          prompt: "Create a 10-slide deck on ",
+        },
+        sheets: {
+          label: "Sheets",
+          prompt: "Analyze this spreadsheet: ",
+        },
+        docs: {
+          label: "Docs",
+          prompt: "Write a document about ",
+        },
+        pdf: {
+          label: "PDF",
+          prompt: "Summarize this PDF: ",
+        },
+        image: {
+          label: "Image",
+          prompt: "Generate an image of ",
+        },
+        research: {
+          label: "Research",
+          prompt: "Do deep research on ",
+        },
+      },
+      followupTitle: "Need it to run again and again?",
+      followupDescription: "Turn this workflow into a reusable agent you can call any time.",
+      buildAgent: "Build an agent",
+    },
+    agents: {
+      title: "Your agents",
+      subtitle: "Click to chat — these are your published, ready-to-run workers",
+      manageAll: "Manage all",
+      empty: "No agents yet. Create one to turn repeat work into a reusable workflow.",
+      newAgent: "New agent",
+      buildTime: "Build in minutes",
     },
     getStarted: {
       title: "Get started",
@@ -94,13 +145,17 @@ const en = {
       }
     },
     templates: {
-      title: "Build agents with templates",
+      title: "Templates",
       viewAll: "View all",
       setupTime: "{time} setup",
+      subtitle: "Skip the blank page — pre-built agents you can clone in 5 minutes",
+      browseLibrary: "Browse library",
       useTemplate: "Use Template"
     },
     recent: {
       title: "Recent",
+      subtitle: "Jump back into recent tasks and pick up where you left off.",
+      viewTask: "Open task",
       untitledTask: "Untitled Task",
       defaultAgent: "Agent"
     }
@@ -123,47 +178,21 @@ const en = {
     cards: {
       research: {
         title: "Research a topic in depth",
-        prompt: "I need to research the latest trends in artificial intelligence."
       },
       linkedin: {
         title: "Write a LinkedIn post about an achievement",
-        prompt: "Help me write a LinkedIn post announcing a new feature launch."
       },
       poster: {
         title: "Design a poster for an event",
-        prompt: "Design a poster for an upcoming tech conference."
       },
       compare: {
         title: "Compare products with deep research",
-        prompt: "Compare the top 3 electric vehicles on the market."
       },
       visual: {
         title: "Create visual for a topic",
-        prompt: "Create a visual representation of how a neural network works."
       },
       presentation: {
         title: "Turn a topic into a presentation deck",
-        prompt: "Create a 5-slide presentation on renewable energy."
-      },
-      createPPT: {
-        title: "Generate a PPT from a report",
-        description: "Sales reports, slides",
-        prompt: "Generate a PPT from a report"
-      },
-      dataAnalysis: {
-        title: "Analyze a dataset",
-        description: "Trends, feedback",
-        prompt: "Analyze a dataset"
-      },
-      designPoster: {
-        title: "Design a marketing poster",
-        description: "Social media assets",
-        prompt: "Design a marketing poster"
-      },
-      automatic: {
-        title: "Automate a workflow",
-        description: "Custom workflows",
-        prompt: "Automate a workflow"
       }
     },
     input: {
@@ -225,7 +254,8 @@ const en = {
   branding: {
     subtitle: "AI Agents for Everyone",
     tagline: `Run instantly.
-Build when you need.`
+Build when you need.`,
+    hero_description: "Plan, run and review your agents in one workspace, from instant tasks to fully built workflows.",
   },
   settings: {
     title: "System Settings",
@@ -233,6 +263,21 @@ Build when you need.`
     language: {
       title: "Language",
       description: "Choose the display language",
+    },
+    email: {
+      title: "Email Settings",
+      description: "View and update the email address linked to your account",
+      username: "Username",
+      current: "Email Address",
+      placeholder: "Enter email address",
+      submit: "Update Email",
+      submitting: "Updating...",
+      success: "Email updated successfully",
+      failed: "Email update failed",
+      errors: {
+        required: "Please enter an email address",
+        network: "Network error, please try again later",
+      },
     },
     versionControl: {
       title: "Autonomous Planning",
@@ -275,6 +320,11 @@ Build when you need.`
         visual: { title: "Vision Model", description: "Understands and processes images" },
         compact: { title: "Long Context Model", description: "Handles long contexts and compression" },
         embedding: { title: "Embedding Model", description: "Generates vector embeddings" },
+        image: { title: "Image Generation Model", description: "Used for image generation tasks" },
+        image_edit: { title: "Image Edit Model", description: "Used for image editing and refinement" },
+        asr: { title: "Speech Recognition Model", description: "Used for speech-to-text tasks" },
+        tts: { title: "Text-to-Speech Model", description: "Used for text-to-speech tasks" },
+        speech: { title: "Speech Model", description: "Supports both recognition and synthesis" },
       },
       actions: {
         clearDefault: "Clear Default",
@@ -311,6 +361,8 @@ Build when you need.`
     form: {
       username: "Username",
       username_placeholder: "Enter username",
+      email: "Email",
+      email_placeholder: "Enter email address",
       password: "Password",
       password_placeholder: "Enter password (at least 6 characters)",
       confirm_password: "Confirm Password",
@@ -324,6 +376,7 @@ Build when you need.`
       failed_retry: "Registration failed, please try again later",
       password_mismatch: "Passwords do not match",
       password_too_short: "Password must be at least 6 characters",
+      invalid_email: "Please enter a valid email address",
     },
     login_hint: {
       has_account: "Already have an account?",
@@ -437,32 +490,76 @@ Build when you need.`
     },
     form: {
       username: "Admin username",
+      email: "Admin email",
       password: "Admin password",
       confirmPassword: "Confirm password",
       submit: "Create administrator",
       submitting: "Creating...",
     },
     errors: {
-      required: "Please fill in username and password",
+      required: "Please fill in username, email, and password",
+      invalidEmail: "Please enter a valid email address",
       passwordTooShort: "Password must be at least 6 characters",
       passwordMismatch: "Passwords do not match",
       failed: "Setup failed",
     },
+  },
+  forgotPassword: {
+    mobile_title: "Recover Password",
+    mode_label: "Password Reset",
+    title: "Recover your {appName} password",
+    description: "Enter your email address and we will send you a reset link",
+    form: {
+      email: "Email",
+      email_placeholder: "Enter your email address",
+      submit: "Send reset link",
+      submitting: "Sending...",
+    },
+    alerts: {
+      success: "If the email exists, we have sent a reset link",
+      failed: "Failed to send reset link",
+      failed_retry: "Failed to send reset link, please try again later",
+      invalid_email: "Please enter a valid email address",
+    },
+    back_to_login: "Remember your password?",
+  },
+  resetPassword: {
+    mobile_title: "Reset Password",
+    mode_label: "New Password",
+    title: "Reset your {appName} password",
+    description: "Enter and confirm your new password",
+    form: {
+      password: "New Password",
+      password_placeholder: "Enter a new password (at least 6 characters)",
+      confirm_password: "Confirm New Password",
+      confirm_password_placeholder: "Re-enter your new password",
+      submit: "Update password",
+      submitting: "Updating...",
+    },
+    alerts: {
+      success: "Password reset successful, redirecting to login",
+      failed: "Password reset failed",
+      failed_retry: "Password reset failed, please try again later",
+      password_mismatch: "Passwords do not match",
+      password_too_short: "Password must be at least 6 characters",
+      invalid_token: "The reset link is invalid or missing a token",
+    },
+    back_to_login: "Back to login?",
   },
   login: {
     mobile_title: "Welcome back",
     title: "Login {appName}",
     description: "Please enter your account information to access the agent platform",
     form: {
-      username: "Username",
-      username_placeholder: "Enter username",
+      username: "Username or email",
+      username_placeholder: "Enter username or email",
       password: "Password",
       password_placeholder: "Enter password",
       submit: "Log In",
       submitting: "Logging in...",
     },
     alerts: {
-      auth_failed: "Incorrect username or password",
+      auth_failed: "Incorrect username/email or password",
       network_failed: "Login failed, please try again later",
     },
     options: {
@@ -1062,6 +1159,7 @@ Build when you need.`
     previewDialog: {
       buttons: {
         download: "Download",
+        open: "Open",
         openInNewWindow: "Open in New Window",
       },
       loading: "Loading file content...",
@@ -1074,6 +1172,7 @@ Build when you need.`
         loadFailed: "Failed to load file",
         docxRenderFailed: "Failed to render DOCX preview",
         excelRenderFailed: "Failed to render Excel preview",
+        pptxRenderFailed: "Failed to render PowerPoint preview",
         cors: "CORS error: Unable to access the file. This might be a browser cache issue, please try refreshing the page.",
         networkErrorWithMsg: "Network error: {msg}",
       },
@@ -1200,6 +1299,7 @@ Build when you need.`
     title: "Templates",
     subtitle: "Jumpstart your workflow with pre-built agents.",
     searchPlaceholder: "Search templates...",
+    popular: "Popular",
     useTemplate: "Use Template",
     countOne: "{count} template",
     countOther: "{count} templates",
@@ -1497,8 +1597,13 @@ Build when you need.`
       multiFileNameRequired: "Please enter one knowledge base name before uploading multiple files",
       uploadFailedFile: "Failed to upload file: {name}",
       uploadFailed: "Upload failed",
+      embeddingModelUnavailable: "Knowledge base import failed: no usable embedding model is configured",
+      embeddingModelUnavailableHint: "Configure a default embedding model in Model Settings, or choose a valid embedding model in Index Settings before retrying.",
+      rollbackFailed: "Knowledge base import failed and cleanup did not fully complete",
+      rollbackFailedHint: "The system attempted to roll back this import. Check Processing Results for the detailed error and verify file status.",
       startUrlRequired: "Start URL is required",
       webIngestFailed: "Website import failed",
+      cloudIngestFailed: "Cloud import failed",
       deleteFailed: "Failed to delete knowledge base: {name}",
       deleteFailedGeneric: "Failed to delete knowledge base",
       batchDeleteFailed: "Failed to batch delete knowledge bases",
@@ -1717,6 +1822,7 @@ Build when you need.`
           crawling: "Crawling website, this may take a few minutes...",
           success: "Crawl Successful",
           done: "Crawl Completed",
+          failed: "Crawl Failed",
         },
         result: {
           pages: "Crawled Pages",
@@ -2150,6 +2256,7 @@ Build when you need.`
     loadAgentDetailsFailed: "Unable to load agent details",
   },
   agent: {
+    logo: "Agent Logo",
     header: {
       backTitle: "Back to Vibe",
       badge: {
@@ -2795,6 +2902,9 @@ Build when you need.`
   traceEventRenderer: {
     skillSelected: "Selected Skill",
     taskExecution: "Thinking",
+    thoughtProcess: "Thought process",
+    showProcess: "Show process",
+    hideProcess: "Hide process",
     unknownModel: "Unknown Model",
     callLLM: "Call LLM: {model}",
     llmResponse: "LLM Response",
@@ -2826,13 +2936,20 @@ Build when you need.`
     command: "Command",
     searchQuery: "Search Query",
     content: "Content",
+    toolCallNote: "Tool note",
+    progressMessage: "Progress",
     copy: "Copy",
     previewFile: "Preview File",
     filePrefix: "File:",
     queryPrefix: "Query:",
     pathPrefix: "Path:",
     bashPrefix: "Bash:",
-    searchPrefix: "Search:"
+    searchPrefix: "Search:",
+    workforceDelegation: "Workforce Delegation",
+    delegateToWorker: "Delegate to {worker}",
+    workerReturned: "Worker returned result",
+    workerFailed: "Worker failed",
+    unknownWorker: "Unknown Worker"
   },
   deploy_agent: {
     title: "Deploy Agent",
@@ -2884,6 +3001,239 @@ Build when you need.`
       update_success: "Widget configuration updated",
       update_failed: "Failed to update widget configuration",
       copied: "Copied to clipboard"
+    }
+  },
+  workforces: {
+    common: {
+      noDescription: "No description",
+      notAvailable: "N/A",
+      notSelected: "Not selected"
+    },
+    status: {
+      draft: "Draft",
+      active: "Active",
+      archived: "Archived",
+      published: "Published",
+      enabled: "Enabled",
+      disabled: "Disabled"
+    },
+    sourceTypes: {
+      existing: "Existing Agent"
+    },
+    actions: {
+      new: "New Workforce",
+      create: "Create Workforce",
+      run: "Run",
+      runWorkforce: "Run Workforce",
+      details: "Details",
+      builder: "Builder",
+      canvas: "Canvas",
+      saveWorkforce: "Save Workforce",
+      addWorker: "Add Worker",
+      openAgent: "Open Agent",
+      openAgentEditor: "Open Agent Editor",
+      editAgent: "Edit Agent",
+      remove: "Remove",
+      saveWorker: "Save Worker",
+      up: "Move up",
+      down: "Move down",
+      proposeChanges: "Propose Changes",
+      applyChanges: "Apply Changes",
+      alreadyApplied: "Already Applied",
+      readOnly: "Read only",
+      publish: "Publish",
+      unpublish: "Unpublish",
+      archive: "Archive"
+    },
+    fields: {
+      name: "Name",
+      description: "Description",
+      manager: "Manager",
+      managerInstructions: "Manager Instructions",
+      workers: "Workers",
+      publishedAgent: "Published Agent",
+      alias: "Alias",
+      assignmentInstructions: "Assignment Instructions",
+      enabled: "Enabled",
+      order: "Order",
+      updated: "Updated"
+    },
+    list: {
+      badge: "Workforce",
+      title: "Workforces",
+      description: "Create manager-led multi-agent work groups, keep worker roles explicit, and run them from a single entry point.",
+      searchPlaceholder: "Search workforces...",
+      emptyTitle: "No workforces yet",
+      emptyDescription: "Start with a manager agent, add a few workers, and return here to launch coordinated runs.",
+      createFirst: "Create your first workforce",
+      manager: "Manager: {name}",
+      workers: "Workers: {count}",
+      lastUpdate: "Last update: {value}",
+      lastRun: "Last run #{runId} - {status}",
+      lastRunWithTask: "Last run #{runId} - task #{taskId} - {status}",
+      noRuns: "No runs yet"
+    },
+    pagination: {
+      showing: "Showing {start}-{end} of {total}",
+      prev: "Prev",
+      page: "Page {page} of {pages}",
+      next: "Next"
+    },
+    create: {
+      backToWorkforces: "Back to Workforces",
+      title: "Create Workforce",
+      description: "Start with a manager, add workers, then review the orchestration before saving.",
+      prompt: {
+        badge: "AI setup",
+        title: "Create Workforce",
+        description: "Describe the outcome you want. The builder will create a manager, select published workers when they fit, and open a reviewable draft.",
+        cardTitle: "What should this Workforce do?",
+        cardDescription: "The generated manager is created for this Workforce. Workers are selected only from existing published agents.",
+        placeholder: "Example: Build a Workforce for weekly competitor monitoring. It should research competitor updates, summarize pricing changes, and draft a concise leadership brief.",
+        manualSetup: "Manual setup",
+        generate: "Generate Workforce"
+      },
+      manual: {
+        title: "Manual Workforce Setup",
+        description: "Choose an existing manager, add workers, then review the orchestration before saving.",
+        backToPrompt: "Back to AI setup"
+      },
+      steps: {
+        basics: "Basics",
+        workers: "Workers",
+        review: "Review"
+      },
+      placeholders: {
+        name: "Marketing Launch Workforce",
+        description: "Coordinate research, content, and launch tasks.",
+        managerInstructions: "Coordinate workers, reconcile conflicting outputs, and return a single answer."
+      },
+      manager: {
+        selectLabel: "Select the manager agent",
+        placeholder: "Choose an agent"
+      }
+    },
+    detail: {
+      description: "Review and edit the current orchestration before running it.",
+      editTitle: "Edit Workforce"
+    },
+    workers: {
+      addTitle: "Add Worker",
+      manageTitle: "Manage Workers",
+      chooseAgent: "Choose a worker agent",
+      aliasPlaceholder: "Optional display name",
+      instructionsPlaceholder: "Describe what this worker handles inside the workforce.",
+      noneSelected: "No workers selected yet.",
+      noneConfigured: "No workers configured.",
+      noneYet: "No workers yet.",
+      fallbackName: "Worker {index}",
+      aWorker: "A worker",
+      defaultDescription: "Published agent worker",
+      publishedAgent: "Published agent",
+      disabledHelp: "Disabled workers are kept in the Workforce but skipped at runtime."
+    },
+    review: {
+      potentialRisks: "Potential Risks",
+      untitled: "Untitled Workforce",
+      noManagerInstructions: "No manager instructions",
+      warnings: {
+        managerNotPublished: "Manager is not published yet.",
+        workerNotPublished: "{name} is not published yet.",
+        missingInstructions: "{name} is missing assignment instructions.",
+        managerCannotBeWorker: "{name} is already a worker. Choose a different manager or remove that worker."
+      }
+    },
+    summary: {
+      enabledCount: "{count} enabled"
+    },
+    run: {
+      testTitle: "Test Workforce",
+      placeholder: "Describe the task you want the manager to coordinate.",
+      inactiveDisabled: "Publish this workforce before running it.",
+      archivedDisabled: "Archived workforces cannot run."
+    },
+    builder: {
+      chatTitle: "Builder Chat",
+      chatDescription: "Describe the workforce change you want. The builder will turn it into a reviewable patch.",
+      archivedReadOnly: "Archived workforces are read-only. Builder changes cannot be proposed or applied.",
+      emptyPrompt: "Start with something like: add worker Research Agent to handle competitor research.",
+      roleBuilder: "Builder",
+      roleYou: "You",
+      preparingPatch: "Preparing a proposed patch...",
+      messagePlaceholder: "Rename this workforce to \"Launch Crew\" and make Writer focus on launch email copy.",
+      sendHint: "Press Ctrl/Cmd + Enter to send.",
+      patchTitle: "Proposed Patch",
+      patchDescription: "Review the generated workforce changes before applying them.",
+      noProposal: "No proposal yet. Send a request in Builder Chat to generate a patch.",
+      summary: "Summary",
+      clarificationNeeded: "Clarification needed",
+      warnings: "Warnings",
+      readyToApply: "Ready to apply",
+      noDestructiveWarning: "No destructive warning was detected in this patch.",
+      operationsTitle: "Operations",
+      changeCount: "{count} change(s)",
+      noOperations: "This proposal does not contain any executable operation yet.",
+      operations: {
+        update_workforce: "Update Workforce",
+        add_existing_worker: "Add Existing Worker",
+        update_worker: "Update Worker",
+        remove_worker: "Remove Worker"
+      }
+    },
+    canvas: {
+      backToDetails: "Back to details",
+      connections: "Connections",
+      noConnections: "No connections configured.",
+      nodeTypes: {
+        human: "Human",
+        manager: "Manager",
+        worker: "Worker"
+      }
+    },
+    loading: {
+      list: "Loading workforces...",
+      agents: "Loading agents...",
+      creating: "Creating...",
+      detail: "Loading workforce...",
+      saving: "Saving...",
+      starting: "Starting...",
+      builderHistory: "Loading builder history...",
+      proposing: "Proposing...",
+      applyingChanges: "Applying Changes...",
+      runView: "Loading run view...",
+      canvas: "Loading canvas...",
+      builder: "Loading builder..."
+    },
+    messages: {
+      updated: "Workforce updated",
+      workerAdded: "Worker added",
+      workerUpdated: "Worker updated",
+      workerRemoved: "Worker removed",
+      proposalCreated: "Builder proposal created",
+      changesApplied: "Workforce changes applied",
+      published: "Workforce published",
+      unpublished: "Workforce unpublished",
+      archived: "Workforce archived"
+    },
+    errors: {
+      loadList: "Failed to load workforces",
+      loadAgents: "Failed to load agents",
+      create: "Failed to create workforce",
+      load: "Failed to load workforce",
+      update: "Failed to update workforce",
+      addWorker: "Failed to add worker",
+      updateWorker: "Failed to update worker",
+      removeWorker: "Failed to remove worker",
+      run: "Failed to run workforce",
+      notFound: "Workforce not found.",
+      loadCanvas: "Failed to load workforce canvas",
+      canvasUnavailable: "Canvas unavailable.",
+      loadBuilder: "Failed to load builder",
+      proposeChanges: "Failed to propose changes",
+      applyChanges: "Failed to apply changes",
+      publish: "Failed to publish workforce",
+      unpublish: "Failed to unpublish workforce",
+      archive: "Failed to archive workforce"
     }
   },
   adminMcp: {
@@ -2939,7 +3289,15 @@ Build when you need.`
       columns: {
         appId: "APP ID",
         provider: "PROVIDER",
-        transport: "TRANSPORT"
+        transport: "TRANSPORT",
+        connectorVisibility: "CONNECTOR VISIBILITY"
+      },
+      visibility: {
+        visible: "Visible",
+        hidden: "Hidden",
+        showSuccess: "App is now visible in the connector dialog",
+        hideSuccess: "App is now hidden from the connector dialog",
+        updateFailed: "Failed to update connector visibility"
       },
       form: {
         appId: "App ID (e.g. gmail)",
@@ -2948,6 +3306,8 @@ Build when you need.`
         iconUrl: "Icon URL",
         category: "Category",
         transport: "Transport",
+        visibleInConnector: "Show in connector dialog",
+        visibleInConnectorDescription: "When disabled, this public app is completely hidden from the connector dialog for all users.",
         oauthScopes: "OAuth Scopes (comma separated)",
         launchConfig: "Launch Config (JSON)",
         invalidJson: "Invalid JSON in launch_config"

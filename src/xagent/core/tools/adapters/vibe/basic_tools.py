@@ -12,7 +12,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool
+@register_tool(categories={"basic"})
 async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
     """Create basic tools (web search, code executors)."""
     if not config.get_basic_tools_enabled():

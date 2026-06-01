@@ -7,15 +7,22 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
+from xagent.config import WEB_CRAWL_TLS_IMPERSONATE
 from xagent.core.tools.core.RAG_tools.core.schemas import (
+    CollectionOperationResult,
     IngestionConfig,
     IngestionResult,
     WebIngestionResult,
 )
 from xagent.web.api.kb import kb_router
+from xagent.web.models.background_job import (
+    BackgroundJob,
+    BackgroundJobStatus,
+    BackgroundJobType,
+)
 from xagent.web.models.database import get_db
 
 
@@ -163,33 +170,407 @@ def test_ingest_separators_valid_json_passed_to_config(app_with_kb, mock_user):
     assert captured_config[0].separators == ["\n\n", "\n", "。"]
 
 
-def test_delete_collection_forbidden_for_non_admin_with_other_users_docs(
+def test_delete_collection_removes_only_current_user_docs_when_name_is_shared(
     app_with_kb, mock_user
 ):
-    """Non-admin is rejected by _ensure_collection_access before delete_collection."""
+    """Non-admin deletes own documents even when other users share the collection name."""
     with (
         patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
         patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
     ):
         mock_store = MagicMock()
         mock_get_vector_store.return_value = mock_store
-        mock_store.list_document_records.return_value = []
         # Simulate total_count=5 and own_count=3 for the same collection.
         mock_store.count_documents_grouped_by_collection.side_effect = [
             {"test_collection": 5},
             {"test_collection": 3},
+            {"test_collection": 5},
+            {"test_collection": 3},
+        ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
+
+        client = TestClient(app_with_kb)
+        resp = client.delete("/api/kb/collections/test_collection")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
+    )
+
+
+def test_delete_collection_rechecks_permission_before_full_delete(
+    app_with_kb, mock_user
+):
+    """Single delete rechecks live state but mixed ownership still deletes only own docs."""
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 2},
+            {"test_collection": 1},
+            {"test_collection": 2},
+            {"test_collection": 1},
+        ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
+
+        client = TestClient(app_with_kb)
+        resp = client.delete("/api/kb/collections/test_collection")
+
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "success"
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
+    )
+    mock_physical.assert_called_once()
+
+
+def test_delete_collection_removes_stale_config_without_deleting_other_users_docs(
+    app_with_kb, mock_user
+):
+    """Config-only stale entries should be removable without touching documents."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 0},
+        ) as mock_delete_config,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
         ]
 
         client = TestClient(app_with_kb)
         resp = client.delete("/api/kb/collections/test_collection")
 
-    assert resp.status_code == 403
-    detail = resp.json()["detail"]
-    assert (
-        "Only admin users can delete collections containing documents from other users."
-        in detail
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data["status"] == "success"
+    assert "knowledge base list" in data["message"]
+    assert data["deleted_counts"] == {"config_rows": 1, "metadata_rows": 0}
+    mock_delete_config.assert_called_once_with(
+        collection_name="test_collection",
+        user_id=mock_user.id,
+        is_admin=False,
+        delete_orphaned_metadata=False,
     )
     mock_delete_collection.assert_not_called()
+    mock_physical.assert_not_called()
+    # config_only path must not delete global metadata used by other users.
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_allows_config_only_stale_collection(app_with_kb, mock_user):
+    """Batch preflight should pass own_count=0 stale config entries to cleanup."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 0},
+        ),
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        # Preflight makes a single batched call per filter (totals/owns), then
+        # the delete path rechecks live mode before mutating config.
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == ["test_collection"]
+    assert resp.json()["failed"] == []
+    mock_delete_collection.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_config_only_preflight_can_become_full_delete(app_with_kb, mock_user):
+    """A stale config-only preflight must not hide a newly owned collection."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync"
+        ) as mock_delete_config,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 1},
+        ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["deleted"] == ["test_collection"]
+    mock_delete_config.assert_not_called()
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
+    )
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_rechecks_and_deletes_only_current_user_docs_for_shared_name(
+    app_with_kb, mock_user
+):
+    """A stale batch preflight rechecks, then tenant-scoped delete handles mixed ownership."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch("xagent.web.api.kb.delete_collection_uploaded_files", return_value=0),
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 1},
+            {"test_collection": 2},
+            {"test_collection": 1},
+        ]
+        mock_store.list_document_records.side_effect = [[], []]
+        mock_delete_collection.return_value = CollectionOperationResult(
+            status="success",
+            collection="test_collection",
+            message="deleted",
+            affected_documents=[],
+            deleted_counts={},
+        )
+        mock_physical.return_value = MagicMock(
+            status="not_found", error=None, collection_dir=None
+        )
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == ["test_collection"]
+    assert body["failed"] == []
+    mock_delete_collection.assert_called_once_with(
+        "test_collection", mock_user.id, False
+    )
+    mock_physical.assert_called_once()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_delete_collection_returns_not_found_when_user_config_already_cleaned(
+    app_with_kb, mock_user
+):
+    """Config-only cleanup must require a real user config row."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch("xagent.web.api.kb.delete_collection_physical_dir") as mock_physical,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 0, "metadata_rows": 0},
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.delete("/api/kb/collections/test_collection")
+
+    assert resp.status_code == 404
+    assert "not in your knowledge base list" in resp.json()["detail"]
+    mock_delete_collection.assert_not_called()
+    mock_physical.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_fails_when_config_only_row_is_absent(app_with_kb, mock_user):
+    """Batch config-only cleanup should not report success without user config."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 0, "metadata_rows": 0},
+        ),
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == []
+    assert len(body["failed"]) == 1
+    assert body["failed"][0]["name"] == "test_collection"
+    assert "not in your knowledge base list" in body["failed"][0]["error"]
+    mock_delete_collection.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
+
+
+def test_batch_delete_marks_config_cleanup_failure_as_failed(app_with_kb, mock_user):
+    """When _remove_user_collection_config raises in config_only path, item should fail."""
+    mock_metadata_store = MagicMock()
+    mock_metadata_store.delete_collection = AsyncMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            side_effect=RuntimeError("metadata store down"),
+        ),
+        patch("xagent.web.api.kb.delete_collection") as mock_delete_collection,
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=mock_metadata_store,
+        ),
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        client = TestClient(app_with_kb)
+        resp = client.post(
+            "/api/kb/collections/batch-delete",
+            json={"collection_names": ["test_collection"]},
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["deleted"] == []
+    assert len(body["failed"]) == 1
+    failed_item = body["failed"][0]
+    assert failed_item["name"] == "test_collection"
+    assert "Failed to delete collection configuration" in failed_item["error"]
+    mock_delete_collection.assert_not_called()
+    mock_metadata_store.delete_collection.assert_not_called()
 
 
 def test_delete_collection_allowed_for_admin_with_other_users_docs(
@@ -226,6 +607,70 @@ def test_delete_collection_allowed_for_admin_with_other_users_docs(
 
     assert resp.status_code == 200
     mock_delete_collection.assert_called_once()
+
+
+def test_document_delete_cleanup_removes_config_after_last_owned_doc():
+    """Last owned document deletion should clear only the current user's config."""
+    from xagent.web.api import kb
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 0},
+        ) as mock_delete_config,
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 1},
+            {"test_collection": 0},
+        ]
+
+        result = kb._cleanup_collection_config_if_no_owned_documents(
+            "test_collection",
+            user_id=(mock_user_id := 1),
+        )
+
+    assert result == {"config_rows": 1, "metadata_rows": 0}
+    mock_delete_config.assert_called_once_with(
+        collection_name="test_collection",
+        user_id=mock_user_id,
+        is_admin=False,
+        delete_orphaned_metadata=False,
+    )
+
+
+def test_document_delete_cleanup_deletes_orphaned_metadata_when_collection_empty():
+    """If no documents remain globally, orphan metadata can be removed too."""
+    from xagent.web.api import kb
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.web.api.kb.delete_collection_metadata_sync",
+            return_value={"config_rows": 1, "metadata_rows": 1},
+        ) as mock_delete_config,
+    ):
+        mock_store = MagicMock()
+        mock_get_vector_store.return_value = mock_store
+        mock_store.count_documents_grouped_by_collection.side_effect = [
+            {"test_collection": 0},
+            {"test_collection": 0},
+        ]
+
+        result = kb._cleanup_collection_config_if_no_owned_documents(
+            "test_collection",
+            user_id=1,
+        )
+
+    assert result == {"config_rows": 1, "metadata_rows": 1}
+    mock_delete_config.assert_called_once_with(
+        collection_name="test_collection",
+        user_id=1,
+        is_admin=False,
+        delete_orphaned_metadata=True,
+    )
 
 
 def test_delete_document_forbidden_for_non_admin_other_users_doc(
@@ -269,6 +714,53 @@ def test_delete_document_forbidden_for_non_admin_other_users_doc(
     assert "Access denied for collection" in body.get("detail", "")
     assert "test_collection" in body.get("detail", "")
     mock_delete_document.assert_not_called()
+
+
+def test_delete_document_keeps_success_when_config_cleanup_fails(
+    app_with_kb_admin, admin_user
+):
+    """Cleanup failures must not downgrade overall status from success."""
+    from fastapi import HTTPException as _HTTPException
+
+    with (
+        patch("xagent.web.api.kb.get_vector_index_store") as mock_get_vector_store,
+        patch(
+            "xagent.core.tools.core.RAG_tools.management.collections.delete_document"
+        ) as mock_delete_document,
+        patch(
+            "xagent.web.api.kb._cleanup_collection_config_if_no_owned_documents",
+            side_effect=_HTTPException(
+                status_code=500,
+                detail="Failed to delete collection configuration: boom",
+            ),
+        ) as mock_cleanup,
+    ):
+        mock_record = MagicMock()
+        mock_record.doc_id = "doc_123"
+        mock_record.source_path = "/tmp/doc.txt"
+        mock_record.metadata = {}
+        mock_get_vector_store.return_value.list_document_records.return_value = [
+            mock_record
+        ]
+        mock_delete_document.return_value = type(
+            "DeleteResult",
+            (),
+            {"status": "success", "message": "ok"},
+        )()
+
+        client = TestClient(app_with_kb_admin)
+        resp = client.delete(
+            "/api/kb/collections/test_collection/documents/doc.txt",
+        )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "success"
+    assert body["deleted_doc_ids"] == ["doc_123"]
+    assert "collection_config_cleanup_error" in body
+    assert "boom" in body["collection_config_cleanup_error"]
+    assert "errors" not in body
+    mock_cleanup.assert_called_once()
 
 
 def test_delete_document_allowed_for_admin_any_doc(app_with_kb_admin, admin_user):
@@ -372,6 +864,205 @@ def test_ingest_returns_413_when_file_exceeds_limit(app_with_kb, monkeypatch):
 
     assert response.status_code == 413
     assert "maximum limit" in response.json()["detail"].lower()
+
+
+def test_ingest_job_uses_staged_snapshot_in_payload(app_with_kb):
+    captured_payload = {}
+
+    def fake_create_background_job(db, *, payload, **kwargs):
+        captured_payload.update(payload)
+        return BackgroundJob(
+            id="job-1",
+            user_id=1,
+            job_type=BackgroundJobType.KB_INGEST_DOCUMENT.value,
+            queue="kb_ingest",
+            status=BackgroundJobStatus.ENQUEUED.value,
+            payload=payload,
+            progress={"message": "Queued", "completed": 0, "total": 1},
+            attempts=0,
+            max_attempts=3,
+        )
+
+    async def fake_enqueue(db, job):
+        return job
+
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        with (
+            patch("xagent.web.api.kb.get_upload_path") as mock_path,
+            patch(
+                "xagent.web.api.kb._ensure_background_job_queue_available_async",
+                new=AsyncMock(),
+            ),
+            patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError),
+            patch("xagent.web.api.kb.get_metadata_store", return_value=metadata_store),
+            patch(
+                "xagent.web.api.kb.get_non_terminal_background_job_by_idempotency_key",
+                return_value=None,
+            ),
+            patch(
+                "xagent.web.api.kb.create_background_job",
+                side_effect=fake_create_background_job,
+            ),
+            patch("xagent.web.api.kb.admit_kb_ingest_target"),
+            patch(
+                "xagent.web.api.kb._enqueue_background_job_or_503_async",
+                side_effect=fake_enqueue,
+            ),
+        ):
+            mock_path.side_effect = _ingest_test_get_upload_path_side_effect(tmpdir)
+            client = TestClient(app_with_kb)
+            response = client.post(
+                "/api/kb/ingest/jobs",
+                data={"collection": "test_coll"},
+                files={"file": ("test.txt", io.BytesIO(b"hello"), "text/plain")},
+            )
+
+        assert response.status_code == 202
+        source_path = Path(captured_payload["source_path"])
+        target_path = Path(captured_payload["target_path"])
+        assert source_path != target_path
+        assert ".background-ingest" in source_path.parts
+        assert source_path.read_bytes() == b"hello"
+        assert not target_path.exists()
+        assert captured_payload["file_size"] == 5
+        assert captured_payload["file_id"]
+        assert captured_payload["generation_id"]
+        assert (
+            captured_payload["file_sha256"]
+            == "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"
+        )
+
+
+def test_ingest_web_job_payload_records_new_collection_state(app_with_kb):
+    captured_payload = {}
+
+    def fake_create_background_job(db, *, payload, **kwargs):
+        captured_payload.update(payload)
+        return BackgroundJob(
+            id="job-1",
+            user_id=1,
+            job_type=BackgroundJobType.KB_INGEST_WEB.value,
+            queue="kb_ingest",
+            status=BackgroundJobStatus.ENQUEUED.value,
+            payload=payload,
+            progress={"message": "Queued", "completed": 0, "total": 1},
+            attempts=0,
+            max_attempts=3,
+        )
+
+    async def fake_enqueue(db, job):
+        return job
+
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+
+    with (
+        patch(
+            "xagent.web.api.kb._ensure_background_job_queue_available_async",
+            new=AsyncMock(),
+        ),
+        patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError),
+        patch("xagent.web.api.kb.get_metadata_store", return_value=metadata_store),
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb.get_non_terminal_background_job_by_idempotency_key",
+            return_value=None,
+        ),
+        patch(
+            "xagent.web.api.kb.create_background_job",
+            side_effect=fake_create_background_job,
+        ),
+        patch(
+            "xagent.web.api.kb._enqueue_background_job_or_503_async",
+            side_effect=fake_enqueue,
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web/jobs",
+            data={
+                "collection": "web_jobs_new_collection",
+                "start_url": "https://example.com",
+            },
+        )
+
+    assert response.status_code == 202
+    assert captured_payload["collection_existed_before"] is False
+
+
+def test_ingest_web_job_cleans_new_collection_metadata_when_enqueue_fails(
+    app_with_kb,
+):
+    def fake_create_background_job(db, *, payload, **kwargs):
+        return BackgroundJob(
+            id="job-1",
+            user_id=1,
+            job_type=BackgroundJobType.KB_INGEST_WEB.value,
+            queue="kb_ingest",
+            status=BackgroundJobStatus.PENDING.value,
+            payload=payload,
+            progress={"message": "Queued", "completed": 0, "total": 1},
+            attempts=0,
+            max_attempts=3,
+        )
+
+    async def fake_enqueue(db, job):
+        raise HTTPException(
+            status_code=503, detail="Background job queue is unavailable"
+        )
+
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock(
+        return_value={"metadata_rows": 0, "config_rows": 1}
+    )
+
+    with (
+        patch(
+            "xagent.web.api.kb._ensure_background_job_queue_available_async",
+            new=AsyncMock(),
+        ),
+        patch("xagent.web.api.kb.get_collection_sync", side_effect=ValueError),
+        patch("xagent.web.api.kb.get_metadata_store", return_value=metadata_store),
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb.get_non_terminal_background_job_by_idempotency_key",
+            return_value=None,
+        ),
+        patch(
+            "xagent.web.api.kb.create_background_job",
+            side_effect=fake_create_background_job,
+        ),
+        patch(
+            "xagent.web.api.kb._enqueue_background_job_or_503_async",
+            side_effect=fake_enqueue,
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web/jobs",
+            data={
+                "collection": "web_jobs_enqueue_failure",
+                "start_url": "https://example.com",
+            },
+        )
+
+    assert response.status_code == 503
+    metadata_store.delete_collection_metadata.assert_awaited_once_with(
+        collection_name="web_jobs_enqueue_failure",
+        user_id=1,
+        is_admin=False,
+        delete_orphaned_metadata=True,
+    )
 
 
 def test_ingest_separators_invalid_json_request_succeeds_uses_default(
@@ -512,6 +1203,9 @@ async def _fake_run_web_ingestion(
     """Async fake that captures ingestion_config and returns WebIngestionResult."""
     captured_config: list = _fake_run_web_ingestion.captured  # type: ignore[attr-defined]
     captured_config.append(ingestion_config)
+    captured_crawl_config = getattr(_fake_run_web_ingestion, "captured_crawl", None)
+    if captured_crawl_config is not None:
+        captured_crawl_config.append(crawl_config)
     return WebIngestionResult(
         status="success",
         collection=collection,
@@ -526,10 +1220,13 @@ async def _fake_run_web_ingestion(
     )
 
 
-def test_ingest_web_separators_valid_json_passed_to_config(app_with_kb):
+def test_ingest_web_separators_valid_json_passed_to_config(app_with_kb, monkeypatch):
     """POST /api/kb/ingest-web with valid separators passes list to IngestionConfig."""
+    monkeypatch.setenv(WEB_CRAWL_TLS_IMPERSONATE, "auto")
     captured_config: list[IngestionConfig] = []
     _fake_run_web_ingestion.captured = captured_config  # type: ignore[attr-defined]
+    captured_crawl_config: list = []
+    _fake_run_web_ingestion.captured_crawl = captured_crawl_config  # type: ignore[attr-defined]
 
     with patch(
         "xagent.web.api.kb.run_web_ingestion", side_effect=_fake_run_web_ingestion
@@ -550,6 +1247,8 @@ def test_ingest_web_separators_valid_json_passed_to_config(app_with_kb):
     assert response.status_code == 200
     assert len(captured_config) == 1
     assert captured_config[0].separators == ["\n", " "]
+    assert len(captured_crawl_config) == 1
+    assert captured_crawl_config[0].tls_impersonate == "auto"
 
 
 def test_ingest_web_separators_invalid_json_request_succeeds(app_with_kb):
@@ -576,6 +1275,81 @@ def test_ingest_web_separators_invalid_json_request_succeeds(app_with_kb):
     assert response.status_code == 200
     assert len(captured_config) == 1
     assert captured_config[0].separators is None
+
+
+def test_ingest_web_missing_protocol_returns_422(app_with_kb):
+    """POST ingest-web rejects start_url values without an explicit HTTP(S) scheme."""
+    with patch("xagent.web.api.kb.run_web_ingestion") as mock_run_web_ingestion:
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_coll",
+                "start_url": "www.example.com",
+            },
+        )
+
+    assert response.status_code == 422
+    assert (
+        response.json()["detail"]
+        == "Invalid start_url: URL must start with http:// or https://"
+    )
+    mock_run_web_ingestion.assert_not_called()
+
+
+def test_ingest_web_uppercase_scheme_is_normalized(app_with_kb):
+    """POST ingest-web should accept uppercase schemes via shared URL normalization."""
+    captured_config = []
+
+    async def capture_web_ingestion(*, crawl_config, **kwargs):
+        captured_config.append(crawl_config)
+        return WebIngestionResult(
+            status="success",
+            collection=kwargs["collection"],
+            total_urls_found=1,
+            pages_crawled=1,
+            pages_failed=0,
+            documents_created=1,
+            chunks_created=1,
+            embeddings_created=1,
+            crawled_urls=[crawl_config.start_url],
+            failed_urls={},
+            message="ok",
+            warnings=[],
+            elapsed_time_ms=1,
+        )
+
+    with patch(
+        "xagent.web.api.kb.run_web_ingestion",
+        new=AsyncMock(side_effect=capture_web_ingestion),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_coll",
+                "start_url": "HTTP://Example.com/docs#intro",
+            },
+        )
+
+    assert response.status_code == 200
+    assert len(captured_config) == 1
+    assert captured_config[0].start_url == "http://example.com/docs"
+
+
+@pytest.mark.parametrize("start_url", ["http://@", "http://:80"])
+def test_ingest_web_hostless_url_returns_422(app_with_kb, start_url):
+    """POST ingest-web should reject hostless HTTP(S) URLs at validation time."""
+    with patch("xagent.web.api.kb.run_web_ingestion") as mock_run_web_ingestion:
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={"collection": "web_coll", "start_url": start_url},
+        )
+
+    assert response.status_code == 422
+    assert response.json()["detail"] == "Invalid start_url: URL must include a hostname"
+    mock_run_web_ingestion.assert_not_called()
 
 
 def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
@@ -629,3 +1403,60 @@ def test_ingest_web_error_cleans_new_collection_config(app_with_kb):
         is_admin=False,
         delete_orphaned_metadata=True,
     )
+
+
+def test_ingest_web_surfaces_embedding_configuration_fix_guidance(app_with_kb):
+    """POST ingest-web should explain how to fix embedding configuration errors."""
+    metadata_store = MagicMock()
+    metadata_store.save_collection_config = AsyncMock()
+    metadata_store.delete_collection_metadata = AsyncMock(
+        return_value={"metadata_rows": 0, "config_rows": 1}
+    )
+
+    with (
+        patch(
+            "xagent.core.tools.core.RAG_tools.storage.factory.get_metadata_store",
+            return_value=metadata_store,
+        ),
+        patch(
+            "xagent.web.api.kb.get_collection_sync", side_effect=ValueError("missing")
+        ),
+        patch(
+            "xagent.web.api.kb.run_web_ingestion",
+            return_value=WebIngestionResult(
+                status="error",
+                collection="web_embedding_error",
+                total_urls_found=1,
+                pages_crawled=0,
+                pages_failed=1,
+                documents_created=0,
+                chunks_created=0,
+                embeddings_created=0,
+                crawled_urls=[],
+                failed_urls={"https://example.com": "embedding failed"},
+                message=(
+                    "Model 'text-embedding-v4' not found in hub and no "
+                    "environment configuration available for embedding."
+                ),
+                warnings=[],
+                elapsed_time_ms=0,
+            ),
+        ),
+    ):
+        client = TestClient(app_with_kb)
+        response = client.post(
+            "/api/kb/ingest-web",
+            data={
+                "collection": "web_embedding_error",
+                "start_url": "https://example.com",
+            },
+        )
+
+    assert response.status_code == 500
+    message = response.json()["message"]
+    assert (
+        "Cause: knowledge-base ingestion requires a resolvable embedding model"
+        in message
+    )
+    assert "Current embedding_model_id: 'text-embedding-v4'." in message
+    assert "How to fix:" in message

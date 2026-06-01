@@ -10,6 +10,7 @@ import pytest
 from xagent.core.tools.core.RAG_tools.utils.user_scope import user_scope_context
 from xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner import (
     cascade_delete,
+    cascade_delete_documents,
     cleanup_chunk_cascade,
     cleanup_document_cascade,
     cleanup_embed_cascade,
@@ -903,6 +904,100 @@ def test_cascade_delete_document_multitable_predicates_are_consistent(
     assert "collection == 'c_multi'" in pointers_filter
     assert "doc_id == 'd_multi'" in pointers_filter
     assert "user_id ==" not in pointers_filter
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_documents_builds_doc_id_batched_predicates(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Batched document delete should stay document-scoped across all tables."""
+    conn = MagicMock(spec=["table_names", "open_table"])
+    conn.table_names.return_value = [
+        "documents",
+        "parses",
+        "chunks",
+        "main_pointers",
+        "ingestion_runs",
+        "embeddings_m1",
+        "embeddings_legacy",
+    ]
+
+    table_map = {
+        "documents": _create_mock_table_with_columns(
+            ["collection", "doc_id", "user_id"]
+        ),
+        "parses": _create_mock_table_with_columns(["collection", "doc_id", "user_id"]),
+        "chunks": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+        "main_pointers": _create_mock_table_with_columns(["collection", "doc_id"]),
+        "ingestion_runs": _create_mock_table_with_columns(
+            ["collection", "doc_id", "status", "user_id"]
+        ),
+        "embeddings_m1": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash", "user_id"]
+        ),
+        "embeddings_legacy": _create_mock_table_with_columns(
+            ["collection", "doc_id", "parse_hash"]
+        ),
+    }
+    conn.open_table.side_effect = lambda name: table_map[name]
+    mock_get_conn.return_value = conn
+
+    with patch(
+        "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner._plan_by_predicates"
+    ) as mock_plan:
+        mock_plan.return_value = {}
+        cascade_delete_documents(
+            collection="c_batch",
+            doc_ids=["d2", "d1", "d1"],
+            user_id=5,
+            is_admin=False,
+            preview_only=True,
+            confirm=False,
+        )
+
+    predicates = mock_plan.call_args.args[1]
+
+    for table_name in (
+        "documents",
+        "parses",
+        "chunks",
+        "ingestion_runs",
+        "embeddings_m1",
+    ):
+        filt = predicates[table_name]
+        assert "collection == 'c_batch'" in filt
+        assert "doc_id IN ('d1', 'd2')" in filt
+        assert "user_id == 5" in filt
+
+    for table_name in ("main_pointers", "embeddings_legacy"):
+        filt = predicates[table_name]
+        assert "collection == 'c_batch'" in filt
+        assert "doc_id IN ('d1', 'd2')" in filt
+        assert "user_id ==" not in filt
+
+
+@patch(
+    "xagent.core.tools.core.RAG_tools.version_management.cascade_cleaner.get_vector_store_raw_connection"
+)
+def test_cascade_delete_documents_noops_for_unauthenticated_non_admin(
+    mock_get_conn: MagicMock,
+) -> None:
+    """Unauthenticated callers should not build predicates for legacy tables."""
+    result = cascade_delete_documents(
+        collection="c_batch",
+        doc_ids=["d1"],
+        user_id=None,
+        is_admin=False,
+        preview_only=False,
+        confirm=True,
+    )
+
+    assert result == {}
+    mock_get_conn.assert_not_called()
 
 
 @patch(

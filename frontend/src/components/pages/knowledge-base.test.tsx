@@ -27,6 +27,12 @@ vi.mock("@/contexts/i18n-context", () => ({
   }),
 }))
 
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({
+    user: { id: 1, is_admin: false },
+  }),
+}))
+
 vi.mock("sonner", () => ({
   toast: {
     error: toastErrorMock,
@@ -41,8 +47,15 @@ vi.mock("lucide-react", () => {
     Plus: Icon,
     FileText: Icon,
     FolderOpen: Icon,
+    Globe: Icon,
     HardDrive: Icon,
+    Database: Icon,
+    Plug: Icon,
+    Search: Icon,
+    Settings2: Icon,
     Trash2: Icon,
+    UploadCloud: Icon,
+    X: Icon,
   }
 })
 
@@ -157,7 +170,7 @@ describe("KnowledgeBasePage", () => {
 
     await waitFor(() => {
       expect(collectionFetchCount).toBe(2)
-      expect(screen.getByText("kb.empty.noKB")).toBeInTheDocument()
+      expect(screen.getByText("kb.emptyState.title")).toBeInTheDocument()
     })
   })
 
@@ -212,7 +225,7 @@ describe("KnowledgeBasePage", () => {
 
     await waitFor(() => {
       expect(collectionFetchCount).toBe(2)
-      expect(screen.getByText("kb.empty.noKB")).toBeInTheDocument()
+      expect(screen.getByText("kb.emptyState.title")).toBeInTheDocument()
       expect(toastWarningMock).toHaveBeenCalledWith("cleanup warning")
     })
   })

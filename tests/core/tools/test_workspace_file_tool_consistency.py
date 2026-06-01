@@ -68,6 +68,47 @@ class TestWorkspaceFileToolConsistency:
         assert read_content == test_content
 
     @pytest.mark.usefixtures("mock_workspace_db")
+    def test_write_json_returns_file_ref(self, tmp_path):
+        """Test that JSON writes expose FileRef metadata to the model."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        result = tools.write_json_file("data/report.json", {"answer": 42})
+
+        assert result["success"] is True
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "report.json"
+        assert result["mime_type"] == "application/json"
+        assert result["relative_path"] == "output/data/report.json"
+        assert result["preview_url"].endswith(result["file_id"])
+        assert result["download_url"].endswith(result["file_id"])
+        assert result["markdown_link"] == f"[report.json](file:{result['file_id']})"
+        assert result["file_ref"]["file_id"] == result["file_id"]
+        assert (workspace.output_dir / "data" / "report.json").exists()
+
+    @pytest.mark.usefixtures("mock_workspace_db")
+    def test_write_csv_returns_file_ref(self, tmp_path):
+        """Test that CSV writes expose FileRef metadata to the model."""
+        workspace = TaskWorkspace("test_task", str(tmp_path))
+        tools = WorkspaceFileTools(workspace)
+
+        result = tools.write_csv_file(
+            "data/report.csv",
+            [{"name": "Alice", "score": "10"}, {"name": "Bob", "score": "11"}],
+        )
+
+        assert result["success"] is True
+        assert isinstance(result.get("file_id"), str)
+        assert result["filename"] == "report.csv"
+        assert result["mime_type"] == "text/csv"
+        assert result["relative_path"] == "output/data/report.csv"
+        assert result["preview_url"].endswith(result["file_id"])
+        assert result["download_url"].endswith(result["file_id"])
+        assert result["markdown_link"] == f"[report.csv](file:{result['file_id']})"
+        assert result["file_ref"]["file_id"] == result["file_id"]
+        assert (workspace.output_dir / "data" / "report.csv").exists()
+
+    @pytest.mark.usefixtures("mock_workspace_db")
     def test_write_then_read_with_relative_path(self, tmp_path):
         """Test that relative paths work consistently."""
         workspace = TaskWorkspace("test_task", str(tmp_path))
@@ -349,6 +390,109 @@ class TestWorkspaceFileToolConsistency:
         )
 
         assert workspace.resolve_file_id("foreign-file") is None
+
+    def test_resolve_file_id_rejects_durable_only_other_user_records(
+        self, tmp_path, mocker
+    ):
+        """Test durable-only DB file_id lookup is scoped to the workspace owner."""
+        missing_local = tmp_path / "missing-other-user.txt"
+        workspace = TaskWorkspace("web_task_10", str(tmp_path))
+        workspace.owner_user_id = 1
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return SimpleNamespace(
+                    file_id="foreign-file",
+                    user_id=2,
+                    task_id=None,
+                    storage_path=str(missing_local),
+                    storage_key="users/2/uploads/foreign-file/private.txt",
+                    storage_status="available",
+                )
+
+        class FakeSession:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def close(self):
+                pass
+
+        materialize_calls = []
+
+        class SpyManagedFileRef:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def materialize(self):
+                materialize_calls.append(None)
+                return missing_local
+
+        mocker.patch(
+            "xagent.core.storage.manager.create_db_session",
+            return_value=FakeSession(),
+        )
+        mocker.patch(
+            "xagent.web.services.managed_file_ref.ManagedFileRef",
+            SpyManagedFileRef,
+        )
+
+        assert workspace.resolve_file_id("foreign-file") is None
+        assert materialize_calls == []
+
+    def test_resolve_file_id_rejects_durable_only_other_user_inside_workspace_path(
+        self, tmp_path, mocker
+    ):
+        """Test durable-only authorization does not trust stale workspace paths."""
+        workspace = TaskWorkspace("web_task_10", str(tmp_path))
+        workspace.owner_user_id = 1
+        missing_local = workspace.output_dir / "private.txt"
+        assert not missing_local.exists()
+
+        class FakeQuery:
+            def filter(self, *_args):
+                return self
+
+            def first(self):
+                return SimpleNamespace(
+                    file_id="foreign-file",
+                    user_id=2,
+                    task_id=None,
+                    storage_path=str(missing_local),
+                    storage_key="users/2/uploads/foreign-file/private.txt",
+                    storage_status="available",
+                )
+
+        class FakeSession:
+            def query(self, *_args):
+                return FakeQuery()
+
+            def close(self):
+                pass
+
+        materialize_calls = []
+
+        class SpyManagedFileRef:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def materialize(self):
+                materialize_calls.append(None)
+                return missing_local
+
+        mocker.patch(
+            "xagent.core.storage.manager.create_db_session",
+            return_value=FakeSession(),
+        )
+        mocker.patch(
+            "xagent.web.services.managed_file_ref.ManagedFileRef",
+            SpyManagedFileRef,
+        )
+
+        assert workspace.resolve_file_id("foreign-file") is None
+        assert materialize_calls == []
 
 
 if __name__ == "__main__":
