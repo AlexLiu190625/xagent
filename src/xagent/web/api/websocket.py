@@ -1085,27 +1085,27 @@ async def execute_task_background(
         logger.info(f"Background task {task_id} execution completed")
 
     except Exception as e:
-        logger.error(f"Background task {task_id} execution failed: {e}", exc_info=True)
-        # Persist the real exception text to ``task.error_message`` and
-        # mark the row FAILED here so SDK/web clients reading
-        # ``GET /v1/chat/tasks/{id}`` (or the equivalent web endpoint)
-        # see the actual failure cause instead of the generic placeholder
-        # ``finish_turn``'s fallback writes when ``error_message`` is
-        # empty.
+        # This outer try also spans the post-terminal steps -- assistant
+        # message persistence and the completion / paused broadcasts --
+        # that run *after* the task status was already committed terminal
+        # (COMPLETED above). Branch on the task's current status so a
+        # failure in one of those best-effort steps does not rewrite an
+        # already-terminal task as FAILED or emit a spurious task_error.
+        # Only a task still RUNNING is a genuine execution failure.
         #
-        # Status must move to FAILED in the same commit: otherwise
-        # ``finish_turn``'s RUNNING-fallback branch overwrites
-        # ``error_message`` unconditionally with its own generic string.
-        # The FAILED branch, by contrast, only writes a placeholder when
-        # ``error_message`` is empty -- which is what we want.
-        #
-        # Uses a fresh session because the original ``db`` may be in a
-        # failed-transaction state after the exception.
+        # Terminal-field writing itself is owned by ``finish_turn``; this
+        # handler's only added job on the genuine-failure path is to
+        # record the real exception text, which ``finish_turn``'s
+        # RUNNING-fallback cannot recover (it writes a generic
+        # placeholder). A fresh session is used because the original
+        # ``db`` may be in a failed-transaction state after the exception.
+        is_execution_failure = False
         err_db_gen = get_db()
         try:
             err_db = next(err_db_gen)
             err_task = err_db.query(Task).filter(Task.id == task_id).first()
-            if err_task is not None:
+            if err_task is not None and err_task.status == TaskStatus.RUNNING:
+                is_execution_failure = True
                 err_task.error_message = str(e)[:4000]  # type: ignore[assignment]
                 err_task.status = TaskStatus.FAILED
                 err_db.commit()
@@ -1118,19 +1118,37 @@ async def execute_task_background(
                 next(err_db_gen)
             except StopIteration:
                 pass
-        # Send error event
-        try:
-            await manager.broadcast_to_task(
-                {
-                    "type": "task_error",
-                    "task_id": task_id,
-                    "error": str(e),
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                },
-                task_id,
+
+        if is_execution_failure:
+            logger.error(
+                f"Background task {task_id} execution failed: {e}", exc_info=True
             )
-        except Exception as broadcast_error:
-            logger.error(f"Failed to send error notification: {broadcast_error}")
+            # Notify clients only on a genuine failure. A terminal task
+            # that tripped here did so in a best-effort post-completion
+            # step, so emitting task_error would contradict its real state.
+            try:
+                await manager.broadcast_to_task(
+                    {
+                        "type": "task_error",
+                        "task_id": task_id,
+                        "error": str(e),
+                        "timestamp": datetime.now(timezone.utc).timestamp(),
+                    },
+                    task_id,
+                )
+            except Exception as broadcast_error:
+                logger.error(f"Failed to send error notification: {broadcast_error}")
+        else:
+            # Task already terminal (COMPLETED / PAUSED / ...). The
+            # exception came from a post-terminal best-effort step
+            # (broadcast or message persistence); observe it without
+            # touching the row or emitting task_error. ``finish_turn``
+            # still runs afterward and reconciles the terminal fields.
+            logger.warning(
+                f"Background task {task_id} post-terminal step failed; "
+                f"task state left unchanged: {e}",
+                exc_info=True,
+            )
     except asyncio.CancelledError:
         logger.info(f"Background task {task_id} cancelled")
         raise

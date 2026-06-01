@@ -195,6 +195,133 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
     assert captured["agent_task"] == "重试"
 
 
+class _NoopAgentService:
+    def set_conversation_history(self, history):
+        pass
+
+    def set_execution_context_messages(self, messages):
+        pass
+
+    def set_recovered_skill_context(self, skill_context):
+        pass
+
+
+class _NoopBackgroundTaskManager:
+    async def wait_for_previous(self, task_id):
+        pass
+
+    def cleanup_task(self, task_id):
+        pass
+
+
+def _wire_execute_task_background(monkeypatch, db_session, manager, agent_manager):
+    def fake_get_db():
+        yield db_session
+
+    def fake_release(db, task_id, *, status):
+        return True
+
+    monkeypatch.setattr(
+        websocket_api, "background_task_manager", _NoopBackgroundTaskManager()
+    )
+    monkeypatch.setattr(websocket_api, "manager", manager)
+    monkeypatch.setattr(
+        websocket_api, "release_current_runner_task_lease", fake_release
+    )
+    monkeypatch.setattr(database_models, "get_db", fake_get_db)
+    monkeypatch.setattr(
+        "xagent.web.services.chat_history_service.persist_assistant_message",
+        lambda *args, **kwargs: None,
+    )
+
+
+@pytest.mark.asyncio
+async def test_completion_broadcast_failure_keeps_task_completed(
+    db_session, monkeypatch
+):
+    """A failure in the post-completion broadcast must not rewrite an
+    already-COMPLETED task as FAILED or clobber error_message, and must
+    not emit a contradictory task_error event."""
+    user = _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=10, user_id=1, status=TaskStatus.RUNNING)
+
+    sent_events: list[object] = []
+
+    class BroadcastManager:
+        async def broadcast_to_task(self, event, task_id):
+            etype = event.get("type") if isinstance(event, dict) else None
+            sent_events.append(etype)
+            if etype == "task_completed":
+                raise RuntimeError("websocket client disconnected")
+
+    class AgentManager:
+        async def get_agent_for_task(self, task_id, db, user=None):
+            return _NoopAgentService()
+
+        async def execute_task(self, **kwargs):
+            return {"success": True, "output": "ok", "file_outputs": []}
+
+    _wire_execute_task_background(
+        monkeypatch, db_session, BroadcastManager(), AgentManager()
+    )
+
+    await execute_task_background(
+        task_id=10,
+        user_message="hi",
+        context={},
+        agent_manager=AgentManager(),
+        user_id=int(user.id),
+        llm_user_message="hi",
+    )
+
+    db_session.expire_all()
+    task = db_session.query(Task).filter(Task.id == 10).first()
+    assert task.status == TaskStatus.COMPLETED
+    assert task.error_message is None
+    assert "task_completed" in sent_events
+    assert "task_error" not in sent_events
+
+
+@pytest.mark.asyncio
+async def test_execution_failure_marks_failed_with_real_error(db_session, monkeypatch):
+    """A genuine execution failure (task still RUNNING) records the real
+    exception text, flips the row to FAILED, and notifies clients."""
+    user = _create_user(db_session, 1, "owner")
+    _create_task(db_session, task_id=11, user_id=1, status=TaskStatus.RUNNING)
+
+    sent_events: list[object] = []
+
+    class BroadcastManager:
+        async def broadcast_to_task(self, event, task_id):
+            sent_events.append(event.get("type") if isinstance(event, dict) else None)
+
+    class AgentManager:
+        async def get_agent_for_task(self, task_id, db, user=None):
+            return _NoopAgentService()
+
+        async def execute_task(self, **kwargs):
+            raise RuntimeError("agent boom xyz")
+
+    _wire_execute_task_background(
+        monkeypatch, db_session, BroadcastManager(), AgentManager()
+    )
+
+    await execute_task_background(
+        task_id=11,
+        user_message="hi",
+        context={},
+        agent_manager=AgentManager(),
+        user_id=int(user.id),
+        llm_user_message="hi",
+    )
+
+    db_session.expire_all()
+    task = db_session.query(Task).filter(Task.id == 11).first()
+    assert task.status == TaskStatus.FAILED
+    assert task.error_message == "agent boom xyz"
+    assert "task_error" in sent_events
+
+
 def test_build_uploaded_files_context_includes_agent_builder_kb_instruction():
     context = _build_uploaded_files_context(
         [
