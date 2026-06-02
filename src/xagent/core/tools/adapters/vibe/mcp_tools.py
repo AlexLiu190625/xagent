@@ -45,16 +45,18 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     # agent wants, drop configs for any server outside that set BEFORE
     # ``_create_mcp_tools_from_configs`` runs -- the latter performs the
     # actual session initialization (network I/O), which is the real
-    # cost we want to avoid. Server names are normalized the same way
-    # ``chat.py._build_selection_spec_from_categories`` and
-    # ``mcp_adapter.py`` normalize them (spaces and hyphens -> underscore)
-    # so the comparison matches across both sides.
+    # cost we want to avoid. Both sides go through the single
+    # ``normalize_mcp_server_name`` SSOT (strip + spaces/hyphens ->
+    # underscore + case-fold) so a "gmail" selector matches a "Gmail"
+    # config and stray whitespace doesn't silently drop the server.
     if spec is not None and spec.mcp_servers is not None:
+        from .selection_spec import normalize_mcp_server_name
+
+        wanted = {normalize_mcp_server_name(s) for s in spec.mcp_servers}
         mcp_configs = [
             cfg
             for cfg in mcp_configs
-            if cfg.get("name", "").replace(" ", "_").replace("-", "_")
-            in spec.mcp_servers
+            if normalize_mcp_server_name(cfg.get("name", "")) in wanted
         ]
         if not mcp_configs:
             return []

@@ -53,6 +53,27 @@ from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
 
 
+def normalize_mcp_server_name(name: str) -> str:
+    """SSOT for matching an MCP server selector against server-config
+    names and generated tool names.
+
+    Folds the same transform used when naming MCP / Custom-API tools
+    (spaces / hyphens -> underscore), strips surrounding whitespace, and
+    case-folds so the match is case-insensitive. Every server-name MATCH
+    site must use this:
+
+      - :meth:`ToolSelectionSpec.from_raw` (parse ``mcp:<server>``),
+      - the per-server config filter in ``mcp_tools.create_mcp_tools``,
+      - :meth:`_SpecByCategories.compute_allowed_names`.
+
+    so a selector like ``"mcp: Gmail"`` / ``"mcp:gmail"`` reliably matches
+    a ``"Gmail"`` server. Tool-name GENERATION (``mcp_adapter`` /
+    ``api_tool_adapter``) intentionally keeps the original case for the
+    LLM-visible name; the case-insensitive match here tolerates that.
+    """
+    return name.strip().replace(" ", "_").replace("-", "_").lower()
+
+
 class ToolSelectionSpec(ABC):
     """Sealed type for tool selection.
 
@@ -241,12 +262,7 @@ class ToolSelectionSpec(ABC):
         derived_mcp_servers: Set[str] = set()
         for entry in tool_categories:
             if isinstance(entry, str) and entry.startswith("mcp:"):
-                # ``.strip()`` first so ``"mcp: Gmail"`` (stray space after
-                # the colon) normalizes to ``Gmail`` rather than ``_Gmail``,
-                # which would never match ``mcp_<server>_*`` downstream.
-                server_name = (
-                    entry.split(":", 1)[1].strip().replace(" ", "_").replace("-", "_")
-                )
+                server_name = normalize_mcp_server_name(entry.split(":", 1)[1])
                 derived_mcp_servers.add(server_name)
             else:
                 plain_cats.add(entry)
@@ -490,7 +506,9 @@ class _SpecByCategories(ToolSelectionSpec):
         Duck-typed access to ``tool.metadata.category`` keeps this module
         free of any Tool / AbstractBaseTool import.
         """
-        norm_servers = {s.lower() for s in (self.mcp_servers or frozenset())}
+        norm_servers = {
+            normalize_mcp_server_name(s) for s in (self.mcp_servers or frozenset())
+        }
         names: Set[str] = set()
         for tool in all_tools:
             if not (hasattr(tool, "metadata") and hasattr(tool.metadata, "category")):

@@ -609,7 +609,7 @@ async def test_e2e_mcp_server_form_extracts_servers_and_includes_mcp(static_crea
     assert spec.categories == frozenset({"basic", "file", "knowledge"})
     assert "mcp" not in spec.categories
     assert "other" not in spec.categories
-    assert spec.mcp_servers == frozenset({"Gmail"})
+    assert spec.mcp_servers == frozenset({"gmail"})
     assert spec.includes_mcp() is True
     assert spec.includes_custom_api() is True
 
@@ -641,7 +641,7 @@ async def test_e2e_mcp_server_name_normalization_matches_prod_shape(static_creat
     # All three server names normalized identically to the way
     # mcp_tools.create_mcp_tools normalizes the prod ``mcp_configs[i]["name"]``
     # field when applying the per-server filter.
-    assert spec.mcp_servers == frozenset({"Google_Calendar", "Google_Drive", "HubSpot"})
+    assert spec.mcp_servers == frozenset({"google_calendar", "google_drive", "hubspot"})
 
 
 async def test_e2e_empty_categories_yields_none_spec(static_creators):
@@ -778,7 +778,7 @@ def test_mcp_server_form_tolerates_stray_whitespace() -> None:
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp: Gmail"])
-    assert spec.mcp_servers == frozenset({"Gmail"})
+    assert spec.mcp_servers == frozenset({"gmail"})
     result = spec.compute_allowed_names(
         [
             _mock_tool("mcp_gmail_send_message", "mcp"),
@@ -786,6 +786,29 @@ def test_mcp_server_form_tolerates_stray_whitespace() -> None:
         ],
     )
     assert sorted(result or []) == ["mcp_gmail_send_message"]
+
+
+def test_normalize_mcp_server_name_ssot() -> None:
+    """The single normalizer: strip + spaces/hyphens->underscore + lower."""
+    from xagent.core.tools.adapters.vibe.selection_spec import (
+        normalize_mcp_server_name,
+    )
+
+    assert normalize_mcp_server_name(" Gmail ") == "gmail"
+    assert normalize_mcp_server_name("Google Drive") == "google_drive"
+    assert normalize_mcp_server_name("Hub-Spot") == "hub_spot"
+
+
+def test_mcp_server_match_is_case_insensitive_vs_real_tool_name() -> None:
+    """A lowercase ``mcp:gmail`` selector matches a tool named
+    ``mcp_Gmail_*``. ``mcp_adapter`` generates tool names preserving the
+    config-name case; server matching is case-insensitive via the SSOT,
+    so the two reconcile without forcing tool names to lowercase."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:gmail"])
+    result = spec.compute_allowed_names(
+        [_mock_tool("mcp_Gmail_send_message", "mcp")],  # mixed case (real shape)
+    )
+    assert sorted(result or []) == ["mcp_Gmail_send_message"]
 
 
 def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
@@ -1523,7 +1546,7 @@ def test_compute_allowed_names_plain_mcp_wins_over_server_scope():
     tools; the parallel server scope does not narrow it (plain wins)."""
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp", "mcp:Gmail"])
     assert "mcp" in spec.categories
-    assert spec.mcp_servers == frozenset({"Gmail"})
+    assert spec.mcp_servers == frozenset({"gmail"})
     result = spec.compute_allowed_names(
         [
             _mock_tool("mcp_gmail_send", "mcp"),
