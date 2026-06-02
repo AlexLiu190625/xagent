@@ -855,6 +855,22 @@ def test_server_scope_match_is_independent_of_tool_name() -> None:
     assert sorted(result or []) == ["totally_unrelated_name"]
 
 
+def test_empty_source_server_never_matches_scope() -> None:
+    """A degenerate ``mcp:`` selector (empty server) normalizes to ``""``;
+    a tool whose ``source_server`` is empty/whitespace-only also normalizes
+    to ``""``. The truthy guard prevents that accidental equality from
+    admitting an origin-less tool under a scope."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:"])
+    assert spec.mcp_servers == frozenset({""})
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_send", "mcp", source_server=""),
+            _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
+        ],
+    )
+    assert result == frozenset()
+
+
 def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
     """User selected an MCP server whose tools aren't registered (e.g.
     server config exists but no tools loaded). The result is an

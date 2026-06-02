@@ -534,8 +534,10 @@ class _SpecByCategories(ToolSelectionSpec):
             # identity (set + normalized once at generation) equals a scoped
             # server. Covers MCP tools and their Custom-API wrapper uniformly,
             # with no tool-name re-parsing / case / strip / startswith-vs-==.
+            # ``src`` is truthy-checked so a tool with no origin (None) or an
+            # empty/whitespace-only server identity never matches a scope.
             src = getattr(tool.metadata, "source_server", None)
-            if norm_servers and src is not None and src in norm_servers:
+            if norm_servers and src and src in norm_servers:
                 names.add(tool_name)
                 continue
 
