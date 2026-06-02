@@ -272,37 +272,47 @@ class TaskTurnOrchestrator:
         # bg-inflight guard before any DB write (see note 1 in docstring).
         _refuse_if_bg_inflight(task_id)
 
-        # Off-loop atomic claim + persist + commit. Only raises pre-commit
-        # (bg-inflight already handled above; busy / not-found here), so
-        # reaching the next line means the row is committed RUNNING.
-        claimed = await asyncio.to_thread(
-            _begin_turn_atomic_sync,
-            task_id,
-            user_id,
-            payload=payload,
-            kind=kind,
-        )
-
-        # Point of no return: the row is RUNNING. ``_schedule_bg`` is
-        # synchronous (no await), so there is no suspension point between
-        # the commit and the schedule; any failure here (or a CancelledError
-        # delivered at the ``to_thread`` resume above) must force the task
-        # FAILED so it isn't left RUNNING with no worker.
-        try:
-            bg_task = _schedule_bg(
-                task_id=task_id,
-                user_id=user_id,
-                task_source=claimed.task_source,
+        # The claim and the schedule must be atomic with respect to
+        # cancellation: once the claim commits, the row is RUNNING, so the bg
+        # run MUST be scheduled (or the task forced FAILED) -- otherwise a
+        # CancelledError landing at the ``to_thread`` resume, after the commit,
+        # would strand the row as RUNNING with no worker. Running both inside
+        # ``asyncio.shield`` lets them finish even when ``begin_turn``'s caller
+        # is cancelled.
+        async def _claim_and_schedule() -> tuple[_ClaimedTurn, "asyncio.Task[None]"]:
+            # Off-loop atomic claim + persist + commit. Only raises pre-commit
+            # (busy / not-found), so a normal exception here means nothing was
+            # committed; reaching the schedule means the row is RUNNING.
+            res = await asyncio.to_thread(
+                _begin_turn_atomic_sync,
+                task_id,
+                user_id,
                 payload=payload,
-                force_fresh=force_fresh,
-                context=context,
-                before_message_id=claimed.before_message_id,
+                kind=kind,
             )
-        except BaseException:
-            _mark_task_failed_if_running(
-                task_id, "turn scheduling failed after claim commit"
-            )
-            raise
+            try:
+                handle = _schedule_bg(
+                    task_id=task_id,
+                    user_id=user_id,
+                    task_source=res.task_source,
+                    payload=payload,
+                    force_fresh=force_fresh,
+                    context=context,
+                    before_message_id=res.before_message_id,
+                )
+            except BaseException:
+                # Schedule failed after the claim committed -> force FAILED so
+                # the row isn't left RUNNING. Off-loop, so the error path also
+                # keeps the goal of no synchronous DB on the event loop.
+                await asyncio.to_thread(
+                    _mark_task_failed_if_running,
+                    task_id,
+                    "turn scheduling failed after claim commit",
+                )
+                raise
+            return res, handle
+
+        claimed, bg_task = await asyncio.shield(_claim_and_schedule())
 
         return TurnStarted(
             task_id=task_id,

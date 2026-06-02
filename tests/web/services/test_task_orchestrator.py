@@ -32,6 +32,7 @@ from xagent.web.services.task_orchestrator import (
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
+    _ClaimedTurn,
     _schedule_bg,
     finish_turn,
 )
@@ -380,6 +381,55 @@ async def test_begin_turn_marks_failed_when_schedule_raises(
 
     db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> None:
+    """Cancellation safety: if begin_turn's caller is cancelled while the
+    off-loop claim is in flight (which commits RUNNING in a worker thread),
+    ``asyncio.shield`` must still let the claim+schedule finish, so a committed
+    RUNNING task is never left with no scheduled worker."""
+    import time as _time
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+
+    def slow_claim(task_id, user_id, *, payload, kind):
+        _time.sleep(0.15)  # window during which we cancel the caller
+        return _ClaimedTurn(
+            status=TaskStatus.RUNNING,
+            updated_at=datetime.now(timezone.utc),
+            before_message_id=1,
+            task_source="sdk",
+        )
+
+    sched = MagicMock(return_value=MagicMock())
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator._begin_turn_atomic_sync",
+            new=slow_claim,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator._schedule_bg",
+            new=sched,
+        ),
+    ):
+        t = asyncio.create_task(
+            TaskTurnOrchestrator.begin_turn(
+                task_id=int(task.id),
+                user_id=int(user.id),
+                payload=TaskTurnPayload("x"),
+                kind=TurnKind.CREATE,
+            )
+        )
+        await asyncio.sleep(0.05)  # let it enter the off-loop claim
+        t.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await t
+        # The shielded inner keeps running; give it time to finish.
+        await asyncio.sleep(0.3)
+
+    sched.assert_called_once()  # scheduled despite the cancellation
 
 
 @pytest.mark.asyncio
