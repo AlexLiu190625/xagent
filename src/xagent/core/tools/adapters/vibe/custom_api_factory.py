@@ -19,15 +19,16 @@ logger = logging.getLogger(__name__)
 async def create_db_custom_api_tools(config: BaseToolConfig) -> Sequence[Tool]:
     """Create Custom API tools from database configurations.
 
-    Internal short-circuit via ``ToolSelectionSpec.includes_custom_api()``:
-    when the spec explicitly excludes Custom APIs (empty
-    ``custom_api_ids`` frozenset), this creator returns early WITHOUT
-    calling ``config.get_custom_api_configs()`` — that call goes
-    through the DB to enumerate the user's Custom API rows. No
-    ``categories=`` is declared on the registration because Custom
-    API tools currently surface under multiple operative categories
-    in the UI; registry-level skip therefore relies on the per-
-    creator short-circuit rather than a static category annotation.
+    Internal short-circuit via ``ToolSelectionSpec.includes_custom_api()``
+    (``"other" in categories or bool(mcp_servers)``): when the spec
+    selects neither the ``"other"`` category nor any ``mcp:<server>``
+    scope, this creator returns early WITHOUT calling
+    ``config.get_custom_api_configs()`` — that call goes through the DB
+    to enumerate the user's Custom API rows. The creator is registered
+    bare (no ``categories=``), so the registry always dispatches it;
+    selection is enforced by this per-creator short-circuit plus the
+    post-build ``compute_allowed_names`` ``source_server`` filter, not a
+    static category annotation.
 
     Args:
         config: The tool configuration containing user/workspace context.

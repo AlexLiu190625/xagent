@@ -309,8 +309,8 @@ class _MCPConfig:
 
 
 async def test_mcp_per_server_filter_skips_non_matching_configs(monkeypatch):
-    """The MCP creator must filter ``mcp_configs`` by
-    ``spec.mcp_servers`` BEFORE handing them to
+    """A server-only selection (``mcp:Gmail``) must filter ``mcp_configs``
+    via ``spec.scoped_mcp_servers()`` BEFORE handing them to
     ``_create_mcp_tools_from_configs`` -- the latter does the network
     session-initialize work whose cost we want to avoid.
 
@@ -338,10 +338,7 @@ async def test_mcp_per_server_filter_skips_non_matching_configs(monkeypatch):
         {"name": "Google Drive"},
         {"name": "Slack"},
     ]
-    spec = ToolSelectionSpec(
-        categories=frozenset({"mcp"}),
-        mcp_servers=frozenset({"Gmail"}),
-    )
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
     cfg = _MCPConfig(servers, selection_spec=spec)
 
     await mcp_tools.create_mcp_tools(cfg)
@@ -375,12 +372,9 @@ async def test_mcp_per_server_filter_normalizes_whitespace(monkeypatch):
         {"name": "Google Drive"},
         {"name": "Slack"},
     ]
-    # Spec contains the normalized form (matches how
-    # _build_selection_spec_from_categories assembles it).
-    spec = ToolSelectionSpec(
-        categories=frozenset({"mcp"}),
-        mcp_servers=frozenset({"Google_Drive"}),
-    )
+    # from_raw normalizes "Google Drive" -> "google_drive" on the selector
+    # side; the filter normalizes the config name the same way.
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Google Drive"])
     cfg = _MCPConfig(servers, selection_spec=spec)
 
     await mcp_tools.create_mcp_tools(cfg)
@@ -411,16 +405,45 @@ async def test_mcp_per_server_filter_empty_match_short_circuits(monkeypatch):
     )
 
     servers = [{"name": "Slack"}]
-    spec = ToolSelectionSpec(
-        categories=frozenset({"mcp"}),
-        mcp_servers=frozenset({"Gmail"}),
-    )
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
     cfg = _MCPConfig(servers, selection_spec=spec)
 
     result = await mcp_tools.create_mcp_tools(cfg)
 
     assert result == []
     assert call_count == 0  # short-circuit, no factory call
+
+
+async def test_mcp_parent_category_forwards_all_servers(monkeypatch):
+    """Parent/child rule (③): when the plain ``"mcp"`` parent is present
+    alongside a ``mcp:<server>`` child, ``scoped_mcp_servers()`` returns
+    ``None`` (no restriction), so the pre-build filter forwards EVERY
+    server -- consistent with ``compute_allowed_names`` admitting all MCP
+    tools. The earlier behavior wrongly initialized only the child server."""
+    from xagent.core.tools.adapters.vibe import mcp_tools
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    received = []
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        received.append(mcp_configs)
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+
+    servers = [{"name": "Gmail"}, {"name": "Slack"}]
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp", "mcp:Gmail"])
+    assert spec.scoped_mcp_servers() is None
+    cfg = _MCPConfig(servers, selection_spec=spec)
+
+    await mcp_tools.create_mcp_tools(cfg)
+
+    assert len(received) == 1
+    assert [c["name"] for c in received[0]] == ["Gmail", "Slack"]
 
 
 async def test_mcp_no_per_server_filter_when_spec_lacks_servers(monkeypatch):
@@ -450,6 +473,46 @@ async def test_mcp_no_per_server_filter_when_spec_lacks_servers(monkeypatch):
 
     assert len(received) == 1
     assert [c["name"] for c in received[0]] == ["Gmail", "Slack"]
+
+
+def test_scoped_mcp_servers_parent_child_table() -> None:
+    """``scoped_mcp_servers()`` encodes the pre-build restriction in one
+    place: frozenset()=none, None=all (parent mcp / ALL), non-empty=scoped."""
+    raw = ToolSelectionSpec.from_raw
+    # server-only -> scoped to that server (normalized key)
+    assert raw(tool_categories=["mcp:Gmail"]).scoped_mcp_servers() == frozenset(
+        {"gmail"}
+    )
+    # plain parent -> unrestricted
+    assert raw(tool_categories=["mcp"]).scoped_mcp_servers() is None
+    # parent + child -> parent wins (unrestricted)
+    assert raw(tool_categories=["mcp", "mcp:Gmail"]).scoped_mcp_servers() is None
+    # unconfigured (_SpecAll) -> unrestricted (维持现状)
+    assert raw(tool_categories=[]).scoped_mcp_servers() is None
+    # explicit none -> initialize nothing
+    assert raw(explicit_none=True).scoped_mcp_servers() == frozenset()
+    # category without mcp -> nothing
+    assert raw(tool_categories=["basic"]).scoped_mcp_servers() == frozenset()
+
+
+def test_should_run_creator_mcp_gate_dispatches_server_only() -> None:
+    """① regression pin: the MCP creator's ``selection_gate="mcp"`` must
+    dispatch on ``spec.includes_mcp()``, NOT category intersection, so a
+    server-only ``mcp:Gmail`` spec (categories=frozenset()) still runs it."""
+    from xagent.core.tools.adapters.vibe.factory import ToolRegistry
+
+    declared = frozenset({"mcp"})
+    server_only = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
+    assert server_only.categories == frozenset()  # the trap: empty categories
+    assert ToolRegistry._should_run_creator(declared, server_only, "mcp") is True
+
+    # A non-MCP selection must still skip the MCP creator.
+    basic_only = ToolSelectionSpec.from_raw(tool_categories=["basic"])
+    assert ToolRegistry._should_run_creator(declared, basic_only, "mcp") is False
+
+    # Without the gate (category intersection) the server-only spec would
+    # wrongly be skipped -- this documents why the gate is required.
+    assert ToolRegistry._should_run_creator(declared, server_only, None) is False
 
 
 # ----- factory.py:194 allowed_tools=[] semantic fix ----------------------

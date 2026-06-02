@@ -11,24 +11,23 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-@register_tool(categories={"mcp"})
+@register_tool(categories={"mcp"}, selection_gate="mcp")
 async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     """Create MCP tools from configuration.
 
+    Registry dispatch goes through ``selection_gate="mcp"`` ->
+    ``spec.includes_mcp()`` (see ``ToolRegistry._should_run_creator``),
+    not the plain category intersection: a ``mcp:<server>`` scope lands
+    in ``mcp_servers`` only and leaves ``categories`` without ``"mcp"``,
+    so a category-only gate would skip this creator for server-only specs.
+
     Internal short-circuit via ``ToolSelectionSpec.includes_mcp()``:
-    when the spec explicitly excludes MCP (either by omitting ``"mcp"``
-    from ``categories`` or by setting ``mcp_servers`` to an empty
-    frozenset), this creator returns early WITHOUT calling
+    when the spec excludes MCP this creator returns early WITHOUT calling
     ``config.get_mcp_server_configs()`` — that call goes through the
     MCP server scan / DB lookup / per-server session-initialize path
     which dominates the 25-30s setup window for tasks that don't
-    actually want MCP tools (see issue #427).
-
-    Registry-level skip (``categories={"mcp"}``) handles the case
-    where the spec's ``categories`` set doesn't include ``"mcp"`` at
-    all; the internal check covers the finer "include MCP category
-    but no servers" case and the legacy spec=None backward-compat
-    path.
+    actually want MCP tools (see issue #427). The check is redundant with
+    the dispatch gate but kept as defense and to cover the spec=None path.
     """
     spec = (
         config.get_tool_selection_spec()
@@ -41,25 +40,30 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     if not mcp_configs:
         return []
 
-    # Per-server filter: when the spec restricts which MCP servers the
-    # agent wants, drop configs for any server outside that set BEFORE
-    # ``_create_mcp_tools_from_configs`` runs -- the latter performs the
-    # actual session initialization (network I/O), which is the real
-    # cost we want to avoid. Both sides go through the single
-    # ``normalize_mcp_server_name`` SSOT (strip + spaces/hyphens ->
-    # underscore + case-fold) so a "gmail" selector matches a "Gmail"
-    # config and stray whitespace doesn't silently drop the server.
-    if spec is not None and spec.mcp_servers is not None:
-        from .selection_spec import normalize_mcp_server_name
-
-        wanted = {normalize_mcp_server_name(s) for s in spec.mcp_servers}
-        mcp_configs = [
-            cfg
-            for cfg in mcp_configs
-            if normalize_mcp_server_name(cfg.get("name", "")) in wanted
-        ]
-        if not mcp_configs:
+    # Pre-build per-server restriction comes from the single policy method
+    # ``spec.scoped_mcp_servers()`` so it stays consistent with the parent/
+    # child rule ``compute_allowed_names`` applies post-build:
+    #   - frozenset(): MCP not selected -> initialize nothing.
+    #   - None: no restriction (plain "mcp" parent, or ALL) -> keep all.
+    #   - non-empty: keep only those servers.
+    # Dropping configs here matters because ``_create_mcp_tools_from_configs``
+    # performs the actual session initialization (network I/O). The config
+    # ``name`` is folded through the same ``normalize_mcp_server_name`` SSOT
+    # as the scoped keys, so case / whitespace / hyphen never drop a server.
+    if spec is not None:
+        scoped = spec.scoped_mcp_servers()
+        if scoped == frozenset():
             return []
+        if scoped is not None:
+            from .selection_spec import normalize_mcp_server_name
+
+            mcp_configs = [
+                cfg
+                for cfg in mcp_configs
+                if normalize_mcp_server_name(cfg.get("name", "")) in scoped
+            ]
+            if not mcp_configs:
+                return []
 
     try:
         from .factory import ToolFactory

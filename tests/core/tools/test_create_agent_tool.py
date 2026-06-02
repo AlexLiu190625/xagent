@@ -2090,6 +2090,93 @@ class TestCreateAndCallAgent:
             # folds), matched at build time against each tool's
             # metadata.source_server.
             assert spec.mcp_servers == frozenset({"linkedin"})
+            # Delegated WebToolConfig single-sources the MCP-init decision
+            # from the spec (includes_mcp()), instead of falling back to the
+            # default True. An mcp:<server> selection -> include_mcp_tools True.
+            assert tool_config._include_mcp_tools is True
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    async def test_delegated_basic_agent_disables_mcp_init(self) -> None:
+        """A delegated agent that did not select MCP (``tool_categories``
+        without ``mcp``) must build its WebToolConfig with
+        ``include_mcp_tools=False`` -- so it does not pay MCP server init.
+        Before single-sourcing this from the spec it fell back to the
+        WebToolConfig default ``True`` (divergent MCP-init decision)."""
+        db, db_path = _create_session()
+        try:
+            user = User(username="basicdeleg", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            model = Model(
+                model_id="test-model-id",
+                category="llm",
+                model_provider="openai",
+                model_name="gpt-4",
+                api_key="test-api-key",
+                base_url="https://api.openai.com/v1",
+                temperature=0.7,
+                abilities=["chat"],
+            )
+            db.add(model)
+            db.commit()
+            db.refresh(model)
+
+            agent = Agent(
+                user_id=user.id,
+                name="Basic Assistant",
+                description="Nested non-MCP agent",
+                instructions="You are delegated.",
+                status=AgentStatus.PUBLISHED,
+                models={"general": model.id},
+                tool_categories=["basic"],
+            )
+            db.add(agent)
+            db.commit()
+            db.refresh(agent)
+
+            tool = AgentTool(
+                agent_id=agent.id,
+                agent_name=agent.name,
+                agent_description=agent.description or "",
+                db=db,
+                user_id=user.id,
+                task_id="parent-task-basic",
+            )
+
+            with (
+                patch(
+                    "xagent.web.services.llm_utils.UserAwareModelStorage"
+                ) as mock_storage_class,
+                patch(
+                    "xagent.core.agent.service.AgentService"
+                ) as mock_agent_service_class,
+                patch("xagent.core.memory.in_memory.InMemoryMemoryStore"),
+            ):
+                mock_storage = Mock()
+                mock_llm = Mock()
+                mock_storage.get_llm_by_name_with_access.return_value = mock_llm
+                mock_storage_class.return_value = mock_storage
+
+                mock_agent_service = mock_agent_service_class.return_value
+                mock_agent_service.execute_task = AsyncMock(
+                    return_value={"output": "nested response"}
+                )
+
+                await tool.run_json_async({"task": "do basic work"})
+
+            tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
+            spec = tool_config.get_tool_selection_spec()
+            assert spec.includes_mcp() is False
+            assert tool_config._include_mcp_tools is False
         finally:
             db.close()
             try:

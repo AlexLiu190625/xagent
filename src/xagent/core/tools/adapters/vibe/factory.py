@@ -140,6 +140,14 @@ class ToolRegistry:
         if selection_gate == "published_agent":
             return spec.includes_published_agent()
 
+        if selection_gate == "mcp":
+            # ``mcp:<server>`` scopes land in ``mcp_servers`` only, leaving
+            # ``categories`` without ``"mcp"``. Dispatch must read the spec's
+            # own MCP predicate (which honors both the plain ``"mcp"`` category
+            # and a server scope) rather than the category intersection below,
+            # or a server-only spec would skip the MCP creator entirely.
+            return spec.includes_mcp()
+
         if declared_cats & spec.categories:
             return True
 

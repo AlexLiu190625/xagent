@@ -161,6 +161,24 @@ class ToolSelectionSpec(ABC):
     def includes_published_agent(self) -> bool:
         """Whether the Published Agent delegation creators should run."""
 
+    @abstractmethod
+    def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
+        """Pre-build MCP server restriction for the MCP creator.
+
+        The MCP creator initializes server sessions (network I/O) before
+        any tool name exists, so it filters at the config level. This
+        method is the single source of that restriction, kept consistent
+        with the parent/child rule ``compute_allowed_names`` applies
+        post-build:
+
+          - ``frozenset()`` — MCP is not selected; do not initialize any
+            MCP server.
+          - ``None`` — MCP is selected without a server restriction
+            (the plain ``"mcp"`` parent is present, or ALL mode); initialize
+            every MCP server.
+          - non-empty — initialize only these normalized server keys.
+        """
+
     # ── Final name-level filter ───────────────────────────────────
 
     @abstractmethod
@@ -354,6 +372,12 @@ class _SpecAll(ToolSelectionSpec):
             return False
         return True
 
+    def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
+        # ALL mode: MCP selected without restriction -> initialize every
+        # server. (``includes_mcp()`` already honors the legacy
+        # explicit-empty ``mcp_servers`` exclude before the creator runs.)
+        return None
+
     def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
         # None signals "no name-level filter" -- factory keeps
         # every tool returned by the registry.
@@ -393,6 +417,10 @@ class _SpecNone(ToolSelectionSpec):
 
     def includes_published_agent(self) -> bool:
         return False
+
+    def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
+        # NONE mode: MCP not selected -> initialize no servers.
+        return frozenset()
 
     def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
         # Empty frozenset signals "filter to []" -- factory drops
@@ -488,6 +516,16 @@ class _SpecByCategories(ToolSelectionSpec):
         if self.published_agent_ids is not None and len(self.published_agent_ids) == 0:
             return False
         return "agent" in self.categories or bool(self.published_agent_ids)
+
+    def scoped_mcp_servers(self) -> Optional[frozenset[str]]:
+        # Parent/child rule, identical to what compute_allowed_names applies
+        # post-build: the plain "mcp" parent admits every server, so it means
+        # "no restriction" (None). A server-only selection restricts to its
+        # set. No MCP selected -> empty (initialize nothing). Mirrors
+        # includes_mcp(): when that is False this returns frozenset().
+        if "mcp" in self.categories:
+            return None
+        return self.mcp_servers or frozenset()
 
     def compute_allowed_names(self, all_tools: List[Any]) -> Optional[frozenset[str]]:
         """Filter ``all_tools`` by ``categories`` + ``mcp_servers``,

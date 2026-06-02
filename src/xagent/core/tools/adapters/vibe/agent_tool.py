@@ -1770,6 +1770,16 @@ class AgentTool(AbstractBaseTool):
                 else None,
                 allowed_skills=agent.skills,
                 tool_selection_spec=tool_selection_spec,
+                # Single-source the MCP-init decision from the spec, same as
+                # the chat path (chat.py:_spec_wants_mcp). Without this the
+                # delegated WebToolConfig falls back to include_mcp_tools=True
+                # and pays MCP server init even for agents that didn't select
+                # MCP. Unconfigured (_SpecAll) keeps include_mcp_tools=True.
+                include_mcp_tools=(
+                    tool_selection_spec.includes_mcp()
+                    if tool_selection_spec is not None
+                    else True
+                ),
                 allowed_agent_ids=self._delegation_allowed_agent_ids,
                 agent_tool_overrides=self._agent_tool_overrides,
                 enable_global_agent_tools=self._enable_global_agent_tools,
