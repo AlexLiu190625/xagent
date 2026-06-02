@@ -241,7 +241,12 @@ class ToolSelectionSpec(ABC):
         derived_mcp_servers: Set[str] = set()
         for entry in tool_categories:
             if isinstance(entry, str) and entry.startswith("mcp:"):
-                server_name = entry.split(":", 1)[1].replace(" ", "_").replace("-", "_")
+                # ``.strip()`` first so ``"mcp: Gmail"`` (stray space after
+                # the colon) normalizes to ``Gmail`` rather than ``_Gmail``,
+                # which would never match ``mcp_<server>_*`` downstream.
+                server_name = (
+                    entry.split(":", 1)[1].strip().replace(" ", "_").replace("-", "_")
+                )
                 derived_mcp_servers.add(server_name)
             else:
                 plain_cats.add(entry)

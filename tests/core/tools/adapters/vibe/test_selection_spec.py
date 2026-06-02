@@ -771,6 +771,23 @@ def test_select_allowed_tool_names_mcp_server_form() -> None:
     ]
 
 
+def test_mcp_server_form_tolerates_stray_whitespace() -> None:
+    """``"mcp: Gmail"`` (stray space after the colon) must normalize to
+    ``Gmail`` and still match ``mcp_gmail_*`` -- not ``_Gmail`` which
+    would silently match nothing."""
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp: Gmail"])
+    assert spec.mcp_servers == frozenset({"Gmail"})
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_gmail_send_message", "mcp"),
+            _mock_tool("mcp_slack_send", "mcp"),
+        ],
+    )
+    assert sorted(result or []) == ["mcp_gmail_send_message"]
+
+
 def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
     """User selected an MCP server whose tools aren't registered (e.g.
     server config exists but no tools loaded). The result is an
