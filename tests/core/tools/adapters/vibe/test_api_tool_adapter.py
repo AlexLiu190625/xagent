@@ -19,6 +19,10 @@ def test_custom_api_tool_init():
     )
 
     assert tool.name == "api_my_test_api_call"
+    # Structured originating-server identity, normalized once via the SSOT,
+    # so a scoped mcp:<server> selector matches this wrapper by equality.
+    assert tool.source_server == "my_test_api"
+    assert tool.metadata.source_server == "my_test_api"
     assert "A test API" in tool.description
     assert "Configured endpoint: https://api.example.com/hello" in tool.description
     assert "Configured method: POST" in tool.description

@@ -66,6 +66,7 @@ class MCPToolAdapter(AbstractBaseTool):
         name_prefix: Optional[str] = None,
         visibility: Optional[ToolVisibility] = None,
         allow_users: Optional[List[str]] = None,
+        source_server: Optional[str] = None,
     ):
         """Initialize MCP tool adapter.
 
@@ -75,12 +76,17 @@ class MCPToolAdapter(AbstractBaseTool):
             name_prefix: Optional prefix for tool name (e.g., "mcp_")
             visibility: Tool visibility setting
             allow_users: List of allowed user IDs
+            source_server: Normalized identity of the originating MCP server
+                (``normalize_mcp_server_name``), surfaced on
+                ``metadata.source_server`` so server-scoped selection matches
+                by structured equality rather than re-parsing the tool name.
         """
         self.mcp_tool = mcp_tool
         self.connection = connection
         self._name_prefix = name_prefix or ""
         self._visibility = visibility or ToolVisibility.PRIVATE
         self._allow_users = allow_users
+        self.source_server = source_server
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -481,12 +487,18 @@ def _build_mcp_tool_adapter(
     # Create tool name with server prefix
     tool_prefix = f"{name_prefix}{server_name}_" if name_prefix else f"{server_name}_"
 
+    # Carry the originating server identity as structured metadata, normalized
+    # once here through the same SSOT the selector parse / config filter use,
+    # so server-scoped selection matches by equality (no tool-name re-parse).
+    from .selection_spec import normalize_mcp_server_name
+
     return MCPToolAdapter(
         mcp_tool=mcp_tool,
         connection=connection,
         name_prefix=tool_prefix,
         visibility=visibility,
         allow_users=allow_users,
+        source_server=normalize_mcp_server_name(server_name),
     )
 
 

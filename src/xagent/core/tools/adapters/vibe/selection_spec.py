@@ -54,22 +54,24 @@ from typing import Any, List, Optional, Set
 
 
 def normalize_mcp_server_name(name: str) -> str:
-    """SSOT for matching an MCP server selector against server-config
-    names and generated tool names.
+    """SSOT for normalizing an MCP / Custom-API server identity.
 
-    Folds the same transform used when naming MCP / Custom-API tools
-    (spaces / hyphens -> underscore), strips surrounding whitespace, and
-    case-folds so the match is case-insensitive. Every server-name MATCH
-    site must use this:
+    Strips surrounding whitespace, folds spaces / hyphens to underscore,
+    and case-folds, yielding a stable key for a server. Every site that
+    derives a server identity must use this single transform:
 
-      - :meth:`ToolSelectionSpec.from_raw` (parse ``mcp:<server>``),
-      - the per-server config filter in ``mcp_tools.create_mcp_tools``,
-      - :meth:`_SpecByCategories.compute_allowed_names`.
+      - :meth:`ToolSelectionSpec.from_raw` (parse ``mcp:<server>`` selector),
+      - the per-server config filter in ``mcp_tools.create_mcp_tools``
+        (server-config ``name``),
+      - tool GENERATION (``mcp_adapter`` / ``api_tool_adapter``), which
+        stamps the result onto ``metadata.source_server``.
 
-    so a selector like ``"mcp: Gmail"`` / ``"mcp:gmail"`` reliably matches
-    a ``"Gmail"`` server. Tool-name GENERATION (``mcp_adapter`` /
-    ``api_tool_adapter``) intentionally keeps the original case for the
-    LLM-visible name; the case-insensitive match here tolerates that.
+    Because both the selector and the tool's ``source_server`` pass through
+    here, server-scoped selection (``compute_allowed_names``) is a plain
+    equality check on normalized keys -- a ``"mcp: Gmail"`` / ``"mcp:gmail"``
+    selector reliably matches a ``"Gmail"`` server regardless of whitespace,
+    case, or hyphen/space. The LLM-visible tool ``name`` keeps its original
+    casing; only the structured ``source_server`` key is normalized.
     """
     return name.strip().replace(" ", "_").replace("-", "_").lower()
 
@@ -254,10 +256,10 @@ class ToolSelectionSpec(ABC):
         #
         # Whether the MCP / Custom-API creators run is derived from
         # ``includes_mcp()`` / ``includes_custom_api()`` (which read
-        # ``mcp_servers`` too); ``compute_allowed_names`` reads
-        # ``mcp_servers`` directly for the per-server name match. No
-        # support categories are injected and no raw ``mcp:<server>``
-        # string leaks into ``categories``.
+        # ``mcp_servers`` too); ``compute_allowed_names`` matches
+        # ``mcp_servers`` against each tool's structured
+        # ``metadata.source_server``. No support categories are injected and
+        # no raw ``mcp:<server>`` string leaks into ``categories``.
         plain_cats: Set[str] = set()
         derived_mcp_servers: Set[str] = set()
         for entry in tool_categories:
@@ -471,9 +473,9 @@ class _SpecByCategories(ToolSelectionSpec):
         # mcp:<server> also fronts a Custom-API wrapper
         # (api_<server>_call), so a server scope runs this creator too.
         # Filter happens in the creator via ``config.get_custom_api_configs``
-        # and ``compute_allowed_names``'s "other"/server matching -- there
-        # is no spec-level custom_api id list (ids can't be mapped to tool
-        # names in the spec layer).
+        # and ``compute_allowed_names``'s structured ``source_server`` match
+        # -- there is no spec-level custom_api id list (ids can't be mapped to
+        # tool names in the spec layer).
         return "other" in self.categories or bool(self.mcp_servers)
 
     def includes_published_agent(self) -> bool:
@@ -497,14 +499,19 @@ class _SpecByCategories(ToolSelectionSpec):
           - a tool whose category ∈ ``categories`` is admitted (plain
             ``"mcp"`` admits all MCP tools, ``"other"`` all Custom-API
             tools, etc.);
-          - otherwise an ``"mcp"`` tool is admitted when its name matches
-            a scoped server in ``mcp_servers`` (``mcp_<server>_*``);
-          - otherwise an ``"other"`` tool admits the scoped Custom-API
-            wrapper ``api_<server>_call``;
+          - otherwise a tool whose ``metadata.source_server`` matches a
+            scoped server in ``mcp_servers`` is admitted. ``source_server``
+            is the normalized originating-server identity set once at
+            generation (MCP adapter + Custom-API wrapper), so this is a
+            structured equality match -- the spec never re-parses the tool
+            name (``mcp_<server>_*`` / ``api_<server>_call``). A scoped
+            ``mcp:<server>`` therefore admits both the server's MCP tools
+            and its ``api_<server>_call`` wrapper, since both carry the same
+            ``source_server``;
           - finally ``name_allowlist`` names are unioned in.
 
-        Duck-typed access to ``tool.metadata.category`` keeps this module
-        free of any Tool / AbstractBaseTool import.
+        Duck-typed access to ``tool.metadata`` keeps this module free of any
+        Tool / AbstractBaseTool import.
         """
         norm_servers = {
             normalize_mcp_server_name(s) for s in (self.mcp_servers or frozenset())
@@ -523,19 +530,13 @@ class _SpecByCategories(ToolSelectionSpec):
                 names.add(tool_name)
                 continue
 
-            # Server-scoped MCP: mcp_<server>_* for a server in
-            # mcp_servers, even when plain "mcp" was not selected.
-            if category == "mcp" and norm_servers:
-                lname = tool_name.lower()
-                if any(lname.startswith(f"mcp_{server}_") for server in norm_servers):
-                    names.add(tool_name)
-                continue
-
-            # Server-scoped Custom-API wrapper: api_<server>_call.
-            if category == "other" and norm_servers:
-                lname = tool_name.lower()
-                if any(lname == f"api_{server}_call" for server in norm_servers):
-                    names.add(tool_name)
+            # Server-scoped admit: the tool's structured originating-server
+            # identity (set + normalized once at generation) equals a scoped
+            # server. Covers MCP tools and their Custom-API wrapper uniformly,
+            # with no tool-name re-parsing / case / strip / startswith-vs-==.
+            src = getattr(tool.metadata, "source_server", None)
+            if norm_servers and src is not None and src in norm_servers:
+                names.add(tool_name)
                 continue
 
         # Union the exact-name allow-list (workforce injection +

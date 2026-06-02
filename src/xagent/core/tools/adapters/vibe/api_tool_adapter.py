@@ -93,6 +93,14 @@ class CustomApiTool(AbstractBaseTool):
         else:
             self._name = f"api_{sanitized_name}_call"
 
+        # Structured originating-server identity, normalized once through the
+        # shared SSOT. A scoped mcp:<server> selector fronts this Custom-API
+        # wrapper, so server-scoped selection matches on this field by equality
+        # instead of re-parsing ``api_<server>_call``.
+        from .selection_spec import normalize_mcp_server_name
+
+        self.source_server = normalize_mcp_server_name(name)
+
         default_info = ""
         if url:
             default_info += f"\nConfigured endpoint: {url}"

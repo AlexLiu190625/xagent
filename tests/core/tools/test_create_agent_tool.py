@@ -2086,7 +2086,10 @@ class TestCreateAndCallAgent:
             # mcp_servers only, not in categories (no raw string leak).
             assert "mcp:LinkedIn" not in spec.categories
             assert "mcp" not in spec.categories
-            assert spec.mcp_servers == frozenset({"LinkedIn"})
+            # mcp_servers holds the normalized server key (SSOT lower-cases /
+            # folds), matched at build time against each tool's
+            # metadata.source_server.
+            assert spec.mcp_servers == frozenset({"linkedin"})
         finally:
             db.close()
             try:

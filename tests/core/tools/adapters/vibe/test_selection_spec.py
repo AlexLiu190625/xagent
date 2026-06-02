@@ -680,10 +680,14 @@ async def test_e2e_empty_categories_yields_none_spec(static_creators):
 # ---------------------------------------------------------------------------
 
 
-def _mock_tool(name: str, category: str):
-    """Build a minimal mock tool with the ``.metadata.category.value``
-    shape the helper inspects. Using ``MagicMock`` here would
-    silently match anything; explicit class keeps the contract tight.
+def _mock_tool(name: str, category: str, source_server: str | None = None):
+    """Build a minimal mock tool with the ``.metadata.category.value`` +
+    ``.metadata.source_server`` shape the helper inspects.
+
+    ``source_server`` mirrors what tool generation stamps (the normalized
+    originating server identity, or ``None`` for non-server tools). It is
+    set explicitly -- a bare ``MagicMock`` attribute would auto-spawn a
+    truthy mock and silently match every scoped server.
     """
     from unittest.mock import MagicMock
 
@@ -692,6 +696,7 @@ def _mock_tool(name: str, category: str):
     tool.metadata = MagicMock()
     tool.metadata.category = MagicMock()
     tool.metadata.category.value = category
+    tool.metadata.source_server = source_server
     return tool
 
 
@@ -750,8 +755,8 @@ def test_select_allowed_tool_names_plain_category_match() -> None:
 
 
 def test_select_allowed_tool_names_mcp_server_form() -> None:
-    """``mcp:<server>`` entry matches tools named ``mcp_<server>_*``
-    (case-insensitive, with spaces / dashes folded to underscores).
+    """``mcp:<server>`` entry matches tools whose structured
+    ``metadata.source_server`` equals the normalized server identity.
     """
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
@@ -759,9 +764,10 @@ def test_select_allowed_tool_names_mcp_server_form() -> None:
         tool_categories=["mcp:Gmail"]
     ).compute_allowed_names(
         [
-            _mock_tool("mcp_gmail_send_message", "mcp"),
-            _mock_tool("mcp_gmail_list_messages", "mcp"),
-            _mock_tool("mcp_slack_send", "mcp"),  # different server, excluded
+            _mock_tool("mcp_gmail_send_message", "mcp", source_server="gmail"),
+            _mock_tool("mcp_gmail_list_messages", "mcp", source_server="gmail"),
+            # different server, excluded
+            _mock_tool("mcp_slack_send", "mcp", source_server="slack"),
             _mock_tool("calculator", "basic"),  # different category, excluded
         ],
     )
@@ -773,16 +779,17 @@ def test_select_allowed_tool_names_mcp_server_form() -> None:
 
 def test_mcp_server_form_tolerates_stray_whitespace() -> None:
     """``"mcp: Gmail"`` (stray space after the colon) must normalize to
-    ``Gmail`` and still match ``mcp_gmail_*`` -- not ``_Gmail`` which
-    would silently match nothing."""
+    ``gmail`` on the selector side and still match a tool whose
+    ``source_server`` is ``gmail`` -- not ``_gmail`` which would silently
+    match nothing."""
     from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp: Gmail"])
     assert spec.mcp_servers == frozenset({"gmail"})
     result = spec.compute_allowed_names(
         [
-            _mock_tool("mcp_gmail_send_message", "mcp"),
-            _mock_tool("mcp_slack_send", "mcp"),
+            _mock_tool("mcp_gmail_send_message", "mcp", source_server="gmail"),
+            _mock_tool("mcp_slack_send", "mcp", source_server="slack"),
         ],
     )
     assert sorted(result or []) == ["mcp_gmail_send_message"]
@@ -800,15 +807,52 @@ def test_normalize_mcp_server_name_ssot() -> None:
 
 
 def test_mcp_server_match_is_case_insensitive_vs_real_tool_name() -> None:
-    """A lowercase ``mcp:gmail`` selector matches a tool named
-    ``mcp_Gmail_*``. ``mcp_adapter`` generates tool names preserving the
-    config-name case; server matching is case-insensitive via the SSOT,
-    so the two reconcile without forcing tool names to lowercase."""
+    """A lowercase ``mcp:gmail`` selector matches a mixed-case tool. The
+    LLM-visible name (``mcp_Gmail_send_message``) keeps the config-name
+    case, but matching is on the structured ``source_server`` that
+    generation normalized to ``gmail`` -- so case never affects the match
+    and the tool name is irrelevant to selection."""
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:gmail"])
     result = spec.compute_allowed_names(
-        [_mock_tool("mcp_Gmail_send_message", "mcp")],  # mixed case (real shape)
+        # mixed-case LLM name, normalized source_server (real shape)
+        [_mock_tool("mcp_Gmail_send_message", "mcp", source_server="gmail")],
     )
     assert sorted(result or []) == ["mcp_Gmail_send_message"]
+
+
+def test_mcp_server_scope_admits_custom_api_wrapper() -> None:
+    """A scoped ``mcp:<server>`` admits the server's Custom-API wrapper
+    (``other`` category) the same way as its MCP tools: both carry the same
+    structured ``source_server``. Replaces the old name-shape ``==
+    api_<server>_call`` match, so a stray space / case in the wrapper name
+    can no longer silently drop it."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
+    result = spec.compute_allowed_names(
+        [
+            _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
+            _mock_tool("api_Gmail_call", "other", source_server="gmail"),
+            _mock_tool("api_slack_call", "other", source_server="slack"),
+        ],
+    )
+    assert sorted(result or []) == ["api_Gmail_call", "mcp_gmail_send"]
+
+
+def test_server_scope_match_is_independent_of_tool_name() -> None:
+    """The match is purely on structured ``source_server`` -- a tool whose
+    LLM name shares no prefix with the server is still admitted when its
+    generation-stamped ``source_server`` matches, and one that merely looks
+    like it belongs (by name) is not, when ``source_server`` differs. This
+    is what ends the name-transform edge-case class."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
+    result = spec.compute_allowed_names(
+        [
+            # Name unrelated to "gmail", but source_server matches -> admit.
+            _mock_tool("totally_unrelated_name", "mcp", source_server="gmail"),
+            # Name looks gmail-ish, but source_server differs -> reject.
+            _mock_tool("mcp_gmail_lookalike", "mcp", source_server="other_srv"),
+        ],
+    )
+    assert sorted(result or []) == ["totally_unrelated_name"]
 
 
 def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
@@ -830,7 +874,7 @@ def test_select_allowed_tool_names_unknown_mcp_server_yields_empty() -> None:
     ).compute_allowed_names(
         [
             _mock_tool("calculator", "basic"),
-            _mock_tool("mcp_gmail_send", "mcp"),
+            _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
         ],
     )
     # Non-empty input with no matches: ``compute_allowed_names`` returns
@@ -1267,8 +1311,8 @@ async def test_factory_by_categories_filters_by_compute_allowed_names(
 
 
 def test_compute_allowed_names_by_categories_mcp_subcategory_match():
-    """``mcp:Gmail`` sub-category in categories matches ``mcp_gmail_*``
-    tool names (case-insensitive, spaces normalized)."""
+    """``mcp:Gmail`` scope matches tools whose ``source_server`` is
+    ``gmail`` (normalized at generation)."""
     # Use from_raw so ``mcp_servers`` is derived consistently with
     # ``categories`` -- direct ``_SpecByCategories`` construction with
     # ``mcp:<server>`` in categories but ``mcp_servers=None`` is
@@ -1276,9 +1320,10 @@ def test_compute_allowed_names_by_categories_mcp_subcategory_match():
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
     result = spec.compute_allowed_names(
         [
-            _mock_tool("mcp_gmail_send", "mcp"),
-            _mock_tool("mcp_gmail_read", "mcp"),
-            _mock_tool("mcp_slack_post", "mcp"),  # different server
+            _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
+            _mock_tool("mcp_gmail_read", "mcp", source_server="gmail"),
+            # different server
+            _mock_tool("mcp_slack_post", "mcp", source_server="slack"),
             _mock_tool("calc", "basic"),
         ]
     )
@@ -1519,8 +1564,8 @@ def test_compute_allowed_names_mcp_server_does_not_broaden_to_all_mcp():
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"])
     result = spec.compute_allowed_names(
         [
-            _mock_tool("mcp_gmail_send", "mcp"),
-            _mock_tool("mcp_slack_post", "mcp"),
+            _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
+            _mock_tool("mcp_slack_post", "mcp", source_server="slack"),
         ]
     )
     assert result == frozenset({"mcp_gmail_send"})
@@ -1532,9 +1577,9 @@ def test_compute_allowed_names_mixed_plain_and_server_picks():
     spec = ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail", "other"])
     result = spec.compute_allowed_names(
         [
-            _mock_tool("mcp_gmail_send", "mcp"),
-            _mock_tool("mcp_slack_post", "mcp"),
-            _mock_tool("api_custom_call", "other"),
+            _mock_tool("mcp_gmail_send", "mcp", source_server="gmail"),
+            _mock_tool("mcp_slack_post", "mcp", source_server="slack"),
+            _mock_tool("api_custom_call", "other", source_server="custom"),
             _mock_tool("calc", "basic"),
         ]
     )

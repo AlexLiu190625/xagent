@@ -41,6 +41,12 @@ class ToolMetadata(BaseModel):
     allow_users: Optional[list[str]] = None  # Explicitly allowed user IDs
     has_state: bool = False
     category: ToolCategory = ToolCategory.OTHER  # Default category
+    # Normalized identity of the MCP server / Custom-API config a tool was
+    # generated from (via ``normalize_mcp_server_name``), or ``None`` for
+    # tools with no server origin. Set once at generation so server-scoped
+    # selection (``ToolSelectionSpec.compute_allowed_names``) matches by
+    # structured equality instead of re-parsing the tool name.
+    source_server: Optional[str] = None
 
 
 @runtime_checkable
@@ -86,6 +92,7 @@ class AbstractBaseTool(ABC, Tool):
             allow_users=getattr(self, "_allow_users", None),
             has_state=self.state_type() is not None,
             category=getattr(self, "category", ToolCategory.OTHER),
+            source_server=getattr(self, "source_server", None),
         )
 
     @abstractmethod
