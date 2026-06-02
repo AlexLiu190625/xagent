@@ -43,6 +43,7 @@ from ...services.hot_path_cache import (
 )
 from ...services.task_orchestrator import (
     TaskTurnError,
+    TaskTurnNotFoundError,
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
@@ -151,29 +152,28 @@ async def create_chat_task(
     # A brand-new task shouldn't ever hit busy -- but we map it
     # anyway for defense.
     try:
-        await TaskTurnOrchestrator.begin_turn(
-            task=task,
+        started = await TaskTurnOrchestrator.begin_turn(
+            task_id=int(task.id),
+            user_id=int(agent.user_id),
             payload=TaskTurnPayload(transcript_message=request.message.content),
-            user=task.user,
-            db=db,
             kind=TurnKind.CREATE,
             force_fresh=False,
         )
+    except TaskTurnNotFoundError:
+        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     except TaskTurnError:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
 
-    # ``status=task.status.value`` (i.e. 'running'), not 'pending':
-    # ``begin_turn`` ran an atomic UPDATE that flipped the row to
-    # RUNNING and ``db.refresh(task)``'d the in-memory object before
-    # returning. Returning 'pending' would lie to the SDK client --
-    # an immediately-following GET would see 'running' and the caller
-    # would have to reconcile two contradictory values from
-    # back-to-back calls. This matches the AppendMessageResponse
-    # contract below.
+    # ``status`` comes from the orchestrator's committed-row snapshot
+    # (``started.status`` == RUNNING), NOT the caller's ``task`` object --
+    # ``begin_turn`` now commits on an isolated worker-thread session and
+    # never refreshes this request's ORM row, so ``task.status`` is still
+    # the stale PENDING. ``created_at`` is set at task creation and isn't
+    # touched by the turn, so the in-memory value is correct.
     return CreateTaskResponse(
         task_id=int(task.id),
         agent_id=int(agent.id),
-        status=task.status.value,
+        status=started.status.value,
         created_at=task.created_at,
     )
 
@@ -301,39 +301,29 @@ async def append_message_to_task(
     # 409), persists the new user message, and schedules the bg turn
     # with a single-flight guard against concurrent kickoffs.
     try:
-        await TaskTurnOrchestrator.begin_turn(
-            task=task,
+        started = await TaskTurnOrchestrator.begin_turn(
+            task_id=int(task.id),
+            user_id=int(agent.user_id),
             payload=TaskTurnPayload(transcript_message=request.message.content),
-            user=task.user,
-            db=db,
             kind=TurnKind.APPEND,
             force_fresh=False,
         )
+    except TaskTurnNotFoundError:
+        raise V1ApiError(V1ErrorCode.TASK_NOT_FOUND, 404)
     except TaskTurnError:
         raise V1ApiError(V1ErrorCode.TASK_BUSY, 409)
 
-    # Pick up updated_at written by the orchestrator's UPDATE.
-    db.refresh(task)
-
-    # accepted_at uses the DB row's ``updated_at`` (set by ``onupdate=
-    # func.now()`` on the atomic UPDATE) instead of a fresh
-    # ``datetime.now(...)``. That way SDK clients reading this field
-    # see a value that matches what they'd read from the DB directly
-    # via GET /v1/chat/tasks/{id}, with no clock-skew between the two.
-    #
-    # ``status=task.status.value`` (i.e. 'running'), read from the
-    # refreshed in-memory row rather than hardcoded, mirrors the
-    # CreateTaskResponse contract above: the atomic UPDATE inside
-    # ``begin_turn`` flipped the row to RUNNING in the same
-    # transaction. Returning 'pending' here would lie to the SDK
-    # client -- an immediately-following GET would see 'running' and
-    # the caller would have to reconcile two contradictory values
-    # from back-to-back calls.
+    # ``status`` / ``accepted_at`` come from the orchestrator's committed-row
+    # snapshot (``started``), not a post-call ``db.refresh(task)``. The
+    # refresh was itself a blocking SELECT on the event loop; ``begin_turn``
+    # already SELECTed ``updated_at`` (set by ``onupdate=func.now()`` on the
+    # atomic UPDATE) inside its off-loop transaction, so SDK clients still see
+    # a value matching what GET /v1/chat/tasks/{id} would return.
     return AppendMessageResponse(
         task_id=int(task.id),
         agent_id=int(agent.id),
-        status=task.status.value,
-        accepted_at=task.updated_at,
+        status=started.status.value,
+        accepted_at=started.updated_at,
     )
 
 

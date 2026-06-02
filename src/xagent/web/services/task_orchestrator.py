@@ -53,7 +53,6 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from ..models.task import Task, TaskStatus
-from ..models.user import User
 from .hot_path_cache import invalidate_task_cache
 from .task_lease_service import (
     acquire_task_lease_isolated,
@@ -152,6 +151,46 @@ class TaskTurnError(Exception):
         self.reason = reason
 
 
+class TaskTurnNotFoundError(Exception):
+    """Raised when the turn's atomic claim finds no row that both exists
+    and is owned by the calling principal.
+
+    Deliberately NOT a subclass of :class:`TaskTurnError`: callers map
+    ``TaskTurnError`` to 409 (busy / bg_inflight), but a missing or
+    not-owned task is a 404. Keeping it a separate type means a
+    ``except TaskTurnError`` clause never silently turns a not-found into
+    a "busy". Part of ``begin_turn``'s public error contract.
+    """
+
+    def __init__(self, task_id: int):
+        super().__init__(f"task {task_id} not found or not owned by caller")
+        self.task_id = task_id
+
+
+@dataclass(frozen=True)
+class TurnStarted:
+    """Result of a started turn.
+
+    Internal orchestration result (not a serialized public DTO): it
+    carries the committed-row snapshot the caller needs to build its
+    response WITHOUT re-reading the ORM (``begin_turn`` no longer touches
+    the caller's session), plus the live bg handle.
+
+    The snapshot fields (``status`` / ``updated_at`` / ``before_message_id``)
+    are read inside the isolated worker-thread transaction, so callers do
+    not pay an on-loop ``db.refresh`` to learn the post-claim state.
+    ``task_source`` is internal (passed to ``_schedule_bg``); ``background_task``
+    is the scheduler handle (workforce / tests await it).
+    """
+
+    task_id: int
+    status: TaskStatus
+    updated_at: Optional[datetime]
+    before_message_id: Optional[int]
+    task_source: Optional[str]
+    background_task: "asyncio.Task[None]"
+
+
 class TaskTurnOrchestrator:
     """Drive one task-turn lifecycle.
 
@@ -163,94 +202,66 @@ class TaskTurnOrchestrator:
     @staticmethod
     async def begin_turn(
         *,
-        task: Task,
+        task_id: int,
+        user_id: int,
         payload: TaskTurnPayload,
-        user: User,
-        db: Any,
         kind: TurnKind,
         force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
-    ) -> "asyncio.Task[None]":
+    ) -> TurnStarted:
         """Single entry for any new-turn transition (CREATE / APPEND).
 
-        The single transactional primitive that owns the full turn-start
-        contract:
+        Owns the full turn-start contract. The atomic write transaction
+        (claim + user-message persist + commit) runs on an isolated
+        worker-thread session via ``asyncio.to_thread`` so the ~5s write
+        RTT does not block the asyncio event loop (issue #427). The caller
+        passes primitives only; ``begin_turn`` never touches the caller's
+        session, and returns a :class:`TurnStarted` snapshot the caller
+        reads instead of re-fetching the ORM.
 
-          1. Refuse if a bg coroutine is still in flight for this task
-             (``TaskTurnError("bg_inflight")``). Checked before any DB
-             write so a rejected turn never mutates the row.
-          2. Atomic UPDATE in one statement on the caller's session
-             — the latest-turn snapshot invariant:
+        Sequence:
 
-             - ``status = RUNNING``
-             - ``input = payload.transcript_message``
-             - ``output = NULL``          (clear prior-turn terminal field)
-             - ``error_message = NULL``   (clear prior-turn terminal field)
+          1. ``_refuse_if_bg_inflight`` — reject if a bg coroutine is still
+             running for this task (``TaskTurnError("bg_inflight")``). Pure
+             in-memory dict check. NOTE: it now sits before the
+             ``await asyncio.to_thread`` below, so two concurrent new turns
+             can both pass it; the authoritative serializer is the DB atomic
+             claim (the status-filter rowcount), which lets exactly one win.
+          2. ``_begin_turn_atomic_sync`` (off-loop): atomic claim
+             (``id == task_id AND user_id == user_id AND <status_filter>``)
+             + persist + snapshot SELECT + single commit. By construction it
+             only raises BEFORE commit, so a successful return means the row
+             is committed RUNNING.
+          3. ``_schedule_bg`` (sync, no await) — schedule the lease-aware bg
+             coroutine. Once step 2 committed, this must succeed or the task
+             is forced FAILED (no zombie RUNNING).
 
-             with filter:
-
-             - ``kind == CREATE`` → ``status == PENDING``
-             - ``kind == APPEND`` → ``status IN APPENDABLE_STATUSES``
-
-             rowcount 0 → ``TaskTurnError("busy")``.
-          3. ``persist_user_message(payload.transcript_message)`` in the
-             same session (no commit yet).
-          4. ``db.commit()`` ONCE for steps 2 + 3 together — the
-             single-transaction turn-start contract. If any step above
-             raises, the session is rolled back and neither the status
-             flip nor the message persists, so a rejected turn never
-             leaves an orphan user message in the transcript.
-          5. Schedule the bg coroutine via ``_schedule_bg``, passing
-             the full payload so the execution side receives the
-             execution-only message channel, not just the transcript.
-
-        Preconditions (caller contract — assert on entry):
-
-          - ``db`` is a clean session: no uncommitted ``new`` /
-            ``dirty`` / ``deleted`` instances. ``begin_turn`` commits
-            the atomic UPDATE + message persist together; a dirty
-            caller session would have its pending changes committed
-            alongside, which is rarely the caller's intent. All current
-            callers (SDK ``create_chat_task``, SDK
-            ``append_message_to_task``, WS path) satisfy this; the
-            assert is defensive against future callers.
-          - ``kind == CREATE and force_fresh`` is invalid — a new task
-            has no prior execution state to discard. Raises
-            ``ValueError``.
+        ``user_id`` is the authenticated principal's id (the SDK agent's
+        owner / the WS user), NOT ``task.user_id`` — folding it into the
+        claim predicate is what makes ownership meaningful instead of the
+        row proving itself.
 
         Args:
-            task: The committed Task row. ``status`` should be PENDING
-                for ``kind=CREATE`` or terminal for ``kind=APPEND``.
-            payload: Two-channel message (transcript + execution); see
-                :class:`TaskTurnPayload`.
-            user: Task owner; passed through to the bg coroutine's
-                ``UserContext``.
-            db: Caller's request-scoped session. Used for steps 2-4
-                (atomic claim + persist + commit). The bg coroutine
-                opens its own independent session inside
-                ``_schedule_bg``.
-            kind: Which status filter the atomic claim uses; see
-                :class:`TurnKind`.
-            force_fresh: When True, the bg coroutine ignores any
-                reconstructible prior execution state and starts a
-                fresh agent run. WS terminal-task re-engage passes
-                True; SDK callers pass False.
-            context: Optional execution-context dict
-                (execution_mode / process_description / examples)
-                merged into the bg run.
+            task_id: The committed task's id.
+            user_id: Authenticated principal id; claim only succeeds if the
+                task belongs to this user.
+            payload: Two-channel message (transcript + execution).
+            kind: Which status filter the atomic claim uses.
+            force_fresh: When True, the bg coroutine starts a fresh agent
+                run (WS terminal re-engage); invalid with ``kind=CREATE``.
+            context: Optional execution-context dict.
 
         Returns:
-            The ``asyncio.Task`` wrapping the bg coroutine. Callers
-            usually fire-and-forget; the handle is returned for tests.
+            :class:`TurnStarted` — committed-row snapshot
+            (``status``/``updated_at``/``before_message_id``) plus the bg
+            ``background_task`` handle.
 
         Raises:
-            ValueError: invalid ``kind`` / ``force_fresh`` combination,
-                or caller session not clean.
-            TaskTurnError("bg_inflight"): a previous bg coroutine for
-                this task is still running.
-            TaskTurnError("busy"): atomic claim filter mismatched the
-                current row status (e.g. ``kind=APPEND`` against a
-                non-terminal row).
+            ValueError: ``kind == CREATE and force_fresh``.
+            TaskTurnError("bg_inflight"): a previous bg coroutine is running.
+            TaskTurnError("busy"): the row exists and is owned but its status
+                did not match the claim filter.
+            TaskTurnNotFoundError: no row matched id + ownership (404).
         """
         if kind == TurnKind.CREATE and force_fresh:
             raise ValueError(
@@ -258,86 +269,184 @@ class TaskTurnOrchestrator:
                 "has no prior execution state to discard"
             )
 
-        # Session-clean precondition. Catching this up-front prevents the
-        # commit at step 4 from accidentally persisting unrelated
-        # caller-staged objects.
-        if db.new or db.dirty or db.deleted:
-            raise ValueError(
-                "begin_turn requires a clean db session "
-                f"(new={len(db.new)}, dirty={len(db.dirty)}, "
-                f"deleted={len(db.deleted)}); caller must commit or "
-                "rollback its pending changes before calling begin_turn"
-            )
-
-        task_id = int(task.id)
-
-        # Step 1: bg-inflight guard before any DB write.
+        # bg-inflight guard before any DB write (see note 1 in docstring).
         _refuse_if_bg_inflight(task_id)
 
-        # Step 2 + 3 + 4: atomic claim + persist + single commit. We
-        # don't commit between 2 and 3, so a failure at step 3 rolls
-        # back step 2 cleanly — the rejected-turn-leaves-no-side-effect
-        # contract.
-        try:
-            if kind == TurnKind.CREATE:
-                status_filter = Task.status == TaskStatus.PENDING
-            else:  # APPEND
-                status_filter = Task.status.in_(_APPENDABLE_STATUSES)
-
-            claimed = (
-                db.query(Task)
-                .filter(Task.id == task_id, status_filter)
-                .update(
-                    {
-                        Task.status: TaskStatus.RUNNING,
-                        Task.input: payload.transcript_message,
-                        Task.output: None,
-                        Task.error_message: None,
-                    },
-                    synchronize_session=False,
-                )
-            )
-            if claimed == 0:
-                db.rollback()
-                raise TaskTurnError("busy")
-
-            from .chat_history_service import persist_user_message_no_commit
-
-            persisted_message = persist_user_message_no_commit(
-                db=db,
-                task_id=task_id,
-                user_id=int(user.id),
-                content=payload.transcript_message,
-                attachments=payload.attachments,
-                turn_id=payload.turn_id,
-            )
-            if persisted_message is not None:
-                db.flush()
-                before_message_id = int(persisted_message.id)
-            else:
-                before_message_id = None
-            db.commit()
-            invalidate_task_cache(task_id)
-        except TaskTurnError:
-            raise
-        except Exception:
-            db.rollback()
-            raise
-
-        db.refresh(task)
-
-        # Step 5: hand off to lease-aware scheduler.
-        return await _schedule_bg(
-            task=task,
-            user=user,
+        # Off-loop atomic claim + persist + commit. Only raises pre-commit
+        # (bg-inflight already handled above; busy / not-found here), so
+        # reaching the next line means the row is committed RUNNING.
+        claimed = await asyncio.to_thread(
+            _begin_turn_atomic_sync,
+            task_id,
+            user_id,
             payload=payload,
-            force_fresh=force_fresh,
-            context=context,
-            before_message_id=before_message_id,
+            kind=kind,
+        )
+
+        # Point of no return: the row is RUNNING. ``_schedule_bg`` is
+        # synchronous (no await), so there is no suspension point between
+        # the commit and the schedule; any failure here (or a CancelledError
+        # delivered at the ``to_thread`` resume above) must force the task
+        # FAILED so it isn't left RUNNING with no worker.
+        try:
+            bg_task = _schedule_bg(
+                task_id=task_id,
+                user_id=user_id,
+                task_source=claimed.task_source,
+                payload=payload,
+                force_fresh=force_fresh,
+                context=context,
+                before_message_id=claimed.before_message_id,
+            )
+        except BaseException:
+            _mark_task_failed_if_running(
+                task_id, "turn scheduling failed after claim commit"
+            )
+            raise
+
+        return TurnStarted(
+            task_id=task_id,
+            status=claimed.status,
+            updated_at=claimed.updated_at,
+            before_message_id=claimed.before_message_id,
+            task_source=claimed.task_source,
+            background_task=bg_task,
         )
 
 
 # ===== internal helpers =====
+
+
+@dataclass(frozen=True)
+class _ClaimedTurn:
+    """Snapshot returned by ``_begin_turn_atomic_sync`` after the claim
+    commits, so ``begin_turn`` can build :class:`TurnStarted` without the
+    caller re-reading the ORM."""
+
+    status: TaskStatus
+    updated_at: Optional[datetime]
+    before_message_id: Optional[int]
+    task_source: Optional[str]
+
+
+def _begin_turn_atomic_sync(
+    task_id: int,
+    user_id: int,
+    *,
+    payload: TaskTurnPayload,
+    kind: TurnKind,
+) -> _ClaimedTurn:
+    """Atomic claim + user-message persist + commit on its OWN session.
+
+    Designed to run under ``asyncio.to_thread`` so the synchronous write
+    transaction (~5s RTT measured in issue #427) stays off the event loop.
+    Opens / commits / closes its own ``SessionLocal`` — never touches the
+    caller's session.
+
+    Ownership is folded into the claim predicate (``id`` AND ``user_id`` AND
+    status filter) so the UPDATE is atomic w.r.t. ownership. On ``rowcount
+    0`` a diagnostic SELECT distinguishes:
+
+      - row missing or not owned by ``user_id`` → :class:`TaskTurnNotFoundError`
+      - row exists + owned but wrong status     → ``TaskTurnError("busy")``
+
+    Invariant relied on by ``begin_turn``: this function only raises BEFORE
+    ``commit``. The committed-row snapshot is SELECTed pre-commit
+    (read-your-writes within the transaction; a bulk
+    ``.update(synchronize_session=False)`` leaves no ORM object to refresh),
+    and the only post-commit work — ``invalidate_task_cache`` — is
+    best-effort. So a successful return always means the row is committed
+    RUNNING, and any exception means it is not.
+    """
+    from ..models.database import get_session_local
+    from .chat_history_service import persist_user_message_no_commit
+
+    if kind == TurnKind.CREATE:
+        status_filter = Task.status == TaskStatus.PENDING
+    else:  # APPEND
+        status_filter = Task.status.in_(_APPENDABLE_STATUSES)
+
+    SessionLocal = get_session_local()
+    db = SessionLocal()
+    try:
+        claimed = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.user_id == user_id,
+                status_filter,
+            )
+            .update(
+                {
+                    Task.status: TaskStatus.RUNNING,
+                    Task.input: payload.transcript_message,
+                    Task.output: None,
+                    Task.error_message: None,
+                },
+                synchronize_session=False,
+            )
+        )
+        if claimed == 0:
+            db.rollback()
+            owned = (
+                db.query(Task.id)
+                .filter(Task.id == task_id, Task.user_id == user_id)
+                .first()
+            )
+            if owned is None:
+                raise TaskTurnNotFoundError(task_id)
+            raise TaskTurnError("busy")
+
+        persisted_message = persist_user_message_no_commit(
+            db=db,
+            task_id=task_id,
+            user_id=user_id,
+            content=payload.transcript_message,
+            attachments=payload.attachments,
+            turn_id=payload.turn_id,
+        )
+        if persisted_message is not None:
+            db.flush()
+            before_message_id: Optional[int] = int(persisted_message.id)
+        else:
+            before_message_id = None
+
+        # Snapshot the committed row's columns BEFORE commit (read-your-writes
+        # in the same transaction). Keeps commit as the last fallible DB op,
+        # so there is no post-commit window where the row is RUNNING but this
+        # helper still raises.
+        status, updated_at, source = (
+            db.query(Task.status, Task.updated_at, Task.source)
+            .filter(Task.id == task_id)
+            .one()
+        )
+
+        db.commit()
+    except (TaskTurnError, TaskTurnNotFoundError):
+        raise
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+    # Best-effort: a stale cache entry self-heals on the next write / TTL,
+    # and must never strand a committed RUNNING task by raising here.
+    try:
+        invalidate_task_cache(task_id)
+    except Exception:
+        logger.warning(
+            "invalidate_task_cache failed for task %s (non-fatal)",
+            task_id,
+            exc_info=True,
+        )
+
+    return _ClaimedTurn(
+        status=status,
+        updated_at=updated_at,
+        before_message_id=before_message_id,
+        task_source=source,
+    )
 
 
 def _refuse_if_bg_inflight(task_id: int) -> None:
@@ -564,16 +673,23 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
     # PAUSED / WAITING_FOR_USER / other: leave alone.
 
 
-async def _schedule_bg(
+def _schedule_bg(
     *,
-    task: Task,
-    user: User,
+    task_id: int,
+    user_id: int,
+    task_source: Optional[str],
     payload: TaskTurnPayload,
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
     before_message_id: Optional[int] = None,
 ) -> "asyncio.Task[None]":
     """Lease-aware bg scheduler.
+
+    Synchronous: it defines ``_runner``, schedules it via
+    ``asyncio.create_task``, registers the handle and returns it — there is
+    no ``await`` at this level (every await lives inside ``_runner``, which
+    runs later as its own task). Being sync removes a misleading
+    suspension/cancellation point right after ``begin_turn``'s claim commit.
 
     Owns the full lease lifecycle for the bg run:
 
@@ -590,12 +706,12 @@ async def _schedule_bg(
         returned normally or raised. ``execute_task_background`` only
         writes ``task.status`` and never touches the lease columns;
         the scheduler is responsible for the whole lease lifecycle.
+
+    Takes primitives only (``task_id`` / ``user_id`` / ``task_source``); the
+    bg run loads its own snapshot and opens its own sessions, so no
+    caller-bound ORM object crosses into the coroutine.
     """
     from ..api.websocket import background_task_manager, execute_task_background
-
-    task_id = int(task.id)
-    task_source = getattr(task, "source", None)
-    user_id = int(user.id)
 
     async def _runner() -> None:
         # ``bg_db`` is opened lazily inside the post-run finalize block

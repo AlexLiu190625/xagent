@@ -158,14 +158,14 @@ async def create_workforce_run(
     task_id = int(task.id)
 
     try:
-        background_task = await TaskTurnOrchestrator.begin_turn(
-            task=task,
+        started = await TaskTurnOrchestrator.begin_turn(
+            task_id=task_id,
+            user_id=int(user.id),
             payload=TaskTurnPayload(transcript_message=normalized_message),
-            user=user,
-            db=db,
             kind=TurnKind.CREATE,
             force_fresh=False,
         )
+        background_task = started.background_task
     except Exception:
         db.rollback()
         fresh_task = db.get(Task, task_id)

@@ -2987,6 +2987,7 @@ async def handle_chat_message(
                     # lifecycle state machine.
                     from ..services.task_orchestrator import (
                         TaskTurnError,
+                        TaskTurnNotFoundError,
                         TaskTurnOrchestrator,
                         TaskTurnPayload,
                         TurnKind,
@@ -3047,15 +3048,34 @@ async def handle_chat_message(
 
                     try:
                         await TaskTurnOrchestrator.begin_turn(
-                            task=task,
+                            task_id=int(task.id),
+                            user_id=int(user.id),
                             payload=payload,
-                            user=user,
-                            db=db,
                             kind=turn_kind,
                             force_fresh=turn_force_fresh,
                             context=context,
                         )
                         logger.info(f"Task {task_id} started in background")
+                    except TaskTurnNotFoundError:
+                        # Task vanished or changed ownership between the
+                        # resolve above and the atomic claim — surface it the
+                        # same way as a busy refusal (no row was mutated).
+                        logger.warning(
+                            "begin_turn: task %s not found / not owned at claim",
+                            task_id,
+                        )
+                        await manager.broadcast_to_task(
+                            {
+                                **_task_error_payload(
+                                    db,
+                                    task_id,
+                                    "Task is no longer available.",
+                                    event_type="agent_error",
+                                ),
+                                "timestamp": datetime.now(timezone.utc).timestamp(),
+                            },
+                            task_id,
+                        )
                     except TaskTurnError as busy_err:
                         # begin_turn's atomic transaction rolls back on
                         # bg_inflight / busy — neither the status flip

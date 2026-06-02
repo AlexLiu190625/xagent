@@ -28,6 +28,7 @@ from xagent.web.models.user import User
 from xagent.web.services.task_lease_service import get_runner_id
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
+    TaskTurnNotFoundError,
     TaskTurnOrchestrator,
     TaskTurnPayload,
     TurnKind,
@@ -99,7 +100,7 @@ def mock_schedule_bg():
     """
     with patch(
         "xagent.web.services.task_orchestrator._schedule_bg",
-        new=AsyncMock(),
+        new=MagicMock(),
     ) as mocked:
         yield mocked
 
@@ -147,10 +148,9 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
 
     await TaskTurnOrchestrator.begin_turn(
-        task=task,
+        task_id=int(task.id),
         payload=TaskTurnPayload("first turn"),
-        user=user,
-        db=db_session,
+        user_id=int(user.id),
         kind=TurnKind.CREATE,
         force_fresh=False,
     )
@@ -182,10 +182,9 @@ async def test_begin_turn_append_clears_stale_output_and_error(
     )
 
     await TaskTurnOrchestrator.begin_turn(
-        task=task,
+        task_id=int(task.id),
         payload=TaskTurnPayload("second question"),
-        user=user,
-        db=db_session,
+        user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=False,
     )
@@ -215,10 +214,9 @@ async def test_begin_turn_append_clears_stale_error_message(
     )
 
     await TaskTurnOrchestrator.begin_turn(
-        task=task,
+        task_id=int(task.id),
         payload=TaskTurnPayload("second"),
-        user=user,
-        db=db_session,
+        user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=False,
     )
@@ -248,10 +246,9 @@ async def test_begin_turn_append_accepts_paused_task_as_new_turn(
 
     payload = TaskTurnPayload("new request after pause")
     await TaskTurnOrchestrator.begin_turn(
-        task=task,
+        task_id=int(task.id),
         payload=payload,
-        user=user,
-        db=db_session,
+        user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=False,
     )
@@ -270,7 +267,7 @@ async def test_begin_turn_append_accepts_paused_task_as_new_turn(
     assert persisted.content == "new request after pause"
     assert persisted.turn_id == payload.turn_id
 
-    mock_schedule_bg.assert_awaited_once()
+    mock_schedule_bg.assert_called_once()
 
 
 @pytest.mark.asyncio
@@ -290,16 +287,15 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
         execution_message="show me\n\n[file: foo.pdf]",
     )
     await TaskTurnOrchestrator.begin_turn(
-        task=task,
+        task_id=int(task.id),
         payload=payload,
-        user=user,
-        db=db_session,
+        user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=True,
     )
 
-    mock_schedule_bg.assert_awaited_once()
-    kwargs = mock_schedule_bg.await_args.kwargs
+    mock_schedule_bg.assert_called_once()
+    kwargs = mock_schedule_bg.call_args.kwargs
     assert kwargs["payload"] is payload
     assert kwargs["force_fresh"] is True
 
@@ -327,38 +323,63 @@ async def test_begin_turn_rejects_create_with_force_fresh(
 
     with pytest.raises(ValueError, match="force_fresh has no meaning"):
         await TaskTurnOrchestrator.begin_turn(
-            task=task,
+            task_id=int(task.id),
             payload=TaskTurnPayload("x"),
-            user=user,
-            db=db_session,
+            user_id=int(user.id),
             kind=TurnKind.CREATE,
             force_fresh=True,
         )
 
 
 @pytest.mark.asyncio
-async def test_begin_turn_asserts_session_clean_precondition(
+async def test_begin_turn_rejects_task_not_owned_by_user(
     db_session,
     mock_schedule_bg,
 ) -> None:
-    """Caller contract: db session must be clean of uncommitted state."""
+    """Ownership is folded into the atomic claim predicate. A ``user_id``
+    that does not own the task → ``TaskTurnNotFoundError`` (404), NOT
+    ``TaskTurnError`` (409), and no row is mutated. Passing a *different*
+    user id (not ``task.user_id``) proves the predicate actually guards."""
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
 
-    # Stage an uncommitted user without committing — simulates a caller
-    # that forgot to commit before calling begin_turn.
-    stray = User(username="stray", password_hash="hash")
-    db_session.add(stray)
-    # NOT committing on purpose
-
-    with pytest.raises(ValueError, match="clean db session"):
+    with pytest.raises(TaskTurnNotFoundError):
         await TaskTurnOrchestrator.begin_turn(
-            task=task,
+            task_id=int(task.id),
+            user_id=int(user.id) + 9999,
             payload=TaskTurnPayload("x"),
-            user=user,
-            db=db_session,
             kind=TurnKind.CREATE,
         )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.PENDING, "rejected claim must not mutate"
+    mock_schedule_bg.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_marks_failed_when_schedule_raises(
+    db_session,
+) -> None:
+    """Post-commit invariant: once the claim commits (RUNNING) but
+    ``_schedule_bg`` raises, the task must be forced FAILED so it is never
+    left RUNNING with no bg worker (zombie)."""
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(side_effect=RuntimeError("schedule boom")),
+    ):
+        with pytest.raises(RuntimeError, match="schedule boom"):
+            await TaskTurnOrchestrator.begin_turn(
+                task_id=int(task.id),
+                user_id=int(user.id),
+                payload=TaskTurnPayload("x"),
+                kind=TurnKind.CREATE,
+            )
+
+    db_session.refresh(task)
+    assert task.status == TaskStatus.FAILED
 
 
 @pytest.mark.asyncio
@@ -383,10 +404,9 @@ async def test_begin_turn_refuses_when_bg_inflight(
     try:
         with pytest.raises(TaskTurnError) as excinfo:
             await TaskTurnOrchestrator.begin_turn(
-                task=task,
+                task_id=int(task.id),
                 payload=TaskTurnPayload("x"),
-                user=user,
-                db=db_session,
+                user_id=int(user.id),
                 kind=TurnKind.APPEND,
             )
         assert excinfo.value.reason == "bg_inflight"
@@ -410,10 +430,9 @@ async def test_begin_turn_refuses_create_against_terminal_task(
 
     with pytest.raises(TaskTurnError) as excinfo:
         await TaskTurnOrchestrator.begin_turn(
-            task=task,
+            task_id=int(task.id),
             payload=TaskTurnPayload("x"),
-            user=user,
-            db=db_session,
+            user_id=int(user.id),
             kind=TurnKind.CREATE,
         )
     assert excinfo.value.reason == "busy"
@@ -430,10 +449,9 @@ async def test_begin_turn_refuses_append_against_pending_task(
 
     with pytest.raises(TaskTurnError) as excinfo:
         await TaskTurnOrchestrator.begin_turn(
-            task=task,
+            task_id=int(task.id),
             payload=TaskTurnPayload("x"),
-            user=user,
-            db=db_session,
+            user_id=int(user.id),
             kind=TurnKind.APPEND,
         )
     assert excinfo.value.reason == "busy"
@@ -598,9 +616,10 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
         # Note: this test does NOT use the mock_schedule_bg fixture
         # because we're testing _schedule_bg itself. The real
         # function runs with the deeper layers patched.
-        bg_task = await _schedule_bg(
-            task=task,
-            user=user,
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
             context=None,
@@ -649,9 +668,10 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
             return_value=MagicMock(),
         ),
     ):
-        bg_task = await _schedule_bg(
-            task=task,
-            user=user,
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
             context=None,
@@ -719,9 +739,10 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
             transcript_message="summarize this",
             execution_message="summarize this\n\n[uploaded file: secret.txt]",
         )
-        bg_task = await _schedule_bg(
-            task=task,
-            user=user,
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            task_source=task.source,
             payload=payload,
             force_fresh=False,
             context={"turn_id": "caller-turn", "existing": "value"},
@@ -806,9 +827,10 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
             return_value=MagicMock(),
         ),
     ):
-        bg_task = await _schedule_bg(
-            task=task,
-            user=user,
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
             context=None,
@@ -882,9 +904,10 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
             return_value=MagicMock(),
         ),
     ):
-        bg_task = await _schedule_bg(
-            task=task,
-            user=user,
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
             context=None,
@@ -962,9 +985,10 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
             return_value=MagicMock(),
         ),
     ):
-        bg_task = await _schedule_bg(
-            task=task,
-            user=user,
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
             context=None,

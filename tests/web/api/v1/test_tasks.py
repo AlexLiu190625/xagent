@@ -16,7 +16,7 @@ drive the mapping.
 
 from datetime import datetime, timezone
 from typing import Tuple
-from unittest.mock import AsyncMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -88,7 +88,7 @@ def mock_start_task():
     # only the asyncio.create_task / agent execution is stubbed.
     with patch(
         "xagent.web.services.task_orchestrator._schedule_bg",
-        new=AsyncMock(),
+        new=MagicMock(),
     ) as mocked:
         yield mocked
 
@@ -147,9 +147,9 @@ def test_create_task_happy_path(mock_start_task):
     # Background kickoff was called exactly once for this task. The
     # scheduler receives a ``TaskTurnPayload`` carrying both transcript
     # and execution channels.
-    assert mock_start_task.await_count == 1
-    kwargs = mock_start_task.await_args.kwargs
-    assert kwargs["task"].id == task_id
+    assert mock_start_task.call_count == 1
+    kwargs = mock_start_task.call_args.kwargs
+    assert kwargs["task_id"] == task_id
     assert kwargs["payload"].transcript_message == "first user message"
 
 
@@ -168,7 +168,7 @@ def test_create_task_missing_authorization_returns_401(mock_start_task):
     body = resp.json()
     assert body["error"]["code"] == "invalid_api_key"
     # No DB side effects
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_create_task_agent_id_mismatch_returns_404(mock_start_task):
@@ -186,7 +186,7 @@ def test_create_task_agent_id_mismatch_returns_404(mock_start_task):
     assert resp.status_code == 404
     body = resp.json()
     assert body["error"]["code"] == "agent_not_found"
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_create_task_empty_message_returns_422(mock_start_task):
@@ -211,7 +211,7 @@ def test_create_task_empty_message_returns_422(mock_start_task):
     body = resp.json()
     assert body["error"]["code"] == "invalid_input"
     assert "detail" not in body  # legacy FastAPI shape must not leak
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_create_task_wrong_role_returns_422(mock_start_task):
@@ -231,7 +231,7 @@ def test_create_task_wrong_role_returns_422(mock_start_task):
     body = resp.json()
     assert body["error"]["code"] == "invalid_input"
     assert "detail" not in body
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_create_task_revoked_key_returns_401(mock_start_task):
@@ -253,7 +253,7 @@ def test_create_task_revoked_key_returns_401(mock_start_task):
     )
     assert resp.status_code == 401
     assert resp.json()["error"]["code"] == "invalid_api_key"
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_create_task_cross_user_agent_returns_404(mock_start_task):
@@ -297,7 +297,7 @@ def test_create_task_cross_user_agent_returns_404(mock_start_task):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "agent_not_found"
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 # ===== Shared helper for E tests: create a task via POST then return its id =====
@@ -382,7 +382,7 @@ def test_append_message_happy_path(mock_start_task):
     finally:
         db.close()
 
-    assert mock_start_task.await_count == 1
+    assert mock_start_task.call_count == 1
 
 
 def test_append_message_to_running_task_returns_409(mock_start_task):
@@ -409,7 +409,7 @@ def test_append_message_to_running_task_returns_409(mock_start_task):
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "task_busy"
     # No new background kickoff happened
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_append_message_claims_slot_atomically(mock_start_task):
@@ -456,7 +456,7 @@ def test_append_message_claims_slot_atomically(mock_start_task):
     assert r2.status_code == 409
     assert r2.json()["error"]["code"] == "task_busy"
     # Only one bg kickoff total (from the winning first append).
-    assert mock_start_task.await_count == 1
+    assert mock_start_task.call_count == 1
 
 
 def test_create_then_append_race_returns_409(mock_start_task):
@@ -488,7 +488,7 @@ def test_create_then_append_race_returns_409(mock_start_task):
     assert resp.status_code == 409
     assert resp.json()["error"]["code"] == "task_busy"
     # No second bg kickoff should have happened
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task):
@@ -548,7 +548,7 @@ def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task)
             )
             assert resp.status_code == 409
             assert resp.json()["error"]["code"] == "task_busy"
-            assert mock_start_task.await_count == 0
+            assert mock_start_task.call_count == 0
 
             # The critical assertion: DB row was NOT mutated by the
             # refused append. status stays terminal, input unchanged.
@@ -584,7 +584,7 @@ def test_append_message_to_missing_task_returns_404(mock_start_task):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "task_not_found"
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_append_message_to_other_agents_task_returns_404(mock_start_task):
@@ -618,7 +618,7 @@ def test_append_message_to_other_agents_task_returns_404(mock_start_task):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "task_not_found"
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_append_message_body_agent_id_mismatch_returns_404(mock_start_task):
@@ -639,7 +639,7 @@ def test_append_message_body_agent_id_mismatch_returns_404(mock_start_task):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "agent_not_found"
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 # ===== GET /v1/chat/tasks/{task_id} =====
@@ -1083,7 +1083,7 @@ def test_append_message_returns_404_for_non_sdk_source(mock_start_task):
     )
     assert resp.status_code == 404
     assert resp.json()["error"]["code"] == "task_not_found"
-    assert mock_start_task.await_count == 0
+    assert mock_start_task.call_count == 0
 
 
 def test_get_steps_returns_404_for_non_sdk_source(mock_start_task):
@@ -1133,7 +1133,7 @@ def test_append_message_clears_stale_output_for_sdk_caller(mock_start_task):
         json={"agent_id": agent_id, "message": {"role": "user", "content": "second"}},
     )
     assert resp.status_code == 202, resp.text
-    assert mock_start_task.await_count == 1
+    assert mock_start_task.call_count == 1
 
     # After the response returns, an immediate GET must see:
     #   - status = running (atomic transition committed)

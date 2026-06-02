@@ -43,11 +43,21 @@ def db_session() -> Session:
     )
     Base.metadata.create_all(bind=engine)
     session_factory = sessionmaker(bind=engine)
+    # begin_turn now runs its atomic claim on an isolated session opened via
+    # the global SessionLocal (``get_session_local``) inside ``asyncio.to_thread``.
+    # Point that global at this test's StaticPool engine (single shared
+    # connection, check_same_thread=False) so the off-loop claim hits the same
+    # in-memory DB the test reads from.
+    import xagent.web.models.database as _db_module
+
+    _prev_session_local = _db_module._SessionLocal
+    _db_module._SessionLocal = session_factory
     session = session_factory()
     try:
         yield session
     finally:
         session.close()
+        _db_module._SessionLocal = _prev_session_local
         Base.metadata.drop_all(bind=engine)
         engine.dispose()
 
@@ -136,7 +146,7 @@ def _add_worker(
 def _patch_schedule_bg(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     scheduled: dict[str, Any] = {}
 
-    async def fake_schedule_bg(**kwargs: Any) -> asyncio.Task[None]:
+    def fake_schedule_bg(**kwargs: Any) -> asyncio.Task[None]:
         scheduled.update(kwargs)
 
         async def noop() -> None:
@@ -218,7 +228,7 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     assert workforce_run.task_id == task.id
     assert workforce_run.status == "running"
     assert uploaded_file.task_id == task.id
-    assert scheduled["task"].id == task.id
+    assert scheduled["task_id"] == task.id
     assert scheduled["payload"].transcript_message == "Coordinate a launch brief"
     assert (
         db_session.query(TaskChatMessage)
@@ -233,7 +243,7 @@ async def test_create_workforce_run_marks_task_failed_when_turn_start_fails_afte
     db_session: Session,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def fail_schedule_bg(**kwargs: Any) -> asyncio.Task[None]:
+    def fail_schedule_bg(**kwargs: Any) -> asyncio.Task[None]:
         del kwargs
         raise RuntimeError("schedule failed")
 
