@@ -61,6 +61,7 @@ from ..services.task_lease_service import (
     stop_task_lease_heartbeat,
 )
 from ..services.task_setup_snapshot import (
+    TaskOwnerMismatchError,
     TaskSetupSnapshot,
     load_task_setup_snapshot_sync,
 )
@@ -579,6 +580,10 @@ class AgentServiceManager:
 
     def __init__(self, request: Optional[Any] = None) -> None:
         self._agents: Dict[int, AgentService] = {}
+        # Owner (runtime identity) each cached AgentService was built for. A
+        # task_id-keyed cache must not silently hand back an instance built
+        # under a different user (e.g. once built with the wrong identity).
+        self._agent_owner_ids: Dict[int, Optional[int]] = {}
         self._sandboxes: Dict[str, Any] = {}  # lifecycle scope -> Sandbox instance
         self._default_llm = create_default_llm()
         self.request = request
@@ -1042,6 +1047,7 @@ class AgentServiceManager:
         db: Optional[Session] = None,
         user: Optional[User] = None,
         task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
+        task_owner_user_id: Optional[int] = None,
     ) -> AgentService:
         """Get or create AgentService instance for specific task.
 
@@ -1052,7 +1058,76 @@ class AgentServiceManager:
         callers and any caller that hasn't adopted the snapshot
         plumbing pass ``None`` and the Step-3 in-method thread call
         runs as before.
+
+        ``task_owner_user_id`` is the task OWNER's id — the runtime identity
+        the agent runs as (models, tools, OAuth, UserContext). It differs from
+        the acting principal (``user``) when an admin operates on another
+        user's task; callers that loaded/authorized the task should pass it.
+        When omitted it falls back to the snapshot owner, then the task row's
+        owner, then ``user.id``.
         """
+        # Resolve the runtime identity (OWNER). Everything below — snapshot
+        # load, model resolution, tool config, UserContext — runs as this
+        # identity, never the acting principal. Precedence: explicit owner →
+        # snapshot owner → the task row's owner (authoritative) → the acting
+        # ``user`` as a last resort. Deriving the owner from the task row means
+        # callers that pass only the acting ``user`` (e.g. WS resume / execute
+        # / pause handlers, which authorize the task separately) still run as
+        # the owner, not an admin acting on someone else's task.
+        runtime_user_id: Optional[int] = task_owner_user_id
+        if runtime_user_id is None and task_setup_snapshot is not None:
+            runtime_user_id = int(task_setup_snapshot.task.user_id)
+        if runtime_user_id is None and db is not None:
+            try:
+                owner_row = db.query(Task.user_id).filter(Task.id == task_id).first()
+                if owner_row is not None and owner_row[0] is not None:
+                    runtime_user_id = int(owner_row[0])
+            except Exception:
+                runtime_user_id = None
+        if runtime_user_id is None and user is not None and user.id is not None:
+            runtime_user_id = int(user.id)
+        # The User object the runtime needs (tool overrides / tracer). Reuse the
+        # passed ``user`` when it already IS the owner; otherwise load the owner.
+        runtime_user: Optional[User] = user
+        if (
+            runtime_user_id is not None
+            and db is not None
+            and (user is None or user.id is None or int(user.id) != runtime_user_id)
+        ):
+            runtime_user = db.query(User).filter(User.id == runtime_user_id).first()
+
+        # Owner invariant: evict a cached AgentService built for a different
+        # owner so we rebuild it under the correct runtime identity instead of
+        # silently reusing the wrong one.
+        if (
+            task_id in self._agents
+            and self._agent_owner_ids.get(task_id) != runtime_user_id
+        ):
+            logger.warning(
+                "Evicting cached AgentService for task %s: built for owner %s, "
+                "requested %s",
+                task_id,
+                self._agent_owner_ids.get(task_id),
+                runtime_user_id,
+            )
+            # The evicted instance was built for the wrong owner; its workspace
+            # lives under that owner's user-scoped path
+            # (``user_{owner}/web_task_{task_id}``), a different directory from
+            # the correct owner's. Clean it up so no wrong-owner workspace
+            # residue is left behind -- this cannot touch the rebuilt owner's
+            # workspace. Eviction itself must proceed even if cleanup fails.
+            try:
+                self._agents[task_id].cleanup_workspace()
+            except Exception as e:
+                logger.warning(
+                    "Failed to clean up workspace while evicting wrong-owner "
+                    "AgentService for task %s: %s",
+                    task_id,
+                    e,
+                )
+            del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
+
         if task_id not in self._agents:
             # Check if task exists in database
             task_exists = False
@@ -1128,6 +1203,7 @@ class AgentServiceManager:
                         await self._reconstruct_agent_from_history(task_id, db)
                         self._load_persisted_conversation_history(task_id, db)
                         await self._load_persisted_execution_context(task_id, db)
+                        self._agent_owner_ids[task_id] = runtime_user_id
                         return self._agents[task_id]
                     except HTTPException:
                         raise
@@ -1141,10 +1217,11 @@ class AgentServiceManager:
                                 f"Cleaning up partially reconstructed agent for task {task_id}"
                             )
                             del self._agents[task_id]
+                            self._agent_owner_ids.pop(task_id, None)
                         # Continue with normal agent creation
 
             # Create tracer with all necessary handlers
-            tracer = create_task_tracer(task_id, user)
+            tracer = create_task_tracer(task_id, runtime_user)
 
             # Load the contiguous synchronous DB block (Task row,
             # per-task LLM resolution, optional Agent Builder lookup
@@ -1166,16 +1243,26 @@ class AgentServiceManager:
                 if task_setup_snapshot is not None:
                     # Caller already loaded the snapshot off-loop
                     # (typically ``_schedule_bg._runner``). Reuse it
-                    # instead of re-spinning a worker thread.
+                    # instead of re-spinning a worker thread. The loader's
+                    # owner guard is bypassed on this branch, so re-assert it
+                    # here: the snapshot's owner must match the runtime owner,
+                    # or tools / model / UserContext would split from the
+                    # workspace owner.
+                    if (
+                        runtime_user_id is not None
+                        and int(task_setup_snapshot.task.user_id) != runtime_user_id
+                    ):
+                        raise TaskOwnerMismatchError(
+                            task_id,
+                            runtime_user_id,
+                            int(task_setup_snapshot.task.user_id),
+                        )
                     snapshot = task_setup_snapshot
                 else:
-                    user_id_for_snapshot: Optional[int] = (
-                        int(user.id) if user and user.id is not None else None
-                    )
                     snapshot = await asyncio.to_thread(
                         load_task_setup_snapshot_sync,
                         task_id,
-                        user_id_for_snapshot,
+                        runtime_user_id,
                     )
 
                 if snapshot is not None:
@@ -1232,8 +1319,8 @@ class AgentServiceManager:
                         #    breaking those callers.
                         if snapshot.agent is not None:
                             user_id_for_fallback: Optional[int] = (
-                                int(user.id)
-                                if user and user.id is not None
+                                runtime_user_id
+                                if runtime_user_id is not None
                                 else task.user_id
                             )
                             task_llm = self._pick_default_llm_with_warning(
@@ -1270,7 +1357,11 @@ class AgentServiceManager:
                     task_fast_llm = None
                     task_vision_llm = None
                     task_compact_llm = None
-            except HTTPException:
+            except (HTTPException, TaskOwnerMismatchError):
+                # Owner mismatch is an identity/authorization fault, not a
+                # recoverable "LLM config failed to load" -- it must not fall
+                # through to the default-LLM path, which would build the
+                # runtime as the wrong user. Propagate it.
                 raise
             except Exception as e:
                 logger.error(
@@ -1283,9 +1374,12 @@ class AgentServiceManager:
             llm_info = "database LLM configuration"
 
             try:
-                # Set user context for memory operations during agent creation
-                if user is None:
-                    raise ValueError("User context is required for agent creation")
+                # Runtime creation depends on the OWNER identity, not the
+                # acting principal -- guard on the resolved runtime user.
+                if runtime_user is None:
+                    raise ValueError(
+                        "Task owner / runtime user is required for agent creation"
+                    )
 
                 if not db:
                     raise ValueError(
@@ -1347,7 +1441,7 @@ class AgentServiceManager:
                 workspace_owner_id = (
                     int(task.user_id)
                     if task and task.user_id is not None
-                    else int(user.id)
+                    else int(runtime_user.id)
                 )
                 sandbox_workspace_config = {
                     "base_dir": str(get_uploads_dir() / f"user_{workspace_owner_id}"),
@@ -1387,7 +1481,11 @@ class AgentServiceManager:
                 tools = await create_default_tools(
                     db,
                     request=self.request,
-                    user=user,
+                    # Owner, not the acting principal: tool config (models,
+                    # OAuth, KB/MCP/SQL visibility, is_admin scope) must be the
+                    # task owner's. The is_admin tri-state in WebToolConfig keeps
+                    # ``request``'s admin from widening this back.
+                    user=runtime_user,
                     task_id=f"web_task_{task_id}",
                     workspace_owner_id=workspace_owner_id,
                     allowed_collections=agent_config["knowledge_bases"]
@@ -1418,7 +1516,7 @@ class AgentServiceManager:
                     else None,
                 )
 
-                with UserContext(int(user.id)):
+                with UserContext(runtime_user_id):
                     # Unpack tools and tool_config from create_default_tools
                     tools_list, tool_config = tools
 
@@ -1495,7 +1593,9 @@ class AgentServiceManager:
                         from ..models.uploaded_file import UploadedFile
 
                         for selected_file_id in selected_file_ids:
-                            task_owner_id = int(task.user_id) if task else int(user.id)
+                            task_owner_id = (
+                                int(task.user_id) if task else int(runtime_user.id)
+                            )
                             uploaded_file = (
                                 db.query(UploadedFile)
                                 .filter(
@@ -1545,6 +1645,7 @@ class AgentServiceManager:
                 # Re-raise the exception - no fallback logic allowed
                 raise
 
+        self._agent_owner_ids[task_id] = runtime_user_id
         return self._agents[task_id]
 
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
@@ -1566,6 +1667,7 @@ class AgentServiceManager:
             logger.info(f"Cleaned up workspace for task {task_id}")
 
             del self._agents[task_id]
+            self._agent_owner_ids.pop(task_id, None)
             logger.info(f"Removed AgentService for task {task_id}")
         else:
             # If agent is not in memory, clean up workspace directory directly

@@ -161,6 +161,8 @@ async def create_workforce_run(
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=task_id,
             task_owner_user_id=int(user.id),
+            # Workforce runs as the requesting user; actor == owner here.
+            actor_user_id=int(user.id),
             payload=TaskTurnPayload(transcript_message=normalized_message),
             kind=TurnKind.CREATE,
             force_fresh=False,

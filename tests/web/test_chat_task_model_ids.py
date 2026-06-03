@@ -877,7 +877,7 @@ def test_task_create_allows_policy_visible_published_agent(
 
         snapshot = load_task_setup_snapshot_sync(
             int(task.id),
-            user_id=int(task.user_id),
+            task_owner_user_id=int(task.user_id),
         )
         assert snapshot is not None
         assert snapshot.agent is not None

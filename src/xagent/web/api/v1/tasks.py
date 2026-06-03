@@ -155,6 +155,8 @@ async def create_chat_task(
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
             task_owner_user_id=int(agent.user_id),
+            # SDK key resolves to the agent owner; actor == owner here.
+            actor_user_id=int(agent.user_id),
             payload=TaskTurnPayload(transcript_message=request.message.content),
             kind=TurnKind.CREATE,
             force_fresh=False,
@@ -304,6 +306,8 @@ async def append_message_to_task(
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
             task_owner_user_id=int(agent.user_id),
+            # SDK key resolves to the agent owner; actor == owner here.
+            actor_user_id=int(agent.user_id),
             payload=TaskTurnPayload(transcript_message=request.message.content),
             kind=TurnKind.APPEND,
             force_fresh=False,

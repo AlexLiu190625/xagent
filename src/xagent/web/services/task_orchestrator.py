@@ -153,7 +153,7 @@ class TaskTurnError(Exception):
 
 class TaskTurnNotFoundError(Exception):
     """Raised when the turn's atomic claim finds no row that both exists
-    and is owned by the calling principal.
+    and is owned by ``task_owner_user_id``.
 
     Deliberately NOT a subclass of :class:`TaskTurnError`: callers map
     ``TaskTurnError`` to 409 (busy / bg_inflight), but a missing or
@@ -163,7 +163,7 @@ class TaskTurnNotFoundError(Exception):
     """
 
     def __init__(self, task_id: int):
-        super().__init__(f"task {task_id} not found or not owned by caller")
+        super().__init__(f"task {task_id} not found or not owned by the task owner")
         self.task_id = task_id
 
 
@@ -208,6 +208,7 @@ class TaskTurnOrchestrator:
         kind: TurnKind,
         force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
+        actor_user_id: Optional[int] = None,
     ) -> TurnStarted:
         """Single entry for any new-turn transition (CREATE / APPEND).
 
@@ -244,6 +245,13 @@ class TaskTurnOrchestrator:
         the entry (e.g. the WS admin bypass), and the turn must still run as
         the owner, not the admin. The claim predicate keeps ``Task.user_id ==
         task_owner_user_id`` as defense-in-depth.
+
+        ``actor_user_id`` is the acting principal that initiated the turn —
+        the same as the owner for normal / SDK / workforce flows, but the
+        admin's id when an admin acts on another user's task. It is recorded
+        for audit/logging only and deliberately does NOT enter the claim,
+        snapshot resolution, ``UserContext``, or tool config; the runtime
+        always runs as ``task_owner_user_id``.
 
         Args:
             task_id: The committed task's id.
@@ -318,6 +326,18 @@ class TaskTurnOrchestrator:
             return res, handle
 
         claimed, bg_task = await asyncio.shield(_claim_and_schedule())
+
+        # Audit who initiated the committed turn. The runtime always runs as
+        # the owner; this only records the acting principal (an admin when
+        # acting on another user's task) and is intentionally not used for any
+        # runtime resolution.
+        logger.info(
+            "turn started: task=%s kind=%s owner=%s actor=%s",
+            task_id,
+            kind,
+            task_owner_user_id,
+            actor_user_id if actor_user_id is not None else task_owner_user_id,
+        )
 
         return TurnStarted(
             task_id=task_id,
@@ -723,7 +743,8 @@ def _schedule_bg(
         writes ``task.status`` and never touches the lease columns;
         the scheduler is responsible for the whole lease lifecycle.
 
-    Takes primitives only (``task_id`` / ``user_id`` / ``task_source``); the
+    Takes primitives only (``task_id`` / ``task_owner_user_id`` /
+    ``task_source``); the
     bg run loads its own snapshot and opens its own sessions, so no
     caller-bound ORM object crosses into the coroutine.
     """
@@ -811,7 +832,7 @@ def _schedule_bg(
                             context, payload.turn_id
                         ),
                         agent_manager=_get_agent_manager(),
-                        user_id=task_owner_user_id,
+                        task_owner_user_id=task_owner_user_id,
                         before_message_id=before_message_id,
                         llm_user_message=payload.execution_message,
                         task_setup_snapshot=snapshot,

@@ -15,6 +15,7 @@ require an actual agent runtime (``execute_task_background``).
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -306,6 +307,48 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
         .one()
     )
     assert persisted.turn_id == payload.turn_id
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_actor_is_audit_only_not_runtime(
+    db_session,
+    mock_schedule_bg,
+    caplog,
+) -> None:
+    """``actor_user_id`` records who initiated the turn (an admin acting on
+    another user's task) for audit/logging only. It must never reach the
+    claim or the bg schedule -- those run as the OWNER -- and it must appear
+    in the audit log line."""
+    owner = _create_user(db_session)
+    task = _create_task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    actor_id = int(owner.id) + 999  # a different principal (e.g. an admin)
+
+    with caplog.at_level(logging.INFO, logger="xagent.web.services.task_orchestrator"):
+        await TaskTurnOrchestrator.begin_turn(
+            task_id=int(task.id),
+            payload=TaskTurnPayload("follow-up"),
+            task_owner_user_id=int(owner.id),
+            actor_user_id=actor_id,
+            kind=TurnKind.APPEND,
+        )
+
+    # The bg schedule runs as the owner; the actor never leaks into it.
+    kwargs = mock_schedule_bg.call_args.kwargs
+    assert kwargs["task_owner_user_id"] == int(owner.id)
+    assert actor_id not in kwargs.values()
+
+    # The persisted user message is attributed to the owner, not the actor.
+    persisted = (
+        db_session.query(TaskChatMessage)
+        .filter(TaskChatMessage.task_id == int(task.id), TaskChatMessage.role == "user")
+        .one()
+    )
+    assert persisted.user_id == int(owner.id)
+
+    # The actor is captured in the audit log.
+    assert "turn started" in caplog.text
+    assert f"owner={int(owner.id)}" in caplog.text
+    assert f"actor={actor_id}" in caplog.text
 
 
 # ---------------------------------------------------------------------------

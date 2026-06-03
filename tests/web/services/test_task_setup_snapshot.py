@@ -99,8 +99,31 @@ def _create_agent(db, user_id: int, **overrides) -> Agent:
 def test_returns_none_when_task_missing(db_session) -> None:
     """A task_id with no matching row must yield ``None``, mirroring
     the legacy ``else`` branch's "Task not found" fallback."""
-    snapshot = load_task_setup_snapshot_sync(task_id=99999, user_id=1)
+    snapshot = load_task_setup_snapshot_sync(task_id=99999, task_owner_user_id=1)
     assert snapshot is None
+
+
+def test_owner_mismatch_raises_distinct_from_missing(db_session) -> None:
+    """Identity guard: a task that exists but is owned by a different user
+    must raise ``TaskOwnerMismatchError`` -- NOT return ``None`` (which means
+    "task missing"). Keeps runtime model/tool resolution from running as the
+    wrong user, and lets callers tell a vanished task apart from an identity
+    inconsistency."""
+    from xagent.web.services.task_setup_snapshot import TaskOwnerMismatchError
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user_id=int(user.id))
+
+    with pytest.raises(TaskOwnerMismatchError):
+        load_task_setup_snapshot_sync(
+            task_id=int(task.id), task_owner_user_id=int(user.id) + 9999
+        )
+
+    # None owner skips the check (backward compat for callers without an owner).
+    assert (
+        load_task_setup_snapshot_sync(task_id=int(task.id), task_owner_user_id=None)
+        is not None
+    )
 
 
 def test_basic_task_no_agent_builder(db_session) -> None:
@@ -110,7 +133,9 @@ def test_basic_task_no_agent_builder(db_session) -> None:
     user = _create_user(db_session)
     task = _create_task(db_session, user_id=int(user.id))
 
-    snapshot = load_task_setup_snapshot_sync(task_id=int(task.id), user_id=int(user.id))
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
 
     assert snapshot is not None
     assert isinstance(snapshot, TaskSetupSnapshot)
@@ -151,7 +176,9 @@ def test_agent_builder_published_sets_excluded_agent_id(db_session) -> None:
         execution_mode=None,  # let agent-builder execution_mode take over downstream
     )
 
-    snapshot = load_task_setup_snapshot_sync(task_id=int(task.id), user_id=int(user.id))
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
 
     assert snapshot is not None
     assert snapshot.agent is not None
@@ -182,7 +209,9 @@ def test_agent_builder_draft_no_excluded_agent_id(db_session) -> None:
     )
     task = _create_task(db_session, user_id=int(user.id), agent_id=int(agent.id))
 
-    snapshot = load_task_setup_snapshot_sync(task_id=int(task.id), user_id=int(user.id))
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
 
     assert snapshot is not None
     assert snapshot.agent is not None
@@ -205,7 +234,7 @@ def test_task_pattern_derived_from_execution_mode(db_session) -> None:
     for mode, expected_pattern in cases:
         task = _create_task(db_session, user_id=int(user.id), execution_mode=mode)
         snapshot = load_task_setup_snapshot_sync(
-            task_id=int(task.id), user_id=int(user.id)
+            task_id=int(task.id), task_owner_user_id=int(user.id)
         )
         assert snapshot is not None
         assert snapshot.task_pattern == expected_pattern, (
@@ -230,7 +259,9 @@ def test_no_orm_leak_in_returned_fields(db_session) -> None:
     agent = _create_agent(db_session, user_id=int(user.id))
     task = _create_task(db_session, user_id=int(user.id), agent_id=int(agent.id))
 
-    snapshot = load_task_setup_snapshot_sync(task_id=int(task.id), user_id=int(user.id))
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
     assert snapshot is not None
 
     # The frozen container.
@@ -291,7 +322,9 @@ def test_snapshot_frozen_dataclass(db_session) -> None:
 
     user = _create_user(db_session)
     task = _create_task(db_session, user_id=int(user.id))
-    snapshot = load_task_setup_snapshot_sync(task_id=int(task.id), user_id=int(user.id))
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
     assert snapshot is not None
 
     with pytest.raises(FrozenInstanceError):
@@ -325,7 +358,9 @@ def test_session_closes_even_when_loader_raises(db_session) -> None:
         side_effect=boom,
     ):
         with pytest.raises(RuntimeError, match="simulated llm-resolve failure"):
-            load_task_setup_snapshot_sync(task_id=int(task.id), user_id=int(user.id))
+            load_task_setup_snapshot_sync(
+                task_id=int(task.id), task_owner_user_id=int(user.id)
+            )
 
     # If the session leaked, this fresh query would block / fail on
     # SQLite (single-writer) or exhaust the pool elsewhere. A clean

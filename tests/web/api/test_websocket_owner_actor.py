@@ -1,0 +1,256 @@
+"""Owner/actor regression pins for the WebSocket control handlers.
+
+An admin may operate on another user's task (admin bypass), but the agent
+runtime must run as the task OWNER, not the admin. A non-admin who is not the
+owner must be refused before any runtime is built. These pin the pause / resume
+handlers directly (the focused unit tests cover get_agent_for_task in
+isolation; here we exercise the handlers end to end).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from xagent.web.api.websocket import (
+    execute_resume_background,
+    handle_chat_message,
+    handle_pause_task,
+    handle_resume_task,
+)
+from xagent.web.models.database import Base, get_db, get_engine, init_db
+from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.user import User
+
+
+@pytest.fixture()
+def db_session(tmp_path):
+    init_db(db_url=f"sqlite:///{tmp_path / 'owner_actor.db'}")
+    db = next(get_db())
+    try:
+        yield db
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+
+
+def _user(db, username, *, is_admin=False) -> User:
+    u = User(username=username, password_hash="x", is_admin=is_admin)
+    db.add(u)
+    db.commit()
+    db.refresh(u)
+    return u
+
+
+def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
+    t = Task(
+        user_id=owner_id,
+        title="t",
+        description="d",
+        status=status,
+        execution_mode="balanced",
+        source="sdk",
+    )
+    db.add(t)
+    db.commit()
+    db.refresh(t)
+    return t
+
+
+def _patched_manager_and_agent():
+    """Return (patches contextmanagers, captured) wiring get_agent_manager +
+    the module ``manager`` so the handler can run without real IO."""
+    captured: dict = {}
+    agent_service = MagicMock()
+    agent_service.pause_execution = AsyncMock(return_value={"status": "paused"})
+    agent_service.resume_execution = AsyncMock()
+    agent_service.supports_live_control = MagicMock(return_value=False)
+
+    async def _get_agent_for_task(task_id, db, *, user=None, task_owner_user_id=None):
+        captured["task_owner_user_id"] = task_owner_user_id
+        return agent_service
+
+    mgr = MagicMock()
+    mgr.get_agent_for_task = AsyncMock(side_effect=_get_agent_for_task)
+
+    ws_manager = MagicMock()
+    ws_manager.send_personal_message = AsyncMock()
+    ws_manager.broadcast_to_task = AsyncMock()
+    return captured, agent_service, mgr, ws_manager
+
+
+@pytest.mark.asyncio
+async def test_chat_admin_append_to_other_users_task_claims_as_owner(
+    db_session,
+) -> None:
+    """The original #587 regression: an admin appending through
+    ``handle_chat_message`` to a task owned by another user. The bug was the
+    atomic claim using the actor id, so the owner's appendable task failed with
+    ``TaskTurnNotFoundError``. Pin that ``begin_turn`` is invoked with
+    ``task_owner_user_id == task.user_id`` (the owner), not the admin actor.
+    """
+    owner = _user(db_session, "owner")
+    admin = _user(db_session, "admin", is_admin=True)
+    # COMPLETED -> the WS path treats the follow-up as an APPEND turn.
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+
+    ws_manager = MagicMock()
+    ws_manager.broadcast_to_task = AsyncMock()
+    ws_manager.send_personal_message = AsyncMock()
+    begin_turn = AsyncMock()
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+            new=begin_turn,
+        ),
+    ):
+        await handle_chat_message(
+            MagicMock(),
+            int(task.id),
+            {"message": "follow-up", "user": admin, "files": []},
+        )
+
+    begin_turn.assert_awaited_once()
+    assert begin_turn.await_args.kwargs["task_owner_user_id"] == int(owner.id)
+
+
+@pytest.mark.asyncio
+async def test_pause_admin_on_other_users_task_runs_as_owner(db_session) -> None:
+    owner = _user(db_session, "owner")
+    admin = _user(db_session, "admin", is_admin=True)
+    task = _task(db_session, owner.id)
+    captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        await handle_pause_task(MagicMock(), int(task.id), {"user": admin})
+
+    # Built and paused as the OWNER, not the admin actor.
+    assert captured["task_owner_user_id"] == int(owner.id)
+    agent.pause_execution.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pause_non_owner_non_admin_is_refused(db_session) -> None:
+    owner = _user(db_session, "owner")
+    stranger = _user(db_session, "stranger")  # not admin, not owner
+    task = _task(db_session, owner.id)
+    captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        # The handler authorizes the task away and handles the denial
+        # internally; the point is that no owner runtime is built / paused.
+        await handle_pause_task(MagicMock(), int(task.id), {"user": stranger})
+
+    assert "task_owner_user_id" not in captured
+    agent.pause_execution.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_resume_admin_on_other_users_task_runs_as_owner(db_session) -> None:
+    owner = _user(db_session, "owner")
+    admin = _user(db_session, "admin", is_admin=True)
+    task = _task(db_session, owner.id)
+    captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        await handle_resume_task(MagicMock(), int(task.id), {"user": admin})
+
+    assert captured["task_owner_user_id"] == int(owner.id)
+
+
+@pytest.mark.asyncio
+async def test_resume_live_control_admin_runs_background_as_owner(db_session) -> None:
+    """Live-control resume schedules ``execute_resume_background``; when an
+    admin resumes another user's task it must run with the OWNER's
+    UserContext, i.e. ``task_owner_user_id`` is the owner, not the admin."""
+    owner = _user(db_session, "owner")
+    admin = _user(db_session, "admin", is_admin=True)
+    task = _task(db_session, owner.id)
+    captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+    agent.supports_live_control = MagicMock(return_value=True)
+
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.running_tasks.get = MagicMock(return_value=None)
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_resume_task(MagicMock(), int(task.id), {"user": admin})
+
+    # Agent built as owner, and the background resume runs as owner.
+    assert captured["task_owner_user_id"] == int(owner.id)
+    resume_bg.assert_called_once()
+    assert resume_bg.call_args.kwargs["task_owner_user_id"] == int(owner.id)
+
+
+@pytest.mark.asyncio
+async def test_execute_resume_background_rejects_owner_mismatch(db_session) -> None:
+    """``execute_resume_background`` runs the resume under
+    ``UserContext(task_owner_user_id)``. If a caller passes an owner id that
+    disagrees with the task row, the symmetric guard (same as
+    ``execute_task_background``) must fire before the agent resumes, so the
+    runtime never executes as the wrong user."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id)
+
+    agent = MagicMock()
+    agent.resume_execution_by_id = AsyncMock()
+    ws_manager = MagicMock()
+    ws_manager.broadcast_to_task = AsyncMock()
+
+    with (
+        patch("xagent.web.api.websocket.acquire_task_lease", return_value=object()),
+        patch("xagent.web.api.websocket.release_task_lease_with_workforce_sync"),
+        patch("xagent.web.api.websocket.stop_task_lease_heartbeat", new=AsyncMock()),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id) + 999,  # != task owner
+        )
+
+    # Guard fired before the resume ran -- nothing executed as the wrong user.
+    agent.resume_execution_by_id.assert_not_awaited()
+    error_types = {
+        msg.get("type")
+        for (msg, _tid) in (
+            call.args for call in ws_manager.broadcast_to_task.call_args_list
+        )
+        if isinstance(msg, dict)
+    }
+    assert "task_error" in error_types
+
+
+@pytest.mark.asyncio
+async def test_resume_non_owner_non_admin_is_refused(db_session) -> None:
+    owner = _user(db_session, "owner")
+    stranger = _user(db_session, "stranger")
+    task = _task(db_session, owner.id)
+    captured, agent, mgr, ws_manager = _patched_manager_and_agent()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+    ):
+        await handle_resume_task(MagicMock(), int(task.id), {"user": stranger})
+
+    # Authorized away before any runtime is built; an error is sent back.
+    assert "task_owner_user_id" not in captured
+    ws_manager.send_personal_message.assert_awaited()

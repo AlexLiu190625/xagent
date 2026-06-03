@@ -106,9 +106,25 @@ class TaskSetupSnapshot:
 # primitive wrapping and runs inside the request session's lifetime.
 
 
+class TaskOwnerMismatchError(Exception):
+    """The task row's owner does not match the expected ``task_owner_user_id``.
+
+    Distinct from "task missing" (which returns ``None``): a missing task is a
+    benign race (deleted before the bg run), whereas an owner mismatch is an
+    identity/authorization inconsistency. Raising keeps the runtime from
+    silently resolving models / tools as the wrong user.
+    """
+
+    def __init__(self, task_id: int, expected: int, actual: int):
+        super().__init__(f"task {task_id} owner {actual} != expected {expected}")
+        self.task_id = task_id
+        self.expected = expected
+        self.actual = actual
+
+
 def load_task_setup_snapshot_sync(
     task_id: int,
-    user_id: Optional[int],
+    task_owner_user_id: Optional[int],
 ) -> Optional[TaskSetupSnapshot]:
     """Open a dedicated ``SessionLocal``, read every synchronous field
     ``get_agent_for_task`` needs for normal (non-reconstruct) creation,
@@ -117,6 +133,12 @@ def load_task_setup_snapshot_sync(
     Designed to be called from the event loop via
     ``await asyncio.to_thread(load_task_setup_snapshot_sync, ...)`` so
     the main loop stays responsive during the read (issue #427).
+
+    ``task_owner_user_id`` is the runtime identity the task runs as. When
+    provided it MUST match the row's ``user_id``; a mismatch raises
+    :class:`TaskOwnerMismatchError` (never silently splits "snapshot owner"
+    from "resolution user"). Model / runtime resolution always uses the
+    row's owner, not the passed value.
 
     Returns ``None`` when the task row is missing -- callers fall back
     to whatever behaviour the legacy in-line code already implements
@@ -130,6 +152,10 @@ def load_task_setup_snapshot_sync(
         task_row = session.query(Task).filter(Task.id == task_id).first()
         if task_row is None:
             return None
+
+        owner_user_id = int(task_row.user_id)
+        if task_owner_user_id is not None and owner_user_id != task_owner_user_id:
+            raise TaskOwnerMismatchError(task_id, task_owner_user_id, owner_user_id)
 
         task_fields = _TaskFields(
             id=int(task_row.id),
@@ -155,7 +181,11 @@ def load_task_setup_snapshot_sync(
             ),
         )
 
-        core = resolve_task_runtime_config_core(task_row, session, user_id=user_id)
+        # Runtime resolution always uses the row's OWNER, never the passed
+        # value (which is validated to match above when provided).
+        core = resolve_task_runtime_config_core(
+            task_row, session, user_id=owner_user_id
+        )
         task_llm, task_fast_llm, task_vision_llm, task_compact_llm = core.llms
 
         # ``core.agent_fields`` is already an ``AgentRuntimeFields``

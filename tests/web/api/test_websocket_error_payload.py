@@ -220,7 +220,7 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
         user_message="run",
         context={},
         agent_manager=FailingAgentManager(),
-        user_id=user_id,
+        task_owner_user_id=user_id,
     )
 
     assert broadcasts

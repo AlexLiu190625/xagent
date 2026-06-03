@@ -1258,7 +1258,7 @@ async def execute_task_background(
     user_message: str,
     context: Dict[str, Any],
     agent_manager: Any,
-    user_id: int | None,
+    task_owner_user_id: int | None,
     before_message_id: int | None = None,
     llm_user_message: Optional[str] = None,
     task_setup_snapshot: Optional["TaskSetupSnapshot"] = None,
@@ -1309,7 +1309,25 @@ async def execute_task_background(
                 raise ValueError(f"Task {task_id} not found")
             task_user_id = _task_user_id(task)
 
-        effective_user_id = user_id if user_id is not None else task_user_id
+        # The task OWNER (from snapshot / DB) is the runtime identity. A passed
+        # ``task_owner_user_id`` must equal it -- it may never override the
+        # owner, or the task would run as the wrong user (e.g. an admin acting
+        # on someone else's task would get the admin's models / tools / OAuth).
+        # All callers pass the owner; a mismatch is a programming error, so
+        # reject it rather than silently continue.
+        if (
+            task_owner_user_id is not None
+            and task_user_id is not None
+            and task_owner_user_id != task_user_id
+        ):
+            raise ValueError(
+                f"execute_task_background: passed task_owner_user_id "
+                f"{task_owner_user_id} does not match task {task_id} owner "
+                f"{task_user_id}; refusing to run as the wrong user"
+            )
+        effective_user_id = (
+            task_user_id if task_user_id is not None else task_owner_user_id
+        )
         user = (
             db.query(User).filter(User.id == effective_user_id).first()
             if effective_user_id is not None
@@ -1317,12 +1335,15 @@ async def execute_task_background(
         )
 
         with UserContext(effective_user_id):
-            # Get agent service
+            # Get agent service. ``effective_user_id`` is the task owner
+            # (authoritative above); pass it as the runtime identity so the
+            # agent's models / tools resolve as the owner, not any acting admin.
             agent_service = await agent_manager.get_agent_for_task(
                 task_id,
                 db,
                 user=user,
                 task_setup_snapshot=task_setup_snapshot,
+                task_owner_user_id=effective_user_id,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
@@ -1683,10 +1704,14 @@ async def execute_task_background(
 async def execute_resume_background(
     task_id: int,
     agent_service: Any,
-    user_id: int | None,
+    task_owner_user_id: int | None,
     previous_task: Optional[asyncio.Task] = None,
 ) -> None:
-    """Resume an agent execution after an interrupt/user-message checkpoint."""
+    """Resume an agent execution after an interrupt/user-message checkpoint.
+
+    ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
+    resume executes as (``UserContext``), not the acting principal.
+    """
     from ..models.agent import Agent
     from ..models.database import get_db
     from ..models.task import Task, TaskStatus
@@ -1721,6 +1746,23 @@ async def execute_resume_background(
             lease = acquire_task_lease(db_lease, task_id)
             if lease is not None:
                 task_for_sync = db_lease.query(Task).filter(Task.id == task_id).first()
+                # Same owner guard as ``execute_task_background``: the resume
+                # runs under ``UserContext(task_owner_user_id)`` below, so a
+                # passed owner that disagrees with the task row would resume as
+                # the wrong user. All callers pass the owner; a mismatch is a
+                # programming error -- fail loudly rather than run as the wrong
+                # identity.
+                if (
+                    task_for_sync is not None
+                    and task_owner_user_id is not None
+                    and int(task_for_sync.user_id) != task_owner_user_id
+                ):
+                    raise ValueError(
+                        f"execute_resume_background: passed task_owner_user_id "
+                        f"{task_owner_user_id} does not match task {task_id} "
+                        f"owner {int(task_for_sync.user_id)}; refusing to resume "
+                        "as the wrong user"
+                    )
                 if task_for_sync is not None and sync_workforce_run_status(
                     db_lease, task_for_sync, TaskStatus.RUNNING
                 ):
@@ -1737,7 +1779,7 @@ async def execute_resume_background(
             run_task_lease_heartbeat(lease, lease_stop_event)
         )
 
-        with UserContext(user_id):
+        with UserContext(task_owner_user_id):
             result = await agent_service.resume_execution_by_id(str(task_id))
 
         if result is None:
@@ -1748,7 +1790,7 @@ async def execute_resume_background(
         success = bool(result.get("success", False))
         output = str(result.get("output") or result.get("error") or "")
 
-        if user_id is not None:
+        if task_owner_user_id is not None:
             db_gen = get_db()
             db_normalize = next(db_gen)
             try:
@@ -2697,7 +2739,10 @@ async def handle_chat_message(
                 has_continuation = False
                 if task_uses_live_control:
                     agent_service = await get_agent_manager().get_agent_for_task(
-                        task_id, db, user=user
+                        task_id,
+                        db,
+                        user=user,
+                        task_owner_user_id=int(task.user_id),
                     )
                     if hasattr(agent_service, "set_outbound_message_handler"):
                         agent_service.set_outbound_message_handler(
@@ -2843,7 +2888,7 @@ async def handle_chat_message(
                         execute_resume_background(
                             task_id=task_id,
                             agent_service=agent_service,
-                            user_id=int(user.id),
+                            task_owner_user_id=int(task.user_id),
                             previous_task=previous_task,
                         )
                     )
@@ -3054,6 +3099,9 @@ async def handle_chat_message(
                             # check), and the turn must run as the task owner,
                             # not an admin acting on someone else's task.
                             task_owner_user_id=int(task.user_id),
+                            # The acting principal (the admin when acting on
+                            # another user's task) -- audit/logging only.
+                            actor_user_id=int(user.id),
                             payload=payload,
                             kind=turn_kind,
                             force_fresh=turn_force_fresh,
@@ -3269,7 +3317,7 @@ async def handle_execute_task(
 
             agent_manager = get_agent_manager()
             agent_service = await agent_manager.get_agent_for_task(
-                task_id, db, user=user
+                task_id, db, user=user, task_owner_user_id=int(task.user_id)
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(
@@ -3283,8 +3331,11 @@ async def handle_execute_task(
                 recovery_state.get("skill_context")
             )
 
-            # Set up user context
-            with UserContext(user.id):
+            # Set up user context as the task OWNER (runtime identity), not the
+            # acting principal -- an admin executing another user's task must
+            # run with the owner's identity. ``task`` is already loaded and
+            # authorized above.
+            with UserContext(int(task.user_id)):
                 # Build context with vibe mode information if available
                 task_context = {}
                 if hasattr(task, "execution_mode") and task.execution_mode:
@@ -4057,12 +4108,32 @@ async def handle_pause_task(
         db_gen = get_db()
         db = next(db_gen)
 
-        # Get agent service
+        # Authorize the task BEFORE building any runtime: an admin may pause any
+        # task; a non-admin only their own. Loading the task here also gives us
+        # the OWNER, so the agent runtime runs as the owner, not the actor.
+        from ..models.task import Task as _PauseTask
+
+        if user.is_admin:
+            task = db.query(_PauseTask).filter(_PauseTask.id == task_id).first()
+        else:
+            task = (
+                db.query(_PauseTask)
+                .filter(_PauseTask.id == task_id, _PauseTask.user_id == int(user.id))
+                .first()
+            )
+        if task is None:
+            logger.warning(
+                "pause: task %s not found or not owned by user %s", task_id, user.id
+            )
+            raise ValueError(f"Access denied: task {task_id} is not available")
+        task_owner_user_id = int(task.user_id)
+
+        # Get agent service (as the task owner)
         from .chat import get_agent_manager
 
         logger.info(f"Getting agent service for task {task_id}")
         agent_service = await get_agent_manager().get_agent_for_task(
-            task_id, db, user=user
+            task_id, db, user=user, task_owner_user_id=task_owner_user_id
         )
         logger.info(f"Agent service obtained: {type(agent_service).__name__}")
 
@@ -4142,36 +4213,38 @@ async def handle_resume_task(
         db_gen = get_db()
         db = next(db_gen)
 
-        # Get agent service
-        from .chat import get_agent_manager
-
-        try:
-            agent_service = await get_agent_manager().get_agent_for_task(
-                task_id, db, user=user
-            )
-        finally:
-            db.close()
-
         from ..models.task import Task
 
         task: Any | None = None
-        db_update_gen = get_db()
-        db_update = next(db_update_gen)
+        agent_service: Any = None
         try:
+            # Authorize BEFORE building any runtime: an admin may resume any
+            # task, a non-admin only their own. Loading the task here also
+            # yields the OWNER, so the agent runs as the owner (not the actor)
+            # and nothing is built / cached for an unauthorized request.
             if user.is_admin:
-                task = db_update.query(Task).filter(Task.id == task_id).first()
+                task = db.query(Task).filter(Task.id == task_id).first()
             else:
                 task = (
-                    db_update.query(Task)
-                    .filter(Task.id == task_id, Task.user_id == user.id)
+                    db.query(Task)
+                    .filter(Task.id == task_id, Task.user_id == int(user.id))
                     .first()
                 )
-            if not task:
+            if task is None:
                 logger.warning(
                     f"Task {task_id} not found or access denied for user {user.id}"
                 )
+            else:
+                from .chat import get_agent_manager
+
+                agent_service = await get_agent_manager().get_agent_for_task(
+                    task_id,
+                    db,
+                    user=user,
+                    task_owner_user_id=int(task.user_id),
+                )
         finally:
-            db_update.close()
+            db.close()
 
         if task is None:
             await manager.send_personal_message(
@@ -4195,7 +4268,7 @@ async def handle_resume_task(
                 execute_resume_background(
                     task_id=task_id,
                     agent_service=agent_service,
-                    user_id=int(user.id),
+                    task_owner_user_id=int(task.user_id),
                     previous_task=previous_task,
                 )
             )

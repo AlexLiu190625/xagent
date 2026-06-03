@@ -125,7 +125,7 @@ class WebToolConfig(BaseToolConfig):
         db: Any,
         request: Any,
         user_id: Optional[int] = None,
-        is_admin: bool = False,
+        is_admin: Optional[bool] = None,
         user: Optional[Any] = None,
         workspace_config: Optional[Dict[str, Any]] = None,
         vision_model: Optional[Any] = None,
@@ -157,7 +157,18 @@ class WebToolConfig(BaseToolConfig):
         self._user_id = (
             user_id if user_id is not None else self._get_user_id_from_request(request)
         )
-        self._is_admin_value = is_admin or self._get_is_admin_from_request(request)
+        # Tri-state: an explicit ``is_admin`` (including ``False``) is
+        # authoritative and is NOT OR-ed with the request's admin flag. This
+        # is the privilege-isolation boundary: when the runtime builds a tool
+        # config for a task owner (passing ``is_admin=bool(owner.is_admin)``),
+        # an admin *actor* on the request must not silently widen the config
+        # to admin scope. Only when ``is_admin`` is unset do we fall back to
+        # the request.
+        self._is_admin_value = (
+            bool(is_admin)
+            if is_admin is not None
+            else self._get_is_admin_from_request(request)
+        )
         # Initialize workspace_config with base_dir and task_id if provided
         if workspace_config is None:
             workspace_config = {}
@@ -262,18 +273,13 @@ class WebToolConfig(BaseToolConfig):
             return 1
 
     def _get_is_admin_from_request(self, request: Any) -> bool:
-        """Extract is_admin flag from request."""
-        try:
-            # If request has a user attribute directly, check is_admin
-            if hasattr(request, "user") and request.user:
-                return bool(request.user.is_admin)
+        """Extract is_admin flag from the request user, defaulting to False.
 
-            return False
-
-        except Exception as e:
-            logger = logging.getLogger(__name__)
-            logger.warning(f"Failed to get is_admin from request: {e}")
-            return False
+        Uses ``getattr`` so a minimal request object (e.g. one carrying only a
+        user id) doesn't trip the broad ``except`` and log a spurious warning.
+        """
+        user = getattr(request, "user", None)
+        return bool(getattr(user, "is_admin", False)) if user is not None else False
 
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:
         """Get workspace configuration."""

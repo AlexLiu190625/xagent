@@ -218,7 +218,7 @@ async def test_snapshot_path_skips_task_query_keeps_user_query() -> None:
                 user_message="hi",
                 context={},
                 agent_manager=agent_manager,
-                user_id=1,
+                task_owner_user_id=1,
                 task_setup_snapshot=snapshot,
             )
         except Exception:
@@ -251,7 +251,7 @@ async def test_legacy_path_runs_task_and_user_queries() -> None:
                 user_message="hi",
                 context={},
                 agent_manager=agent_manager,
-                user_id=1,
+                task_owner_user_id=1,
                 task_setup_snapshot=None,
             )
         except Exception:

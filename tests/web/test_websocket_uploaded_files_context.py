@@ -144,7 +144,7 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
 
     class AgentManager:
         async def get_agent_for_task(
-            self, task_id, db, user=None, task_setup_snapshot=None
+            self, task_id, db, user=None, task_setup_snapshot=None, **kwargs
         ):
             captured["agent_db"] = db
             return AgentService()
@@ -194,7 +194,7 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
         user_message="重试",
         context={},
         agent_manager=AgentManager(),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         llm_user_message="重试",
     )
 
@@ -302,7 +302,7 @@ async def test_completion_broadcast_failure_keeps_task_completed(
         user_message="hi",
         context={},
         agent_manager=AgentManager(),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         llm_user_message="hi",
     )
 
@@ -352,7 +352,7 @@ async def test_execution_failure_routes_real_error_to_terminal_payload(
         user_message="hi",
         context={},
         agent_manager=AgentManager(),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         llm_user_message="hi",
     )
 
@@ -405,7 +405,7 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
         user_message="hi",
         context={},
         agent_manager=AgentManager(),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         llm_user_message="hi",
     )
 
@@ -455,7 +455,7 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
         user_message="hi",
         context={},
         agent_manager=AgentManager(),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         llm_user_message="hi",
     )
 
