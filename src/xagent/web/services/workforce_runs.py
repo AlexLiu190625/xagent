@@ -160,7 +160,7 @@ async def create_workforce_run(
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=task_id,
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             payload=TaskTurnPayload(transcript_message=normalized_message),
             kind=TurnKind.CREATE,
             force_fresh=False,

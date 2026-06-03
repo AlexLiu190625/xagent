@@ -151,7 +151,7 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     await TaskTurnOrchestrator.begin_turn(
         task_id=int(task.id),
         payload=TaskTurnPayload("first turn"),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         kind=TurnKind.CREATE,
         force_fresh=False,
     )
@@ -185,7 +185,7 @@ async def test_begin_turn_append_clears_stale_output_and_error(
     await TaskTurnOrchestrator.begin_turn(
         task_id=int(task.id),
         payload=TaskTurnPayload("second question"),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=False,
     )
@@ -217,7 +217,7 @@ async def test_begin_turn_append_clears_stale_error_message(
     await TaskTurnOrchestrator.begin_turn(
         task_id=int(task.id),
         payload=TaskTurnPayload("second"),
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=False,
     )
@@ -249,7 +249,7 @@ async def test_begin_turn_append_accepts_paused_task_as_new_turn(
     await TaskTurnOrchestrator.begin_turn(
         task_id=int(task.id),
         payload=payload,
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=False,
     )
@@ -290,7 +290,7 @@ async def test_begin_turn_passes_force_fresh_through_to_schedule_bg(
     await TaskTurnOrchestrator.begin_turn(
         task_id=int(task.id),
         payload=payload,
-        user_id=int(user.id),
+        task_owner_user_id=int(user.id),
         kind=TurnKind.APPEND,
         force_fresh=True,
     )
@@ -326,7 +326,7 @@ async def test_begin_turn_rejects_create_with_force_fresh(
         await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
             payload=TaskTurnPayload("x"),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             kind=TurnKind.CREATE,
             force_fresh=True,
         )
@@ -347,7 +347,7 @@ async def test_begin_turn_rejects_task_not_owned_by_user(
     with pytest.raises(TaskTurnNotFoundError):
         await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
-            user_id=int(user.id) + 9999,
+            task_owner_user_id=int(user.id) + 9999,
             payload=TaskTurnPayload("x"),
             kind=TurnKind.CREATE,
         )
@@ -374,7 +374,7 @@ async def test_begin_turn_marks_failed_when_schedule_raises(
         with pytest.raises(RuntimeError, match="schedule boom"):
             await TaskTurnOrchestrator.begin_turn(
                 task_id=int(task.id),
-                user_id=int(user.id),
+                task_owner_user_id=int(user.id),
                 payload=TaskTurnPayload("x"),
                 kind=TurnKind.CREATE,
             )
@@ -394,7 +394,7 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
 
-    def slow_claim(task_id, user_id, *, payload, kind):
+    def slow_claim(task_id, task_owner_user_id, *, payload, kind):
         _time.sleep(0.15)  # window during which we cancel the caller
         return _ClaimedTurn(
             status=TaskStatus.RUNNING,
@@ -417,7 +417,7 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
         t = asyncio.create_task(
             TaskTurnOrchestrator.begin_turn(
                 task_id=int(task.id),
-                user_id=int(user.id),
+                task_owner_user_id=int(user.id),
                 payload=TaskTurnPayload("x"),
                 kind=TurnKind.CREATE,
             )
@@ -456,7 +456,7 @@ async def test_begin_turn_refuses_when_bg_inflight(
             await TaskTurnOrchestrator.begin_turn(
                 task_id=int(task.id),
                 payload=TaskTurnPayload("x"),
-                user_id=int(user.id),
+                task_owner_user_id=int(user.id),
                 kind=TurnKind.APPEND,
             )
         assert excinfo.value.reason == "bg_inflight"
@@ -482,7 +482,7 @@ async def test_begin_turn_refuses_create_against_terminal_task(
         await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
             payload=TaskTurnPayload("x"),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             kind=TurnKind.CREATE,
         )
     assert excinfo.value.reason == "busy"
@@ -501,7 +501,7 @@ async def test_begin_turn_refuses_append_against_pending_task(
         await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
             payload=TaskTurnPayload("x"),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             kind=TurnKind.APPEND,
         )
     assert excinfo.value.reason == "busy"
@@ -668,7 +668,7 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
         # function runs with the deeper layers patched.
         bg_task = _schedule_bg(
             task_id=int(task.id),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
@@ -720,7 +720,7 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
     ):
         bg_task = _schedule_bg(
             task_id=int(task.id),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
@@ -791,7 +791,7 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
         )
         bg_task = _schedule_bg(
             task_id=int(task.id),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             task_source=task.source,
             payload=payload,
             force_fresh=False,
@@ -879,7 +879,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     ):
         bg_task = _schedule_bg(
             task_id=int(task.id),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
@@ -956,7 +956,7 @@ async def test_schedule_bg_marks_task_failed_when_execute_raises(
     ):
         bg_task = _schedule_bg(
             task_id=int(task.id),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,
@@ -1037,7 +1037,7 @@ async def test_schedule_bg_does_not_overwrite_terminal_status_from_execute(
     ):
         bg_task = _schedule_bg(
             task_id=int(task.id),
-            user_id=int(user.id),
+            task_owner_user_id=int(user.id),
             task_source=task.source,
             payload=TaskTurnPayload("x"),
             force_fresh=False,

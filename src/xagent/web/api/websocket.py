@@ -3049,7 +3049,11 @@ async def handle_chat_message(
                     try:
                         await TaskTurnOrchestrator.begin_turn(
                             task_id=int(task.id),
-                            user_id=int(user.id),
+                            # Owner, not the acting principal: ``task`` was
+                            # already authorized above (admin bypass / owner
+                            # check), and the turn must run as the task owner,
+                            # not an admin acting on someone else's task.
+                            task_owner_user_id=int(task.user_id),
                             payload=payload,
                             kind=turn_kind,
                             force_fresh=turn_force_fresh,

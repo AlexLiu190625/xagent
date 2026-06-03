@@ -203,7 +203,7 @@ class TaskTurnOrchestrator:
     async def begin_turn(
         *,
         task_id: int,
-        user_id: int,
+        task_owner_user_id: int,
         payload: TaskTurnPayload,
         kind: TurnKind,
         force_fresh: bool = False,
@@ -228,23 +228,28 @@ class TaskTurnOrchestrator:
              can both pass it; the authoritative serializer is the DB atomic
              claim (the status-filter rowcount), which lets exactly one win.
           2. ``_begin_turn_atomic_sync`` (off-loop): atomic claim
-             (``id == task_id AND user_id == user_id AND <status_filter>``)
-             + persist + snapshot SELECT + single commit. By construction it
-             only raises BEFORE commit, so a successful return means the row
-             is committed RUNNING.
+             (``id == task_id AND user_id == task_owner_user_id AND
+             <status_filter>``) + persist + snapshot SELECT + single commit.
+             By construction it only raises BEFORE commit, so a successful
+             return means the row is committed RUNNING.
           3. ``_schedule_bg`` (sync, no await) — schedule the lease-aware bg
              coroutine. Once step 2 committed, this must succeed or the task
              is forced FAILED (no zombie RUNNING).
 
-        ``user_id`` is the authenticated principal's id (the SDK agent's
-        owner / the WS user), NOT ``task.user_id`` — folding it into the
-        claim predicate is what makes ownership meaningful instead of the
-        row proving itself.
+        ``task_owner_user_id`` is the task OWNER's id — the runtime identity
+        the turn executes as. Callers derive it from the already-authorized
+        task row (``task.user_id``) or the SDK agent's owner
+        (``agent.user_id``), NOT from the acting principal. They differ when
+        an admin operates on another user's task: authorization happens at
+        the entry (e.g. the WS admin bypass), and the turn must still run as
+        the owner, not the admin. The claim predicate keeps ``Task.user_id ==
+        task_owner_user_id`` as defense-in-depth.
 
         Args:
             task_id: The committed task's id.
-            user_id: Authenticated principal id; claim only succeeds if the
-                task belongs to this user.
+            task_owner_user_id: The task owner's id (runtime identity). Used
+                for the claim predicate, the persisted user message, and the
+                whole bg execution context.
             payload: Two-channel message (transcript + execution).
             kind: Which status filter the atomic claim uses.
             force_fresh: When True, the bg coroutine starts a fresh agent
@@ -261,7 +266,7 @@ class TaskTurnOrchestrator:
             TaskTurnError("bg_inflight"): a previous bg coroutine is running.
             TaskTurnError("busy"): the row exists and is owned but its status
                 did not match the claim filter.
-            TaskTurnNotFoundError: no row matched id + ownership (404).
+            TaskTurnNotFoundError: no row matched id + owner.
         """
         if kind == TurnKind.CREATE and force_fresh:
             raise ValueError(
@@ -286,14 +291,14 @@ class TaskTurnOrchestrator:
             res = await asyncio.to_thread(
                 _begin_turn_atomic_sync,
                 task_id,
-                user_id,
+                task_owner_user_id,
                 payload=payload,
                 kind=kind,
             )
             try:
                 handle = _schedule_bg(
                     task_id=task_id,
-                    user_id=user_id,
+                    task_owner_user_id=task_owner_user_id,
                     task_source=res.task_source,
                     payload=payload,
                     force_fresh=force_fresh,
@@ -341,7 +346,7 @@ class _ClaimedTurn:
 
 def _begin_turn_atomic_sync(
     task_id: int,
-    user_id: int,
+    task_owner_user_id: int,
     *,
     payload: TaskTurnPayload,
     kind: TurnKind,
@@ -353,12 +358,13 @@ def _begin_turn_atomic_sync(
     Opens / commits / closes its own ``SessionLocal`` — never touches the
     caller's session.
 
-    Ownership is folded into the claim predicate (``id`` AND ``user_id`` AND
-    status filter) so the UPDATE is atomic w.r.t. ownership. On ``rowcount
+    Owner is folded into the claim predicate (``id`` AND ``user_id`` AND
+    status filter) so the UPDATE is atomic w.r.t. the owner. On ``rowcount
     0`` a diagnostic SELECT distinguishes:
 
-      - row missing or not owned by ``user_id`` → :class:`TaskTurnNotFoundError`
-      - row exists + owned but wrong status     → ``TaskTurnError("busy")``
+      - row missing / not owned by ``task_owner_user_id`` →
+        :class:`TaskTurnNotFoundError`
+      - row exists + owned but wrong status → ``TaskTurnError("busy")``
 
     Invariant relied on by ``begin_turn``: this function only raises BEFORE
     ``commit``. The committed-row snapshot is SELECTed pre-commit
@@ -383,7 +389,7 @@ def _begin_turn_atomic_sync(
             db.query(Task)
             .filter(
                 Task.id == task_id,
-                Task.user_id == user_id,
+                Task.user_id == task_owner_user_id,
                 status_filter,
             )
             .update(
@@ -400,7 +406,7 @@ def _begin_turn_atomic_sync(
             db.rollback()
             owned = (
                 db.query(Task.id)
-                .filter(Task.id == task_id, Task.user_id == user_id)
+                .filter(Task.id == task_id, Task.user_id == task_owner_user_id)
                 .first()
             )
             if owned is None:
@@ -410,7 +416,7 @@ def _begin_turn_atomic_sync(
         persisted_message = persist_user_message_no_commit(
             db=db,
             task_id=task_id,
-            user_id=user_id,
+            user_id=task_owner_user_id,
             content=payload.transcript_message,
             attachments=payload.attachments,
             turn_id=payload.turn_id,
@@ -686,7 +692,7 @@ def finish_turn(bg_db: Any, task_id: int) -> None:
 def _schedule_bg(
     *,
     task_id: int,
-    user_id: int,
+    task_owner_user_id: int,
     task_source: Optional[str],
     payload: TaskTurnPayload,
     force_fresh: bool,
@@ -786,7 +792,7 @@ def _schedule_bg(
                     # chain of three redundant Task queries into a
                     # single off-loop read.
                     snapshot = await asyncio.to_thread(
-                        load_task_setup_snapshot_sync, task_id, user_id
+                        load_task_setup_snapshot_sync, task_id, task_owner_user_id
                     )
                     if snapshot is None:
                         logger.warning(
@@ -805,7 +811,7 @@ def _schedule_bg(
                             context, payload.turn_id
                         ),
                         agent_manager=_get_agent_manager(),
-                        user_id=user_id,
+                        user_id=task_owner_user_id,
                         before_message_id=before_message_id,
                         llm_user_message=payload.execution_message,
                         task_setup_snapshot=snapshot,

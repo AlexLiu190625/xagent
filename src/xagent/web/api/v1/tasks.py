@@ -154,7 +154,7 @@ async def create_chat_task(
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
-            user_id=int(agent.user_id),
+            task_owner_user_id=int(agent.user_id),
             payload=TaskTurnPayload(transcript_message=request.message.content),
             kind=TurnKind.CREATE,
             force_fresh=False,
@@ -303,7 +303,7 @@ async def append_message_to_task(
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
-            user_id=int(agent.user_id),
+            task_owner_user_id=int(agent.user_id),
             payload=TaskTurnPayload(transcript_message=request.message.content),
             kind=TurnKind.APPEND,
             force_fresh=False,
