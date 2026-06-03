@@ -24,6 +24,7 @@ from ...core.model.chat.basic.deepseek import DeepSeekLLM
 from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.providers import is_placeholder_api_key
+from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
@@ -321,11 +322,7 @@ def _spec_wants_mcp(tool_selection_spec: Optional[Any]) -> bool:
     ``"mcp"`` category or a scoped ``mcp_servers``) wants MCP loading;
     this defers to the spec's own ``includes_mcp()`` dispatch.
     """
-    if tool_selection_spec is None:
-        return False
-    if not tool_selection_spec.is_by_categories():
-        return False
-    return bool(tool_selection_spec.includes_mcp())
+    return should_load_mcp_server_configs(tool_selection_spec)
 
 
 def _build_tool_selection_spec_for_task(

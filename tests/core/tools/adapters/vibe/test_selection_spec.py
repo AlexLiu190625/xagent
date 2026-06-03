@@ -1701,28 +1701,26 @@ def test_from_raw_generic_name_allowlist_unions_into_results():
 
 
 def test_spec_wants_mcp_only_for_explicit_mcp_selection():
-    """``_spec_wants_mcp`` (chat.py) must NOT trigger MCP DB query for
-    default / no-MCP agents. Pin the contract here to keep the
-    derivation honest."""
-    from xagent.core.tools.adapters.vibe.selection_spec import _SpecAll, _SpecNone
+    """MCP config loading must only run for explicit MCP selections."""
+    from xagent.core.tools.adapters.vibe.selection_spec import (
+        _SpecAll,
+        _SpecNone,
+        should_load_mcp_server_configs,
+    )
     from xagent.web.api.chat import _spec_wants_mcp
 
-    assert _spec_wants_mcp(None) is False  # legacy / no-spec caller
-    assert _spec_wants_mcp(_SpecAll()) is False  # default agent
-    assert _spec_wants_mcp(_SpecNone()) is False  # explicit zero tools
-    assert (
-        _spec_wants_mcp(ToolSelectionSpec.from_raw(tool_categories=["basic"])) is False
-    )  # no mcp picked
-    assert (
-        _spec_wants_mcp(ToolSelectionSpec.from_raw(tool_categories=["mcp"])) is True
-    )  # plain mcp
-    assert (
-        _spec_wants_mcp(ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"]))
-        is True
-    )  # mcp:<server>
-    assert (
-        _spec_wants_mcp(
-            ToolSelectionSpec.from_raw(tool_categories=["basic", "mcp:Gmail"])
-        )
-        is True
-    )  # mixed
+    specs = [
+        (None, False),
+        (_SpecAll(), False),
+        (_SpecNone(), False),
+        (ToolSelectionSpec.from_raw(tool_categories=[]), False),
+        (ToolSelectionSpec.from_raw(tool_categories=None), False),
+        (ToolSelectionSpec.from_raw(tool_categories=["basic"]), False),
+        (ToolSelectionSpec.from_raw(tool_categories=["mcp"]), True),
+        (ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"]), True),
+        (ToolSelectionSpec.from_raw(tool_categories=["basic", "mcp:Gmail"]), True),
+    ]
+
+    for spec, expected in specs:
+        assert should_load_mcp_server_configs(spec) is expected
+        assert _spec_wants_mcp(spec) is expected

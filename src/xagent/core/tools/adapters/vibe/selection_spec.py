@@ -322,6 +322,24 @@ class ToolSelectionSpec(ABC):
         return cat in getattr(self, "categories", frozenset())
 
 
+def should_load_mcp_server_configs(
+    tool_selection_spec: Optional[ToolSelectionSpec],
+) -> bool:
+    """Whether web-task setup should load MCP server configs.
+
+    ``includes_mcp()`` is broader creator/filter compatibility semantics:
+    ALL mode returns true so legacy unrestricted factory paths keep admitting
+    MCP tools when configs are already supplied. Web task setup has a narrower
+    product meaning: pay the MCP config scan/session-init cost only when the
+    user explicitly selected the MCP domain via categories.
+    """
+    if tool_selection_spec is None:
+        return False
+    if not tool_selection_spec.is_by_categories():
+        return False
+    return bool(tool_selection_spec.includes_mcp())
+
+
 # ─────────────────────────────────────────────────────────────────
 # Concrete subclasses. Production code MUST go through ``from_raw``.
 # The leading underscore signals "internal" — direct construction is

@@ -2090,9 +2090,9 @@ class TestCreateAndCallAgent:
             # folds), matched at build time against each tool's
             # metadata.source_server.
             assert spec.mcp_servers == frozenset({"linkedin"})
-            # Delegated WebToolConfig single-sources the MCP-init decision
-            # from the spec (includes_mcp()), instead of falling back to the
-            # default True. An mcp:<server> selection -> include_mcp_tools True.
+            # Delegated WebToolConfig uses the shared MCP config-loading
+            # helper instead of falling back to the default True. An
+            # mcp:<server> selection -> include_mcp_tools True.
             assert tool_config._include_mcp_tools is True
         finally:
             db.close()
@@ -2103,12 +2103,19 @@ class TestCreateAndCallAgent:
             except OSError:
                 pass
 
-    async def test_delegated_basic_agent_disables_mcp_init(self) -> None:
+    @pytest.mark.parametrize(
+        "tool_categories",
+        [["basic"], [], None],
+        ids=["basic-only", "empty-list", "null"],
+    )
+    async def test_delegated_non_mcp_agent_disables_mcp_init(
+        self, tool_categories: list[str] | None
+    ) -> None:
         """A delegated agent that did not select MCP (``tool_categories``
         without ``mcp``) must build its WebToolConfig with
         ``include_mcp_tools=False`` -- so it does not pay MCP server init.
-        Before single-sourcing this from the spec it fell back to the
-        WebToolConfig default ``True`` (divergent MCP-init decision)."""
+        Empty and NULL categories still build an ALL-mode selection spec
+        for final filtering, but should not opt into MCP config loading."""
         db, db_path = _create_session()
         try:
             user = User(username="basicdeleg", password_hash="x", is_admin=False)
@@ -2137,7 +2144,7 @@ class TestCreateAndCallAgent:
                 instructions="You are delegated.",
                 status=AgentStatus.PUBLISHED,
                 models={"general": model.id},
-                tool_categories=["basic"],
+                tool_categories=tool_categories,
             )
             db.add(agent)
             db.commit()
@@ -2175,7 +2182,11 @@ class TestCreateAndCallAgent:
 
             tool_config = mock_agent_service_class.call_args.kwargs["tool_config"]
             spec = tool_config.get_tool_selection_spec()
-            assert spec.includes_mcp() is False
+            if tool_categories:
+                assert spec.includes_mcp() is False
+            else:
+                assert spec.is_all()
+                assert spec.includes_mcp() is True
             assert tool_config._include_mcp_tools is False
         finally:
             db.close()
