@@ -73,17 +73,34 @@ export function AgentApiKeyDialog({
   const handleGenerate = async () => {
     if (agentId === null) return
     setBusy(true)
+    let result
     try {
-      const result = await generateAgentApiKey(agentId)
-      setFullKey(result.full_key)
-      // Re-read so the masked "active key" view matches the backend's
-      // canonical format instead of a locally synthesized one.
-      setMetadata(await getAgentApiKeyMetadata(agentId))
-      setMode("view")
-      toast.success(t("api_key.messages.generated") || "API key generated")
+      result = await generateAgentApiKey(agentId)
     } catch (err) {
       console.error(err)
       toast.error(t("api_key.messages.generate_failed") || "Failed to generate API key")
+      setBusy(false)
+      return
+    }
+    // Generation already succeeded (the old key, if any, is now rotated and
+    // this plaintext is the only copy). Commit that state from the POST
+    // response BEFORE any follow-up read, so a transient metadata-refresh
+    // failure can never present a successful rotation as a failure and prompt
+    // the user to retry -- which would invalidate the key they just copied.
+    setFullKey(result.full_key)
+    setMetadata({
+      key_prefix: result.key_prefix,
+      masked_key: "",
+      created_at: result.created_at,
+    })
+    setMode("view")
+    toast.success(t("api_key.messages.generated") || "API key generated")
+    // Best-effort upgrade to the backend's canonical masked form; non-fatal.
+    try {
+      const meta = await getAgentApiKeyMetadata(agentId)
+      if (meta) setMetadata(meta)
+    } catch (err) {
+      console.error(err)
     } finally {
       setBusy(false)
     }
