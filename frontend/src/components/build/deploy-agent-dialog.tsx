@@ -12,6 +12,7 @@ import { Rocket, LayoutGrid, Code2, Share, Webhook, ArrowRight, Copy, Check } fr
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
+import { copyToClipboard } from "@/lib/clipboard"
 import { apiRequest } from "@/lib/api-wrapper"
 type ApiSnippetTab = "curl" | "python"
 
@@ -72,11 +73,14 @@ with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
     }
   }, [agentId])
 
-  const handleCopyApiSnippet = () => {
-    navigator.clipboard.writeText(apiSnippets[apiTab])
-    setCopiedSnippet(true)
-    toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
-    setTimeout(() => setCopiedSnippet(false), 2000)
+  const handleCopyApiSnippet = async () => {
+    if (await copyToClipboard(apiSnippets[apiTab])) {
+      setCopiedSnippet(true)
+      toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
+      setTimeout(() => setCopiedSnippet(false), 2000)
+    } else {
+      toast.error(t("deploy_agent.messages.copy_failed") || "Failed to copy to clipboard")
+    }
   }
 
   const handleUpdateWidgetConfig = async (updates: { widget_enabled?: boolean, allowed_domains?: string[] }) => {

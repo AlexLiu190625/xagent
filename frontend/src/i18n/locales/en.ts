@@ -3020,7 +3020,8 @@ Build when you need.`,
     messages: {
       update_success: "Widget configuration updated",
       update_failed: "Failed to update widget configuration",
-      copied: "Copied to clipboard"
+      copied: "Copied to clipboard",
+      copy_failed: "Failed to copy to clipboard"
     },
     api_panel: {
       title: "Call this agent via REST API",
@@ -3056,7 +3057,8 @@ Build when you need.`,
       generate_failed: "Failed to generate API key",
       revoked: "API key revoked",
       revoke_failed: "Failed to revoke API key",
-      copied: "Copied to clipboard"
+      copied: "Copied to clipboard",
+      copy_failed: "Failed to copy to clipboard"
     }
   },
   workforces: {

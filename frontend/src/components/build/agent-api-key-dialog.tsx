@@ -13,6 +13,7 @@ import { Label } from "@/components/ui/label"
 import { KeyRound, Copy, Check, AlertTriangle, Loader2 } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
+import { copyToClipboard } from "@/lib/clipboard"
 import {
   AgentApiKeyMetadata,
   generateAgentApiKey,
@@ -105,12 +106,15 @@ export function AgentApiKeyDialog({
     }
   }
 
-  const handleCopy = () => {
+  const handleCopy = async () => {
     if (!fullKey) return
-    navigator.clipboard.writeText(fullKey)
-    setCopied(true)
-    toast.success(t("api_key.messages.copied") || "Copied to clipboard")
-    setTimeout(() => setCopied(false), 2000)
+    if (await copyToClipboard(fullKey)) {
+      setCopied(true)
+      toast.success(t("api_key.messages.copied") || "Copied to clipboard")
+      setTimeout(() => setCopied(false), 2000)
+    } else {
+      toast.error(t("api_key.messages.copy_failed") || "Failed to copy to clipboard")
+    }
   }
 
   const handleOpenChange = (next: boolean) => {
