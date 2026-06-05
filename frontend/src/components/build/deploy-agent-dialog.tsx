@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useState } from "react"
+import React, { useMemo, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Card, CardHeader, CardTitle, CardDescription, CardContent } from "@/components/ui/card"
@@ -13,6 +13,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { toast } from "@/components/ui/sonner"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest } from "@/lib/api-wrapper"
+type ApiSnippetTab = "curl" | "python"
 
 export interface Agent {
   id: number
@@ -35,14 +36,48 @@ interface DeployAgentDialogProps {
   deployAgent: Agent | null
   onClose: () => void
   onUpdate: (updatedAgent: Agent) => void
+  // Opens the shared API-key dialog (a single instance lives in the parent),
+  // so this dialog never nests its own Radix Dialog.
+  onManageApiKey?: () => void
 }
 
-export function DeployAgentDialog({ deployAgent, onClose, onUpdate }: DeployAgentDialogProps) {
+export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiKey }: DeployAgentDialogProps) {
   const { t } = useI18n()
   const [showSnippet, setShowSnippet] = useState(false)
+  const [showApiPanel, setShowApiPanel] = useState(false)
+  const [apiTab, setApiTab] = useState<ApiSnippetTab>("curl")
+  const [copiedSnippet, setCopiedSnippet] = useState(false)
   const [copied, setCopied] = useState(false)
   const [isUpdatingWidget, setIsUpdatingWidget] = useState(false)
   const [newDomain, setNewDomain] = useState("")
+
+  const agentId = deployAgent?.id ?? 0
+  const apiSnippets: Record<ApiSnippetTab, string> = useMemo(() => {
+    const apiBase =
+      getApiUrl() || (typeof window !== "undefined" ? window.location.origin : "")
+    return {
+      curl: `curl -X POST ${apiBase}/v1/chat/tasks \\
+  -H "Authorization: Bearer YOUR_API_KEY" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "agent_id": ${agentId},
+    "message": { "role": "user", "content": "Hello" }
+  }'`,
+      python: `# pip install "xagent-sdk @ git+https://github.com/xorbitsai/xagent-sdk@v0.3.0#subdirectory=python"
+from xagent_sdk import AgentClient
+
+with AgentClient(api_key="YOUR_API_KEY", base_url="${apiBase}") as agent:
+    result = agent.tasks.run(agent_id=${agentId}, message="Hello")
+    print(result.output)`,
+    }
+  }, [agentId])
+
+  const handleCopyApiSnippet = () => {
+    navigator.clipboard.writeText(apiSnippets[apiTab])
+    setCopiedSnippet(true)
+    toast.success(t("deploy_agent.messages.copied") || "Copied to clipboard")
+    setTimeout(() => setCopiedSnippet(false), 2000)
+  }
 
   const handleUpdateWidgetConfig = async (updates: { widget_enabled?: boolean, allowed_domains?: string[] }) => {
     if (!deployAgent) return
@@ -104,7 +139,11 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate }: DeployAgen
     if (!open) {
       onClose()
       // Reset state when closing
-      setTimeout(() => setShowSnippet(false), 300)
+      setTimeout(() => {
+        setShowSnippet(false)
+        setShowApiPanel(false)
+        setApiTab("curl")
+      }, 300)
     }
   }
 
@@ -130,7 +169,8 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate }: DeployAgen
       desc: t("deploy_agent.options.rest_api.desc") || "Call the agent programmatically from your backend or app",
       actionText: t("deploy_agent.options.rest_api.action") || "View endpoints",
       actionColor: "text-purple-600",
-      className: "opacity-50 cursor-not-allowed shadow-sm",
+      className: "cursor-pointer hover:border-primary transition-colors shadow-sm",
+      onClick: () => setShowApiPanel(true),
     },
     {
       id: "shareable_link",
@@ -167,7 +207,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate }: DeployAgen
           <DialogDescription>{deployAgent?.name}</DialogDescription>
         </DialogHeader>
 
-        {!showSnippet ? (
+        {!showSnippet && !showApiPanel ? (
           <div className="mt-6">
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
               {deploymentOptions.map((option) => (
@@ -192,6 +232,58 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate }: DeployAgen
                   </CardContent>
                 </Card>
               ))}
+            </div>
+          </div>
+        ) : showApiPanel ? (
+          <div className="mt-4 space-y-4">
+            <div className="flex items-center text-sm text-muted-foreground cursor-pointer hover:text-foreground" onClick={() => setShowApiPanel(false)}>
+              <ArrowRight className="h-4 w-4 mr-1 rotate-180" /> {t("deploy_agent.back_to_options") || "Back to Deploy Options"}
+            </div>
+
+            <div className="space-y-1">
+              <div className="font-medium">{t("deploy_agent.api_panel.title") || "Call this agent via REST API"}</div>
+              <div className="text-sm text-muted-foreground">
+                {t("deploy_agent.api_panel.desc") || "Submit a task to the agent. Poll GET /v1/chat/tasks/{id} for the result."}
+              </div>
+            </div>
+
+            <div className="flex gap-1 border-b">
+              {(["curl", "python"] as ApiSnippetTab[]).map((tab) => (
+                <button
+                  key={tab}
+                  type="button"
+                  onClick={() => setApiTab(tab)}
+                  className={`px-3 py-1.5 text-sm font-medium border-b-2 -mb-px transition-colors ${apiTab === tab ? "border-primary text-foreground" : "border-transparent text-muted-foreground hover:text-foreground"}`}
+                >
+                  {tab === "curl" ? "cURL" : "Python"}
+                </button>
+              ))}
+            </div>
+
+            <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group">
+              <pre className="whitespace-pre-wrap break-all text-muted-foreground max-h-80 overflow-auto">
+                {apiSnippets[apiTab]}
+              </pre>
+              <Button
+                variant="secondary"
+                size="icon"
+                className="absolute top-2 right-2 opacity-0 group-hover:opacity-100 transition-opacity"
+                onClick={handleCopyApiSnippet}
+                title={t("deploy_agent.api_panel.copy_btn") || "Copy"}
+              >
+                {copiedSnippet ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
+              </Button>
+            </div>
+
+            <div className="text-sm text-muted-foreground">
+              {t("deploy_agent.api_panel.key_hint") || "Replace YOUR_API_KEY with this agent's API key."}{" "}
+              <button
+                type="button"
+                className="text-primary hover:underline font-medium"
+                onClick={() => onManageApiKey?.()}
+              >
+                {t("deploy_agent.api_panel.manage_key") || "Manage API Key"}
+              </button>
             </div>
           </div>
         ) : (

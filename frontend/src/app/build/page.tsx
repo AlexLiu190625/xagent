@@ -569,6 +569,7 @@ export default function BuildsPage() {
           setDeployAgent(updatedAgent)
           setAgents(agents.map(a => a.id === updatedAgent.id ? updatedAgent : a))
         }}
+        onManageApiKey={() => { if (deployAgent) setApiKeyAgent(deployAgent) }}
       />
 
       <AgentApiKeyDialog

@@ -3021,6 +3021,13 @@ Build when you need.`,
       update_success: "Widget 配置已更新",
       update_failed: "Widget 配置更新失败",
       copied: "已复制到剪贴板"
+    },
+    api_panel: {
+      title: "通过 REST API 调用此 Agent",
+      desc: "向 Agent 提交一个任务，然后轮询 GET /v1/chat/tasks/{id} 获取结果。",
+      copy_btn: "复制",
+      key_hint: "将 YOUR_API_KEY 替换为此 Agent 的 API Key。",
+      manage_key: "管理 API Key"
     }
   },
   api_key: {

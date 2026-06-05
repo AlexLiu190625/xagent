@@ -3021,6 +3021,13 @@ Build when you need.`,
       update_success: "Widget configuration updated",
       update_failed: "Failed to update widget configuration",
       copied: "Copied to clipboard"
+    },
+    api_panel: {
+      title: "Call this agent via REST API",
+      desc: "Submit a task to the agent, then poll GET /v1/chat/tasks/{id} for the result.",
+      copy_btn: "Copy",
+      key_hint: "Replace YOUR_API_KEY with this agent's API key.",
+      manage_key: "Manage API Key"
     }
   },
   api_key: {
