@@ -3,11 +3,12 @@
 import React, { useState, useEffect, useRef } from "react"
 import { SearchInput } from "@/components/ui/search-input"
 import { Button } from "@/components/ui/button"
-import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug } from "lucide-react"
+import { Plus, Bot, Trash2, MessageSquare, Edit, MoreVertical, Globe, Calendar, Clock, Rocket, Sparkles, Settings2, ArrowRight, FileText, Wrench, Database, Plug, KeyRound } from "lucide-react"
 import { Popover, PopoverTrigger, PopoverContent } from "@/components/ui/popover"
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog"
 import { Textarea } from "@/components/ui/textarea"
 import { DeployAgentDialog, Agent } from "@/components/build/deploy-agent-dialog"
+import { AgentApiKeyDialog } from "@/components/build/agent-api-key-dialog"
 import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
@@ -75,6 +76,7 @@ export default function BuildsPage() {
 
   // Deploy Dialog State
   const [deployAgent, setDeployAgent] = useState<Agent | null>(null)
+  const [apiKeyAgent, setApiKeyAgent] = useState<Agent | null>(null)
 
   // Check for template parameter and redirect to create page
   useEffect(() => {
@@ -393,7 +395,7 @@ export default function BuildsPage() {
                             </div>
                           </div>
                         </div>
-                        {(canPublishAgent(agent) || canDeleteAgent(agent)) && (
+                        {(canPublishAgent(agent) || canDeleteAgent(agent) || canEditAgent(agent)) && (
                           <div className="absolute right-4 top-1" onClick={(e) => e.stopPropagation()}>
                             <Popover>
                               <PopoverTrigger asChild>
@@ -401,8 +403,24 @@ export default function BuildsPage() {
                                   <MoreVertical className="h-4 w-4" />
                                 </Button>
                               </PopoverTrigger>
-                              <PopoverContent align="end" className="w-32 p-1" onClick={(e) => e.stopPropagation()}>
+                              <PopoverContent align="end" className="w-40 p-1" onClick={(e) => e.stopPropagation()}>
                                 <div className="flex flex-col">
+                                  {canEditAgent(agent) && (
+                                    <Button
+                                      variant="ghost"
+                                      className="justify-start px-2 py-1.5 h-auto font-normal text-sm"
+                                      onClick={(e) => {
+                                        e.stopPropagation()
+                                        setApiKeyAgent(agent)
+                                      }}
+                                    >
+                                      <KeyRound className="mr-2 h-4 w-4" />
+                                      {t('builds.list.actions.apiKey') || 'API Key'}
+                                    </Button>
+                                  )}
+                                  {canEditAgent(agent) && (canPublishAgent(agent) || canDeleteAgent(agent)) && (
+                                    <div className="h-px bg-border my-1 mx-1" />
+                                  )}
                                   {canPublishAgent(agent) && (
                                     <Button
                                       variant="ghost"
@@ -551,6 +569,13 @@ export default function BuildsPage() {
           setDeployAgent(updatedAgent)
           setAgents(agents.map(a => a.id === updatedAgent.id ? updatedAgent : a))
         }}
+      />
+
+      <AgentApiKeyDialog
+        agentId={apiKeyAgent?.id ?? null}
+        agentName={apiKeyAgent?.name}
+        open={apiKeyAgent !== null}
+        onOpenChange={(open) => { if (!open) setApiKeyAgent(null) }}
       />
 
       <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>

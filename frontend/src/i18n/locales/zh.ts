@@ -2043,6 +2043,7 @@ Build when you need.`,
         publish: "发布",
         delete: "删除",
         edit: "编辑",
+        apiKey: "API Key",
         deleteConfirm: "确定要删除这个 Agent 吗？",
       },
       createModal: {
@@ -3019,6 +3020,35 @@ Build when you need.`,
     messages: {
       update_success: "Widget 配置已更新",
       update_failed: "Widget 配置更新失败",
+      copied: "已复制到剪贴板"
+    }
+  },
+  api_key: {
+    title: "API Key",
+    subtitle: "SDK / REST API 凭证",
+    empty: "尚未创建 API Key。生成一个即可通过 SDK 或 REST API 调用此 Agent。",
+    active_key: "当前 Key",
+    created_at: "创建于",
+    reveal: {
+      warning: "请立即复制此 Key —— 它只显示一次。",
+      copy: "复制"
+    },
+    actions: {
+      generate: "生成 API Key",
+      regenerate: "重新生成",
+      revoke: "撤销",
+      cancel: "取消"
+    },
+    confirm: {
+      regenerate: "重新生成会立即使当前 Key 失效，正在使用它的应用将停止工作，直到更新为新 Key。",
+      revoke: "撤销会使当前 Key 失效，正在使用它的应用将停止工作。"
+    },
+    messages: {
+      load_failed: "加载 API Key 失败",
+      generated: "API Key 已生成",
+      generate_failed: "生成 API Key 失败",
+      revoked: "API Key 已撤销",
+      revoke_failed: "撤销 API Key 失败",
       copied: "已复制到剪贴板"
     }
   },
