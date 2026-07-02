@@ -7,22 +7,32 @@ in the web application.
 
 import json
 import logging
+import base64
+import hashlib
+import secrets
 import shlex
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional, Union, cast
+from urllib.parse import urlencode, urlsplit
 
-from fastapi import APIRouter, Depends, HTTPException, status
+import httpx
+from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from ...config import get_app_base_url
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
+from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user
 from ..mcp_apps import get_all_mcp_apps, get_app_by_name
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
+from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from ..models.user import User
+from ..services.mcp_oauth import MCPOAuthDiscoveryError, discover_mcp_oauth_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +99,61 @@ class MCPConnectionTestResponse(BaseModel):
     success: bool
     message: str
     details: Optional[dict] = None
+
+
+class MCPOAuthDiscoverRequest(BaseModel):
+    """Request model for MCP OAuth metadata discovery."""
+
+    resource: Optional[str] = None
+    issuer: Optional[str] = None
+    scope: Optional[str] = None
+    resource_metadata_url: Optional[str] = None
+
+
+class MCPOAuthDiscoverResponse(BaseModel):
+    """Selected MCP OAuth metadata for a configured MCP server."""
+
+    resource: str
+    issuer: str
+    authorization_endpoint: str
+    token_endpoint: str
+    scopes: list[str]
+    authorization_servers: list[str]
+    client_id_metadata_document_supported: bool
+
+
+class MCPOAuthConnectRequest(MCPOAuthDiscoverRequest):
+    """Request model for starting MCP OAuth Authorization Code + PKCE."""
+
+    resource_owner_key: Optional[str] = None
+    redirect_after: Optional[str] = None
+
+
+class MCPOAuthGrantResponse(BaseModel):
+    """Public-safe MCP OAuth grant status."""
+
+    id: int
+    resource_owner_key: str
+    issuer: str
+    resource: str
+    scope: str
+    token_type: str
+    status: str
+    expires_at: Optional[str]
+    created_at: Optional[str]
+    updated_at: Optional[str]
+    revoked_at: Optional[str]
+
+
+class MCPOAuthStatusResponse(BaseModel):
+    """MCP OAuth connection status for the current user."""
+
+    server_id: int
+    auth_type: Optional[str]
+    resource: Optional[str]
+    issuer: Optional[str]
+    scope: Optional[str]
+    grants: list[MCPOAuthGrantResponse]
 
 
 # Create router
@@ -178,6 +243,315 @@ class ConfigFieldParser:
 def _format_optional_datetime(value: object) -> Optional[str]:
     """Serialize datetimes while tolerating ORM attributes without DB timestamps."""
     return value.isoformat() if isinstance(value, datetime) else None
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _as_aware_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _default_mcp_oauth_redirect_uri() -> str:
+    base_url = get_app_base_url() or "http://localhost:8000"
+    return f"{base_url.rstrip('/')}/api/mcp/oauth/callback"
+
+
+def _safe_mcp_oauth_redirect_after(value: str | None) -> str:
+    if not value:
+        return "/mcp"
+    parsed = urlsplit(value)
+    if (
+        parsed.scheme
+        or parsed.netloc
+        or not value.startswith("/")
+        or value.startswith("//")
+    ):
+        return "/mcp"
+    return value
+
+
+def _default_resource_owner_key(user_id: int) -> str:
+    return f"xagent:user:{user_id}"
+
+
+def _split_scope(scope: str | None) -> list[str]:
+    if not scope:
+        return []
+    return [item for item in scope.split() if item]
+
+
+def _scope_string(scopes: list[str] | tuple[str, ...] | str | None) -> str:
+    if isinstance(scopes, str):
+        return " ".join(_split_scope(scopes))
+    return " ".join(scope for scope in scopes or [] if scope)
+
+
+def _pkce_code_challenge(code_verifier: str) -> str:
+    digest = hashlib.sha256(code_verifier.encode("ascii")).digest()
+    return base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+
+
+def _get_user_mcp_server_or_404(
+    db: Session, *, user_id: int, server_id: int
+) -> tuple[UserMCPServer, MCPServer]:
+    result = (
+        db.query(UserMCPServer, MCPServer)
+        .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
+        .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
+        .first()
+    )
+    if not result:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
+        )
+    return cast(tuple[UserMCPServer, MCPServer], result)
+
+
+def _get_mcp_oauth_config(server: MCPServer) -> dict[str, Any]:
+    config = server.to_config_dict()
+    auth_config = config.get("auth")
+    if not isinstance(auth_config, dict) or auth_config.get("type") != "mcp_oauth":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MCP server is not configured for MCP OAuth",
+        )
+    if server.transport not in {"sse", "streamable_http"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MCP OAuth is only supported for HTTP MCP transports",
+        )
+    if not server.url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MCP OAuth server requires a URL",
+        )
+    return auth_config
+
+
+def _configured_mcp_oauth_value(
+    request_value: str | None, auth_config: dict[str, Any], key: str
+) -> str | None:
+    value = request_value if request_value is not None else auth_config.get(key)
+    return str(value).strip() if value else None
+
+
+async def _discover_mcp_oauth_for_server(
+    server: MCPServer,
+    auth_config: dict[str, Any],
+    request_data: MCPOAuthDiscoverRequest,
+):
+    if not server.url:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MCP OAuth server requires a URL",
+        )
+    try:
+        return await discover_mcp_oauth_metadata(
+            str(server.url),
+            headers=None,
+            configured_resource_metadata_url=_configured_mcp_oauth_value(
+                request_data.resource_metadata_url,
+                auth_config,
+                "resource_metadata_url",
+            ),
+            configured_issuer=_configured_mcp_oauth_value(
+                request_data.issuer, auth_config, "issuer"
+            ),
+            configured_resource=_configured_mcp_oauth_value(
+                request_data.resource, auth_config, "resource"
+            ),
+        )
+    except MCPOAuthDiscoveryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
+
+
+def _mcp_oauth_discovery_response(discovery: Any) -> MCPOAuthDiscoverResponse:
+    return MCPOAuthDiscoverResponse(
+        resource=discovery.resource,
+        issuer=discovery.authorization_server.issuer,
+        authorization_endpoint=discovery.authorization_server.authorization_endpoint,
+        token_endpoint=discovery.authorization_server.token_endpoint,
+        scopes=list(discovery.scopes),
+        authorization_servers=list(discovery.protected_resource.authorization_servers),
+        client_id_metadata_document_supported=(
+            discovery.authorization_server.client_id_metadata_document_supported
+        ),
+    )
+
+
+def _upsert_mcp_oauth_client(
+    db: Session,
+    *,
+    server_id: int,
+    discovery: Any,
+    client_id: str,
+    client_secret: str | None,
+    token_endpoint_auth_method: str,
+    redirect_uri: str,
+) -> MCPOAuthClient:
+    existing = (
+        db.query(MCPOAuthClient)
+        .filter(
+            MCPOAuthClient.mcp_server_id == server_id,
+            MCPOAuthClient.issuer == discovery.authorization_server.issuer,
+            MCPOAuthClient.client_id == client_id,
+        )
+        .first()
+    )
+    encrypted_client_secret = encrypt_value(client_secret) if client_secret else None
+    client = existing or MCPOAuthClient(
+        mcp_server_id=server_id,
+        issuer=discovery.authorization_server.issuer,
+        client_id=client_id,
+    )
+    client.authorization_endpoint = (
+        discovery.authorization_server.authorization_endpoint
+    )
+    client.token_endpoint = discovery.authorization_server.token_endpoint
+    client.client_secret = encrypted_client_secret
+    client.token_endpoint_auth_method = token_endpoint_auth_method
+    client.redirect_uri = redirect_uri
+    client.metadata_json = discovery.authorization_server.raw
+    if existing is None:
+        db.add(client)
+    return client
+
+
+def _mcp_oauth_grant_response(grant: MCPOAuthGrant) -> MCPOAuthGrantResponse:
+    return MCPOAuthGrantResponse(
+        id=cast(int, grant.id),
+        resource_owner_key=str(grant.resource_owner_key),
+        issuer=str(grant.issuer),
+        resource=str(grant.resource),
+        scope=str(grant.scope),
+        token_type=str(grant.token_type),
+        status=str(grant.status),
+        expires_at=_format_optional_datetime(grant.expires_at),
+        created_at=_format_optional_datetime(grant.created_at),
+        updated_at=_format_optional_datetime(grant.updated_at),
+        revoked_at=_format_optional_datetime(grant.revoked_at),
+    )
+
+
+async def _exchange_mcp_oauth_code(
+    *,
+    client: MCPOAuthClient,
+    code: str,
+    code_verifier: str,
+    resource: str,
+) -> dict[str, Any]:
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "client_id": client.client_id,
+        "redirect_uri": client.redirect_uri,
+        "code_verifier": code_verifier,
+        "resource": resource,
+    }
+    auth: httpx.Auth | None = None
+    client_secret = (
+        decrypt_value(str(client.client_secret)) if client.client_secret else ""
+    )
+    auth_method = str(client.token_endpoint_auth_method or "none")
+    if auth_method == "client_secret_post" and client_secret:
+        data["client_secret"] = client_secret
+    elif auth_method == "client_secret_basic" and client_secret:
+        auth = httpx.BasicAuth(str(client.client_id), client_secret)
+    elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "unsupported_auth_server",
+                "message": f"Unsupported token endpoint auth method: {auth_method}",
+            },
+        )
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as http_client:
+            response = await http_client.post(
+                str(client.token_endpoint),
+                data=data,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                auth=auth,
+            )
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "token_exchange_failed", "message": str(exc)},
+        ) from exc
+
+    if (
+        response.status_code >= 400
+        or not isinstance(payload, dict)
+        or payload.get("error")
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "token_exchange_failed", "message": payload},
+        )
+    if not payload.get("access_token"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "token_exchange_failed",
+                "message": "Token response did not include access_token",
+            },
+        )
+    return payload
+
+
+def _upsert_mcp_oauth_grant(
+    db: Session,
+    *,
+    flow_state: MCPOAuthFlowState,
+    token_data: dict[str, Any],
+) -> MCPOAuthGrant:
+    scope = _scope_string(str(token_data.get("scope") or flow_state.scope))
+    existing = (
+        db.query(MCPOAuthGrant)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == flow_state.mcp_server_id,
+            MCPOAuthGrant.user_id == flow_state.user_id,
+            MCPOAuthGrant.resource_owner_key == flow_state.resource_owner_key,
+            MCPOAuthGrant.issuer == flow_state.issuer,
+            MCPOAuthGrant.resource == flow_state.resource,
+            MCPOAuthGrant.scope == scope,
+        )
+        .first()
+    )
+    grant = existing or MCPOAuthGrant(
+        mcp_server_id=flow_state.mcp_server_id,
+        user_id=flow_state.user_id,
+        resource_owner_key=flow_state.resource_owner_key,
+        issuer=flow_state.issuer,
+        resource=flow_state.resource,
+        scope=scope,
+    )
+    grant.access_token = encrypt_value(str(token_data["access_token"]))
+    refresh_token = token_data.get("refresh_token")
+    if refresh_token:
+        grant.refresh_token = encrypt_value(str(refresh_token))
+    grant.token_type = str(token_data.get("token_type") or "Bearer")
+    grant.status = "active"
+    grant.revoked_at = None
+    grant.metadata_json = {
+        key: value
+        for key, value in token_data.items()
+        if key not in {"access_token", "refresh_token"}
+    }
+    if token_data.get("expires_in") is not None:
+        grant.expires_at = _utc_now() + timedelta(seconds=int(token_data["expires_in"]))
+    if existing is None:
+        db.add(grant)
+    return grant
 
 
 class MCPConfigFieldRegistry:
@@ -1452,3 +1826,258 @@ async def get_mcp_server_tools(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get MCP server tools",
         )
+
+
+@mcp_router.get("/oauth/callback")
+async def mcp_oauth_callback(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    """Complete MCP OAuth Authorization Code + PKCE and store an encrypted grant."""
+    code = request.query_params.get("code")
+    state_value = request.query_params.get("state")
+    error = request.query_params.get("error")
+    if error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "token_exchange_failed", "message": error},
+        )
+    if not code or not state_value:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_state", "message": "Missing code or state"},
+        )
+
+    flow_state = (
+        db.query(MCPOAuthFlowState)
+        .filter(MCPOAuthFlowState.state == state_value)
+        .first()
+    )
+    if not flow_state:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_state", "message": "Invalid OAuth state"},
+        )
+    if flow_state.consumed_at is not None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "state_already_consumed",
+                "message": "OAuth state consumed",
+            },
+        )
+    if _as_aware_utc(flow_state.expires_at) <= _utc_now():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "expired_state", "message": "OAuth state expired"},
+        )
+    if (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == flow_state.user_id,
+            UserMCPServer.mcpserver_id == flow_state.mcp_server_id,
+        )
+        .first()
+        is None
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "invalid_state",
+                "message": "OAuth state is no longer associated with MCP server access",
+            },
+        )
+
+    client = (
+        db.query(MCPOAuthClient)
+        .filter(
+            MCPOAuthClient.mcp_server_id == flow_state.mcp_server_id,
+            MCPOAuthClient.issuer == flow_state.issuer,
+        )
+        .first()
+    )
+    if not client:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "token_exchange_failed",
+                "message": "OAuth client metadata not found",
+            },
+        )
+
+    token_data = await _exchange_mcp_oauth_code(
+        client=client,
+        code=code,
+        code_verifier=decrypt_value(str(flow_state.code_verifier)),
+        resource=str(flow_state.resource),
+    )
+    _upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
+    flow_state.consumed_at = _utc_now()
+    db.commit()
+
+    return RedirectResponse(_safe_mcp_oauth_redirect_after(flow_state.redirect_after))
+
+
+@mcp_router.post("/{server_id}/oauth/discover", response_model=MCPOAuthDiscoverResponse)
+async def discover_mcp_oauth(
+    server_id: int,
+    request_data: MCPOAuthDiscoverRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MCPOAuthDiscoverResponse:
+    """Discover MCP OAuth protected-resource and authorization-server metadata."""
+    _, server = _get_user_mcp_server_or_404(
+        db, user_id=cast(int, current_user.id), server_id=server_id
+    )
+    auth_config = _get_mcp_oauth_config(server)
+    discovery = await _discover_mcp_oauth_for_server(server, auth_config, request_data)
+    return _mcp_oauth_discovery_response(discovery)
+
+
+@mcp_router.post("/{server_id}/oauth/connect")
+async def connect_mcp_oauth(
+    server_id: int,
+    request_data: MCPOAuthConnectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> RedirectResponse:
+    """Start MCP OAuth Authorization Code + PKCE for the current user."""
+    user_id = cast(int, current_user.id)
+    _, server = _get_user_mcp_server_or_404(db, user_id=user_id, server_id=server_id)
+    auth_config = _get_mcp_oauth_config(server)
+    discovery = await _discover_mcp_oauth_for_server(server, auth_config, request_data)
+
+    client_id = _configured_mcp_oauth_value(None, auth_config, "client_id")
+    if not client_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "unsupported_auth_server",
+                "message": "MCP OAuth client_id is required",
+            },
+        )
+    client_secret = _configured_mcp_oauth_value(None, auth_config, "client_secret")
+    token_endpoint_auth_method = str(
+        auth_config.get("token_endpoint_auth_method")
+        or ("client_secret_post" if client_secret else "none")
+    )
+    redirect_uri = (
+        _configured_mcp_oauth_value(None, auth_config, "redirect_uri")
+        or _default_mcp_oauth_redirect_uri()
+    )
+    selected_scope = _scope_string(
+        request_data.scope or auth_config.get("scope") or discovery.scopes
+    )
+    resource_owner_key = (
+        request_data.resource_owner_key.strip()
+        if request_data.resource_owner_key and request_data.resource_owner_key.strip()
+        else _default_resource_owner_key(user_id)
+    )
+
+    _upsert_mcp_oauth_client(
+        db,
+        server_id=server_id,
+        discovery=discovery,
+        client_id=client_id,
+        client_secret=client_secret,
+        token_endpoint_auth_method=token_endpoint_auth_method,
+        redirect_uri=redirect_uri,
+    )
+
+    state_value = secrets.token_urlsafe(32)
+    code_verifier = secrets.token_urlsafe(64)
+    flow_state = MCPOAuthFlowState(
+        state=state_value,
+        mcp_server_id=server_id,
+        user_id=user_id,
+        resource_owner_key=resource_owner_key,
+        issuer=discovery.authorization_server.issuer,
+        resource=discovery.resource,
+        scope=selected_scope,
+        code_verifier=encrypt_value(code_verifier),
+        redirect_after=_safe_mcp_oauth_redirect_after(request_data.redirect_after),
+        expires_at=_utc_now() + timedelta(minutes=10),
+    )
+    db.add(flow_state)
+    db.commit()
+
+    params = {
+        "response_type": "code",
+        "client_id": client_id,
+        "redirect_uri": redirect_uri,
+        "state": state_value,
+        "code_challenge": _pkce_code_challenge(code_verifier),
+        "code_challenge_method": "S256",
+        "resource": discovery.resource,
+    }
+    if selected_scope:
+        params["scope"] = selected_scope
+    separator = (
+        "&" if "?" in discovery.authorization_server.authorization_endpoint else "?"
+    )
+    authorization_url = (
+        f"{discovery.authorization_server.authorization_endpoint}"
+        f"{separator}{urlencode(params)}"
+    )
+    return RedirectResponse(authorization_url, status_code=status.HTTP_303_SEE_OTHER)
+
+
+@mcp_router.get("/{server_id}/oauth/status", response_model=MCPOAuthStatusResponse)
+async def get_mcp_oauth_status(
+    server_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MCPOAuthStatusResponse:
+    """Return MCP OAuth grants owned by the current user for one MCP server."""
+    user_id = cast(int, current_user.id)
+    _, server = _get_user_mcp_server_or_404(db, user_id=user_id, server_id=server_id)
+    config = server.to_config_dict()
+    auth_config = config.get("auth") if isinstance(config.get("auth"), dict) else {}
+    grants = (
+        db.query(MCPOAuthGrant)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == server_id,
+            MCPOAuthGrant.user_id == user_id,
+        )
+        .order_by(MCPOAuthGrant.created_at.desc())
+        .all()
+    )
+    return MCPOAuthStatusResponse(
+        server_id=server_id,
+        auth_type=auth_config.get("type") if isinstance(auth_config, dict) else None,
+        resource=auth_config.get("resource") if isinstance(auth_config, dict) else None,
+        issuer=auth_config.get("issuer") if isinstance(auth_config, dict) else None,
+        scope=auth_config.get("scope") if isinstance(auth_config, dict) else None,
+        grants=[_mcp_oauth_grant_response(grant) for grant in grants],
+    )
+
+
+@mcp_router.delete(
+    "/{server_id}/oauth/grants/{grant_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_mcp_oauth_grant(
+    server_id: int,
+    grant_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> None:
+    """Revoke an MCP OAuth grant owned by the current user."""
+    user_id = cast(int, current_user.id)
+    _get_user_mcp_server_or_404(db, user_id=user_id, server_id=server_id)
+    grant = (
+        db.query(MCPOAuthGrant)
+        .filter(
+            MCPOAuthGrant.id == grant_id,
+            MCPOAuthGrant.mcp_server_id == server_id,
+            MCPOAuthGrant.user_id == user_id,
+        )
+        .first()
+    )
+    if not grant:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP OAuth grant not found"
+        )
+    grant.status = "revoked"
+    grant.revoked_at = _utc_now()
+    db.commit()
