@@ -178,6 +178,7 @@ class WebToolConfig(BaseToolConfig):
         agent_call_stack: Optional[List[int]] = None,
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
+        mcp_auth_context: Optional[Dict[str, Any]] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -217,7 +218,16 @@ class WebToolConfig(BaseToolConfig):
             workspace_config["base_dir"] = workspace_base_dir
         if self._user_id is not None and "user_id" not in workspace_config:
             workspace_config["user_id"] = self._user_id
+        if mcp_auth_context is None:
+            raw_auth_context = workspace_config.get("mcp_auth_context")
+            mcp_auth_context = (
+                raw_auth_context if isinstance(raw_auth_context, dict) else None
+            )
         self._workspace_config = workspace_config
+        self._mcp_auth_context = (
+            mcp_auth_context if isinstance(mcp_auth_context, dict) else {}
+        )
+        self._mcp_oauth_diagnostics: List[Dict[str, Any]] = []
         self._explicit_vision_model = vision_model
         self._explicit_llm = llm
         self._include_mcp_tools = include_mcp_tools
@@ -364,6 +374,10 @@ class WebToolConfig(BaseToolConfig):
         if self._cached_mcp_configs is None:
             self._cached_mcp_configs = await self._load_mcp_server_configs()
         return self._cached_mcp_configs
+
+    def get_mcp_oauth_diagnostics(self) -> List[Dict[str, Any]]:
+        """Return structured MCP OAuth runtime diagnostics from the last load."""
+        return list(self._mcp_oauth_diagnostics)
 
     def get_embedding_model(self) -> Optional[str]:
         """Load default embedding model ID from database."""
@@ -666,6 +680,7 @@ class WebToolConfig(BaseToolConfig):
         """Load MCP server configurations from database with user context."""
         logger = logging.getLogger(__name__)
         configs = []
+        self._mcp_oauth_diagnostics = []
 
         try:
             from ...web.models.mcp import MCPServer, UserMCPServer
@@ -837,9 +852,25 @@ class WebToolConfig(BaseToolConfig):
                     typed_headers = (
                         raw_headers if isinstance(raw_headers, dict) else None
                     )
-                    merged_headers = server._merge_auth_headers(
-                        typed_headers, decrypted_auth
-                    )
+                    if (
+                        isinstance(decrypted_auth, dict)
+                        and decrypted_auth.get("type") == "mcp_oauth"
+                    ):
+                        runtime_auth = await self._resolve_mcp_oauth_runtime_auth(
+                            server, decrypted_auth
+                        )
+                        if runtime_auth is None:
+                            continue
+                        merged_headers = self._headers_without_authorization(
+                            typed_headers
+                        )
+                        merged_headers["Authorization"] = (
+                            f"Bearer {runtime_auth.access_token}"
+                        )
+                    else:
+                        merged_headers = server._merge_auth_headers(
+                            typed_headers, decrypted_auth
+                        )
                     if merged_headers:
                         transport_config["headers"] = merged_headers
 
@@ -889,6 +920,95 @@ class WebToolConfig(BaseToolConfig):
 
         logger.info(f"Loaded {len(configs)} MCP server configurations")
         return configs
+
+    async def _resolve_mcp_oauth_runtime_auth(
+        self, server: Any, auth_config: Dict[str, Any]
+    ) -> Optional[Any]:
+        from ...web.services.mcp_oauth import (
+            MCPOAuthRuntimeError,
+            resolve_mcp_oauth_runtime_auth,
+        )
+
+        server_id = getattr(server, "id", None)
+        if (
+            not isinstance(server_id, int)
+            or not isinstance(self._user_id, int)
+            or self.db is None
+        ):
+            self._record_mcp_oauth_diagnostic(
+                server,
+                code="authorization_required",
+                message=(
+                    "MCP OAuth runtime requires a persisted server, user, and "
+                    "database session"
+                ),
+            )
+            return None
+
+        selection = self._mcp_oauth_selection(server_id)
+        resource_owner_key = selection.get("resource_owner_key") or (
+            f"xagent:user:{self._user_id}"
+        )
+        try:
+            return await resolve_mcp_oauth_runtime_auth(
+                self.db,
+                server_id=server_id,
+                user_id=self._user_id,
+                auth_config=auth_config,
+                resource_owner_key=str(resource_owner_key),
+                resource=selection.get("resource"),
+                scope=selection.get("scope"),
+                issuer=selection.get("issuer"),
+            )
+        except MCPOAuthRuntimeError as exc:
+            self._record_mcp_oauth_diagnostic(
+                server,
+                code=exc.code,
+                message=exc.message,
+                resource_owner_key=str(resource_owner_key),
+                resource=selection.get("resource") or auth_config.get("resource"),
+                scope=selection.get("scope") or auth_config.get("scope"),
+                issuer=selection.get("issuer") or auth_config.get("issuer"),
+            )
+            return None
+
+    def _mcp_oauth_selection(self, server_id: int) -> Dict[str, Any]:
+        selection = self._mcp_auth_context.get(str(server_id))
+        return selection if isinstance(selection, dict) else {}
+
+    @staticmethod
+    def _headers_without_authorization(
+        headers: Dict[str, Any] | None,
+    ) -> Dict[str, Any]:
+        return {
+            str(key): value
+            for key, value in dict(headers or {}).items()
+            if str(key).lower() != "authorization"
+        }
+
+    def _record_mcp_oauth_diagnostic(
+        self,
+        server: Any,
+        *,
+        code: str,
+        message: str,
+        resource_owner_key: Optional[str] = None,
+        resource: Optional[Any] = None,
+        scope: Optional[Any] = None,
+        issuer: Optional[Any] = None,
+    ) -> None:
+        self._mcp_oauth_diagnostics.append(
+            {
+                "code": code,
+                "message": message,
+                "server_id": getattr(server, "id", None),
+                "server_name": getattr(server, "name", None),
+                "resource_owner_key": resource_owner_key,
+                "resource": str(resource) if resource else None,
+                "scope": str(scope) if scope else "",
+                "issuer": str(issuer) if issuer else None,
+            }
+        )
 
     def get_custom_api_configs(self) -> List[Dict[str, Any]]:
         """Get custom API configurations."""

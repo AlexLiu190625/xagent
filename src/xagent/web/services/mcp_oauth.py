@@ -2,18 +2,27 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
 
-
 DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT = 10.0
 
 
 class MCPOAuthDiscoveryError(RuntimeError):
     """Raised when MCP OAuth discovery cannot produce usable metadata."""
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class MCPOAuthRuntimeError(RuntimeError):
+    """Raised when runtime cannot prepare an MCP OAuth bearer token."""
 
     def __init__(self, code: str, message: str):
         super().__init__(message)
@@ -63,6 +72,19 @@ class MCPOAuthDiscoveryResult:
     authorization_server: OAuthAuthorizationServerMetadata
     resource: str
     scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MCPOAuthRuntimeAuth:
+    """Prepared MCP OAuth bearer authorization for runtime MCP connections."""
+
+    access_token: str
+    resource_owner_key: str
+    issuer: str
+    resource: str
+    scope: str
+    grant_id: int
+    refreshed: bool = False
 
 
 def parse_www_authenticate_bearer(
@@ -191,6 +213,108 @@ async def discover_mcp_oauth_metadata(  # noqa: PLR0913
             configured_resource=configured_resource,
             client=owned_client,
         )
+
+
+async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
+    db: Any,
+    *,
+    server_id: int,
+    user_id: int,
+    auth_config: dict[str, Any],
+    resource_owner_key: str,
+    resource: str | None = None,
+    scope: str | None = None,
+    issuer: str | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> MCPOAuthRuntimeAuth:
+    """Resolve and refresh an MCP OAuth grant for one runtime MCP connection."""
+    from ...core.utils.encryption import decrypt_value, encrypt_value
+    from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
+
+    normalized_resource = _runtime_config_value(resource, auth_config, "resource")
+    normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
+    selected_scope = scope if scope is not None else auth_config.get("scope")
+    normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
+    if not normalized_resource:
+        raise MCPOAuthRuntimeError(
+            "authorization_required",
+            "MCP OAuth runtime requires a configured resource or runtime resource",
+        )
+
+    query = db.query(MCPOAuthGrant).filter(
+        MCPOAuthGrant.mcp_server_id == server_id,
+        MCPOAuthGrant.user_id == user_id,
+        MCPOAuthGrant.resource_owner_key == resource_owner_key,
+        MCPOAuthGrant.resource == normalized_resource,
+        MCPOAuthGrant.status == "active",
+    )
+    if normalized_issuer:
+        query = query.filter(MCPOAuthGrant.issuer == normalized_issuer)
+    if normalized_scope is not None:
+        query = query.filter(MCPOAuthGrant.scope == normalized_scope)
+    grant = query.order_by(MCPOAuthGrant.updated_at.desc()).first()
+    if grant is None:
+        raise MCPOAuthRuntimeError(
+            "authorization_required",
+            "No active MCP OAuth grant exists for the selected resource owner",
+        )
+
+    access_token = decrypt_value(str(grant.access_token))
+    refreshed = False
+    if _grant_needs_refresh(grant.expires_at):
+        if not grant.refresh_token:
+            raise MCPOAuthRuntimeError(
+                "token_refresh_failed",
+                "MCP OAuth grant is expired and has no refresh token",
+            )
+        oauth_client = (
+            db.query(MCPOAuthClient)
+            .filter(
+                MCPOAuthClient.mcp_server_id == server_id,
+                MCPOAuthClient.issuer == grant.issuer,
+            )
+            .order_by(MCPOAuthClient.updated_at.desc())
+            .first()
+        )
+        if oauth_client is None:
+            raise MCPOAuthRuntimeError(
+                "token_refresh_failed",
+                "MCP OAuth client metadata not found for grant refresh",
+            )
+        token_data = await _refresh_mcp_oauth_grant(
+            oauth_client,
+            refresh_token=decrypt_value(str(grant.refresh_token)),
+            resource=str(grant.resource),
+            client=client,
+        )
+        grant.access_token = encrypt_value(str(token_data["access_token"]))
+        access_token = str(token_data["access_token"])
+        if token_data.get("refresh_token"):
+            grant.refresh_token = encrypt_value(str(token_data["refresh_token"]))
+        grant.token_type = str(token_data.get("token_type") or "Bearer")
+        if token_data.get("scope") is not None:
+            grant.scope = _normalize_scope(token_data.get("scope"))
+        grant.metadata_json = {
+            key: value
+            for key, value in token_data.items()
+            if key not in {"access_token", "refresh_token"}
+        }
+        if token_data.get("expires_in") is not None:
+            grant.expires_at = _utc_now() + timedelta(
+                seconds=int(token_data["expires_in"])
+            )
+        db.commit()
+        refreshed = True
+
+    return MCPOAuthRuntimeAuth(
+        access_token=access_token,
+        resource_owner_key=str(grant.resource_owner_key),
+        issuer=str(grant.issuer),
+        resource=str(grant.resource),
+        scope=str(grant.scope),
+        grant_id=int(grant.id),
+        refreshed=refreshed,
+    )
 
 
 async def _discover_with_client(  # noqa: PLR0913
@@ -419,6 +543,98 @@ def _select_scopes(
     if challenge and challenge.scope:
         return tuple(scope for scope in challenge.scope.split() if scope)
     return protected_resource.scopes_supported
+
+
+async def _refresh_mcp_oauth_grant(
+    oauth_client: Any,
+    *,
+    refresh_token: str,
+    resource: str,
+    client: httpx.AsyncClient | None = None,
+) -> dict[str, Any]:
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": oauth_client.client_id,
+        "resource": resource,
+    }
+    auth: httpx.Auth | None = None
+    client_secret = ""
+    if oauth_client.client_secret:
+        from ...core.utils.encryption import decrypt_value
+
+        client_secret = decrypt_value(str(oauth_client.client_secret))
+    auth_method = str(oauth_client.token_endpoint_auth_method or "none")
+    if auth_method == "client_secret_post" and client_secret:
+        data["client_secret"] = client_secret
+    elif auth_method == "client_secret_basic" and client_secret:
+        auth = httpx.BasicAuth(str(oauth_client.client_id), client_secret)
+    elif auth_method not in {"none", "client_secret_post", "client_secret_basic"}:
+        raise MCPOAuthRuntimeError(
+            "token_refresh_failed",
+            f"Unsupported token endpoint auth method: {auth_method}",
+        )
+
+    try:
+        request_kwargs: dict[str, Any] = {
+            "data": data,
+            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        }
+        if auth is not None:
+            request_kwargs["auth"] = auth
+        if client is not None:
+            response = await client.post(
+                str(oauth_client.token_endpoint),
+                **request_kwargs,
+            )
+        else:
+            async with httpx.AsyncClient(timeout=10.0) as owned_client:
+                response = await owned_client.post(
+                    str(oauth_client.token_endpoint),
+                    **request_kwargs,
+                )
+        payload = response.json()
+    except (httpx.HTTPError, ValueError) as exc:
+        raise MCPOAuthRuntimeError("token_refresh_failed", str(exc)) from exc
+
+    if (
+        response.status_code >= 400
+        or not isinstance(payload, dict)
+        or payload.get("error")
+        or not payload.get("access_token")
+    ):
+        raise MCPOAuthRuntimeError(
+            "token_refresh_failed",
+            f"MCP OAuth refresh failed: {payload}",
+        )
+    return payload
+
+
+def _runtime_config_value(
+    request_value: str | None, auth_config: dict[str, Any], key: str
+) -> str | None:
+    value = request_value if request_value is not None else auth_config.get(key)
+    return str(value).strip() if value else None
+
+
+def _normalize_scope(value: Any) -> str:
+    if isinstance(value, str):
+        return " ".join(item for item in value.split() if item)
+    if isinstance(value, (list, tuple, set)):
+        return " ".join(str(item) for item in value if str(item))
+    return ""
+
+
+def _grant_needs_refresh(expires_at: Any) -> bool:
+    if not isinstance(expires_at, datetime):
+        return False
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return bool(expires_at <= _utc_now() + timedelta(minutes=5))
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _canonical_resource(endpoint_url: str) -> str:

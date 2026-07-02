@@ -1,0 +1,279 @@
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from urllib.parse import parse_qs
+
+import httpx
+import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
+from xagent.core.utils.encryption import decrypt_value, encrypt_value
+from xagent.web.models.database import Base
+from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
+from xagent.web.models.user import User
+from xagent.web.services import mcp_oauth as mcp_oauth_service
+from xagent.web.tools.config import WebToolConfig
+
+
+@pytest.fixture()
+def db_session(tmp_path):
+    db_path = tmp_path / "mcp-oauth-runtime.db"
+    engine = create_engine(
+        f"sqlite:///{db_path}", connect_args={"check_same_thread": False}
+    )
+    Base.metadata.create_all(engine)
+    SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+    db = SessionLocal()
+
+    user = User(username="alice", password_hash="x", is_admin=False)
+    other_user = User(username="bob", password_hash="x", is_admin=False)
+    db.add_all([user, other_user])
+    db.commit()
+    db.refresh(user)
+    db.refresh(other_user)
+
+    yield db, user, other_user
+    db.close()
+    engine.dispose()
+
+
+def _add_mcp_oauth_server(db, user: User, *, include_scope: bool = True) -> MCPServer:
+    auth_config = {
+        "type": "mcp_oauth",
+        "resource": "https://mcp.example.com/mcp",
+        "issuer": "https://auth.example.com",
+    }
+    if include_scope:
+        auth_config["scope"] = "records.read"
+    server = MCPServer.from_config(
+        {
+            "name": "records-runtime",
+            "managed": "external",
+            "transport": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "headers": {
+                "X-Request-Source": "xagent",
+                "Authorization": "Bearer static-token",
+            },
+            "auth": auth_config,
+        }
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.commit()
+    return server
+
+
+def _add_grant(
+    db,
+    *,
+    server: MCPServer,
+    user: User,
+    resource_owner_key: str,
+    access_token: str,
+    refresh_token: str | None = None,
+    expires_at: datetime | None = None,
+) -> MCPOAuthGrant:
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        resource_owner_key=resource_owner_key,
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=encrypt_value(access_token),
+        refresh_token=encrypt_value(refresh_token) if refresh_token else None,
+        expires_at=expires_at,
+        status="active",
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    return grant
+
+
+async def _load_configs(db, user: User, **kwargs):
+    cfg = WebToolConfig(
+        db=db,
+        request=None,
+        user=user,
+        user_id=user.id,
+        workspace_config={"base_dir": "/tmp", "task_id": "test"},
+        **kwargs,
+    )
+    return await cfg.get_mcp_server_configs(), cfg
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_missing_grant_does_not_fall_back_to_static_headers(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics == [
+        {
+            "code": "authorization_required",
+            "message": "No active MCP OAuth grant exists for the selected resource owner",
+            "server_id": server.id,
+            "server_name": "records-runtime",
+            "resource_owner_key": f"xagent:user:{user.id}",
+            "resource": "https://mcp.example.com/mcp",
+            "scope": "records.read",
+            "issuer": "https://auth.example.com",
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_selects_resource_owner_grant(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key="resource-owner-a",
+        access_token="access-token-a",
+    )
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key="resource-owner-b",
+        access_token="access-token-b",
+    )
+
+    configs, cfg = await _load_configs(
+        db,
+        user,
+        mcp_auth_context={str(server.id): {"resource_owner_key": "resource-owner-b"}},
+    )
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert len(configs) == 1
+    headers = configs[0]["config"]["headers"]
+    assert headers["X-Request-Source"] == "xagent"
+    assert headers["Authorization"] == "Bearer access-token-b"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_allows_discovered_scope_when_not_configured(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user, include_scope=False)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="discovered-scope-token",
+    )
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer discovered-scope-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_does_not_use_other_users_grant(db_session):
+    db, user, other_user = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=other_user,
+        resource_owner_key="resource-owner-b",
+        access_token="other-user-token",
+    )
+
+    configs, cfg = await _load_configs(
+        db,
+        user,
+        mcp_auth_context={str(server.id): {"resource_owner_key": "resource-owner-b"}},
+    )
+
+    assert configs == []
+    assert cfg.get_mcp_oauth_diagnostics()[0]["code"] == "authorization_required"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    db.add(
+        MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="client-123",
+            client_secret=encrypt_value("client-secret"),
+            token_endpoint_auth_method="client_secret_post",
+            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        )
+    )
+    db.commit()
+
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        form = parse_qs(request.content.decode())
+        assert form["grant_type"] == ["refresh_token"]
+        assert form["refresh_token"] == ["refresh-token-123"]
+        assert form["resource"] == ["https://mcp.example.com/mcp"]
+        assert form["client_id"] == ["client-123"]
+        assert form["client_secret"] == ["client-secret"]
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "fresh-access-token",
+                "refresh_token": "fresh-refresh-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "records.read",
+            },
+        )
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer fresh-access-token"
+    )
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "fresh-access-token"
+    assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
