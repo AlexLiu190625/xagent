@@ -481,4 +481,52 @@ describe("CustomMcpForm MCP OAuth", () => {
     const nextState = updater(clearedFormData)
     expect(nextState.config.auth.client_secret).toBe("********")
   })
+
+  it("keeps an explicitly cleared masked OAuth client secret empty on blur", async () => {
+    apiRequestMock.mockResolvedValue(okJson({ server_id: 42, grants: [] }))
+    const loadedFormData: MCPServerFormData = {
+      name: "records",
+      transport: "streamable_http",
+      description: "",
+      config: {
+        url: "https://mcp.example.com/mcp",
+        auth: {
+          type: "mcp_oauth",
+          resource: "https://mcp.example.com/mcp",
+          issuer: "https://auth.example.com",
+          scope: "records.read",
+          client_id: "client-123",
+          client_secret: "********",
+        },
+      },
+    }
+
+    function Harness() {
+      const [formData, setFormData] = React.useState(loadedFormData)
+      return (
+        <CustomMcpForm
+          mcpFormData={formData}
+          setMcpFormData={setFormData}
+          transports={[]}
+          serverId={42}
+        />
+      )
+    }
+
+    render(<Harness />)
+    const clientSecret = screen.getByLabelText("tools.mcp.dialog.clientSecret")
+
+    fireEvent.focus(clientSecret)
+    expect(clientSecret).toHaveValue("")
+    fireEvent.change(clientSecret, {
+      target: { value: "temporary-secret" },
+    })
+    expect(clientSecret).toHaveValue("temporary-secret")
+    fireEvent.change(clientSecret, {
+      target: { value: "" },
+    })
+    fireEvent.blur(clientSecret)
+
+    expect(clientSecret).toHaveValue("")
+  })
 })

@@ -13,6 +13,7 @@ from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
+from sqlalchemy.orm import sessionmaker
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,13 @@ class MCPOAuthDiscoveryError(RuntimeError):
 class MCPOAuthRuntimeError(RuntimeError):
     """Raised when runtime cannot prepare an MCP OAuth bearer token."""
 
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+
+
+class _RetryRuntimeGrantSelection(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
@@ -371,8 +379,7 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     client: httpx.AsyncClient | None = None,
 ) -> MCPOAuthRuntimeAuth:
     """Resolve and refresh an MCP OAuth grant for one runtime MCP connection."""
-    from ...core.utils.encryption import decrypt_value, encrypt_value
-    from ..models.mcp_oauth import MCPOAuthGrant
+    from ...core.utils.encryption import decrypt_value
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
     selected_scope = scope if scope is not None else auth_config.get("scope")
@@ -397,8 +404,8 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             scope="",
         )
         grant = _select_runtime_grant(candidate_grants, required_scopes)
-        access_token = decrypt_value(str(grant.access_token))
         if not _grant_needs_refresh(grant.expires_at):
+            access_token = decrypt_value(str(grant.access_token))
             return MCPOAuthRuntimeAuth(
                 access_token=access_token,
                 resource_owner_key=str(grant.resource_owner_key),
@@ -409,58 +416,99 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
                 refreshed=False,
             )
 
-        locked_grant = (
-            db.query(MCPOAuthGrant)
-            .filter(MCPOAuthGrant.id == grant.id)
-            .with_for_update()
-            .first()
-        )
-        if locked_grant is None or not _runtime_grant_matches(
-            locked_grant,
-            server_id=server_id,
-            user_id=user_id,
-            auth_config=auth_config,
-            resource_owner_key=resource_owner_key,
-            resource=resource,
-            issuer=issuer,
-            required_scopes=required_scopes,
-        ):
-            db.rollback()
-            if attempt == 0:
-                continue
-            raise MCPOAuthRuntimeError(
-                "authorization_required",
-                "MCP OAuth grant changed while preparing runtime authorization",
-            )
-
-        if not _grant_needs_refresh(locked_grant.expires_at):
-            access_token = decrypt_value(str(locked_grant.access_token))
-            db.rollback()
-            return MCPOAuthRuntimeAuth(
-                access_token=access_token,
-                resource_owner_key=str(locked_grant.resource_owner_key),
-                issuer=str(locked_grant.issuer),
-                resource=str(locked_grant.resource),
-                scope=str(locked_grant.scope),
-                grant_id=int(locked_grant.id),
-                refreshed=False,
-            )
-        if not locked_grant.refresh_token:
-            db.rollback()
-            if attempt == 0:
-                continue
-            raise MCPOAuthRuntimeError(
-                "authorization_required",
-                "MCP OAuth grant is expired and requires reauthorization",
-            )
-        if locked_grant.oauth_client is None:
-            db.rollback()
-            raise MCPOAuthRuntimeError(
-                "token_refresh_failed",
-                "MCP OAuth client metadata not found for grant refresh",
-            )
-
         try:
+            return await _refresh_runtime_grant_in_dedicated_session(
+                db,
+                grant_id=int(grant.id),
+                server_id=server_id,
+                user_id=user_id,
+                auth_config=auth_config,
+                resource_owner_key=resource_owner_key,
+                resource=resource,
+                issuer=issuer,
+                required_scopes=required_scopes,
+                client=client,
+            )
+        except _RetryRuntimeGrantSelection as exc:
+            db.expire_all()
+            if attempt == 0:
+                continue
+            raise MCPOAuthRuntimeError(exc.code, exc.message) from exc
+
+    raise MCPOAuthRuntimeError(
+        "authorization_required",
+        "MCP OAuth grant changed while preparing runtime authorization",
+    )
+
+
+async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
+    db: Any,
+    *,
+    grant_id: int,
+    server_id: int,
+    user_id: int,
+    auth_config: dict[str, Any],
+    resource_owner_key: str,
+    resource: str | None,
+    issuer: str | None,
+    required_scopes: set[str],
+    client: httpx.AsyncClient | None,
+) -> MCPOAuthRuntimeAuth:
+    """Refresh one runtime grant without committing or rolling back caller state."""
+    from ...core.utils.encryption import decrypt_value, encrypt_value
+    from ..models.mcp_oauth import MCPOAuthGrant
+
+    SessionLocal = sessionmaker(
+        bind=db.get_bind(),
+        autoflush=False,
+        autocommit=False,
+    )
+    refresh_db = SessionLocal()
+    try:
+        with refresh_db.begin_nested():
+            locked_grant: Any = (
+                refresh_db.query(MCPOAuthGrant)
+                .filter(MCPOAuthGrant.id == grant_id)
+                .with_for_update()
+                .first()
+            )
+            if locked_grant is None or not _runtime_grant_matches(
+                locked_grant,
+                server_id=server_id,
+                user_id=user_id,
+                auth_config=auth_config,
+                resource_owner_key=resource_owner_key,
+                resource=resource,
+                issuer=issuer,
+                required_scopes=required_scopes,
+            ):
+                raise _RetryRuntimeGrantSelection(
+                    "authorization_required",
+                    "MCP OAuth grant changed while preparing runtime authorization",
+                )
+
+            if not _grant_needs_refresh(locked_grant.expires_at):
+                access_token = decrypt_value(str(locked_grant.access_token))
+                return MCPOAuthRuntimeAuth(
+                    access_token=access_token,
+                    resource_owner_key=str(locked_grant.resource_owner_key),
+                    issuer=str(locked_grant.issuer),
+                    resource=str(locked_grant.resource),
+                    scope=str(locked_grant.scope),
+                    grant_id=int(locked_grant.id),
+                    refreshed=False,
+                )
+            if not locked_grant.refresh_token:
+                raise _RetryRuntimeGrantSelection(
+                    "authorization_required",
+                    "MCP OAuth grant is expired and requires reauthorization",
+                )
+            if locked_grant.oauth_client is None:
+                raise MCPOAuthRuntimeError(
+                    "token_refresh_failed",
+                    "MCP OAuth client metadata not found for grant refresh",
+                )
+
             token_data = await _refresh_mcp_oauth_grant(
                 locked_grant.oauth_client,
                 refresh_token=decrypt_value(str(locked_grant.refresh_token)),
@@ -497,25 +545,24 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
                 locked_grant.expires_at = _utc_now() + timedelta(
                     seconds=int(token_data["expires_in"])
                 )
-            db.commit()
-        except Exception:
-            db.rollback()
-            raise
+            refresh_db.flush()
+            runtime_auth = MCPOAuthRuntimeAuth(
+                access_token=access_token,
+                resource_owner_key=str(locked_grant.resource_owner_key),
+                issuer=str(locked_grant.issuer),
+                resource=str(locked_grant.resource),
+                scope=str(locked_grant.scope),
+                grant_id=int(locked_grant.id),
+                refreshed=True,
+            )
 
-        return MCPOAuthRuntimeAuth(
-            access_token=access_token,
-            resource_owner_key=str(locked_grant.resource_owner_key),
-            issuer=str(locked_grant.issuer),
-            resource=str(locked_grant.resource),
-            scope=str(locked_grant.scope),
-            grant_id=int(locked_grant.id),
-            refreshed=True,
-        )
-
-    raise MCPOAuthRuntimeError(
-        "authorization_required",
-        "MCP OAuth grant changed while preparing runtime authorization",
-    )
+        refresh_db.commit()
+        return runtime_auth
+    except Exception:
+        refresh_db.rollback()
+        raise
+    finally:
+        refresh_db.close()
 
 
 def select_mcp_oauth_grants(  # noqa: PLR0913

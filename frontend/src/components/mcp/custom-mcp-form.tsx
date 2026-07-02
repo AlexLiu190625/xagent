@@ -50,6 +50,8 @@ interface McpOAuthConnectResponse {
   authorization_url: string
 }
 
+const MASKED_SECRET_VALUE = "********"
+
 async function parseMcpOAuthErrorMessage(response: Response, fallback: string): Promise<string> {
   try {
     const payload = await response.json()
@@ -75,12 +77,18 @@ export function CustomMcpForm({
   const [oauthAction, setOauthAction] = useState<string | null>(null)
   const isMountedRef = useRef(false)
   const pollingIntervalRef = useRef<number | null>(null)
+  const editedSecretFieldsRef = useRef<Set<string>>(new Set())
+  const previousServerIdRef = useRef<number | null | undefined>(serverId)
 
   // Default to sse if not set
   const transport = mcpFormData.transport || "sse"
-  const authType = mcpFormData.config?.auth?.type || "none"
+  const authConfig = mcpFormData.config?.auth
+  const authType = authConfig?.type || "none"
   const isHttpMcpTransport = transport === "streamable_http" || transport === "sse"
   const isMcpOAuth = authType === "mcp_oauth"
+  const bearerTokenValue = authConfig?.bearer_token
+  const apiKeyValue = authConfig?.api_key_value
+  const clientSecretValue = authConfig?.client_secret
 
   const clearOAuthPolling = useCallback(() => {
     if (pollingIntervalRef.current !== null && typeof window !== "undefined") {
@@ -112,6 +120,32 @@ export function CustomMcpForm({
         auth: { ...(prev.config?.auth || {}), [key]: value }
       }
     }))
+  }
+
+  const updateSecretAuth = (key: string, value: string) => {
+    editedSecretFieldsRef.current.add(key)
+    updateAuth(key, value)
+  }
+
+  const focusSecretAuth = (key: string, value: unknown) => {
+    if (value === MASKED_SECRET_VALUE) {
+      editedSecretFieldsRef.current.delete(key)
+      updateAuth(key, "")
+    }
+  }
+
+  const blurSecretAuth = (
+    key: string,
+    value: unknown,
+    originalMaskedValue: string | undefined,
+  ) => {
+    if (
+      (value == null || value === "") &&
+      originalMaskedValue &&
+      !editedSecretFieldsRef.current.has(key)
+    ) {
+      updateAuth(key, MASKED_SECRET_VALUE)
+    }
   }
 
   const updateAuthType = (value: string) => {
@@ -323,29 +357,41 @@ export function CustomMcpForm({
     api_key_value?: string;
     client_secret?: string;
   }>({
-    bearer_token: mcpFormData.config?.auth?.bearer_token === '********' ? '********' : undefined,
-    api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : undefined,
-    client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : undefined,
+    bearer_token: bearerTokenValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+    api_key_value: apiKeyValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+    client_secret: clientSecretValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
   })
 
   useEffect(() => {
-    setOriginalAuth({
-      bearer_token: mcpFormData.config?.auth?.bearer_token === '********' ? '********' : undefined,
-      api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : undefined,
-      client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : undefined,
-    })
-  }, [serverId])
-
-  useEffect(() => {
+    const serverChanged = previousServerIdRef.current !== serverId
+    if (serverChanged) {
+      editedSecretFieldsRef.current.clear()
+      previousServerIdRef.current = serverId
+    }
+    const nextOriginalAuth = {
+      bearer_token: bearerTokenValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+      api_key_value: apiKeyValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+      client_secret: clientSecretValue === MASKED_SECRET_VALUE ? MASKED_SECRET_VALUE : undefined,
+    }
+    if (nextOriginalAuth.bearer_token) {
+      editedSecretFieldsRef.current.delete("bearer_token")
+    }
+    if (nextOriginalAuth.api_key_value) {
+      editedSecretFieldsRef.current.delete("api_key_value")
+    }
+    if (nextOriginalAuth.client_secret) {
+      editedSecretFieldsRef.current.delete("client_secret")
+    }
     setOriginalAuth((prev) => ({
-      bearer_token: mcpFormData.config?.auth?.bearer_token === '********' ? '********' : prev.bearer_token,
-      api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : prev.api_key_value,
-      client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : prev.client_secret,
+      bearer_token: serverChanged ? nextOriginalAuth.bearer_token : nextOriginalAuth.bearer_token || prev.bearer_token,
+      api_key_value: serverChanged ? nextOriginalAuth.api_key_value : nextOriginalAuth.api_key_value || prev.api_key_value,
+      client_secret: serverChanged ? nextOriginalAuth.client_secret : nextOriginalAuth.client_secret || prev.client_secret,
     }))
   }, [
-    mcpFormData.config?.auth?.bearer_token,
-    mcpFormData.config?.auth?.api_key_value,
-    mcpFormData.config?.auth?.client_secret,
+    serverId,
+    bearerTokenValue,
+    apiKeyValue,
+    clientSecretValue,
   ])
 
   const syncHeaders = (newList: { key: string, value: string }[]) => {
@@ -468,16 +514,12 @@ export function CustomMcpForm({
                 id="bearer_token"
                 type="password"
                 value={mcpFormData.config?.auth?.bearer_token || ""}
-                onChange={(e) => updateAuth("bearer_token", e.target.value)}
+                onChange={(e) => updateSecretAuth("bearer_token", e.target.value)}
                 onFocus={() => {
-                  if (mcpFormData.config?.auth?.bearer_token === "********") {
-                    updateAuth("bearer_token", "")
-                  }
+                  focusSecretAuth("bearer_token", mcpFormData.config?.auth?.bearer_token)
                 }}
                 onBlur={() => {
-                  if ((!mcpFormData.config?.auth?.bearer_token || mcpFormData.config.auth.bearer_token === "") && originalAuth.bearer_token) {
-                    updateAuth("bearer_token", "********")
-                  }
+                  blurSecretAuth("bearer_token", mcpFormData.config?.auth?.bearer_token, originalAuth.bearer_token)
                 }}
                 placeholder={t('tools.mcp.dialog.tokenPlaceholder')}
               />
@@ -501,16 +543,12 @@ export function CustomMcpForm({
                   id="api_key_value"
                   type="password"
                   value={mcpFormData.config?.auth?.api_key_value || ""}
-                  onChange={(e) => updateAuth("api_key_value", e.target.value)}
+                  onChange={(e) => updateSecretAuth("api_key_value", e.target.value)}
                   onFocus={() => {
-                    if (mcpFormData.config?.auth?.api_key_value === "********") {
-                      updateAuth("api_key_value", "")
-                    }
+                    focusSecretAuth("api_key_value", mcpFormData.config?.auth?.api_key_value)
                   }}
                   onBlur={() => {
-                    if ((!mcpFormData.config?.auth?.api_key_value || mcpFormData.config.auth.api_key_value === "") && originalAuth.api_key_value) {
-                      updateAuth("api_key_value", "********")
-                    }
+                    blurSecretAuth("api_key_value", mcpFormData.config?.auth?.api_key_value, originalAuth.api_key_value)
                   }}
                   placeholder={t('tools.mcp.dialog.apiKeyPlaceholder')}
                 />
@@ -535,16 +573,12 @@ export function CustomMcpForm({
                   id="client_secret"
                   type="password"
                   value={mcpFormData.config?.auth?.client_secret || ""}
-                  onChange={(e) => updateAuth("client_secret", e.target.value)}
+                  onChange={(e) => updateSecretAuth("client_secret", e.target.value)}
                   onFocus={() => {
-                    if (mcpFormData.config?.auth?.client_secret === "********") {
-                      updateAuth("client_secret", "")
-                    }
+                    focusSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret)
                   }}
                   onBlur={() => {
-                    if ((!mcpFormData.config?.auth?.client_secret || mcpFormData.config.auth.client_secret === "") && originalAuth.client_secret) {
-                      updateAuth("client_secret", "********")
-                    }
+                    blurSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret, originalAuth.client_secret)
                   }}
                   placeholder={t('tools.mcp.dialog.clientSecretPlaceholder')}
                 />
@@ -610,16 +644,12 @@ export function CustomMcpForm({
                     id="mcp_oauth_client_secret"
                     type="password"
                     value={mcpFormData.config?.auth?.client_secret || ""}
-                    onChange={(e) => updateAuth("client_secret", e.target.value)}
+                    onChange={(e) => updateSecretAuth("client_secret", e.target.value)}
                     onFocus={() => {
-                      if (mcpFormData.config?.auth?.client_secret === "********") {
-                        updateAuth("client_secret", "")
-                      }
+                      focusSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret)
                     }}
                     onBlur={() => {
-                      if ((!mcpFormData.config?.auth?.client_secret || mcpFormData.config.auth.client_secret === "") && originalAuth.client_secret) {
-                        updateAuth("client_secret", "********")
-                      }
+                      blurSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret, originalAuth.client_secret)
                     }}
                     placeholder={t('tools.mcp.dialog.clientSecretPlaceholder')}
                   />

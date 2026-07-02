@@ -21,12 +21,11 @@ class MCPOAuthClient(Base):  # type: ignore
         ),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     mcp_server_id = Column(
         Integer,
         ForeignKey("mcp_servers.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     issuer = Column(String(1000), nullable=False, index=True)
     authorization_endpoint = Column(String(1000), nullable=False)
@@ -67,12 +66,11 @@ class MCPOAuthGrant(Base):  # type: ignore
         ),
     )
 
-    id = Column(Integer, primary_key=True, index=True)
+    id = Column(Integer, primary_key=True)
     mcp_server_id = Column(
         Integer,
         ForeignKey("mcp_servers.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
@@ -115,8 +113,8 @@ class MCPOAuthFlowState(Base):  # type: ignore
 
     __tablename__ = "mcp_oauth_flow_states"
 
-    id = Column(Integer, primary_key=True, index=True)
-    state = Column(String(255), nullable=False, unique=True, index=True)
+    id = Column(Integer, primary_key=True)
+    state = Column(String(255), nullable=False, unique=True)
     mcp_server_id = Column(
         Integer,
         ForeignKey("mcp_servers.id", ondelete="CASCADE"),

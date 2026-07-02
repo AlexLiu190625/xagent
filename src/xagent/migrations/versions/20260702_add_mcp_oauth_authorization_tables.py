@@ -212,11 +212,7 @@ def upgrade() -> None:
         )
 
     for table_name, index_name, columns in (
-        ("mcp_oauth_clients", "ix_mcp_oauth_clients_id", ["id"]),
-        ("mcp_oauth_clients", "ix_mcp_oauth_clients_mcp_server_id", ["mcp_server_id"]),
         ("mcp_oauth_clients", "ix_mcp_oauth_clients_issuer", ["issuer"]),
-        ("mcp_oauth_grants", "ix_mcp_oauth_grants_id", ["id"]),
-        ("mcp_oauth_grants", "ix_mcp_oauth_grants_mcp_server_id", ["mcp_server_id"]),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_user_id", ["user_id"]),
         (
             "mcp_oauth_grants",
@@ -224,12 +220,6 @@ def upgrade() -> None:
             ["mcp_oauth_client_id"],
         ),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_expires_at", ["expires_at"]),
-        ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_id", ["id"]),
-        (
-            "mcp_oauth_flow_states",
-            "ix_mcp_oauth_flow_states_state",
-            ["state"],
-        ),
         (
             "mcp_oauth_flow_states",
             "ix_mcp_oauth_flow_states_mcp_server_id",
@@ -259,16 +249,10 @@ def downgrade() -> None:
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_mcp_oauth_client_id"),
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_user_id"),
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_mcp_server_id"),
-        ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_state"),
-        ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_id"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_expires_at"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_mcp_oauth_client_id"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_user_id"),
-        ("mcp_oauth_grants", "ix_mcp_oauth_grants_mcp_server_id"),
-        ("mcp_oauth_grants", "ix_mcp_oauth_grants_id"),
         ("mcp_oauth_clients", "ix_mcp_oauth_clients_issuer"),
-        ("mcp_oauth_clients", "ix_mcp_oauth_clients_mcp_server_id"),
-        ("mcp_oauth_clients", "ix_mcp_oauth_clients_id"),
     ):
         if table_name in inspector.get_table_names() and index_name in _index_names(
             table_name

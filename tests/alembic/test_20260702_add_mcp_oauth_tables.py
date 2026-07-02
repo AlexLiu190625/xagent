@@ -117,9 +117,27 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
             index["name"] for index in inspector.get_indexes("mcp_oauth_grants")
         }
         assert "ix_mcp_oauth_grants_user_id" in grant_indexes
-        assert "ix_mcp_oauth_grants_mcp_server_id" in grant_indexes
         assert "ix_mcp_oauth_grants_mcp_oauth_client_id" in grant_indexes
         assert "ix_mcp_oauth_grants_expires_at" in grant_indexes
+        assert "ix_mcp_oauth_grants_id" not in grant_indexes
+        assert "ix_mcp_oauth_grants_mcp_server_id" not in grant_indexes
+
+        client_indexes = {
+            index["name"] for index in inspector.get_indexes("mcp_oauth_clients")
+        }
+        assert "ix_mcp_oauth_clients_issuer" in client_indexes
+        assert "ix_mcp_oauth_clients_id" not in client_indexes
+        assert "ix_mcp_oauth_clients_mcp_server_id" not in client_indexes
+
+        state_indexes = {
+            index["name"] for index in inspector.get_indexes("mcp_oauth_flow_states")
+        }
+        assert "ix_mcp_oauth_flow_states_mcp_server_id" in state_indexes
+        assert "ix_mcp_oauth_flow_states_user_id" in state_indexes
+        assert "ix_mcp_oauth_flow_states_mcp_oauth_client_id" in state_indexes
+        assert "ix_mcp_oauth_flow_states_expires_at" in state_indexes
+        assert "ix_mcp_oauth_flow_states_id" not in state_indexes
+        assert "ix_mcp_oauth_flow_states_state" not in state_indexes
 
         grant_unique_constraints = {
             constraint["name"]

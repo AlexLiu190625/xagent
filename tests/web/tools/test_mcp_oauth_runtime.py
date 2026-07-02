@@ -430,12 +430,17 @@ async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch
     monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
 
+    pending_user = User(username="pending-refresh-user", password_hash="x")
+    db.add(pending_user)
+
     configs, cfg = await _load_configs(db, user)
 
     assert cfg.get_mcp_oauth_diagnostics() == []
     assert configs[0]["config"]["headers"]["Authorization"] == (
         "Bearer fresh-access-token"
     )
+    assert pending_user in db.new
+    assert pending_user.id is None
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "fresh-access-token"
     assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
