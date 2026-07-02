@@ -412,14 +412,16 @@ def _upsert_mcp_oauth_client(
         issuer=discovery.authorization_server.issuer,
         client_id=client_id,
     )
-    client.authorization_endpoint = (
-        discovery.authorization_server.authorization_endpoint
+    setattr(
+        client,
+        "authorization_endpoint",
+        discovery.authorization_server.authorization_endpoint,
     )
-    client.token_endpoint = discovery.authorization_server.token_endpoint
-    client.client_secret = encrypted_client_secret
-    client.token_endpoint_auth_method = token_endpoint_auth_method
-    client.redirect_uri = redirect_uri
-    client.metadata_json = discovery.authorization_server.raw
+    setattr(client, "token_endpoint", discovery.authorization_server.token_endpoint)
+    setattr(client, "client_secret", encrypted_client_secret)
+    setattr(client, "token_endpoint_auth_method", token_endpoint_auth_method)
+    setattr(client, "redirect_uri", redirect_uri)
+    setattr(client, "metadata_json", discovery.authorization_server.raw)
     if existing is None:
         db.add(client)
     db.flush()
@@ -539,13 +541,14 @@ async def _exchange_mcp_oauth_code(
         )
 
     try:
+        post_kwargs: dict[str, Any] = {
+            "data": data,
+            "headers": {"Content-Type": "application/x-www-form-urlencoded"},
+        }
+        if auth is not None:
+            post_kwargs["auth"] = auth
         async with httpx.AsyncClient(timeout=10.0) as http_client:
-            response = await http_client.post(
-                str(client.token_endpoint),
-                data=data,
-                headers={"Content-Type": "application/x-www-form-urlencoded"},
-                auth=auth,
-            )
+            response = await http_client.post(str(client.token_endpoint), **post_kwargs)
         payload = response.json()
     except (httpx.HTTPError, ValueError) as exc:
         raise HTTPException(
@@ -602,20 +605,28 @@ def _upsert_mcp_oauth_grant(
         resource=flow_state.resource,
         scope=scope,
     )
-    grant.access_token = encrypt_value(str(token_data["access_token"]))
+    setattr(grant, "access_token", encrypt_value(str(token_data["access_token"])))
     refresh_token = token_data.get("refresh_token")
     if refresh_token:
-        grant.refresh_token = encrypt_value(str(refresh_token))
-    grant.token_type = str(token_data.get("token_type") or "Bearer")
-    grant.status = "active"
-    grant.revoked_at = None
-    grant.metadata_json = {
-        key: value
-        for key, value in token_data.items()
-        if key not in {"access_token", "refresh_token"}
-    }
+        setattr(grant, "refresh_token", encrypt_value(str(refresh_token)))
+    setattr(grant, "token_type", str(token_data.get("token_type") or "Bearer"))
+    setattr(grant, "status", "active")
+    setattr(grant, "revoked_at", None)
+    setattr(
+        grant,
+        "metadata_json",
+        {
+            key: value
+            for key, value in token_data.items()
+            if key not in {"access_token", "refresh_token"}
+        },
+    )
     if token_data.get("expires_in") is not None:
-        grant.expires_at = _utc_now() + timedelta(seconds=int(token_data["expires_in"]))
+        setattr(
+            grant,
+            "expires_at",
+            _utc_now() + timedelta(seconds=int(token_data["expires_in"])),
+        )
     if existing is None:
         db.add(grant)
     return grant
@@ -1836,13 +1847,17 @@ async def get_mcp_server_tools(
 ) -> dict:
     """Get tools available from a specific MCP server."""
     try:
-        user_id = current_user.id
+        user_id = int(current_user.id)
 
         # Check user has access to this server
         result = (
             db.query(UserMCPServer, MCPServer)
             .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
-            .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
+            .filter(
+                UserMCPServer.user_id == user_id,
+                UserMCPServer.is_active,
+                MCPServer.id == server_id,
+            )
             .first()
         )
 
@@ -1854,8 +1869,23 @@ async def get_mcp_server_tools(
 
         _, server = result
 
-        # Get connection from server
-        connection = server.to_connection_dict()
+        from ..services.mcp_runtime import build_mcp_runtime_connection
+
+        runtime_build = await build_mcp_runtime_connection(
+            db,
+            server,
+            user_id=user_id,
+        )
+        if runtime_build.connection is None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=runtime_build.diagnostic
+                or {
+                    "code": "authorization_required",
+                    "message": "MCP server authorization is required",
+                },
+            )
+        connection = runtime_build.connection
 
         # Try to load tools
         from ...core.tools.adapters.vibe.mcp_adapter import (
@@ -1863,6 +1893,7 @@ async def get_mcp_server_tools(
         )
 
         server_name = server.name
+        tools: List[Any] = []
         if isinstance(server_name, str):
             connections_dict: Dict[str, Any] = {server_name: connection}
             tools = await load_mcp_tools_as_agent_tools(
@@ -2162,6 +2193,6 @@ async def delete_mcp_oauth_grant(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="MCP OAuth grant not found"
         )
-    grant.status = "revoked"
-    grant.revoked_at = _utc_now()
+    setattr(grant, "status", "revoked")
+    setattr(grant, "revoked_at", _utc_now())
     db.commit()

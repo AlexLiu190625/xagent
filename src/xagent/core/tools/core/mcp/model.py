@@ -116,7 +116,13 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
             }
             auth_type = auth_value.get("type")
 
-            if auth_type == "bearer":
+            if auth_type == "mcp_oauth":
+                merged_headers = {
+                    str(header_name): header_value
+                    for header_name, header_value in merged_headers.items()
+                    if str(header_name).lower() != "authorization"
+                }
+            elif auth_type == "bearer":
                 bearer_token = auth_value.get("bearer_token")
                 if bearer_token and "authorization" not in existing_headers:
                     merged_headers["Authorization"] = f"Bearer {bearer_token}"

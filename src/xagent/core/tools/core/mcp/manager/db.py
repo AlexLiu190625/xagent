@@ -185,6 +185,13 @@ class DatabaseMCPServerManager:
 
                 server_name = server.name
                 if isinstance(server_name, str):
+                    if self._requires_runtime_mcp_oauth(server):
+                        logger.warning(
+                            "Skipping MCP OAuth server '%s' in direct database "
+                            "connection manager; use a runtime resolver instead",
+                            server_name,
+                        )
+                        continue
                     connections[server_name] = server.to_connection_dict()
 
             logger.info(f"Created {len(connections)} MCP connections from database")
@@ -193,6 +200,16 @@ class DatabaseMCPServerManager:
             logger.error(f"Failed to create MCP connections from database: {e}")
 
         return connections
+
+    @staticmethod
+    def _requires_runtime_mcp_oauth(server: Any) -> bool:
+        auth_config = server._decrypt_auth_config(getattr(server, "auth", None))
+        return (
+            getattr(server, "transport", None)
+            in {"sse", "websocket", "streamable_http"}
+            and isinstance(auth_config, dict)
+            and auth_config.get("type") == "mcp_oauth"
+        )
 
     def add_server(self, config: MCPServerConfig) -> None:
         """Add a new MCP server configuration to database."""

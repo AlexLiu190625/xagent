@@ -181,6 +181,29 @@ class TestDatabaseMCPServerManager:
         assert stdio_conn["concurrency_safe"] is True
         assert stdio_conn["concurrent_tools"] == ["list_messages"]
 
+    def test_get_connections_skips_mcp_oauth_without_runtime_resolver(self, test_db):
+        """Direct DB manager must not execute MCP OAuth via static headers."""
+        manager = DatabaseMCPServerManager(test_db)
+        config = manager.create_config(
+            name="test_mcp_oauth_server",
+            transport="streamable_http",
+            managed="external",
+            description="MCP OAuth server",
+            url="https://mcp.example.com/mcp",
+            headers={"Authorization": "Bearer static-token"},
+            auth={
+                "type": "mcp_oauth",
+                "resource": "https://mcp.example.com/mcp",
+                "issuer": "https://auth.example.com",
+                "client_id": "client-123",
+            },
+        )
+        manager.add_server(config)
+
+        connections = manager.get_connections()
+
+        assert "test_mcp_oauth_server" not in connections
+
     def test_get_server(self, test_db, sample_stdio_config):
         """Test getting specific server."""
         manager = DatabaseMCPServerManager(test_db)

@@ -73,6 +73,24 @@ class TestMCPServerModel:
         assert connection_dict["url"] == "ws://localhost:8080/ws"
         assert connection_dict["headers"] == {"Authorization": "Bearer token"}
 
+    def test_mcp_oauth_to_connection_dict_strips_static_authorization(self):
+        """MCP OAuth runtime credentials must not fall back to stored headers."""
+        server = MCPServer(
+            name="test_oauth_server",
+            transport="streamable_http",
+            managed="external",
+            url="https://mcp.example.com/mcp",
+            headers={
+                "Authorization": "Bearer static-token",
+                "X-Request-Source": "xagent",
+            },
+            auth={"type": "mcp_oauth"},
+        )
+
+        connection_dict = server.to_connection_dict()
+
+        assert connection_dict["headers"] == {"X-Request-Source": "xagent"}
+
     def test_to_config_dict_external(self):
         """Test to_config_dict method for external server."""
         server = MCPServer(

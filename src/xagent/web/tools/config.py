@@ -843,36 +843,24 @@ class WebToolConfig(BaseToolConfig):
                         transport_config["cwd"] = server.cwd
 
                 elif server.transport in ["sse", "websocket", "streamable_http"]:
-                    decrypted_auth = server._decrypt_auth_config(
-                        getattr(server, "auth", None)
+                    from ...web.services.mcp_runtime import (
+                        build_mcp_runtime_connection,
+                        connection_to_transport_config,
                     )
-                    if server.url:
-                        transport_config["url"] = server.url
-                    raw_headers = getattr(server, "headers", None)
-                    typed_headers = (
-                        raw_headers if isinstance(raw_headers, dict) else None
+
+                    runtime_build = await build_mcp_runtime_connection(
+                        self.db,
+                        server,
+                        user_id=self._user_id,
+                        mcp_auth_context=self._mcp_auth_context,
                     )
-                    if (
-                        isinstance(decrypted_auth, dict)
-                        and decrypted_auth.get("type") == "mcp_oauth"
-                    ):
-                        runtime_auth = await self._resolve_mcp_oauth_runtime_auth(
-                            server, decrypted_auth
-                        )
-                        if runtime_auth is None:
-                            continue
-                        merged_headers = self._headers_without_authorization(
-                            typed_headers
-                        )
-                        merged_headers["Authorization"] = (
-                            f"Bearer {runtime_auth.access_token}"
-                        )
-                    else:
-                        merged_headers = server._merge_auth_headers(
-                            typed_headers, decrypted_auth
-                        )
-                    if merged_headers:
-                        transport_config["headers"] = merged_headers
+                    if runtime_build.connection is None:
+                        if runtime_build.diagnostic is not None:
+                            self._mcp_oauth_diagnostics.append(runtime_build.diagnostic)
+                        continue
+                    transport_config.update(
+                        connection_to_transport_config(runtime_build.connection)
+                    )
 
                 transport_config["concurrency_safe"] = bool(
                     getattr(server, "concurrency_safe", False)
@@ -920,95 +908,6 @@ class WebToolConfig(BaseToolConfig):
 
         logger.info(f"Loaded {len(configs)} MCP server configurations")
         return configs
-
-    async def _resolve_mcp_oauth_runtime_auth(
-        self, server: Any, auth_config: Dict[str, Any]
-    ) -> Optional[Any]:
-        from ...web.services.mcp_oauth import (
-            MCPOAuthRuntimeError,
-            resolve_mcp_oauth_runtime_auth,
-        )
-
-        server_id = getattr(server, "id", None)
-        if (
-            not isinstance(server_id, int)
-            or not isinstance(self._user_id, int)
-            or self.db is None
-        ):
-            self._record_mcp_oauth_diagnostic(
-                server,
-                code="authorization_required",
-                message=(
-                    "MCP OAuth runtime requires a persisted server, user, and "
-                    "database session"
-                ),
-            )
-            return None
-
-        selection = self._mcp_oauth_selection(server_id)
-        resource_owner_key = selection.get("resource_owner_key") or (
-            f"xagent:user:{self._user_id}"
-        )
-        try:
-            return await resolve_mcp_oauth_runtime_auth(
-                self.db,
-                server_id=server_id,
-                user_id=self._user_id,
-                auth_config=auth_config,
-                resource_owner_key=str(resource_owner_key),
-                resource=selection.get("resource"),
-                scope=selection.get("scope"),
-                issuer=selection.get("issuer"),
-            )
-        except MCPOAuthRuntimeError as exc:
-            self._record_mcp_oauth_diagnostic(
-                server,
-                code=exc.code,
-                message=exc.message,
-                resource_owner_key=str(resource_owner_key),
-                resource=selection.get("resource") or auth_config.get("resource"),
-                scope=selection.get("scope") or auth_config.get("scope"),
-                issuer=selection.get("issuer") or auth_config.get("issuer"),
-            )
-            return None
-
-    def _mcp_oauth_selection(self, server_id: int) -> Dict[str, Any]:
-        selection = self._mcp_auth_context.get(str(server_id))
-        return selection if isinstance(selection, dict) else {}
-
-    @staticmethod
-    def _headers_without_authorization(
-        headers: Dict[str, Any] | None,
-    ) -> Dict[str, Any]:
-        return {
-            str(key): value
-            for key, value in dict(headers or {}).items()
-            if str(key).lower() != "authorization"
-        }
-
-    def _record_mcp_oauth_diagnostic(
-        self,
-        server: Any,
-        *,
-        code: str,
-        message: str,
-        resource_owner_key: Optional[str] = None,
-        resource: Optional[Any] = None,
-        scope: Optional[Any] = None,
-        issuer: Optional[Any] = None,
-    ) -> None:
-        self._mcp_oauth_diagnostics.append(
-            {
-                "code": code,
-                "message": message,
-                "server_id": getattr(server, "id", None),
-                "server_name": getattr(server, "name", None),
-                "resource_owner_key": resource_owner_key,
-                "resource": str(resource) if resource else None,
-                "scope": str(scope) if scope else "",
-                "issuer": str(issuer) if issuer else None,
-            }
-        )
 
     def get_custom_api_configs(self) -> List[Dict[str, Any]]:
         """Get custom API configurations."""

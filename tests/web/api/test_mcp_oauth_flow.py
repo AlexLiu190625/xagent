@@ -6,21 +6,25 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
-from xagent.core.utils.encryption import decrypt_value
+from xagent.core.utils.encryption import decrypt_value, encrypt_value
 from xagent.web.api import mcp as mcp_api
 from xagent.web.api.mcp import (
     MCPOAuthConnectRequest,
     MCPOAuthDiscoverRequest,
     MCPOAuthStatusResponse,
+    MCPServerUpdate,
     connect_mcp_oauth,
     delete_mcp_oauth_grant,
     discover_mcp_oauth,
     get_mcp_oauth_status,
+    get_mcp_server_tools,
     mcp_oauth_callback,
+    update_mcp_server,
 )
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
@@ -177,6 +181,110 @@ def _set_user_mcp_active(db, user: User, server: MCPServer, is_active: bool) -> 
     )
     user_mcp.is_active = is_active
     db.commit()
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_server_tools_requires_oauth_grant_without_static_fallback(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    server.headers = {
+        "Authorization": "Bearer static-token",
+        "X-Request-Source": "xagent",
+    }
+    db.commit()
+
+    async def fail_load_tools(*args, **kwargs):
+        pytest.fail("MCP tools loader should not be called without an OAuth grant")
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        fail_load_tools,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_mcp_server_tools(server.id, user, db)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail["code"] == "authorization_required"
+    assert (
+        exc_info.value.detail["message"]
+        == "No active MCP OAuth grant exists for the selected resource owner"
+    )
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_server_tools_injects_runtime_oauth_grant(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    server.headers = {
+        "Authorization": "Bearer static-token",
+        "X-Request-Source": "xagent",
+    }
+    client = _add_oauth_client(db, server, client_id="client-123")
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=encrypt_value("runtime-token"),
+        status="active",
+    )
+    db.add(grant)
+    db.commit()
+    captured_connections = []
+
+    async def fake_load_tools(connections, name_prefix):
+        captured_connections.append(connections)
+        return [SimpleNamespace(name="search_records", description="Search records")]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        fake_load_tools,
+    )
+
+    response = await get_mcp_server_tools(server.id, user, db)
+
+    assert response["tool_count"] == 1
+    connection = captured_connections[0]["records"]
+    assert connection["headers"]["Authorization"] == "Bearer runtime-token"
+    assert connection["headers"]["X-Request-Source"] == "xagent"
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_server_tools_rejects_inactive_user_server(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _set_user_mcp_active(db, user, server, False)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_mcp_server_tools(server.id, user, db)
+
+    assert exc_info.value.status_code == 404
+
+
+def test_update_mcp_server_can_reactivate_inactive_user_server(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _set_user_mcp_active(db, user, server, False)
+
+    response = update_mcp_server(
+        server.id,
+        MCPServerUpdate(description="Updated while inactive", is_active=True),
+        user,
+        db,
+    )
+
+    assert response.description == "Updated while inactive"
+    assert response.is_active is True
 
 
 @pytest.mark.asyncio
