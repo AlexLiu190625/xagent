@@ -12,6 +12,7 @@ SENSITIVE_AUTH_FIELDS = (
     "client_secret",
     "access_token",
 )
+MASKED_SECRET_VALUE = "********"
 
 
 def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
@@ -273,11 +274,13 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
                 # Check if it's already encrypted (starts with gAAAAAB...) to avoid double encryption
                 # (Fernet tokens always start with gAAAAAB)
                 for key in SENSITIVE_AUTH_FIELDS:
-                    if (
-                        key in encrypted_auth
-                        and encrypted_auth[key]
-                        and not encrypted_auth[key].startswith("gAAAAAB")
-                    ):
+                    if key in encrypted_auth and encrypted_auth[key]:
+                        if encrypted_auth[key] == MASKED_SECRET_VALUE:
+                            raise ValueError(
+                                f"Masked auth value for '{key}' cannot be stored"
+                            )
+                        if encrypted_auth[key].startswith("gAAAAAB"):
+                            continue
                         encrypted_auth[key] = encrypt_value(encrypted_auth[key])
                 auth_config = encrypted_auth
 

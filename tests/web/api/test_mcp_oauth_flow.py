@@ -1056,15 +1056,13 @@ async def test_callback_rejects_missing_required_issuer_before_token_exchange(
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?code=auth-code&state=issuer-required-state"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=issuer-required-state"),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "issuer_mismatch"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["issuer_mismatch"]
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -1085,16 +1083,16 @@ async def test_callback_rejects_mismatched_issuer_before_token_exchange(
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?code=auth-code&state=issuer-mismatch-state"
-                "&iss=https%3A%2F%2Fevil.example.com"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=issuer-mismatch-state"
+            "&iss=https%3A%2F%2Fevil.example.com"
+        ),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "issuer_mismatch"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["issuer_mismatch"]
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -1115,16 +1113,16 @@ async def test_callback_rejects_error_response_mismatched_issuer(
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?error=access_denied&state=issuer-error-state"
-                "&iss=https%3A%2F%2Fevil.example.com"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?error=access_denied&state=issuer-error-state"
+            "&iss=https%3A%2F%2Fevil.example.com"
+        ),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "issuer_mismatch"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["issuer_mismatch"]
     assert db.query(MCPOAuthGrant).count() == 0
 
 

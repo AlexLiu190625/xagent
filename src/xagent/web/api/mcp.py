@@ -25,7 +25,7 @@ from sqlalchemy.orm import Session
 from ...config import get_app_base_url, get_session_secret
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
-from ...core.tools.core.mcp.model import SENSITIVE_AUTH_FIELDS
+from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user
 from ..mcp_apps import get_all_mcp_apps, get_app_by_name
@@ -58,7 +58,6 @@ MCP_OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = 10 * 60
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
-MASKED_SECRET_VALUE = "********"
 
 
 # Pydantic models for API
@@ -2235,12 +2234,6 @@ async def mcp_oauth_callback(
             detail={"code": "invalid_state", "message": "Missing OAuth state"},
         )
     _validate_mcp_oauth_state_cookie(request, state_value)
-    if not code and not error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "invalid_state", "message": "Missing authorization code"},
-        )
-
     flow_state = (
         db.query(MCPOAuthFlowState)
         .filter(MCPOAuthFlowState.state == state_value)
@@ -2272,11 +2265,24 @@ async def mcp_oauth_callback(
             message="OAuth client metadata not found",
         )
 
-    _validate_mcp_oauth_callback_issuer(
-        request=request,
-        client=client,
-        flow_state=flow_state,
-    )
+    try:
+        _validate_mcp_oauth_callback_issuer(
+            request=request,
+            client=client,
+            flow_state=flow_state,
+        )
+    except HTTPException as exc:
+        issuer_detail: dict[str, Any] = (
+            exc.detail if isinstance(exc.detail, dict) else {}
+        )
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code=str(issuer_detail.get("code") or "issuer_mismatch"),
+            message=str(
+                issuer_detail.get("message")
+                or "Authorization response issuer did not match flow state"
+            ),
+        )
     claim_error = _claim_mcp_oauth_flow_state(db, flow_state)
     if claim_error is not None:
         error_code, message = claim_error
@@ -2294,9 +2300,10 @@ async def mcp_oauth_callback(
             ),
         )
     if not code:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "invalid_state", "message": "Missing authorization code"},
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code="invalid_state",
+            message="Missing authorization code",
         )
     try:
         token_data = await _exchange_mcp_oauth_code(

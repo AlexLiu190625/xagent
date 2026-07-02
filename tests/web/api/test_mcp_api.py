@@ -251,6 +251,23 @@ class TestMCPServerModel:
         assert server.auth["access_token"] != "plain-access-token"
         assert server.to_config_dict()["auth"]["access_token"] == "plain-access-token"
 
+    def test_from_config_rejects_masked_auth_secret_without_existing_value(self):
+        """Masked placeholders are response values, not creatable secrets."""
+        with pytest.raises(ValueError, match="Masked auth value"):
+            MCPServer.from_config(
+                {
+                    "name": "masked_server",
+                    "managed": "external",
+                    "transport": "streamable_http",
+                    "url": "https://example.com/mcp",
+                    "auth": {
+                        "type": "mcp_oauth",
+                        "client_id": "client-123",
+                        "client_secret": "********",
+                    },
+                }
+            )
+
     def test_transport_display_property(self):
         """Test transport_display property for different transports."""
         stdio_server = MCPServer(
