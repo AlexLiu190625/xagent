@@ -42,6 +42,7 @@ from ..services.mcp_oauth import (
     oauth_error_log_payload,
     oauth_error_message,
     oauth_post,
+    oauth_token_expires_at,
     select_mcp_oauth_grants,
 )
 
@@ -790,12 +791,7 @@ def _upsert_mcp_oauth_grant(
             if key not in {"access_token", "refresh_token"}
         },
     )
-    if token_data.get("expires_in") is not None:
-        setattr(
-            grant,
-            "expires_at",
-            _utc_now() + timedelta(seconds=int(token_data["expires_in"])),
-        )
+    setattr(grant, "expires_at", oauth_token_expires_at(token_data))
     if existing is None:
         db.add(grant)
     return grant

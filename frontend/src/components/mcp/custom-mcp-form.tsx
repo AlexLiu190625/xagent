@@ -15,7 +15,6 @@ import { MCPServerFormData } from "./custom-api-form"
 interface CustomMcpFormProps {
   mcpFormData: MCPServerFormData
   setMcpFormData: React.Dispatch<React.SetStateAction<MCPServerFormData>>
-  transports: unknown[]
   serverId?: number | null
   onOAuthStatusChange?: () => void
 }

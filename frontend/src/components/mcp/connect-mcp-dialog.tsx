@@ -102,7 +102,6 @@ export function ConnectMcpDialog({
   // Custom MCP Server state
   const [isSavingCustom, setIsSavingCustom] = useState(false)
   const [customApiEnv, setCustomApiEnv] = useState<{ key: string, value: string }[]>([{ key: "", value: "" }])
-  const [transports, setTransports] = useState<any[]>([])
   const [mcpFormData, setMcpFormData] = useState<MCPServerFormData>({
     name: "",
     transport: "stdio",
@@ -139,32 +138,7 @@ export function ConnectMcpDialog({
   }
 
   useEffect(() => {
-    const loadTransports = async () => {
-      try {
-        const response = await apiRequest(`${getApiUrl()}/api/mcp/transports`)
-        if (response.ok) {
-          const data = await response.json()
-          const transformedTransports = (data.transports || []).map((transport: any) => ({
-            value: transport.id,
-            label: transport.name,
-            description: transport.description,
-            fields: (transport.config_fields || []).map((field: any) => ({
-              name: field.name,
-              label: field.description,
-              type: field.type === 'string' ? 'text' : field.type === 'array' ? 'textarea' : field.type,
-              required: field.required,
-              placeholder: t('tools.mcp.form.fieldPlaceholderPrefix', { field: field.description })
-            }))
-          }))
-          setTransports(transformedTransports)
-        }
-      } catch (error) {
-        console.error("Failed to load transports:", error)
-      }
-    }
-
     if (open) {
-      loadTransports()
       setMcpFormData({
         name: "",
         transport: "stdio",
@@ -755,7 +729,6 @@ export function ConnectMcpDialog({
                   <CustomMcpForm
                     mcpFormData={mcpFormData}
                     setMcpFormData={setMcpFormData}
-                    transports={transports}
                     serverId={editingCustomServerId}
                     onOAuthStatusChange={loadApps}
                   />

@@ -78,20 +78,6 @@ export interface MCPServer {
   provider?: string
 }
 
-interface TransportConfig {
-  value: string
-  label: string
-  description: string
-  fields: Array<{
-    name: string
-    label: string
-    type: 'text' | 'number' | 'textarea' | 'select'
-    required: boolean
-    placeholder?: string
-    options?: Array<{ value: string; label: string }>
-  }>
-}
-
 interface ConfigurableToolField {
   label: string
   required: boolean
@@ -126,7 +112,6 @@ const DEFAULT_PORTS: Record<Exclude<SqlDbType, 'sqlite'>, string> = {
 export default function ToolsPage() {
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
-  const [transports, setTransports] = useState<TransportConfig[]>([])
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
   const [sqlConnections, setSqlConnections] = useState<SqlConnectionItem[]>([])
   const [isLoading, setIsLoading] = useState(false)
@@ -173,7 +158,6 @@ export default function ToolsPage() {
   useEffect(() => {
     loadTools()
     loadMCPServers()
-    loadTransports()
   }, [])
 
   useEffect(() => {
@@ -230,46 +214,6 @@ export default function ToolsPage() {
       }
     } catch (error) {
       console.error("Failed to load MCP servers:", error)
-    }
-  }
-
-  const loadTransports = async () => {
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/mcp/transports`)
-      if (response.ok) {
-        const data = await response.json()
-        // Transform API data to match expected format
-        const transformedTransports = (data.transports || []).map((transport: any) => ({
-          value: transport.id,
-          label: transport.name,
-          description: transport.description,
-          fields: (transport.config_fields || []).map((field: any) => ({
-            name: field.name,
-            label: field.description,
-            type: field.type === 'string' ? 'text' : field.type === 'array' ? 'textarea' : field.type,
-            required: field.required,
-            placeholder: t('tools.mcp.form.fieldPlaceholderPrefix', { field: field.description })
-          }))
-        }))
-        setTransports(transformedTransports)
-      } else {
-        // Fallback transports if API fails
-        setTransports([
-          { value: "stdio", label: t('tools.mcp.transports.stdio.label'), description: t('tools.mcp.transports.stdio.description'), fields: [] },
-          { value: "sse", label: t('tools.mcp.transports.sse.label'), description: t('tools.mcp.transports.sse.description'), fields: [] },
-          { value: "websocket", label: t('tools.mcp.transports.websocket.label'), description: t('tools.mcp.transports.websocket.description'), fields: [] },
-          { value: "streamable_http", label: t('tools.mcp.transports.streamable_http.label'), description: t('tools.mcp.transports.streamable_http.description'), fields: [] }
-        ])
-      }
-    } catch (error) {
-      console.error("Failed to load transports:", error)
-      // Fallback transports if API fails
-      setTransports([
-        { value: "stdio", label: t('tools.mcp.transports.stdio.label'), description: t('tools.mcp.transports.stdio.description'), fields: [] },
-        { value: "sse", label: t('tools.mcp.transports.sse.label'), description: t('tools.mcp.transports.sse.description'), fields: [] },
-        { value: "websocket", label: t('tools.mcp.transports.websocket.label'), description: t('tools.mcp.transports.websocket.description'), fields: [] },
-        { value: "streamable_http", label: t('tools.mcp.transports.streamable_http.label'), description: t('tools.mcp.transports.streamable_http.description'), fields: [] }
-      ])
     }
   }
 
@@ -979,7 +923,6 @@ export default function ToolsPage() {
                     <CustomMcpForm
                       mcpFormData={mcpFormData}
                       setMcpFormData={setMcpFormData}
-                      transports={transports}
                       serverId={editingServer?.id}
                       onOAuthStatusChange={loadMCPServers}
                     />

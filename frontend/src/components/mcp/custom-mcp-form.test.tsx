@@ -77,7 +77,6 @@ function renderMcpOAuthForm(overrides: Partial<MCPServerFormData> = {}) {
     <CustomMcpForm
       mcpFormData={formData}
       setMcpFormData={vi.fn()}
-      transports={[]}
       serverId={42}
     />
   )
@@ -228,7 +227,6 @@ describe("CustomMcpForm MCP OAuth", () => {
       <CustomMcpForm
         mcpFormData={formData}
         setMcpFormData={vi.fn()}
-        transports={[]}
         serverId={42}
         onOAuthStatusChange={onOAuthStatusChange}
       />
@@ -392,7 +390,6 @@ describe("CustomMcpForm MCP OAuth", () => {
       <CustomMcpForm
         mcpFormData={formData}
         setMcpFormData={vi.fn()}
-        transports={[]}
         serverId={42}
         onOAuthStatusChange={onOAuthStatusChange}
       />
@@ -449,7 +446,6 @@ describe("CustomMcpForm MCP OAuth", () => {
       <CustomMcpForm
         mcpFormData={baseFormData}
         setMcpFormData={setMcpFormData}
-        transports={[]}
         serverId={42}
       />
     )
@@ -468,7 +464,6 @@ describe("CustomMcpForm MCP OAuth", () => {
       <CustomMcpForm
         mcpFormData={loadedFormData}
         setMcpFormData={setMcpFormData}
-        transports={[]}
         serverId={42}
       />
     )
@@ -493,7 +488,6 @@ describe("CustomMcpForm MCP OAuth", () => {
       <CustomMcpForm
         mcpFormData={clearedFormData}
         setMcpFormData={setMcpFormData}
-        transports={[]}
         serverId={42}
       />
     )
@@ -531,7 +525,6 @@ describe("CustomMcpForm MCP OAuth", () => {
         <CustomMcpForm
           mcpFormData={formData}
           setMcpFormData={setFormData}
-          transports={[]}
           serverId={42}
         />
       )

@@ -757,6 +757,50 @@ async def test_callback_canonicalizes_scope_before_persisting_grant(
 
 
 @pytest.mark.asyncio
+async def test_callback_without_expires_in_clears_existing_grant_expiry(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server, client, _ = _add_callback_client_and_state(
+        db,
+        user,
+        state="no-expiry-state",
+    )
+    existing_grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key="resource-owner-a",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=mcp_api.encrypt_value("old-access-token"),
+        expires_at=mcp_api._utc_now() - timedelta(minutes=1),
+    )
+    db.add(existing_grant)
+    db.commit()
+
+    async def fake_exchange(**kwargs):
+        return {
+            "access_token": "plain-access-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=no-expiry-state"),
+        db,
+    )
+
+    assert response.status_code == 307
+    db.refresh(existing_grant)
+    assert decrypt_value(existing_grant.access_token) == "plain-access-token"
+    assert existing_grant.expires_at is None
+
+
+@pytest.mark.asyncio
 async def test_callback_rejects_missing_required_issuer_before_token_exchange(
     db_session, monkeypatch
 ):

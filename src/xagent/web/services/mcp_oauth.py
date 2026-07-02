@@ -541,10 +541,7 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                 for key, value in token_data.items()
                 if key not in {"access_token", "refresh_token"}
             }
-            if token_data.get("expires_in") is not None:
-                locked_grant.expires_at = _utc_now() + timedelta(
-                    seconds=int(token_data["expires_in"])
-                )
+            locked_grant.expires_at = oauth_token_expires_at(token_data)
             refresh_db.flush()
             runtime_auth = MCPOAuthRuntimeAuth(
                 access_token=access_token,
@@ -978,6 +975,19 @@ def _normalize_scope(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return " ".join(sorted({str(item) for item in value if str(item)}))
     return ""
+
+
+def oauth_token_expires_at(token_data: dict[str, Any]) -> datetime | None:
+    """Map OAuth token response expiry into stored grant expiry.
+
+    OAuth access tokens can be opaque/non-expiring from the client's point of
+    view when ``expires_in`` is omitted. Store that as ``None`` so refresh
+    selection does not keep treating a newly refreshed token as expired.
+    """
+    expires_in = token_data.get("expires_in")
+    if expires_in is None:
+        return None
+    return _utc_now() + timedelta(seconds=int(expires_in))
 
 
 def _scope_set(value: Any) -> set[str]:
