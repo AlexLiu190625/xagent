@@ -1257,6 +1257,55 @@ async def test_delete_grant_revokes_external_tokens_when_endpoint_is_advertised(
 
 
 @pytest.mark.asyncio
+async def test_delete_grant_continues_local_revoke_when_token_decryption_fails(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(
+        db,
+        server,
+        token_endpoint_auth_method="none",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token="not-encrypted-token",
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    real_async_client = httpx.AsyncClient
+    real_decrypt_value = mcp_api.decrypt_value
+
+    def fail_target_token_decrypt(value: str) -> str:
+        if value == "not-encrypted-token":
+            raise ValueError("cannot decrypt token")
+        return real_decrypt_value(value)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        pytest.fail("External revocation should be skipped when token decrypt fails")
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_api, "decrypt_value", fail_target_token_decrypt)
+    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+
+    await delete_mcp_oauth_grant(server.id, grant.id, user, db)
+
+    db.refresh(grant)
+    assert grant.status == "revoked"
+    assert grant.revoked_at is not None
+
+
+@pytest.mark.asyncio
 async def test_status_only_reports_grants_matching_current_oauth_config(db_session):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)

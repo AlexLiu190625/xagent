@@ -8,6 +8,7 @@ import re
 import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Iterable, Sequence
 from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
@@ -465,6 +466,66 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
     )
     refresh_db = SessionLocal()
     try:
+        grant: Any = (
+            refresh_db.query(MCPOAuthGrant).filter(MCPOAuthGrant.id == grant_id).first()
+        )
+        if grant is None or not _runtime_grant_matches(
+            grant,
+            server_id=server_id,
+            user_id=user_id,
+            auth_config=auth_config,
+            resource_owner_key=resource_owner_key,
+            resource=resource,
+            issuer=issuer,
+            required_scopes=required_scopes,
+        ):
+            raise _RetryRuntimeGrantSelection(
+                "authorization_required",
+                "MCP OAuth grant changed while preparing runtime authorization",
+            )
+
+        if not _grant_needs_refresh(grant.expires_at):
+            access_token = decrypt_value(str(grant.access_token))
+            return MCPOAuthRuntimeAuth(
+                access_token=access_token,
+                resource_owner_key=str(grant.resource_owner_key),
+                issuer=str(grant.issuer),
+                resource=str(grant.resource),
+                scope=str(grant.scope),
+                grant_id=int(grant.id),
+                refreshed=False,
+            )
+        if not grant.refresh_token:
+            raise _RetryRuntimeGrantSelection(
+                "authorization_required",
+                "MCP OAuth grant is expired and requires reauthorization",
+            )
+        if grant.oauth_client is None:
+            raise MCPOAuthRuntimeError(
+                "token_refresh_failed",
+                "MCP OAuth client metadata not found for grant refresh",
+            )
+
+        encrypted_refresh_token = str(grant.refresh_token)
+        refresh_token = decrypt_value(encrypted_refresh_token)
+        refresh_resource = str(grant.resource)
+        oauth_client_snapshot = SimpleNamespace(
+            token_endpoint=str(grant.oauth_client.token_endpoint),
+            client_id=str(grant.oauth_client.client_id),
+            client_secret=grant.oauth_client.client_secret,
+            token_endpoint_auth_method=str(
+                grant.oauth_client.token_endpoint_auth_method or "none"
+            ),
+        )
+        refresh_db.rollback()
+
+        token_data = await _refresh_mcp_oauth_grant(
+            oauth_client_snapshot,
+            refresh_token=refresh_token,
+            resource=refresh_resource,
+            client=client,
+        )
+
         with refresh_db.begin():
             locked_grant: Any = (
                 refresh_db.query(MCPOAuthGrant)
@@ -498,23 +559,15 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                     grant_id=int(locked_grant.id),
                     refreshed=False,
                 )
-            if not locked_grant.refresh_token:
+            if (
+                not locked_grant.refresh_token
+                or str(locked_grant.refresh_token) != encrypted_refresh_token
+            ):
                 raise _RetryRuntimeGrantSelection(
                     "authorization_required",
-                    "MCP OAuth grant is expired and requires reauthorization",
-                )
-            if locked_grant.oauth_client is None:
-                raise MCPOAuthRuntimeError(
-                    "token_refresh_failed",
-                    "MCP OAuth client metadata not found for grant refresh",
+                    "MCP OAuth grant changed while preparing runtime authorization",
                 )
 
-            token_data = await _refresh_mcp_oauth_grant(
-                locked_grant.oauth_client,
-                refresh_token=decrypt_value(str(locked_grant.refresh_token)),
-                resource=str(locked_grant.resource),
-                client=client,
-            )
             refreshed_scope = (
                 _normalize_scope(token_data.get("scope"))
                 if token_data.get("scope") is not None

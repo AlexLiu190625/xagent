@@ -689,9 +689,18 @@ async def _revoke_mcp_oauth_grant_externally(
     if not isinstance(revocation_endpoint, str) or not revocation_endpoint:
         return
 
-    client_secret = (
-        decrypt_value(str(client.client_secret)) if client.client_secret else ""
-    )
+    try:
+        client_secret = (
+            decrypt_value(str(client.client_secret)) if client.client_secret else ""
+        )
+    except Exception as exc:
+        logger.warning(
+            "Skipping MCP OAuth token revocation for grant %s because client secret "
+            "could not be decrypted: %s",
+            grant.id,
+            exc,
+        )
+        return
     auth_method = str(client.token_endpoint_auth_method or "none")
     auth: httpx.Auth | None = None
     base_data: dict[str, str] = {"client_id": str(client.client_id)}
@@ -716,9 +725,20 @@ async def _revoke_mcp_oauth_grant_externally(
         for encrypted_token, token_type_hint in encrypted_tokens:
             if not encrypted_token:
                 continue
+            try:
+                decrypted_token = decrypt_value(str(encrypted_token))
+            except Exception as exc:
+                logger.warning(
+                    "Skipping MCP OAuth %s revocation for grant %s because token "
+                    "could not be decrypted: %s",
+                    token_type_hint,
+                    grant.id,
+                    exc,
+                )
+                continue
             data = {
                 **base_data,
-                "token": decrypt_value(str(encrypted_token)),
+                "token": decrypted_token,
                 "token_type_hint": token_type_hint,
             }
             request_kwargs: dict[str, Any] = {

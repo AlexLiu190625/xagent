@@ -6,7 +6,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Query, sessionmaker
 
 from xagent.core.utils.encryption import decrypt_value, encrypt_value
 from xagent.web.models.database import Base
@@ -444,6 +444,52 @@ async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "fresh-access-token"
     assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refresh_calls_token_endpoint_before_row_lock(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    events: list[str] = []
+    original_with_for_update = Query.with_for_update
+
+    def recording_with_for_update(self, *args, **kwargs):
+        events.append("lock")
+        return original_with_for_update(self, *args, **kwargs)
+
+    async def fake_refresh_grant(*args, **kwargs):
+        events.append("network")
+        return {
+            "access_token": "fresh-access-token",
+            "refresh_token": "fresh-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(Query, "with_for_update", recording_with_for_update)
+    monkeypatch.setattr(
+        mcp_oauth_service, "_refresh_mcp_oauth_grant", fake_refresh_grant
+    )
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer fresh-access-token"
+    )
+    assert events == ["network", "lock"]
 
 
 @pytest.mark.asyncio
