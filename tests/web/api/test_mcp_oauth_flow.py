@@ -112,6 +112,41 @@ def _add_mcp_oauth_server(db, user: User) -> MCPServer:
     return server
 
 
+def _add_callback_client_and_state(
+    db,
+    user: User,
+    *,
+    state: str,
+    metadata_json: dict | None = None,
+) -> tuple[MCPServer, MCPOAuthClient, MCPOAuthFlowState]:
+    server = _add_mcp_oauth_server(db, user)
+    client = MCPOAuthClient(
+        mcp_server_id=server.id,
+        issuer="https://auth.example.com",
+        authorization_endpoint="https://auth.example.com/authorize",
+        token_endpoint="https://auth.example.com/token",
+        client_id="client-123",
+        token_endpoint_auth_method="none",
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        metadata_json=metadata_json,
+    )
+    flow_state = MCPOAuthFlowState(
+        state=state,
+        mcp_server_id=server.id,
+        user_id=user.id,
+        resource_owner_key="resource-owner-a",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        code_verifier=mcp_api.encrypt_value("verifier-123"),
+        redirect_after="/mcp",
+        expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+    )
+    db.add_all([client, flow_state])
+    db.commit()
+    return server, client, flow_state
+
+
 @pytest.mark.asyncio
 async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch):
     db, user, _ = db_session
@@ -231,6 +266,158 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     assert decrypt_value(grant.access_token) == "plain-access-token"
     assert decrypt_value(grant.refresh_token) == "plain-refresh-token"
     assert db.query(MCPOAuthFlowState).one().consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_callback_accepts_matching_issuer_when_supported(db_session, monkeypatch):
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="issuer-match-state",
+        metadata_json={"authorization_response_iss_parameter_supported": True},
+    )
+
+    async def fake_exchange(**kwargs):
+        return {
+            "access_token": "plain-access-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
+
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=issuer-match-state"
+            "&iss=https%3A%2F%2Fauth.example.com"
+        ),
+        db,
+    )
+
+    assert response.status_code == 307
+    assert db.query(MCPOAuthGrant).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_missing_required_issuer_before_token_exchange(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="issuer-required-state",
+        metadata_json={"authorization_response_iss_parameter_supported": True},
+    )
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("token exchange must not run when callback issuer is required")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?code=auth-code&state=issuer-required-state"
+            ),
+            db,
+        )
+
+    assert exc.value.detail["code"] == "issuer_mismatch"
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_mismatched_issuer_before_token_exchange(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="issuer-mismatch-state",
+        metadata_json={"authorization_response_iss_parameter_supported": False},
+    )
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("token exchange must not run when callback issuer mismatches")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?code=auth-code&state=issuer-mismatch-state"
+                "&iss=https%3A%2F%2Fevil.example.com"
+            ),
+            db,
+        )
+
+    assert exc.value.detail["code"] == "issuer_mismatch"
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_error_response_mismatched_issuer(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="issuer-error-state",
+        metadata_json={"authorization_response_iss_parameter_supported": True},
+    )
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("token exchange must not run for authorization error callbacks")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?error=access_denied&state=issuer-error-state"
+                "&iss=https%3A%2F%2Fevil.example.com"
+            ),
+            db,
+        )
+
+    assert exc.value.detail["code"] == "issuer_mismatch"
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
+async def test_callback_accepts_absent_issuer_when_not_supported(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="issuer-unsupported-state",
+        metadata_json={"authorization_response_iss_parameter_supported": False},
+    )
+
+    async def fake_exchange(**kwargs):
+        return {
+            "access_token": "plain-access-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
+
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=issuer-unsupported-state"
+        ),
+        db,
+    )
+
+    assert response.status_code == 307
+    assert db.query(MCPOAuthGrant).count() == 1
 
 
 @pytest.mark.asyncio

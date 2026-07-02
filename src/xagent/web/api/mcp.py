@@ -440,6 +440,42 @@ def _mcp_oauth_grant_response(grant: MCPOAuthGrant) -> MCPOAuthGrantResponse:
     )
 
 
+def _validate_mcp_oauth_callback_issuer(
+    *,
+    request: Request,
+    client: MCPOAuthClient,
+    flow_state: MCPOAuthFlowState,
+) -> None:
+    metadata: dict[str, Any] = (
+        client.metadata_json if isinstance(client.metadata_json, dict) else {}
+    )
+    issuer_required = (
+        metadata.get("authorization_response_iss_parameter_supported") is True
+    )
+    response_issuer = request.query_params.get("iss")
+    expected_issuer = str(flow_state.issuer)
+
+    if response_issuer is None:
+        if issuer_required:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "issuer_mismatch",
+                    "message": "Authorization response issuer is required",
+                },
+            )
+        return
+
+    if response_issuer != expected_issuer:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "issuer_mismatch",
+                "message": "Authorization response issuer did not match flow state",
+            },
+        )
+
+
 async def _exchange_mcp_oauth_code(
     *,
     client: MCPOAuthClient,
@@ -1837,15 +1873,15 @@ async def mcp_oauth_callback(
     code = request.query_params.get("code")
     state_value = request.query_params.get("state")
     error = request.query_params.get("error")
-    if error:
+    if not state_value:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "token_exchange_failed", "message": error},
+            detail={"code": "invalid_state", "message": "Missing OAuth state"},
         )
-    if not code or not state_value:
+    if not code and not error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "invalid_state", "message": "Missing code or state"},
+            detail={"code": "invalid_state", "message": "Missing authorization code"},
         )
 
     flow_state = (
@@ -1905,6 +1941,21 @@ async def mcp_oauth_callback(
             },
         )
 
+    _validate_mcp_oauth_callback_issuer(
+        request=request,
+        client=client,
+        flow_state=flow_state,
+    )
+    if error:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "token_exchange_failed", "message": error},
+        )
+    if not code:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": "invalid_state", "message": "Missing authorization code"},
+        )
     token_data = await _exchange_mcp_oauth_code(
         client=client,
         code=code,
