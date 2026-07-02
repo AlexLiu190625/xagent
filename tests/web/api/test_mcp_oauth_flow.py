@@ -819,3 +819,39 @@ async def test_status_and_delete_are_scoped_to_current_user(db_session):
 
     status_response = await get_mcp_oauth_status(server.id, user, db)
     assert status_response.grants == []
+
+
+@pytest.mark.asyncio
+async def test_status_only_reports_grants_matching_current_oauth_config(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    stale_client = _add_oauth_client(db, server, client_id="stale-client")
+    current_client = _add_oauth_client(db, server, client_id="client-123")
+    stale_grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=stale_client.id,
+        resource_owner_key="resource-owner-a",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=mcp_api.encrypt_value("stale-access-token"),
+    )
+    current_grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=current_client.id,
+        resource_owner_key="resource-owner-b",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.write records.read",
+        access_token=mcp_api.encrypt_value("current-access-token"),
+    )
+    db.add_all([stale_grant, current_grant])
+    db.commit()
+    db.refresh(stale_grant)
+    db.refresh(current_grant)
+
+    status_response = await get_mcp_oauth_status(server.id, user, db)
+
+    assert [grant.id for grant in status_response.grants] == [current_grant.id]

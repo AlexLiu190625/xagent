@@ -44,6 +44,7 @@ def _add_mcp_oauth_server(db, user: User, *, include_scope: bool = True) -> MCPS
         "type": "mcp_oauth",
         "resource": "https://mcp.example.com/mcp",
         "issuer": "https://auth.example.com",
+        "client_id": "client-123",
     }
     if include_scope:
         auth_config["scope"] = "records.read"

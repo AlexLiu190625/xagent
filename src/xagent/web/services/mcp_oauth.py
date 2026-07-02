@@ -229,10 +229,9 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
 ) -> MCPOAuthRuntimeAuth:
     """Resolve and refresh an MCP OAuth grant for one runtime MCP connection."""
     from ...core.utils.encryption import decrypt_value, encrypt_value
-    from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
+    from ..models.mcp_oauth import MCPOAuthClient
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
-    normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
     selected_scope = scope if scope is not None else auth_config.get("scope")
     normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
     if not normalized_resource:
@@ -241,16 +240,16 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             "MCP OAuth runtime requires a configured resource or runtime resource",
         )
 
-    query = db.query(MCPOAuthGrant).filter(
-        MCPOAuthGrant.mcp_server_id == server_id,
-        MCPOAuthGrant.user_id == user_id,
-        MCPOAuthGrant.resource_owner_key == resource_owner_key,
-        MCPOAuthGrant.resource == normalized_resource,
-        MCPOAuthGrant.status == "active",
+    candidate_grants = select_mcp_oauth_grants(
+        db,
+        server_id=server_id,
+        user_id=user_id,
+        auth_config=auth_config,
+        resource_owner_key=resource_owner_key,
+        resource=resource,
+        issuer=issuer,
+        scope="",
     )
-    if normalized_issuer:
-        query = query.filter(MCPOAuthGrant.issuer == normalized_issuer)
-    candidate_grants = query.order_by(MCPOAuthGrant.updated_at.desc()).all()
     required_scopes = _scope_set(normalized_scope) if normalized_scope else set()
     grant = next(
         (
@@ -324,6 +323,60 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
         grant_id=int(grant.id),
         refreshed=refreshed,
     )
+
+
+def select_mcp_oauth_grants(  # noqa: PLR0913
+    db: Any,
+    *,
+    server_id: int,
+    user_id: int,
+    auth_config: dict[str, Any],
+    resource_owner_key: str | None = None,
+    resource: str | None = None,
+    issuer: str | None = None,
+    scope: str | None = None,
+) -> list[Any]:
+    """Return active MCP OAuth grants matching the current server auth config.
+
+    This selector is intentionally side-effect free: it does not decrypt tokens,
+    refresh grants, or mutate persistence. Runtime code can build on the selected
+    grants when it needs bearer material.
+    """
+    from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
+
+    normalized_resource = _runtime_config_value(resource, auth_config, "resource")
+    normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
+    selected_scope = scope if scope is not None else auth_config.get("scope")
+    normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
+    configured_client_id = _runtime_config_value(None, auth_config, "client_id")
+    if not normalized_resource:
+        return []
+
+    query = (
+        db.query(MCPOAuthGrant)
+        .join(MCPOAuthClient, MCPOAuthGrant.mcp_oauth_client_id == MCPOAuthClient.id)
+        .filter(
+            MCPOAuthGrant.mcp_server_id == server_id,
+            MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.resource == normalized_resource,
+            MCPOAuthGrant.status == "active",
+            MCPOAuthClient.mcp_server_id == server_id,
+        )
+    )
+    if resource_owner_key:
+        query = query.filter(MCPOAuthGrant.resource_owner_key == resource_owner_key)
+    if normalized_issuer:
+        query = query.filter(MCPOAuthGrant.issuer == normalized_issuer)
+    if configured_client_id:
+        query = query.filter(MCPOAuthClient.client_id == configured_client_id)
+
+    grants = query.order_by(MCPOAuthGrant.updated_at.desc()).all()
+    required_scopes = _scope_set(normalized_scope) if normalized_scope else set()
+    if not required_scopes:
+        return list(grants)
+    return [
+        grant for grant in grants if required_scopes.issubset(_scope_set(grant.scope))
+    ]
 
 
 async def _discover_with_client(  # noqa: PLR0913

@@ -32,7 +32,11 @@ from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from ..models.user import User
-from ..services.mcp_oauth import MCPOAuthDiscoveryError, discover_mcp_oauth_metadata
+from ..services.mcp_oauth import (
+    MCPOAuthDiscoveryError,
+    discover_mcp_oauth_metadata,
+    select_mcp_oauth_grants,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2122,15 +2126,11 @@ async def get_mcp_oauth_status(
     )
     config = server.to_config_dict()
     auth_config = config.get("auth") if isinstance(config.get("auth"), dict) else {}
-    grants = (
-        db.query(MCPOAuthGrant)
-        .filter(
-            MCPOAuthGrant.mcp_server_id == server_id,
-            MCPOAuthGrant.user_id == user_id,
-            MCPOAuthGrant.status == "active",
-        )
-        .order_by(MCPOAuthGrant.created_at.desc())
-        .all()
+    grants = select_mcp_oauth_grants(
+        db,
+        server_id=server_id,
+        user_id=user_id,
+        auth_config=auth_config if isinstance(auth_config, dict) else {},
     )
     return MCPOAuthStatusResponse(
         server_id=server_id,
