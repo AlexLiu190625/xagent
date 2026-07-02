@@ -7,6 +7,7 @@ from .database import Base, get_db, get_engine, get_session_local
 from .gmail_watch import GmailWatchState
 from .kb_ingest_target import KBIngestTarget
 from .mcp import MCPServer, UserMCPServer
+from .mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from .model import Model
 from .oauth_provider import OAuthProvider
 from .oidc_consumed_token import OidcConsumedToken
@@ -40,6 +41,9 @@ __all__ = [
     "Model",
     "MCPServer",
     "UserMCPServer",
+    "MCPOAuthClient",
+    "MCPOAuthGrant",
+    "MCPOAuthFlowState",
     "CustomApi",
     "UserCustomApi",
     "Task",
