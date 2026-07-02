@@ -90,6 +90,45 @@ class MCPOAuthRuntimeAuth:
     refreshed: bool = False
 
 
+class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
+    """HTTP transport that resolves and pins OAuth hosts before connecting."""
+
+    def __init__(self) -> None:
+        self._transport = httpx.AsyncHTTPTransport(trust_env=False)
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        original_url = request.url
+        original_host = request.headers.get("Host")
+        resolved_ip = await _resolve_first_allowed_address(str(original_url))
+        request.url = original_url.copy_with(host=resolved_ip)
+        request.headers["Host"] = _host_header_value(str(original_url))
+        if original_url.scheme == "https":
+            request.extensions["sni_hostname"] = _hostname_for_url(str(original_url))
+        try:
+            response = await self._transport.handle_async_request(request)
+        finally:
+            request.url = original_url
+            if original_host is None:
+                request.headers.pop("Host", None)
+            else:
+                request.headers["Host"] = original_host
+        return response
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+def create_mcp_oauth_http_client(
+    *, timeout: float, follow_redirects: bool = False
+) -> httpx.AsyncClient:
+    """Create an OAuth HTTP client that applies the MCP OAuth URL policy."""
+    return httpx.AsyncClient(
+        timeout=timeout,
+        follow_redirects=follow_redirects,
+        transport=SafeOAuthAsyncHTTPTransport(),
+    )
+
+
 def parse_www_authenticate_bearer(
     headers: str | Sequence[str] | None,
 ) -> MCPAuthorizationChallenge | None:
@@ -205,7 +244,7 @@ async def discover_mcp_oauth_metadata(  # noqa: PLR0913
             resolve_dns_for_url_policy=False,
         )
 
-    async with httpx.AsyncClient(
+    async with create_mcp_oauth_http_client(
         timeout=DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT,
         follow_redirects=True,
     ) as owned_client:
@@ -216,7 +255,7 @@ async def discover_mcp_oauth_metadata(  # noqa: PLR0913
             configured_issuer=configured_issuer,
             configured_resource=configured_resource,
             client=owned_client,
-            resolve_dns_for_url_policy=True,
+            resolve_dns_for_url_policy=False,
         )
 
 
@@ -697,7 +736,7 @@ async def _refresh_mcp_oauth_grant(
                 **request_kwargs,
             )
         else:
-            async with httpx.AsyncClient(
+            async with create_mcp_oauth_http_client(
                 timeout=10.0, follow_redirects=True
             ) as owned_client:
                 response = await owned_client.post(
@@ -833,6 +872,22 @@ async def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
     client for synthetic domains; those still get literal IP / localhost checks
     without turning tests into live DNS lookups.
     """
+    await _validate_and_resolve_oauth_http_url(value, resolve_dns=resolve_dns)
+
+
+async def _resolve_first_allowed_address(value: str) -> str:
+    addresses = await _validate_and_resolve_oauth_http_url(value, resolve_dns=True)
+    if not addresses:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "Could not resolve OAuth metadata host",
+        )
+    return addresses[0]
+
+
+async def _validate_and_resolve_oauth_http_url(
+    value: str, *, resolve_dns: bool
+) -> list[str]:
     parts = urlsplit(value)
     if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
         raise MCPOAuthDiscoveryError(
@@ -848,7 +903,7 @@ async def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
     hostname = parts.hostname.rstrip(".").lower()
     _reject_blocked_host(hostname)
     if not resolve_dns:
-        return
+        return []
 
     try:
         loop = asyncio.get_running_loop()
@@ -866,10 +921,35 @@ async def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
             f"Could not resolve OAuth metadata host: {hostname}",
         ) from exc
 
+    resolved: list[str] = []
     for address in addresses:
         sockaddr = address[4]
         if sockaddr:
-            _reject_blocked_host(str(sockaddr[0]))
+            ip_value = str(sockaddr[0])
+            _reject_blocked_host(ip_value)
+            if ip_value not in resolved:
+                resolved.append(ip_value)
+    return resolved
+
+
+def _hostname_for_url(value: str) -> str:
+    hostname = urlsplit(value).hostname
+    if not hostname:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth metadata URL must include a hostname",
+        )
+    return hostname.rstrip(".").lower()
+
+
+def _host_header_value(value: str) -> str:
+    parts = urlsplit(value)
+    hostname = _hostname_for_url(value)
+    port = parts.port
+    default_port = 443 if parts.scheme.lower() == "https" else 80
+    if port and port != default_port:
+        return f"{hostname}:{port}"
+    return hostname
 
 
 def _reject_blocked_host(hostname: str) -> None:

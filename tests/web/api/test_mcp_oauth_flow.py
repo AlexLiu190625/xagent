@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -54,15 +55,33 @@ def db_session(tmp_path):
     engine.dispose()
 
 
-def _request(path: str, headers: list[tuple[bytes, bytes]] | None = None) -> Request:
+def _request(
+    path: str,
+    headers: list[tuple[bytes, bytes]] | None = None,
+    *,
+    bind_oauth_state_cookie: bool = True,
+) -> Request:
     parsed = urlparse(path)
+    request_headers = list(headers or [])
+    query = parse_qs(parsed.query)
+    state = query.get("state", [None])[0]
+    if bind_oauth_state_cookie and parsed.path == "/api/mcp/oauth/callback" and state:
+        request_headers.append(
+            (
+                b"cookie",
+                (
+                    f"{mcp_api.MCP_OAUTH_STATE_COOKIE}="
+                    f"{mcp_api._mcp_oauth_state_cookie_value(state)}"
+                ).encode(),
+            )
+        )
     return Request(
         {
             "type": "http",
             "method": "GET",
             "path": parsed.path,
             "query_string": parsed.query.encode(),
-            "headers": headers or [],
+            "headers": request_headers,
         }
     )
 
@@ -383,8 +402,8 @@ async def test_connect_merges_authorization_endpoint_query_and_preserves_fragmen
         accept="application/json",
     )
 
-    assert isinstance(response, dict)
-    parsed = urlparse(response["authorization_url"])
+    payload = json.loads(response.body)
+    parsed = urlparse(payload["authorization_url"])
     query = parse_qs(parsed.query)
     assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == (
         "https://auth.example.com/authorize"
@@ -442,8 +461,8 @@ async def test_connect_can_return_authorization_url_json(db_session, monkeypatch
         accept="application/json",
     )
 
-    assert isinstance(response, dict)
-    authorization_url = response["authorization_url"]
+    payload = json.loads(response.body)
+    authorization_url = payload["authorization_url"]
     parsed = urlparse(authorization_url)
     query = parse_qs(parsed.query)
     assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == (
@@ -558,11 +577,7 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
-    async def skip_url_policy(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(mcp_api.httpx, "AsyncClient", async_client_factory)
-    monkeypatch.setattr(mcp_api, "validate_oauth_http_url", skip_url_policy)
+    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
 
     response = await mcp_oauth_callback(
         _request("/api/mcp/oauth/callback?code=auth-code&state=state-123"),
@@ -601,13 +616,38 @@ async def test_callback_accepts_matching_issuer_when_supported(db_session, monke
     response = await mcp_oauth_callback(
         _request(
             "/api/mcp/oauth/callback?code=auth-code&state=issuer-match-state"
-            "&iss=https%3A%2F%2Fauth.example.com"
+            "&iss=https%3A%2F%2Fauth.example.com%2F"
         ),
         db,
     )
 
     assert response.status_code == 307
     assert db.query(MCPOAuthGrant).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_state_without_browser_session_cookie(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _add_callback_client_and_state(db, user, state="missing-cookie-state")
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("token exchange must not run without browser-bound state cookie")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?code=auth-code&state=missing-cookie-state",
+                bind_oauth_state_cookie=False,
+            ),
+            db,
+        )
+
+    assert exc.value.detail["code"] == "invalid_state"
+    assert db.query(MCPOAuthGrant).count() == 0
 
 
 @pytest.mark.asyncio
@@ -936,7 +976,7 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
             )
         )
 
-    monkeypatch.setattr(mcp_api.httpx, "AsyncClient", async_client_factory)
+    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
 
     with pytest.raises(mcp_api.HTTPException) as exc:
         await mcp_oauth_callback(
@@ -1007,6 +1047,61 @@ async def test_status_and_delete_are_scoped_to_current_user(db_session):
 
     status_response = await get_mcp_oauth_status(server.id, user, db)
     assert status_response.grants == []
+
+
+@pytest.mark.asyncio
+async def test_delete_grant_revokes_external_tokens_when_endpoint_is_advertised(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(
+        db,
+        server,
+        client_secret=encrypt_value("client-secret"),
+        token_endpoint_auth_method="client_secret_post",
+        metadata_json={"revocation_endpoint": "https://auth.example.com/revoke"},
+    )
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=encrypt_value("access-token"),
+        refresh_token=encrypt_value("refresh-token"),
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+    requests: list[dict[str, list[str]]] = []
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(parse_qs(request.content.decode()))
+        return httpx.Response(200)
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+
+    await delete_mcp_oauth_grant(server.id, grant.id, user, db)
+
+    assert [request["token"] for request in requests] == [
+        ["access-token"],
+        ["refresh-token"],
+    ]
+    assert [request["token_type_hint"] for request in requests] == [
+        ["access_token"],
+        ["refresh_token"],
+    ]
+    assert all(request["client_secret"] == ["client-secret"] for request in requests)
+    db.refresh(grant)
+    assert grant.status == "revoked"
+    assert grant.revoked_at is not None
 
 
 @pytest.mark.asyncio

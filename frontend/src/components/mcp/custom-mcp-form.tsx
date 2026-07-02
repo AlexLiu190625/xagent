@@ -83,7 +83,7 @@ export function CustomMcpForm({
 
   const clearOAuthPolling = useCallback(() => {
     if (pollingIntervalRef.current !== null && typeof window !== "undefined") {
-      window.clearInterval(pollingIntervalRef.current)
+      window.clearTimeout(pollingIntervalRef.current)
       pollingIntervalRef.current = null
     }
   }, [])
@@ -232,18 +232,19 @@ export function CustomMcpForm({
       }
       const startedAt = Date.now()
       const maxWaitMs = 5 * 60 * 1000
-      const intervalId = window.setInterval(async () => {
+      const poll = async () => {
         const expired = Date.now() - startedAt >= maxWaitMs
         const stillOpen = popup && !popup.closed
         if (stillOpen && !expired) {
           await loadOAuthStatus()
+          pollingIntervalRef.current = window.setTimeout(poll, 3000)
           return
         }
         clearOAuthPolling()
         await loadOAuthStatus()
         onOAuthStatusChange?.()
-      }, 3000)
-      pollingIntervalRef.current = intervalId
+      }
+      pollingIntervalRef.current = window.setTimeout(poll, 3000)
     } catch (error) {
       if (popup) popup.close()
       console.error("Failed to start MCP OAuth authorization:", error)

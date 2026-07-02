@@ -4,6 +4,7 @@ import pytest
 from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
     MCPOAuthDiscoveryError,
+    SafeOAuthAsyncHTTPTransport,
     _same_url,
     authorization_server_metadata_urls,
     discover_mcp_oauth_metadata,
@@ -83,6 +84,48 @@ async def test_oauth_url_dns_resolution_runs_in_executor(monkeypatch):
 
     assert len(calls) == 1
     assert calls[0][1] is mcp_oauth_service.socket.getaddrinfo
+
+
+@pytest.mark.asyncio
+async def test_safe_oauth_transport_pins_resolved_ip_and_preserves_host(monkeypatch):
+    captured: list[tuple[str, str, str | None]] = []
+
+    class CaptureTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            captured.append(
+                (
+                    str(request.url),
+                    request.headers["Host"],
+                    request.extensions.get("sni_hostname"),
+                )
+            )
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fake_resolve(value: str) -> str:
+        assert value == "https://auth.example.com/token"
+        return "93.184.216.34"
+
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "_resolve_first_allowed_address",
+        fake_resolve,
+    )
+    transport = SafeOAuthAsyncHTTPTransport()
+    transport._transport = CaptureTransport()
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("https://auth.example.com/token")
+
+    assert response.status_code == 200
+    assert captured[0] == (
+        "https://93.184.216.34/token",
+        "auth.example.com",
+        "auth.example.com",
+    )
+    assert str(response.request.url) == "https://auth.example.com/token"
 
 
 @pytest.mark.asyncio
