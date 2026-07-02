@@ -97,6 +97,7 @@ def upgrade() -> None:
                 "mcp_server_id",
                 "user_id",
                 "resource_owner_key",
+                "mcp_oauth_client_id",
                 "issuer",
                 "resource",
                 "scope",
@@ -113,12 +114,20 @@ def upgrade() -> None:
             constraints.append(
                 sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE")
             )
+        constraints.append(
+            sa.ForeignKeyConstraint(
+                ["mcp_oauth_client_id"],
+                ["mcp_oauth_clients.id"],
+                ondelete="CASCADE",
+            )
+        )
 
         op.create_table(
             "mcp_oauth_grants",
             sa.Column("id", sa.Integer(), nullable=False),
             sa.Column("mcp_server_id", sa.Integer(), nullable=False),
             sa.Column("user_id", sa.Integer(), nullable=False),
+            sa.Column("mcp_oauth_client_id", sa.Integer(), nullable=False),
             sa.Column("resource_owner_key", sa.String(length=512), nullable=False),
             sa.Column("issuer", sa.String(length=1000), nullable=False),
             sa.Column("resource", sa.String(length=1000), nullable=False),
@@ -170,6 +179,13 @@ def upgrade() -> None:
             constraints.append(
                 sa.ForeignKeyConstraint(["user_id"], ["users.id"], ondelete="CASCADE")
             )
+        constraints.append(
+            sa.ForeignKeyConstraint(
+                ["mcp_oauth_client_id"],
+                ["mcp_oauth_clients.id"],
+                ondelete="CASCADE",
+            )
+        )
 
         op.create_table(
             "mcp_oauth_flow_states",
@@ -177,6 +193,7 @@ def upgrade() -> None:
             sa.Column("state", sa.String(length=255), nullable=False),
             sa.Column("mcp_server_id", sa.Integer(), nullable=False),
             sa.Column("user_id", sa.Integer(), nullable=False),
+            sa.Column("mcp_oauth_client_id", sa.Integer(), nullable=False),
             sa.Column("resource_owner_key", sa.String(length=512), nullable=False),
             sa.Column("issuer", sa.String(length=1000), nullable=False),
             sa.Column("resource", sa.String(length=1000), nullable=False),
@@ -201,6 +218,11 @@ def upgrade() -> None:
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_id", ["id"]),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_mcp_server_id", ["mcp_server_id"]),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_user_id", ["user_id"]),
+        (
+            "mcp_oauth_grants",
+            "ix_mcp_oauth_grants_mcp_oauth_client_id",
+            ["mcp_oauth_client_id"],
+        ),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_expires_at", ["expires_at"]),
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_id", ["id"]),
         (
@@ -216,6 +238,11 @@ def upgrade() -> None:
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_user_id", ["user_id"]),
         (
             "mcp_oauth_flow_states",
+            "ix_mcp_oauth_flow_states_mcp_oauth_client_id",
+            ["mcp_oauth_client_id"],
+        ),
+        (
+            "mcp_oauth_flow_states",
             "ix_mcp_oauth_flow_states_expires_at",
             ["expires_at"],
         ),
@@ -229,11 +256,13 @@ def downgrade() -> None:
 
     for table_name, index_name in (
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_expires_at"),
+        ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_mcp_oauth_client_id"),
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_user_id"),
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_mcp_server_id"),
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_state"),
         ("mcp_oauth_flow_states", "ix_mcp_oauth_flow_states_id"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_expires_at"),
+        ("mcp_oauth_grants", "ix_mcp_oauth_grants_mcp_oauth_client_id"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_user_id"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_mcp_server_id"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_id"),

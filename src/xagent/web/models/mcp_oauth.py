@@ -59,6 +59,7 @@ class MCPOAuthGrant(Base):  # type: ignore
             "mcp_server_id",
             "user_id",
             "resource_owner_key",
+            "mcp_oauth_client_id",
             "issuer",
             "resource",
             "scope",
@@ -75,6 +76,12 @@ class MCPOAuthGrant(Base):  # type: ignore
     )
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    mcp_oauth_client_id = Column(
+        Integer,
+        ForeignKey("mcp_oauth_clients.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     resource_owner_key = Column(String(512), nullable=False)
     issuer = Column(String(1000), nullable=False)
@@ -93,6 +100,7 @@ class MCPOAuthGrant(Base):  # type: ignore
     revoked_at = Column(DateTime(timezone=True), nullable=True)
 
     mcp_server = relationship("MCPServer")
+    oauth_client = relationship("MCPOAuthClient")
     user = relationship("User")
 
     def __repr__(self) -> str:
@@ -118,6 +126,12 @@ class MCPOAuthFlowState(Base):  # type: ignore
     user_id = Column(
         Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
+    mcp_oauth_client_id = Column(
+        Integer,
+        ForeignKey("mcp_oauth_clients.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
     resource_owner_key = Column(String(512), nullable=False)
     issuer = Column(String(1000), nullable=False)
     resource = Column(String(1000), nullable=False)
@@ -129,6 +143,7 @@ class MCPOAuthFlowState(Base):  # type: ignore
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     mcp_server = relationship("MCPServer")
+    oauth_client = relationship("MCPOAuthClient")
     user = relationship("User")
 
     def __repr__(self) -> str:

@@ -114,6 +114,31 @@ def _add_mcp_oauth_server(db, user: User) -> MCPServer:
     return server
 
 
+def _add_oauth_client(
+    db,
+    server: MCPServer,
+    *,
+    client_id: str = "client-123",
+    client_secret: str | None = None,
+    token_endpoint_auth_method: str = "none",
+    metadata_json: dict | None = None,
+) -> MCPOAuthClient:
+    client = MCPOAuthClient(
+        mcp_server_id=server.id,
+        issuer="https://auth.example.com",
+        authorization_endpoint="https://auth.example.com/authorize",
+        token_endpoint="https://auth.example.com/token",
+        client_id=client_id,
+        client_secret=client_secret,
+        token_endpoint_auth_method=token_endpoint_auth_method,
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        metadata_json=metadata_json,
+    )
+    db.add(client)
+    db.flush()
+    return client
+
+
 def _add_callback_client_and_state(
     db,
     user: User,
@@ -122,20 +147,12 @@ def _add_callback_client_and_state(
     metadata_json: dict | None = None,
 ) -> tuple[MCPServer, MCPOAuthClient, MCPOAuthFlowState]:
     server = _add_mcp_oauth_server(db, user)
-    client = MCPOAuthClient(
-        mcp_server_id=server.id,
-        issuer="https://auth.example.com",
-        authorization_endpoint="https://auth.example.com/authorize",
-        token_endpoint="https://auth.example.com/token",
-        client_id="client-123",
-        token_endpoint_auth_method="none",
-        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
-        metadata_json=metadata_json,
-    )
+    client = _add_oauth_client(db, server, metadata_json=metadata_json)
     flow_state = MCPOAuthFlowState(
         state=state,
         mcp_server_id=server.id,
         user_id=user.id,
+        mcp_oauth_client_id=client.id,
         resource_owner_key="resource-owner-a",
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
@@ -144,7 +161,7 @@ def _add_callback_client_and_state(
         redirect_after="/mcp",
         expires_at=mcp_api._utc_now() + timedelta(minutes=10),
     )
-    db.add_all([client, flow_state])
+    db.add(flow_state)
     db.commit()
     return server, client, flow_state
 
@@ -210,6 +227,7 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert client.client_id == "client-123"
     assert client.client_secret != "client-secret"
     assert decrypt_value(client.client_secret) == "client-secret"
+    assert flow_state.mcp_oauth_client_id == client.id
 
 
 def test_connect_request_rejects_public_resource_owner_key():
@@ -285,9 +303,11 @@ async def test_oauth_routes_reject_inactive_user_mcp_server(db_session, monkeypa
         await get_mcp_oauth_status(server.id, user, db)
     assert exc.value.status_code == 404
 
+    client = _add_oauth_client(db, server)
     grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=user.id,
+        mcp_oauth_client_id=client.id,
         resource_owner_key=f"xagent:user:{user.id}",
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
@@ -309,20 +329,17 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
 ):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
-    client = MCPOAuthClient(
-        mcp_server_id=server.id,
-        issuer="https://auth.example.com",
-        authorization_endpoint="https://auth.example.com/authorize",
-        token_endpoint="https://auth.example.com/token",
-        client_id="client-123",
+    client = _add_oauth_client(
+        db,
+        server,
         client_secret=mcp_api.encrypt_value("client-secret"),
         token_endpoint_auth_method="client_secret_post",
-        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
     )
     flow_state = MCPOAuthFlowState(
         state="state-123",
         mcp_server_id=server.id,
         user_id=user.id,
+        mcp_oauth_client_id=client.id,
         resource_owner_key="resource-owner-a",
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
@@ -331,7 +348,7 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
         redirect_after="/mcp",
         expires_at=mcp_api._utc_now() + timedelta(minutes=10),
     )
-    db.add_all([client, flow_state])
+    db.add(flow_state)
     db.commit()
 
     real_async_client = httpx.AsyncClient
@@ -403,6 +420,50 @@ async def test_callback_accepts_matching_issuer_when_supported(db_session, monke
 
     assert response.status_code == 307
     assert db.query(MCPOAuthGrant).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_callback_uses_flow_bound_client_when_same_issuer_has_multiple_clients(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_oauth_client(db, server, client_id="stale-client")
+    bound_client = _add_oauth_client(db, server, client_id="bound-client")
+    flow_state = MCPOAuthFlowState(
+        state="client-bound-state",
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=bound_client.id,
+        resource_owner_key="resource-owner-a",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        code_verifier=mcp_api.encrypt_value("verifier-123"),
+        redirect_after="/mcp",
+        expires_at=mcp_api._utc_now() + timedelta(minutes=10),
+    )
+    db.add(flow_state)
+    db.commit()
+
+    async def fake_exchange(**kwargs):
+        assert kwargs["client"].client_id == "bound-client"
+        return {
+            "access_token": "plain-access-token",
+            "token_type": "Bearer",
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=client-bound-state"),
+        db,
+    )
+
+    assert response.status_code == 307
+    grant = db.query(MCPOAuthGrant).one()
+    assert grant.mcp_oauth_client_id == bound_client.id
 
 
 @pytest.mark.asyncio
@@ -530,11 +591,13 @@ async def test_callback_accepts_absent_issuer_when_not_supported(
 async def test_callback_rejects_state_replay(db_session):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
     db.add(
         MCPOAuthFlowState(
             state="used-state",
             mcp_server_id=server.id,
             user_id=user.id,
+            mcp_oauth_client_id=client.id,
             resource_owner_key="resource-owner-a",
             issuer="https://auth.example.com",
             resource="https://mcp.example.com/mcp",
@@ -560,11 +623,13 @@ async def test_callback_rejects_state_replay(db_session):
 async def test_callback_rejects_expired_state(db_session):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
     db.add(
         MCPOAuthFlowState(
             state="expired-state",
             mcp_server_id=server.id,
             user_id=user.id,
+            mcp_oauth_client_id=client.id,
             resource_owner_key="resource-owner-a",
             issuer="https://auth.example.com",
             resource="https://mcp.example.com/mcp",
@@ -589,11 +654,13 @@ async def test_callback_rejects_expired_state(db_session):
 async def test_callback_rejects_state_after_user_loses_mcp_access(db_session):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
     db.add(
         MCPOAuthFlowState(
             state="orphaned-access-state",
             mcp_server_id=server.id,
             user_id=user.id,
+            mcp_oauth_client_id=client.id,
             resource_owner_key="resource-owner-a",
             issuer="https://auth.example.com",
             resource="https://mcp.example.com/mcp",
@@ -654,22 +721,13 @@ async def test_callback_rejects_state_after_user_mcp_server_is_deactivated(
 async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
-    db.add(
-        MCPOAuthClient(
-            mcp_server_id=server.id,
-            issuer="https://auth.example.com",
-            authorization_endpoint="https://auth.example.com/authorize",
-            token_endpoint="https://auth.example.com/token",
-            client_id="client-123",
-            token_endpoint_auth_method="none",
-            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
-        )
-    )
+    client = _add_oauth_client(db, server)
     db.add(
         MCPOAuthFlowState(
             state="bad-token-state",
             mcp_server_id=server.id,
             user_id=user.id,
+            mcp_oauth_client_id=client.id,
             resource_owner_key="resource-owner-a",
             issuer="https://auth.example.com",
             resource="https://mcp.example.com/mcp",
@@ -706,9 +764,11 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
 async def test_status_and_delete_are_scoped_to_current_user(db_session):
     db, user, other_user = db_session
     server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server)
     own_grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=user.id,
+        mcp_oauth_client_id=client.id,
         resource_owner_key="resource-owner-a",
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
@@ -718,6 +778,7 @@ async def test_status_and_delete_are_scoped_to_current_user(db_session):
     other_grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=other_user.id,
+        mcp_oauth_client_id=client.id,
         resource_owner_key="resource-owner-b",
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",

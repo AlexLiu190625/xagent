@@ -282,11 +282,7 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             )
         oauth_client = (
             db.query(MCPOAuthClient)
-            .filter(
-                MCPOAuthClient.mcp_server_id == server_id,
-                MCPOAuthClient.issuer == grant.issuer,
-            )
-            .order_by(MCPOAuthClient.updated_at.desc())
+            .filter(MCPOAuthClient.id == grant.mcp_oauth_client_id)
             .first()
         )
         if oauth_client is None:

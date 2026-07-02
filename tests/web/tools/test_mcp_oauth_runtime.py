@@ -87,9 +87,32 @@ def _add_grant(
     scope: str = "records.read",
     status: str = "active",
 ) -> MCPOAuthGrant:
+    oauth_client = (
+        db.query(MCPOAuthClient)
+        .filter(
+            MCPOAuthClient.mcp_server_id == server.id,
+            MCPOAuthClient.issuer == "https://auth.example.com",
+            MCPOAuthClient.client_id == "client-123",
+        )
+        .first()
+    )
+    if oauth_client is None:
+        oauth_client = MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="client-123",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        )
+        db.add(oauth_client)
+        db.flush()
+
     grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=user.id,
+        mcp_oauth_client_id=oauth_client.id,
         resource_owner_key=resource_owner_key,
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
@@ -307,15 +330,16 @@ async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch
         refresh_token="refresh-token-123",
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
     )
+    grant.oauth_client.client_secret = encrypt_value("client-secret")
+    grant.oauth_client.token_endpoint_auth_method = "client_secret_post"
     db.add(
         MCPOAuthClient(
             mcp_server_id=server.id,
             issuer="https://auth.example.com",
             authorization_endpoint="https://auth.example.com/authorize",
-            token_endpoint="https://auth.example.com/token",
-            client_id="client-123",
-            client_secret=encrypt_value("client-secret"),
-            token_endpoint_auth_method="client_secret_post",
+            token_endpoint="https://auth.example.com/stale-token",
+            client_id="stale-client",
+            token_endpoint_auth_method="none",
             redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
         )
     )
@@ -372,17 +396,6 @@ async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fal
         access_token="expired-access-token",
         refresh_token="refresh-token-123",
         expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
-    )
-    db.add(
-        MCPOAuthClient(
-            mcp_server_id=server.id,
-            issuer="https://auth.example.com",
-            authorization_endpoint="https://auth.example.com/authorize",
-            token_endpoint="https://auth.example.com/token",
-            client_id="client-123",
-            token_endpoint_auth_method="none",
-            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
-        )
     )
     db.commit()
 

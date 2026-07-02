@@ -424,6 +424,7 @@ def _upsert_mcp_oauth_client(
     client.metadata_json = discovery.authorization_server.raw
     if existing is None:
         db.add(client)
+    db.flush()
     return client
 
 
@@ -560,6 +561,7 @@ def _upsert_mcp_oauth_grant(
             MCPOAuthGrant.mcp_server_id == flow_state.mcp_server_id,
             MCPOAuthGrant.user_id == flow_state.user_id,
             MCPOAuthGrant.resource_owner_key == flow_state.resource_owner_key,
+            MCPOAuthGrant.mcp_oauth_client_id == flow_state.mcp_oauth_client_id,
             MCPOAuthGrant.issuer == flow_state.issuer,
             MCPOAuthGrant.resource == flow_state.resource,
             MCPOAuthGrant.scope == scope,
@@ -569,6 +571,7 @@ def _upsert_mcp_oauth_grant(
     grant = existing or MCPOAuthGrant(
         mcp_server_id=flow_state.mcp_server_id,
         user_id=flow_state.user_id,
+        mcp_oauth_client_id=flow_state.mcp_oauth_client_id,
         resource_owner_key=flow_state.resource_owner_key,
         issuer=flow_state.issuer,
         resource=flow_state.resource,
@@ -1930,10 +1933,7 @@ async def mcp_oauth_callback(
 
     client = (
         db.query(MCPOAuthClient)
-        .filter(
-            MCPOAuthClient.mcp_server_id == flow_state.mcp_server_id,
-            MCPOAuthClient.issuer == flow_state.issuer,
-        )
+        .filter(MCPOAuthClient.id == flow_state.mcp_oauth_client_id)
         .first()
     )
     if not client:
@@ -2031,7 +2031,7 @@ async def connect_mcp_oauth(
     )
     resource_owner_key = _default_resource_owner_key(user_id)
 
-    _upsert_mcp_oauth_client(
+    oauth_client = _upsert_mcp_oauth_client(
         db,
         server_id=server_id,
         discovery=discovery,
@@ -2047,6 +2047,7 @@ async def connect_mcp_oauth(
         state=state_value,
         mcp_server_id=server_id,
         user_id=user_id,
+        mcp_oauth_client_id=oauth_client.id,
         resource_owner_key=resource_owner_key,
         issuer=discovery.authorization_server.issuer,
         resource=discovery.resource,

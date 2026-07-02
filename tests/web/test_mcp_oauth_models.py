@@ -55,6 +55,7 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     grant = MCPOAuthGrant(
         mcp_server_id=server.id,
         user_id=user.id,
+        oauth_client=client,
         resource_owner_key="external:customer:resource-owner-a",
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
@@ -68,6 +69,7 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
         state="state-123",
         mcp_server_id=server.id,
         user_id=user.id,
+        oauth_client=client,
         resource_owner_key="external:customer:resource-owner-a",
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
@@ -87,6 +89,7 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     stored_grant = db_session.query(MCPOAuthGrant).one()
     assert stored_grant.mcp_server_id == server.id
     assert stored_grant.user_id == user.id
+    assert stored_grant.mcp_oauth_client_id == client.id
     assert stored_grant.resource_owner_key == "external:customer:resource-owner-a"
     assert stored_grant.metadata_json == {"resource": "https://mcp.example.com/mcp"}
     assert stored_grant.mcp_server.id == server.id
@@ -94,9 +97,20 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
 
 def test_mcp_oauth_grant_lookup_uniqueness_includes_resource_owner_key(db_session):
     user, server = _create_user_and_server(db_session)
+    client = MCPOAuthClient(
+        mcp_server_id=server.id,
+        issuer="https://auth.example.com",
+        authorization_endpoint="https://auth.example.com/authorize",
+        token_endpoint="https://auth.example.com/token",
+        client_id="xagent-client",
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+    )
+    db_session.add(client)
+    db_session.flush()
     base_grant = {
         "mcp_server_id": server.id,
         "user_id": user.id,
+        "mcp_oauth_client_id": client.id,
         "issuer": "https://auth.example.com",
         "resource": "https://mcp.example.com/mcp",
         "scope": "records.read",

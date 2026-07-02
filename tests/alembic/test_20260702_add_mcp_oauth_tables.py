@@ -94,6 +94,7 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
         assert {
             "mcp_server_id",
             "user_id",
+            "mcp_oauth_client_id",
             "resource_owner_key",
             "issuer",
             "resource",
@@ -106,6 +107,7 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
             "state",
             "mcp_server_id",
             "user_id",
+            "mcp_oauth_client_id",
             "resource_owner_key",
             "code_verifier",
             "expires_at",
@@ -116,6 +118,7 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
         }
         assert "ix_mcp_oauth_grants_user_id" in grant_indexes
         assert "ix_mcp_oauth_grants_mcp_server_id" in grant_indexes
+        assert "ix_mcp_oauth_grants_mcp_oauth_client_id" in grant_indexes
         assert "ix_mcp_oauth_grants_expires_at" in grant_indexes
 
         grant_unique_constraints = {
@@ -131,6 +134,7 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
         }
         assert ("mcp_server_id",) in constrained_columns
         assert ("user_id",) in constrained_columns
+        assert ("mcp_oauth_client_id",) in constrained_columns
 
 
 def test_downgrade_removes_mcp_oauth_tables(tmp_path):
