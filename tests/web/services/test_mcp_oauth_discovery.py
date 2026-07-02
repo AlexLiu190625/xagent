@@ -319,6 +319,22 @@ async def test_oauth_url_rejects_ipv6_zone_identifiers(url):
     assert exc.value.code == "invalid_resource"
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[::ffff:127.0.0.1]/metadata",
+        "http://[::ffff:169.254.169.254]/metadata",
+        "http://[::ffff:10.0.0.1]/metadata",
+    ],
+)
+@pytest.mark.asyncio
+async def test_oauth_url_rejects_ipv4_mapped_ipv6_private_targets(url):
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        await validate_oauth_http_url(url, resolve_dns=False)
+
+    assert exc.value.code == "invalid_resource"
+
+
 @pytest.mark.asyncio
 async def test_discover_rejects_loopback_endpoint_before_request():
     requested_urls: list[str] = []

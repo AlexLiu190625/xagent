@@ -254,7 +254,11 @@ export function CustomMcpForm({
       clearOAuthPolling()
       if (typeof window !== "undefined") {
         popup = window.open("about:blank", "_blank")
-        if (popup) popup.opener = null
+        if (!popup) {
+          toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+          return
+        }
+        popup.opener = null
       }
       const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/connect`, {
         method: "POST",

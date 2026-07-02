@@ -203,7 +203,10 @@ class DatabaseMCPServerManager:
 
     @staticmethod
     def _requires_runtime_mcp_oauth(server: Any) -> bool:
-        auth_config = server._decrypt_auth_config(getattr(server, "auth", None))
+        decrypt_auth = getattr(server, "_decrypt_auth_config", None)
+        if not callable(decrypt_auth):
+            return False
+        auth_config = decrypt_auth(getattr(server, "auth", None))
         return (
             getattr(server, "transport", None)
             in {"sse", "websocket", "streamable_http"}

@@ -162,6 +162,30 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(popup.location.href).toBe("https://auth.example.com/authorize")
   })
 
+  it("does not start OAuth connect when the authorization popup is blocked", async () => {
+    vi.spyOn(window, "open").mockReturnValue(null)
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/mcp/42/oauth/status") {
+        return Promise.resolve(okJson({ server_id: 42, grants: [] }))
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    renderMcpOAuthForm()
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/42/oauth/status"
+      )
+    })
+    apiRequestMock.mockClear()
+
+    fireEvent.click(screen.getByText("tools.mcp.dialog.oauthConnect"))
+
+    expect(toastErrorMock).toHaveBeenCalledWith("tools.mcp.dialog.oauthConnectFailed")
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
   it("polls OAuth status until the authorization popup is closed", async () => {
     const onOAuthStatusChange = vi.fn()
     const popup = {

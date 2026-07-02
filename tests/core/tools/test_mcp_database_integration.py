@@ -2,6 +2,7 @@
 Test MCP database integration for web and agent entry points.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -203,6 +204,14 @@ class TestDatabaseMCPServerManager:
         connections = manager.get_connections()
 
         assert "test_mcp_oauth_server" not in connections
+
+    def test_runtime_oauth_detection_fails_closed_without_auth_decrypter(self):
+        server = SimpleNamespace(
+            transport="streamable_http",
+            auth={"type": "mcp_oauth"},
+        )
+
+        assert DatabaseMCPServerManager._requires_runtime_mcp_oauth(server) is False
 
     def test_get_server(self, test_db, sample_stdio_config):
         """Test getting specific server."""

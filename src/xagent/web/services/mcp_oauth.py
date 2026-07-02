@@ -974,9 +974,9 @@ def _runtime_config_value(
 
 def _normalize_scope(value: Any) -> str:
     if isinstance(value, str):
-        return " ".join(item for item in value.split() if item)
+        return " ".join(sorted({item for item in value.split() if item}))
     if isinstance(value, (list, tuple, set)):
-        return " ".join(str(item) for item in value if str(item))
+        return " ".join(sorted({str(item) for item in value if str(item)}))
     return ""
 
 
@@ -1298,6 +1298,8 @@ def _reject_blocked_host(hostname: str) -> None:
         ip_address = ipaddress.ip_address(hostname)
     except ValueError:
         return
+    if isinstance(ip_address, ipaddress.IPv6Address) and ip_address.ipv4_mapped:
+        ip_address = ip_address.ipv4_mapped
     if (
         ip_address.is_private
         or ip_address.is_loopback

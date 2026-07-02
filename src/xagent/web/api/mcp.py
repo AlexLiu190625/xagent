@@ -372,8 +372,8 @@ def _split_scope(scope: str | None) -> list[str]:
 
 def _scope_string(scopes: list[str] | tuple[str, ...] | str | None) -> str:
     if isinstance(scopes, str):
-        return " ".join(_split_scope(scopes))
-    return " ".join(scope for scope in scopes or [] if scope)
+        return " ".join(sorted(set(_split_scope(scopes))))
+    return " ".join(sorted({scope for scope in scopes or [] if scope}))
 
 
 def _pkce_code_challenge(code_verifier: str) -> str:

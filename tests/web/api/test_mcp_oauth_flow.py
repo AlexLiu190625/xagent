@@ -103,7 +103,7 @@ def _discovery() -> SimpleNamespace:
     )
 
 
-def _add_mcp_oauth_server(db, user: User) -> MCPServer:
+def _add_mcp_oauth_server(db, user: User, *, scope: str = "records.read") -> MCPServer:
     server = MCPServer.from_config(
         {
             "name": "records",
@@ -114,7 +114,7 @@ def _add_mcp_oauth_server(db, user: User) -> MCPServer:
                 "type": "mcp_oauth",
                 "resource": "https://mcp.example.com/mcp",
                 "issuer": "https://auth.example.com",
-                "scope": "records.read",
+                "scope": scope,
                 "client_id": "client-123",
                 "client_secret": "client-secret",
                 "redirect_uri": "https://xagent.example.com/api/mcp/oauth/callback",
@@ -355,6 +355,34 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert client.client_secret != "client-secret"
     assert decrypt_value(client.client_secret) == "client-secret"
     assert flow_state.mcp_oauth_client_id == client.id
+
+
+@pytest.mark.asyncio
+async def test_connect_canonicalizes_scope_before_persisting_flow_state(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        scope="records.write records.read records.write",
+    )
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["scope"] == ["records.read records.write"]
+    assert db.query(MCPOAuthFlowState).one().scope == "records.read records.write"
 
 
 @pytest.mark.asyncio
@@ -692,6 +720,40 @@ async def test_callback_uses_flow_bound_client_when_same_issuer_has_multiple_cli
     assert response.status_code == 307
     grant = db.query(MCPOAuthGrant).one()
     assert grant.mcp_oauth_client_id == bound_client.id
+
+
+@pytest.mark.asyncio
+async def test_callback_canonicalizes_scope_before_persisting_grant(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server, client, flow_state = _add_callback_client_and_state(
+        db,
+        user,
+        state="scope-canonical-state",
+    )
+    flow_state.scope = "records.write records.read records.write"
+    db.commit()
+
+    async def fake_exchange(**kwargs):
+        return {
+            "access_token": "plain-access-token",
+            "token_type": "Bearer",
+            "scope": "records.write records.read records.write",
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
+
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=scope-canonical-state"),
+        db,
+    )
+
+    assert response.status_code == 307
+    grant = db.query(MCPOAuthGrant).one()
+    assert grant.mcp_server_id == server.id
+    assert grant.mcp_oauth_client_id == client.id
+    assert grant.scope == "records.read records.write"
 
 
 @pytest.mark.asyncio
