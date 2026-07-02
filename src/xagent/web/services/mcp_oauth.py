@@ -2,17 +2,32 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
+import logging
 import re
 import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urljoin, urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
 
-DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT = 10.0
+logger = logging.getLogger(__name__)
+
+MCP_OAUTH_HTTP_TIMEOUT_SECONDS = 10.0
+DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT = MCP_OAUTH_HTTP_TIMEOUT_SECONDS
+MCP_OAUTH_MAX_REDIRECTS = 5
+OAUTH_ERROR_MESSAGE_MAX_LENGTH = 500
+OAUTH_LOG_PAYLOAD_MAX_LENGTH = 2000
+OAUTH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
+OAUTH_CROSS_ORIGIN_STRIPPED_HEADERS = frozenset(
+    {"authorization", "cookie", "proxy-authorization"}
+)
+OAUTH_SENSITIVE_PAYLOAD_KEYS = frozenset(
+    {"access_token", "refresh_token", "id_token", "client_secret"}
+)
 
 
 class MCPOAuthDiscoveryError(RuntimeError):
@@ -94,7 +109,11 @@ class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
     """HTTP transport that resolves and pins OAuth hosts before connecting."""
 
     def __init__(self) -> None:
-        self._transport = httpx.AsyncHTTPTransport(trust_env=False)
+        self._transport = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(max_keepalive_connections=0),
+            trust_env=False,
+            http2=False,
+        )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         original_url = request.url
@@ -127,6 +146,87 @@ def create_mcp_oauth_http_client(
         follow_redirects=follow_redirects,
         transport=SafeOAuthAsyncHTTPTransport(),
     )
+
+
+async def oauth_get(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+    headers: dict[str, str] | None = None,
+    allow_redirects: bool = True,
+    resolve_dns_for_url_policy: bool = False,
+) -> httpx.Response:
+    """GET an OAuth URL through the shared URL policy and redirect rules."""
+    current_url = url
+    current_headers = dict(headers or {})
+    for redirect_count in range(MCP_OAUTH_MAX_REDIRECTS + 1):
+        await validate_oauth_http_url(
+            current_url, resolve_dns=resolve_dns_for_url_policy
+        )
+        try:
+            response = await client.get(
+                current_url, headers=current_headers, follow_redirects=False
+            )
+        except httpx.RemoteProtocolError as exc:
+            raise MCPOAuthDiscoveryError(
+                "metadata_not_found",
+                "OAuth metadata redirect Location was invalid",
+            ) from exc
+        if not allow_redirects or response.status_code not in OAUTH_REDIRECT_STATUSES:
+            return response
+        if redirect_count >= MCP_OAUTH_MAX_REDIRECTS:
+            raise MCPOAuthDiscoveryError(
+                "metadata_not_found",
+                "OAuth metadata redirects exceeded the maximum allowed hops",
+            )
+        location = response.headers.get("location")
+        if not location:
+            raise MCPOAuthDiscoveryError(
+                "metadata_not_found",
+                "OAuth metadata redirect did not include a Location header",
+            )
+        try:
+            next_url = urljoin(str(response.url), location)
+            await validate_oauth_http_url(
+                next_url, resolve_dns=resolve_dns_for_url_policy
+            )
+        except ValueError as exc:
+            raise MCPOAuthDiscoveryError(
+                "metadata_not_found",
+                "OAuth metadata redirect Location was invalid",
+            ) from exc
+        if not _same_origin(current_url, next_url):
+            current_headers = _headers_without_cross_origin_secrets(current_headers)
+        current_url = next_url
+
+    raise MCPOAuthDiscoveryError(
+        "metadata_not_found",
+        "OAuth metadata redirects exceeded the maximum allowed hops",
+    )
+
+
+async def oauth_post(
+    url: str,
+    *,
+    client: httpx.AsyncClient,
+    resolve_dns_for_url_policy: bool = False,
+    **request_kwargs: Any,
+) -> httpx.Response:
+    """POST to an OAuth token-like endpoint without following redirects."""
+    await validate_oauth_http_url(url, resolve_dns=resolve_dns_for_url_policy)
+    try:
+        response = await client.post(url, follow_redirects=False, **request_kwargs)
+    except httpx.RemoteProtocolError as exc:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth token endpoint redirects are not supported",
+        ) from exc
+    if 300 <= response.status_code < 400:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth token endpoint redirects are not supported",
+        )
+    return response
 
 
 def parse_www_authenticate_bearer(
@@ -246,7 +346,6 @@ async def discover_mcp_oauth_metadata(  # noqa: PLR0913
 
     async with create_mcp_oauth_http_client(
         timeout=DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT,
-        follow_redirects=True,
     ) as owned_client:
         return await _discover_with_client(
             endpoint_url,
@@ -273,7 +372,7 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
 ) -> MCPOAuthRuntimeAuth:
     """Resolve and refresh an MCP OAuth grant for one runtime MCP connection."""
     from ...core.utils.encryption import decrypt_value, encrypt_value
-    from ..models.mcp_oauth import MCPOAuthClient
+    from ..models.mcp_oauth import MCPOAuthGrant
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
     selected_scope = scope if scope is not None else auth_config.get("scope")
@@ -284,88 +383,138 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             "MCP OAuth runtime requires a configured resource or runtime resource",
         )
 
-    candidate_grants = select_mcp_oauth_grants(
-        db,
-        server_id=server_id,
-        user_id=user_id,
-        auth_config=auth_config,
-        resource_owner_key=resource_owner_key,
-        resource=resource,
-        issuer=issuer,
-        scope="",
-    )
     required_scopes = _scope_set(normalized_scope) if normalized_scope else set()
-    grant = next(
-        (
-            candidate
-            for candidate in candidate_grants
-            if not required_scopes
-            or required_scopes.issubset(_scope_set(candidate.scope))
-        ),
-        None,
-    )
-    if grant is None:
-        if candidate_grants and required_scopes:
-            raise MCPOAuthRuntimeError(
-                "insufficient_scope",
-                "No active MCP OAuth grant includes the required scope",
-            )
-        raise MCPOAuthRuntimeError(
-            "authorization_required",
-            "No active MCP OAuth grant exists for the selected resource owner",
-        )
 
-    access_token = decrypt_value(str(grant.access_token))
-    refreshed = False
-    if _grant_needs_refresh(grant.expires_at):
-        if not grant.refresh_token:
-            raise MCPOAuthRuntimeError(
-                "token_refresh_failed",
-                "MCP OAuth grant is expired and has no refresh token",
+    for attempt in range(2):
+        candidate_grants = select_mcp_oauth_grants(
+            db,
+            server_id=server_id,
+            user_id=user_id,
+            auth_config=auth_config,
+            resource_owner_key=resource_owner_key,
+            resource=resource,
+            issuer=issuer,
+            scope="",
+        )
+        grant = _select_runtime_grant(candidate_grants, required_scopes)
+        access_token = decrypt_value(str(grant.access_token))
+        if not _grant_needs_refresh(grant.expires_at):
+            return MCPOAuthRuntimeAuth(
+                access_token=access_token,
+                resource_owner_key=str(grant.resource_owner_key),
+                issuer=str(grant.issuer),
+                resource=str(grant.resource),
+                scope=str(grant.scope),
+                grant_id=int(grant.id),
+                refreshed=False,
             )
-        oauth_client = (
-            db.query(MCPOAuthClient)
-            .filter(MCPOAuthClient.id == grant.mcp_oauth_client_id)
+
+        locked_grant = (
+            db.query(MCPOAuthGrant)
+            .filter(MCPOAuthGrant.id == grant.id)
+            .with_for_update()
             .first()
         )
-        if oauth_client is None:
+        if locked_grant is None or not _runtime_grant_matches(
+            locked_grant,
+            server_id=server_id,
+            user_id=user_id,
+            auth_config=auth_config,
+            resource_owner_key=resource_owner_key,
+            resource=resource,
+            issuer=issuer,
+            required_scopes=required_scopes,
+        ):
+            db.rollback()
+            if attempt == 0:
+                continue
+            raise MCPOAuthRuntimeError(
+                "authorization_required",
+                "MCP OAuth grant changed while preparing runtime authorization",
+            )
+
+        if not _grant_needs_refresh(locked_grant.expires_at):
+            access_token = decrypt_value(str(locked_grant.access_token))
+            db.rollback()
+            return MCPOAuthRuntimeAuth(
+                access_token=access_token,
+                resource_owner_key=str(locked_grant.resource_owner_key),
+                issuer=str(locked_grant.issuer),
+                resource=str(locked_grant.resource),
+                scope=str(locked_grant.scope),
+                grant_id=int(locked_grant.id),
+                refreshed=False,
+            )
+        if not locked_grant.refresh_token:
+            db.rollback()
+            if attempt == 0:
+                continue
+            raise MCPOAuthRuntimeError(
+                "authorization_required",
+                "MCP OAuth grant is expired and requires reauthorization",
+            )
+        if locked_grant.oauth_client is None:
+            db.rollback()
             raise MCPOAuthRuntimeError(
                 "token_refresh_failed",
                 "MCP OAuth client metadata not found for grant refresh",
             )
-        token_data = await _refresh_mcp_oauth_grant(
-            oauth_client,
-            refresh_token=decrypt_value(str(grant.refresh_token)),
-            resource=str(grant.resource),
-            client=client,
-        )
-        grant.access_token = encrypt_value(str(token_data["access_token"]))
-        access_token = str(token_data["access_token"])
-        if token_data.get("refresh_token"):
-            grant.refresh_token = encrypt_value(str(token_data["refresh_token"]))
-        grant.token_type = str(token_data.get("token_type") or "Bearer")
-        if token_data.get("scope") is not None:
-            grant.scope = _normalize_scope(token_data.get("scope"))
-        grant.metadata_json = {
-            key: value
-            for key, value in token_data.items()
-            if key not in {"access_token", "refresh_token"}
-        }
-        if token_data.get("expires_in") is not None:
-            grant.expires_at = _utc_now() + timedelta(
-                seconds=int(token_data["expires_in"])
-            )
-        db.commit()
-        refreshed = True
 
-    return MCPOAuthRuntimeAuth(
-        access_token=access_token,
-        resource_owner_key=str(grant.resource_owner_key),
-        issuer=str(grant.issuer),
-        resource=str(grant.resource),
-        scope=str(grant.scope),
-        grant_id=int(grant.id),
-        refreshed=refreshed,
+        try:
+            token_data = await _refresh_mcp_oauth_grant(
+                locked_grant.oauth_client,
+                refresh_token=decrypt_value(str(locked_grant.refresh_token)),
+                resource=str(locked_grant.resource),
+                client=client,
+            )
+            refreshed_scope = (
+                _normalize_scope(token_data.get("scope"))
+                if token_data.get("scope") is not None
+                else str(locked_grant.scope)
+            )
+            if required_scopes and not required_scopes.issubset(
+                _scope_set(refreshed_scope)
+            ):
+                raise MCPOAuthRuntimeError(
+                    "insufficient_scope",
+                    "Refreshed MCP OAuth grant does not include the required scope",
+                )
+            locked_grant.access_token = encrypt_value(str(token_data["access_token"]))
+            access_token = str(token_data["access_token"])
+            if token_data.get("refresh_token"):
+                locked_grant.refresh_token = encrypt_value(
+                    str(token_data["refresh_token"])
+                )
+            locked_grant.token_type = str(token_data.get("token_type") or "Bearer")
+            if token_data.get("scope") is not None:
+                locked_grant.scope = refreshed_scope
+            locked_grant.metadata_json = {
+                key: value
+                for key, value in token_data.items()
+                if key not in {"access_token", "refresh_token"}
+            }
+            if token_data.get("expires_in") is not None:
+                locked_grant.expires_at = _utc_now() + timedelta(
+                    seconds=int(token_data["expires_in"])
+                )
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+
+        return MCPOAuthRuntimeAuth(
+            access_token=access_token,
+            resource_owner_key=str(locked_grant.resource_owner_key),
+            issuer=str(locked_grant.issuer),
+            resource=str(locked_grant.resource),
+            scope=str(locked_grant.scope),
+            grant_id=int(locked_grant.id),
+            refreshed=True,
+        )
+
+    raise MCPOAuthRuntimeError(
+        "authorization_required",
+        "MCP OAuth grant changed while preparing runtime authorization",
     )
 
 
@@ -491,10 +640,12 @@ async def _probe_authorization_challenge(
     resolve_dns_for_url_policy: bool,
 ) -> MCPAuthorizationChallenge | None:
     try:
-        await validate_oauth_http_url(
-            endpoint_url, resolve_dns=resolve_dns_for_url_policy
+        response = await oauth_get(
+            endpoint_url,
+            headers=headers,
+            client=client,
+            resolve_dns_for_url_policy=resolve_dns_for_url_policy,
         )
-        response = await client.get(endpoint_url, headers=headers)
     except httpx.HTTPError as exc:
         raise MCPOAuthDiscoveryError(
             "metadata_not_found",
@@ -513,10 +664,11 @@ async def _fetch_first_protected_resource_metadata(
     last_error: Exception | None = None
     for metadata_url in metadata_urls:
         try:
-            await validate_oauth_http_url(
-                metadata_url, resolve_dns=resolve_dns_for_url_policy
+            response = await oauth_get(
+                metadata_url,
+                client=client,
+                resolve_dns_for_url_policy=resolve_dns_for_url_policy,
             )
-            response = await client.get(metadata_url)
             if response.status_code >= 400:
                 last_error = MCPOAuthDiscoveryError(
                     "metadata_not_found",
@@ -546,10 +698,11 @@ async def _fetch_authorization_server_metadata(
     last_error: Exception | None = None
     for metadata_url in authorization_server_metadata_urls(authorization_server_url):
         try:
-            await validate_oauth_http_url(
-                metadata_url, resolve_dns=resolve_dns_for_url_policy
+            response = await oauth_get(
+                metadata_url,
+                client=client,
+                resolve_dns_for_url_policy=resolve_dns_for_url_policy,
             )
-            response = await client.get(metadata_url)
             if response.status_code >= 400:
                 last_error = MCPOAuthDiscoveryError(
                     "authorization_server_not_found",
@@ -721,9 +874,6 @@ async def _refresh_mcp_oauth_grant(
         )
 
     try:
-        await validate_oauth_http_url(
-            str(oauth_client.token_endpoint), resolve_dns=client is None
-        )
         request_kwargs: dict[str, Any] = {
             "data": data,
             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
@@ -731,16 +881,20 @@ async def _refresh_mcp_oauth_grant(
         if auth is not None:
             request_kwargs["auth"] = auth
         if client is not None:
-            response = await client.post(
+            response = await oauth_post(
                 str(oauth_client.token_endpoint),
+                client=client,
+                resolve_dns_for_url_policy=False,
                 **request_kwargs,
             )
         else:
             async with create_mcp_oauth_http_client(
-                timeout=10.0, follow_redirects=True
+                timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
             ) as owned_client:
-                response = await owned_client.post(
+                response = await oauth_post(
                     str(oauth_client.token_endpoint),
+                    client=owned_client,
+                    resolve_dns_for_url_policy=False,
                     **request_kwargs,
                 )
         payload = response.json()
@@ -753,9 +907,13 @@ async def _refresh_mcp_oauth_grant(
         or payload.get("error")
         or not payload.get("access_token")
     ):
+        logger.warning(
+            "MCP OAuth refresh failed with token endpoint payload: %s",
+            oauth_error_log_payload(payload),
+        )
         raise MCPOAuthRuntimeError(
             "token_refresh_failed",
-            f"MCP OAuth refresh failed: {payload}",
+            oauth_error_message(payload, "MCP OAuth refresh failed"),
         )
     return payload
 
@@ -777,6 +935,69 @@ def _normalize_scope(value: Any) -> str:
 
 def _scope_set(value: Any) -> set[str]:
     return set(_normalize_scope(value).split())
+
+
+def _select_runtime_grant(grants: Sequence[Any], required_scopes: set[str]) -> Any:
+    scope_matches = [
+        grant
+        for grant in grants
+        if not required_scopes or required_scopes.issubset(_scope_set(grant.scope))
+    ]
+    if not scope_matches:
+        if grants and required_scopes:
+            raise MCPOAuthRuntimeError(
+                "insufficient_scope",
+                "No active MCP OAuth grant includes the required scope",
+            )
+        raise MCPOAuthRuntimeError(
+            "authorization_required",
+            "No active MCP OAuth grant exists for the selected resource owner",
+        )
+
+    for grant in scope_matches:
+        if not _grant_needs_refresh(grant.expires_at):
+            return grant
+    for grant in scope_matches:
+        if grant.refresh_token:
+            return grant
+    raise MCPOAuthRuntimeError(
+        "authorization_required",
+        "MCP OAuth grant is expired and requires reauthorization",
+    )
+
+
+def _runtime_grant_matches(  # noqa: PLR0913
+    grant: Any,
+    *,
+    server_id: int,
+    user_id: int,
+    auth_config: dict[str, Any],
+    resource_owner_key: str,
+    resource: str | None,
+    issuer: str | None,
+    required_scopes: set[str],
+) -> bool:
+    normalized_resource = _runtime_config_value(resource, auth_config, "resource")
+    normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
+    configured_client_id = _runtime_config_value(None, auth_config, "client_id")
+    oauth_client = getattr(grant, "oauth_client", None)
+    return bool(
+        grant.mcp_server_id == server_id
+        and grant.user_id == user_id
+        and grant.resource_owner_key == resource_owner_key
+        and grant.resource == normalized_resource
+        and grant.status == "active"
+        and (not normalized_issuer or grant.issuer == normalized_issuer)
+        and (
+            not configured_client_id
+            or (
+                oauth_client is not None
+                and oauth_client.mcp_server_id == server_id
+                and oauth_client.client_id == configured_client_id
+            )
+        )
+        and (not required_scopes or required_scopes.issubset(_scope_set(grant.scope)))
+    )
 
 
 def _grant_needs_refresh(expires_at: Any) -> bool:
@@ -839,6 +1060,18 @@ def _dedupe_urls(urls: Sequence[str]) -> tuple[str, ...]:
 
 def _same_url(left: str, right: str) -> bool:
     return _url_comparison_key(left) == _url_comparison_key(right)
+
+
+def _same_origin(left: str, right: str) -> bool:
+    left_parts = urlsplit(left)
+    right_parts = urlsplit(right)
+    return (
+        left_parts.scheme.lower(),
+        _host_header_value(left),
+    ) == (
+        right_parts.scheme.lower(),
+        _host_header_value(right),
+    )
 
 
 def _url_comparison_key(value: str) -> str:
@@ -947,9 +1180,64 @@ def _host_header_value(value: str) -> str:
     hostname = _hostname_for_url(value)
     port = parts.port
     default_port = 443 if parts.scheme.lower() == "https" else 80
+    header_host = (
+        f"[{hostname}]"
+        if ":" in hostname and not hostname.startswith("[")
+        else hostname
+    )
     if port and port != default_port:
-        return f"{hostname}:{port}"
-    return hostname
+        return f"{header_host}:{port}"
+    return header_host
+
+
+def _headers_without_cross_origin_secrets(headers: dict[str, str]) -> dict[str, str]:
+    return {
+        key: value
+        for key, value in headers.items()
+        if key.lower() not in OAUTH_CROSS_ORIGIN_STRIPPED_HEADERS
+    }
+
+
+def oauth_error_message(payload: Any, fallback: str) -> str:
+    """Return a bounded user-safe OAuth error message."""
+    message: Any = None
+    if isinstance(payload, dict):
+        message = payload.get("error_description") or payload.get("error")
+    elif isinstance(payload, str):
+        message = payload
+    text = str(message or fallback)
+    return _truncate(text, OAUTH_ERROR_MESSAGE_MAX_LENGTH)
+
+
+def oauth_error_log_payload(payload: Any) -> str:
+    """Return a masked, bounded OAuth payload representation for logs."""
+    masked = _mask_oauth_payload(payload)
+    try:
+        text = json.dumps(masked, sort_keys=True, default=str)
+    except (TypeError, ValueError):
+        text = repr(masked)
+    return _truncate(text, OAUTH_LOG_PAYLOAD_MAX_LENGTH)
+
+
+def _mask_oauth_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: (
+                "********"
+                if str(key).lower() in OAUTH_SENSITIVE_PAYLOAD_KEYS
+                else _mask_oauth_payload(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_mask_oauth_payload(item) for item in value]
+    return value
+
+
+def _truncate(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return f"{value[: max_length - 3]}..."
 
 
 def _reject_blocked_host(hostname: str) -> None:
@@ -958,6 +1246,7 @@ def _reject_blocked_host(hostname: str) -> None:
             "invalid_resource",
             "OAuth metadata host must not resolve to local addresses",
         )
+    hostname = _strip_ipv6_zone_id(hostname)
     try:
         ip_address = ipaddress.ip_address(hostname)
     except ValueError:
@@ -974,3 +1263,9 @@ def _reject_blocked_host(hostname: str) -> None:
             "invalid_resource",
             "OAuth metadata host must not resolve to local addresses",
         )
+
+
+def _strip_ipv6_zone_id(hostname: str) -> str:
+    if "%" not in hostname:
+        return hostname
+    return hostname.split("%", 1)[0]

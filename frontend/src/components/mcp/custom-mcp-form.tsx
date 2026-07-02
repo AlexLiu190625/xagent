@@ -73,6 +73,7 @@ export function CustomMcpForm({
   const [oauthStatus, setOauthStatus] = useState<McpOAuthStatus | null>(null)
   const [oauthStatusLoading, setOauthStatusLoading] = useState(false)
   const [oauthAction, setOauthAction] = useState<string | null>(null)
+  const isMountedRef = useRef(false)
   const pollingIntervalRef = useRef<number | null>(null)
 
   // Default to sse if not set
@@ -88,7 +89,13 @@ export function CustomMcpForm({
     }
   }, [])
 
-  useEffect(() => clearOAuthPolling, [clearOAuthPolling])
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+      clearOAuthPolling()
+    }
+  }, [clearOAuthPolling])
 
   const updateConfig = (key: string, value: unknown) => {
     setMcpFormData((prev: MCPServerFormData) => ({
@@ -139,22 +146,27 @@ export function CustomMcpForm({
 
   const loadOAuthStatus = useCallback(async () => {
     if (!serverId || !isMcpOAuth) {
-      setOauthStatus(null)
+      if (isMountedRef.current) setOauthStatus(null)
       return
     }
-    setOauthStatusLoading(true)
+    if (isMountedRef.current) setOauthStatusLoading(true)
     try {
       const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/status`)
+      if (!isMountedRef.current) return
       if (response.ok) {
-        setOauthStatus(await response.json())
+        const status = await response.json()
+        if (!isMountedRef.current) return
+        setOauthStatus(status)
       } else {
-        toast.error(await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthStatusFailed')))
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthStatusFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
       }
     } catch (error) {
       console.error("Failed to load MCP OAuth status:", error)
-      toast.error(t('tools.mcp.dialog.oauthStatusFailed'))
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthStatusFailed'))
     } finally {
-      setOauthStatusLoading(false)
+      if (isMountedRef.current) setOauthStatusLoading(false)
     }
   }, [serverId, isMcpOAuth, t])
 
@@ -174,11 +186,15 @@ export function CustomMcpForm({
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(buildOAuthRequestBody())
       })
+      if (!isMountedRef.current) return
       if (!response.ok) {
-        toast.error(await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthDiscoveryFailed')))
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthDiscoveryFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
         return
       }
       const discovery = await response.json() as McpOAuthDiscoveryResponse
+      if (!isMountedRef.current) return
       updateAuthFields({
         resource: discovery.resource,
         issuer: discovery.issuer,
@@ -187,9 +203,9 @@ export function CustomMcpForm({
       toast.success(t('tools.mcp.dialog.oauthDiscoverySuccess'))
     } catch (error) {
       console.error("Failed to discover MCP OAuth metadata:", error)
-      toast.error(t('tools.mcp.dialog.oauthDiscoveryFailed'))
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDiscoveryFailed'))
     } finally {
-      setOauthAction(null)
+      if (isMountedRef.current) setOauthAction(null)
     }
   }
 
@@ -214,12 +230,22 @@ export function CustomMcpForm({
         },
         body: JSON.stringify(buildOAuthRequestBody(true))
       })
+      if (!isMountedRef.current) {
+        if (popup) popup.close()
+        return
+      }
       if (!response.ok) {
         if (popup) popup.close()
-        toast.error(await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthConnectFailed')))
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthConnectFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
         return
       }
       const data = await response.json() as McpOAuthConnectResponse
+      if (!isMountedRef.current) {
+        if (popup) popup.close()
+        return
+      }
       if (!data.authorization_url) {
         if (popup) popup.close()
         toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
@@ -233,24 +259,27 @@ export function CustomMcpForm({
       const startedAt = Date.now()
       const maxWaitMs = 5 * 60 * 1000
       const poll = async () => {
+        if (!isMountedRef.current) return
         const expired = Date.now() - startedAt >= maxWaitMs
         const stillOpen = popup && !popup.closed
         if (stillOpen && !expired) {
           await loadOAuthStatus()
+          if (!isMountedRef.current) return
           pollingIntervalRef.current = window.setTimeout(poll, 3000)
           return
         }
         clearOAuthPolling()
         await loadOAuthStatus()
+        if (!isMountedRef.current) return
         onOAuthStatusChange?.()
       }
       pollingIntervalRef.current = window.setTimeout(poll, 3000)
     } catch (error) {
       if (popup) popup.close()
       console.error("Failed to start MCP OAuth authorization:", error)
-      toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
     } finally {
-      setOauthAction(null)
+      if (isMountedRef.current) setOauthAction(null)
     }
   }
 
@@ -261,18 +290,22 @@ export function CustomMcpForm({
       const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/grants/${grantId}`, {
         method: "DELETE"
       })
+      if (!isMountedRef.current) return
       if (!response.ok) {
-        toast.error(await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthDisconnectFailed')))
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthDisconnectFailed'))
+        if (!isMountedRef.current) return
+        toast.error(message)
         return
       }
       toast.success(t('tools.mcp.dialog.oauthDisconnectSuccess'))
       await loadOAuthStatus()
+      if (!isMountedRef.current) return
       onOAuthStatusChange?.()
     } catch (error) {
       console.error("Failed to delete MCP OAuth grant:", error)
-      toast.error(t('tools.mcp.dialog.oauthDisconnectFailed'))
+      if (isMountedRef.current) toast.error(t('tools.mcp.dialog.oauthDisconnectFailed'))
     } finally {
-      setOauthAction(null)
+      if (isMountedRef.current) setOauthAction(null)
     }
   }
 

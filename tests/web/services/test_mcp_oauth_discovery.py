@@ -1,13 +1,18 @@
+from pathlib import Path
+
 import httpx
 import pytest
 
 from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
+    MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCPOAuthDiscoveryError,
     SafeOAuthAsyncHTTPTransport,
     _same_url,
     authorization_server_metadata_urls,
     discover_mcp_oauth_metadata,
+    oauth_get,
+    oauth_post,
     parse_www_authenticate_bearer,
     protected_resource_metadata_urls,
     validate_oauth_http_url,
@@ -126,6 +131,161 @@ async def test_safe_oauth_transport_pins_resolved_ip_and_preserves_host(monkeypa
         "auth.example.com",
     )
     assert str(response.request.url) == "https://auth.example.com/token"
+
+
+def test_safe_oauth_transport_disables_proxy_http2_and_keepalive(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class CaptureTransport(httpx.AsyncBaseTransport):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, request=request)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncHTTPTransport", CaptureTransport)
+
+    SafeOAuthAsyncHTTPTransport()
+
+    assert captured["trust_env"] is False
+    assert captured["http2"] is False
+    assert captured["limits"].max_keepalive_connections == 0
+
+
+@pytest.mark.asyncio
+async def test_oauth_get_revalidates_redirects_and_blocks_private_target():
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            302,
+            headers={"Location": "http://169.254.169.254/latest/meta-data"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_get(
+                "https://auth.example.com/.well-known/oauth-authorization-server",
+                client=client,
+            )
+
+    assert exc.value.code == "invalid_resource"
+    assert requested_urls == [
+        "https://auth.example.com/.well-known/oauth-authorization-server"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_oauth_get_strips_sensitive_headers_on_cross_origin_redirect():
+    captured_headers: list[dict[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured_headers.append(dict(request.headers))
+        if str(request.url) == "https://auth.example.com/start":
+            return httpx.Response(
+                302,
+                headers={"Location": "https://login.example.com/metadata"},
+            )
+        return httpx.Response(200, json={"ok": True})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await oauth_get(
+            "https://auth.example.com/start",
+            client=client,
+            headers={
+                "Authorization": "Bearer secret",
+                "Cookie": "session=secret",
+                "X-Trace": "trace-id",
+            },
+        )
+
+    assert response.status_code == 200
+    assert captured_headers[0]["authorization"] == "Bearer secret"
+    assert captured_headers[0]["cookie"] == "session=secret"
+    assert "authorization" not in captured_headers[1]
+    assert "cookie" not in captured_headers[1]
+    assert captured_headers[1]["x-trace"] == "trace-id"
+
+
+@pytest.mark.asyncio
+async def test_oauth_get_rejects_missing_redirect_location():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_get("https://auth.example.com/start", client=client)
+
+    assert exc.value.code == "metadata_not_found"
+
+
+@pytest.mark.asyncio
+async def test_oauth_get_rejects_malformed_redirect_location():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(302, headers={"Location": "http://[::1"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_get("https://auth.example.com/start", client=client)
+
+    assert exc.value.code == "metadata_not_found"
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_rejects_redirect_without_following():
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(302, headers={"Location": "https://auth.example.com/new"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_post("https://auth.example.com/token", client=client, data={})
+
+    assert exc.value.code == "invalid_resource"
+    assert requested_urls == ["https://auth.example.com/token"]
+
+
+def test_owned_oauth_paths_use_shared_helpers_without_redirect_following():
+    service_source = Path(mcp_oauth_service.__file__).read_text()
+    api_source = (
+        Path(mcp_oauth_service.__file__)
+        .parents[1]
+        .joinpath("api", "mcp.py")
+        .read_text()
+    )
+
+    assert "follow_redirects=True" not in service_source
+    assert "follow_redirects=True" not in api_source
+    assert "timeout=10.0" not in service_source
+    assert "timeout=10.0" not in api_source
+    assert "response = await client.get(endpoint_url" not in service_source
+    assert "response = await client.get(metadata_url" not in service_source
+    assert (
+        "response = await client.post(\n                str(oauth_client.token_endpoint)"
+        not in service_source
+    )
+    assert MCP_OAUTH_HTTP_TIMEOUT_SECONDS == 10.0
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://[fe80::1%en0]/metadata",
+        "http://[fe80::1%25en0]/metadata",
+    ],
+)
+@pytest.mark.asyncio
+async def test_oauth_url_rejects_ipv6_zone_identifiers(url):
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        await validate_oauth_http_url(url, resolve_dns=False)
+
+    assert exc.value.code == "invalid_resource"
 
 
 @pytest.mark.asyncio

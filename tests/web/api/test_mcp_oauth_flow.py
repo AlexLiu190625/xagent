@@ -972,7 +972,15 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
     def async_client_factory(*args, **kwargs):
         return real_async_client(
             transport=httpx.MockTransport(
-                lambda request: httpx.Response(400, json={"error": "invalid_grant"})
+                lambda request: httpx.Response(
+                    400,
+                    json={
+                        "error": "invalid_grant",
+                        "error_description": "authorization code is invalid",
+                        "access_token": "leaked-access-token",
+                        "refresh_token": "leaked-refresh-token",
+                    },
+                )
             )
         )
 
@@ -985,6 +993,9 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
         )
 
     assert exc.value.detail["code"] == "token_exchange_failed"
+    assert exc.value.detail["message"] == "authorization code is invalid"
+    assert "leaked-access-token" not in str(exc.value.detail)
+    assert "leaked-refresh-token" not in str(exc.value.detail)
     assert db.query(MCPOAuthGrant).count() == 0
     flow_state = db.query(MCPOAuthFlowState).filter_by(state="bad-token-state").one()
     assert flow_state.consumed_at is not None

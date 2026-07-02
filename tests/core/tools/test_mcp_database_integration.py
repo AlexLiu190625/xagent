@@ -332,6 +332,23 @@ class TestDatabaseMCPServerManager:
 class TestToolFactoryMCPIntegration:
     """Test ToolFactory MCP integration."""
 
+    @staticmethod
+    def _mcp_oauth_config(name: str = "test_mcp_oauth_server"):
+        return {
+            "name": name,
+            "transport": "streamable_http",
+            "managed": "external",
+            "description": "MCP OAuth server",
+            "url": "https://mcp.example.com/mcp",
+            "headers": {"Authorization": "Bearer static-token"},
+            "auth": {
+                "type": "mcp_oauth",
+                "resource": "https://mcp.example.com/mcp",
+                "issuer": "https://auth.example.com",
+                "client_id": "client-123",
+            },
+        }
+
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_success(
         self, mock_load_mcp, test_db, sample_stdio_config
@@ -357,6 +374,35 @@ class TestToolFactoryMCPIntegration:
         call_args = mock_load_mcp.call_args
         connections_arg = call_args[0][0]  # First positional argument
         assert sample_stdio_config["name"] in connections_arg
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_skips_mcp_oauth_but_loads_other_servers(
+        self, mock_load_mcp, test_db, sample_stdio_config
+    ):
+        mock_tools = [MagicMock()]
+        mock_load_mcp.return_value = mock_tools
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        manager.add_server(manager.create_config(**self._mcp_oauth_config()))
+
+        tools = await ToolFactory.create_mcp_tools(test_db)
+
+        assert tools == mock_tools
+        connections_arg = mock_load_mcp.call_args[0][0]
+        assert sample_stdio_config["name"] in connections_arg
+        assert "test_mcp_oauth_server" not in connections_arg
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_all_mcp_oauth_returns_empty_without_loading(
+        self, mock_load_mcp, test_db
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**self._mcp_oauth_config()))
+
+        tools = await ToolFactory.create_mcp_tools(test_db)
+
+        assert tools == []
+        mock_load_mcp.assert_not_called()
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_no_connections(self, mock_load_mcp, test_db):

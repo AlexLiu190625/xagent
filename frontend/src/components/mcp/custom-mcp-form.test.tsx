@@ -42,6 +42,14 @@ function okJson(data: unknown): Response {
   } as unknown as Response
 }
 
+function deferredResponse() {
+  let resolve!: (response: Response) => void
+  const promise = new Promise<Response>((res) => {
+    resolve = res
+  })
+  return { promise, resolve }
+}
+
 async function flushPromises() {
   await Promise.resolve()
   await Promise.resolve()
@@ -219,8 +227,11 @@ describe("CustomMcpForm MCP OAuth", () => {
       String(url).endsWith("/oauth/status")
     ).length
 
+    act(() => {
+      vi.advanceTimersByTime(3000)
+    })
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(3000)
+      await flushPromises()
     })
     expect(
       apiRequestMock.mock.calls.filter(([url]) => String(url).endsWith("/oauth/status"))
@@ -229,8 +240,11 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(onOAuthStatusChange).not.toHaveBeenCalled()
 
     popup.closed = true
+    act(() => {
+      vi.advanceTimersByTime(3000)
+    })
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(3000)
+      await flushPromises()
     })
     expect(onOAuthStatusChange).toHaveBeenCalledTimes(1)
   })
@@ -283,6 +297,109 @@ describe("CustomMcpForm MCP OAuth", () => {
       apiRequestMock.mock.calls.filter(([url]) => String(url).endsWith("/oauth/status"))
         .length
     ).toBe(statusCallsBeforeUnmount)
+  })
+
+  it("ignores pending OAuth status responses after unmount", async () => {
+    const pendingStatus = deferredResponse()
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/mcp/42/oauth/status") {
+        return pendingStatus.promise
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    const { unmount } = renderMcpOAuthForm()
+    unmount()
+
+    await act(async () => {
+      pendingStatus.resolve(okJson({ server_id: 42, grants: [] }))
+      await flushPromises()
+    })
+
+    expect(toastErrorMock).not.toHaveBeenCalled()
+    expect(toastSuccessMock).not.toHaveBeenCalled()
+  })
+
+  it("does not reschedule polling when unmounted while a poll is awaiting status", async () => {
+    const onOAuthStatusChange = vi.fn()
+    const popup = {
+      closed: false,
+      opener: window,
+      close: vi.fn(),
+      location: { href: "" },
+    }
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const pendingPolledStatus = deferredResponse()
+    let statusCalls = 0
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/mcp/42/oauth/status") {
+        statusCalls += 1
+        if (statusCalls === 1) {
+          return Promise.resolve(okJson({ server_id: 42, grants: [] }))
+        }
+        return pendingPolledStatus.promise
+      }
+      if (url === "http://api.local/api/mcp/42/oauth/connect") {
+        return Promise.resolve(
+          okJson({ authorization_url: "https://auth.example.com/authorize" })
+        )
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    const formData: MCPServerFormData = {
+      name: "records",
+      transport: "streamable_http",
+      description: "",
+      config: {
+        url: "https://mcp.example.com/mcp",
+        auth: {
+          type: "mcp_oauth",
+          resource: "https://mcp.example.com/mcp",
+          issuer: "https://auth.example.com",
+          scope: "records.read",
+          client_id: "client-123",
+        },
+      },
+    }
+
+    const { unmount } = render(
+      <CustomMcpForm
+        mcpFormData={formData}
+        setMcpFormData={vi.fn()}
+        transports={[]}
+        serverId={42}
+        onOAuthStatusChange={onOAuthStatusChange}
+      />
+    )
+
+    await waitFor(() => {
+      expect(statusCalls).toBe(1)
+    })
+
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByText("tools.mcp.dialog.oauthConnect"))
+    await act(async () => {
+      await flushPromises()
+    })
+    act(() => {
+      vi.advanceTimersByTime(3000)
+    })
+    await act(async () => {
+      await flushPromises()
+    })
+    expect(statusCalls).toBe(2)
+
+    unmount()
+    await act(async () => {
+      pendingPolledStatus.resolve(okJson({ server_id: 42, grants: [] }))
+      await flushPromises()
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+
+    expect(statusCalls).toBe(2)
+    expect(onOAuthStatusChange).not.toHaveBeenCalled()
   })
 
   it("restores asynchronously loaded masked OAuth client secrets on blur", async () => {

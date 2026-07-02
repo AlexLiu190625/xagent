@@ -34,10 +34,14 @@ from ..models.mcp import MCPServer, UserMCPServer
 from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from ..models.user import User
 from ..services.mcp_oauth import (
+    MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCPOAuthDiscoveryError,
     _same_url,
     create_mcp_oauth_http_client,
     discover_mcp_oauth_metadata,
+    oauth_error_log_payload,
+    oauth_error_message,
+    oauth_post,
     select_mcp_oauth_grants,
 )
 
@@ -628,9 +632,13 @@ async def _exchange_mcp_oauth_code(
         if auth is not None:
             post_kwargs["auth"] = auth
         async with create_mcp_oauth_http_client(
-            timeout=10.0, follow_redirects=True
+            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
         ) as http_client:
-            response = await http_client.post(str(client.token_endpoint), **post_kwargs)
+            response = await oauth_post(
+                str(client.token_endpoint),
+                client=http_client,
+                **post_kwargs,
+            )
         payload = response.json()
     except (MCPOAuthDiscoveryError, httpx.HTTPError, ValueError) as exc:
         raise HTTPException(
@@ -643,9 +651,18 @@ async def _exchange_mcp_oauth_code(
         or not isinstance(payload, dict)
         or payload.get("error")
     ):
+        logger.warning(
+            "MCP OAuth token exchange failed with token endpoint payload: %s",
+            oauth_error_log_payload(payload),
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "token_exchange_failed", "message": payload},
+            detail={
+                "code": "token_exchange_failed",
+                "message": oauth_error_message(
+                    payload, "MCP OAuth token exchange failed"
+                ),
+            },
         )
     if not payload.get("access_token"):
         raise HTTPException(
@@ -692,7 +709,7 @@ async def _revoke_mcp_oauth_grant_externally(
         (grant.refresh_token, "refresh_token"),
     )
     async with create_mcp_oauth_http_client(
-        timeout=10.0, follow_redirects=True
+        timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     ) as http_client:
         for encrypted_token, token_type_hint in encrypted_tokens:
             if not encrypted_token:
@@ -709,8 +726,9 @@ async def _revoke_mcp_oauth_grant_externally(
             if auth is not None:
                 request_kwargs["auth"] = auth
             try:
-                response = await http_client.post(
+                response = await oauth_post(
                     revocation_endpoint,
+                    client=http_client,
                     **request_kwargs,
                 )
                 if response.status_code >= 400:

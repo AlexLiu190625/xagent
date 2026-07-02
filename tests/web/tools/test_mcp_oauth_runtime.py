@@ -297,6 +297,61 @@ async def test_mcp_oauth_runtime_ignores_revoked_grant_without_static_fallback(
 
 
 @pytest.mark.asyncio
+async def test_mcp_oauth_runtime_prefers_valid_grant_over_expired_without_refresh(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="valid-access-token",
+        expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+    )
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        scope="records.read records.extra",
+    )
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer valid-access-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_expired_grant_without_refresh_requires_reauth(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "authorization_required"
+    assert "reauthorization" in diagnostics[0]["message"]
+
+
+@pytest.mark.asyncio
 async def test_mcp_oauth_runtime_does_not_use_other_users_grant(db_session):
     db, user, other_user = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -412,6 +467,8 @@ async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fal
             json={
                 "error": "invalid_grant",
                 "error_description": "refresh token is invalid",
+                "access_token": "leaked-access-token",
+                "refresh_token": "leaked-refresh-token",
             },
         )
 
@@ -429,5 +486,62 @@ async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fal
     assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "token_refresh_failed"
+    assert diagnostics[0]["message"] == "refresh token is invalid"
+    assert "leaked-access-token" not in str(diagnostics[0])
+    assert "leaked-refresh-token" not in str(diagnostics[0])
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "expired-access-token"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refresh_rejects_narrowed_scope_without_commit(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        scope="records.read records.write",
+    )
+
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "narrowed-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": "records.read",
+            },
+        )
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    async def skip_url_policy(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+
+    configs, cfg = await _load_configs(
+        db,
+        user,
+        mcp_auth_context={str(server.id): {"scope": "records.write"}},
+    )
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "insufficient_scope"
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "expired-access-token"
+    assert grant.scope == "records.read records.write"
