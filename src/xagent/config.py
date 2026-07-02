@@ -102,6 +102,7 @@ OIDC_LOGIN_TTL_SECONDS = "XAGENT_OIDC_LOGIN_TTL_SECONDS"
 OIDC_EXCHANGE_TTL_SECONDS = "XAGENT_OIDC_EXCHANGE_TTL_SECONDS"
 SESSION_SECRET = "XAGENT_SESSION_SECRET"
 OPENROUTER_OFFICIAL_PROVIDERS_ONLY = "XAGENT_OPENROUTER_OFFICIAL_PROVIDERS_ONLY"
+MCP_OAUTH_ALLOW_PRIVATE_HOSTS = "XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS"
 
 TOOL_MAX_OUTPUT_LENGTH = "XAGENT_TOOL_MAX_OUTPUT_LENGTH"
 TOOL_MAX_RECURSION_DEPTH = "XAGENT_TOOL_MAX_RECURSION_DEPTH"
@@ -305,6 +306,15 @@ def get_smtp_from_name(default: str) -> str:
 def get_openrouter_official_providers_only() -> bool:
     """Return whether OpenRouter requests should pin official provider endpoints."""
     return _get_bool_env(OPENROUTER_OFFICIAL_PROVIDERS_ONLY, False)
+
+
+def get_mcp_oauth_allow_private_hosts() -> bool:
+    """Return whether MCP OAuth URL policy may target local/private hosts.
+
+    This is intended only for local development with local authorization
+    servers. Production deployments should leave it disabled.
+    """
+    return _get_bool_env(MCP_OAUTH_ALLOW_PRIVATE_HOSTS, False)
 
 
 def _redis_url_with_database(url: str, database: int) -> str:

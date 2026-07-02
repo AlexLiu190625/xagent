@@ -16,6 +16,8 @@ from urllib.request import parse_http_list, parse_keqv_list
 import httpx
 from sqlalchemy.orm import sessionmaker
 
+from ...config import get_mcp_oauth_allow_private_hosts
+
 logger = logging.getLogger(__name__)
 
 MCP_OAUTH_HTTP_TIMEOUT_SECONDS = 10.0
@@ -1405,6 +1407,8 @@ def _truncate(value: str, max_length: int) -> str:
 
 
 def _reject_blocked_host(hostname: str) -> None:
+    if get_mcp_oauth_allow_private_hosts():
+        return
     if hostname in {"localhost", "ip6-localhost"}:
         raise MCPOAuthDiscoveryError(
             "invalid_resource",

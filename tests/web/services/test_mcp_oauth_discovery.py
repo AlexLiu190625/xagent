@@ -105,6 +105,72 @@ async def test_oauth_url_policy_rejects_invalid_port_without_500():
 
 
 @pytest.mark.asyncio
+async def test_oauth_url_policy_rejects_localhost_by_default(monkeypatch):
+    monkeypatch.delenv("XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS", raising=False)
+
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        await validate_oauth_http_url("http://localhost:8080/token", resolve_dns=False)
+
+    assert exc.value.code == "invalid_resource"
+
+
+@pytest.mark.asyncio
+async def test_oauth_url_policy_allows_localhost_when_explicitly_configured(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS", "true")
+
+    await validate_oauth_http_url("http://localhost:8080/token", resolve_dns=False)
+
+
+@pytest.mark.asyncio
+async def test_oauth_url_policy_allows_private_resolved_ip_when_explicitly_configured(
+    monkeypatch,
+):
+    calls: list[tuple[object, object, tuple[object, ...]]] = []
+
+    class FakeLoop:
+        async def run_in_executor(self, executor, func, *args):
+            calls.append((executor, func, args))
+            return [
+                (
+                    0,
+                    0,
+                    0,
+                    "",
+                    ("127.0.0.1", 8080),
+                )
+            ]
+
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS", "true")
+    monkeypatch.setattr(
+        mcp_oauth_service.asyncio,
+        "get_running_loop",
+        lambda: FakeLoop(),
+    )
+
+    await validate_oauth_http_url("http://auth.example.com/token", resolve_dns=True)
+
+    assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_oauth_url_policy_still_rejects_userinfo_when_private_hosts_allowed(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_ALLOW_PRIVATE_HOSTS", "true")
+
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        await validate_oauth_http_url(
+            "http://user:password@localhost:8080/token",
+            resolve_dns=False,
+        )
+
+    assert exc.value.code == "invalid_resource"
+    assert "userinfo" in exc.value.message
+
+
+@pytest.mark.asyncio
 async def test_safe_oauth_transport_pins_resolved_ip_and_preserves_host(monkeypatch):
     captured: list[tuple[str, str, str | None]] = []
 
