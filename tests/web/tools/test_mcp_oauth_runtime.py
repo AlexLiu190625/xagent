@@ -645,3 +645,55 @@ async def test_mcp_oauth_runtime_refresh_rejects_narrowed_scope_without_commit(
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "expired-access-token"
     assert grant.scope == "records.read records.write"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refresh_rejects_oversized_scope_without_commit(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        scope="records.read",
+    )
+    oversized_scope = "scope-" + "x" * mcp_oauth_service.MCP_OAUTH_SCOPE_MAX_LENGTH
+
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "access_token": "oversized-scope-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "scope": oversized_scope,
+            },
+        )
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    async def skip_url_policy(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "token_refresh_failed"
+    assert "at most" in diagnostics[0]["message"]
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "expired-access-token"
+    assert grant.scope == "records.read"

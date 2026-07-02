@@ -39,6 +39,7 @@ from ..services.mcp_oauth import (
     _same_url,
     create_mcp_oauth_http_client,
     discover_mcp_oauth_metadata,
+    normalize_mcp_oauth_scope,
     oauth_error_log_payload,
     oauth_error_message,
     oauth_post,
@@ -366,16 +367,14 @@ def _oauth_authorization_url(endpoint: str, params: dict[str, str]) -> str:
     )
 
 
-def _split_scope(scope: str | None) -> list[str]:
-    if not scope:
-        return []
-    return [item for item in scope.split() if item]
-
-
 def _scope_string(scopes: list[str] | tuple[str, ...] | str | None) -> str:
-    if isinstance(scopes, str):
-        return " ".join(sorted(set(_split_scope(scopes))))
-    return " ".join(sorted({scope for scope in scopes or [] if scope}))
+    try:
+        return normalize_mcp_oauth_scope(scopes)
+    except MCPOAuthDiscoveryError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"code": exc.code, "message": exc.message},
+        ) from exc
 
 
 def _pkce_code_challenge(code_verifier: str) -> str:

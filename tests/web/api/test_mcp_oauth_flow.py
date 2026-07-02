@@ -31,6 +31,7 @@ from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
+from xagent.web.services.mcp_oauth import MCP_OAUTH_SCOPE_MAX_LENGTH
 
 
 @pytest.fixture()
@@ -389,6 +390,32 @@ async def test_connect_canonicalizes_scope_before_persisting_flow_state(
     query = parse_qs(urlparse(response.headers["location"]).query)
     assert query["scope"] == ["records.read records.write"]
     assert db.query(MCPOAuthFlowState).one().scope == "records.read records.write"
+
+
+@pytest.mark.asyncio
+async def test_connect_rejects_scope_that_cannot_fit_grant_lookup_key(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    oversized_scope = "scope-" + "x" * MCP_OAUTH_SCOPE_MAX_LENGTH
+    server = _add_mcp_oauth_server(db, user, scope=oversized_scope)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    with pytest.raises(HTTPException) as exc:
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+            user,
+            db,
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_scope"
+    assert db.query(MCPOAuthFlowState).count() == 0
 
 
 @pytest.mark.asyncio
@@ -789,6 +816,40 @@ async def test_callback_canonicalizes_scope_before_persisting_grant(
     assert grant.mcp_server_id == server.id
     assert grant.mcp_oauth_client_id == client.id
     assert grant.scope == "records.read records.write"
+
+
+@pytest.mark.asyncio
+async def test_callback_rejects_scope_that_cannot_fit_grant_lookup_key(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    _server, _client, _flow_state = _add_callback_client_and_state(
+        db,
+        user,
+        state="oversized-scope-state",
+    )
+    oversized_scope = "scope-" + "x" * MCP_OAUTH_SCOPE_MAX_LENGTH
+
+    async def fake_exchange(**kwargs):
+        return {
+            "access_token": "plain-access-token",
+            "token_type": "Bearer",
+            "scope": oversized_scope,
+        }
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
+
+    with pytest.raises(HTTPException) as exc:
+        await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?code=auth-code&state=oversized-scope-state"
+            ),
+            db,
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail["code"] == "invalid_scope"
+    assert db.query(MCPOAuthGrant).count() == 0
 
 
 @pytest.mark.asyncio

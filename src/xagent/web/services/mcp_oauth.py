@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 MCP_OAUTH_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT = MCP_OAUTH_HTTP_TIMEOUT_SECONDS
 MCP_OAUTH_MAX_REDIRECTS = 5
+MCP_OAUTH_SCOPE_MAX_LENGTH = 1000
 OAUTH_ERROR_MESSAGE_MAX_LENGTH = 500
 OAUTH_LOG_PAYLOAD_MAX_LENGTH = 2000
 OAUTH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -384,7 +385,12 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
     selected_scope = scope if scope is not None else auth_config.get("scope")
-    normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
+    try:
+        normalized_scope = (
+            normalize_mcp_oauth_scope(selected_scope) if selected_scope else None
+        )
+    except MCPOAuthDiscoveryError as exc:
+        raise MCPOAuthRuntimeError(exc.code, exc.message) from exc
     if not normalized_resource:
         raise MCPOAuthRuntimeError(
             "authorization_required",
@@ -568,11 +574,14 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                     "MCP OAuth grant changed while preparing runtime authorization",
                 )
 
-            refreshed_scope = (
-                _normalize_scope(token_data.get("scope"))
-                if token_data.get("scope") is not None
-                else str(locked_grant.scope)
-            )
+            try:
+                refreshed_scope = (
+                    normalize_mcp_oauth_scope(token_data.get("scope"))
+                    if token_data.get("scope") is not None
+                    else str(locked_grant.scope)
+                )
+            except MCPOAuthDiscoveryError as exc:
+                raise MCPOAuthRuntimeError("token_refresh_failed", exc.message) from exc
             if required_scopes and not required_scopes.issubset(
                 _scope_set(refreshed_scope)
             ):
@@ -1023,6 +1032,17 @@ def _normalize_scope(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return " ".join(sorted({str(item) for item in value if str(item)}))
     return ""
+
+
+def normalize_mcp_oauth_scope(value: Any) -> str:
+    """Canonicalize a scope string that can be persisted in grant lookup keys."""
+    scope = _normalize_scope(value)
+    if len(scope) > MCP_OAUTH_SCOPE_MAX_LENGTH:
+        raise MCPOAuthDiscoveryError(
+            "invalid_scope",
+            f"MCP OAuth scope must be at most {MCP_OAUTH_SCOPE_MAX_LENGTH} characters",
+        )
+    return scope
 
 
 def oauth_token_expires_at(token_data: dict[str, Any]) -> datetime | None:
