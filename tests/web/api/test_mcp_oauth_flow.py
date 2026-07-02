@@ -91,6 +91,10 @@ def _request(
     )
 
 
+def _redirect_query(response):
+    return parse_qs(urlparse(response.headers["location"]).query)
+
+
 def _discovery() -> SimpleNamespace:
     return SimpleNamespace(
         resource="https://mcp.example.com/mcp",
@@ -180,6 +184,7 @@ def _add_callback_client_and_state(
     *,
     state: str,
     metadata_json: dict | None = None,
+    redirect_after: str = "/mcp",
 ) -> tuple[MCPServer, MCPOAuthClient, MCPOAuthFlowState]:
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(db, server, metadata_json=metadata_json)
@@ -193,7 +198,7 @@ def _add_callback_client_and_state(
         resource="https://mcp.example.com/mcp",
         scope="records.read",
         code_verifier=mcp_api.encrypt_value("verifier-123"),
-        redirect_after="/mcp",
+        redirect_after=redirect_after,
         expires_at=mcp_api._utc_now() + timedelta(minutes=10),
     )
     db.add(flow_state)
@@ -471,7 +476,7 @@ async def test_connect_sanitizes_backslash_redirect_after(db_session, monkeypatc
     )
 
     flow_state = db.query(MCPOAuthFlowState).one()
-    assert flow_state.redirect_after == "/mcp"
+    assert flow_state.redirect_after == "/tools"
 
 
 @pytest.mark.asyncio
@@ -493,7 +498,7 @@ async def test_connect_sanitizes_oversized_redirect_after(db_session, monkeypatc
         db,
     )
 
-    assert db.query(MCPOAuthFlowState).one().redirect_after == "/mcp"
+    assert db.query(MCPOAuthFlowState).one().redirect_after == "/tools"
 
 
 @pytest.mark.asyncio
@@ -746,7 +751,12 @@ async def test_callback_rejects_token_type_that_cannot_fit_persistence(
     db_session, monkeypatch
 ):
     db, user, _ = db_session
-    _add_callback_client_and_state(db, user, state="oversized-token-type-state")
+    _add_callback_client_and_state(
+        db,
+        user,
+        state="oversized-token-type-state",
+        redirect_after="/tools?tab=mcp",
+    )
 
     async def fake_exchange(**kwargs):
         return {
@@ -757,17 +767,18 @@ async def test_callback_rejects_token_type_that_cannot_fit_persistence(
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
 
-    with pytest.raises(HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?code=auth-code&state=oversized-token-type-state"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=oversized-token-type-state"
+        ),
+        db,
+    )
 
-    assert exc.value.status_code == 400
-    assert exc.value.detail["code"] == "invalid_resource"
-    assert "token_type" in exc.value.detail["message"]
+    assert response.status_code == 307
+    assert response.headers["location"].startswith("/tools?tab=mcp&")
+    query = _redirect_query(response)
+    assert query["mcp_oauth_error"] == ["invalid_resource"]
+    assert "token_type" in query["mcp_oauth_error_message"][0]
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -914,6 +925,7 @@ async def test_callback_rejects_scope_that_cannot_fit_grant_lookup_key(
         db,
         user,
         state="oversized-scope-state",
+        redirect_after="/tools",
     )
     oversized_scope = "scope-" + "x" * MCP_OAUTH_SCOPE_MAX_LENGTH
 
@@ -926,16 +938,14 @@ async def test_callback_rejects_scope_that_cannot_fit_grant_lookup_key(
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fake_exchange)
 
-    with pytest.raises(HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?code=auth-code&state=oversized-scope-state"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=oversized-scope-state"),
+        db,
+    )
 
-    assert exc.value.status_code == 400
-    assert exc.value.detail["code"] == "invalid_scope"
+    assert response.status_code == 307
+    query = _redirect_query(response)
+    assert query["mcp_oauth_error"] == ["invalid_scope"]
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -1079,6 +1089,7 @@ async def test_callback_sanitizes_authorization_error_response(db_session, monke
         db,
         user,
         state="authorization-error-state",
+        redirect_after="/tools",
     )
 
     async def fail_exchange(**kwargs):
@@ -1087,18 +1098,19 @@ async def test_callback_sanitizes_authorization_error_response(db_session, monke
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
     oversized_error = "access_denied_" + "x" * 1000
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?"
-                f"error={oversized_error}&state=authorization-error-state"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?"
+            f"error={oversized_error}&state=authorization-error-state"
+        ),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "token_exchange_failed"
-    assert len(exc.value.detail["message"]) <= 500
-    assert exc.value.detail["message"].endswith("...")
+    assert response.status_code == 307
+    query = _redirect_query(response)
+    assert query["mcp_oauth_error"] == ["token_exchange_failed"]
+    assert len(query["mcp_oauth_error_message"][0]) <= 500
+    assert query["mcp_oauth_error_message"][0].endswith("...")
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -1213,7 +1225,7 @@ async def test_callback_rejects_state_after_user_loses_mcp_access(db_session):
             resource="https://mcp.example.com/mcp",
             scope="records.read",
             code_verifier=mcp_api.encrypt_value("verifier-123"),
-            redirect_after="/mcp",
+            redirect_after="/tools",
             expires_at=mcp_api._utc_now() + timedelta(minutes=10),
         )
     )
@@ -1305,16 +1317,17 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
 
     monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request("/api/mcp/oauth/callback?code=auth-code&state=bad-token-state"),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=bad-token-state"),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "token_exchange_failed"
-    assert exc.value.detail["message"] == "authorization code is invalid"
-    assert "leaked-access-token" not in str(exc.value.detail)
-    assert "leaked-refresh-token" not in str(exc.value.detail)
+    assert response.status_code == 307
+    query = _redirect_query(response)
+    assert query["mcp_oauth_error"] == ["token_exchange_failed"]
+    assert query["mcp_oauth_error_message"] == ["authorization code is invalid"]
+    assert "leaked-access-token" not in response.headers["location"]
+    assert "leaked-refresh-token" not in response.headers["location"]
     assert db.query(MCPOAuthGrant).count() == 0
     flow_state = db.query(MCPOAuthFlowState).filter_by(state="bad-token-state").one()
     assert flow_state.consumed_at is not None

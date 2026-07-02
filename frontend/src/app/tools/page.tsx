@@ -1,6 +1,7 @@
 "use client"
 
 import { useState, useEffect } from "react"
+import { useRouter } from "next/navigation"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -110,6 +111,7 @@ const DEFAULT_PORTS: Record<Exclude<SqlDbType, 'sqlite'>, string> = {
 }
 
 export default function ToolsPage() {
+  const router = useRouter()
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
@@ -154,6 +156,18 @@ export default function ToolsPage() {
   const { user } = useAuth()
   const { getAppIcon } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
+
+  useEffect(() => {
+    const nextParams = new URLSearchParams(window.location.search)
+    const oauthErrorMessage = nextParams.get("mcp_oauth_error_message")
+    if (!oauthErrorMessage) return
+
+    toast.error(oauthErrorMessage)
+    nextParams.delete("mcp_oauth_error")
+    nextParams.delete("mcp_oauth_error_message")
+    const nextQuery = nextParams.toString()
+    router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
+  }, [router])
 
   useEffect(() => {
     loadTools()

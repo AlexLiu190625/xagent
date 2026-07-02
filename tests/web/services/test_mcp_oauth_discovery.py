@@ -257,12 +257,36 @@ def test_safe_oauth_transport_disables_proxy_http2_and_keepalive(monkeypatch):
             return None
 
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncHTTPTransport", CaptureTransport)
+    monkeypatch.delenv("XAGENT_MCP_OAUTH_PROXY_URL", raising=False)
 
     SafeOAuthAsyncHTTPTransport()
 
     assert captured["trust_env"] is False
+    assert captured["proxy"] is None
     assert captured["http2"] is False
     assert captured["limits"].max_keepalive_connections == 0
+
+
+def test_safe_oauth_transport_uses_explicit_proxy_configuration(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class CaptureTransport(httpx.AsyncBaseTransport):
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, request=request)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncHTTPTransport", CaptureTransport)
+    monkeypatch.setenv("XAGENT_MCP_OAUTH_PROXY_URL", "http://proxy.example.com:8080")
+
+    SafeOAuthAsyncHTTPTransport()
+
+    assert captured["trust_env"] is False
+    assert captured["proxy"] == "http://proxy.example.com:8080"
 
 
 @pytest.mark.asyncio

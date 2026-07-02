@@ -283,7 +283,7 @@ def _default_mcp_oauth_redirect_uri() -> str:
 
 def _safe_mcp_oauth_redirect_after(value: str | None) -> str:
     if not value:
-        return "/mcp"
+        return "/tools"
     parsed = urlsplit(value)
     if (
         parsed.scheme
@@ -293,7 +293,7 @@ def _safe_mcp_oauth_redirect_after(value: str | None) -> str:
         or value.startswith("/\\")
         or len(value) > MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH
     ):
-        return "/mcp"
+        return "/tools"
     return value
 
 
@@ -328,6 +328,34 @@ def _set_mcp_oauth_state_cookie(response: Response, state_value: str) -> None:
 
 def _clear_mcp_oauth_state_cookie(response: Response) -> None:
     response.delete_cookie(MCP_OAUTH_STATE_COOKIE, path="/api/mcp")
+
+
+def _mcp_oauth_callback_error_redirect(
+    flow_state: MCPOAuthFlowState,
+    *,
+    error_code: str,
+    message: str,
+) -> RedirectResponse:
+    raw_redirect_after = (
+        str(flow_state.redirect_after) if flow_state.redirect_after else None
+    )
+    redirect_after = _safe_mcp_oauth_redirect_after(raw_redirect_after)
+    parts = urlsplit(redirect_after)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    query.extend(
+        (
+            ("mcp_oauth_error", error_code),
+            (
+                "mcp_oauth_error_message",
+                oauth_error_message(message, "MCP OAuth authorization failed"),
+            ),
+        )
+    )
+    response = RedirectResponse(
+        urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+    )
+    _clear_mcp_oauth_state_cookie(response)
+    return response
 
 
 def _validate_mcp_oauth_state_cookie(request: Request, state_value: str) -> None:
@@ -2239,28 +2267,45 @@ async def mcp_oauth_callback(
     )
     _claim_mcp_oauth_flow_state(db, flow_state)
     if error:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "token_exchange_failed",
-                "message": oauth_error_message(
-                    {"error": error}, "MCP OAuth authorization failed"
-                ),
-            },
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code="token_exchange_failed",
+            message=oauth_error_message(
+                {"error": error}, "MCP OAuth authorization failed"
+            ),
         )
     if not code:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_state", "message": "Missing authorization code"},
         )
-    token_data = await _exchange_mcp_oauth_code(
-        client=client,
-        code=code,
-        code_verifier=decrypt_value(str(flow_state.code_verifier)),
-        resource=str(flow_state.resource),
-    )
-    _upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
-    db.commit()
+    try:
+        token_data = await _exchange_mcp_oauth_code(
+            client=client,
+            code=code,
+            code_verifier=decrypt_value(str(flow_state.code_verifier)),
+            resource=str(flow_state.resource),
+        )
+        _upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
+        db.commit()
+    except HTTPException as exc:
+        db.rollback()
+        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        error_code = str(detail.get("code") or "token_exchange_failed")
+        message = str(detail.get("message") or "MCP OAuth authorization failed")
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code=error_code,
+            message=message,
+        )
+    except Exception:
+        db.rollback()
+        logger.exception("MCP OAuth callback failed after state claim")
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code="token_exchange_failed",
+            message="MCP OAuth authorization failed",
+        )
 
     response = RedirectResponse(
         _safe_mcp_oauth_redirect_after(flow_state.redirect_after)

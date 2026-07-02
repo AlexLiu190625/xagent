@@ -16,7 +16,7 @@ from urllib.request import parse_http_list, parse_keqv_list
 import httpx
 from sqlalchemy.orm import sessionmaker
 
-from ...config import get_mcp_oauth_allow_private_hosts
+from ...config import get_mcp_oauth_allow_private_hosts, get_mcp_oauth_proxy_url
 
 logger = logging.getLogger(__name__)
 
@@ -123,10 +123,12 @@ class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
     """HTTP transport that resolves and pins OAuth hosts before connecting."""
 
     def __init__(self) -> None:
+        proxy_url = get_mcp_oauth_proxy_url()
         self._transport = httpx.AsyncHTTPTransport(
             limits=httpx.Limits(max_keepalive_connections=0),
             trust_env=False,
             http2=False,
+            proxy=proxy_url,
         )
 
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
