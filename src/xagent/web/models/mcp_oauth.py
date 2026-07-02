@@ -84,7 +84,7 @@ class MCPOAuthGrant(Base):  # type: ignore
     resource_owner_key = Column(String(512), nullable=False)
     issuer = Column(String(1000), nullable=False)
     resource = Column(String(1000), nullable=False)
-    scope = Column(Text, nullable=False, default="")
+    scope = Column(String(1000), nullable=False, default="")
     access_token = Column(Text, nullable=False)
     refresh_token = Column(Text, nullable=True)
     expires_at = Column(DateTime(timezone=True), nullable=True, index=True)

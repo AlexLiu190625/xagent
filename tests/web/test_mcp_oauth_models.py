@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sqlalchemy import create_engine, inspect
+from sqlalchemy import String, create_engine, inspect
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -85,6 +85,12 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
         column["name"] for column in inspector.get_columns("mcp_oauth_grants")
     }
     assert "metadata" in grant_columns
+    grant_column_types = {
+        column["name"]: column["type"]
+        for column in inspector.get_columns("mcp_oauth_grants")
+    }
+    assert isinstance(grant_column_types["scope"], String)
+    assert grant_column_types["scope"].length == 1000
 
     stored_grant = db_session.query(MCPOAuthGrant).one()
     assert stored_grant.mcp_server_id == server.id

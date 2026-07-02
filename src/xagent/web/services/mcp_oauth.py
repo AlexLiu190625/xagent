@@ -9,7 +9,7 @@ import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
-from urllib.parse import urljoin, urlsplit, urlunsplit
+from urllib.parse import SplitResult, urljoin, urlsplit, urlunsplit
 from urllib.request import parse_http_list, parse_keqv_list
 
 import httpx
@@ -465,7 +465,7 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
     )
     refresh_db = SessionLocal()
     try:
-        with refresh_db.begin_nested():
+        with refresh_db.begin():
             locked_grant: Any = (
                 refresh_db.query(MCPOAuthGrant)
                 .filter(MCPOAuthGrant.id == grant_id)
@@ -542,7 +542,6 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                 if key not in {"access_token", "refresh_token"}
             }
             locked_grant.expires_at = oauth_token_expires_at(token_data)
-            refresh_db.flush()
             runtime_auth = MCPOAuthRuntimeAuth(
                 access_token=access_token,
                 resource_owner_key=str(locked_grant.resource_owner_key),
@@ -553,11 +552,7 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                 refreshed=True,
             )
 
-        refresh_db.commit()
         return runtime_auth
-    except Exception:
-        refresh_db.rollback()
-        raise
     finally:
         refresh_db.close()
 
@@ -1190,6 +1185,7 @@ async def _validate_and_resolve_oauth_http_url(
             "OAuth metadata URL must not include userinfo",
         )
 
+    port = _url_port(parts)
     hostname = parts.hostname.rstrip(".").lower()
     _reject_blocked_host(hostname)
     if not resolve_dns:
@@ -1201,7 +1197,7 @@ async def _validate_and_resolve_oauth_http_url(
             None,
             socket.getaddrinfo,
             hostname,
-            parts.port or (443 if parts.scheme.lower() == "https" else 80),
+            port or (443 if parts.scheme.lower() == "https" else 80),
             socket.AF_UNSPEC,
             socket.SOCK_STREAM,
         )
@@ -1235,7 +1231,7 @@ def _hostname_for_url(value: str) -> str:
 def _host_header_value(value: str) -> str:
     parts = urlsplit(value)
     hostname = _hostname_for_url(value)
-    port = parts.port
+    port = _url_port(parts)
     default_port = 443 if parts.scheme.lower() == "https" else 80
     header_host = (
         f"[{hostname}]"
@@ -1245,6 +1241,16 @@ def _host_header_value(value: str) -> str:
     if port and port != default_port:
         return f"{header_host}:{port}"
     return header_host
+
+
+def _url_port(parts: SplitResult) -> int | None:
+    try:
+        return parts.port
+    except ValueError as exc:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth metadata URL has an invalid port",
+        ) from exc
 
 
 def _headers_without_cross_origin_secrets(headers: dict[str, str]) -> dict[str, str]:

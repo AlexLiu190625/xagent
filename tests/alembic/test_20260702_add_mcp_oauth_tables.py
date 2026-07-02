@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import String, create_engine, inspect, text
 
 
 def _load_migration_module():
@@ -78,6 +78,10 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
         grant_columns = {
             column["name"] for column in inspector.get_columns("mcp_oauth_grants")
         }
+        grant_column_types = {
+            column["name"]: column["type"]
+            for column in inspector.get_columns("mcp_oauth_grants")
+        }
         state_columns = {
             column["name"] for column in inspector.get_columns("mcp_oauth_flow_states")
         }
@@ -103,6 +107,8 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
             "refresh_token",
             "metadata",
         }.issubset(grant_columns)
+        assert isinstance(grant_column_types["scope"], String)
+        assert grant_column_types["scope"].length == 1000
         assert {
             "state",
             "mcp_server_id",

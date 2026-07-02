@@ -131,7 +131,9 @@ def upgrade() -> None:
             sa.Column("resource_owner_key", sa.String(length=512), nullable=False),
             sa.Column("issuer", sa.String(length=1000), nullable=False),
             sa.Column("resource", sa.String(length=1000), nullable=False),
-            sa.Column("scope", sa.Text(), nullable=False, server_default=""),
+            sa.Column(
+                "scope", sa.String(length=1000), nullable=False, server_default=""
+            ),
             sa.Column("access_token", sa.Text(), nullable=False),
             sa.Column("refresh_token", sa.Text(), nullable=True),
             sa.Column("expires_at", sa.DateTime(timezone=True), nullable=True),

@@ -92,6 +92,18 @@ async def test_oauth_url_dns_resolution_runs_in_executor(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_oauth_url_policy_rejects_invalid_port_without_500():
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        await validate_oauth_http_url(
+            "https://auth.example.com:not-a-port/token",
+            resolve_dns=False,
+        )
+
+    assert exc.value.code == "invalid_resource"
+    assert "invalid port" in exc.value.message
+
+
+@pytest.mark.asyncio
 async def test_safe_oauth_transport_pins_resolved_ip_and_preserves_host(monkeypatch):
     captured: list[tuple[str, str, str | None]] = []
 
