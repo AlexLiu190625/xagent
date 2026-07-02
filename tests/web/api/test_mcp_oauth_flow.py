@@ -14,9 +14,11 @@ from xagent.core.utils.encryption import decrypt_value
 from xagent.web.api import mcp as mcp_api
 from xagent.web.api.mcp import (
     MCPOAuthConnectRequest,
+    MCPOAuthDiscoverRequest,
     MCPOAuthStatusResponse,
     connect_mcp_oauth,
     delete_mcp_oauth_grant,
+    discover_mcp_oauth,
     get_mcp_oauth_status,
     mcp_oauth_callback,
 )
@@ -147,6 +149,19 @@ def _add_callback_client_and_state(
     return server, client, flow_state
 
 
+def _set_user_mcp_active(db, user: User, server: MCPServer, is_active: bool) -> None:
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    user_mcp.is_active = is_active
+    db.commit()
+
+
 @pytest.mark.asyncio
 async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch):
     db, user, _ = db_session
@@ -197,6 +212,16 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert decrypt_value(client.client_secret) == "client-secret"
 
 
+def test_connect_request_rejects_public_resource_owner_key():
+    with pytest.raises(ValueError):
+        MCPOAuthConnectRequest.model_validate(
+            {
+                "redirect_after": "/settings/mcp",
+                "resource_owner_key": "external:public-request",
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_connect_can_return_authorization_url_json(db_session, monkeypatch):
     db, user, _ = db_session
@@ -225,6 +250,57 @@ async def test_connect_can_return_authorization_url_json(db_session, monkeypatch
     assert query["client_id"] == ["client-123"]
     assert query["resource"] == ["https://mcp.example.com/mcp"]
     assert db.query(MCPOAuthFlowState).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_oauth_routes_reject_inactive_user_mcp_server(db_session, monkeypatch):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _set_user_mcp_active(db, user, server, False)
+
+    async def fail_discover(*args, **kwargs):
+        pytest.fail("inactive MCP server must not run OAuth discovery")
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fail_discover)
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await discover_mcp_oauth(
+            server.id,
+            MCPOAuthDiscoverRequest(),
+            user,
+            db,
+        )
+    assert exc.value.status_code == 404
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+            user,
+            db,
+        )
+    assert exc.value.status_code == 404
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await get_mcp_oauth_status(server.id, user, db)
+    assert exc.value.status_code == 404
+
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=mcp_api.encrypt_value("own-access-token"),
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await delete_mcp_oauth_grant(server.id, grant.id, user, db)
+    assert exc.value.status_code == 404
 
 
 @pytest.mark.asyncio
@@ -546,6 +622,35 @@ async def test_callback_rejects_state_after_user_loses_mcp_access(db_session):
 
 
 @pytest.mark.asyncio
+async def test_callback_rejects_state_after_user_mcp_server_is_deactivated(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server, _, _ = _add_callback_client_and_state(
+        db,
+        user,
+        state="inactive-access-state",
+    )
+    _set_user_mcp_active(db, user, server, False)
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("token exchange must not run for inactive MCP server access")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await mcp_oauth_callback(
+            _request(
+                "/api/mcp/oauth/callback?code=auth-code&state=inactive-access-state"
+            ),
+            db,
+        )
+
+    assert exc.value.detail["code"] == "invalid_state"
+    assert db.query(MCPOAuthGrant).count() == 0
+
+
+@pytest.mark.asyncio
 async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -637,3 +742,6 @@ async def test_status_and_delete_are_scoped_to_current_user(db_session):
     db.refresh(own_grant)
     assert own_grant.status == "revoked"
     assert own_grant.revoked_at is not None
+
+    status_response = await get_mcp_oauth_status(server.id, user, db)
+    assert status_response.grants == []

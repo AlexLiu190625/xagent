@@ -18,7 +18,7 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url
@@ -125,7 +125,8 @@ class MCPOAuthDiscoverResponse(BaseModel):
 class MCPOAuthConnectRequest(MCPOAuthDiscoverRequest):
     """Request model for starting MCP OAuth Authorization Code + PKCE."""
 
-    resource_owner_key: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
     redirect_after: Optional[str] = None
 
 
@@ -296,14 +297,16 @@ def _pkce_code_challenge(code_verifier: str) -> str:
 
 
 def _get_user_mcp_server_or_404(
-    db: Session, *, user_id: int, server_id: int
+    db: Session, *, user_id: int, server_id: int, require_active: bool = False
 ) -> tuple[UserMCPServer, MCPServer]:
-    result = (
+    query = (
         db.query(UserMCPServer, MCPServer)
         .join(MCPServer, UserMCPServer.mcpserver_id == MCPServer.id)
         .filter(UserMCPServer.user_id == user_id, MCPServer.id == server_id)
-        .first()
     )
+    if require_active:
+        query = query.filter(UserMCPServer.is_active)
+    result = query.first()
     if not result:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND, detail="MCP server not found"
@@ -1912,6 +1915,7 @@ async def mcp_oauth_callback(
         .filter(
             UserMCPServer.user_id == flow_state.user_id,
             UserMCPServer.mcpserver_id == flow_state.mcp_server_id,
+            UserMCPServer.is_active,
         )
         .first()
         is None
@@ -1978,7 +1982,10 @@ async def discover_mcp_oauth(
 ) -> MCPOAuthDiscoverResponse:
     """Discover MCP OAuth protected-resource and authorization-server metadata."""
     _, server = _get_user_mcp_server_or_404(
-        db, user_id=cast(int, current_user.id), server_id=server_id
+        db,
+        user_id=cast(int, current_user.id),
+        server_id=server_id,
+        require_active=True,
     )
     auth_config = _get_mcp_oauth_config(server)
     discovery = await _discover_mcp_oauth_for_server(server, auth_config, request_data)
@@ -1995,7 +2002,9 @@ async def connect_mcp_oauth(
 ) -> RedirectResponse | dict[str, str]:
     """Start MCP OAuth Authorization Code + PKCE for the current user."""
     user_id = cast(int, current_user.id)
-    _, server = _get_user_mcp_server_or_404(db, user_id=user_id, server_id=server_id)
+    _, server = _get_user_mcp_server_or_404(
+        db, user_id=user_id, server_id=server_id, require_active=True
+    )
     auth_config = _get_mcp_oauth_config(server)
     discovery = await _discover_mcp_oauth_for_server(server, auth_config, request_data)
 
@@ -2020,11 +2029,7 @@ async def connect_mcp_oauth(
     selected_scope = _scope_string(
         request_data.scope or auth_config.get("scope") or discovery.scopes
     )
-    resource_owner_key = (
-        request_data.resource_owner_key.strip()
-        if request_data.resource_owner_key and request_data.resource_owner_key.strip()
-        else _default_resource_owner_key(user_id)
-    )
+    resource_owner_key = _default_resource_owner_key(user_id)
 
     _upsert_mcp_oauth_client(
         db,
@@ -2084,7 +2089,9 @@ async def get_mcp_oauth_status(
 ) -> MCPOAuthStatusResponse:
     """Return MCP OAuth grants owned by the current user for one MCP server."""
     user_id = cast(int, current_user.id)
-    _, server = _get_user_mcp_server_or_404(db, user_id=user_id, server_id=server_id)
+    _, server = _get_user_mcp_server_or_404(
+        db, user_id=user_id, server_id=server_id, require_active=True
+    )
     config = server.to_config_dict()
     auth_config = config.get("auth") if isinstance(config.get("auth"), dict) else {}
     grants = (
@@ -2092,6 +2099,7 @@ async def get_mcp_oauth_status(
         .filter(
             MCPOAuthGrant.mcp_server_id == server_id,
             MCPOAuthGrant.user_id == user_id,
+            MCPOAuthGrant.status == "active",
         )
         .order_by(MCPOAuthGrant.created_at.desc())
         .all()
@@ -2118,7 +2126,9 @@ async def delete_mcp_oauth_grant(
 ) -> None:
     """Revoke an MCP OAuth grant owned by the current user."""
     user_id = cast(int, current_user.id)
-    _get_user_mcp_server_or_404(db, user_id=user_id, server_id=server_id)
+    _get_user_mcp_server_or_404(
+        db, user_id=user_id, server_id=server_id, require_active=True
+    )
     grant = (
         db.query(MCPOAuthGrant)
         .filter(
