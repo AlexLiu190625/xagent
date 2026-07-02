@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { CustomMcpForm } from "./custom-mcp-form"
@@ -42,6 +42,11 @@ function okJson(data: unknown): Response {
   } as unknown as Response
 }
 
+async function flushPromises() {
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
 function renderMcpOAuthForm(overrides: Partial<MCPServerFormData> = {}) {
   const formData: MCPServerFormData = {
     name: "records",
@@ -78,12 +83,15 @@ describe("CustomMcpForm MCP OAuth", () => {
   })
 
   afterEach(() => {
+    vi.clearAllTimers()
+    vi.useRealTimers()
     vi.restoreAllMocks()
     cleanup()
   })
 
   it("starts connect through the JSON authorization URL response", async () => {
     const popup = {
+      closed: false,
       opener: window,
       close: vi.fn(),
       location: { href: "" },
@@ -110,20 +118,22 @@ describe("CustomMcpForm MCP OAuth", () => {
       )
     })
 
+    vi.useFakeTimers()
     fireEvent.click(screen.getByText("tools.mcp.dialog.oauthConnect"))
-
-    await waitFor(() => {
-      expect(apiRequestMock).toHaveBeenCalledWith(
-        "http://api.local/api/mcp/42/oauth/connect",
-        expect.objectContaining({
-          method: "POST",
-          headers: expect.objectContaining({
-            Accept: "application/json",
-            "Content-Type": "application/json",
-          }),
-        })
-      )
+    await act(async () => {
+      await flushPromises()
     })
+
+    expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/mcp/42/oauth/connect",
+      expect.objectContaining({
+        method: "POST",
+        headers: expect.objectContaining({
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        }),
+      })
+    )
 
     const connectCall = apiRequestMock.mock.calls.find(([url]) =>
       String(url).endsWith("/oauth/connect")
@@ -142,5 +152,166 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(openMock).toHaveBeenCalledWith("about:blank", "_blank")
     expect(popup.opener).toBeNull()
     expect(popup.location.href).toBe("https://auth.example.com/authorize")
+  })
+
+  it("polls OAuth status until the authorization popup is closed", async () => {
+    const onOAuthStatusChange = vi.fn()
+    const popup = {
+      closed: false,
+      opener: window,
+      close: vi.fn(),
+      location: { href: "" },
+    }
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/mcp/42/oauth/status") {
+        return Promise.resolve(okJson({ server_id: 42, grants: [] }))
+      }
+      if (url === "http://api.local/api/mcp/42/oauth/connect") {
+        return Promise.resolve(
+          okJson({ authorization_url: "https://auth.example.com/authorize" })
+        )
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    const formData: MCPServerFormData = {
+      name: "records",
+      transport: "streamable_http",
+      description: "",
+      config: {
+        url: "https://mcp.example.com/mcp",
+        auth: {
+          type: "mcp_oauth",
+          resource: "https://mcp.example.com/mcp",
+          issuer: "https://auth.example.com",
+          scope: "records.read",
+          client_id: "client-123",
+        },
+      },
+    }
+
+    render(
+      <CustomMcpForm
+        mcpFormData={formData}
+        setMcpFormData={vi.fn()}
+        transports={[]}
+        serverId={42}
+        onOAuthStatusChange={onOAuthStatusChange}
+      />
+    )
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/42/oauth/status"
+      )
+    })
+
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByText("tools.mcp.dialog.oauthConnect"))
+    await act(async () => {
+      await flushPromises()
+    })
+    expect(popup.location.href).toBe("https://auth.example.com/authorize")
+
+    const statusCallsBeforePolling = apiRequestMock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/oauth/status")
+    ).length
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(
+      apiRequestMock.mock.calls.filter(([url]) => String(url).endsWith("/oauth/status"))
+        .length
+    ).toBe(statusCallsBeforePolling + 1)
+    expect(onOAuthStatusChange).not.toHaveBeenCalled()
+
+    popup.closed = true
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+    expect(onOAuthStatusChange).toHaveBeenCalledTimes(1)
+  })
+
+  it("restores asynchronously loaded masked OAuth client secrets on blur", async () => {
+    const setMcpFormData = vi.fn()
+    apiRequestMock.mockResolvedValue(okJson({ server_id: 42, grants: [] }))
+    const baseFormData: MCPServerFormData = {
+      name: "records",
+      transport: "streamable_http",
+      description: "",
+      config: {
+        url: "https://mcp.example.com/mcp",
+        auth: {
+          type: "mcp_oauth",
+          resource: "https://mcp.example.com/mcp",
+          issuer: "https://auth.example.com",
+          scope: "records.read",
+          client_id: "client-123",
+        },
+      },
+    }
+
+    const { rerender } = render(
+      <CustomMcpForm
+        mcpFormData={baseFormData}
+        setMcpFormData={setMcpFormData}
+        transports={[]}
+        serverId={42}
+      />
+    )
+
+    const loadedFormData: MCPServerFormData = {
+      ...baseFormData,
+      config: {
+        ...baseFormData.config!,
+        auth: {
+          ...baseFormData.config!.auth,
+          client_secret: "********",
+        },
+      },
+    }
+    rerender(
+      <CustomMcpForm
+        mcpFormData={loadedFormData}
+        setMcpFormData={setMcpFormData}
+        transports={[]}
+        serverId={42}
+      />
+    )
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("tools.mcp.dialog.clientSecret")).toHaveValue(
+        "********"
+      )
+    })
+
+    const clearedFormData: MCPServerFormData = {
+      ...loadedFormData,
+      config: {
+        ...loadedFormData.config!,
+        auth: {
+          ...loadedFormData.config!.auth,
+          client_secret: "",
+        },
+      },
+    }
+    rerender(
+      <CustomMcpForm
+        mcpFormData={clearedFormData}
+        setMcpFormData={setMcpFormData}
+        transports={[]}
+        serverId={42}
+      />
+    )
+
+    fireEvent.blur(screen.getByLabelText("tools.mcp.dialog.clientSecret"))
+
+    const updater = setMcpFormData.mock.calls.at(-1)?.[0]
+    expect(typeof updater).toBe("function")
+    const nextState = updater(clearedFormData)
+    expect(nextState.config.auth.client_secret).toBe("********")
   })
 })

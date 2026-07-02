@@ -338,6 +338,63 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert flow_state.mcp_oauth_client_id == client.id
 
 
+@pytest.mark.asyncio
+async def test_connect_sanitizes_backslash_redirect_after(db_session, monkeypatch):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/\\evil.example.com"),
+        user,
+        db,
+    )
+
+    flow_state = db.query(MCPOAuthFlowState).one()
+    assert flow_state.redirect_after == "/mcp"
+
+
+@pytest.mark.asyncio
+async def test_connect_merges_authorization_endpoint_query_and_preserves_fragment(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    async def fake_discover(*args, **kwargs):
+        discovery = _discovery()
+        discovery.authorization_server.authorization_endpoint = (
+            "https://auth.example.com/authorize?prompt=consent#login"
+        )
+        return discovery
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+        accept="application/json",
+    )
+
+    assert isinstance(response, dict)
+    parsed = urlparse(response["authorization_url"])
+    query = parse_qs(parsed.query)
+    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == (
+        "https://auth.example.com/authorize"
+    )
+    assert query["prompt"] == ["consent"]
+    assert query["client_id"] == ["client-123"]
+    assert query["resource"] == ["https://mcp.example.com/mcp"]
+    assert parsed.fragment == "login"
+
+
 def test_connect_request_rejects_public_resource_owner_key():
     with pytest.raises(ValueError):
         MCPOAuthConnectRequest.model_validate(
@@ -502,6 +559,9 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
         return real_async_client(transport=httpx.MockTransport(handler))
 
     monkeypatch.setattr(mcp_api.httpx, "AsyncClient", async_client_factory)
+    monkeypatch.setattr(
+        mcp_api, "validate_oauth_http_url", lambda *args, **kwargs: None
+    )
 
     response = await mcp_oauth_callback(
         _request("/api/mcp/oauth/callback?code=auth-code&state=state-123"),

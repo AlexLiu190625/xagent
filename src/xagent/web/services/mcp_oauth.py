@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ipaddress
 import re
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable, Sequence
@@ -199,6 +201,7 @@ async def discover_mcp_oauth_metadata(  # noqa: PLR0913
             configured_issuer=configured_issuer,
             configured_resource=configured_resource,
             client=client,
+            resolve_dns_for_url_policy=False,
         )
 
     async with httpx.AsyncClient(
@@ -212,6 +215,7 @@ async def discover_mcp_oauth_metadata(  # noqa: PLR0913
             configured_issuer=configured_issuer,
             configured_resource=configured_resource,
             client=owned_client,
+            resolve_dns_for_url_policy=True,
         )
 
 
@@ -387,6 +391,7 @@ async def _discover_with_client(  # noqa: PLR0913
     configured_issuer: str | None,
     configured_resource: str | None,
     client: httpx.AsyncClient,
+    resolve_dns_for_url_policy: bool,
 ) -> MCPOAuthDiscoveryResult:
     challenge: MCPAuthorizationChallenge | None = None
     metadata_urls: tuple[str, ...]
@@ -395,7 +400,10 @@ async def _discover_with_client(  # noqa: PLR0913
         metadata_urls = (configured_resource_metadata_url,)
     else:
         challenge = await _probe_authorization_challenge(
-            endpoint_url, headers=headers, client=client
+            endpoint_url,
+            headers=headers,
+            client=client,
+            resolve_dns_for_url_policy=resolve_dns_for_url_policy,
         )
         if challenge and challenge.resource_metadata_url:
             metadata_urls = (challenge.resource_metadata_url,)
@@ -403,7 +411,9 @@ async def _discover_with_client(  # noqa: PLR0913
             metadata_urls = protected_resource_metadata_urls(endpoint_url)
 
     protected_resource = await _fetch_first_protected_resource_metadata(
-        metadata_urls, client=client
+        metadata_urls,
+        client=client,
+        resolve_dns_for_url_policy=resolve_dns_for_url_policy,
     )
     resource = protected_resource.resource or _canonical_resource(endpoint_url)
     if configured_resource and not _same_url(configured_resource, resource):
@@ -420,6 +430,7 @@ async def _discover_with_client(  # noqa: PLR0913
         authorization_server_url,
         configured_issuer=configured_issuer,
         client=client,
+        resolve_dns_for_url_policy=resolve_dns_for_url_policy,
     )
     scopes = _select_scopes(challenge, protected_resource)
 
@@ -437,8 +448,10 @@ async def _probe_authorization_challenge(
     *,
     headers: dict[str, str] | None,
     client: httpx.AsyncClient,
+    resolve_dns_for_url_policy: bool,
 ) -> MCPAuthorizationChallenge | None:
     try:
+        validate_oauth_http_url(endpoint_url, resolve_dns=resolve_dns_for_url_policy)
         response = await client.get(endpoint_url, headers=headers)
     except httpx.HTTPError as exc:
         raise MCPOAuthDiscoveryError(
@@ -450,11 +463,17 @@ async def _probe_authorization_challenge(
 
 
 async def _fetch_first_protected_resource_metadata(
-    metadata_urls: Sequence[str], *, client: httpx.AsyncClient
+    metadata_urls: Sequence[str],
+    *,
+    client: httpx.AsyncClient,
+    resolve_dns_for_url_policy: bool,
 ) -> MCPProtectedResourceMetadata:
     last_error: Exception | None = None
     for metadata_url in metadata_urls:
         try:
+            validate_oauth_http_url(
+                metadata_url, resolve_dns=resolve_dns_for_url_policy
+            )
             response = await client.get(metadata_url)
             if response.status_code >= 400:
                 last_error = MCPOAuthDiscoveryError(
@@ -480,10 +499,14 @@ async def _fetch_authorization_server_metadata(
     *,
     configured_issuer: str | None,
     client: httpx.AsyncClient,
+    resolve_dns_for_url_policy: bool,
 ) -> OAuthAuthorizationServerMetadata:
     last_error: Exception | None = None
     for metadata_url in authorization_server_metadata_urls(authorization_server_url):
         try:
+            validate_oauth_http_url(
+                metadata_url, resolve_dns=resolve_dns_for_url_policy
+            )
             response = await client.get(metadata_url)
             if response.status_code >= 400:
                 last_error = MCPOAuthDiscoveryError(
@@ -495,6 +518,10 @@ async def _fetch_authorization_server_metadata(
             if not isinstance(payload, dict):
                 raise ValueError("metadata response is not a JSON object")
             metadata = _parse_authorization_server_metadata(metadata_url, payload)
+            _validate_authorization_server_endpoints(
+                metadata,
+                resolve_dns_for_url_policy=resolve_dns_for_url_policy,
+            )
             _validate_issuer(
                 selected_authorization_server=authorization_server_url,
                 metadata=metadata,
@@ -544,6 +571,17 @@ def _parse_authorization_server_metadata(
             payload.get("client_id_metadata_document_supported")
         ),
         raw=payload,
+    )
+
+
+def _validate_authorization_server_endpoints(
+    metadata: OAuthAuthorizationServerMetadata, *, resolve_dns_for_url_policy: bool
+) -> None:
+    validate_oauth_http_url(
+        metadata.authorization_endpoint, resolve_dns=resolve_dns_for_url_policy
+    )
+    validate_oauth_http_url(
+        metadata.token_endpoint, resolve_dns=resolve_dns_for_url_policy
     )
 
 
@@ -638,6 +676,9 @@ async def _refresh_mcp_oauth_grant(
         )
 
     try:
+        validate_oauth_http_url(
+            str(oauth_client.token_endpoint), resolve_dns=client is None
+        )
         request_kwargs: dict[str, Any] = {
             "data": data,
             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
@@ -650,13 +691,15 @@ async def _refresh_mcp_oauth_grant(
                 **request_kwargs,
             )
         else:
-            async with httpx.AsyncClient(timeout=10.0) as owned_client:
+            async with httpx.AsyncClient(
+                timeout=10.0, follow_redirects=True
+            ) as owned_client:
                 response = await owned_client.post(
                     str(oauth_client.token_endpoint),
                     **request_kwargs,
                 )
         payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
+    except (MCPOAuthDiscoveryError, httpx.HTTPError, ValueError) as exc:
         raise MCPOAuthRuntimeError("token_refresh_failed", str(exc)) from exc
 
     if (
@@ -758,7 +801,86 @@ def _url_comparison_key(value: str) -> str:
     if not parts.scheme or not parts.netloc:
         return value.rstrip("/")
 
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    hostname = (parts.hostname or "").lower()
+    if port and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        netloc = f"{hostname}:{port}"
+    else:
+        netloc = hostname
+
     path = parts.path.rstrip("/")
-    return urlunsplit(
-        (parts.scheme.lower(), parts.netloc.lower(), path, parts.query, "")
-    )
+    return urlunsplit((scheme, netloc, path, parts.query, ""))
+
+
+def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
+    """Reject OAuth metadata/token URLs that can target local infrastructure.
+
+    Production discovery creates its own HTTP client, so it resolves DNS and
+    blocks private, loopback, link-local, reserved, multicast, and unspecified
+    addresses before connecting. Unit tests often pass a MockTransport-backed
+    client for synthetic domains; those still get literal IP / localhost checks
+    without turning tests into live DNS lookups.
+    """
+    parts = urlsplit(value)
+    if parts.scheme.lower() not in {"http", "https"} or not parts.hostname:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth metadata URL must be an absolute HTTP(S) URL",
+        )
+    if parts.username or parts.password:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth metadata URL must not include userinfo",
+        )
+
+    hostname = parts.hostname.rstrip(".").lower()
+    _reject_blocked_host(hostname)
+    if not resolve_dns:
+        return
+
+    try:
+        addresses = socket.getaddrinfo(
+            hostname,
+            parts.port or (443 if parts.scheme.lower() == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    except OSError as exc:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            f"Could not resolve OAuth metadata host: {hostname}",
+        ) from exc
+
+    for address in addresses:
+        sockaddr = address[4]
+        if sockaddr:
+            _reject_blocked_host(str(sockaddr[0]))
+
+
+def _reject_blocked_host(hostname: str) -> None:
+    if hostname in {"localhost", "ip6-localhost"}:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth metadata host must not resolve to local addresses",
+        )
+    try:
+        ip_address = ipaddress.ip_address(hostname)
+    except ValueError:
+        return
+    if (
+        ip_address.is_private
+        or ip_address.is_loopback
+        or ip_address.is_link_local
+        or ip_address.is_multicast
+        or ip_address.is_reserved
+        or ip_address.is_unspecified
+    ):
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "OAuth metadata host must not resolve to local addresses",
+        )

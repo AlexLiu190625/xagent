@@ -13,7 +13,7 @@ import secrets
 import shlex
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, Any, Callable, Dict, List, Optional, Union, cast
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
@@ -36,6 +36,7 @@ from ..services.mcp_oauth import (
     MCPOAuthDiscoveryError,
     discover_mcp_oauth_metadata,
     select_mcp_oauth_grants,
+    validate_oauth_http_url,
 )
 
 logger = logging.getLogger(__name__)
@@ -271,6 +272,7 @@ def _safe_mcp_oauth_redirect_after(value: str | None) -> str:
         or parsed.netloc
         or not value.startswith("/")
         or value.startswith("//")
+        or value.startswith("/\\")
     ):
         return "/mcp"
     return value
@@ -278,6 +280,15 @@ def _safe_mcp_oauth_redirect_after(value: str | None) -> str:
 
 def _default_resource_owner_key(user_id: int) -> str:
     return f"xagent:user:{user_id}"
+
+
+def _oauth_authorization_url(endpoint: str, params: dict[str, str]) -> str:
+    parts = urlsplit(endpoint)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query.update(params)
+    return urlunsplit(
+        (parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)
+    )
 
 
 def _split_scope(scope: str | None) -> list[str]:
@@ -541,6 +552,7 @@ async def _exchange_mcp_oauth_code(
         )
 
     try:
+        validate_oauth_http_url(str(client.token_endpoint), resolve_dns=True)
         post_kwargs: dict[str, Any] = {
             "data": data,
             "headers": {"Content-Type": "application/x-www-form-urlencoded"},
@@ -550,7 +562,7 @@ async def _exchange_mcp_oauth_code(
         async with httpx.AsyncClient(timeout=10.0) as http_client:
             response = await http_client.post(str(client.token_endpoint), **post_kwargs)
         payload = response.json()
-    except (httpx.HTTPError, ValueError) as exc:
+    except (MCPOAuthDiscoveryError, httpx.HTTPError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "token_exchange_failed", "message": str(exc)},
@@ -2124,12 +2136,8 @@ async def connect_mcp_oauth(
     }
     if selected_scope:
         params["scope"] = selected_scope
-    separator = (
-        "&" if "?" in discovery.authorization_server.authorization_endpoint else "?"
-    )
-    authorization_url = (
-        f"{discovery.authorization_server.authorization_endpoint}"
-        f"{separator}{urlencode(params)}"
+    authorization_url = _oauth_authorization_url(
+        discovery.authorization_server.authorization_endpoint, params
     )
     if accept and "application/json" in accept.lower():
         return {"authorization_url": authorization_url}

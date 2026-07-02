@@ -1047,6 +1047,15 @@ class TestWebToolConfigMCPAuth:
             **(headers or {}),
             "Authorization": f"Bearer {auth['bearer_token']}",
         }
+        server.to_connection_dict.side_effect = lambda: {
+            "name": server.name,
+            "transport": server.transport,
+            "url": server.url,
+            "headers": server._merge_auth_headers(
+                server.headers,
+                server._decrypt_auth_config(server.auth),
+            ),
+        }
 
         db = MagicMock()
         db.query.return_value.join.return_value.filter.return_value.all.return_value = [

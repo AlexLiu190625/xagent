@@ -369,6 +369,9 @@ async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
+    monkeypatch.setattr(
+        mcp_oauth_service, "validate_oauth_http_url", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
 
     configs, cfg = await _load_configs(db, user)
@@ -414,6 +417,9 @@ async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fal
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
+    monkeypatch.setattr(
+        mcp_oauth_service, "validate_oauth_http_url", lambda *args, **kwargs: None
+    )
     monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
 
     configs, cfg = await _load_configs(db, user)

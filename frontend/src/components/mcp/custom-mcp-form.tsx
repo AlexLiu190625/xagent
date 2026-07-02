@@ -217,10 +217,19 @@ export function CustomMcpForm({
       if (popup) {
         popup.location.href = data.authorization_url
       } else {
-        window.open(data.authorization_url, "_blank", "noopener,noreferrer")
+        popup = window.open(data.authorization_url, "_blank", "noopener,noreferrer")
       }
-      setTimeout(() => {
-        loadOAuthStatus()
+      const startedAt = Date.now()
+      const maxWaitMs = 5 * 60 * 1000
+      const intervalId = window.setInterval(async () => {
+        const expired = Date.now() - startedAt >= maxWaitMs
+        const stillOpen = popup && !popup.closed
+        if (stillOpen && !expired) {
+          await loadOAuthStatus()
+          return
+        }
+        window.clearInterval(intervalId)
+        await loadOAuthStatus()
         onOAuthStatusChange?.()
       }, 3000)
     } catch (error) {
@@ -263,7 +272,7 @@ export function CustomMcpForm({
   )
 
   // Track original masked values to restore them on blur if empty
-  const [originalAuth] = useState<{
+  const [originalAuth, setOriginalAuth] = useState<{
     bearer_token?: string;
     api_key_value?: string;
     client_secret?: string;
@@ -272,6 +281,26 @@ export function CustomMcpForm({
     api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : undefined,
     client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : undefined,
   })
+
+  useEffect(() => {
+    setOriginalAuth({
+      bearer_token: mcpFormData.config?.auth?.bearer_token === '********' ? '********' : undefined,
+      api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : undefined,
+      client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : undefined,
+    })
+  }, [serverId])
+
+  useEffect(() => {
+    setOriginalAuth((prev) => ({
+      bearer_token: mcpFormData.config?.auth?.bearer_token === '********' ? '********' : prev.bearer_token,
+      api_key_value: mcpFormData.config?.auth?.api_key_value === '********' ? '********' : prev.api_key_value,
+      client_secret: mcpFormData.config?.auth?.client_secret === '********' ? '********' : prev.client_secret,
+    }))
+  }, [
+    mcpFormData.config?.auth?.bearer_token,
+    mcpFormData.config?.auth?.api_key_value,
+    mcpFormData.config?.auth?.client_secret,
+  ])
 
   const syncHeaders = (newList: { key: string, value: string }[]) => {
     setHeadersList(newList)

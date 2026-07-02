@@ -3,6 +3,7 @@ import pytest
 
 from xagent.web.services.mcp_oauth import (
     MCPOAuthDiscoveryError,
+    _same_url,
     authorization_server_metadata_urls,
     discover_mcp_oauth_metadata,
     parse_www_authenticate_bearer,
@@ -36,6 +37,94 @@ def test_authorization_server_metadata_urls_for_path_issuer():
         "https://auth.example.com/.well-known/openid-configuration/org1",
         "https://auth.example.com/org1/.well-known/openid-configuration",
     )
+
+
+def test_url_comparison_normalizes_default_ports():
+    assert _same_url("https://auth.example.com:443", "https://AUTH.example.com")
+    assert _same_url("http://auth.example.com:80/path/", "http://auth.example.com/path")
+    assert not _same_url("https://auth.example.com:8443", "https://auth.example.com")
+
+
+@pytest.mark.asyncio
+async def test_discover_rejects_loopback_endpoint_before_request():
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await discover_mcp_oauth_metadata(
+                "http://127.0.0.1:8500/mcp", client=client
+            )
+
+    assert exc.value.code == "invalid_resource"
+    assert requested_urls == []
+
+
+@pytest.mark.asyncio
+async def test_discover_rejects_link_local_resource_metadata_before_request():
+    requested_urls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        if str(request.url) == "https://mcp.example.com/mcp":
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": 'Bearer resource_metadata="http://169.254.169.254/latest/meta-data"'
+                },
+            )
+        return httpx.Response(200)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await discover_mcp_oauth_metadata(
+                "https://mcp.example.com/mcp", client=client
+            )
+
+    assert exc.value.code == "invalid_resource"
+    assert requested_urls == ["https://mcp.example.com/mcp"]
+
+
+@pytest.mark.asyncio
+async def test_discover_rejects_invalid_authorization_endpoint_metadata():
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://mcp.example.com/mcp":
+            return httpx.Response(401)
+        if (
+            str(request.url)
+            == "https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"],
+                },
+            )
+        if (
+            str(request.url)
+            == "https://auth.example.com/.well-known/oauth-authorization-server"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://auth.example.com",
+                    "authorization_endpoint": "javascript:alert(1)",
+                    "token_endpoint": "https://auth.example.com/token",
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await discover_mcp_oauth_metadata(
+                "https://mcp.example.com/mcp", client=client
+            )
+
+    assert exc.value.code == "invalid_resource"
 
 
 @pytest.mark.asyncio
