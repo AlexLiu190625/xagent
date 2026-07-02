@@ -88,6 +88,7 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
 
         assert {
             "mcp_server_id",
+            "lookup_hash",
             "issuer",
             "authorization_endpoint",
             "token_endpoint",
@@ -99,6 +100,7 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
             "mcp_server_id",
             "user_id",
             "mcp_oauth_client_id",
+            "lookup_hash",
             "resource_owner_key",
             "issuer",
             "resource",
@@ -146,10 +148,20 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
         assert "ix_mcp_oauth_flow_states_state" not in state_indexes
 
         grant_unique_constraints = {
-            constraint["name"]
+            constraint["name"]: tuple(constraint["column_names"])
             for constraint in inspector.get_unique_constraints("mcp_oauth_grants")
         }
-        assert "uq_mcp_oauth_grants_lookup" in grant_unique_constraints
+        assert grant_unique_constraints["uq_mcp_oauth_grants_lookup"] == (
+            "lookup_hash",
+        )
+
+        client_unique_constraints = {
+            constraint["name"]: tuple(constraint["column_names"])
+            for constraint in inspector.get_unique_constraints("mcp_oauth_clients")
+        }
+        assert client_unique_constraints[
+            "uq_mcp_oauth_clients_server_issuer_client"
+        ] == ("lookup_hash",)
 
         grant_foreign_keys = inspector.get_foreign_keys("mcp_oauth_grants")
         constrained_columns = {

@@ -45,9 +45,7 @@ def upgrade() -> None:
         constraints = [
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint(
-                "mcp_server_id",
-                "issuer",
-                "client_id",
+                "lookup_hash",
                 name="uq_mcp_oauth_clients_server_issuer_client",
             ),
         ]
@@ -62,6 +60,7 @@ def upgrade() -> None:
             "mcp_oauth_clients",
             sa.Column("id", sa.Integer(), nullable=False),
             sa.Column("mcp_server_id", sa.Integer(), nullable=False),
+            sa.Column("lookup_hash", sa.String(length=64), nullable=False),
             sa.Column("issuer", sa.String(length=1000), nullable=False),
             sa.Column("authorization_endpoint", sa.String(length=1000), nullable=False),
             sa.Column("token_endpoint", sa.String(length=1000), nullable=False),
@@ -94,13 +93,7 @@ def upgrade() -> None:
         constraints = [
             sa.PrimaryKeyConstraint("id"),
             sa.UniqueConstraint(
-                "mcp_server_id",
-                "user_id",
-                "resource_owner_key",
-                "mcp_oauth_client_id",
-                "issuer",
-                "resource",
-                "scope",
+                "lookup_hash",
                 name="uq_mcp_oauth_grants_lookup",
             ),
         ]
@@ -128,6 +121,7 @@ def upgrade() -> None:
             sa.Column("mcp_server_id", sa.Integer(), nullable=False),
             sa.Column("user_id", sa.Integer(), nullable=False),
             sa.Column("mcp_oauth_client_id", sa.Integer(), nullable=False),
+            sa.Column("lookup_hash", sa.String(length=64), nullable=False),
             sa.Column("resource_owner_key", sa.String(length=512), nullable=False),
             sa.Column("issuer", sa.String(length=1000), nullable=False),
             sa.Column("resource", sa.String(length=1000), nullable=False),

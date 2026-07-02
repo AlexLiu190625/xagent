@@ -8,6 +8,10 @@ from sqlalchemy.orm import sessionmaker
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer
+from xagent.web.models.mcp_oauth import (
+    mcp_oauth_client_lookup_hash,
+    mcp_oauth_grant_lookup_hash,
+)
 from xagent.web.models.user import User
 
 
@@ -81,10 +85,15 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     db_session.commit()
 
     inspector = inspect(db_session.bind)
+    client_columns = {
+        column["name"] for column in inspector.get_columns("mcp_oauth_clients")
+    }
     grant_columns = {
         column["name"] for column in inspector.get_columns("mcp_oauth_grants")
     }
+    assert "lookup_hash" in client_columns
     assert "metadata" in grant_columns
+    assert "lookup_hash" in grant_columns
     grant_column_types = {
         column["name"]: column["type"]
         for column in inspector.get_columns("mcp_oauth_grants")
@@ -99,6 +108,22 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     assert stored_grant.resource_owner_key == "external:customer:resource-owner-a"
     assert stored_grant.metadata_json == {"resource": "https://mcp.example.com/mcp"}
     assert stored_grant.mcp_server.id == server.id
+    assert client.lookup_hash == mcp_oauth_client_lookup_hash(
+        server.id,
+        "https://auth.example.com",
+        "xagent-client",
+    )
+    assert len(client.lookup_hash) == 64
+    assert stored_grant.lookup_hash == mcp_oauth_grant_lookup_hash(
+        server.id,
+        user.id,
+        "external:customer:resource-owner-a",
+        client.id,
+        "https://auth.example.com",
+        "https://mcp.example.com/mcp",
+        "records.read",
+    )
+    assert len(stored_grant.lookup_hash) == 64
 
 
 def test_mcp_oauth_grant_lookup_uniqueness_includes_resource_owner_key(db_session):

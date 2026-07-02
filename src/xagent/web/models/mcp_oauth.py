@@ -1,11 +1,56 @@
 from __future__ import annotations
 
-from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text
+import hashlib
+from typing import Any
+
+from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, event
 from sqlalchemy.orm import relationship
 from sqlalchemy.schema import UniqueConstraint
 from sqlalchemy.sql import func
 
 from .database import Base
+
+
+def _lookup_hash(parts: tuple[object, ...]) -> str:
+    digest = hashlib.sha256()
+    for part in parts:
+        value = "" if part is None else str(part)
+        encoded = value.encode("utf-8")
+        digest.update(str(len(encoded)).encode("ascii"))
+        digest.update(b":")
+        digest.update(encoded)
+        digest.update(b";")
+    return digest.hexdigest()
+
+
+def mcp_oauth_client_lookup_hash(
+    mcp_server_id: object,
+    issuer: object,
+    client_id: object,
+) -> str:
+    return _lookup_hash((mcp_server_id, issuer, client_id))
+
+
+def mcp_oauth_grant_lookup_hash(
+    mcp_server_id: object,
+    user_id: object,
+    resource_owner_key: object,
+    mcp_oauth_client_id: object,
+    issuer: object,
+    resource: object,
+    scope: object,
+) -> str:
+    return _lookup_hash(
+        (
+            mcp_server_id,
+            user_id,
+            resource_owner_key,
+            mcp_oauth_client_id,
+            issuer,
+            resource,
+            scope,
+        )
+    )
 
 
 class MCPOAuthClient(Base):  # type: ignore
@@ -14,9 +59,7 @@ class MCPOAuthClient(Base):  # type: ignore
     __tablename__ = "mcp_oauth_clients"
     __table_args__ = (
         UniqueConstraint(
-            "mcp_server_id",
-            "issuer",
-            "client_id",
+            "lookup_hash",
             name="uq_mcp_oauth_clients_server_issuer_client",
         ),
     )
@@ -27,6 +70,7 @@ class MCPOAuthClient(Base):  # type: ignore
         ForeignKey("mcp_servers.id", ondelete="CASCADE"),
         nullable=False,
     )
+    lookup_hash = Column(String(64), nullable=False)
     issuer = Column(String(1000), nullable=False, index=True)
     authorization_endpoint = Column(String(1000), nullable=False)
     token_endpoint = Column(String(1000), nullable=False)
@@ -55,13 +99,7 @@ class MCPOAuthGrant(Base):  # type: ignore
     __tablename__ = "mcp_oauth_grants"
     __table_args__ = (
         UniqueConstraint(
-            "mcp_server_id",
-            "user_id",
-            "resource_owner_key",
-            "mcp_oauth_client_id",
-            "issuer",
-            "resource",
-            "scope",
+            "lookup_hash",
             name="uq_mcp_oauth_grants_lookup",
         ),
     )
@@ -81,6 +119,7 @@ class MCPOAuthGrant(Base):  # type: ignore
         nullable=False,
         index=True,
     )
+    lookup_hash = Column(String(64), nullable=False)
     resource_owner_key = Column(String(512), nullable=False)
     issuer = Column(String(1000), nullable=False)
     resource = Column(String(1000), nullable=False)
@@ -106,6 +145,44 @@ class MCPOAuthGrant(Base):  # type: ignore
             f"<MCPOAuthGrant(id={self.id}, mcp_server_id={self.mcp_server_id}, "
             f"user_id={self.user_id}, resource_owner_key='{self.resource_owner_key}')>"
         )
+
+
+def _set_client_lookup_hash(
+    _mapper: Any, _connection: Any, target: MCPOAuthClient
+) -> None:
+    setattr(
+        target,
+        "lookup_hash",
+        mcp_oauth_client_lookup_hash(
+            target.mcp_server_id,
+            target.issuer,
+            target.client_id,
+        ),
+    )
+
+
+def _set_grant_lookup_hash(
+    _mapper: Any, _connection: Any, target: MCPOAuthGrant
+) -> None:
+    setattr(
+        target,
+        "lookup_hash",
+        mcp_oauth_grant_lookup_hash(
+            target.mcp_server_id,
+            target.user_id,
+            target.resource_owner_key,
+            target.mcp_oauth_client_id,
+            target.issuer,
+            target.resource,
+            target.scope,
+        ),
+    )
+
+
+event.listen(MCPOAuthClient, "before_insert", _set_client_lookup_hash)
+event.listen(MCPOAuthClient, "before_update", _set_client_lookup_hash)
+event.listen(MCPOAuthGrant, "before_insert", _set_grant_lookup_hash)
+event.listen(MCPOAuthGrant, "before_update", _set_grant_lookup_hash)
 
 
 class MCPOAuthFlowState(Base):  # type: ignore
