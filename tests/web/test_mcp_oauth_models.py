@@ -27,7 +27,7 @@ def _create_user_and_server(db_session):
     user = User(id=1, username="alice", password_hash="hashed")
     server = MCPServer(
         id=10,
-        name="shiftcare_mcp",
+        name="tenant_records_mcp",
         managed="external",
         transport="streamable_http",
         url="https://mcp.example.com/mcp",

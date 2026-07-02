@@ -6,6 +6,7 @@ import pytest
 from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+    MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
     MCPOAuthDiscoveryError,
     SafeOAuthAsyncHTTPTransport,
     _same_url,
@@ -427,6 +428,50 @@ async def test_discover_rejects_invalid_authorization_endpoint_metadata():
             )
 
     assert exc.value.code == "invalid_resource"
+
+
+@pytest.mark.asyncio
+async def test_discover_rejects_metadata_values_that_cannot_fit_persistence():
+    oversized_issuer = "https://auth.example.com/" + (
+        "x" * MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "https://mcp.example.com/mcp":
+            return httpx.Response(401)
+        if (
+            str(request.url)
+            == "https://mcp.example.com/.well-known/oauth-protected-resource/mcp"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "resource": "https://mcp.example.com/mcp",
+                    "authorization_servers": ["https://auth.example.com"],
+                },
+            )
+        if (
+            str(request.url)
+            == "https://auth.example.com/.well-known/oauth-authorization-server"
+        ):
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": oversized_issuer,
+                    "authorization_endpoint": "https://auth.example.com/authorize",
+                    "token_endpoint": "https://auth.example.com/token",
+                },
+            )
+        return httpx.Response(404)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await discover_mcp_oauth_metadata(
+                "https://mcp.example.com/mcp", client=client
+            )
+
+    assert exc.value.code == "invalid_resource"
+    assert "issuer" in exc.value.message
 
 
 @pytest.mark.asyncio

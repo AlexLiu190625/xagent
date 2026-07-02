@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 MCP_OAUTH_HTTP_TIMEOUT_SECONDS = 10.0
 DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT = MCP_OAUTH_HTTP_TIMEOUT_SECONDS
 MCP_OAUTH_MAX_REDIRECTS = 5
+MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH = 1000
 MCP_OAUTH_SCOPE_MAX_LENGTH = 1000
+MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH = 50
 OAUTH_ERROR_MESSAGE_MAX_LENGTH = 500
 OAUTH_LOG_PAYLOAD_MAX_LENGTH = 2000
 OAUTH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -595,7 +597,14 @@ async def _refresh_runtime_grant_in_dedicated_session(  # noqa: PLR0913
                 locked_grant.refresh_token = encrypt_value(
                     str(token_data["refresh_token"])
                 )
-            locked_grant.token_type = str(token_data.get("token_type") or "Bearer")
+            try:
+                locked_grant.token_type = validate_mcp_oauth_persisted_value(
+                    str(token_data.get("token_type") or "Bearer"),
+                    field_name="token_type",
+                    max_length=MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
+                )
+            except MCPOAuthDiscoveryError as exc:
+                raise MCPOAuthRuntimeError("token_refresh_failed", exc.message) from exc
             if token_data.get("scope") is not None:
                 locked_grant.scope = refreshed_scope
             locked_grant.metadata_json = {
@@ -844,7 +853,7 @@ def _parse_protected_resource_metadata(
         )
     return MCPProtectedResourceMetadata(
         url=metadata_url,
-        resource=_optional_string(payload.get("resource")),
+        resource=_optional_string(payload.get("resource"), field_name="resource"),
         authorization_servers=authorization_servers,
         scopes_supported=_string_tuple(payload.get("scopes_supported")),
         raw=payload,
@@ -862,7 +871,9 @@ def _parse_authorization_server_metadata(
         issuer=issuer,
         authorization_endpoint=authorization_endpoint,
         token_endpoint=token_endpoint,
-        registration_endpoint=_optional_string(payload.get("registration_endpoint")),
+        registration_endpoint=_optional_string(
+            payload.get("registration_endpoint"), field_name="registration_endpoint"
+        ),
         client_id_metadata_document_supported=bool(
             payload.get("client_id_metadata_document_supported")
         ),
@@ -1045,6 +1056,21 @@ def normalize_mcp_oauth_scope(value: Any) -> str:
     return scope
 
 
+def validate_mcp_oauth_persisted_value(
+    value: str,
+    *,
+    field_name: str,
+    max_length: int = MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
+) -> str:
+    """Validate a string that will be stored in a bounded OAuth column."""
+    if len(value) > max_length:
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            f"MCP OAuth {field_name} must be at most {max_length} characters",
+        )
+    return value
+
+
 def oauth_token_expires_at(token_data: dict[str, Any]) -> datetime | None:
     """Map OAuth token response expiry into stored grant expiry.
 
@@ -1152,11 +1178,13 @@ def _required_string(payload: dict[str, Any], key: str) -> str:
             "unsupported_auth_server",
             f"Authorization server metadata missing required field '{key}'",
         )
-    return value
+    return validate_mcp_oauth_persisted_value(value, field_name=key)
 
 
-def _optional_string(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
+def _optional_string(value: Any, *, field_name: str) -> str | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return validate_mcp_oauth_persisted_value(value, field_name=field_name)
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:
