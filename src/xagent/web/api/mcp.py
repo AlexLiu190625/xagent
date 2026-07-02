@@ -2243,7 +2243,6 @@ async def mcp_oauth_callback(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_state", "message": "Missing OAuth state"},
         )
-    _validate_mcp_oauth_state_cookie(request, state_value)
     flow_state = (
         db.query(MCPOAuthFlowState)
         .filter(MCPOAuthFlowState.state == state_value)
@@ -2253,6 +2252,20 @@ async def mcp_oauth_callback(
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_state", "message": "Invalid OAuth state"},
+        )
+    try:
+        _validate_mcp_oauth_state_cookie(request, state_value)
+    except HTTPException as exc:
+        cookie_detail: dict[str, Any] = (
+            exc.detail if isinstance(exc.detail, dict) else {}
+        )
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code=str(cookie_detail.get("code") or "invalid_state"),
+            message=str(
+                cookie_detail.get("message")
+                or "OAuth callback state did not match this browser session"
+            ),
         )
     state_error = _mcp_oauth_flow_state_error(db, flow_state)
     if state_error is not None:

@@ -441,7 +441,6 @@ async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch
     )
     assert pending_user in db.new
     assert pending_user.id is None
-    db.refresh(grant)
     assert decrypt_value(grant.access_token) == "fresh-access-token"
     assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
 

@@ -443,7 +443,7 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
             )
 
         try:
-            return await _refresh_runtime_grant_in_dedicated_session(
+            runtime_auth = await _refresh_runtime_grant_in_dedicated_session(
                 db,
                 grant_id=int(grant.id),
                 server_id=server_id,
@@ -455,6 +455,8 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
                 required_scopes=required_scopes,
                 client=client,
             )
+            db.expire(grant)
+            return runtime_auth
         except _RetryRuntimeGrantSelection as exc:
             db.expire_all()
             if attempt == 0:

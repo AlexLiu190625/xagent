@@ -871,16 +871,16 @@ async def test_callback_rejects_state_without_browser_session_cookie(
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?code=auth-code&state=missing-cookie-state",
-                bind_oauth_state_cookie=False,
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request(
+            "/api/mcp/oauth/callback?code=auth-code&state=missing-cookie-state",
+            bind_oauth_state_cookie=False,
+        ),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "invalid_state"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_state"]
     assert db.query(MCPOAuthGrant).count() == 0
 
 
