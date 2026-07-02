@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import ipaddress
 import re
 import socket
@@ -451,7 +452,9 @@ async def _probe_authorization_challenge(
     resolve_dns_for_url_policy: bool,
 ) -> MCPAuthorizationChallenge | None:
     try:
-        validate_oauth_http_url(endpoint_url, resolve_dns=resolve_dns_for_url_policy)
+        await validate_oauth_http_url(
+            endpoint_url, resolve_dns=resolve_dns_for_url_policy
+        )
         response = await client.get(endpoint_url, headers=headers)
     except httpx.HTTPError as exc:
         raise MCPOAuthDiscoveryError(
@@ -471,7 +474,7 @@ async def _fetch_first_protected_resource_metadata(
     last_error: Exception | None = None
     for metadata_url in metadata_urls:
         try:
-            validate_oauth_http_url(
+            await validate_oauth_http_url(
                 metadata_url, resolve_dns=resolve_dns_for_url_policy
             )
             response = await client.get(metadata_url)
@@ -504,7 +507,7 @@ async def _fetch_authorization_server_metadata(
     last_error: Exception | None = None
     for metadata_url in authorization_server_metadata_urls(authorization_server_url):
         try:
-            validate_oauth_http_url(
+            await validate_oauth_http_url(
                 metadata_url, resolve_dns=resolve_dns_for_url_policy
             )
             response = await client.get(metadata_url)
@@ -518,7 +521,7 @@ async def _fetch_authorization_server_metadata(
             if not isinstance(payload, dict):
                 raise ValueError("metadata response is not a JSON object")
             metadata = _parse_authorization_server_metadata(metadata_url, payload)
-            _validate_authorization_server_endpoints(
+            await _validate_authorization_server_endpoints(
                 metadata,
                 resolve_dns_for_url_policy=resolve_dns_for_url_policy,
             )
@@ -574,13 +577,13 @@ def _parse_authorization_server_metadata(
     )
 
 
-def _validate_authorization_server_endpoints(
+async def _validate_authorization_server_endpoints(
     metadata: OAuthAuthorizationServerMetadata, *, resolve_dns_for_url_policy: bool
 ) -> None:
-    validate_oauth_http_url(
+    await validate_oauth_http_url(
         metadata.authorization_endpoint, resolve_dns=resolve_dns_for_url_policy
     )
-    validate_oauth_http_url(
+    await validate_oauth_http_url(
         metadata.token_endpoint, resolve_dns=resolve_dns_for_url_policy
     )
 
@@ -591,11 +594,14 @@ def _parse_bearer_challenge(header_value: str) -> MCPAuthorizationChallenge | No
         return None
 
     params_text = header_value[match.end() :].strip()
-    params = {
-        str(key).lower(): str(value)
-        for key, value in parse_keqv_list(parse_http_list(params_text)).items()
-        if value is not None
-    }
+    try:
+        params = {
+            str(key).lower(): str(value)
+            for key, value in parse_keqv_list(parse_http_list(params_text)).items()
+            if value is not None
+        }
+    except Exception:
+        return None
     return MCPAuthorizationChallenge(
         resource_metadata_url=params.get("resource_metadata"),
         scope=params.get("scope"),
@@ -676,7 +682,7 @@ async def _refresh_mcp_oauth_grant(
         )
 
     try:
-        validate_oauth_http_url(
+        await validate_oauth_http_url(
             str(oauth_client.token_endpoint), resolve_dns=client is None
         )
         request_kwargs: dict[str, Any] = {
@@ -818,7 +824,7 @@ def _url_comparison_key(value: str) -> str:
     return urlunsplit((scheme, netloc, path, parts.query, ""))
 
 
-def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
+async def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
     """Reject OAuth metadata/token URLs that can target local infrastructure.
 
     Production discovery creates its own HTTP client, so it resolves DNS and
@@ -845,10 +851,14 @@ def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
         return
 
     try:
-        addresses = socket.getaddrinfo(
+        loop = asyncio.get_running_loop()
+        addresses = await loop.run_in_executor(
+            None,
+            socket.getaddrinfo,
             hostname,
             parts.port or (443 if parts.scheme.lower() == "https" else 80),
-            type=socket.SOCK_STREAM,
+            socket.AF_UNSPEC,
+            socket.SOCK_STREAM,
         )
     except OSError as exc:
         raise MCPOAuthDiscoveryError(

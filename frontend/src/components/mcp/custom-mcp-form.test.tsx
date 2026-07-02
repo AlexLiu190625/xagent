@@ -235,6 +235,56 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(onOAuthStatusChange).toHaveBeenCalledTimes(1)
   })
 
+  it("clears OAuth polling when the form unmounts", async () => {
+    const popup = {
+      closed: false,
+      opener: window,
+      close: vi.fn(),
+      location: { href: "" },
+    }
+    vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url === "http://api.local/api/mcp/42/oauth/status") {
+        return Promise.resolve(okJson({ server_id: 42, grants: [] }))
+      }
+      if (url === "http://api.local/api/mcp/42/oauth/connect") {
+        return Promise.resolve(
+          okJson({ authorization_url: "https://auth.example.com/authorize" })
+        )
+      }
+      throw new Error(`Unhandled apiRequest: ${url}`)
+    })
+
+    const { unmount } = renderMcpOAuthForm()
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(
+        "http://api.local/api/mcp/42/oauth/status"
+      )
+    })
+
+    vi.useFakeTimers()
+    fireEvent.click(screen.getByText("tools.mcp.dialog.oauthConnect"))
+    await act(async () => {
+      await flushPromises()
+    })
+
+    const statusCallsBeforeUnmount = apiRequestMock.mock.calls.filter(([url]) =>
+      String(url).endsWith("/oauth/status")
+    ).length
+
+    unmount()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3000)
+    })
+
+    expect(
+      apiRequestMock.mock.calls.filter(([url]) => String(url).endsWith("/oauth/status"))
+        .length
+    ).toBe(statusCallsBeforeUnmount)
+  })
+
   it("restores asynchronously loaded masked OAuth client secrets on blur", async () => {
     const setMcpFormData = vi.fn()
     apiRequestMock.mockResolvedValue(okJson({ server_id: 42, grants: [] }))

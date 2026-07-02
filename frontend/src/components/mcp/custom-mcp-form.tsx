@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Button } from "@/components/ui/button"
@@ -73,12 +73,22 @@ export function CustomMcpForm({
   const [oauthStatus, setOauthStatus] = useState<McpOAuthStatus | null>(null)
   const [oauthStatusLoading, setOauthStatusLoading] = useState(false)
   const [oauthAction, setOauthAction] = useState<string | null>(null)
+  const pollingIntervalRef = useRef<number | null>(null)
 
   // Default to sse if not set
   const transport = mcpFormData.transport || "sse"
   const authType = mcpFormData.config?.auth?.type || "none"
   const isHttpMcpTransport = transport === "streamable_http" || transport === "sse"
   const isMcpOAuth = authType === "mcp_oauth"
+
+  const clearOAuthPolling = useCallback(() => {
+    if (pollingIntervalRef.current !== null && typeof window !== "undefined") {
+      window.clearInterval(pollingIntervalRef.current)
+      pollingIntervalRef.current = null
+    }
+  }, [])
+
+  useEffect(() => clearOAuthPolling, [clearOAuthPolling])
 
   const updateConfig = (key: string, value: unknown) => {
     setMcpFormData((prev: MCPServerFormData) => ({
@@ -191,6 +201,7 @@ export function CustomMcpForm({
     setOauthAction("connect")
     let popup: Window | null = null
     try {
+      clearOAuthPolling()
       if (typeof window !== "undefined") {
         popup = window.open("about:blank", "_blank")
         if (popup) popup.opener = null
@@ -228,10 +239,11 @@ export function CustomMcpForm({
           await loadOAuthStatus()
           return
         }
-        window.clearInterval(intervalId)
+        clearOAuthPolling()
         await loadOAuthStatus()
         onOAuthStatusChange?.()
       }, 3000)
+      pollingIntervalRef.current = intervalId
     } catch (error) {
       if (popup) popup.close()
       console.error("Failed to start MCP OAuth authorization:", error)

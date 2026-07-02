@@ -1,6 +1,7 @@
 import httpx
 import pytest
 
+from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
     MCPOAuthDiscoveryError,
     _same_url,
@@ -8,6 +9,7 @@ from xagent.web.services.mcp_oauth import (
     discover_mcp_oauth_metadata,
     parse_www_authenticate_bearer,
     protected_resource_metadata_urls,
+    validate_oauth_http_url,
 )
 
 
@@ -22,6 +24,15 @@ def test_parse_www_authenticate_bearer_challenge():
         == "https://mcp.example.com/.well-known/oauth-protected-resource"
     )
     assert challenge.scope == "records.read records.write"
+
+
+def test_parse_www_authenticate_bearer_ignores_malformed_parameters(monkeypatch):
+    def raise_malformed(_value):
+        raise ValueError("malformed")
+
+    monkeypatch.setattr(mcp_oauth_service, "parse_http_list", raise_malformed)
+
+    assert parse_www_authenticate_bearer("Bearer malformed") is None
 
 
 def test_protected_resource_metadata_urls_use_endpoint_path_before_root():
@@ -43,6 +54,35 @@ def test_url_comparison_normalizes_default_ports():
     assert _same_url("https://auth.example.com:443", "https://AUTH.example.com")
     assert _same_url("http://auth.example.com:80/path/", "http://auth.example.com/path")
     assert not _same_url("https://auth.example.com:8443", "https://auth.example.com")
+
+
+@pytest.mark.asyncio
+async def test_oauth_url_dns_resolution_runs_in_executor(monkeypatch):
+    calls: list[tuple[object, object, tuple[object, ...]]] = []
+
+    class FakeLoop:
+        async def run_in_executor(self, executor, func, *args):
+            calls.append((executor, func, args))
+            return [
+                (
+                    0,
+                    0,
+                    0,
+                    "",
+                    ("93.184.216.34", 443),
+                )
+            ]
+
+    monkeypatch.setattr(
+        mcp_oauth_service.asyncio,
+        "get_running_loop",
+        lambda: FakeLoop(),
+    )
+
+    await validate_oauth_http_url("https://auth.example.com/token", resolve_dns=True)
+
+    assert len(calls) == 1
+    assert calls[0][1] is mcp_oauth_service.socket.getaddrinfo
 
 
 @pytest.mark.asyncio

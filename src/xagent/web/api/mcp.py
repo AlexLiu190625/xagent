@@ -552,7 +552,7 @@ async def _exchange_mcp_oauth_code(
         )
 
     try:
-        validate_oauth_http_url(str(client.token_endpoint), resolve_dns=True)
+        await validate_oauth_http_url(str(client.token_endpoint), resolve_dns=True)
         post_kwargs: dict[str, Any] = {
             "data": data,
             "headers": {"Content-Type": "application/x-www-form-urlencoded"},

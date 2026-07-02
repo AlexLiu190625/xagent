@@ -558,10 +558,11 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     def async_client_factory(*args, **kwargs):
         return real_async_client(transport=httpx.MockTransport(handler))
 
+    async def skip_url_policy(*args, **kwargs):
+        return None
+
     monkeypatch.setattr(mcp_api.httpx, "AsyncClient", async_client_factory)
-    monkeypatch.setattr(
-        mcp_api, "validate_oauth_http_url", lambda *args, **kwargs: None
-    )
+    monkeypatch.setattr(mcp_api, "validate_oauth_http_url", skip_url_policy)
 
     response = await mcp_oauth_callback(
         _request("/api/mcp/oauth/callback?code=auth-code&state=state-123"),
