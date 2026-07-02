@@ -480,6 +480,33 @@ def _validate_mcp_oauth_callback_issuer(
         )
 
 
+def _claim_mcp_oauth_flow_state(db: Session, flow_state: MCPOAuthFlowState) -> None:
+    claimed_at = _utc_now()
+    updated = (
+        db.query(MCPOAuthFlowState)
+        .filter(
+            MCPOAuthFlowState.id == flow_state.id,
+            MCPOAuthFlowState.consumed_at.is_(None),
+            MCPOAuthFlowState.expires_at > claimed_at,
+        )
+        .update(
+            {MCPOAuthFlowState.consumed_at: claimed_at},
+            synchronize_session=False,
+        )
+    )
+    if updated != 1:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "code": "state_already_consumed",
+                "message": "OAuth state consumed",
+            },
+        )
+    db.commit()
+    db.refresh(flow_state)
+
+
 async def _exchange_mcp_oauth_code(
     *,
     client: MCPOAuthClient,
@@ -1950,6 +1977,7 @@ async def mcp_oauth_callback(
         client=client,
         flow_state=flow_state,
     )
+    _claim_mcp_oauth_flow_state(db, flow_state)
     if error:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -1967,7 +1995,6 @@ async def mcp_oauth_callback(
         resource=str(flow_state.resource),
     )
     _upsert_mcp_oauth_grant(db, flow_state=flow_state, token_data=token_data)
-    flow_state.consumed_at = _utc_now()
     db.commit()
 
     return RedirectResponse(_safe_mcp_oauth_redirect_after(flow_state.redirect_after))

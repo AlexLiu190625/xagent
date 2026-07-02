@@ -758,6 +758,19 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
 
     assert exc.value.detail["code"] == "token_exchange_failed"
     assert db.query(MCPOAuthGrant).count() == 0
+    flow_state = db.query(MCPOAuthFlowState).filter_by(state="bad-token-state").one()
+    assert flow_state.consumed_at is not None
+
+    async def fail_exchange(**kwargs):
+        pytest.fail("terminal failed state must not be exchanged again")
+
+    monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
+    with pytest.raises(mcp_api.HTTPException) as exc:
+        await mcp_oauth_callback(
+            _request("/api/mcp/oauth/callback?code=auth-code&state=bad-token-state"),
+            db,
+        )
+    assert exc.value.detail["code"] == "state_already_consumed"
 
 
 @pytest.mark.asyncio
