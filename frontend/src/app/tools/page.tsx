@@ -980,6 +980,8 @@ export default function ToolsPage() {
                       mcpFormData={mcpFormData}
                       setMcpFormData={setMcpFormData}
                       transports={transports}
+                      serverId={editingServer?.id}
+                      onOAuthStatusChange={loadMCPServers}
                     />
                   </>
                 )}

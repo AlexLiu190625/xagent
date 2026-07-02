@@ -756,6 +756,8 @@ export function ConnectMcpDialog({
                     mcpFormData={mcpFormData}
                     setMcpFormData={setMcpFormData}
                     transports={transports}
+                    serverId={editingCustomServerId}
+                    onOAuthStatusChange={loadApps}
                   />
                 </div>
                 <div className="flex justify-end gap-3 mt-8">

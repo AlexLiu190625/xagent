@@ -48,7 +48,7 @@ def db_session(tmp_path):
     engine.dispose()
 
 
-def _request(path: str) -> Request:
+def _request(path: str, headers: list[tuple[bytes, bytes]] | None = None) -> Request:
     parsed = urlparse(path)
     return Request(
         {
@@ -56,7 +56,7 @@ def _request(path: str) -> Request:
             "method": "GET",
             "path": parsed.path,
             "query_string": parsed.query.encode(),
-            "headers": [],
+            "headers": headers or [],
         }
     )
 
@@ -195,6 +195,36 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert client.client_id == "client-123"
     assert client.client_secret != "client-secret"
     assert decrypt_value(client.client_secret) == "client-secret"
+
+
+@pytest.mark.asyncio
+async def test_connect_can_return_authorization_url_json(db_session, monkeypatch):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+        accept="application/json",
+    )
+
+    assert isinstance(response, dict)
+    authorization_url = response["authorization_url"]
+    parsed = urlparse(authorization_url)
+    query = parse_qs(parsed.query)
+    assert f"{parsed.scheme}://{parsed.netloc}{parsed.path}" == (
+        "https://auth.example.com/authorize"
+    )
+    assert query["client_id"] == ["client-123"]
+    assert query["resource"] == ["https://mcp.example.com/mcp"]
+    assert db.query(MCPOAuthFlowState).count() == 1
 
 
 @pytest.mark.asyncio

@@ -5,18 +5,18 @@ Provides REST API endpoints for managing MCP server configurations
 in the web application.
 """
 
-import json
-import logging
 import base64
 import hashlib
+import json
+import logging
 import secrets
 import shlex
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Union, cast
+from typing import Annotated, Any, Callable, Dict, List, Optional, Union, cast
 from urllib.parse import urlencode, urlsplit
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
@@ -1985,13 +1985,14 @@ async def discover_mcp_oauth(
     return _mcp_oauth_discovery_response(discovery)
 
 
-@mcp_router.post("/{server_id}/oauth/connect")
+@mcp_router.post("/{server_id}/oauth/connect", response_model=None)
 async def connect_mcp_oauth(
     server_id: int,
     request_data: MCPOAuthConnectRequest,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
-) -> RedirectResponse:
+    accept: Annotated[str | None, Header()] = None,
+) -> RedirectResponse | dict[str, str]:
     """Start MCP OAuth Authorization Code + PKCE for the current user."""
     user_id = cast(int, current_user.id)
     _, server = _get_user_mcp_server_or_404(db, user_id=user_id, server_id=server_id)
@@ -2070,6 +2071,8 @@ async def connect_mcp_oauth(
         f"{discovery.authorization_server.authorization_endpoint}"
         f"{separator}{urlencode(params)}"
     )
+    if accept and "application/json" in accept.lower():
+        return {"authorization_url": authorization_url}
     return RedirectResponse(authorization_url, status_code=status.HTTP_303_SEE_OTHER)
 
 
