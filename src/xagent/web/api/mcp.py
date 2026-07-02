@@ -58,6 +58,7 @@ MCP_OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = 10 * 60
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
+MASKED_SECRET_VALUE = "********"
 
 
 # Pydantic models for API
@@ -560,7 +561,21 @@ def _upsert_mcp_oauth_client(
         )
         .first()
     )
-    encrypted_client_secret = encrypt_value(client_secret) if client_secret else None
+    encrypted_client_secret: str | None
+    if client_secret == MASKED_SECRET_VALUE:
+        if existing is None or not existing.client_secret:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail={
+                    "code": "invalid_resource",
+                    "message": "Masked MCP OAuth client_secret has no stored value",
+                },
+            )
+        encrypted_client_secret = str(existing.client_secret)
+    else:
+        encrypted_client_secret = (
+            encrypt_value(client_secret) if client_secret else None
+        )
     client = existing or MCPOAuthClient(
         mcp_server_id=server_id,
         issuer=issuer,
@@ -630,7 +645,33 @@ def _validate_mcp_oauth_callback_issuer(
         )
 
 
-def _claim_mcp_oauth_flow_state(db: Session, flow_state: MCPOAuthFlowState) -> None:
+def _mcp_oauth_flow_state_error(
+    db: Session, flow_state: MCPOAuthFlowState
+) -> tuple[str, str] | None:
+    if flow_state.consumed_at is not None:
+        return "state_already_consumed", "OAuth state consumed"
+    if _as_aware_utc(flow_state.expires_at) <= _utc_now():
+        return "expired_state", "OAuth state expired"
+    if (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == flow_state.user_id,
+            UserMCPServer.mcpserver_id == flow_state.mcp_server_id,
+            UserMCPServer.is_active,
+        )
+        .first()
+        is None
+    ):
+        return (
+            "invalid_state",
+            "OAuth state is no longer associated with MCP server access",
+        )
+    return None
+
+
+def _claim_mcp_oauth_flow_state(
+    db: Session, flow_state: MCPOAuthFlowState
+) -> tuple[str, str] | None:
     claimed_at = _utc_now()
     updated = (
         db.query(MCPOAuthFlowState)
@@ -646,15 +687,10 @@ def _claim_mcp_oauth_flow_state(db: Session, flow_state: MCPOAuthFlowState) -> N
     )
     if updated != 1:
         db.rollback()
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "state_already_consumed",
-                "message": "OAuth state consumed",
-            },
-        )
+        return "state_already_consumed", "OAuth state consumed"
     db.commit()
     db.refresh(flow_state)
+    return None
 
 
 async def _exchange_mcp_oauth_code(
@@ -1027,7 +1063,7 @@ def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> No
                 for key in SENSITIVE_AUTH_FIELDS:
                     if key in encrypted_auth and encrypted_auth[key]:
                         # If masked, retain the existing encrypted value from the database
-                        if encrypted_auth[key] == "********":
+                        if encrypted_auth[key] == MASKED_SECRET_VALUE:
                             existing_auth: Any = server.auth or {}
                             encrypted_auth[key] = existing_auth.get(key)
                         # Otherwise encrypt it if it isn't already encrypted
@@ -2215,35 +2251,13 @@ async def mcp_oauth_callback(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail={"code": "invalid_state", "message": "Invalid OAuth state"},
         )
-    if flow_state.consumed_at is not None:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "state_already_consumed",
-                "message": "OAuth state consumed",
-            },
-        )
-    if _as_aware_utc(flow_state.expires_at) <= _utc_now():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "expired_state", "message": "OAuth state expired"},
-        )
-    if (
-        db.query(UserMCPServer)
-        .filter(
-            UserMCPServer.user_id == flow_state.user_id,
-            UserMCPServer.mcpserver_id == flow_state.mcp_server_id,
-            UserMCPServer.is_active,
-        )
-        .first()
-        is None
-    ):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "invalid_state",
-                "message": "OAuth state is no longer associated with MCP server access",
-            },
+    state_error = _mcp_oauth_flow_state_error(db, flow_state)
+    if state_error is not None:
+        error_code, message = state_error
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code=error_code,
+            message=message,
         )
 
     client = (
@@ -2252,12 +2266,10 @@ async def mcp_oauth_callback(
         .first()
     )
     if not client:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail={
-                "code": "token_exchange_failed",
-                "message": "OAuth client metadata not found",
-            },
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code="token_exchange_failed",
+            message="OAuth client metadata not found",
         )
 
     _validate_mcp_oauth_callback_issuer(
@@ -2265,7 +2277,14 @@ async def mcp_oauth_callback(
         client=client,
         flow_state=flow_state,
     )
-    _claim_mcp_oauth_flow_state(db, flow_state)
+    claim_error = _claim_mcp_oauth_flow_state(db, flow_state)
+    if claim_error is not None:
+        error_code, message = claim_error
+        return _mcp_oauth_callback_error_redirect(
+            flow_state,
+            error_code=error_code,
+            message=message,
+        )
     if error:
         return _mcp_oauth_callback_error_redirect(
             flow_state,
@@ -2290,7 +2309,7 @@ async def mcp_oauth_callback(
         db.commit()
     except HTTPException as exc:
         db.rollback()
-        detail = exc.detail if isinstance(exc.detail, dict) else {}
+        detail: dict[str, Any] = exc.detail if isinstance(exc.detail, dict) else {}
         error_code = str(detail.get("code") or "token_exchange_failed")
         message = str(detail.get("message") or "MCP OAuth authorization failed")
         return _mcp_oauth_callback_error_redirect(
@@ -2308,7 +2327,7 @@ async def mcp_oauth_callback(
         )
 
     response = RedirectResponse(
-        _safe_mcp_oauth_redirect_after(flow_state.redirect_after)
+        _safe_mcp_oauth_redirect_after(str(flow_state.redirect_after))
     )
     _clear_mcp_oauth_state_cookie(response)
     return response

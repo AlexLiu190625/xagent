@@ -1,7 +1,7 @@
 "use client"
 
-import { useState, useEffect } from "react"
-import { useRouter } from "next/navigation"
+import { Suspense, useState, useEffect } from "react"
+import { useRouter, useSearchParams } from "next/navigation"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -110,8 +110,9 @@ const DEFAULT_PORTS: Record<Exclude<SqlDbType, 'sqlite'>, string> = {
   mssql: '1433',
 }
 
-export default function ToolsPage() {
+function ToolsPageContent() {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [tools, setTools] = useState<Tool[]>([])
   const [mcpServers, setMcpServers] = useState<MCPServer[]>([])
   const [configurableTools, setConfigurableTools] = useState<ConfigurableTool[]>([])
@@ -158,16 +159,16 @@ export default function ToolsPage() {
   const isAdmin = Boolean(user?.is_admin)
 
   useEffect(() => {
-    const nextParams = new URLSearchParams(window.location.search)
-    const oauthErrorMessage = nextParams.get("mcp_oauth_error_message")
+    const oauthErrorMessage = searchParams.get("mcp_oauth_error_message")
     if (!oauthErrorMessage) return
 
     toast.error(oauthErrorMessage)
+    const nextParams = new URLSearchParams(searchParams.toString())
     nextParams.delete("mcp_oauth_error")
     nextParams.delete("mcp_oauth_error_message")
     const nextQuery = nextParams.toString()
     router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
-  }, [router])
+  }, [router, searchParams])
 
   useEffect(() => {
     loadTools()
@@ -1325,6 +1326,14 @@ export default function ToolsPage() {
         }}
       />
     </div>
+  )
+}
+
+export default function ToolsPage() {
+  return (
+    <Suspense fallback={null}>
+      <ToolsPageContent />
+    </Suspense>
   )
 }
 

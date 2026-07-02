@@ -188,13 +188,13 @@ async def test_safe_oauth_transport_pins_resolved_ip_and_preserves_host(monkeypa
         async def aclose(self) -> None:
             return None
 
-    async def fake_resolve(value: str) -> str:
+    async def fake_resolve(value: str) -> list[str]:
         assert value == "https://auth.example.com/token"
-        return "93.184.216.34"
+        return ["93.184.216.34"]
 
     monkeypatch.setattr(
         mcp_oauth_service,
-        "_resolve_first_allowed_address",
+        "_resolve_allowed_addresses",
         fake_resolve,
     )
     transport = SafeOAuthAsyncHTTPTransport()
@@ -224,13 +224,13 @@ async def test_safe_oauth_transport_formats_resolved_ipv6_url(monkeypatch):
         async def aclose(self) -> None:
             return None
 
-    async def fake_resolve(value: str) -> str:
+    async def fake_resolve(value: str) -> list[str]:
         assert value == "https://auth.example.com/token"
-        return "2001:db8::1"
+        return ["2001:db8::1"]
 
     monkeypatch.setattr(
         mcp_oauth_service,
-        "_resolve_first_allowed_address",
+        "_resolve_allowed_addresses",
         fake_resolve,
     )
     transport = SafeOAuthAsyncHTTPTransport()
@@ -241,6 +241,43 @@ async def test_safe_oauth_transport_formats_resolved_ipv6_url(monkeypatch):
 
     assert response.status_code == 200
     assert captured == ["https://[2001:db8::1]/token"]
+
+
+@pytest.mark.asyncio
+async def test_safe_oauth_transport_falls_back_within_validated_addresses(monkeypatch):
+    requested_urls: list[str] = []
+
+    class CaptureTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            requested_urls.append(str(request.url))
+            if len(requested_urls) == 1:
+                raise httpx.ConnectError("first address unavailable", request=request)
+            return httpx.Response(200, json={"ok": True}, request=request)
+
+        async def aclose(self) -> None:
+            return None
+
+    async def fake_resolve(value: str) -> list[str]:
+        assert value == "https://auth.example.com/token"
+        return ["2001:db8::1", "93.184.216.34"]
+
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "_resolve_allowed_addresses",
+        fake_resolve,
+    )
+    transport = SafeOAuthAsyncHTTPTransport()
+    transport._transport = CaptureTransport()
+
+    async with httpx.AsyncClient(transport=transport) as client:
+        response = await client.get("https://auth.example.com/token")
+
+    assert response.status_code == 200
+    assert requested_urls == [
+        "https://[2001:db8::1]/token",
+        "https://93.184.216.34/token",
+    ]
+    assert str(response.request.url) == "https://auth.example.com/token"
 
 
 def test_safe_oauth_transport_disables_proxy_http2_and_keepalive(monkeypatch):

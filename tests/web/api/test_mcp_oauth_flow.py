@@ -374,6 +374,52 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert flow_state.mcp_oauth_client_id == client.id
 
 
+def test_upsert_oauth_client_preserves_existing_masked_client_secret(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    existing = _add_oauth_client(
+        db,
+        server,
+        client_secret=encrypt_value("client-secret"),
+        token_endpoint_auth_method="client_secret_post",
+    )
+    db.commit()
+
+    client = mcp_api._upsert_mcp_oauth_client(
+        db,
+        server_id=server.id,
+        discovery=_discovery(),
+        client_id="client-123",
+        client_secret=mcp_api.MASKED_SECRET_VALUE,
+        token_endpoint_auth_method="client_secret_basic",
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+    )
+
+    assert client.id == existing.id
+    assert decrypt_value(client.client_secret) == "client-secret"
+    assert client.token_endpoint_auth_method == "client_secret_basic"
+
+
+def test_upsert_oauth_client_rejects_masked_client_secret_without_existing_value(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    with pytest.raises(HTTPException) as exc:
+        mcp_api._upsert_mcp_oauth_client(
+            db,
+            server_id=server.id,
+            discovery=_discovery(),
+            client_id="client-123",
+            client_secret=mcp_api.MASKED_SECRET_VALUE,
+            token_endpoint_auth_method="client_secret_post",
+            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        )
+
+    assert exc.value.detail["code"] == "invalid_resource"
+
+
 @pytest.mark.asyncio
 async def test_connect_canonicalizes_scope_before_persisting_flow_state(
     db_session, monkeypatch
@@ -1169,13 +1215,13 @@ async def test_callback_rejects_state_replay(db_session):
     )
     db.commit()
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request("/api/mcp/oauth/callback?code=auth-code&state=used-state"),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=used-state"),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "state_already_consumed"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["state_already_consumed"]
 
 
 @pytest.mark.asyncio
@@ -1200,13 +1246,13 @@ async def test_callback_rejects_expired_state(db_session):
     )
     db.commit()
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request("/api/mcp/oauth/callback?code=auth-code&state=expired-state"),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=expired-state"),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "expired_state"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["expired_state"]
 
 
 @pytest.mark.asyncio
@@ -1235,15 +1281,13 @@ async def test_callback_rejects_state_after_user_loses_mcp_access(db_session):
     ).delete()
     db.commit()
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?code=auth-code&state=orphaned-access-state"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=orphaned-access-state"),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "invalid_state"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_state"]
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -1264,15 +1308,13 @@ async def test_callback_rejects_state_after_user_mcp_server_is_deactivated(
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
 
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request(
-                "/api/mcp/oauth/callback?code=auth-code&state=inactive-access-state"
-            ),
-            db,
-        )
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=inactive-access-state"),
+        db,
+    )
 
-    assert exc.value.detail["code"] == "invalid_state"
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["invalid_state"]
     assert db.query(MCPOAuthGrant).count() == 0
 
 
@@ -1336,12 +1378,12 @@ async def test_callback_reports_token_exchange_failure(db_session, monkeypatch):
         pytest.fail("terminal failed state must not be exchanged again")
 
     monkeypatch.setattr(mcp_api, "_exchange_mcp_oauth_code", fail_exchange)
-    with pytest.raises(mcp_api.HTTPException) as exc:
-        await mcp_oauth_callback(
-            _request("/api/mcp/oauth/callback?code=auth-code&state=bad-token-state"),
-            db,
-        )
-    assert exc.value.detail["code"] == "state_already_consumed"
+    response = await mcp_oauth_callback(
+        _request("/api/mcp/oauth/callback?code=auth-code&state=bad-token-state"),
+        db,
+    )
+    assert response.status_code == 307
+    assert _redirect_query(response)["mcp_oauth_error"] == ["state_already_consumed"]
 
 
 @pytest.mark.asyncio

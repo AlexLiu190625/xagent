@@ -134,20 +134,33 @@ class SafeOAuthAsyncHTTPTransport(httpx.AsyncBaseTransport):
     async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
         original_url = request.url
         original_host = request.headers.get("Host")
-        resolved_ip = await _resolve_first_allowed_address(str(original_url))
-        request.url = original_url.copy_with(host=resolved_ip)
-        request.headers["Host"] = _host_header_value(str(original_url))
-        if original_url.scheme == "https":
-            request.extensions["sni_hostname"] = _hostname_for_url(str(original_url))
-        try:
-            response = await self._transport.handle_async_request(request)
-        finally:
-            request.url = original_url
-            if original_host is None:
-                request.headers.pop("Host", None)
-            else:
-                request.headers["Host"] = original_host
-        return response
+        resolved_ips = await _resolve_allowed_addresses(str(original_url))
+        last_connect_error: httpx.TransportError | None = None
+        for index, resolved_ip in enumerate(resolved_ips):
+            request.url = original_url.copy_with(host=resolved_ip)
+            request.headers["Host"] = _host_header_value(str(original_url))
+            if original_url.scheme == "https":
+                request.extensions["sni_hostname"] = _hostname_for_url(
+                    str(original_url)
+                )
+            try:
+                return await self._transport.handle_async_request(request)
+            except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+                last_connect_error = exc
+                if index == len(resolved_ips) - 1:
+                    raise
+            finally:
+                request.url = original_url
+                if original_host is None:
+                    request.headers.pop("Host", None)
+                else:
+                    request.headers["Host"] = original_host
+        if last_connect_error is not None:
+            raise last_connect_error
+        raise MCPOAuthDiscoveryError(
+            "invalid_resource",
+            "Could not resolve OAuth metadata host",
+        )
 
     async def aclose(self) -> None:
         await self._transport.aclose()
@@ -1265,14 +1278,14 @@ async def validate_oauth_http_url(value: str, *, resolve_dns: bool) -> None:
     await _validate_and_resolve_oauth_http_url(value, resolve_dns=resolve_dns)
 
 
-async def _resolve_first_allowed_address(value: str) -> str:
+async def _resolve_allowed_addresses(value: str) -> list[str]:
     addresses = await _validate_and_resolve_oauth_http_url(value, resolve_dns=True)
     if not addresses:
         raise MCPOAuthDiscoveryError(
             "invalid_resource",
             "Could not resolve OAuth metadata host",
         )
-    return addresses[0]
+    return addresses
 
 
 async def _validate_and_resolve_oauth_http_url(
