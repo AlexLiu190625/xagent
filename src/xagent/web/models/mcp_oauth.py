@@ -71,7 +71,7 @@ class MCPOAuthClient(Base):  # type: ignore
         nullable=False,
     )
     lookup_hash = Column(String(64), nullable=False)
-    issuer = Column(String(1000), nullable=False, index=True)
+    issuer = Column(String(1000), nullable=False)
     authorization_endpoint = Column(String(1000), nullable=False)
     token_endpoint = Column(String(1000), nullable=False)
     client_id = Column(String(1000), nullable=False)

@@ -208,7 +208,6 @@ def upgrade() -> None:
         )
 
     for table_name, index_name, columns in (
-        ("mcp_oauth_clients", "ix_mcp_oauth_clients_issuer", ["issuer"]),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_user_id", ["user_id"]),
         (
             "mcp_oauth_grants",
@@ -248,7 +247,6 @@ def downgrade() -> None:
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_expires_at"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_mcp_oauth_client_id"),
         ("mcp_oauth_grants", "ix_mcp_oauth_grants_user_id"),
-        ("mcp_oauth_clients", "ix_mcp_oauth_clients_issuer"),
     ):
         if table_name in inspector.get_table_names() and index_name in _index_names(
             table_name

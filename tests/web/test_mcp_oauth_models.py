@@ -100,6 +100,10 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     }
     assert isinstance(grant_column_types["scope"], String)
     assert grant_column_types["scope"].length == 1000
+    client_indexes = {
+        index["name"] for index in inspector.get_indexes("mcp_oauth_clients")
+    }
+    assert "ix_mcp_oauth_clients_issuer" not in client_indexes
 
     stored_grant = db_session.query(MCPOAuthGrant).one()
     assert stored_grant.mcp_server_id == server.id

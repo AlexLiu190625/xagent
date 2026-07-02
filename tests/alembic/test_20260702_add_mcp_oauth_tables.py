@@ -133,7 +133,7 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
         client_indexes = {
             index["name"] for index in inspector.get_indexes("mcp_oauth_clients")
         }
-        assert "ix_mcp_oauth_clients_issuer" in client_indexes
+        assert "ix_mcp_oauth_clients_issuer" not in client_indexes
         assert "ix_mcp_oauth_clients_id" not in client_indexes
         assert "ix_mcp_oauth_clients_mcp_server_id" not in client_indexes
 

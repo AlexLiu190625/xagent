@@ -31,7 +31,13 @@ from ..auth_dependencies import get_current_user
 from ..mcp_apps import get_all_mcp_apps, get_app_by_name
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
-from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
+from ..models.mcp_oauth import (
+    MCPOAuthClient,
+    MCPOAuthFlowState,
+    MCPOAuthGrant,
+    mcp_oauth_client_lookup_hash,
+    mcp_oauth_grant_lookup_hash,
+)
 from ..models.user import User
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
@@ -551,12 +557,11 @@ def _upsert_mcp_oauth_client(
         max_length=100,
     )
     redirect_uri = _bounded_mcp_oauth_value(redirect_uri, field_name="redirect_uri")
+    lookup_hash = mcp_oauth_client_lookup_hash(server_id, issuer, client_id)
     existing = (
         db.query(MCPOAuthClient)
         .filter(
-            MCPOAuthClient.mcp_server_id == server_id,
-            MCPOAuthClient.issuer == issuer,
-            MCPOAuthClient.client_id == client_id,
+            MCPOAuthClient.lookup_hash == lookup_hash,
         )
         .first()
     )
@@ -577,6 +582,7 @@ def _upsert_mcp_oauth_client(
         )
     client = existing or MCPOAuthClient(
         mcp_server_id=server_id,
+        lookup_hash=lookup_hash,
         issuer=issuer,
         client_id=client_id,
     )
@@ -873,16 +879,19 @@ def _upsert_mcp_oauth_grant(
     token_data: dict[str, Any],
 ) -> MCPOAuthGrant:
     scope = _scope_string(str(token_data.get("scope") or flow_state.scope))
+    lookup_hash = mcp_oauth_grant_lookup_hash(
+        flow_state.mcp_server_id,
+        flow_state.user_id,
+        flow_state.resource_owner_key,
+        flow_state.mcp_oauth_client_id,
+        flow_state.issuer,
+        flow_state.resource,
+        scope,
+    )
     existing = (
         db.query(MCPOAuthGrant)
         .filter(
-            MCPOAuthGrant.mcp_server_id == flow_state.mcp_server_id,
-            MCPOAuthGrant.user_id == flow_state.user_id,
-            MCPOAuthGrant.resource_owner_key == flow_state.resource_owner_key,
-            MCPOAuthGrant.mcp_oauth_client_id == flow_state.mcp_oauth_client_id,
-            MCPOAuthGrant.issuer == flow_state.issuer,
-            MCPOAuthGrant.resource == flow_state.resource,
-            MCPOAuthGrant.scope == scope,
+            MCPOAuthGrant.lookup_hash == lookup_hash,
         )
         .first()
     )
@@ -890,6 +899,7 @@ def _upsert_mcp_oauth_grant(
         mcp_server_id=flow_state.mcp_server_id,
         user_id=flow_state.user_id,
         mcp_oauth_client_id=flow_state.mcp_oauth_client_id,
+        lookup_hash=lookup_hash,
         resource_owner_key=flow_state.resource_owner_key,
         issuer=flow_state.issuer,
         resource=flow_state.resource,
