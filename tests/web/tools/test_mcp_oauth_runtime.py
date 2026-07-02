@@ -84,6 +84,8 @@ def _add_grant(
     access_token: str,
     refresh_token: str | None = None,
     expires_at: datetime | None = None,
+    scope: str = "records.read",
+    status: str = "active",
 ) -> MCPOAuthGrant:
     grant = MCPOAuthGrant(
         mcp_server_id=server.id,
@@ -91,11 +93,11 @@ def _add_grant(
         resource_owner_key=resource_owner_key,
         issuer="https://auth.example.com",
         resource="https://mcp.example.com/mcp",
-        scope="records.read",
+        scope=scope,
         access_token=encrypt_value(access_token),
         refresh_token=encrypt_value(refresh_token) if refresh_token else None,
         expires_at=expires_at,
-        status="active",
+        status=status,
     )
     db.add(grant)
     db.commit()
@@ -195,6 +197,82 @@ async def test_mcp_oauth_runtime_allows_discovered_scope_when_not_configured(
 
 
 @pytest.mark.asyncio
+async def test_mcp_oauth_runtime_accepts_grant_scope_superset_regardless_of_order(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="superset-scope-token",
+        scope="records.write records.read records.delete",
+    )
+
+    configs, cfg = await _load_configs(
+        db,
+        user,
+        mcp_auth_context={str(server.id): {"scope": "records.read records.write"}},
+    )
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer superset-scope-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_reports_insufficient_scope_without_static_fallback(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="read-only-token",
+        scope="records.read",
+    )
+
+    configs, cfg = await _load_configs(
+        db,
+        user,
+        mcp_auth_context={str(server.id): {"scope": "records.write"}},
+    )
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "insufficient_scope"
+    assert diagnostics[0]["scope"] == "records.write"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_ignores_revoked_grant_without_static_fallback(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="revoked-token",
+        status="revoked",
+    )
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "authorization_required"
+
+
+@pytest.mark.asyncio
 async def test_mcp_oauth_runtime_does_not_use_other_users_grant(db_session):
     db, user, other_user = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -277,3 +355,57 @@ async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "fresh-access-token"
     assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fallback(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    db.add(
+        MCPOAuthClient(
+            mcp_server_id=server.id,
+            issuer="https://auth.example.com",
+            authorization_endpoint="https://auth.example.com/authorize",
+            token_endpoint="https://auth.example.com/token",
+            client_id="client-123",
+            token_endpoint_auth_method="none",
+            redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        )
+    )
+    db.commit()
+
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "error": "invalid_grant",
+                "error_description": "refresh token is invalid",
+            },
+        )
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "token_refresh_failed"
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "expired-access-token"

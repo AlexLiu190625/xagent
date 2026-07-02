@@ -250,10 +250,23 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     )
     if normalized_issuer:
         query = query.filter(MCPOAuthGrant.issuer == normalized_issuer)
-    if normalized_scope is not None:
-        query = query.filter(MCPOAuthGrant.scope == normalized_scope)
-    grant = query.order_by(MCPOAuthGrant.updated_at.desc()).first()
+    candidate_grants = query.order_by(MCPOAuthGrant.updated_at.desc()).all()
+    required_scopes = _scope_set(normalized_scope) if normalized_scope else set()
+    grant = next(
+        (
+            candidate
+            for candidate in candidate_grants
+            if not required_scopes
+            or required_scopes.issubset(_scope_set(candidate.scope))
+        ),
+        None,
+    )
     if grant is None:
+        if candidate_grants and required_scopes:
+            raise MCPOAuthRuntimeError(
+                "insufficient_scope",
+                "No active MCP OAuth grant includes the required scope",
+            )
         raise MCPOAuthRuntimeError(
             "authorization_required",
             "No active MCP OAuth grant exists for the selected resource owner",
@@ -623,6 +636,10 @@ def _normalize_scope(value: Any) -> str:
     if isinstance(value, (list, tuple, set)):
         return " ".join(str(item) for item in value if str(item))
     return ""
+
+
+def _scope_set(value: Any) -> set[str]:
+    return set(_normalize_scope(value).split())
 
 
 def _grant_needs_refresh(expires_at: Any) -> bool:
