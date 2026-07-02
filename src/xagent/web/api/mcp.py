@@ -45,6 +45,7 @@ from ..services.mcp_oauth import (
     oauth_token_expires_at,
     select_mcp_oauth_grants,
 )
+from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
 
 logger = logging.getLogger(__name__)
 
@@ -408,7 +409,7 @@ def _get_mcp_oauth_config(server: MCPServer) -> dict[str, Any]:
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP server is not configured for MCP OAuth",
         )
-    if server.transport not in {"sse", "streamable_http"}:
+    if server.transport not in HTTP_MCP_TRANSPORTS:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="MCP OAuth is only supported for HTTP MCP transports",

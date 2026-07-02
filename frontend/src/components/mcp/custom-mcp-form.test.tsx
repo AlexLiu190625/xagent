@@ -2,7 +2,7 @@ import React from "react"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { CustomMcpForm } from "./custom-mcp-form"
+import { CustomMcpForm, isHttpMcpOAuthTransport } from "./custom-mcp-form"
 import { MCPServerFormData } from "./custom-api-form"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -159,6 +159,13 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(openMock).toHaveBeenCalledWith("about:blank", "_blank")
     expect(popup.opener).toBeNull()
     expect(popup.location.href).toBe("https://auth.example.com/authorize")
+  })
+
+  it("treats websocket as an MCP OAuth-capable transport", () => {
+    expect(isHttpMcpOAuthTransport("streamable_http")).toBe(true)
+    expect(isHttpMcpOAuthTransport("sse")).toBe(true)
+    expect(isHttpMcpOAuthTransport("websocket")).toBe(true)
+    expect(isHttpMcpOAuthTransport("stdio")).toBe(false)
   })
 
   it("does not start OAuth connect when the authorization popup is blocked", async () => {

@@ -103,12 +103,18 @@ def _discovery() -> SimpleNamespace:
     )
 
 
-def _add_mcp_oauth_server(db, user: User, *, scope: str = "records.read") -> MCPServer:
+def _add_mcp_oauth_server(
+    db,
+    user: User,
+    *,
+    scope: str = "records.read",
+    transport: str = "streamable_http",
+) -> MCPServer:
     server = MCPServer.from_config(
         {
             "name": "records",
             "managed": "external",
-            "transport": "streamable_http",
+            "transport": transport,
             "url": "https://mcp.example.com/mcp",
             "auth": {
                 "type": "mcp_oauth",
@@ -498,6 +504,35 @@ async def test_connect_can_return_authorization_url_json(db_session, monkeypatch
     )
     assert query["client_id"] == ["client-123"]
     assert query["resource"] == ["https://mcp.example.com/mcp"]
+    assert db.query(MCPOAuthFlowState).count() == 1
+
+
+@pytest.mark.asyncio
+async def test_oauth_routes_allow_websocket_transport(db_session, monkeypatch):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user, transport="websocket")
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    discovery_response = await discover_mcp_oauth(
+        server.id,
+        MCPOAuthDiscoverRequest(),
+        user,
+        db,
+    )
+    assert discovery_response.issuer == "https://auth.example.com"
+
+    connect_response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    assert connect_response.status_code == 303
     assert db.query(MCPOAuthFlowState).count() == 1
 
 

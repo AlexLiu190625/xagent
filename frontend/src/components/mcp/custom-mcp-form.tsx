@@ -50,6 +50,11 @@ interface McpOAuthConnectResponse {
 }
 
 const MASKED_SECRET_VALUE = "********"
+const HTTP_MCP_OAUTH_TRANSPORTS = new Set(["streamable_http", "sse", "websocket"])
+
+export function isHttpMcpOAuthTransport(transport: string): boolean {
+  return HTTP_MCP_OAUTH_TRANSPORTS.has(transport)
+}
 
 async function parseMcpOAuthErrorMessage(response: Response, fallback: string): Promise<string> {
   try {
@@ -83,7 +88,7 @@ export function CustomMcpForm({
   const transport = mcpFormData.transport || "sse"
   const authConfig = mcpFormData.config?.auth
   const authType = authConfig?.type || "none"
-  const isHttpMcpTransport = transport === "streamable_http" || transport === "sse"
+  const isHttpMcpTransport = isHttpMcpOAuthTransport(transport)
   const isMcpOAuth = authType === "mcp_oauth"
   const bearerTokenValue = authConfig?.bearer_token
   const apiKeyValue = authConfig?.api_key_value
