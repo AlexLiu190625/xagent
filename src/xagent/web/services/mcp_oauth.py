@@ -403,6 +403,8 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
     from ...core.utils.encryption import decrypt_value
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
+    if normalized_resource:
+        normalized_resource = _canonical_resource(normalized_resource)
     selected_scope = scope if scope is not None else auth_config.get("scope")
     try:
         normalized_scope = (
@@ -667,7 +669,11 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     from ..models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
+    if normalized_resource:
+        normalized_resource = _canonical_resource(normalized_resource)
     normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
+    if normalized_issuer:
+        normalized_issuer = _canonical_issuer(normalized_issuer)
     selected_scope = scope if scope is not None else auth_config.get("scope")
     normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
     configured_client_id = _runtime_config_value(None, auth_config, "client_id")
@@ -733,7 +739,7 @@ async def _discover_with_client(  # noqa: PLR0913
         client=client,
         resolve_dns_for_url_policy=resolve_dns_for_url_policy,
     )
-    resource = protected_resource.resource or _canonical_resource(endpoint_url)
+    resource = _canonical_resource(protected_resource.resource or endpoint_url)
     if configured_resource and not _same_url(configured_resource, resource):
         raise MCPOAuthDiscoveryError(
             "resource_mismatch",
@@ -882,7 +888,7 @@ def _parse_protected_resource_metadata(
 def _parse_authorization_server_metadata(
     metadata_url: str, payload: dict[str, Any]
 ) -> OAuthAuthorizationServerMetadata:
-    issuer = _required_string(payload, "issuer")
+    issuer = _canonical_issuer(_required_string(payload, "issuer"))
     authorization_endpoint = _required_string(payload, "authorization_endpoint")
     token_endpoint = _required_string(payload, "token_endpoint")
     return OAuthAuthorizationServerMetadata(
@@ -1148,7 +1154,11 @@ def _runtime_grant_matches(  # noqa: PLR0913
     required_scopes: set[str],
 ) -> bool:
     normalized_resource = _runtime_config_value(resource, auth_config, "resource")
+    if normalized_resource:
+        normalized_resource = _canonical_resource(normalized_resource)
     normalized_issuer = _runtime_config_value(issuer, auth_config, "issuer")
+    if normalized_issuer:
+        normalized_issuer = _canonical_issuer(normalized_issuer)
     configured_client_id = _runtime_config_value(None, auth_config, "client_id")
     oauth_client = getattr(grant, "oauth_client", None)
     return bool(
@@ -1183,11 +1193,34 @@ def _utc_now() -> datetime:
 
 
 def _canonical_resource(endpoint_url: str) -> str:
+    return _canonical_url_identifier(endpoint_url)
+
+
+def _canonical_issuer(issuer_url: str) -> str:
+    return _canonical_url_identifier(issuer_url)
+
+
+def _canonical_url_identifier(endpoint_url: str) -> str:
     parts = urlsplit(endpoint_url)
-    path = parts.path
-    if path == "/":
-        path = ""
-    return urlunsplit((parts.scheme.lower(), parts.netloc.lower(), path, "", ""))
+    if not parts.scheme or not parts.netloc:
+        return endpoint_url.rstrip("/")
+    scheme = parts.scheme.lower()
+    try:
+        port = parts.port
+    except ValueError:
+        port = None
+    hostname = (parts.hostname or "").rstrip(".").lower()
+    netloc = (
+        f"[{hostname}]"
+        if ":" in hostname and not hostname.startswith("[")
+        else hostname
+    )
+    if port and not (
+        (scheme == "http" and port == 80) or (scheme == "https" and port == 443)
+    ):
+        netloc = f"{netloc}:{port}"
+    path = parts.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, "", ""))
 
 
 def _required_string(payload: dict[str, Any], key: str) -> str:

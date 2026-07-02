@@ -39,11 +39,18 @@ def db_session(tmp_path):
     engine.dispose()
 
 
-def _add_mcp_oauth_server(db, user: User, *, include_scope: bool = True) -> MCPServer:
+def _add_mcp_oauth_server(
+    db,
+    user: User,
+    *,
+    include_scope: bool = True,
+    resource: str = "https://mcp.example.com/mcp",
+    issuer: str = "https://auth.example.com",
+) -> MCPServer:
     auth_config = {
         "type": "mcp_oauth",
-        "resource": "https://mcp.example.com/mcp",
-        "issuer": "https://auth.example.com",
+        "resource": resource,
+        "issuer": issuer,
         "client_id": "client-123",
     }
     if include_scope:
@@ -217,6 +224,33 @@ async def test_mcp_oauth_runtime_allows_discovered_scope_when_not_configured(
     assert cfg.get_mcp_oauth_diagnostics() == []
     assert configs[0]["config"]["headers"]["Authorization"] == (
         "Bearer discovered-scope-token"
+    )
+
+
+@pytest.mark.asyncio
+async def test_mcp_oauth_runtime_canonicalizes_configured_resource_for_lookup(
+    db_session,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        resource="https://MCP.EXAMPLE.com:443/mcp/",
+        issuer="https://AUTH.EXAMPLE.com:443/",
+    )
+    _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="canonical-resource-token",
+    )
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer canonical-resource-token"
     )
 
 

@@ -684,7 +684,7 @@ async def test_discover_falls_back_to_well_known_resource_metadata():
             return httpx.Response(
                 200,
                 json={
-                    "issuer": "https://auth.example.com",
+                    "issuer": "https://AUTH.EXAMPLE.com:443/",
                     "authorization_endpoint": "https://auth.example.com/authorize",
                     "token_endpoint": "https://auth.example.com/token",
                 },
@@ -773,7 +773,7 @@ async def test_discover_accepts_case_variant_configured_resource_and_issuer():
             return httpx.Response(
                 200,
                 json={
-                    "resource": "https://MCP.EXAMPLE.com/mcp/",
+                    "resource": "https://MCP.EXAMPLE.com:443/mcp/",
                     "authorization_servers": ["https://AUTH.EXAMPLE.com/"],
                 },
             )
@@ -794,12 +794,12 @@ async def test_discover_accepts_case_variant_configured_resource_and_issuer():
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
         result = await discover_mcp_oauth_metadata(
             "https://mcp.example.com/mcp",
-            configured_resource="https://mcp.example.com/mcp",
+            configured_resource="https://mcp.example.com/mcp/",
             configured_issuer="https://auth.example.com",
             client=client,
         )
 
-    assert result.resource == "https://MCP.EXAMPLE.com/mcp/"
+    assert result.resource == "https://mcp.example.com/mcp"
     assert result.authorization_server.issuer == "https://auth.example.com"
 
 
