@@ -131,11 +131,11 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(connectCall).toBeTruthy()
     const [, connectOptions] = connectCall as [string, RequestInit]
     const body = JSON.parse(String(connectOptions.body))
-    expect(body).toMatchObject({
-      resource: "https://mcp.example.com/mcp",
-      issuer: "https://auth.example.com",
-      scope: "records.read",
-    })
+    expect(body).toHaveProperty("redirect_after")
+    expect(body).not.toHaveProperty("resource")
+    expect(body).not.toHaveProperty("issuer")
+    expect(body).not.toHaveProperty("scope")
+    expect(body).not.toHaveProperty("resource_metadata_url")
     expect(body).not.toHaveProperty("access_token")
     expect(body).not.toHaveProperty("refresh_token")
     expect(body).not.toHaveProperty("resource_owner_key")

@@ -118,13 +118,7 @@ export function CustomMcpForm({
   }
 
   const buildOAuthRequestBody = (includeRedirectAfter = false) => {
-    const auth = mcpFormData.config?.auth || {}
-    const body: Record<string, string | undefined> = {
-      resource: auth.resource || undefined,
-      issuer: auth.issuer || undefined,
-      scope: auth.scope || undefined,
-      resource_metadata_url: auth.resource_metadata_url || undefined,
-    }
+    const body: Record<string, string | undefined> = {}
     if (includeRedirectAfter) {
       body.redirect_after = typeof window !== "undefined"
         ? `${window.location.pathname}${window.location.search}`

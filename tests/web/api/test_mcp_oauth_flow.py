@@ -240,6 +240,25 @@ def test_connect_request_rejects_public_resource_owner_key():
         )
 
 
+def test_oauth_request_models_reject_public_config_overrides():
+    public_overrides = {
+        "resource": "https://other-resource.example.com/mcp",
+        "issuer": "https://other-auth.example.com",
+        "scope": "records.admin",
+        "resource_metadata_url": "https://other-resource.example.com/.well-known/oauth-protected-resource",
+    }
+
+    with pytest.raises(ValueError):
+        MCPOAuthDiscoverRequest.model_validate(public_overrides)
+    with pytest.raises(ValueError):
+        MCPOAuthConnectRequest.model_validate(
+            {
+                **public_overrides,
+                "redirect_after": "/settings/mcp",
+            }
+        )
+
+
 @pytest.mark.asyncio
 async def test_connect_can_return_authorization_url_json(db_session, monkeypatch):
     db, user, _ = db_session

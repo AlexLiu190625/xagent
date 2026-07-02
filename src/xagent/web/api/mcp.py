@@ -108,10 +108,7 @@ class MCPConnectionTestResponse(BaseModel):
 class MCPOAuthDiscoverRequest(BaseModel):
     """Request model for MCP OAuth metadata discovery."""
 
-    resource: Optional[str] = None
-    issuer: Optional[str] = None
-    scope: Optional[str] = None
-    resource_metadata_url: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
 
 
 class MCPOAuthDiscoverResponse(BaseModel):
@@ -349,8 +346,7 @@ def _configured_mcp_oauth_value(
 async def _discover_mcp_oauth_for_server(
     server: MCPServer,
     auth_config: dict[str, Any],
-    request_data: MCPOAuthDiscoverRequest,
-):
+) -> Any:
     if not server.url:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
@@ -361,15 +357,13 @@ async def _discover_mcp_oauth_for_server(
             str(server.url),
             headers=None,
             configured_resource_metadata_url=_configured_mcp_oauth_value(
-                request_data.resource_metadata_url,
+                None,
                 auth_config,
                 "resource_metadata_url",
             ),
-            configured_issuer=_configured_mcp_oauth_value(
-                request_data.issuer, auth_config, "issuer"
-            ),
+            configured_issuer=_configured_mcp_oauth_value(None, auth_config, "issuer"),
             configured_resource=_configured_mcp_oauth_value(
-                request_data.resource, auth_config, "resource"
+                None, auth_config, "resource"
             ),
         )
     except MCPOAuthDiscoveryError as exc:
@@ -2019,7 +2013,7 @@ async def discover_mcp_oauth(
         require_active=True,
     )
     auth_config = _get_mcp_oauth_config(server)
-    discovery = await _discover_mcp_oauth_for_server(server, auth_config, request_data)
+    discovery = await _discover_mcp_oauth_for_server(server, auth_config)
     return _mcp_oauth_discovery_response(discovery)
 
 
@@ -2037,7 +2031,7 @@ async def connect_mcp_oauth(
         db, user_id=user_id, server_id=server_id, require_active=True
     )
     auth_config = _get_mcp_oauth_config(server)
-    discovery = await _discover_mcp_oauth_for_server(server, auth_config, request_data)
+    discovery = await _discover_mcp_oauth_for_server(server, auth_config)
 
     client_id = _configured_mcp_oauth_value(None, auth_config, "client_id")
     if not client_id:
@@ -2057,9 +2051,7 @@ async def connect_mcp_oauth(
         _configured_mcp_oauth_value(None, auth_config, "redirect_uri")
         or _default_mcp_oauth_redirect_uri()
     )
-    selected_scope = _scope_string(
-        request_data.scope or auth_config.get("scope") or discovery.scopes
-    )
+    selected_scope = _scope_string(auth_config.get("scope") or discovery.scopes)
     resource_owner_key = _default_resource_owner_key(user_id)
 
     oauth_client = _upsert_mcp_oauth_client(
