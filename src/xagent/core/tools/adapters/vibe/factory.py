@@ -550,35 +550,39 @@ class ToolFactory:
         """
         try:
             from .....web.models.mcp import MCPServer, UserMCPServer
-            from ...core.mcp.manager.db import DatabaseMCPServerManager
+            from .....web.services.mcp_runtime import build_mcp_runtime_connection
             from .mcp_adapter import load_mcp_tools_as_agent_tools
 
-            # Load MCP server connections for the specific user
-            manager = DatabaseMCPServerManager(db)
-
+            query = db.query(MCPServer)
             if user_id:
-
-                def filter_by_user(query):
-                    return query.join(
-                        UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id
-                    ).filter(UserMCPServer.user_id == user_id, UserMCPServer.is_active)
-
-                all_connections = manager.get_connections(filter_by_user)
-            else:
-                all_connections = manager.get_connections()
-
-            if not all_connections:
-                return []
+                query = query.join(
+                    UserMCPServer, MCPServer.id == UserMCPServer.mcpserver_id
+                ).filter(UserMCPServer.user_id == user_id, UserMCPServer.is_active)
 
             connections = {}
+            for server in query.all():
+                if isinstance(server, tuple):
+                    server = server[0]
+                build = await build_mcp_runtime_connection(
+                    db,
+                    server,
+                    user_id=user_id,
+                )
+                if build.connection is not None:
+                    connections[str(server.name)] = build.connection
+                    continue
+                diagnostic = build.diagnostic or {}
+                logger.warning(
+                    "Skipping MCP server '%s' in ToolFactory runtime build: %s",
+                    getattr(server, "name", "<unknown>"),
+                    diagnostic.get("message", "runtime connection unavailable"),
+                )
 
-            for name, config in all_connections.items():
-                connections[name] = config
+            if not connections:
+                return []
 
             # Load MCP tools
-            mcp_tools = (
-                await load_mcp_tools_as_agent_tools(connections) if connections else []
-            )
+            mcp_tools = await load_mcp_tools_as_agent_tools(connections)
 
             return mcp_tools
         except Exception as e:

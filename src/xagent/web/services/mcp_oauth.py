@@ -25,6 +25,8 @@ DEFAULT_MCP_OAUTH_DISCOVERY_TIMEOUT = MCP_OAUTH_HTTP_TIMEOUT_SECONDS
 MCP_OAUTH_MAX_REDIRECTS = 5
 MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH = 1000
 MCP_OAUTH_SCOPE_MAX_LENGTH = 1000
+MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
+MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH = 100
 MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH = 50
 OAUTH_ERROR_MESSAGE_MAX_LENGTH = 500
 OAUTH_LOG_PAYLOAD_MAX_LENGTH = 2000
@@ -1036,7 +1038,10 @@ async def _refresh_mcp_oauth_grant(
                 )
         payload = response.json()
     except (MCPOAuthDiscoveryError, httpx.HTTPError, ValueError) as exc:
-        raise MCPOAuthRuntimeError("token_refresh_failed", str(exc)) from exc
+        raise MCPOAuthRuntimeError(
+            "token_refresh_failed",
+            oauth_exception_message(exc, "MCP OAuth refresh failed"),
+        ) from exc
 
     if (
         response.status_code >= 400
@@ -1063,6 +1068,8 @@ def _runtime_config_value(
 
 
 def _normalize_scope(value: Any) -> str:
+    # OAuth scope values are set-like; canonical ordering keeps lookup keys stable
+    # and is safe to reuse for authorization requests to compliant servers.
     if isinstance(value, str):
         return " ".join(sorted({item for item in value.split() if item}))
     if isinstance(value, (list, tuple, set)):
@@ -1423,6 +1430,21 @@ def oauth_error_message(payload: Any, fallback: str) -> str:
         message = payload
     text = str(message or fallback)
     return _truncate(text, OAUTH_ERROR_MESSAGE_MAX_LENGTH)
+
+
+def oauth_exception_message(exc: Exception, fallback: str) -> str:
+    """Return a bounded user-safe OAuth transport/parsing error message."""
+    if isinstance(exc, MCPOAuthDiscoveryError):
+        message = exc.message
+    elif isinstance(exc, httpx.TimeoutException):
+        message = "OAuth request timed out"
+    elif isinstance(exc, httpx.HTTPError):
+        message = "OAuth request failed"
+    elif isinstance(exc, ValueError):
+        message = "OAuth response was not valid JSON"
+    else:
+        message = fallback
+    return oauth_error_message(str(message), fallback)
 
 
 def oauth_error_log_payload(payload: Any) -> str:

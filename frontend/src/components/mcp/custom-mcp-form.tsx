@@ -80,7 +80,7 @@ export function CustomMcpForm({
   const [oauthStatusLoading, setOauthStatusLoading] = useState(false)
   const [oauthAction, setOauthAction] = useState<string | null>(null)
   const isMountedRef = useRef(false)
-  const pollingIntervalRef = useRef<number | null>(null)
+  const pollingTimeoutRef = useRef<number | null>(null)
   const editedSecretFieldsRef = useRef<Set<string>>(new Set())
   const previousServerIdRef = useRef<number | null | undefined>(serverId)
 
@@ -95,9 +95,9 @@ export function CustomMcpForm({
   const clientSecretValue = authConfig?.client_secret
 
   const clearOAuthPolling = useCallback(() => {
-    if (pollingIntervalRef.current !== null && typeof window !== "undefined") {
-      window.clearTimeout(pollingIntervalRef.current)
-      pollingIntervalRef.current = null
+    if (pollingTimeoutRef.current !== null && typeof window !== "undefined") {
+      window.clearTimeout(pollingTimeoutRef.current)
+      pollingTimeoutRef.current = null
     }
   }, [])
 
@@ -307,7 +307,7 @@ export function CustomMcpForm({
         if (stillOpen && !expired) {
           await loadOAuthStatus()
           if (!isMountedRef.current) return
-          pollingIntervalRef.current = window.setTimeout(poll, 3000)
+          pollingTimeoutRef.current = window.setTimeout(poll, 3000)
           return
         }
         clearOAuthPolling()
@@ -315,7 +315,7 @@ export function CustomMcpForm({
         if (!isMountedRef.current) return
         onOAuthStatusChange?.()
       }
-      pollingIntervalRef.current = window.setTimeout(poll, 3000)
+      pollingTimeoutRef.current = window.setTimeout(poll, 3000)
     } catch (error) {
       if (popup) popup.close()
       console.error("Failed to start MCP OAuth authorization:", error)

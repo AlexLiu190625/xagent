@@ -20,6 +20,7 @@ import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_session_secret
@@ -42,6 +43,8 @@ from ..models.user import User
 from ..services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
+    MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
+    MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
     MCPOAuthDiscoveryError,
     _same_url,
@@ -50,6 +53,7 @@ from ..services.mcp_oauth import (
     normalize_mcp_oauth_scope,
     oauth_error_log_payload,
     oauth_error_message,
+    oauth_exception_message,
     oauth_post,
     oauth_token_expires_at,
     select_mcp_oauth_grants,
@@ -60,7 +64,8 @@ from ..services.mcp_runtime import HTTP_MCP_TRANSPORTS
 logger = logging.getLogger(__name__)
 
 MCP_OAUTH_STATE_COOKIE = "xagent_mcp_oauth_state"
-MCP_OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = 10 * 60
+MCP_OAUTH_STATE_TTL = timedelta(minutes=10)
+MCP_OAUTH_STATE_COOKIE_MAX_AGE_SECONDS = int(MCP_OAUTH_STATE_TTL.total_seconds())
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS = frozenset(
     {"none", "client_secret_post", "client_secret_basic"}
 )
@@ -150,8 +155,6 @@ class MCPOAuthDiscoverResponse(BaseModel):
 
 class MCPOAuthConnectRequest(MCPOAuthDiscoverRequest):
     """Request model for starting MCP OAuth Authorization Code + PKCE."""
-
-    model_config = ConfigDict(extra="forbid")
 
     redirect_after: Optional[str] = None
 
@@ -554,48 +557,70 @@ def _upsert_mcp_oauth_client(
     token_endpoint_auth_method = _bounded_mcp_oauth_value(
         token_endpoint_auth_method,
         field_name="token_endpoint_auth_method",
-        max_length=100,
+        max_length=MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     )
     redirect_uri = _bounded_mcp_oauth_value(redirect_uri, field_name="redirect_uri")
     lookup_hash = mcp_oauth_client_lookup_hash(server_id, issuer, client_id)
-    existing = (
-        db.query(MCPOAuthClient)
-        .filter(
-            MCPOAuthClient.lookup_hash == lookup_hash,
-        )
-        .first()
-    )
-    encrypted_client_secret: str | None
-    if client_secret == MASKED_SECRET_VALUE:
-        if existing is None or not existing.client_secret:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail={
-                    "code": "invalid_resource",
-                    "message": "Masked MCP OAuth client_secret has no stored value",
-                },
+
+    def load_existing_client() -> MCPOAuthClient | None:
+        return (
+            db.query(MCPOAuthClient)
+            .filter(
+                MCPOAuthClient.lookup_hash == lookup_hash,
             )
-        encrypted_client_secret = str(existing.client_secret)
-    else:
-        encrypted_client_secret = (
-            encrypt_value(client_secret) if client_secret else None
+            .first()
         )
-    client = existing or MCPOAuthClient(
-        mcp_server_id=server_id,
-        lookup_hash=lookup_hash,
-        issuer=issuer,
-        client_id=client_id,
-    )
-    setattr(client, "authorization_endpoint", authorization_endpoint)
-    setattr(client, "token_endpoint", token_endpoint)
-    setattr(client, "client_secret", encrypted_client_secret)
-    setattr(client, "token_endpoint_auth_method", token_endpoint_auth_method)
-    setattr(client, "redirect_uri", redirect_uri)
-    setattr(client, "metadata_json", discovery.authorization_server.raw)
-    if existing is None:
-        db.add(client)
-    db.flush()
-    return client
+
+    def apply_client_values(existing: MCPOAuthClient | None) -> MCPOAuthClient:
+        encrypted_client_secret: str | None
+        if client_secret == MASKED_SECRET_VALUE:
+            if existing is None or not existing.client_secret:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail={
+                        "code": "invalid_resource",
+                        "message": "Masked MCP OAuth client_secret has no stored value",
+                    },
+                )
+            encrypted_client_secret = str(existing.client_secret)
+        else:
+            encrypted_client_secret = (
+                encrypt_value(client_secret) if client_secret else None
+            )
+        client = existing or MCPOAuthClient(
+            mcp_server_id=server_id,
+            lookup_hash=lookup_hash,
+            issuer=issuer,
+            client_id=client_id,
+        )
+        setattr(client, "authorization_endpoint", authorization_endpoint)
+        setattr(client, "token_endpoint", token_endpoint)
+        setattr(client, "client_secret", encrypted_client_secret)
+        setattr(client, "token_endpoint_auth_method", token_endpoint_auth_method)
+        setattr(client, "redirect_uri", redirect_uri)
+        setattr(client, "metadata_json", discovery.authorization_server.raw)
+        if existing is None:
+            db.add(client)
+        return client
+
+    try:
+        client = apply_client_values(load_existing_client())
+        db.flush()
+        return client
+    except IntegrityError as exc:
+        db.rollback()
+        existing_after_conflict = load_existing_client()
+        if existing_after_conflict is None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": "oauth_client_conflict",
+                    "message": "MCP OAuth client configuration changed concurrently",
+                },
+            ) from exc
+        client = apply_client_values(existing_after_conflict)
+        db.flush()
+        return client
 
 
 def _mcp_oauth_grant_response(grant: MCPOAuthGrant) -> MCPOAuthGrantResponse:
@@ -750,7 +775,12 @@ async def _exchange_mcp_oauth_code(
     except (MCPOAuthDiscoveryError, httpx.HTTPError, ValueError) as exc:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail={"code": "token_exchange_failed", "message": str(exc)},
+            detail={
+                "code": "token_exchange_failed",
+                "message": oauth_exception_message(
+                    exc, "MCP OAuth token exchange failed"
+                ),
+            },
         ) from exc
 
     if (
@@ -2416,7 +2446,7 @@ async def connect_mcp_oauth(
     token_endpoint_auth_method = _bounded_mcp_oauth_value(
         token_endpoint_auth_method,
         field_name="token_endpoint_auth_method",
-        max_length=100,
+        max_length=MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     )
     if token_endpoint_auth_method not in MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHODS:
         raise HTTPException(
@@ -2438,7 +2468,7 @@ async def connect_mcp_oauth(
     resource_owner_key = _bounded_mcp_oauth_value(
         _default_resource_owner_key(user_id),
         field_name="resource_owner_key",
-        max_length=512,
+        max_length=MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     )
     selected_issuer = _bounded_mcp_oauth_value(
         str(discovery.authorization_server.issuer), field_name="issuer"
@@ -2470,7 +2500,7 @@ async def connect_mcp_oauth(
         scope=selected_scope,
         code_verifier=encrypt_value(code_verifier),
         redirect_after=_safe_mcp_oauth_redirect_after(request_data.redirect_after),
-        expires_at=_utc_now() + timedelta(minutes=10),
+        expires_at=_utc_now() + MCP_OAUTH_STATE_TTL,
     )
     db.add(flow_state)
     db.commit()

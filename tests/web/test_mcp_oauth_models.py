@@ -13,6 +13,10 @@ from xagent.web.models.mcp_oauth import (
     mcp_oauth_grant_lookup_hash,
 )
 from xagent.web.models.user import User
+from xagent.web.services.mcp_oauth import (
+    MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
+    MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
+)
 
 
 @pytest.fixture
@@ -100,6 +104,16 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
     }
     assert isinstance(grant_column_types["scope"], String)
     assert grant_column_types["scope"].length == 1000
+    assert grant_column_types["resource_owner_key"].length == (
+        MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH
+    )
+    client_column_types = {
+        column["name"]: column["type"]
+        for column in inspector.get_columns("mcp_oauth_clients")
+    }
+    assert client_column_types["token_endpoint_auth_method"].length == (
+        MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH
+    )
     client_indexes = {
         index["name"] for index in inspector.get_indexes("mcp_oauth_clients")
     }

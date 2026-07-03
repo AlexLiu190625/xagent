@@ -9,6 +9,7 @@ import httpx
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
@@ -33,7 +34,9 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.user import User
 from xagent.web.services.mcp_oauth import (
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
+    MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
     MCP_OAUTH_SCOPE_MAX_LENGTH,
+    MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
     MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH,
 )
 
@@ -400,6 +403,54 @@ def test_upsert_oauth_client_preserves_existing_masked_client_secret(db_session)
     assert client.token_endpoint_auth_method == "client_secret_basic"
 
 
+def test_upsert_oauth_client_recovers_from_concurrent_insert(db_session, monkeypatch):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    real_flush = db.flush
+    flush_calls = 0
+
+    def fail_first_flush_after_concurrent_insert(*args, **kwargs):
+        nonlocal flush_calls
+        if flush_calls == 0:
+            flush_calls += 1
+            concurrent_db = SessionLocal()
+            try:
+                concurrent_client = MCPOAuthClient(
+                    mcp_server_id=server.id,
+                    issuer="https://auth.example.com",
+                    authorization_endpoint="https://auth.example.com/authorize-old",
+                    token_endpoint="https://auth.example.com/token-old",
+                    client_id="client-123",
+                    token_endpoint_auth_method="none",
+                    redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+                )
+                concurrent_db.add(concurrent_client)
+                concurrent_db.commit()
+            finally:
+                concurrent_db.close()
+            raise IntegrityError("insert", {}, Exception("duplicate lookup_hash"))
+        return real_flush(*args, **kwargs)
+
+    monkeypatch.setattr(db, "flush", fail_first_flush_after_concurrent_insert)
+
+    client = mcp_api._upsert_mcp_oauth_client(
+        db,
+        server_id=server.id,
+        discovery=_discovery(),
+        client_id="client-123",
+        client_secret="client-secret",
+        token_endpoint_auth_method="client_secret_post",
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+    )
+
+    assert client.id is not None
+    assert client.authorization_endpoint == "https://auth.example.com/authorize"
+    assert client.token_endpoint == "https://auth.example.com/token"
+    assert client.token_endpoint_auth_method == "client_secret_post"
+    assert decrypt_value(client.client_secret) == "client-secret"
+
+
 def test_upsert_oauth_client_rejects_masked_client_secret_without_existing_value(
     db_session,
 ):
@@ -418,6 +469,11 @@ def test_upsert_oauth_client_rejects_masked_client_secret_without_existing_value
         )
 
     assert exc.value.detail["code"] == "invalid_resource"
+
+
+def test_oauth_api_length_constants_match_schema():
+    assert MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH == 100
+    assert MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH == 512
 
 
 @pytest.mark.asyncio
@@ -790,6 +846,37 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     assert decrypt_value(grant.access_token) == "plain-access-token"
     assert decrypt_value(grant.refresh_token) == "plain-refresh-token"
     assert db.query(MCPOAuthFlowState).one().consumed_at is not None
+
+
+@pytest.mark.asyncio
+async def test_exchange_code_sanitizes_transport_exception(db_session, monkeypatch):
+    db, user, _ = db_session
+    _, client, _ = _add_callback_client_and_state(
+        db,
+        user,
+        state="transport-error-state",
+    )
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("raw transport detail with secret-token")
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    monkeypatch.setattr(mcp_api, "create_mcp_oauth_http_client", async_client_factory)
+
+    with pytest.raises(HTTPException) as exc:
+        await mcp_api._exchange_mcp_oauth_code(
+            client=client,
+            code="auth-code",
+            code_verifier="verifier-123",
+            resource="https://mcp.example.com/mcp",
+        )
+
+    assert exc.value.detail["code"] == "token_exchange_failed"
+    assert exc.value.detail["message"] == "OAuth request failed"
+    assert "secret-token" not in str(exc.value.detail)
 
 
 @pytest.mark.asyncio

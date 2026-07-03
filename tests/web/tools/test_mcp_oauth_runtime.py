@@ -627,6 +627,47 @@ async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fal
 
 
 @pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refresh_sanitizes_transport_exception(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("raw refresh transport detail with secret-token")
+
+    def async_client_factory(*args, **kwargs):
+        return real_async_client(transport=httpx.MockTransport(handler))
+
+    async def skip_url_policy(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(mcp_oauth_service, "validate_oauth_http_url", skip_url_policy)
+    monkeypatch.setattr(mcp_oauth_service.httpx, "AsyncClient", async_client_factory)
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert configs == []
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert diagnostics[0]["code"] == "token_refresh_failed"
+    assert diagnostics[0]["message"] == "OAuth request failed"
+    assert "secret-token" not in str(diagnostics[0])
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "expired-access-token"
+
+
+@pytest.mark.asyncio
 async def test_mcp_oauth_runtime_refresh_rejects_narrowed_scope_without_commit(
     db_session,
     monkeypatch,

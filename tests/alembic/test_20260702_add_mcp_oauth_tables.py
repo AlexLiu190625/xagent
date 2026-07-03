@@ -8,6 +8,11 @@ from alembic.migration import MigrationContext
 from alembic.operations import Operations
 from sqlalchemy import String, create_engine, inspect, text
 
+from xagent.web.services.mcp_oauth import (
+    MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
+    MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH,
+)
+
 
 def _load_migration_module():
     migration_file = (
@@ -111,6 +116,16 @@ def test_upgrade_creates_mcp_oauth_tables_with_constraints(tmp_path):
         }.issubset(grant_columns)
         assert isinstance(grant_column_types["scope"], String)
         assert grant_column_types["scope"].length == 1000
+        assert grant_column_types["resource_owner_key"].length == (
+            MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH
+        )
+        client_column_types = {
+            column["name"]: column["type"]
+            for column in inspector.get_columns("mcp_oauth_clients")
+        }
+        assert client_column_types["token_endpoint_auth_method"].length == (
+            MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH
+        )
         assert {
             "state",
             "mcp_server_id",
