@@ -11,6 +11,7 @@ import { toast } from "@/components/ui/sonner"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { MCPServerFormData } from "./custom-api-form"
+import { RuntimeInputsForm } from "./runtime-inputs-form"
 
 interface CustomMcpFormProps {
   mcpFormData: MCPServerFormData
@@ -928,8 +929,16 @@ export function CustomMcpForm({
               </div>
             </>
           )}
+
         </>
       )}
+
+      <RuntimeInputsForm
+        connectorType="mcp"
+        formData={mcpFormData}
+        setFormData={setMcpFormData}
+        disabled={!canEditGlobal}
+      />
 
       <Collapsible open={isAdvancedOpen} onOpenChange={setIsAdvancedOpen} className="w-full space-y-2">
         <CollapsibleTrigger asChild>

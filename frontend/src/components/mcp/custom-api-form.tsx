@@ -5,7 +5,11 @@ import { Button } from "@/components/ui/button"
 import { useI18n } from "@/contexts/i18n-context"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select-radix"
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/components/ui/collapsible"
-import { ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react"
+import { ChevronDown, ChevronRight, Plus } from "lucide-react"
+import {
+    RuntimeInputsForm,
+    runtimeBindingsFromConfig,
+} from "./runtime-inputs-form"
 
 export interface MCPServerFormData {
     name: string;
@@ -60,6 +64,22 @@ export function CustomApiForm({
 
     // Track if the update came from internal state changes
     const internalUpdateRef = React.useRef(false)
+    const runtimeBindings = React.useMemo(
+        () => runtimeBindingsFromConfig(mcpFormData.runtime_bindings),
+        [mcpFormData.runtime_bindings],
+    )
+    const runtimeHeaderBindings = React.useMemo(
+        () => runtimeBindings.filter((binding) => binding.targetType === "headers"),
+        [runtimeBindings],
+    )
+    const runtimeBodyBindings = React.useMemo(
+        () => runtimeBindings.filter((binding) => binding.targetType === "body_field"),
+        [runtimeBindings],
+    )
+    const runtimeHeaderKeys = React.useMemo(
+        () => new Set(runtimeHeaderBindings.map((binding) => binding.targetKey.trim().toLowerCase())),
+        [runtimeHeaderBindings],
+    )
 
     // Sync props to local state when external props change.
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -160,15 +180,15 @@ export function CustomApiForm({
         let newHeaders: Record<string, string> = {}
         let newEnv: { key: string, value: string }[] = []
 
-        if (authType === "bearer") {
+        if (authType === "bearer" && !runtimeHeaderKeys.has("authorization")) {
             newHeaders = { "Authorization": "Bearer $BEARER_TOKEN" }
             newEnv = [{ key: "BEARER_TOKEN", value: authSecret }]
         } else if (authType === "api_key") {
-            if (authHeaderName) {
+            if (authHeaderName && !runtimeHeaderKeys.has(authHeaderName.trim().toLowerCase())) {
                 newHeaders = { [authHeaderName]: "$API_KEY" }
+                newEnv = [{ key: "API_KEY", value: authSecret }]
             }
-            newEnv = [{ key: "API_KEY", value: authSecret }]
-        } else if (authType === "basic") {
+        } else if (authType === "basic" && !runtimeHeaderKeys.has("authorization")) {
             newHeaders = { "Authorization": "Basic $BASIC_AUTH" }
             // For basic auth, we combine username:password and base64 encode it
             // However, since it might be masked as ********, we just store it directly
@@ -178,8 +198,9 @@ export function CustomApiForm({
 
         // Add custom headers
         customHeaders.forEach(h => {
-            if (h.key.trim()) {
-                newHeaders[h.key.trim()] = h.value.trim()
+            const headerKey = h.key.trim()
+            if (headerKey && !runtimeHeaderKeys.has(headerKey.toLowerCase())) {
+                newHeaders[headerKey] = h.value.trim()
             }
         })
 
@@ -209,7 +230,7 @@ export function CustomApiForm({
             internalUpdateRef.current = true
             return targetEnv
         })
-    }, [authType, authHeaderName, authSecret, basicUsername, basicPassword, customHeaders, setMcpFormData, setCustomApiEnv])
+    }, [authType, authHeaderName, authSecret, basicUsername, basicPassword, customHeaders, runtimeHeaderKeys, setMcpFormData, setCustomApiEnv])
 
     const methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
@@ -376,6 +397,12 @@ export function CustomApiForm({
                 </>
             )}
 
+            <RuntimeInputsForm
+                connectorType="custom_api"
+                formData={mcpFormData}
+                setFormData={setMcpFormData}
+            />
+
             <Collapsible open={isAdvancedOpen} onOpenChange={setIsAdvancedOpen} className="w-full space-y-2 pt-4">
                 <CollapsibleTrigger asChild>
                     <Button variant="ghost" className="flex w-full items-center justify-between p-4 h-auto font-medium text-slate-700 bg-slate-50 border hover:text-slate-900 hover:bg-slate-100">
@@ -397,7 +424,10 @@ export function CustomApiForm({
                             <p className="text-sm text-slate-500">{t('tools.mcp.dialog.noCustomHeaders')}</p>
                         ) : (
                             <div className="space-y-2">
-                                {customHeaders.map((h, i) => (
+                                {customHeaders
+                                    .map((header, index) => ({ header, index }))
+                                    .filter(({ header }) => !runtimeHeaderKeys.has(header.key.trim().toLowerCase()))
+                                    .map(({ header: h, index: i }) => (
                                     <div key={i} className="flex gap-2 items-center">
                                         <Input
                                             placeholder={t('tools.mcp.dialog.headerKeyPlaceholder')}
@@ -437,6 +467,19 @@ export function CustomApiForm({
                             </div>
                         )}
 
+                        {runtimeHeaderBindings.length > 0 && (
+                            <div className="space-y-2 rounded-md border border-dashed bg-white p-3">
+                                <p className="text-xs font-medium text-slate-600">{t('tools.mcp.runtime.boundHeaders')}</p>
+                                {runtimeHeaderBindings.map((binding) => (
+                                    <div key={`${binding.sourceType}.${binding.sourceKey}:${binding.targetKey}`} className="flex gap-2 items-center">
+                                        <Input value={binding.targetKey} disabled className="flex-1" />
+                                        <span className="text-slate-400">:</span>
+                                        <Input value={`$${binding.sourceKey}`} disabled className="flex-1 font-mono" />
+                                    </div>
+                                ))}
+                            </div>
+                        )}
+
                         <Button
                             type="button"
                             variant="outline"
@@ -457,6 +500,18 @@ export function CustomApiForm({
                                     onChange={(e) => setMcpFormData((prev: MCPServerFormData) => ({ ...prev, body: e.target.value }))}
                                     placeholder={t('tools.mcp.dialog.bodyTemplatePlaceholder')}
                                 />
+                                {runtimeBodyBindings.length > 0 && (
+                                    <div className="mt-2 space-y-2 rounded-md border border-dashed bg-white p-3">
+                                        <p className="text-xs font-medium text-slate-600">{t('tools.mcp.runtime.boundBodyFields')}</p>
+                                        {runtimeBodyBindings.map((binding) => (
+                                            <div key={`${binding.sourceType}.${binding.sourceKey}:${binding.targetKey}`} className="flex gap-2 items-center">
+                                                <Input value={binding.targetKey} disabled className="flex-1" />
+                                                <span className="text-slate-400">=</span>
+                                                <Input value={`$${binding.sourceKey}`} disabled className="flex-1 font-mono" />
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
                             </div>
                         )}
                     </div>

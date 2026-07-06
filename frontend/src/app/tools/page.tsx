@@ -78,6 +78,9 @@ export interface MCPServer {
   connected_account?: string
   app_id?: string
   provider?: string
+  runtime_input_schema?: Record<string, any> | null
+  runtime_bindings?: Record<string, any>[] | null
+  allow_delegated_authorization?: boolean
 }
 
 interface ConfigurableToolField {
@@ -461,7 +464,10 @@ function ToolsPageContent() {
         method: server.config?.method || "GET",
         headers: server.config?.headers || {},
         body: server.config?.body || "",
-        config: server.config || {}
+        config: server.config || {},
+        runtime_input_schema: server.runtime_input_schema ?? null,
+        runtime_bindings: server.runtime_bindings ?? null,
+        allow_delegated_authorization: Boolean(server.allow_delegated_authorization),
       })
 
       const configObj = server.config || {};
@@ -479,7 +485,10 @@ function ToolsPageContent() {
         name: server.name,
         transport: server.transport,
         description: server.description || "",
-        config: server.config || {}
+        config: server.config || {},
+        runtime_input_schema: server.runtime_input_schema ?? null,
+        runtime_bindings: server.runtime_bindings ?? null,
+        allow_delegated_authorization: Boolean(server.allow_delegated_authorization),
       })
       setIsMcpDialogOpen(true)
     }
@@ -1313,14 +1322,20 @@ function ToolsPageContent() {
                 url: configObj.url || "",
                 method: configObj.method || "GET",
                 headers: configObj.headers || {},
-                config: configObj
+                config: configObj,
+                runtime_input_schema: app.server.runtime_input_schema ?? null,
+                runtime_bindings: app.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(app.server.allow_delegated_authorization),
               });
             } else {
               setMcpFormData({
                 name: app.server.name,
                 transport: app.server.transport,
                 description: app.server.description || "",
-                config: app.server.config || {}
+                config: app.server.config || {},
+                runtime_input_schema: app.server.runtime_input_schema ?? null,
+                runtime_bindings: app.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(app.server.allow_delegated_authorization),
               });
             }
             setIsMcpDialogOpen(true);

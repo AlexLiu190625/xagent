@@ -829,7 +829,10 @@ export function ConnectMcpDialog({
               name: appToConfigure.server.name,
               transport: appToConfigure.server.transport,
               description: appToConfigure.server.description || "",
-              config: appToConfigure.server.config || {}
+              config: appToConfigure.server.config || {},
+              runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
+              runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
+              allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
             });
             if (appToConfigure.server.transport === "custom_api") {
               const configObj = appToConfigure.server.config || {};
@@ -849,7 +852,10 @@ export function ConnectMcpDialog({
                 method: configObj.method || "GET",
                 headers: configObj.headers || {},
                 body: configObj.body || "",
-                config: configObj
+                config: configObj,
+                runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
+                runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
               });
             } else {
               setMcpFormData({
@@ -858,7 +864,10 @@ export function ConnectMcpDialog({
                 description: appToConfigure.server.description || "",
                 config: appToConfigure.server.config || {},
                 user_env: appToConfigure.server.user_env || {},
-                can_edit_global: appToConfigure.server.can_edit_global ?? true
+                can_edit_global: appToConfigure.server.can_edit_global ?? true,
+                runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
+                runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
+                allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
               });
             }
             setActiveTab(appToConfigure.server.transport === "custom_api" ? "custom_api" : "custom");
