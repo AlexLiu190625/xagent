@@ -872,12 +872,28 @@ async def test_web_tool_config_applies_runtime_mcp_authorization_header(
         )
 
         configs = await tool_config.get_mcp_server_configs()
+        refresh = configs[0]["config"].get("_connector_runtime_refresh")
+        assert callable(refresh)
+
+        def _resolver(_request):
+            return ConnectorRuntimeValues(
+                context={},
+                secrets={"authorization": "Bearer refreshed-token"},
+                auth_selector={},
+            )
+
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            refreshed_connection = refresh()
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
     finally:
         db.close()
 
     assert len(configs) == 1
     assert configs[0]["id"] == server_id
     assert configs[0]["config"]["headers"]["Authorization"] == "Bearer tenant-token"
+    assert refreshed_connection["headers"]["Authorization"] == "Bearer refreshed-token"
     assert configs[0]["connector_runtime"]["secrets"] == {}
 
 

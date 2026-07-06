@@ -494,6 +494,50 @@ class WebToolConfig(BaseToolConfig):
             headers[header_name] = str(value)
         return headers
 
+    def _delegated_mcp_connection(
+        self,
+        *,
+        server: Any,
+        runtime_values: Optional[Dict[str, Any]],
+        runtime_bindings: Any,
+        allow_delegated_authorization: bool,
+    ) -> dict[str, Any] | None:
+        from ...web.services.mcp_runtime import headers_without_authorization
+
+        delegated_headers = self._runtime_transport_headers(
+            runtime_values=runtime_values,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=allow_delegated_authorization,
+        )
+        if not delegated_headers:
+            return None
+        connection = dict(server.to_connection_dict())
+        headers = headers_without_authorization(
+            connection.get("headers")
+            if isinstance(connection.get("headers"), dict)
+            else None
+        )
+        headers.update(delegated_headers)
+        connection["headers"] = headers
+        connection.pop("auth", None)
+        return connection
+
+    def _refresh_delegated_mcp_connection(
+        self,
+        *,
+        server: Any,
+        runtime_bindings: Any,
+        allow_delegated_authorization: bool,
+    ) -> dict[str, Any] | None:
+        self._connector_runtime_view = None
+        runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
+        return self._delegated_mcp_connection(
+            server=server,
+            runtime_values=runtime_values,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=allow_delegated_authorization,
+        )
+
     def _mcp_auth_context_for_server(
         self,
         *,
@@ -1047,26 +1091,26 @@ class WebToolConfig(BaseToolConfig):
                     from ...web.services.mcp_runtime import (
                         build_mcp_runtime_connection,
                         connection_to_transport_config,
-                        headers_without_authorization,
                     )
 
-                    delegated_headers = self._runtime_transport_headers(
+                    delegated_connection = self._delegated_mcp_connection(
+                        server=server,
                         runtime_values=runtime_values,
                         runtime_bindings=runtime_bindings,
                         allow_delegated_authorization=allow_delegated_authorization,
                     )
-                    if delegated_headers:
-                        connection = server.to_connection_dict()
-                        headers = headers_without_authorization(
-                            connection.get("headers")
-                            if isinstance(connection.get("headers"), dict)
-                            else None
+                    if delegated_connection:
+                        delegated_connection["_connector_runtime_refresh"] = (
+                            lambda _server=server,
+                            _runtime_bindings=runtime_bindings,
+                            _allow_delegated_authorization=allow_delegated_authorization: self._refresh_delegated_mcp_connection(
+                                server=_server,
+                                runtime_bindings=_runtime_bindings,
+                                allow_delegated_authorization=_allow_delegated_authorization,
+                            )
                         )
-                        headers.update(delegated_headers)
-                        connection["headers"] = headers
-                        connection.pop("auth", None)
                         transport_config.update(
-                            connection_to_transport_config(connection)
+                            connection_to_transport_config(delegated_connection)
                         )
                     else:
                         runtime_build = await build_mcp_runtime_connection(

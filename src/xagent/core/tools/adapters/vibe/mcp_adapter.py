@@ -5,6 +5,7 @@ enabling MCP tools to be used in DAG plan-execute patterns and other agent workf
 """
 
 import asyncio
+import inspect
 import logging
 import os
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
@@ -17,6 +18,7 @@ from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
 from .base import AbstractBaseTool, ToolVisibility
 from .connector_runtime import (
+    ERROR_DELEGATED_AUTHORIZATION_FAILED,
     MISSING_RUNTIME_VALUE,
     RUNTIME_INPUT_CONTEXT,
     TARGET_MCP_META,
@@ -37,6 +39,7 @@ class EmptyArgsModel(BaseModel):
 
 
 logger = logging.getLogger(__name__)
+_RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 
 
 def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
@@ -54,6 +57,27 @@ def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
     if not messages:
         return str(exc)
     return f"{exc}: " + ", ".join(messages)
+
+
+def _exception_indicates_http_401(exc: BaseException) -> bool:
+    if isinstance(exc, BaseExceptionGroup):
+        return any(_exception_indicates_http_401(sub_exc) for sub_exc in exc.exceptions)
+    text = str(exc).lower()
+    return "401" in text or "unauthorized" in text
+
+
+def _delegated_authorization_failed_result() -> dict[str, Any]:
+    return {
+        "content": [
+            {
+                "text": (
+                    "Error executing MCP tool: delegated authorization failed "
+                    f"({ERROR_DELEGATED_AUTHORIZATION_FAILED})"
+                )
+            }
+        ],
+        "is_error": True,
+    }
 
 
 def _normalize_concurrent_tools(value: Any) -> list[str]:
@@ -445,32 +469,24 @@ class MCPToolAdapter(AbstractBaseTool):
             user_context = UserContext(current_user_id)
 
             with user_context.set_context():
-                # Create session and execute tool
-                async with create_session(self.connection) as session:
-                    await session.initialize()
-
-                    # Call MCP tool
-                    result = await session.call_tool(
-                        self.mcp_tool.name,
-                        tool_args,
-                        meta=tool_meta or None,
+                try:
+                    return await self._execute_mcp_call(
+                        self.connection, tool_args, tool_meta
                     )
-
-                    # Convert result to our format
-                    content = []
-                    if result.content:
-                        for content_item in result.content:
-                            if hasattr(content_item, "model_dump"):
-                                content.append(content_item.model_dump())
-                            else:
-                                content.append({"text": str(content_item)})
-
-                    return {
-                        "content": content,
-                        "is_error": result.isError
-                        if hasattr(result, "isError")
-                        else False,
-                    }
+                except BaseExceptionGroup as exc:
+                    retry_result = await self._retry_delegated_401(
+                        exc, tool_args, tool_meta
+                    )
+                    if retry_result is not None:
+                        return retry_result
+                    raise
+                except Exception as exc:
+                    retry_result = await self._retry_delegated_401(
+                        exc, tool_args, tool_meta
+                    )
+                    if retry_result is not None:
+                        return retry_result
+                    raise
 
         except BaseExceptionGroup as e:
             logger.error(
@@ -486,6 +502,76 @@ class MCPToolAdapter(AbstractBaseTool):
             logger.error(f"MCP tool {self.mcp_tool.name} execution failed: {e}")
             return {
                 "content": [{"text": f"Error executing MCP tool: {e}"}],
+                "is_error": True,
+            }
+
+    async def _execute_mcp_call(
+        self,
+        connection: Connection,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        async with create_session(connection) as session:
+            await session.initialize()
+            result = await session.call_tool(
+                self.mcp_tool.name,
+                dict(tool_args),
+                meta=dict(tool_meta) or None,
+            )
+
+            content = []
+            if result.content:
+                for content_item in result.content:
+                    if hasattr(content_item, "model_dump"):
+                        content.append(content_item.model_dump())
+                    else:
+                        content.append({"text": str(content_item)})
+
+            return {
+                "content": content,
+                "is_error": result.isError if hasattr(result, "isError") else False,
+            }
+
+    async def _retry_delegated_401(
+        self,
+        exc: BaseException,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        if not _exception_indicates_http_401(exc):
+            return None
+        refresh = cast(Mapping[str, Any], self.connection).get(
+            _RUNTIME_CONNECTION_REFRESH_KEY
+        )
+        if not callable(refresh):
+            return None
+
+        logger.info(
+            "Retrying MCP tool %s after delegated authorization failure",
+            self.mcp_tool.name,
+        )
+        refreshed = refresh()
+        if inspect.isawaitable(refreshed):
+            refreshed = await refreshed
+        if not isinstance(refreshed, dict):
+            return _delegated_authorization_failed_result()
+        try:
+            return await self._execute_mcp_call(
+                cast(Connection, refreshed), tool_args, tool_meta
+            )
+        except BaseExceptionGroup as retry_exc:
+            if _exception_indicates_http_401(retry_exc):
+                return _delegated_authorization_failed_result()
+            error_msg = _format_exception_group_messages(retry_exc)
+            return {
+                "content": [{"text": f"Error executing MCP tool: {error_msg}"}],
+                "is_error": True,
+            }
+        except Exception as retry_exc:
+            if _exception_indicates_http_401(retry_exc):
+                return _delegated_authorization_failed_result()
+            return {
+                "content": [{"text": f"Error executing MCP tool: {retry_exc}"}],
                 "is_error": True,
             }
 

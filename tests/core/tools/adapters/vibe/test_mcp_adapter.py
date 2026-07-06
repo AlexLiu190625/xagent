@@ -314,3 +314,113 @@ async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
     assert captured["name"] == "list_clients"
     assert captured["arguments"] == {"query": "active", "account_id": "6185"}
     assert captured["kwargs"]["meta"] == {"account_id": "6185"}
+
+
+@pytest.mark.asyncio
+async def test_delegated_authorization_401_refreshes_connection_once(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    connections = []
+    refresh_calls = 0
+
+    def _refresh_connection():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "headers": {"Authorization": "Bearer fresh-token"},
+        }
+
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "headers": {"Authorization": "Bearer expired-token"},
+        "_connector_runtime_refresh": _refresh_connection,
+    }
+    adapter = MCPToolAdapter(mcp_tool=mcp_tool, connection=connection)
+
+    class _FakeSession:
+        def __init__(self, connection):
+            self._connection = connection
+
+        async def initialize(self):
+            if self._connection["headers"]["Authorization"] == "Bearer expired-token":
+                raise RuntimeError("HTTP 401 Unauthorized")
+
+        async def call_tool(self, name, arguments, **kwargs):
+            return SimpleNamespace(
+                content=[SimpleNamespace(model_dump=lambda: {"text": "ok"})],
+                isError=False,
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        connections.append(connection)
+        yield _FakeSession(connection)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+
+    result = await adapter.run_json_async({})
+
+    assert result == {"content": [{"text": "ok"}], "is_error": False}
+    assert refresh_calls == 1
+    assert [item["headers"]["Authorization"] for item in connections] == [
+        "Bearer expired-token",
+        "Bearer fresh-token",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_delegated_authorization_401_after_refresh_returns_safe_error(
+    monkeypatch,
+):
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    refresh_calls = 0
+
+    def _refresh_connection():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "headers": {"Authorization": "Bearer still-expired-token"},
+        }
+
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "headers": {"Authorization": "Bearer expired-token"},
+        "_connector_runtime_refresh": _refresh_connection,
+    }
+    adapter = MCPToolAdapter(mcp_tool=mcp_tool, connection=connection)
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError("HTTP 401 Unauthorized")
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+
+    result = await adapter.run_json_async({})
+
+    assert refresh_calls == 1
+    assert result["is_error"] is True
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+    assert "expired-token" not in result["content"][0]["text"]
