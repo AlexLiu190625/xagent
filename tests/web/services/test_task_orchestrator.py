@@ -22,10 +22,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.services.connector_runtime import (
+    get_ephemeral_runtime_values,
+    pop_ephemeral_runtime_values,
+    store_ephemeral_runtime_values,
+)
 from xagent.web.services.task_lease_service import get_runner_id
 from xagent.web.services.task_orchestrator import (
     TaskTurnError,
@@ -86,6 +92,17 @@ def _create_task(
     db.commit()
     db.refresh(task)
     return task
+
+
+def _store_runtime_secret_for_turn(turn_id: str) -> None:
+    store_ephemeral_runtime_values(
+        turn_id,
+        {
+            ConnectorRef("mcp", 1): {
+                "secrets": {"authorization": "Bearer cleanup-token"}
+            }
+        },
+    )
 
 
 @pytest.fixture()
@@ -729,6 +746,10 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
 
     from xagent.web.api.websocket import background_task_manager
 
+    payload = TaskTurnPayload("x")
+    _store_runtime_secret_for_turn(payload.turn_id)
+    assert get_ephemeral_runtime_values(payload.turn_id) is not None
+
     with (
         patch(
             "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
@@ -750,7 +771,7 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
             task_id=int(task.id),
             task_owner_user_id=int(user.id),
             task_source=task.source,
-            payload=TaskTurnPayload("x"),
+            payload=payload,
             force_fresh=False,
             context=None,
         )
@@ -758,6 +779,8 @@ async def test_schedule_bg_skips_finish_turn_when_lease_acquire_fails(
 
     mock_exec.assert_not_awaited()
     mock_finish.assert_not_called()
+    assert get_ephemeral_runtime_values(payload.turn_id) is None
+    assert pop_ephemeral_runtime_values(payload.turn_id) is None
 
 
 @pytest.mark.asyncio
@@ -772,6 +795,9 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    payload = TaskTurnPayload("x")
+    _store_runtime_secret_for_turn(payload.turn_id)
+    assert get_ephemeral_runtime_values(payload.turn_id) is not None
 
     with (
         patch(
@@ -802,7 +828,7 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
             task_id=int(task.id),
             task_owner_user_id=int(user.id),
             task_source=task.source,
-            payload=TaskTurnPayload("x"),
+            payload=payload,
             force_fresh=False,
             context=None,
         )
@@ -815,6 +841,8 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
             pass
 
     mock_release.assert_called_once()
+    assert get_ephemeral_runtime_values(payload.turn_id) is None
+    assert pop_ephemeral_runtime_values(payload.turn_id) is None
 
 
 @pytest.mark.asyncio
@@ -839,6 +867,12 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    payload = TaskTurnPayload(
+        transcript_message="summarize this",
+        execution_message="summarize this\n\n[uploaded file: secret.txt]",
+    )
+    _store_runtime_secret_for_turn(payload.turn_id)
+    assert get_ephemeral_runtime_values(payload.turn_id) is not None
 
     with (
         patch(
@@ -865,10 +899,6 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
             return_value=MagicMock(),
         ),
     ):
-        payload = TaskTurnPayload(
-            transcript_message="summarize this",
-            execution_message="summarize this\n\n[uploaded file: secret.txt]",
-        )
         bg_task = _schedule_bg(
             task_id=int(task.id),
             task_owner_user_id=int(user.id),
@@ -892,6 +922,8 @@ async def test_schedule_bg_forwards_execution_message_to_execute_task_background
     ), "execution_message must reach execute_task_background.llm_user_message"
     assert kwargs["context"]["turn_id"] == payload.turn_id
     assert kwargs["context"]["existing"] == "value"
+    assert get_ephemeral_runtime_values(payload.turn_id) is None
+    assert pop_ephemeral_runtime_values(payload.turn_id) is None
 
 
 @pytest.mark.asyncio
@@ -979,6 +1011,9 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     user = _create_user(db_session)
     task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
     fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    payload = TaskTurnPayload("x")
+    _store_runtime_secret_for_turn(payload.turn_id)
+    assert get_ephemeral_runtime_values(payload.turn_id) is not None
 
     with (
         patch(
@@ -1013,7 +1048,7 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
             task_id=int(task.id),
             task_owner_user_id=int(user.id),
             task_source=task.source,
-            payload=TaskTurnPayload("x"),
+            payload=payload,
             force_fresh=False,
             context=None,
         )
@@ -1035,6 +1070,8 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
     )
     assert task.error_message is not None
     assert "simulated snapshot load failure" in str(task.error_message)
+    assert get_ephemeral_runtime_values(payload.turn_id) is None
+    assert pop_ephemeral_runtime_values(payload.turn_id) is None
 
 
 @pytest.mark.asyncio

@@ -32,9 +32,11 @@ from xagent.web.models.task import (
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
+    get_ephemeral_runtime_values,
     load_connector_runtime_view,
     pop_ephemeral_runtime_values,
     set_connector_runtime_resolver_for_testing,
+    store_ephemeral_runtime_values,
 )
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
@@ -717,6 +719,56 @@ def test_create_task_marks_failed_when_runtime_secret_store_fails(mock_start_tas
         db.close()
 
 
+def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+    turn_ids: list[str] = []
+
+    def recording_store(turn_id, values_by_ref):
+        turn_ids.append(turn_id)
+        store_ephemeral_runtime_values(turn_id, values_by_ref)
+
+    with (
+        patch(
+            "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+            new=recording_store,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator._schedule_bg",
+            side_effect=RuntimeError("schedule failed for Bearer create-token"),
+        ),
+    ):
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {
+                    "role": "user",
+                    "content": "runtime secret schedule failure",
+                },
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer create-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 500
+    assert turn_ids
+    assert get_ephemeral_runtime_values(turn_ids[0]) is None
+    assert "create-token" not in resp.text
+    assert "schedule failed" not in resp.text
+    assert mock_start_task.call_count == 0
+
+
 def test_connector_runtime_resolver_can_override_values(mock_start_task):
     agent_id, full_key = _create_agent_with_key()
     server_id = _install_runtime_mcp_connector(agent_id)
@@ -1270,6 +1322,69 @@ def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
         assert task.error_message is None
     finally:
         db.close()
+
+
+def test_append_message_cleans_runtime_secret_when_task_is_busy(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    pop_ephemeral_runtime_values(mock_start_task.call_args.kwargs["payload"].turn_id)
+    task_id = create_resp.json()["task_id"]
+    mock_start_task.reset_mock()
+
+    turn_ids: list[str] = []
+
+    def recording_store(turn_id, values_by_ref):
+        turn_ids.append(turn_id)
+        store_ephemeral_runtime_values(turn_id, values_by_ref)
+
+    with patch(
+        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        new=recording_store,
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer append-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 409
+    assert resp.json()["error"]["code"] == "task_busy"
+    assert turn_ids
+    assert get_ephemeral_runtime_values(turn_ids[0]) is None
+    assert "append-token" not in resp.text
+    assert mock_start_task.call_count == 0
 
 
 def test_append_message_to_running_task_returns_409(mock_start_task):
