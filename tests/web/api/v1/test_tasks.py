@@ -21,6 +21,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.agent import Agent
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import (
@@ -790,6 +791,28 @@ def test_create_task_marks_failed_when_runtime_secret_store_fails(mock_start_tas
         assert task.error_message == "Connector runtime setup failed."
     finally:
         db.close()
+
+
+def test_runtime_setup_failed_mark_swallows_secondary_rollback_failure(caplog):
+    class RollbackFailingDB:
+        rollback_calls = 0
+
+        def rollback(self):
+            self.rollback_calls += 1
+            if self.rollback_calls > 1:
+                raise RuntimeError("rollback failed")
+
+        def query(self, _model):
+            raise RuntimeError("query failed")
+
+    db = RollbackFailingDB()
+
+    with caplog.at_level("WARNING", logger="xagent.web.api.v1.tasks"):
+        v1_tasks._mark_task_failed_after_runtime_setup_error(db, 123)
+
+    assert db.rollback_calls == 2
+    assert "Failed to roll back task 123 session" in caplog.text
+    assert "Failed to mark task 123 failed" in caplog.text
 
 
 def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):

@@ -80,6 +80,17 @@ def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> None:
     ) from exc
 
 
+def _rollback_runtime_setup_mark_failure(db: Session, task_id: int) -> None:
+    try:
+        db.rollback()
+    except Exception:
+        logger.warning(
+            "Failed to roll back task %s session after connector runtime setup error",
+            task_id,
+            exc_info=True,
+        )
+
+
 def _mark_task_failed_after_runtime_setup_error(db: Session, task_id: int) -> None:
     """Best-effort terminal mark after pre-schedule runtime setup fails."""
 
@@ -91,10 +102,11 @@ def _mark_task_failed_after_runtime_setup_error(db: Session, task_id: int) -> No
             setattr(task, "error_message", _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE)
             db.commit()
     except Exception:
-        db.rollback()
+        _rollback_runtime_setup_mark_failure(db, task_id)
         logger.warning(
             "Failed to mark task %s failed after connector runtime setup error",
             task_id,
+            exc_info=True,
         )
 
 
