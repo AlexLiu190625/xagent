@@ -2531,6 +2531,7 @@ async def handle_chat_message(
                             description=user_message,
                             status=TaskStatus.PENDING,  # Use PENDING instead of RUNNING
                             execution_mode=get_default_task_execution_mode(),
+                            connector_runtime_selected_refs=[],
                         )
                         db.add(task)
                         db.commit()

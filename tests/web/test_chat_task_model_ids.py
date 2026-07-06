@@ -825,6 +825,7 @@ def test_task_create_allows_policy_visible_published_agent(
 ):
     from xagent.web.models.agent import Agent, AgentStatus
     from xagent.web.models.database import get_db
+    from xagent.web.models.mcp import MCPServer, UserMCPServer
     from xagent.web.models.task import Task
     from xagent.web.models.user import User
 
@@ -838,6 +839,8 @@ def test_task_create_allows_policy_visible_published_agent(
 
     db = next(get_db())
     try:
+        user1 = db.query(User).filter(User.username == "user1").first()
+        assert user1 is not None
         user2 = db.query(User).filter(User.username == "user2").first()
         assert user2 is not None
 
@@ -848,10 +851,51 @@ def test_task_create_allows_policy_visible_published_agent(
             instructions="Use shared instructions.",
             execution_mode="think",
             status=AgentStatus.PUBLISHED,
+            tool_categories=["mcp"],
         )
         db.add(shared_agent)
+        owner_server = MCPServer(
+            name="owner-runtime-server",
+            description="owner connector",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/owner/mcp",
+            runtime_input_schema={
+                "context": {"account_id": {"type": "string", "required": False}}
+            },
+        )
+        actor_server = MCPServer(
+            name="actor-runtime-server",
+            description="actor connector",
+            managed="external",
+            transport="streamable_http",
+            url="https://example.com/actor/mcp",
+            runtime_input_schema={
+                "context": {"account_id": {"type": "string", "required": False}}
+            },
+        )
+        db.add_all([owner_server, actor_server])
+        db.flush()
+        db.add_all(
+            [
+                UserMCPServer(
+                    user_id=user2.id,
+                    mcpserver_id=owner_server.id,
+                    is_owner=True,
+                    is_active=True,
+                ),
+                UserMCPServer(
+                    user_id=user1.id,
+                    mcpserver_id=actor_server.id,
+                    is_owner=True,
+                    is_active=True,
+                ),
+            ]
+        )
         db.commit()
         db.refresh(shared_agent)
+        db.refresh(owner_server)
+        db.refresh(actor_server)
 
         set_workforce_policy(VisibleAgentPolicy({int(shared_agent.id)}))
 
@@ -869,6 +913,12 @@ def test_task_create_allows_policy_visible_published_agent(
         task = db.query(Task).filter(Task.id == resp.json()["task_id"]).one()
         assert int(task.agent_id) == int(shared_agent.id)
         assert _load_agent_for_task_runtime(db, task) == shared_agent
+        assert task.connector_runtime_selected_refs == [
+            {"connector_type": "mcp", "connector_id": int(actor_server.id)}
+        ]
+        assert {"connector_type": "mcp", "connector_id": int(owner_server.id)} not in (
+            task.connector_runtime_selected_refs or []
+        )
 
         from xagent.web.services.task_setup_snapshot import (
             load_task_setup_snapshot_sync,

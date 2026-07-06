@@ -22,6 +22,10 @@ from ..models.task import Task, TaskStatus
 from ..models.user import User
 from ..models.user_channel import UserChannel
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from ..services.connector_runtime import (
+    bind_connector_runtime_selection_snapshot,
+    prepare_connector_runtime_selection_snapshot,
+)
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
 from .websocket import (
@@ -385,6 +389,7 @@ async def create_public_chat_task(
             agent_id = access_context.widget_agent_id
         elif agent_id != access_context.widget_agent_id:
             raise HTTPException(status_code=403, detail="Widget access is unavailable")
+    agent = db.query(Agent).filter(Agent.id == agent_id).first() if agent_id else None
     task_title = request.title or task_description or "Untitled Task"
     if task_title and len(task_title) > 50:
         task_title = task_title[:50] + "..."
@@ -401,6 +406,12 @@ async def create_public_chat_task(
         source="widget",
         is_visible=False,
     )
+    selected_refs = prepare_connector_runtime_selection_snapshot(
+        db=db,
+        agent=agent,
+        connector_user_id=int(access_context.user.id),
+    )
+    bind_connector_runtime_selection_snapshot(task=task, selected_refs=selected_refs)
 
     db.add(task)
     db.commit()
@@ -455,6 +466,12 @@ async def create_share_chat_task(
         source="shared_link",
         is_visible=False,
     )
+    selected_refs = prepare_connector_runtime_selection_snapshot(
+        db=db,
+        agent=access_context.agent,
+        connector_user_id=int(access_context.user.id),
+    )
+    bind_connector_runtime_selection_snapshot(task=task, selected_refs=selected_refs)
 
     db.add(task)
     db.commit()

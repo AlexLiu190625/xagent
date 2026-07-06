@@ -400,6 +400,41 @@ def test_widget_public_tokens_cannot_create_tasks_for_other_agents() -> None:
     assert create_task_response.json()["detail"] == "Widget access is unavailable"
 
 
+def test_widget_task_create_persists_connector_runtime_selection_snapshot() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Widget Snapshot Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["example.com"],
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    create_task_response = client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "hello from widget",
+            "description": "hello from widget",
+            "agent_id": agent_id,
+        },
+        headers=guest_headers,
+    )
+    assert create_task_response.status_code == 200, create_task_response.text
+
+    db = _direct_db_session()
+    try:
+        task = (
+            db.query(Task)
+            .filter(Task.id == create_task_response.json()["task_id"])
+            .one()
+        )
+        assert task.connector_runtime_selected_refs == []
+    finally:
+        db.close()
+
+
 def test_share_link_requires_published_agent() -> None:
     headers = _admin_headers()
     owner_id = _user_id("admin")
@@ -590,6 +625,16 @@ def test_rotated_share_link_invalidates_existing_public_tokens() -> None:
     assert refreshed_create_task_response.status_code == 200, (
         refreshed_create_task_response.text
     )
+    db = _direct_db_session()
+    try:
+        task = (
+            db.query(Task)
+            .filter(Task.id == refreshed_create_task_response.json()["task_id"])
+            .one()
+        )
+        assert task.connector_runtime_selected_refs == []
+    finally:
+        db.close()
 
 
 def test_reenabled_share_link_invalidates_existing_public_tokens() -> None:

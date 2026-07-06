@@ -13,6 +13,10 @@ from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun
 
+from .connector_runtime import (
+    bind_connector_runtime_selection_snapshot,
+    prepare_connector_runtime_selection_snapshot,
+)
 from .task_orchestrator import TaskTurnOrchestrator, TaskTurnPayload, TurnKind
 from .workforce_access import ensure_workforce_access, get_workforce_policy
 from .workforce_runtime import mark_workforce_task_status, sync_workforce_run_status
@@ -123,6 +127,14 @@ async def create_workforce_run(
             execution_mode=manager_execution_mode,
             source="internal",
             is_visible=is_visible,
+        )
+        selected_refs = prepare_connector_runtime_selection_snapshot(
+            db=db,
+            agent=cast(Any, workforce.manager_agent),
+            connector_user_id=int(user.id),
+        )
+        bind_connector_runtime_selection_snapshot(
+            task=task, selected_refs=selected_refs
         )
         db.add(task)
         db.flush()

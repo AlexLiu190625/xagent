@@ -110,7 +110,7 @@ class Task(Base):  # type: ignore
         String(20), default=AgentType.STANDARD.value, nullable=True
     )  # SQLite compatible
     agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
-    connector_runtime_selected_refs = Column(JSON, nullable=True)
+    connector_runtime_selected_refs = Column(JSON, nullable=True, default=list)
 
     # Execution mode configuration
     execution_mode = Column(

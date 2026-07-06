@@ -39,6 +39,10 @@ from ..services.chat_history_service import (
     get_latest_waiting_question,
     load_task_transcript,
 )
+from ..services.connector_runtime import (
+    bind_connector_runtime_selection_snapshot,
+    prepare_connector_runtime_selection_snapshot,
+)
 from ..services.hot_path_cache import (
     cache_get,
     cache_set,
@@ -1350,6 +1354,7 @@ class AgentServiceManager:
                             title=f"Task {task_id}",
                             description="Auto-created task",
                             status=TaskStatus.PENDING,
+                            connector_runtime_selected_refs=[],
                         )
                         db.add(new_task)
                         db.commit()
@@ -2610,6 +2615,14 @@ async def create_task(
             examples=examples_data,
             agent_id=request.agent_id,  # Set agent_id if provided
             is_visible=False if request.is_preview else request.is_visible,
+        )
+        selected_refs = prepare_connector_runtime_selection_snapshot(
+            db=db,
+            agent=selected_agent,
+            connector_user_id=int(user.id),
+        )
+        bind_connector_runtime_selection_snapshot(
+            task=task, selected_refs=selected_refs
         )
 
         # Set agent_type using the property to avoid Column type issues

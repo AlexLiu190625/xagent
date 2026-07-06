@@ -258,6 +258,10 @@ def prepare_create_connector_runtime(
     allow_ephemeral: bool = True,
     missing_ephemeral_error_code: str = ERROR_RUNTIME_SECRET_UNAVAILABLE,
 ) -> ConnectorRuntimeCreatePlan:
+    # This create-plan helper is for entrypoints where the task runtime owner is
+    # the agent owner (currently /v1 SDK tasks and triggers). Entrypoints where a
+    # published/shared agent runs under a different task owner must use
+    # prepare_connector_runtime_selection_snapshot(..., connector_user_id=...).
     visible = _load_visible_runtime_connectors(db, user_id=int(agent.user_id))
     selected_refs = _plan_selected_refs(agent, visible)
     payload_by_ref = _parse_payload_items(payload_items)
@@ -293,10 +297,43 @@ def prepare_create_connector_runtime(
             }
 
     return ConnectorRuntimeCreatePlan(
-        selected_refs=tuple(sorted(selected_refs)),
+        selected_refs=_sort_connector_refs(selected_refs),
         context_by_ref=context_by_ref,
         ephemeral_by_ref=ephemeral_by_ref,
     )
+
+
+def prepare_connector_runtime_selection_snapshot(
+    *,
+    db: Session,
+    agent: Agent | None,
+    connector_user_id: int | None,
+) -> tuple[ConnectorRef, ...]:
+    """Return the connector-runtime closed set for a newly created task.
+
+    This helper is intentionally selection-only: non-/v1 task creation paths do
+    not accept per-invocation runtime payloads in this phase. ``agent`` supplies
+    the agent's tool-selection policy, while ``connector_user_id`` supplies the
+    same connector visibility scope used by normal web tool loading
+    (``WebToolConfig`` loads MCP/Custom API junction rows for the task runtime
+    owner). For published-agent chats, this therefore follows the task owner
+    rather than the published agent owner, matching existing tool loading.
+    """
+
+    if agent is None or connector_user_id is None:
+        return ()
+    visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
+    return _plan_selected_refs(agent, visible)
+
+
+def bind_connector_runtime_selection_snapshot(
+    *, task: Task, selected_refs: Iterable[ConnectorRef]
+) -> None:
+    """Attach a connector-runtime selection snapshot to a new task."""
+
+    cast(Any, task).connector_runtime_selected_refs = [
+        ref.to_wire() for ref in _sort_connector_refs(selected_refs)
+    ]
 
 
 def reject_ephemeral_connector_runtime_payload(
@@ -476,7 +513,11 @@ def _plan_selected_refs(
             if scoped_mcp_servers is not None and name_key not in scoped_mcp_servers:
                 continue
         selected.append(ref)
-    return tuple(sorted(selected))
+    return _sort_connector_refs(selected)
+
+
+def _sort_connector_refs(refs: Iterable[ConnectorRef]) -> tuple[ConnectorRef, ...]:
+    return tuple(sorted(refs, key=lambda ref: (ref.connector_type, ref.connector_id)))
 
 
 def _has_runtime_declaration(connector: Any) -> bool:

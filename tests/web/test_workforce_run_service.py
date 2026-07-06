@@ -225,6 +225,7 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
     assert task.agent_config["workforce_run_id"] == workforce_run.id
     assert task.agent_config["selected_file_ids"] == ["file-1"]
     assert task.agent_config["workforce_snapshot"]["manager"]["agent_id"] == manager.id
+    assert task.connector_runtime_selected_refs == []
     assert workforce_run.task_id == task.id
     assert workforce_run.status == "running"
     assert uploaded_file.task_id == task.id

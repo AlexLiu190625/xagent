@@ -522,6 +522,7 @@ class TelegramBotInstance:
                         execution_mode=get_default_task_execution_mode(),
                         channel_id=self.channel_id,
                         channel_name=self.channel_name,
+                        connector_runtime_selected_refs=[],
                     )
                     db.add(task)
                     db.commit()
