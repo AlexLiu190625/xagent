@@ -120,6 +120,16 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
             "secrets": {"authorization": "Bearer tenant-token"},
             "auth_selector": {"resource_owner_key": "xagent:user:owner"},
         },
+        "usage": {
+            "prompt_tokens": 11,
+            "total_tokens": 42,
+            "token_type": "Bearer",
+        },
+        "oauth": {
+            "access_token": "access-secret",
+            "client_secret": "client-secret",
+            "token": "generic-token-secret",
+        },
         "tuple_body": ({"refresh_token": "tuple-refresh-secret"}, {"safe": "value"}),
         "body": [{"refresh_token": "refresh-secret"}, {"safe": "value"}],
     }
@@ -141,6 +151,16 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
             "secrets": {"authorization": REDACTED_RUNTIME_SECRET},
             "auth_selector": {"resource_owner_key": REDACTED_RUNTIME_SECRET},
         },
+        "usage": {
+            "prompt_tokens": 11,
+            "total_tokens": 42,
+            "token_type": "Bearer",
+        },
+        "oauth": {
+            "access_token": REDACTED_RUNTIME_SECRET,
+            "client_secret": REDACTED_RUNTIME_SECRET,
+            "token": REDACTED_RUNTIME_SECRET,
+        },
         "tuple_body": (
             {"refresh_token": REDACTED_RUNTIME_SECRET},
             {"safe": "value"},
@@ -156,6 +176,9 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
     assert "private-key-secret" not in repr(redacted)
     assert "tenant-token" not in repr(redacted)
     assert "xagent:user:owner" not in repr(redacted)
+    assert "access-secret" not in repr(redacted)
+    assert "client-secret" not in repr(redacted)
+    assert "generic-token-secret" not in repr(redacted)
     assert "tuple-refresh-secret" not in repr(redacted)
 
 

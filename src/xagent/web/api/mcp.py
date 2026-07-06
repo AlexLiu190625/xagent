@@ -2332,12 +2332,11 @@ def create_mcp_server(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create server",
             )
-        setattr(server, "runtime_input_schema", server_data.runtime_input_schema)
-        setattr(server, "runtime_bindings", server_data.runtime_bindings)
-        setattr(
-            server,
-            "allow_delegated_authorization",
-            server_data.allow_delegated_authorization,
+        orm_server = cast(Any, server)
+        orm_server.runtime_input_schema = server_data.runtime_input_schema
+        orm_server.runtime_bindings = server_data.runtime_bindings
+        orm_server.allow_delegated_authorization = (
+            server_data.allow_delegated_authorization
         )
 
         # Create user-server association. The creator owns the global config.
@@ -2493,16 +2492,13 @@ def update_mcp_server(
         # Update server fields (global config; no-op values for non-owners)
         _update_server_from_config(server, config)
         if can_edit_global:
+            orm_server = cast(Any, server)
             if "runtime_input_schema" in fields_set:
-                setattr(server, "runtime_input_schema", runtime_input_schema)
+                orm_server.runtime_input_schema = runtime_input_schema
             if "runtime_bindings" in fields_set:
-                setattr(server, "runtime_bindings", runtime_bindings)
+                orm_server.runtime_bindings = runtime_bindings
             if "allow_delegated_authorization" in fields_set:
-                setattr(
-                    server,
-                    "allow_delegated_authorization",
-                    allow_delegated_authorization,
-                )
+                orm_server.allow_delegated_authorization = allow_delegated_authorization
 
         # Store this user's per-user env override (masked values keep stored secrets)
         if server_data.user_env is not None:

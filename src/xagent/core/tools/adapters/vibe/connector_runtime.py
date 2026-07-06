@@ -34,16 +34,9 @@ _SENSITIVE_RUNTIME_KEY_PARTS = frozenset(
         "authorization",
         "auth_selector",
         "bearer",
-        "client_secret",
-        "refresh_token",
-        "access_token",
-        "id_token",
         "api_key",
         "private_key",
         "password",
-        "secret",
-        "secrets",
-        "token",
     }
 )
 
@@ -187,7 +180,11 @@ def _is_sensitive_runtime_key(key: Any) -> bool:
     normalized = str(key).strip().lower().replace("-", "_")
     if any(part in normalized for part in _SENSITIVE_RUNTIME_KEY_PARTS):
         return True
-    return normalized.endswith("_token") or normalized.endswith("_secret")
+    return (
+        normalized in {"token", "secret", "secrets"}
+        or normalized.endswith("_token")
+        or normalized.endswith("_secret")
+    )
 
 
 def runtime_bindings_from_config(config: Mapping[str, Any]) -> list[dict[str, Any]]:

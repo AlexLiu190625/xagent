@@ -15,7 +15,7 @@ by the WebSocket UI path so both transports share one state machine.
 """
 
 import logging
-from typing import Tuple
+from typing import Any, Tuple, cast
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
@@ -98,8 +98,9 @@ def _mark_task_failed_after_runtime_setup_error(db: Session, task_id: int) -> No
         db.rollback()
         task = db.query(Task).filter(Task.id == task_id).first()
         if task is not None:
-            setattr(task, "status", TaskStatus.FAILED)
-            setattr(task, "error_message", _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE)
+            orm_task = cast(Any, task)
+            orm_task.status = TaskStatus.FAILED
+            orm_task.error_message = _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE
             db.commit()
     except Exception:
         _rollback_runtime_setup_mark_failure(db, task_id)
