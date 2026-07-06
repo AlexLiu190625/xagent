@@ -23,6 +23,7 @@ from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
+    load_connector_runtime_view,
     set_connector_runtime_resolver_for_testing,
 )
 from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
@@ -1346,6 +1347,68 @@ def test_scheduled_scan_allows_resolver_to_supply_required_runtime_secret() -> N
             db.close()
     finally:
         set_connector_runtime_resolver_for_testing(None)
+
+
+def test_scheduled_runtime_view_reports_scheduled_secret_when_resolver_omits_secret() -> (
+    None
+):
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        context_required=False,
+        secret_required=True,
+    )
+
+    def resolver(_request):
+        return None
+
+    set_connector_runtime_resolver_for_testing(resolver)
+    try:
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "scheduled",
+                "name": "Resolver missing delegated token",
+                "config": {"interval_seconds": 60},
+            },
+        )
+        assert created.status_code == 200, created.text
+        trigger_id = created.json()["id"]
+
+        db = _direct_db_session()
+        try:
+            trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+            trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            db.add(trigger)
+            db.commit()
+
+            runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+            assert len(runs) == 1
+            run = db.query(TriggerRun).filter(TriggerRun.id == runs[0].id).one()
+            assert run.status == TriggerRunStatus.PENDING.value
+            assert run.task_id is not None
+            task = db.query(Task).filter(Task.id == run.task_id).one()
+
+            with pytest.raises(Exception) as exc_info:
+                load_connector_runtime_view(
+                    db=db,
+                    task_id=int(task.id),
+                    turn_id="scheduled-turn",
+                    user_id=int(task.user_id),
+                )
+        finally:
+            db.close()
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert getattr(exc_info.value, "code", None) == "scheduled_secret_unavailable"
+    assert getattr(exc_info.value, "details", {}).get("reason") == "not_provided"
+    assert getattr(exc_info.value, "details", {}).get("connector_ref") == {
+        "connector_type": "mcp",
+        "connector_id": server_id,
+    }
 
 
 def test_dispatch_claims_pending_trigger_run_once_under_concurrency() -> None:

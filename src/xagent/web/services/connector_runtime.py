@@ -239,7 +239,11 @@ def load_connector_runtime_view(
         )
         _require_context_values(ref, connector, values.context)
         _require_ephemeral_values_at_binding(
-            ref, connector, values, ephemeral_manifest=ephemeral_manifest
+            ref,
+            connector,
+            values,
+            ephemeral_manifest=ephemeral_manifest,
+            error_code=_binding_missing_ephemeral_error_code(task),
         )
         runtime_view[ref.storage_key] = values.to_runtime_config()
 
@@ -636,6 +640,7 @@ def _require_ephemeral_values_at_binding(
     values: ConnectorRuntimeValues,
     *,
     ephemeral_manifest: dict[str, dict[str, set[str]]] | None,
+    error_code: str = ERROR_RUNTIME_SECRET_UNAVAILABLE,
 ) -> None:
     schema = _runtime_input_schema(connector)
     for section_name, section_values in (
@@ -653,10 +658,21 @@ def _require_ephemeral_values_at_binding(
                     else RUNTIME_SECRET_REASON_NOT_PROVIDED
                 )
                 _raise_runtime_error(
-                    ERROR_RUNTIME_SECRET_UNAVAILABLE,
+                    error_code,
                     ref,
                     reason=reason,
                 )
+
+
+def _binding_missing_ephemeral_error_code(task: Task) -> str:
+    if str(getattr(task, "source", "")) != "trigger":
+        return ERROR_RUNTIME_SECRET_UNAVAILABLE
+    config = getattr(task, "agent_config", None)
+    if not isinstance(config, dict):
+        return ERROR_RUNTIME_SECRET_UNAVAILABLE
+    if str(config.get("trigger_type")) == "scheduled":
+        return ERROR_SCHEDULED_SECRET_UNAVAILABLE
+    return ERROR_RUNTIME_SECRET_UNAVAILABLE
 
 
 def _resolve_runtime_values(
