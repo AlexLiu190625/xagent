@@ -45,6 +45,11 @@ if TYPE_CHECKING:
         headers = Column(JSON, nullable=True)  # Dict[str, Any]
         timeout = Column(Integer, nullable=True)
         auth = Column(JSON, nullable=True)  # Dict[str, Any]
+        runtime_input_schema = Column(JSON, nullable=True)
+        runtime_bindings = Column(JSON, nullable=True)
+        allow_delegated_authorization = Column(
+            Boolean, nullable=False, default=False, server_default="0"
+        )
 
         # Container management parameters (internal only)
         docker_url = Column(String(500), nullable=True)

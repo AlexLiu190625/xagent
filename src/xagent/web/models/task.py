@@ -9,6 +9,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -109,6 +110,7 @@ class Task(Base):  # type: ignore
         String(20), default=AgentType.STANDARD.value, nullable=True
     )  # SQLite compatible
     agent_config = Column(JSON, nullable=True)  # Agent-specific configuration
+    connector_runtime_selected_refs = Column(JSON, nullable=True)
 
     # Execution mode configuration
     execution_mode = Column(
@@ -230,6 +232,44 @@ class Task(Base):  # type: ignore
 
     def __repr__(self) -> str:
         return f"<Task(id={self.id}, title='{self.title}', status='{self.status}')>"
+
+
+class TaskConnectorRuntimeContext(Base):  # type: ignore
+    """Task-bound non-secret runtime context for one connector."""
+
+    __tablename__ = "task_connector_runtime_contexts"
+    __table_args__ = (
+        UniqueConstraint(
+            "task_id",
+            "connector_type",
+            "connector_id",
+            name="uq_task_connector_runtime_contexts_ref",
+        ),
+        Index("ix_task_connector_runtime_contexts_task_id", "task_id"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    task_id = Column(
+        Integer,
+        ForeignKey("tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    connector_type = Column(String(32), nullable=False)
+    connector_id = Column(Integer, nullable=False)
+    context = Column(JSON, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    task = relationship("Task")
+
+    def __repr__(self) -> str:
+        return (
+            "<TaskConnectorRuntimeContext("
+            f"task_id={self.task_id}, "
+            f"connector_type='{self.connector_type}', "
+            f"connector_id={self.connector_id})>"
+        )
 
 
 class DAGExecution(Base):  # type: ignore

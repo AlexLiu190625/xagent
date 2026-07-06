@@ -50,6 +50,11 @@ def create_mcp_server_table(Base: Type[Any]) -> Type[Any]:
         auth = Column(JSON, nullable=True)  # Dict[str, Any]
         concurrency_safe = Column(Boolean, nullable=False, default=False)
         concurrent_tools = Column(JSON, nullable=True)  # List[str]
+        runtime_input_schema = Column(JSON, nullable=True)
+        runtime_bindings = Column(JSON, nullable=True)
+        allow_delegated_authorization = Column(
+            Boolean, nullable=False, default=False, server_default="0"
+        )
 
         # Container management parameters (internal only)
         docker_url = Column(String(500), nullable=True)

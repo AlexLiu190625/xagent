@@ -37,6 +37,11 @@ class CustomApi(Base):  # type: ignore[no-any-unimported]
     headers = Column(JSON, nullable=True)  # Dict[str, str]
     body = Column(Text, nullable=True)  # JSON template string
     env = Column(JSON, nullable=True)  # Dict[str, str] - encrypted values
+    runtime_input_schema = Column(JSON, nullable=True)
+    runtime_bindings = Column(JSON, nullable=True)
+    allow_delegated_authorization = Column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
 
     # Timestamps
     created_at = Column(DateTime(timezone=True), server_default=func.now())
