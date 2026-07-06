@@ -1,6 +1,8 @@
 """Web Widget API route handlers."""
 
+from datetime import timedelta
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 from fastapi import (
     APIRouter,
@@ -13,13 +15,16 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
-from pydantic import BaseModel
+from jose import JWTError, jwt
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
 from ..models.user import User
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
+from .auth import create_access_token
 from .public_chat_access import (
     PublicChatAccessContext,
     PublicChatAuthResponse,
@@ -32,13 +37,105 @@ from .public_chat_access import (
 
 widget_router = APIRouter(prefix="/api/widget", tags=["widget"])
 
+EMBED_TICKET_TYPE = "widget_embed_ticket"
+EMBED_TICKET_TTL_SECONDS = 60
+
 
 class WidgetAuthRequest(BaseModel):
-    guest_id: str
+    guest_id: str = Field(max_length=256)
     agent_id: Optional[int] = None
+    # A signed embed ticket is a compact JWT; cap it to reject pathological
+    # payloads, matching the length limits on sibling request models.
+    embed_ticket: Optional[str] = Field(default=None, max_length=4096)
+
+
+class EmbedTicketRequest(BaseModel):
+    agent_id: int
+
+
+class EmbedTicketResponse(BaseModel):
+    ticket: str
 
 
 WidgetAuthResponse = PublicChatAuthResponse
+
+
+def _origin_to_domain(origin: str) -> str:
+    """Extract a lowercased host[:port] from an origin/referer value."""
+    if not origin:
+        return ""
+    parsed = urlparse(origin)
+    return (parsed.netloc or parsed.path).lower()
+
+
+def _domain_allowed(origin_domain: str, allowed_domains: list[str]) -> bool:
+    """Check a domain against the agent allowlist (case-insensitive,
+    supports "*" and subdomain suffix matches)."""
+    for domain in allowed_domains:
+        normalized_domain = domain.strip().lower()
+        if (
+            normalized_domain == "*"
+            or normalized_domain == origin_domain
+            or (origin_domain and origin_domain.endswith("." + normalized_domain))
+        ):
+            return True
+    return False
+
+
+def _require_domain_allowed(origin_domain: str, allowed_domains: list[str]) -> None:
+    """Raise 403 unless the domain passes the agent allowlist."""
+    if not _domain_allowed(origin_domain, allowed_domains):
+        raise HTTPException(
+            status_code=403, detail=f"Domain not allowed: {origin_domain}"
+        )
+
+
+def _get_widget_enabled_agent(db: Session, agent_id: int) -> Agent:
+    """Load a widget-enabled agent or raise the matching HTTP error."""
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if agent is None or is_workforce_generated_manager_agent(agent):
+        raise HTTPException(
+            status_code=401, detail="Widget owner not found or invalid agent_id"
+        )
+    if not agent.widget_enabled:
+        raise HTTPException(status_code=403, detail="Widget is disabled for this agent")
+    return agent
+
+
+@widget_router.post("/embed-ticket", response_model=EmbedTicketResponse)
+async def issue_widget_embed_ticket(
+    request: EmbedTicketRequest,
+    req: Request,
+    db: Session = Depends(get_db),
+) -> Any:
+    """Issue a short-lived signed embed ticket to the embedding page.
+
+    This endpoint is called by widget.js from the top-level embedding page,
+    so the browser-enforced Origin header carries the real embedding site —
+    unlike fetches from inside the widget iframe, whose Origin is the xagent
+    host itself. The signed ticket is the only way that validated origin is
+    trusted downstream; the widget never self-reports its parent's origin.
+    """
+    agent = _get_widget_enabled_agent(db, request.agent_id)
+
+    allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
+    origin = req.headers.get("origin") or req.headers.get("referer", "")
+    origin_domain = _origin_to_domain(origin)
+    _require_domain_allowed(origin_domain, allowed_domains)
+
+    # The ticket has no jti/nonce and is intentionally replayable within its
+    # short TTL: it only re-certifies "this origin is allowed", which /auth
+    # independently re-checks against the live allowlist on every use, and the
+    # guest tokens it mints are low-privilege. Replay-within-TTL is accepted.
+    ticket = create_access_token(
+        {
+            "type": EMBED_TICKET_TYPE,
+            "agent_id": int(agent.id),
+            "embed_origin": origin_domain,
+        },
+        expires_delta=timedelta(seconds=EMBED_TICKET_TTL_SECONDS),
+    )
+    return EmbedTicketResponse(ticket=ticket)
 
 
 @widget_router.post("/auth", response_model=WidgetAuthResponse)
@@ -54,60 +151,47 @@ async def authenticate_widget(
     agent = None
 
     # Authenticate via agent_id directly (since web widget channel is deprecated)
+    origin_domain = ""
     if agent_id:
-        candidate_agent = db.query(Agent).filter(Agent.id == agent_id).first()
-        if candidate_agent and not is_workforce_generated_manager_agent(
-            candidate_agent
-        ):
-            agent = candidate_agent
-        if agent:
-            if not agent.widget_enabled:
-                raise HTTPException(
-                    status_code=403, detail="Widget is disabled for this agent"
+        agent = _get_widget_enabled_agent(db, agent_id)
+
+        allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
+
+        if request.embed_ticket:
+            # The auth fetch runs inside the widget iframe, so its
+            # Origin/Referer headers reflect the xagent host, not the
+            # embedding site. The embedding page's origin is instead carried
+            # by the backend-signed embed ticket issued by /embed-ticket,
+            # where it was validated against the browser-enforced Origin
+            # header. A client-supplied origin value is never trusted here.
+            try:
+                claims = jwt.decode(
+                    request.embed_ticket,
+                    JWT_SECRET_KEY,
+                    algorithms=[JWT_ALGORITHM],
                 )
-
-            # Check allowed domains
-            allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
-
-            # Use X-Forwarded-Host if available, then Host, then Origin/Referer
-            # This is important when widget is loaded via iframe
+            except JWTError:
+                raise HTTPException(
+                    status_code=403, detail="Invalid or expired embed ticket"
+                )
+            if (
+                claims.get("type") != EMBED_TICKET_TYPE
+                or claims.get("agent_id") != agent_id
+            ):
+                raise HTTPException(
+                    status_code=403, detail="Invalid or expired embed ticket"
+                )
+            origin_domain = str(claims.get("embed_origin") or "")
+            # Re-check so tickets die immediately if the allowlist shrinks.
+            _require_domain_allowed(origin_domain, allowed_domains)
+        else:
+            # No ticket: direct page visits (not embedded via widget.js).
+            # Fall back to the request's own Origin/Referer headers.
             origin = req.headers.get("origin") or req.headers.get("referer", "")
+            origin_domain = _origin_to_domain(origin)
+            _require_domain_allowed(origin_domain, allowed_domains)
 
-            from urllib.parse import urlparse
-
-            origin_domain = ""
-
-            # Try origin/referer
-            if origin:
-                parsed = urlparse(origin)
-                origin_domain = (parsed.netloc or parsed.path).lower()
-
-            # If origin_domain is localhost:3000 but host is localhost:8001
-            # Next.js might be rewriting the request. Let's use the origin_domain.
-
-            # Check if origin matches any allowed domain. Domains are
-            # case-insensitive, so compare both sides lowercased regardless of
-            # how the entry was stored.
-            is_allowed = False
-            for domain in allowed_domains:
-                normalized_domain = domain.strip().lower()
-                if (
-                    normalized_domain == "*"
-                    or normalized_domain == origin_domain
-                    or (
-                        origin_domain
-                        and origin_domain.endswith("." + normalized_domain)
-                    )
-                ):
-                    is_allowed = True
-                    break
-
-            if not is_allowed:
-                raise HTTPException(
-                    status_code=403, detail=f"Domain not allowed: {origin_domain}"
-                )
-
-            user = db.query(User).filter(User.id == agent.user_id).first()
+        user = db.query(User).filter(User.id == agent.user_id).first()
 
     if not user:
         raise HTTPException(

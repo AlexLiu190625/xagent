@@ -19,6 +19,7 @@ interface PublicAgentChatPageProps {
   routeToken: string
   guestId?: string | null
   searchAgentId?: number | null
+  embedTicket?: string | null
 }
 
 type PublicAuthResult = {
@@ -259,6 +260,7 @@ export function PublicAgentChatPage({
   routeToken,
   guestId,
   searchAgentId = null,
+  embedTicket = null,
 }: PublicAgentChatPageProps) {
   const { t } = useI18n()
   const normalizedGuestId = authMode === "widget" ? (guestId || "anonymous") : null
@@ -272,7 +274,11 @@ export function PublicAgentChatPage({
         const authPath = authMode === "share" ? "/api/share/auth" : "/api/widget/auth"
         const authPayload = authMode === "share"
           ? { share_token: routeToken }
-          : { guest_id: normalizedGuestId, agent_id: searchAgentId }
+          : {
+              guest_id: normalizedGuestId,
+              agent_id: searchAgentId,
+              embed_ticket: embedTicket || undefined,
+            }
 
         const authResponse = await fetch(`${getApiUrl()}${authPath}`, {
           method: "POST",
@@ -300,7 +306,7 @@ export function PublicAgentChatPage({
 
     initPublicChat()
     return () => setPublicAccessToken(null)
-  }, [authMode, normalizedGuestId, routeToken, searchAgentId, t])
+  }, [authMode, embedTicket, normalizedGuestId, routeToken, searchAgentId, t])
 
   const publicAccessToken = authResult?.access_token ?? ""
 

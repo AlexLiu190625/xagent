@@ -910,7 +910,7 @@ async def upload_agent_logo(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ===== API Key Endpoints =====
+# ===== API Key Endpoints (legacy single-key surface, compat-only) =====
 #
 # Three sibling endpoints (POST/GET/DELETE) at /api/agents/{agent_id}/api-key
 # let the agent owner manage the SDK key. All three share JWT auth via
@@ -918,6 +918,16 @@ async def upload_agent_logo(
 # the unsuccessful-ownership path returns 404 (not 403) so the existence of
 # another user's agent is not leaked. See the SDK design doc §5 for the
 # product-level contract and §10 for the security rationale.
+#
+# Deliberately parallel, not stale: the frontend dashboard manages keys
+# exclusively through the multi-key admin surface at
+# ``/api/agent-api-keys`` (see ``api/agent_api_keys.py``) and has zero
+# callers left for this trio -- but this one remains the stable, versioned
+# contract external SDK/REST callers are pinned to, so it can't be removed
+# just because the UI moved on. Semantics here are intentionally still
+# "one key" flavored under the hood (POST revokes *every* active key on
+# the agent, GET returns the most-recently-created non-paused one) even
+# though the underlying table now allows multiple simultaneous keys.
 
 
 @router.post("/{agent_id}/api-key", response_model=APIKeyGenerateResponse)
@@ -948,18 +958,24 @@ async def generate_agent_api_key(
         HTTPException 401: missing or invalid JWT.
         HTTPException 404: agent does not exist or does not belong to the
             caller (deliberate to avoid leaking agent existence).
-        HTTPException 500: any unexpected error; transaction rolled back.
-            The most plausible internal failure is a partial-unique index
-            violation from a concurrent POST race, which the DB enforces.
+        HTTPException 409: ``rotation_conflict`` -- a ``key_prefix``
+            collision on insert (astronomically rare; the prefix
+            keyspace is large, this is defense-in-depth).
+        HTTPException 500: any other unexpected error; transaction
+            rolled back.
 
     Notes:
         - Transactional shape mirrors ``auth.setup_admin`` and
           ``custom_api.create_custom_api`` -- we collect all writes in the
-          session and commit once. There is no ``SELECT ... FOR UPDATE``;
-          concurrent rotations are caught by the
-          ``uq_agent_api_keys_agent_active`` partial unique index and
-          surfaced as a 500. Two clients racing to rotate the same key is
-          a corner case; a 500 is acceptable.
+          session and commit once. There is no ``SELECT ... FOR UPDATE``:
+          an agent may hold multiple simultaneously-active keys (the
+          ``uq_agent_api_keys_agent_active`` partial unique index that
+          used to enforce "at most one" was dropped for multi-key
+          support), so two clients racing to POST this endpoint for the
+          same agent no longer conflict at the DB level -- each
+          independently revokes whatever was active and inserts its own
+          new row; both succeed, and whichever committed last leaves its
+          key as the sole non-revoked one.
         - Logs include the ``key_prefix`` only -- never the ``full_key``,
           the secret half, or the bcrypt hash.
     """
@@ -973,10 +989,11 @@ async def generate_agent_api_key(
     except HTTPException:
         raise
     except KeyRotationConflict as e:
-        # Partial unique constraint hit -- another POST won the race
-        # between our SELECT and our COMMIT. Surface this as 409 rather
-        # than a generic 500 so the client can retry without alarm.
-        # Internal SQL message stays in the log only.
+        # key_prefix collision on insert -- the only remaining trigger
+        # now that the partial unique index this used to also catch is
+        # gone. Surface as 409 rather than a generic 500 so the client
+        # can retry without alarm. Internal SQL message stays in the log
+        # only.
         logger.warning(f"Concurrent API key rotation race for agent {agent_id}: {e}")
         raise HTTPException(status_code=409, detail="rotation_conflict")
     except Exception as e:

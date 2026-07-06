@@ -13,7 +13,7 @@ import logging
 import secrets
 import shlex
 from datetime import datetime, timedelta, timezone
-from typing import Annotated, Any, Callable, Dict, List, Optional, Union, cast
+from typing import Annotated, Any, Callable, Dict, List, Literal, Optional, Union, cast
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
@@ -123,6 +123,29 @@ class MCPServerUpdate(BaseModel):
     )
 
 
+class MCPAppConnectRequest(BaseModel):
+    """Connect a key-based (non-oauth) catalog app with the caller's own secrets.
+
+    OAuth apps use the OAuth popup flow; this path is for apps like Google Maps
+    that authenticate with a static API key. The key is stored as a per-user env
+    override on a shared server row (see PR #750), so each user brings their own.
+    """
+
+    env: Optional[dict] = Field(
+        None, description="Per-user env overrides (e.g. the API key)"
+    )
+    env_source: Optional[Literal["own", "shared", "platform"]] = Field(
+        None,
+        description="Which env layer to use: 'own' | 'shared' | 'platform'. "
+        "None leaves the legacy fallback (global < shared < user).",
+    )
+    is_active: Optional[bool] = Field(
+        None,
+        description="Whether the connection is active (defaults to True on first "
+        "connect; left unchanged on reconnect when omitted)",
+    )
+
+
 class MCPServerResponse(BaseModel):
     """Response model for MCP server."""
 
@@ -135,6 +158,7 @@ class MCPServerResponse(BaseModel):
     is_active: bool
     is_default: bool
     user_env: Optional[dict] = None
+    env_source: Optional[Literal["own", "shared", "platform"]] = None
     runtime_input_schema: Optional[dict] = None
     runtime_bindings: Optional[list[dict]] = None
     allow_delegated_authorization: bool = False
@@ -1341,6 +1365,7 @@ def _db_server_to_response(
         is_active=user_mcp.is_active,
         is_default=user_mcp.is_default,
         user_env=_mask_env(getattr(user_mcp, "env", None)) if user_mcp.env else None,
+        env_source=getattr(user_mcp, "env_source", None),
         runtime_input_schema=server.runtime_input_schema,
         runtime_bindings=server.runtime_bindings,
         allow_delegated_authorization=bool(server.allow_delegated_authorization),
@@ -1389,6 +1414,22 @@ def _app_lookup_keys(*values: object) -> list[str]:
         if key and key not in keys:
             keys.append(key)
     return keys
+
+
+def _is_reserved_catalog_name(db: Session, name: object) -> bool:
+    """Whether a server name collides (normalized) with a catalog app id/name.
+
+    Custom servers must not squat a catalog id — connect matches servers to apps
+    by normalized id/name, so a squatter would shadow the official shared row (or
+    at least DoS legitimate connects). Enforced on both create and rename.
+    """
+    key = _normalize_app_key(name)
+    if not key:
+        return False
+    return any(
+        key in _app_lookup_keys(app.get("id"), app.get("name"))
+        for app in get_all_mcp_apps(db)
+    )
 
 
 def _oauth_account_can_connect(oauth_account: object) -> bool:
@@ -1531,6 +1572,81 @@ def _build_active_non_oauth_server_lookup(
     return lookup
 
 
+def _env_covers_required(env: Any, required: list) -> bool:
+    if not env:
+        return False
+    from ...core.utils.encryption import decrypt_env_dict
+
+    decrypted = decrypt_env_dict(env) or {}
+    return all(str(decrypted.get(k) or "").strip() for k in required)
+
+
+def _shared_server_for_app(
+    app: dict, server_by_key: dict[str, MCPServer]
+) -> Optional[MCPServer]:
+    """Resolve an app's shared server via the same normalized id/name keys the
+    connected-state lookup uses, so key-source flags stay consistent with it."""
+    for app_key in _app_lookup_keys(app.get("id"), app.get("name")):
+        server = server_by_key.get(app_key)
+        if server is not None:
+            return server
+    return None
+
+
+def _app_shared_env_available(
+    app: dict,
+    server: Optional[MCPServer],
+    shared_env_by_id: dict[int, dict],
+) -> bool:
+    """Whether an application-injected shared layer (e.g. a team key, supplied
+    via the shared-env hook) covers this app's required keys, so the connector
+    can offer "use the shared key". The core stays agnostic to what the layer
+    represents. Distinct from the platform-global env (see
+    _app_platform_env_available). Only meaningful for key-based (non-oauth) apps.
+
+    `server` is the app's already-resolved shared row (see _shared_server_for_app).
+    """
+    required = (app.get("launch_config") or {}).get("required_env") or []
+    if not required or not server:
+        return False
+    # App-injected shared layer is already decrypted, keyed by server id.
+    shared = shared_env_by_id.get(cast(int, server.id)) or {}
+    return all(str(shared.get(k) or "").strip() for k in required)
+
+
+def _app_platform_env_available(
+    app: dict,
+    server: Optional[MCPServer],
+) -> bool:
+    """Whether the platform-global env on the shared server row covers this
+    app's required keys, so the connector can offer "use the platform key".
+    Only meaningful for key-based (non-oauth) apps. `server` is the app's
+    already-resolved shared row (see _shared_server_for_app).
+    """
+    required = (app.get("launch_config") or {}).get("required_env") or []
+    if not required or not server:
+        return False
+    return _env_covers_required(getattr(server, "env", None), required)
+
+
+def _app_user_env_configured(
+    app: dict,
+    server: Optional[MCPServer],
+    user_mcp_by_server_id: dict[int, UserMCPServer],
+) -> bool:
+    """Whether this user has their own per-user key covering the app's required
+    env (vs falling back to the admin's global key). Non-oauth apps only.
+    `server` is the app's already-resolved shared row (see _shared_server_for_app).
+    """
+    required = (app.get("launch_config") or {}).get("required_env") or []
+    if not required or not server:
+        return False
+    assoc = user_mcp_by_server_id.get(cast(int, server.id))
+    if not assoc:
+        return False
+    return _env_covers_required(getattr(assoc, "env", None), required)
+
+
 def _connected_non_oauth_server_for_app(
     app: dict, non_oauth_server_lookup: dict[tuple[str, str], MCPServer]
 ) -> Optional[int]:
@@ -1589,17 +1705,63 @@ def list_mcp_apps(
     oauth_server_lookup = _build_active_oauth_server_lookup(user_mcps)
     non_oauth_server_lookup = _build_active_non_oauth_server_lookup(user_mcps)
 
+    # Prefetch shared servers for key-based apps in one query (the row exists even
+    # when the current user isn't associated, e.g. an admin-only global key), and
+    # index the user's associations, to compute key-source flags without an N+1.
+    # Filter by the raw id/name the row is actually stored under (server.name is
+    # the raw catalog app_id, not its normalized key), then normalize in Python
+    # so mixed-case app ids match the same way the connected-state lookups do.
+    non_oauth_names = {
+        str(name)
+        for app in library_apps
+        if str(app.get("transport") or "").lower() != "oauth"
+        for name in (app.get("id"), app.get("name"))
+        if name
+    }
+    server_by_key: dict[str, MCPServer] = {}
+    if non_oauth_names:
+        for srv in (
+            db.query(MCPServer).filter(MCPServer.name.in_(non_oauth_names)).all()
+        ):
+            norm = _normalize_app_key(srv.name)
+            if norm:
+                server_by_key.setdefault(norm, srv)
+    user_mcp_by_server_id = {cast(int, srv.id): um for srv, um in user_mcps}
+
+    from ..services.mcp_runtime import load_shared_env_overrides
+
+    shared_env_by_id = load_shared_env_overrides(db, cast(int, current_user.id))
+
     if location in ["remote", "all"]:
         for app in library_apps:
             if app.get("transport") == "oauth":
                 server_id, connected_account = _connected_oauth_server_for_app(
                     app, oauth_server_lookup, oauth_account_lookup
                 )
+                app_shared_env = False
+                app_platform_env = False
+                app_user_env = False
+                app_env_source = None
             else:
                 server_id = _connected_non_oauth_server_for_app(
                     app, non_oauth_server_lookup
                 )
                 connected_account = None
+                # Resolve the shared row once and reuse it for all key-source flags.
+                shared_server = _shared_server_for_app(app, server_by_key)
+                app_shared_env = _app_shared_env_available(
+                    app, shared_server, shared_env_by_id
+                )
+                app_platform_env = _app_platform_env_available(app, shared_server)
+                app_user_env = _app_user_env_configured(
+                    app, shared_server, user_mcp_by_server_id
+                )
+                _assoc = (
+                    user_mcp_by_server_id.get(cast(int, shared_server.id))
+                    if shared_server
+                    else None
+                )
+                app_env_source = getattr(_assoc, "env_source", None)
             is_connected = server_id is not None
             is_visible_in_connector = app.get("is_visible_in_connector", True)
 
@@ -1622,6 +1784,10 @@ def list_mcp_apps(
 
             app_copy = app.copy()
             app_copy["is_connected"] = is_connected
+            app_copy["shared_env_available"] = app_shared_env
+            app_copy["platform_env_available"] = app_platform_env
+            app_copy["user_env_configured"] = app_user_env
+            app_copy["env_source"] = app_env_source
 
             if is_connected:
                 app_copy["server_id"] = server_id
@@ -1702,6 +1868,11 @@ def list_mcp_apps(
                     "is_local": True,
                     "server_id": api.id,
                     "is_custom": True,
+                    "runtime_input_schema": api.runtime_input_schema,
+                    "runtime_bindings": api.runtime_bindings,
+                    "allow_delegated_authorization": bool(
+                        api.allow_delegated_authorization
+                    ),
                 }
             )
 
@@ -1793,11 +1964,6 @@ def get_mcp_servers(
                     config=config_dict,
                     is_active=user_api.is_active,
                     is_default=user_api.is_default,
-                    runtime_input_schema=api.runtime_input_schema,
-                    runtime_bindings=api.runtime_bindings,
-                    allow_delegated_authorization=bool(
-                        api.allow_delegated_authorization
-                    ),
                     transport_display="Custom API",
                     created_at=_format_optional_datetime(api.created_at),
                     updated_at=_format_optional_datetime(api.updated_at),
@@ -1872,6 +2038,238 @@ def get_mcp_server(
         )
 
 
+def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
+    """Idempotently ensure the shared server row for a key-based catalog app
+    exists, without creating any per-user association. Returns (server, app_info).
+
+    Used by connect before attaching the caller's env. Raises 400/404/409.
+    """
+    from ..mcp_apps import get_app_by_id
+
+    app_info = get_app_by_id(db, app_id)
+    if not app_info:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
+        )
+    if str(app_info.get("transport") or "").lower() == "oauth":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="OAuth apps must be connected via the OAuth flow",
+        )
+    launch = app_info.get("launch_config") or {}
+    command = launch.get("command")
+    if not command:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This app cannot be connected with an API key",
+        )
+    manager = DatabaseMCPServerManager(db)
+    # app_id is the stable catalog key: it passes the server-name validator and
+    # is what the connector uses to detect an app as connected.
+    server_name = str(app_info["id"])
+
+    server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    # Server names are a single global namespace. A row under this catalog id may
+    # be a hijack — a custom server someone created with their own command — so
+    # only reuse it if it matches the official launch config. Otherwise a victim
+    # would run a foreign command with their own key attached.
+    if server:
+        if (
+            server.command != command
+            or (server.args or []) != (launch.get("args") or [])
+            or str(server.transport or "").lower() != "stdio"
+        ):
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A server with this name already exists with a different configuration",
+            )
+        # A matching config is not enough: a row owned by a user is a custom server
+        # squatting this catalog id (creatable only before the app was seeded, since
+        # create_mcp_server now reserves catalog ids). Its owner keeps edit rights and
+        # could later swap in a foreign command that every connected user then runs —
+        # refuse to adopt it as the official shared row. The legitimate shared row is
+        # created without any association, so it never has an is_owner=True owner.
+        owned = (
+            db.query(UserMCPServer)
+            .filter(
+                UserMCPServer.mcpserver_id == server.id,
+                UserMCPServer.is_owner.is_(True),
+            )
+            .first()
+        )
+        if owned is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A user-owned server already exists under this catalog id",
+            )
+    if not server:
+        try:
+            config = _build_server_config(
+                MCPServerCreate(
+                    name=server_name,
+                    transport="stdio",
+                    description=app_info.get("description"),
+                    config={"command": command, "args": launch.get("args") or []},
+                )
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid app configuration: {str(e)}",
+            )
+        add_error: Exception | None = None
+        try:
+            manager.add_server(config)
+        except (ValueError, IntegrityError) as exc:
+            # A concurrent first-provision loses to the other request: add_server's
+            # own duplicate-name check raises ValueError, or the commit trips the
+            # unique constraint (IntegrityError). Either way the row now exists, so
+            # recover by re-reading it below. Any other failure leaves no row.
+            db.rollback()
+            add_error = exc
+        server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+        if not server:
+            # No row after the failure => it was not a race but a genuine error.
+            # Surface it instead of masking it as an opaque 500.
+            if add_error is not None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid app configuration: {add_error}",
+                ) from add_error
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create server",
+            )
+    return server, app_info
+
+
+@mcp_router.post("/apps/{app_id}/connect", response_model=MCPServerResponse)
+def connect_mcp_app(
+    app_id: str,
+    body: MCPAppConnectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> MCPServerResponse:
+    """Connect a key-based (non-oauth) catalog app for the current user.
+
+    One shared server row backs the app for all users; each user gets their own
+    per-user env (their key). Connecting again updates the caller's key.
+    """
+    from xagent.core.utils.encryption import decrypt_env_dict, encrypt_env_dict
+
+    server, app_info = _ensure_catalog_app_server(db, app_id)
+    allowed_env_keys = set(
+        (app_info.get("launch_config") or {}).get("required_env") or []
+    )
+    manager = DatabaseMCPServerManager(db)
+    server_name = str(app_info["id"])
+
+    assoc: Any = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == current_user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .first()
+    )
+
+    # Only the app's declared keys may be set — never let a caller inject extra
+    # env (e.g. NODE_OPTIONS/LD_PRELOAD/PATH) into the stdio subprocess. Blank
+    # values mean "use the shared/global key" and are dropped so they don't blank
+    # it out. Masked entries ("********") are non-blank and keep the stored value.
+    # An omitted env (None) means "don't touch my key" (e.g. an is_active-only
+    # reconnect) — preserve the stored value. An explicit empty dict means "clear
+    # my key, fall back to the global one" (the "use admin key" button).
+    def _merged_env_for(a: Any) -> Any:
+        # Recompute against the row's *current* env every time, never a cached
+        # value: the concurrent-connect recovery below re-reads a different row
+        # than the initial (None) read, and must merge against that row's real
+        # stored key rather than overwrite it with a stale pre-race value.
+        if body.env is None:
+            return getattr(a, "env", None) if a else None
+        provided = {
+            k: str(v).strip()
+            for k, v in body.env.items()
+            # Accept string or numeric scalars (coerced to str); exclude bool,
+            # which is an int subclass — storing "True"/"False" as an API key is
+            # worse than dropping it (a dropped key falls back to the global one).
+            if k in allowed_env_keys
+            and isinstance(v, (str, int, float))
+            and not isinstance(v, bool)
+            and str(v).strip()
+        }
+        existing = decrypt_env_dict(getattr(a, "env", None)) if a else {}
+        return encrypt_env_dict(_merge_masked_env(provided, existing or {})) or None
+
+    # env_source is validated at the API boundary by the request model's Literal
+    # (own | shared | platform | None); no manual check needed here.
+    def _honest_env_source(source: Any, merged: Any) -> Any:
+        # Never persist "own" with no own key stored — the connection would
+        # silently run on the platform/global key, mislabeling the record. Enforced
+        # on the resulting row state, so it also drops a stale "own" left by a prior
+        # connect when a reconnect clears the key without restating the source.
+        return None if (source == "own" and not merged) else source
+
+    def _apply_updates(a: Any) -> None:
+        merged = _merged_env_for(a)
+        a.env = merged
+        # An explicit source overrides; otherwise keep the row's current pick.
+        source = body.env_source if body.env_source is not None else a.env_source
+        a.env_source = _honest_env_source(source, merged)
+        # Only toggle activation when explicitly requested; a reconnect to update
+        # the key must not silently re-enable a connection the user turned off.
+        if body.is_active is not None:
+            a.is_active = body.is_active
+
+    if assoc:
+        _apply_updates(assoc)
+        db.commit()
+    else:
+        # Connect users never own the shared global config (no editing global env),
+        # but can disconnect their own association.
+        merged = _merged_env_for(None)
+        assoc = UserMCPServer(
+            user_id=current_user.id,
+            mcpserver_id=server.id,
+            is_active=True if body.is_active is None else body.is_active,
+            is_owner=False,
+            can_edit=False,
+            can_delete=True,
+            env=merged,
+            env_source=_honest_env_source(body.env_source, merged),
+        )
+        db.add(assoc)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Concurrent same-user connect (double-click/client retry): another
+            # request already inserted the (user_id, mcpserver_id) association.
+            # Re-read it and apply this request's values idempotently.
+            db.rollback()
+            assoc = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == current_user.id,
+                    UserMCPServer.mcpserver_id == server.id,
+                )
+                .first()
+            )
+            if assoc is None:
+                raise
+            _apply_updates(assoc)
+            db.commit()
+
+    db.refresh(assoc)
+    logger.info(f"User {current_user.id} connected MCP app '{server_name}'")
+    return _db_server_to_response(
+        server,
+        assoc,
+        manager,
+        app_id=str(app_info["id"]),
+        is_admin=getattr(current_user, "is_admin", False),
+    )
+
+
 @mcp_router.post(
     "/servers", response_model=MCPServerResponse, status_code=status.HTTP_201_CREATED
 )
@@ -1893,6 +2291,20 @@ def create_mcp_server(
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"MCP server '{server_data.name}' already exists",
+            )
+
+        # Catalog apps are a reserved namespace: a custom server sharing one
+        # would be reused (and owned/editable) by its creator when others connect
+        # the official app, letting them run a command of their choosing with the
+        # victim's key. Match the way connect resolves apps (normalized id/name),
+        # so a variant like "Google-Maps" can't slip past.
+        if _is_reserved_catalog_name(db, server_data.name):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"'{server_data.name}' is reserved for a catalog app; "
+                    "connect it from the catalog instead"
+                ),
             )
 
         # Build and validate config
@@ -2011,6 +2423,16 @@ def update_mcp_server(
 
         # Check for name conflicts if updating name
         if can_edit_global and server_data.name and server_data.name != server.name:
+            # Same catalog-namespace reservation as create — otherwise a rename
+            # would bypass it and squat a catalog id (e.g. "google-maps").
+            if _is_reserved_catalog_name(db, server_data.name):
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=(
+                        f"'{server_data.name}' is reserved for a catalog app; "
+                        "connect it from the catalog instead"
+                    ),
+                )
             existing = (
                 db.query(MCPServer)
                 .filter(MCPServer.name == server_data.name, MCPServer.id != server_id)
@@ -2115,6 +2537,33 @@ def update_mcp_server(
         )
 
 
+def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
+    """Whether this shared row backs a key-based (non-oauth) catalog app AND
+    carries the admin's platform fallback key in `env` (see
+    _app_platform_env_available).
+
+    Such a row is reused by every future connect, so the per-user disconnect
+    cascade must not hard-delete it — that would silently wipe the platform key
+    with no signal to the admin. A catalog row with no platform key is not
+    special and cascades away as before.
+    """
+    if str(getattr(server, "transport", "") or "").lower() == "oauth":
+        return False
+    env = getattr(server, "env", None)
+    if not env:
+        return False
+    from ..mcp_apps import get_all_mcp_apps
+
+    key = _normalize_app_key(getattr(server, "name", None))
+    if not key:
+        return False
+    for app in get_all_mcp_apps(db):
+        if key in _app_lookup_keys(app.get("id"), app.get("name")):
+            required = (app.get("launch_config") or {}).get("required_env") or []
+            return _env_covers_required(env, required)
+    return False
+
+
 @mcp_router.delete("/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_mcp_server(
     server_id: int,
@@ -2185,8 +2634,17 @@ def delete_mcp_server(
 
         # Only remove from manager and delete if no other users
         if not other_users:
-            manager.remove_server(server_name)
-            logger.info(f"Deleted MCP server '{server_name}'")
+            if _catalog_server_has_platform_key(db, server):
+                # Keep the shared catalog row: it holds the admin's platform
+                # fallback key and is reused by future connects. Deleting it would
+                # silently wipe the platform key with no signal to the admin.
+                logger.info(
+                    f"Kept shared catalog server '{server_name}' after last user "
+                    "disconnect (preserves platform fallback key)"
+                )
+            else:
+                manager.remove_server(server_name)
+                logger.info(f"Deleted MCP server '{server_name}'")
         else:
             logger.info(f"Removed user {user_id} access to MCP server '{server_name}'")
 

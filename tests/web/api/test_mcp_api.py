@@ -371,6 +371,7 @@ class TestMCPApiFunctions:
         user_mcp.is_default = False
         user_mcp.is_owner = True
         user_mcp.env = None
+        user_mcp.env_source = None
 
         response = _db_server_to_response(
             server=server,
@@ -401,6 +402,7 @@ class TestMCPApiFunctions:
         user_mcp.is_default = False
         user_mcp.is_owner = False
         user_mcp.env = {"API_KEY": "my-secret"}
+        user_mcp.env_source = None
 
         response = _db_server_to_response(
             server=server, user_mcp=user_mcp, manager=MagicMock()

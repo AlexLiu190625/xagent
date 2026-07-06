@@ -8,21 +8,9 @@ import { toast } from "@/components/ui/sonner"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
 
-export interface AppIntegration {
-  id: string
-  name: string
-  description: string
-  icon: string
-  is_connected?: boolean
-  users?: string
-  provider?: string
-  category?: string
-  is_local?: boolean
-  server_id?: number
-  connected_account?: string
-  is_custom?: boolean
-  server?: any
-}
+import type { AppIntegration } from "./types"
+
+export type { AppIntegration }
 
 interface OfficialMcpSettingsDialogProps {
   open: boolean
@@ -33,6 +21,7 @@ interface OfficialMcpSettingsDialogProps {
   isGloballyConnected?: boolean
   onConnectStart?: (app: AppIntegration) => void
   onConfigure?: (app: AppIntegration) => void
+  onManageKey?: (app: AppIntegration) => void
 }
 
 export function OfficialMcpSettingsDialog({
@@ -43,7 +32,8 @@ export function OfficialMcpSettingsDialog({
   onDisconnect,
   isGloballyConnected = false,
   onConnectStart,
-  onConfigure
+  onConfigure,
+  onManageKey
 }: OfficialMcpSettingsDialogProps) {
   const { token } = useAuth()
   const { t } = useI18n()
@@ -186,25 +176,37 @@ export function OfficialMcpSettingsDialog({
 
             {isGloballyConnected && (
               <>
-                <Button
-                  className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
-                  onClick={() => {
-                    if (app.is_custom && onConfigure) {
-                      onConfigure(app);
-                    } else {
-                      handleConnectApp(app);
-                    }
-                  }}
-                >
-                  <Settings className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.configure')}
-                </Button>
-                <Button
-                  variant="outline"
-                  className="w-full max-w-[200px] rounded-full h-11 font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
-                  onClick={() => handleDisconnectApp(app)}
-                >
-                  <Unlink className="h-4 w-4 mr-2" /> {app.is_custom ? t('tools.mcp.dialog.deleteService') : t('tools.mcp.dialog.disconnect')}
-                </Button>
+                {(() => {
+                  const isKeyBased = (app.launch_config?.required_env?.length || 0) > 0
+                  return (
+                    <>
+                      <Button
+                        className="w-full max-w-[200px] rounded-full h-11 font-medium bg-slate-900 text-white hover:bg-slate-800"
+                        onClick={() => {
+                          // Key-based apps: users only manage their own key, never the
+                          // shared server config. Route to the key dialog, not the form.
+                          if (isKeyBased && onManageKey) {
+                            onManageKey(app);
+                          } else if (app.is_custom && onConfigure) {
+                            onConfigure(app);
+                          } else {
+                            handleConnectApp(app);
+                          }
+                        }}
+                      >
+                        <Settings className="h-4 w-4 mr-2" />
+                        {isKeyBased ? t('tools.mcp.dialog.manageKey') : t('tools.mcp.dialog.configure')}
+                      </Button>
+                      <Button
+                        variant="outline"
+                        className="w-full max-w-[200px] rounded-full h-11 font-medium text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
+                        onClick={() => handleDisconnectApp(app)}
+                      >
+                        <Unlink className="h-4 w-4 mr-2" /> {(app.is_custom && !isKeyBased) ? t('tools.mcp.dialog.deleteService') : t('tools.mcp.dialog.disconnect')}
+                      </Button>
+                    </>
+                  )
+                })()}
               </>
             )}
           </div>

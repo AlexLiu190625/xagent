@@ -221,6 +221,109 @@ def test_generated_manager_key_returns_401():
     _assert_invalid_api_key(resp)
 
 
+def test_paused_key_returns_401():
+    """A paused (not revoked) key is rejected identically to a revoked one.
+
+    Pausing goes through the multi-key admin service directly here (no
+    HTTP endpoint under test) -- the point is that ``get_agent_from_api_key``
+    treats ``paused_at`` the same as ``revoked_at``, with the same opaque
+    401 envelope.
+    """
+    agent_id, full_key, prefix = _create_agent_and_key()
+    db = _direct_db_session()
+    try:
+        from xagent.web.models.agent_api_key import AgentApiKey
+
+        db.query(AgentApiKey).filter(AgentApiKey.key_prefix == prefix).update(
+            {"paused_at": datetime.now(timezone.utc)}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers={"Authorization": f"Bearer {full_key}"},
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "hello"},
+        },
+    )
+
+    _assert_invalid_api_key(resp)
+
+
+def _usage_snapshot(prefix: str):
+    from xagent.web.models.agent_api_key import AgentApiKey
+
+    db = _direct_db_session()
+    try:
+        row = db.query(AgentApiKey).filter(AgentApiKey.key_prefix == prefix).one()
+        return row.last_used_at, row.usage_month, row.usage_month_calls
+    finally:
+        db.close()
+
+
+def test_record_key_usage_skips_revoked_key():
+    """Direct-call test for the defense-in-depth guard in ``record_key_usage``.
+
+    Both real call sites (create task / append message) are gated by
+    ``get_agent_from_api_key``, which already excludes revoked/paused keys
+    before either ever runs -- so no HTTP-level test can reach the guard
+    in ``record_key_usage``'s own WHERE clause. Call it directly instead
+    to prove the guard itself works, independent of caller discipline.
+    """
+    from xagent.web.api.v1.deps import record_key_usage
+    from xagent.web.models.agent_api_key import AgentApiKey
+
+    _agent_id, _full_key, prefix = _create_agent_and_key()
+    db = _direct_db_session()
+    try:
+        db.query(AgentApiKey).filter(AgentApiKey.key_prefix == prefix).update(
+            {"revoked_at": datetime.now(timezone.utc)}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    before = _usage_snapshot(prefix)
+    record_key_usage(prefix)
+    assert _usage_snapshot(prefix) == before
+
+
+def test_record_key_usage_skips_paused_key():
+    from xagent.web.api.v1.deps import record_key_usage
+    from xagent.web.models.agent_api_key import AgentApiKey
+
+    _agent_id, _full_key, prefix = _create_agent_and_key()
+    db = _direct_db_session()
+    try:
+        db.query(AgentApiKey).filter(AgentApiKey.key_prefix == prefix).update(
+            {"paused_at": datetime.now(timezone.utc)}
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    before = _usage_snapshot(prefix)
+    record_key_usage(prefix)
+    assert _usage_snapshot(prefix) == before
+
+
+def test_record_key_usage_updates_active_key():
+    """Sanity counterpart: the guard doesn't block a legitimately active key."""
+    from xagent.web.api.v1.deps import record_key_usage
+
+    _agent_id, _full_key, prefix = _create_agent_and_key()
+
+    record_key_usage(prefix)
+
+    last_used_at, usage_month, usage_month_calls = _usage_snapshot(prefix)
+    assert last_used_at is not None
+    assert usage_month == datetime.now(timezone.utc).strftime("%Y-%m")
+    assert usage_month_calls == 1
+
+
 # ===== timing oracle defense =====
 
 

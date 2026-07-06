@@ -21,11 +21,13 @@ miss = prefix doesn't exist). See SDK design doc §7 (key format and
 auth flow) and §10 (security considerations).
 """
 
+import logging
 from datetime import datetime, timezone
 from typing import Tuple
 
 from fastapi import Depends
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy import case
 from sqlalchemy.orm import Session, joinedload
 
 from ....core.utils.api_key import (
@@ -36,7 +38,7 @@ from ....core.utils.api_key import (
 )
 from ...models.agent import Agent, is_workforce_generated_manager_agent
 from ...models.agent_api_key import AgentApiKey
-from ...models.database import get_db
+from ...models.database import get_db, get_session_local
 from ...models.user import User
 from ...models.user_api_key import UserApiKey
 from ...utils.db_timezone import normalize_datetime_from_db
@@ -90,23 +92,29 @@ async def get_agent_from_api_key(
 
     prefix = parsed.prefix
 
-    # Index lookup is O(1) on ix_agent_api_keys_key_prefix and excludes
-    # revoked rows via the partial unique index path. ``joinedload``
-    # pulls the bound Agent row in the same SELECT so we don't pay a
-    # second round-trip on the success path (the relationship defaults
-    # to lazy='select', which would otherwise emit a separate query
-    # when we access ``key_row.agent`` below).
+    # Index lookup is O(1) on ix_agent_api_keys_key_prefix; revoked (and,
+    # below, paused) rows are excluded by the filter, not by any DB
+    # constraint -- an agent can hold multiple simultaneously-active
+    # keys, so uniqueness is no longer enforced at the schema level.
+    # ``joinedload`` pulls the bound Agent row in the same SELECT so we
+    # don't pay a second round-trip on the success path (the relationship
+    # defaults to lazy='select', which would otherwise emit a separate
+    # query when we access ``key_row.agent`` below).
     key_row = (
         db.query(AgentApiKey)
         .options(joinedload(AgentApiKey.agent))
         .filter(
             AgentApiKey.key_prefix == prefix,
             AgentApiKey.revoked_at.is_(None),
+            # A paused key is treated identically to a missing/revoked one
+            # -- same opaque 401, same verify_dummy timing -- so a caller
+            # can't distinguish "paused" from "never existed" below.
+            AgentApiKey.paused_at.is_(None),
         )
         .first()
     )
 
-    # Prefix missing or revoked. verify_dummy to keep timing
+    # Prefix missing, revoked, or paused. verify_dummy to keep timing
     # indistinguishable from the "secret wrong" branch below.
     if key_row is None:
         verify_dummy()
@@ -129,6 +137,68 @@ async def get_agent_from_api_key(
         raise V1ApiError(V1ErrorCode.INVALID_API_KEY, 401)
 
     return agent, key_row
+
+
+def record_key_usage(key_prefix: str) -> None:
+    """Best-effort usage tracking for the API Keys page's stat cards.
+
+    Deliberately NOT called from :func:`get_agent_from_api_key` itself --
+    that dependency backs every ``/v1/chat/tasks/*`` route including the
+    read-only status/steps polling endpoints SDK clients hit repeatedly,
+    and recording a write there would (a) put a DB write+commit on the
+    busiest possible request path and (b) conflate polling with real
+    invocations in the "calls this month" stat. Callers should invoke
+    this only from endpoints that represent an actual SDK-visible call
+    (e.g. creating a task or appending a message), not from polling GETs.
+
+    Runs on its own DB session -- deliberately isolated from the
+    request-scoped ``db`` session used for auth -- and issues a single
+    atomic UPDATE (month rollover included via ``case()``) rather than a
+    Python-side read-modify-write. This avoids three problems a shared
+    session would have: committing here would prematurely flush/commit
+    whatever the caller's endpoint later stages on the same session;
+    rolling back on failure would poison that session for the rest of
+    the request; and incrementing ``usage_month_calls`` in Python is
+    subject to lost updates under concurrent calls with the same key.
+    Never allowed to fail the request -- errors are logged and
+    swallowed, not raised.
+    """
+    now = datetime.now(timezone.utc)
+    current_month = now.strftime("%Y-%m")
+    session_local = get_session_local()
+    local_db = session_local()
+    try:
+        local_db.query(AgentApiKey).filter(
+            AgentApiKey.key_prefix == key_prefix,
+            # Belt-and-suspenders: today both call sites are gated by
+            # get_agent_from_api_key, which already excludes revoked/paused
+            # keys before the endpoint body runs. Repeating the guard here
+            # means a future caller that forgets that gate can't silently
+            # bump usage on a dead key.
+            AgentApiKey.revoked_at.is_(None),
+            AgentApiKey.paused_at.is_(None),
+        ).update(
+            {
+                AgentApiKey.last_used_at: now,
+                AgentApiKey.usage_month: current_month,
+                AgentApiKey.usage_month_calls: case(
+                    (
+                        AgentApiKey.usage_month == current_month,
+                        AgentApiKey.usage_month_calls + 1,
+                    ),
+                    else_=1,
+                ),
+            },
+            synchronize_session=False,
+        )
+        local_db.commit()
+    except Exception:
+        local_db.rollback()
+        logging.getLogger(__name__).warning(
+            "Failed to record API key usage for key_prefix=%s", key_prefix
+        )
+    finally:
+        local_db.close()
 
 
 async def get_user_from_personal_key(

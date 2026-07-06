@@ -49,6 +49,7 @@ const en = {
     files: "Files",
     memory: "Memory",
     skillHub: "Skill Hub",
+    apiKeys: "API Keys",
     monitoring: "Monitoring",
     knowledgeBase: "Knowledge Base",
     knowledgeBaseDetail: "KB Detail",
@@ -1004,6 +1005,19 @@ Build when you need.`,
         noServersFound: "No MCP apps found",
         selected: "{count} selected",
         connect: "Connect",
+        connecting: "Connecting...",
+        apiKeyOptionalHint: "Enter your API key to connect.",
+        apiKeyOverrideHint: "Or enter your own key to override the shared one.",
+        sharedKeyConfigured: "A shared key is already configured — you can connect with it directly.",
+        useSharedKey: "Use the shared key",
+        manageKey: "Manage my key",
+        currentlyUsingOwnKey: "Currently using your own key.",
+        currentlyUsingSharedKey: "Currently using the shared key.",
+        envSource: {
+          own: "Use your own key",
+          shared: "Use the shared key",
+          platform: "Use the platform key",
+        },
         configure: "Configure",
         disconnect: "Disconnect",
         disconnectSuccess: "Disconnected from {name}",
@@ -3230,6 +3244,77 @@ Build when you need.`,
       updated: "Widget configuration updated",
       updateFailed: "Failed to update widget configuration",
       copyFailed: "Failed to copy widget snippet"
+    }
+  },
+  apiKeysPage: {
+    title: "API Keys",
+    subtitle: "Manage API keys for programmatic access to your agents.",
+    newKey: "New API Key",
+    newKeyDescription: "Create a new SDK / REST API credential for an agent.",
+    allKeys: "All Keys",
+    searchPlaceholder: "Search keys or agents...",
+    noData: "No API keys yet.",
+    never: "Never",
+    filteredByAgent: "Filtered agent",
+    clearFilter: "Clear filter",
+    stats: {
+      totalKeys: "Total Keys",
+      totalKeysHint: "across all agents",
+      activeKeys: "Active Keys",
+      activeKeysHint: "accepting requests",
+      callsThisMonth: "Calls This Month",
+      callsThisMonthHint: "includes now-inactive keys",
+      lastApiCall: "Last API Call",
+      noActivity: "No activity yet"
+    },
+    columns: {
+      label: "Key Label",
+      agent: "Agent",
+      secretKey: "Secret Key",
+      status: "Status",
+      lastUsed: "Last Used",
+      created: "Created"
+    },
+    status: {
+      active: "Active",
+      paused: "Paused",
+      revoked: "Revoked"
+    },
+    actions: {
+      copy: "Copy",
+      pause: "Pause",
+      resume: "Resume",
+      regenerate: "Regenerate",
+      delete: "Delete"
+    },
+    form: {
+      agent: "Agent",
+      selectAgent: "Select an agent",
+      label: "Label",
+      labelPlaceholder: "e.g. Production",
+      create: "Create"
+    },
+    reveal: {
+      title: "API Key Created",
+      warning: "Copy this key now — it is shown only once."
+    },
+    confirm: {
+      regenerateTitle: "Regenerate API key?",
+      regenerateDescription: "Regenerating immediately invalidates the current secret. Any app using it will stop working until updated.",
+      deleteTitle: "Delete API key?",
+      deleteDescription: "Deleting immediately invalidates this key. Any app using it will stop working."
+    },
+    messages: {
+      loadFailed: "Failed to load API keys",
+      created: "API key created",
+      createFailed: "Failed to create API key",
+      paused: "API key paused",
+      resumed: "API key resumed",
+      regenerated: "API key regenerated",
+      deleted: "API key deleted",
+      actionFailed: "Action failed",
+      copied: "Copied to clipboard",
+      copyFailed: "Failed to copy to clipboard"
     }
   },
   triggers: {

@@ -78,6 +78,8 @@ export interface MCPServer {
   connected_account?: string
   app_id?: string
   provider?: string
+  user_env?: Record<string, string>
+  can_edit_global?: boolean
   runtime_input_schema?: Record<string, any> | null
   runtime_bindings?: Record<string, any>[] | null
   allow_delegated_authorization?: boolean

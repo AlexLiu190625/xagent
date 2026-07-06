@@ -9,6 +9,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Integer,
+    String,
     UniqueConstraint,
 )
 from sqlalchemy.orm import relationship
@@ -115,6 +116,10 @@ class UserMCPServer(Base):  # type: ignore
     # Per-user env overrides, merged over the global MCPServer.env at runtime
     # (global env acts as fallback). Dict[str, str].
     env = Column(JSON, nullable=True)
+    # Which env layer this user picked for the server: "own" | "shared" |
+    # "platform". NULL = legacy fallback (global < shared < user). See
+    # resolve_stdio_env in services/mcp_runtime.py.
+    env_source = Column(String(16), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
 

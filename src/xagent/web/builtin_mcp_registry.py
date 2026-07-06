@@ -268,6 +268,24 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
+        {
+            "app_id": "google-maps",
+            "name": "Google Maps",
+            "description": "Geocoding, directions, place search, and more via the Google Maps APIs.",
+            "icon": "https://www.google.com/s2/favicons?domain=maps.google.com&sz=128",
+            "transport": "stdio",
+            "provider_name": None,
+            "category": "Productivity",
+            "oauth_scopes": None,
+            "is_visible_in_connector": True,
+            # Key-based (non-oauth): connected via POST /api/mcp/apps/{id}/connect.
+            # required_env tells the connector which secret(s) to prompt for.
+            "launch_config": {
+                "command": "npx",
+                "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
+                "required_env": ["GOOGLE_MAPS_API_KEY"],
+            },
+        },
     ]
 
 

@@ -58,7 +58,7 @@ from ...services.task_orchestrator import (
     TurnKind,
 )
 from ._step_mapping import map_trace_events_to_public_steps
-from .deps import get_agent_from_api_key
+from .deps import get_agent_from_api_key, record_key_usage
 from .errors import V1ApiError, V1ErrorCode
 
 router = APIRouter()
@@ -268,6 +268,11 @@ async def create_chat_task(
         pop_ephemeral_runtime_values(payload.turn_id)
         raise
 
+    # Record usage here (not in the shared auth dependency) so read-only
+    # status/steps polling below doesn't count as a "call". Runtime validation
+    # and turn claim have already accepted this as a real task invocation.
+    record_key_usage(str(_key.key_prefix))
+
     # ``status`` comes from the orchestrator's committed-row snapshot
     # (``started.status`` == RUNNING), NOT the caller's ``task`` object --
     # ``begin_turn`` now commits on an isolated worker-thread session and
@@ -441,6 +446,10 @@ async def append_message_to_task(
     except Exception:
         pop_ephemeral_runtime_values(payload.turn_id)
         raise
+
+    # See the matching comment in create_chat_task: recorded here, not in
+    # the shared auth dependency, so status polling elsewhere never counts.
+    record_key_usage(str(_key.key_prefix))
 
     # ``status`` / ``accepted_at`` come from the orchestrator's committed-row
     # snapshot (``started``), not a post-call ``db.refresh(task)``. The

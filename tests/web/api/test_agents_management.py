@@ -1,11 +1,15 @@
 """Integration tests for agent management endpoints."""
 
 import io
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from jose import jwt as jose_jwt
 
 from xagent.config import get_uploads_dir
+from xagent.web.api.widget import EMBED_TICKET_TYPE
+from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.task import Task, TaskStatus
@@ -365,6 +369,371 @@ def test_widget_auth_matches_allowed_domains_case_insensitively() -> None:
     )
 
     assert response.status_code == 200, response.text
+
+
+def _issue_embed_ticket(agent_id: int, origin: str) -> Any:
+    return client.post(
+        "/api/widget/embed-ticket",
+        json={"agent_id": agent_id},
+        headers={"origin": origin},
+    )
+
+
+def test_widget_embed_ticket_flow_validates_embedding_origin() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Embed Ticket Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    # widget.js requests the ticket from the top-level embedding page, so
+    # the browser-enforced Origin header carries the real embedding site.
+    ticket_response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ticket_response.status_code == 200, ticket_response.text
+    ticket = ticket_response.json()["ticket"]
+
+    # The backend signs the validated embedding origin into the ticket, not
+    # a caller-supplied value.
+    ticket_claims = jose_jwt.decode(ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    assert ticket_claims["type"] == EMBED_TICKET_TYPE
+    assert ticket_claims["embed_origin"] == "trusted-site.com"
+
+    # The auth fetch runs inside the iframe: its Origin is the xagent host,
+    # which is NOT in allowed_domains — the ticket alone must carry trust.
+    auth_response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+        headers={"origin": "https://xagent-host.example"},
+    )
+    assert auth_response.status_code == 200, auth_response.text
+
+
+def test_widget_embed_ticket_rejected_for_disallowed_origin() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Embed Ticket Rejection Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = _issue_embed_ticket(agent_id, "https://evil-attacker.com")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
+
+
+def test_widget_auth_ignores_client_supplied_embed_origin() -> None:
+    """A browser-JS attacker must not pass by self-reporting an allowed
+    origin in the request body (the pre-ticket design's flaw)."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Self Reported Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "agent_id": agent_id,
+            "guest_id": "guest-1",
+            "embed_origin": "https://trusted-site.com",
+        },
+        headers={"origin": "https://evil-attacker.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
+
+
+def test_widget_auth_rejects_tampered_or_mismatched_ticket() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Tampered Ticket Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    other_agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Other Ticket Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    # Garbage ticket: fails signature verification.
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "agent_id": agent_id,
+            "guest_id": "guest-1",
+            "embed_ticket": "not-a-real-ticket",
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid or expired embed ticket"
+
+    # Valid ticket, but issued for a different agent.
+    other_ticket = _issue_embed_ticket(
+        other_agent_id, "https://trusted-site.com"
+    ).json()["ticket"]
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "agent_id": agent_id,
+            "guest_id": "guest-1",
+            "embed_ticket": other_ticket,
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid or expired embed ticket"
+
+
+def test_widget_auth_rejects_expired_embed_ticket() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Expired Ticket Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    expired_ticket = jose_jwt.encode(
+        {
+            "type": EMBED_TICKET_TYPE,
+            "agent_id": agent_id,
+            "embed_origin": "trusted-site.com",
+            "exp": datetime.now(timezone.utc) - timedelta(seconds=1),
+        },
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "agent_id": agent_id,
+            "guest_id": "guest-1",
+            "embed_ticket": expired_ticket,
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid or expired embed ticket"
+
+
+def test_widget_auth_rejects_valid_signed_token_of_wrong_type() -> None:
+    """All token classes share one signing key, so the type claim is the only
+    thing separating them. A validly-signed guest access token with the right
+    agent_id must not be replayable as an embed ticket."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Wrong Type Ticket Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    wrong_type_ticket = jose_jwt.encode(
+        {
+            "type": "widget",
+            "agent_id": agent_id,
+            "embed_origin": "trusted-site.com",
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
+        },
+        JWT_SECRET_KEY,
+        algorithm=JWT_ALGORITHM,
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "agent_id": agent_id,
+            "guest_id": "guest-1",
+            "embed_ticket": wrong_type_ticket,
+        },
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid or expired embed ticket"
+
+
+def test_widget_auth_rechecks_ticket_origin_against_current_allowlist() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Shrinking Allowlist Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    ticket = _issue_embed_ticket(agent_id, "https://trusted-site.com").json()["ticket"]
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None
+        agent.allowed_domains = ["another-site.com"]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+
+
+def test_widget_auth_falls_back_to_origin_header_without_embed_ticket() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Header Fallback Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+        headers={"origin": "https://trusted-site.com"},
+    )
+
+    assert response.status_code == 200, response.text
+
+
+def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
+    """allowed_domains matches on host[:port] only; the scheme is not part
+    of the comparison, so an http origin matches an entry with no scheme."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Scheme Agnostic Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = _issue_embed_ticket(agent_id, "http://trusted-site.com")
+
+    assert response.status_code == 200, response.text
+
+
+def test_widget_auth_rejects_when_ticket_and_origin_both_absent() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="No Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: "
+
+
+def test_widget_embed_ticket_wildcard_allows_any_origin() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Wildcard Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["*"],
+    )
+
+    response = _issue_embed_ticket(agent_id, "https://anything-goes.example")
+
+    assert response.status_code == 200, response.text
+
+
+def test_widget_embed_ticket_matches_subdomain_of_allowed_entry() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Subdomain Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    allowed = _issue_embed_ticket(agent_id, "https://app.trusted-site.com")
+    assert allowed.status_code == 200, allowed.text
+
+    # A domain that merely ends with the allowed string but is not a subdomain
+    # (no dot boundary) must not match.
+    spoofed = _issue_embed_ticket(agent_id, "https://eviltrusted-site.com")
+    assert spoofed.status_code == 403
+    assert spoofed.json()["detail"] == "Domain not allowed: eviltrusted-site.com"
+
+
+def test_embed_ticket_endpoint_rejects_unknown_agent() -> None:
+    _admin_headers()
+    response = _issue_embed_ticket(999999, "https://trusted-site.com")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
+
+
+def test_embed_ticket_endpoint_rejects_generated_manager_agent() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    manager_id = _create_agent_row(
+        user_id=owner_id,
+        name="Generated Manager Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        origin=AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+        widget_enabled=True,
+        allowed_domains=["*"],
+    )
+    response = _issue_embed_ticket(manager_id, "https://trusted-site.com")
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
+
+
+def test_embed_ticket_endpoint_rejects_widget_disabled_agent() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Widget Disabled Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=False,
+        allowed_domains=["trusted-site.com"],
+    )
+    response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Widget is disabled for this agent"
 
 
 def test_widget_public_tokens_cannot_create_tasks_for_other_agents() -> None:
