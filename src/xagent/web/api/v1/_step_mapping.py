@@ -68,6 +68,9 @@ from xagent.core.tools.adapters.vibe.agent_tool_names import (
     LEGACY_AGENT_TOOL_NAME_PREFIX,
     is_agent_tool_name,
 )
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    redact_runtime_sensitive_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +394,7 @@ def _build_tool_start(
     args = _data_get(event, "tool_args")
     if args is None:
         args = _data_get(event, "tool_params")
+    args = redact_runtime_sensitive_payload(args)
     assistant_content = _data_get(event, "assistant_content")
     assistant_content = (
         assistant_content.strip()
@@ -487,7 +491,7 @@ def _finalize_pending(
     if extra_data_fn is not None:
         try:
             extra = extra_data_fn(end_event) or {}
-            step["data"].update(extra)
+            step["data"].update(redact_runtime_sensitive_payload(extra))
         except Exception as exc:  # defensive; data shape is external
             logger.debug("step extra_data_fn failed: %s", exc)
     finished.append(step)

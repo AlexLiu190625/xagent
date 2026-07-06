@@ -29,6 +29,21 @@ TARGET_BODY_FIELD = "body_field"
 RUNTIME_SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 REDACTED_RUNTIME_SECRET = "[REDACTED_RUNTIME_SECRET]"
 MISSING_RUNTIME_VALUE = object()
+_SENSITIVE_RUNTIME_KEY_PARTS = frozenset(
+    {
+        "authorization",
+        "auth_selector",
+        "bearer",
+        "client_secret",
+        "refresh_token",
+        "access_token",
+        "id_token",
+        "api_key",
+        "secret",
+        "secrets",
+        "token",
+    }
+)
 
 ERROR_CONNECTOR_NOT_FOUND = "connector_not_found"
 ERROR_INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
@@ -142,6 +157,29 @@ def redact_runtime_value(value: Any) -> Any:
     if isinstance(value, list):
         return [REDACTED_RUNTIME_SECRET for _ in value]
     return REDACTED_RUNTIME_SECRET
+
+
+def redact_runtime_sensitive_payload(value: Any) -> Any:
+    """Recursively redact runtime credential fields from public payloads."""
+
+    if isinstance(value, dict):
+        redacted: dict[Any, Any] = {}
+        for key, item in value.items():
+            if _is_sensitive_runtime_key(key):
+                redacted[key] = redact_runtime_value(item)
+            else:
+                redacted[key] = redact_runtime_sensitive_payload(item)
+        return redacted
+    if isinstance(value, list):
+        return [redact_runtime_sensitive_payload(item) for item in value]
+    return value
+
+
+def _is_sensitive_runtime_key(key: Any) -> bool:
+    normalized = str(key).strip().lower().replace("-", "_")
+    if normalized in _SENSITIVE_RUNTIME_KEY_PARTS:
+        return True
+    return normalized.endswith("_token") or normalized.endswith("_secret")
 
 
 def runtime_bindings_from_config(config: Mapping[str, Any]) -> list[dict[str, Any]]:

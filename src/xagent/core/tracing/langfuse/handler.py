@@ -14,6 +14,7 @@ from ...agent.trace import (
     TraceHandler,
     TraceScope,
 )
+from ...tools.adapters.vibe.connector_runtime import redact_runtime_sensitive_payload
 from .client import get_langfuse_client
 from .serialization import coerce_usage_details, serialize_for_langfuse
 
@@ -116,7 +117,7 @@ class LangfuseTraceHandler(TraceHandler):
     def _handle_task_event(
         self, client: Langfuse, root: Any, event: TraceEvent
     ) -> None:
-        data = serialize_for_langfuse(event.data or {})
+        data = self._event_data(event)
         metadata = self._event_metadata(event)
 
         if (
@@ -172,7 +173,7 @@ class LangfuseTraceHandler(TraceHandler):
     def _handle_task_llm_event(
         self, client: Langfuse, root: Any, event: TraceEvent
     ) -> None:
-        data = serialize_for_langfuse(event.data or {})
+        data = self._event_data(event)
         metadata = self._event_metadata(event)
         observation_key = str(event.task_id or event.id)
         parent = self._resolve_task_event_parent(root, data)
@@ -202,7 +203,7 @@ class LangfuseTraceHandler(TraceHandler):
     def _handle_step_event(
         self, client: Langfuse, root: Any, event: TraceEvent
     ) -> None:
-        data = serialize_for_langfuse(event.data or {})
+        data = self._event_data(event)
         metadata = self._event_metadata(event)
         step_id = event.step_id or "unknown-step"
 
@@ -245,7 +246,7 @@ class LangfuseTraceHandler(TraceHandler):
     def _handle_action_event(
         self, client: Langfuse, root: Any, event: TraceEvent
     ) -> None:
-        data = serialize_for_langfuse(event.data or {})
+        data = self._event_data(event)
         metadata = self._event_metadata(event)
         key = self._action_key(event, data)
         parent = self._step_observations.get(event.step_id or "", root)
@@ -286,7 +287,7 @@ class LangfuseTraceHandler(TraceHandler):
         self._record_event(client, observation, event)
 
     def _record_event(self, client: Langfuse, parent: Any, event: TraceEvent) -> None:
-        data = serialize_for_langfuse(event.data or {})
+        data = self._event_data(event)
         metadata = self._event_metadata(event)
         input_value = data if event.event_type.action == TraceAction.START else None
         output_value = None if event.event_type.action == TraceAction.START else data
@@ -382,7 +383,7 @@ class LangfuseTraceHandler(TraceHandler):
         return "span"
 
     def _extract_trace_input(self, event: TraceEvent) -> Any:
-        data = serialize_for_langfuse(event.data or {})
+        data = self._event_data(event)
         if isinstance(data, dict):
             if "message" in data:
                 return data["message"]
@@ -463,8 +464,14 @@ class LangfuseTraceHandler(TraceHandler):
             "category": event.event_type.category.value,
             "step_id": event.step_id,
             "parent_event_id": event.parent_id,
-            "data": serialize_for_langfuse(event.data or {}),
+            "data": self._event_data(event),
         }
+
+    def _event_data(self, event: TraceEvent) -> Any:
+        data = serialize_for_langfuse(event.data or {})
+        if event.event_type.category == TraceCategory.TOOL:
+            return redact_runtime_sensitive_payload(data)
+        return data
 
     def _action_key(self, event: TraceEvent, data: Any) -> str:
         category = event.event_type.category.value

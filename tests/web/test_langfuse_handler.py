@@ -16,6 +16,7 @@ from xagent.core.agent.trace import (
     trace_task_completion,
     trace_task_start,
 )
+from xagent.core.tools.adapters.vibe.connector_runtime import REDACTED_RUNTIME_SECRET
 from xagent.core.tracing.langfuse import create_langfuse_trace_handler
 from xagent.core.tracing.langfuse.client import get_langfuse_client
 
@@ -138,6 +139,58 @@ async def test_langfuse_handler_keeps_multiple_actions_with_same_key(
 
     first_llm.end.assert_called_once()
     second_llm.end.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_langfuse_handler_redacts_runtime_secrets_from_tool_events(
+    mocker, monkeypatch, langfuse_client_reset
+):
+    monkeypatch.setenv("LANGFUSE_PUBLIC_KEY", "test-public")
+    monkeypatch.setenv("LANGFUSE_SECRET_KEY", "test-secret")
+
+    _, mock_langfuse = create_langfuse_mock(mocker)
+    root = _make_observation(mocker, "trace-secret", "root-secret")
+    tool_observation = _make_observation(mocker, "trace-secret", "tool-secret")
+    mock_langfuse.start_observation.return_value = root
+    root.start_observation.return_value = tool_observation
+
+    handler = create_langfuse_trace_handler(task_id="task-secret")
+    assert handler is not None
+
+    tracer = Tracer()
+    tracer.add_handler(handler)
+
+    await trace_action_start(
+        tracer,
+        "task-secret",
+        "step-1",
+        TraceCategory.TOOL,
+        data={
+            "tool_name": "shiftcare",
+            "tool_args": {
+                "headers": {
+                    "Authorization": "Bearer langfuse-token",
+                    "X-Account": "6185",
+                },
+                "connector_runtime": {
+                    "secrets": {"authorization": "Bearer nested-token"},
+                    "auth_selector": {"resource_owner_key": "xagent:user:owner"},
+                },
+            },
+        },
+    )
+
+    public_payload = repr(mock_langfuse.start_observation.call_args.kwargs)
+    public_payload += repr(root.update_trace.call_args.kwargs)
+    public_payload += repr(root.start_observation.call_args.kwargs)
+    assert "langfuse-token" not in public_payload
+    assert "nested-token" not in public_payload
+    assert "xagent:user:owner" not in public_payload
+    tool_input = root.start_observation.call_args.kwargs["input"]
+    assert (
+        tool_input["tool_args"]["headers"]["Authorization"] == REDACTED_RUNTIME_SECRET
+    )
+    assert tool_input["tool_args"]["headers"]["X-Account"] == "6185"
 
 
 @pytest.mark.asyncio

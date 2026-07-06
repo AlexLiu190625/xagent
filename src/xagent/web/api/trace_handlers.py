@@ -11,6 +11,9 @@ from sqlalchemy.orm import Session
 from ...core.agent.checkpoint import CHECKPOINT_TYPE, READABLE_CHECKPOINT_TYPES
 from ...core.agent.trace import BaseTraceHandler
 from ...core.agent.trace import TraceEvent as CoreTraceEvent
+from ...core.tools.adapters.vibe.connector_runtime import (
+    redact_runtime_sensitive_payload,
+)
 from ...web.models.database import get_db
 from ...web.models.task import Task
 from ...web.models.task import TraceEvent as DatabaseTraceEvent
@@ -175,6 +178,12 @@ class DatabaseTraceHandler(BaseTraceHandler):
 
             # Serialize data to ensure JSON compatibility
             data = self._serialize_data_for_json(event.data or {})
+            if event_type_str in {
+                "tool_execution_start",
+                "tool_execution_end",
+                "tool_execution_failed",
+            }:
+                data = redact_runtime_sensitive_payload(data)
             if self._is_duplicate_user_message_turn(db, event_type_str, data):
                 logger.debug(
                     "Skipping duplicate user_message turn_id=%s for task %s",

@@ -4,6 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from ...core.tools.adapters.vibe.connector_runtime import (
+    redact_runtime_sensitive_payload,
+)
+
+TOOL_EVENT_TYPES = frozenset(
+    {
+        "tool_execution_start",
+        "tool_execution_end",
+        "tool_execution_failed",
+    }
+)
 WORKFORCE_DELEGATION_EVENT_TYPES = frozenset(
     {
         "workforce_delegation_start",
@@ -73,6 +84,9 @@ def normalize_public_trace_event(
     still see a top-level workforce_delegation_* event with only safe summary
     fields.
     """
+    if event_type in TOOL_EVENT_TYPES:
+        data = redact_runtime_sensitive_payload(data)
+
     if not is_public_workforce_delegation_summary(event_type, data):
         return event_type, data
 

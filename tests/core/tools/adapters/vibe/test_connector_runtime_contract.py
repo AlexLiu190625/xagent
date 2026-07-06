@@ -9,6 +9,7 @@ from xagent.core.tools.adapters.vibe.connector_runtime import (
     REDACTED_RUNTIME_SECRET,
     ConnectorRef,
     ConnectorRuntimeError,
+    redact_runtime_sensitive_payload,
     redact_runtime_value,
     validate_runtime_config_declaration,
     validate_runtime_source_key,
@@ -104,6 +105,39 @@ def test_redact_runtime_value_does_not_preserve_secret_material() -> None:
     }
     assert "secret-token" not in repr(redacted)
     assert "person-1" not in repr(redacted)
+
+
+def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> None:
+    value = {
+        "headers": {"Authorization": "Bearer secret-token", "X-Safe": "ok"},
+        "connector_runtime": {
+            "context": {"account_id": "6185"},
+            "secrets": {"authorization": "Bearer tenant-token"},
+            "auth_selector": {"resource_owner_key": "xagent:user:owner"},
+        },
+        "body": [{"refresh_token": "refresh-secret"}, {"safe": "value"}],
+    }
+
+    redacted = redact_runtime_sensitive_payload(value)
+
+    assert redacted == {
+        "headers": {
+            "Authorization": REDACTED_RUNTIME_SECRET,
+            "X-Safe": "ok",
+        },
+        "connector_runtime": {
+            "context": {"account_id": "6185"},
+            "secrets": {"authorization": REDACTED_RUNTIME_SECRET},
+            "auth_selector": {"resource_owner_key": REDACTED_RUNTIME_SECRET},
+        },
+        "body": [
+            {"refresh_token": REDACTED_RUNTIME_SECRET},
+            {"safe": "value"},
+        ],
+    }
+    assert "secret-token" not in repr(redacted)
+    assert "tenant-token" not in repr(redacted)
+    assert "xagent:user:owner" not in repr(redacted)
 
 
 def test_runtime_config_validation_rejects_mcp_context_to_transport_header() -> None:

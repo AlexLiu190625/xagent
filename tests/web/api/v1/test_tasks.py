@@ -829,6 +829,52 @@ async def test_web_tool_config_applies_runtime_mcp_authorization_header(
     assert configs[0]["connector_runtime"]["secrets"] == {}
 
 
+def test_connector_runtime_secrets_do_not_enter_task_transcript(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        required=False,
+        secret_required=True,
+        delegated_authorization_binding=True,
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer transcript-token"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        msgs = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+    finally:
+        db.close()
+
+    assert [msg.content for msg in msgs] == ["first user message"]
+    assert "transcript-token" not in repr([msg.content for msg in msgs])
+
+
 def test_create_task_missing_authorization_returns_401(mock_start_task):
     """No Authorization header -> 401 invalid_api_key envelope."""
     agent_id, _key = _create_agent_with_key()
@@ -1851,6 +1897,75 @@ def test_get_steps_cache_reuses_mapping_until_trace_event_changes(mock_start_tas
             assert len(third.json()["steps"]) == 2
     finally:
         set_cache_backend_for_testing(None)
+
+
+def test_get_steps_redacts_runtime_secrets_before_cache_write(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id)
+    base = datetime(2026, 1, 1, 12, 0, 0, tzinfo=UTC)
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_start",
+        event_id="evt-secret-start",
+        timestamp=base,
+        step_id="secret-step",
+        data={
+            "tool_name": "custom_api_call",
+            "tool_execution_id": "secret-call",
+            "tool_args": {
+                "headers": {
+                    "Authorization": "Bearer runtime-token",
+                    "X-Account": "6185",
+                },
+                "connector_runtime": {
+                    "secrets": {"authorization": "Bearer nested-token"},
+                    "auth_selector": {"resource_owner_key": "xagent:user:owner"},
+                },
+            },
+        },
+    )
+    _insert_trace_event(
+        task_id=task_id,
+        event_type="tool_execution_end",
+        event_id="evt-secret-end",
+        timestamp=base.replace(second=1),
+        step_id="secret-step",
+        data={
+            "tool_name": "custom_api_call",
+            "tool_execution_id": "secret-call",
+            "result": {
+                "headers": {"Authorization": "Bearer echoed-token"},
+                "safe": "ok",
+            },
+            "success": True,
+        },
+    )
+
+    set_cache_backend_for_testing(InMemoryTTLCache())
+    try:
+        first = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
+        second = client.get(
+            f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+        )
+    finally:
+        set_cache_backend_for_testing(None)
+
+    assert first.status_code == 200, first.text
+    assert second.status_code == 200, second.text
+    assert first.json() == second.json()
+    response_text = first.text + second.text
+    assert "runtime-token" not in response_text
+    assert "nested-token" not in response_text
+    assert "xagent:user:owner" not in response_text
+    assert "echoed-token" not in response_text
+    step = first.json()["steps"][0]
+    assert (
+        step["data"]["args"]["headers"]["Authorization"] == "[REDACTED_RUNTIME_SECRET]"
+    )
+    assert step["data"]["args"]["headers"]["X-Account"] == "6185"
+    assert step["data"]["result"]["headers"]["Authorization"] == (
+        "[REDACTED_RUNTIME_SECRET]"
+    )
 
 
 # ===== source filtering: SDK API surface only sees source="sdk" tasks =====

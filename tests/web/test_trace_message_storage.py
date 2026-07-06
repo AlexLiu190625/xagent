@@ -12,7 +12,14 @@ from sqlalchemy.pool import StaticPool
 
 from scripts.convert_trace_checkpoint_messages import convert_trace_checkpoint_messages
 from xagent.core.agent.checkpoint import CHECKPOINT_EVENT_TYPE, CHECKPOINT_TYPE
-from xagent.core.agent.trace import TraceEvent
+from xagent.core.agent.trace import (
+    TraceAction,
+    TraceCategory,
+    TraceEvent,
+    TraceEventType,
+    TraceScope,
+)
+from xagent.core.tools.adapters.vibe.connector_runtime import REDACTED_RUNTIME_SECRET
 from xagent.web.api.trace_handlers import DatabaseTraceHandler
 from xagent.web.models.database import Base
 from xagent.web.models.task import (
@@ -593,6 +600,52 @@ def test_database_trace_handler_stores_checkpoint_messages_as_refs(
         assert loaded["pattern_state"]["tool_ledger"] == {
             "tool-1": {"result": "large tool output"}
         }
+    finally:
+        db.close()
+
+
+def test_database_trace_handler_redacts_runtime_secrets_in_tool_events() -> None:
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        handler = DatabaseTraceHandler(task_id)
+        event = TraceEvent(
+            TraceEventType(TraceScope.ACTION, TraceAction.START, TraceCategory.TOOL),
+            task_id=str(task_id),
+            step_id="step-1",
+            data={
+                "tool_name": "shiftcare",
+                "tool_args": {
+                    "headers": {
+                        "Authorization": "Bearer raw-runtime-token",
+                        "X-Account": "6185",
+                    },
+                    "connector_runtime": {
+                        "secrets": {"authorization": "Bearer raw-runtime-token"},
+                        "auth_selector": {"resource_owner_key": "xagent:user:1"},
+                    },
+                },
+            },
+        )
+
+        handler._save_trace_event(db, event)
+
+        row = db.query(DatabaseTraceEvent).filter_by(task_id=task_id).one()
+        assert "raw-runtime-token" not in str(row.data)
+        assert "xagent:user:1" not in str(row.data)
+        tool_args = row.data["tool_args"]
+        assert tool_args["headers"]["Authorization"] == REDACTED_RUNTIME_SECRET
+        assert tool_args["headers"]["X-Account"] == "6185"
+        assert (
+            tool_args["connector_runtime"]["secrets"]["authorization"]
+            == REDACTED_RUNTIME_SECRET
+        )
+        assert (
+            tool_args["connector_runtime"]["auth_selector"]["resource_owner_key"]
+            == REDACTED_RUNTIME_SECRET
+        )
     finally:
         db.close()
 
