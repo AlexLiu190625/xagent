@@ -5,6 +5,7 @@ from xagent.core.tools.adapters.vibe.connector_runtime import (
     CONNECTOR_TYPE_MCP,
     ERROR_DELEGATED_AUTHORIZATION_FAILED,
     ERROR_MCP_OAUTH_AUTHORIZATION_FAILED,
+    ERROR_RUNTIME_SECRET_UNAVAILABLE,
     REDACTED_RUNTIME_SECRET,
     ConnectorRef,
     ConnectorRuntimeError,
@@ -102,3 +103,30 @@ def test_redact_runtime_value_does_not_preserve_secret_material() -> None:
     }
     assert "secret-token" not in repr(redacted)
     assert "person-1" not in repr(redacted)
+
+
+@pytest.mark.asyncio
+async def test_tool_registry_does_not_swallow_connector_runtime_error() -> None:
+    from xagent.core.tools.adapters.vibe.factory import ToolRegistry
+
+    saved_creators = list(ToolRegistry._tool_creators)
+    saved_imported = ToolRegistry._modules_imported
+    ToolRegistry._tool_creators = []
+    ToolRegistry._modules_imported = True
+
+    async def _creator(_config):
+        raise ConnectorRuntimeError(
+            ERROR_RUNTIME_SECRET_UNAVAILABLE,
+            "Required runtime secret is unavailable.",
+            details={"reason": "store_lost"},
+        )
+
+    try:
+        ToolRegistry.register(_creator, categories={"mcp"})
+        with pytest.raises(ConnectorRuntimeError) as exc_info:
+            await ToolRegistry.create_registered_tools(object())
+    finally:
+        ToolRegistry._tool_creators = saved_creators
+        ToolRegistry._modules_imported = saved_imported
+
+    assert exc_info.value.code == ERROR_RUNTIME_SECRET_UNAVAILABLE

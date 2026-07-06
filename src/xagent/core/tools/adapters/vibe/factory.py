@@ -16,6 +16,7 @@ from .....config import get_uploads_dir
 from .....core.workspace import TaskWorkspace
 from .base import AbstractBaseTool, Tool
 from .config import BaseToolConfig
+from .connector_runtime import ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
 from .selection_spec import ToolSelectionSpec
 
@@ -184,6 +185,8 @@ class ToolRegistry:
             try:
                 created_tools = await creator(config)
                 tools.extend(created_tools)
+            except ConnectorRuntimeError:
+                raise
             except Exception as e:
                 logger.warning(f"Tool creator {creator.__name__} failed: {e}")
 
@@ -544,6 +547,8 @@ class ToolFactory:
                 sandbox=sandbox,
             )  # type: ignore[arg-type]
             return mcp_tools if mcp_tools else []  # type: ignore[return-value]
+        except ConnectorRuntimeError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to create MCP tools: {e}")
             return []

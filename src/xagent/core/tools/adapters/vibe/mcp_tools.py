@@ -3,6 +3,7 @@
 import logging
 from typing import TYPE_CHECKING, Any, List
 
+from .connector_runtime import ConnectorRuntimeError
 from .factory import register_tool
 
 if TYPE_CHECKING:
@@ -72,6 +73,8 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
             mcp_configs,
             sandbox=config.get_sandbox(),
         )
+    except ConnectorRuntimeError:
+        raise
     except Exception as e:
         logger.warning(f"Failed to create MCP tools: {e}")
         return []

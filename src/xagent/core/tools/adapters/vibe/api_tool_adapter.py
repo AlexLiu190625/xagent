@@ -17,6 +17,7 @@ from .connector_runtime import (
     RUNTIME_INPUT_SECRETS,
     TARGET_BODY_FIELD,
     TARGET_HEADERS,
+    ConnectorRuntimeError,
     binding_source_value,
     binding_target,
     connector_runtime_from_config,
@@ -383,6 +384,8 @@ def create_custom_api_tools(configs: List[Dict[str, Any]]) -> List[CustomApiTool
                 ),
             )
             tools.append(tool)
+        except ConnectorRuntimeError:
+            raise
         except Exception as e:
             logger.error(
                 "Failed to create Custom API tool %s: %s",
