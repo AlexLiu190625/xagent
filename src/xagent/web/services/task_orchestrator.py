@@ -978,6 +978,17 @@ def _schedule_bg(
                             task_id,
                             e,
                         )
+            try:
+                from .connector_runtime import pop_ephemeral_runtime_values
+
+                pop_ephemeral_runtime_values(payload.turn_id)
+            except Exception:
+                logger.warning(
+                    "connector runtime cleanup failed for task %s turn %s",
+                    task_id,
+                    payload.turn_id,
+                    exc_info=True,
+                )
 
     bg_task = asyncio.create_task(_runner())
     background_task_manager.register_task(task_id, bg_task)

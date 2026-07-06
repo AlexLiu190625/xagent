@@ -22,6 +22,7 @@ Why a separate error envelope from ``/api/*``:
 """
 
 from enum import Enum
+from typing import Any
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
@@ -73,6 +74,18 @@ class V1ErrorCode(str, Enum):
     # the server log.
     INTERNAL_ERROR = "internal_error"
 
+    CONNECTOR_NOT_FOUND = "connector_not_found"
+    INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
+    MISSING_RUNTIME_CONTEXT = "missing_runtime_context"
+    RUNTIME_CONTEXT_IMMUTABLE = "runtime_context_immutable"
+    RUNTIME_SECRET_NOT_ALLOWED = "runtime_secret_not_allowed"
+    RUNTIME_SECRET_UNAVAILABLE = "runtime_secret_unavailable"
+    SCHEDULED_SECRET_UNAVAILABLE = "scheduled_secret_unavailable"
+    RUNTIME_BINDING_NOT_ALLOWED = "runtime_binding_not_allowed"
+    RUNTIME_BINDING_CONFLICT = "runtime_binding_conflict"
+    MCP_OAUTH_AUTHORIZATION_FAILED = "mcp_oauth_authorization_failed"
+    DELEGATED_AUTHORIZATION_FAILED = "delegated_authorization_failed"
+
 
 # Default human-readable text per code. Endpoints may override the
 # message when more specific context is available (e.g. surfacing
@@ -86,6 +99,17 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.INVALID_INPUT: "Request body failed validation.",
     V1ErrorCode.RATE_LIMITED: "Rate limit exceeded; retry later.",
     V1ErrorCode.INTERNAL_ERROR: "Internal server error.",
+    V1ErrorCode.CONNECTOR_NOT_FOUND: "Connector not found or not accessible.",
+    V1ErrorCode.INVALID_RUNTIME_CONTEXT: "Invalid connector runtime context.",
+    V1ErrorCode.MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",
+    V1ErrorCode.RUNTIME_CONTEXT_IMMUTABLE: "Connector runtime context cannot change after task creation.",
+    V1ErrorCode.RUNTIME_SECRET_NOT_ALLOWED: "Runtime secret is not allowed for this entrypoint.",
+    V1ErrorCode.RUNTIME_SECRET_UNAVAILABLE: "Required runtime secret is unavailable.",
+    V1ErrorCode.SCHEDULED_SECRET_UNAVAILABLE: "Required scheduled runtime secret is unavailable.",
+    V1ErrorCode.RUNTIME_BINDING_NOT_ALLOWED: "Connector runtime binding is not allowed.",
+    V1ErrorCode.RUNTIME_BINDING_CONFLICT: "Connector runtime binding conflicts with static configuration.",
+    V1ErrorCode.MCP_OAUTH_AUTHORIZATION_FAILED: "MCP OAuth authorization is unavailable.",
+    V1ErrorCode.DELEGATED_AUTHORIZATION_FAILED: "Delegated authorization failed.",
 }
 
 
@@ -111,16 +135,18 @@ class V1ApiError(Exception):
         code: V1ErrorCode,
         http_status: int,
         message: str | None = None,
+        details: dict[str, Any] | None = None,
     ) -> None:
         super().__init__(message or _DEFAULT_MESSAGES[code])
         self.code = code
         self.http_status = http_status
         self.message = message or _DEFAULT_MESSAGES[code]
+        self.details = details
 
 
 async def v1_api_error_handler(_request: Request, exc: V1ApiError) -> JSONResponse:
     """FastAPI exception handler -- mount via ``app.add_exception_handler``."""
-    return JSONResponse(
-        status_code=exc.http_status,
-        content={"error": {"code": exc.code.value, "message": exc.message}},
-    )
+    error: dict[str, Any] = {"code": exc.code.value, "message": exc.message}
+    if exc.details is not None:
+        error["details"] = exc.details
+    return JSONResponse(status_code=exc.http_status, content={"error": error})

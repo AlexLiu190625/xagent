@@ -27,7 +27,7 @@ Design notes:
 from datetime import datetime
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class MessageBody(BaseModel):
@@ -54,6 +54,26 @@ class MessageBody(BaseModel):
     )
 
 
+class ConnectorRuntimeRefBody(BaseModel):
+    """Stable connector identity for per-invocation runtime values."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_type: Literal["mcp", "custom_api"]
+    connector_id: int = Field(..., gt=0)
+
+
+class ConnectorRuntimeContextBody(BaseModel):
+    """Per-connector runtime values supplied by a trusted invocation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    connector_ref: ConnectorRuntimeRefBody
+    context: Optional[Dict[str, Any]] = None
+    secrets: Optional[Dict[str, Any]] = None
+    auth_selector: Optional[Dict[str, Any]] = None
+
+
 class CreateTaskRequest(BaseModel):
     """Body for ``POST /v1/chat/tasks``.
 
@@ -75,6 +95,13 @@ class CreateTaskRequest(BaseModel):
         description=(
             "Free-form correlation data the SDK caller can pass through "
             "(trace_id, request_id, etc). Not interpreted server-side."
+        ),
+    )
+    connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
+        default=None,
+        description=(
+            "Trusted server-to-server connector runtime values. Values are "
+            "validated and applied below the LLM/tool-argument layer."
         ),
     )
 
@@ -222,6 +249,12 @@ class AppendMessageRequest(BaseModel):
     metadata: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Free-form correlation data passed through unchanged.",
+    )
+    connector_runtime_context: Optional[List[ConnectorRuntimeContextBody]] = Field(
+        default=None,
+        description=(
+            "Trusted server-to-server connector runtime values for this turn."
+        ),
     )
 
 
