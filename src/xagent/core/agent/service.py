@@ -168,6 +168,12 @@ class AgentService:
             compact_llm.model_name if compact_llm else None,
         )
 
+    def invalidate_tools(self) -> None:
+        """Force the next execution to rebuild tools from ``tool_config``."""
+
+        self._tools_initialized = False
+        self._tool_policy_signature = None
+
     async def execute_task(
         self,
         task: str,

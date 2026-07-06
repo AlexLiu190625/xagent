@@ -1828,6 +1828,17 @@ class AgentServiceManager:
                 # Re-raise the exception - no fallback logic allowed
                 raise
 
+        if task_id in self._agents and connector_runtime_turn_id:
+            tool_config = getattr(self._agents[task_id], "tool_config", None)
+            set_turn_id = getattr(tool_config, "set_connector_runtime_turn_id", None)
+            if callable(set_turn_id) and set_turn_id(connector_runtime_turn_id):
+                logger.info(
+                    "Refreshing connector runtime tools for task %s turn %s",
+                    task_id,
+                    connector_runtime_turn_id,
+                )
+                self._agents[task_id].invalidate_tools()
+
         self._agent_owner_ids[task_id] = runtime_user_id
         return self._agents[task_id]
 

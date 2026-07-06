@@ -81,3 +81,22 @@ def test_mcp_loader_uses_factory_session():
     cfg = WebToolConfig(db=None, request=None, db_factory=lambda: sess, user_id=1)
     asyncio.run(cfg._load_mcp_server_configs())
     assert sess.query_calls >= 1
+
+
+def test_connector_runtime_turn_switch_invalidates_runtime_caches():
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        connector_runtime_turn_id="turn-1",
+    )
+    cfg._connector_runtime_view = {"custom_api:1": {"secrets": {"token": "old"}}}
+    cfg._cached_mcp_configs = [{"id": 1, "connector_runtime": {"context": {}}}]
+
+    assert cfg.set_connector_runtime_turn_id("turn-1") is False
+    assert cfg._connector_runtime_view is not None
+    assert cfg._cached_mcp_configs is not None
+
+    assert cfg.set_connector_runtime_turn_id("turn-2") is True
+    assert cfg._connector_runtime_turn_id == "turn-2"
+    assert cfg._connector_runtime_view is None
+    assert cfg._cached_mcp_configs is None

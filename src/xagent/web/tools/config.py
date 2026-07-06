@@ -445,6 +445,23 @@ class WebToolConfig(BaseToolConfig):
             self._connector_runtime_view = {}
         return self._connector_runtime_view
 
+    def set_connector_runtime_turn_id(self, turn_id: Optional[str]) -> bool:
+        """Switch the per-turn connector runtime source for reused agents.
+
+        ``WebToolConfig`` instances are cached with ``AgentService`` by task.
+        Runtime secrets/auth selectors are intentionally per-turn, so an append
+        turn must not keep using the first turn's resolved connector runtime
+        view or MCP config cache.
+        """
+
+        normalized_turn_id = turn_id if isinstance(turn_id, str) else None
+        if self._connector_runtime_turn_id == normalized_turn_id:
+            return False
+        self._connector_runtime_turn_id = normalized_turn_id
+        self._connector_runtime_view = None
+        self._cached_mcp_configs = None
+        return True
+
     def _parse_numeric_task_id(self) -> Optional[int]:
         task_id = self._task_id
         if not isinstance(task_id, str) or not task_id:
