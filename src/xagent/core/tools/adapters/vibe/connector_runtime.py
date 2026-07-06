@@ -39,6 +39,8 @@ _SENSITIVE_RUNTIME_KEY_PARTS = frozenset(
         "access_token",
         "id_token",
         "api_key",
+        "private_key",
+        "password",
         "secret",
         "secrets",
         "token",
@@ -177,7 +179,7 @@ def redact_runtime_sensitive_payload(value: Any) -> Any:
 
 def _is_sensitive_runtime_key(key: Any) -> bool:
     normalized = str(key).strip().lower().replace("-", "_")
-    if normalized in _SENSITIVE_RUNTIME_KEY_PARTS:
+    if any(part in normalized for part in _SENSITIVE_RUNTIME_KEY_PARTS):
         return True
     return normalized.endswith("_token") or normalized.endswith("_secret")
 

@@ -9,6 +9,7 @@ from sqlalchemy.pool import StaticPool
 
 from xagent.web.models import Agent, Base, MCPServer, Task, User, UserMCPServer
 from xagent.web.models.agent import AgentStatus
+from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.task import TaskStatus
 from xagent.web.services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
@@ -74,6 +75,38 @@ def _create_runtime_mcp(db: Session, user: User, name: str) -> MCPServer:
     return server
 
 
+def _create_runtime_custom_api(db: Session, user: User, name: str) -> CustomApi:
+    api = CustomApi(
+        name=name,
+        description=f"{name} description",
+        url="https://example.com/api",
+        method="GET",
+        runtime_input_schema={
+            "context": {"account_id": {"type": "string", "required": False}}
+        },
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+    )
+    db.add(api)
+    db.flush()
+    db.add(
+        UserCustomApi(
+            user_id=user.id,
+            custom_api_id=api.id,
+            is_owner=True,
+            can_edit=True,
+            can_delete=True,
+            is_active=True,
+        )
+    )
+    db.flush()
+    return api
+
+
 def test_task_model_defaults_connector_runtime_selected_refs_to_empty_list(
     db_session: Session,
 ) -> None:
@@ -137,3 +170,46 @@ def test_selection_snapshot_uses_runtime_owner_connector_visibility(
     assert {"connector_type": "mcp", "connector_id": int(owner_server.id)} not in (
         task.connector_runtime_selected_refs or []
     )
+
+
+def test_selection_snapshot_scopes_custom_api_by_source_server_name(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Scoped Connector Agent",
+        description="shared",
+        instructions="Use scoped tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp:Records"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+
+    selected_mcp = _create_runtime_mcp(db_session, user, "Records")
+    selected_api = _create_runtime_custom_api(db_session, user, "Records")
+    unselected_api = _create_runtime_custom_api(db_session, user, "Billing")
+
+    selected_refs = prepare_connector_runtime_selection_snapshot(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+    task = Task(
+        user_id=user.id,
+        agent_id=agent.id,
+        title="scoped connector task",
+        status=TaskStatus.PENDING,
+    )
+    bind_connector_runtime_selection_snapshot(task=task, selected_refs=selected_refs)
+
+    assert task.connector_runtime_selected_refs == [
+        {"connector_type": "custom_api", "connector_id": int(selected_api.id)},
+        {"connector_type": "mcp", "connector_id": int(selected_mcp.id)},
+    ]
+    assert {
+        "connector_type": "custom_api",
+        "connector_id": int(unselected_api.id),
+    } not in (task.connector_runtime_selected_refs or [])

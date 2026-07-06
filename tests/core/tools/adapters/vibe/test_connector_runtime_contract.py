@@ -110,6 +110,11 @@ def test_redact_runtime_value_does_not_preserve_secret_material() -> None:
 def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> None:
     value = {
         "headers": {"Authorization": "Bearer secret-token", "X-Safe": "ok"},
+        "credentials": {
+            "user_api_key": "api-key-secret",
+            "api_key_v1": "versioned-api-key-secret",
+            "private_key": "private-key-secret",
+        },
         "connector_runtime": {
             "context": {"account_id": "6185"},
             "secrets": {"authorization": "Bearer tenant-token"},
@@ -125,6 +130,11 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
             "Authorization": REDACTED_RUNTIME_SECRET,
             "X-Safe": "ok",
         },
+        "credentials": {
+            "user_api_key": REDACTED_RUNTIME_SECRET,
+            "api_key_v1": REDACTED_RUNTIME_SECRET,
+            "private_key": REDACTED_RUNTIME_SECRET,
+        },
         "connector_runtime": {
             "context": {"account_id": "6185"},
             "secrets": {"authorization": REDACTED_RUNTIME_SECRET},
@@ -136,6 +146,9 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
         ],
     }
     assert "secret-token" not in repr(redacted)
+    assert "api-key-secret" not in repr(redacted)
+    assert "versioned-api-key-secret" not in repr(redacted)
+    assert "private-key-secret" not in repr(redacted)
     assert "tenant-token" not in repr(redacted)
     assert "xagent:user:owner" not in repr(redacted)
 

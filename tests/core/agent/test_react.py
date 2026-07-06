@@ -887,6 +887,26 @@ async def test_react_sanitizes_tool_args_before_trace_and_execution() -> None:
 
 
 @pytest.mark.asyncio
+async def test_react_trace_safe_tool_args_handles_null_args() -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    tool = FakeTraceSanitizingTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-custom-api",
+            "name": "custom_api",
+            "args": None,
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert tool.calls == [{}]
+
+
+@pytest.mark.asyncio
 async def test_react_pattern_unwraps_textual_final_answer_json() -> None:
     llm = FakeLLM(
         responses=[

@@ -2013,7 +2013,7 @@ class ReActPattern(AgentPattern):
         if not callable(sanitizer):
             return tool_call
 
-        args = dict(tool_call.get("args", {}))
+        args = dict(tool_call.get("args") or {})
         sanitized = sanitizer(args)
         if not isinstance(sanitized, dict) or sanitized == args:
             return tool_call
@@ -2059,7 +2059,7 @@ class ReActPattern(AgentPattern):
         error: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
-        args = dict(tool_call.get("args", {}))
+        args = dict(tool_call.get("args") or {})
         args_hash = self._args_hash(args)
         self.tool_ledger[tool_call_id] = ToolCallRecord(
             tool_call_id=tool_call_id,
@@ -2185,7 +2185,7 @@ class ReActPattern(AgentPattern):
     def _tool_args_for_execution(
         self, tool_call: dict[str, Any], tool: Any
     ) -> dict[str, Any]:
-        args = dict(tool_call.get("args", {}))
+        args = dict(tool_call.get("args") or {})
         tool_name = self._tool_name(tool)
         if not tool_name.startswith("browser_"):
             return args

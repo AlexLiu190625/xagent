@@ -375,7 +375,7 @@ export function RuntimeInputsForm({
         ) : (
           <div className="space-y-2">
             {inputs.map((row, index) => (
-              <div key={`${row.inputType}:${row.key}:${index}`} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
+              <div key={`runtime-input-${index}`} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
                 <Select
                   value={row.inputType}
                   disabled={disabled}
@@ -498,7 +498,7 @@ export function RuntimeInputsForm({
             {bindings.map((row, index) => {
               const keys = inputKeysByType.get(row.sourceType) || []
               return (
-                <div key={`${row.sourceType}:${row.sourceKey}:${index}`} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
+                <div key={`runtime-binding-${index}`} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
                   <Select
                     value={row.sourceType}
                     disabled={disabled}

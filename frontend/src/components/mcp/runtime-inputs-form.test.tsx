@@ -104,6 +104,23 @@ describe("RuntimeInputsForm", () => {
     ])
   })
 
+  it("keeps input focus while editing runtime keys", () => {
+    render(<RuntimeFormHarness connectorType="mcp" />)
+
+    fireEvent.click(screen.getByText("tools.mcp.runtime.addInput"))
+    const keyInput = screen.getByPlaceholderText("tools.mcp.runtime.key")
+    keyInput.focus()
+
+    fireEvent.change(keyInput, { target: { value: "tenant_id" } })
+
+    expect(document.activeElement).toBe(keyInput)
+    expect(formState().runtime_input_schema).toEqual({
+      context: {
+        tenant_id: { type: "string", required: false },
+      },
+    })
+  })
+
   it("writes Custom API bindings and delegated authorization to top-level form data", () => {
     render(<RuntimeFormHarness connectorType="custom_api" />)
 
