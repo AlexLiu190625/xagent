@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, Mapping
 
 ConnectorType = Literal["mcp", "custom_api"]
 
@@ -28,6 +28,7 @@ TARGET_BODY_FIELD = "body_field"
 
 RUNTIME_SOURCE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 REDACTED_RUNTIME_SECRET = "[REDACTED_RUNTIME_SECRET]"
+MISSING_RUNTIME_VALUE = object()
 
 ERROR_CONNECTOR_NOT_FOUND = "connector_not_found"
 ERROR_INVALID_RUNTIME_CONTEXT = "invalid_runtime_context"
@@ -141,3 +142,47 @@ def redact_runtime_value(value: Any) -> Any:
     if isinstance(value, list):
         return [REDACTED_RUNTIME_SECRET for _ in value]
     return REDACTED_RUNTIME_SECRET
+
+
+def runtime_bindings_from_config(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    bindings = config.get("runtime_bindings")
+    if not isinstance(bindings, list):
+        return []
+    return [binding for binding in bindings if isinstance(binding, dict)]
+
+
+def connector_runtime_from_config(config: Mapping[str, Any]) -> dict[str, Any]:
+    runtime = config.get("connector_runtime")
+    return runtime if isinstance(runtime, dict) else {}
+
+
+def binding_source(binding: Mapping[str, Any]) -> dict[str, Any]:
+    source = binding.get("source")
+    if isinstance(source, dict):
+        return source
+    if isinstance(source, str) and "." in source:
+        input_type, key = source.split(".", 1)
+        return {"input_type": input_type, "key": key}
+    return {}
+
+
+def binding_target(binding: Mapping[str, Any]) -> dict[str, Any]:
+    target = binding.get("target")
+    return target if isinstance(target, dict) else {}
+
+
+def binding_source_value(
+    binding: Mapping[str, Any],
+    runtime: Mapping[str, Any],
+    *,
+    allowed_input_types: set[str],
+) -> Any:
+    source = binding_source(binding)
+    input_type = source.get("input_type") or source.get("type") or source.get("section")
+    key = source.get("key")
+    if input_type not in allowed_input_types or not isinstance(key, str):
+        return MISSING_RUNTIME_VALUE
+    section = runtime.get(input_type)
+    if not isinstance(section, dict) or key not in section:
+        return MISSING_RUNTIME_VALUE
+    return section[key]

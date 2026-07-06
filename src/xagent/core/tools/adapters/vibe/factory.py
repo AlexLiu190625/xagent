@@ -508,6 +508,14 @@ class ToolFactory:
                     "transport": config["transport"],
                     **config["config"],
                 }
+                for runtime_key in (
+                    "runtime_bindings",
+                    "runtime_input_schema",
+                    "connector_runtime",
+                    "allow_delegated_authorization",
+                ):
+                    if runtime_key in config:
+                        connection_config[runtime_key] = config[runtime_key]
 
                 # Fix args field if it's a string instead of list
                 if "args" in connection_config and isinstance(

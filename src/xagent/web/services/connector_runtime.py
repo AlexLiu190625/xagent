@@ -8,6 +8,7 @@ consume the resolved runtime view later in the execution path.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Iterable, cast
@@ -27,6 +28,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     RUNTIME_INPUT_CONTEXT,
     RUNTIME_INPUT_SECRETS,
     RUNTIME_SECRET_REASON_NOT_PROVIDED,
+    RUNTIME_SECRET_REASON_STORE_LOST,
     ConnectorRef,
     ConnectorRuntimeError,
     ConnectorType,
@@ -62,8 +64,44 @@ class ConnectorRuntimeAppendPlan:
     ephemeral_by_ref: dict[ConnectorRef, dict[str, dict[str, Any]]]
 
 
+@dataclass(frozen=True)
+class ConnectorRuntimeValues:
+    context: dict[str, Any]
+    secrets: dict[str, Any]
+    auth_selector: dict[str, Any]
+
+    def to_runtime_config(self) -> dict[str, Any]:
+        return {
+            RUNTIME_INPUT_CONTEXT: dict(self.context),
+            RUNTIME_INPUT_SECRETS: dict(self.secrets),
+            RUNTIME_INPUT_AUTH_SELECTOR: dict(self.auth_selector),
+        }
+
+
+@dataclass(frozen=True)
+class ConnectorRuntimeRequest:
+    task_id: int
+    turn_id: str | None
+    user_id: int | None
+    connector_ref: ConnectorRef
+    values: ConnectorRuntimeValues
+
+
+ConnectorRuntimeResolver = Callable[
+    [ConnectorRuntimeRequest], ConnectorRuntimeValues | None
+]
+
+
 _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
+_RUNTIME_RESOLVER: ConnectorRuntimeResolver | None = None
+
+
+def set_connector_runtime_resolver_for_testing(
+    resolver: ConnectorRuntimeResolver | None,
+) -> None:
+    global _RUNTIME_RESOLVER
+    _RUNTIME_RESOLVER = resolver
 
 
 def store_ephemeral_runtime_values(
@@ -92,6 +130,70 @@ def get_ephemeral_runtime_values(turn_id: str) -> dict[str, Any] | None:
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
         values = _EPHEMERAL_RUNTIME_VALUES.get(turn_id)
         return dict(values) if isinstance(values, dict) else None
+
+
+def load_connector_runtime_view(
+    *,
+    db: Session,
+    task_id: int,
+    turn_id: str | None,
+    user_id: int | None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve task-bound and per-turn runtime values for tool creation."""
+
+    task = db.query(Task).filter(Task.id == task_id).first()
+    if task is None:
+        return {}
+
+    selected_refs = _load_task_selected_refs(task)
+    if not selected_refs:
+        return {}
+
+    persisted_context = _load_task_context_rows(db, task_id=task_id)
+    ephemeral_by_ref = (
+        get_ephemeral_runtime_values(turn_id) if isinstance(turn_id, str) else None
+    )
+    visible = (
+        _load_visible_runtime_connectors(db, user_id=user_id)
+        if user_id is not None
+        else {}
+    )
+
+    runtime_view: dict[str, dict[str, Any]] = {}
+    for ref in selected_refs:
+        connector = visible.get(ref)
+        if connector is None:
+            continue
+        raw_ephemeral = (
+            ephemeral_by_ref.get(ref.storage_key, {})
+            if isinstance(ephemeral_by_ref, dict)
+            else {}
+        )
+        values = ConnectorRuntimeValues(
+            context=dict(persisted_context.get(ref, {})),
+            secrets=dict(
+                raw_ephemeral.get(RUNTIME_INPUT_SECRETS, {})
+                if isinstance(raw_ephemeral, dict)
+                else {}
+            ),
+            auth_selector=dict(
+                raw_ephemeral.get(RUNTIME_INPUT_AUTH_SELECTOR, {})
+                if isinstance(raw_ephemeral, dict)
+                else {}
+            ),
+        )
+        values = _resolve_runtime_values(
+            task_id=task_id,
+            turn_id=turn_id,
+            user_id=user_id,
+            ref=ref,
+            values=values,
+        )
+        _require_context_values(ref, connector, values.context)
+        _require_ephemeral_values_at_binding(ref, connector, values)
+        runtime_view[ref.storage_key] = values.to_runtime_config()
+
+    return runtime_view
 
 
 def prepare_create_connector_runtime(
@@ -448,10 +550,52 @@ def _require_ephemeral_values(
                         reason=RUNTIME_SECRET_REASON_NOT_PROVIDED,
                     )
                 _raise_runtime_error(
-                    ERROR_RUNTIME_SECRET_NOT_ALLOWED,
+                    ERROR_RUNTIME_SECRET_UNAVAILABLE,
                     ref,
-                    reason=f"missing_{section_name}.{key}",
+                    reason=RUNTIME_SECRET_REASON_NOT_PROVIDED,
                 )
+
+
+def _require_ephemeral_values_at_binding(
+    ref: ConnectorRef,
+    connector: Any,
+    values: ConnectorRuntimeValues,
+) -> None:
+    schema = _runtime_input_schema(connector)
+    for section_name, section_values in (
+        (RUNTIME_INPUT_SECRETS, values.secrets),
+        (RUNTIME_INPUT_AUTH_SELECTOR, values.auth_selector),
+    ):
+        declarations = _schema_section(schema, section_name)
+        for key, declaration in declarations.items():
+            if _is_required(declaration) and key not in section_values:
+                _raise_runtime_error(
+                    ERROR_RUNTIME_SECRET_UNAVAILABLE,
+                    ref,
+                    reason=RUNTIME_SECRET_REASON_STORE_LOST,
+                )
+
+
+def _resolve_runtime_values(
+    *,
+    task_id: int,
+    turn_id: str | None,
+    user_id: int | None,
+    ref: ConnectorRef,
+    values: ConnectorRuntimeValues,
+) -> ConnectorRuntimeValues:
+    if _RUNTIME_RESOLVER is None:
+        return values
+    resolved = _RUNTIME_RESOLVER(
+        ConnectorRuntimeRequest(
+            task_id=task_id,
+            turn_id=turn_id,
+            user_id=user_id,
+            connector_ref=ref,
+            values=values,
+        )
+    )
+    return resolved if resolved is not None else values
 
 
 def _is_required(declaration: Any) -> bool:

@@ -1344,6 +1344,9 @@ async def execute_task_background(
                 user=user,
                 task_setup_snapshot=task_setup_snapshot,
                 task_owner_user_id=effective_user_id,
+                connector_runtime_turn_id=context.get("turn_id")
+                if isinstance(context.get("turn_id"), str)
+                else None,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
                 agent_service.set_outbound_message_handler(

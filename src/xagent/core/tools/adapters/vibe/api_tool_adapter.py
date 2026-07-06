@@ -11,6 +11,17 @@ from pydantic import BaseModel, Field, model_validator
 from ....utils.encryption import decrypt_value
 from ...core.api_tool import call_api
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
+from .connector_runtime import (
+    MISSING_RUNTIME_VALUE,
+    RUNTIME_INPUT_CONTEXT,
+    RUNTIME_INPUT_SECRETS,
+    TARGET_BODY_FIELD,
+    TARGET_HEADERS,
+    binding_source_value,
+    binding_target,
+    connector_runtime_from_config,
+    runtime_bindings_from_config,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +94,9 @@ class CustomApiTool(AbstractBaseTool):
         method: Optional[str] = None,
         headers: Optional[Dict[str, str]] = None,
         body: Optional[str] = None,
+        runtime_bindings: Optional[List[Dict[str, Any]]] = None,
+        connector_runtime: Optional[Dict[str, Any]] = None,
+        allow_delegated_authorization: bool = False,
         visibility: ToolVisibility = ToolVisibility.PUBLIC,
     ):
         # Format name for LLM (replace spaces/dashes with underscores)
@@ -123,6 +137,13 @@ class CustomApiTool(AbstractBaseTool):
         self._default_method = method or "GET"
         self._default_headers = headers or {}
         self._default_body = body
+        self._runtime_bindings = runtime_bindings_from_config(
+            {"runtime_bindings": runtime_bindings}
+        )
+        self._connector_runtime = connector_runtime_from_config(
+            {"connector_runtime": connector_runtime}
+        )
+        self._allow_delegated_authorization = bool(allow_delegated_authorization)
         self._env = {}
         self._env_patterns = []
         for k, v in (env or {}).items():
@@ -187,6 +208,16 @@ class CustomApiTool(AbstractBaseTool):
             merged_headers = dict(self._default_headers)
             if parsed_args.headers:
                 merged_headers.update(parsed_args.headers)
+            runtime_headers = self._runtime_headers()
+            for header_name in runtime_headers:
+                if header_name in merged_headers:
+                    logger.warning(
+                        "Runtime Custom API header binding overrides caller/static "
+                        "header %s for tool %s",
+                        header_name,
+                        self._name,
+                    )
+            merged_headers.update(runtime_headers)
             headers = self._replace_secrets(merged_headers) if merged_headers else {}
             params = (
                 self._replace_secrets(parsed_args.params) if parsed_args.params else {}
@@ -201,6 +232,7 @@ class CustomApiTool(AbstractBaseTool):
                     body = self._replace_secrets(json.loads(self._default_body))
                 except json.JSONDecodeError:
                     body = self._replace_secrets(self._default_body)
+            body = self._apply_runtime_body_fields(body)
 
             # Execute API call
             result = await call_api(
@@ -241,6 +273,78 @@ class CustomApiTool(AbstractBaseTool):
 
         return asyncio.run(self.run_json_async(args))
 
+    def _runtime_headers(self) -> Dict[str, str]:
+        headers: Dict[str, str] = {}
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_HEADERS:
+                continue
+            header_name = target.get("key")
+            if not isinstance(header_name, str) or not header_name:
+                continue
+            if (
+                header_name.lower() == "authorization"
+                and not self._allow_delegated_authorization
+            ):
+                logger.warning(
+                    "Ignoring runtime Authorization header binding for tool %s "
+                    "because delegated authorization is disabled",
+                    self._name,
+                )
+                continue
+            value = binding_source_value(
+                binding,
+                self._connector_runtime,
+                allowed_input_types={RUNTIME_INPUT_CONTEXT, RUNTIME_INPUT_SECRETS},
+            )
+            if value is MISSING_RUNTIME_VALUE:
+                continue
+            if isinstance(value, (dict, list)):
+                logger.warning(
+                    "Ignoring non-scalar runtime header binding %s for tool %s",
+                    header_name,
+                    self._name,
+                )
+                continue
+            headers[header_name] = str(value)
+        return headers
+
+    def _apply_runtime_body_fields(self, body: Any) -> Any:
+        runtime_fields = self._runtime_body_fields()
+        if not runtime_fields:
+            return body
+        if not isinstance(body, dict):
+            body = {}
+        merged_body = dict(body)
+        for path, value in runtime_fields.items():
+            if _dot_path_exists(merged_body, path):
+                logger.warning(
+                    "Runtime Custom API body binding overrides caller/static "
+                    "body field %s for tool %s",
+                    path,
+                    self._name,
+                )
+            _set_dot_path(merged_body, path, value)
+        return merged_body
+
+    def _runtime_body_fields(self) -> Dict[str, Any]:
+        fields: Dict[str, Any] = {}
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_BODY_FIELD:
+                continue
+            path = target.get("path")
+            if not isinstance(path, str) or not _is_simple_dot_path(path):
+                continue
+            value = binding_source_value(
+                binding,
+                self._connector_runtime,
+                allowed_input_types={RUNTIME_INPUT_CONTEXT},
+            )
+            if value is not MISSING_RUNTIME_VALUE:
+                fields[path] = value
+        return fields
+
     async def save_state_json(self) -> Mapping[str, Any]:
         return {}
 
@@ -272,8 +376,43 @@ def create_custom_api_tools(configs: List[Dict[str, Any]]) -> List[CustomApiTool
                 method=method,
                 headers=headers,
                 body=body,
+                runtime_bindings=config.get("runtime_bindings"),
+                connector_runtime=config.get("connector_runtime"),
+                allow_delegated_authorization=bool(
+                    config.get("allow_delegated_authorization", False)
+                ),
             )
             tools.append(tool)
         except Exception as e:
-            logger.error(f"Failed to create Custom API tool for config {config}: {e}")
+            logger.error(
+                "Failed to create Custom API tool %s: %s",
+                config.get("name", "custom_api"),
+                e,
+            )
     return tools
+
+
+def _is_simple_dot_path(path: str) -> bool:
+    return bool(re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", path))
+
+
+def _dot_path_exists(value: Mapping[str, Any], path: str) -> bool:
+    current: Any = value
+    parts = path.split(".")
+    for part in parts:
+        if not isinstance(current, Mapping) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
+def _set_dot_path(value: Dict[str, Any], path: str, field_value: Any) -> None:
+    current = value
+    parts = path.split(".")
+    for part in parts[:-1]:
+        child = current.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            current[part] = child
+        current = child
+    current[parts[-1]] = field_value

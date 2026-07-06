@@ -16,6 +16,16 @@ from .....sandbox.base import Sandbox
 from ...core.mcp.sessions import Connection, create_session
 from ...core.mcp.tools import load_mcp_tools
 from .base import AbstractBaseTool, ToolVisibility
+from .connector_runtime import (
+    MISSING_RUNTIME_VALUE,
+    RUNTIME_INPUT_CONTEXT,
+    TARGET_MCP_META,
+    TARGET_TOOL_ARGUMENTS,
+    binding_source_value,
+    binding_target,
+    connector_runtime_from_config,
+    runtime_bindings_from_config,
+)
 from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
@@ -128,6 +138,8 @@ class MCPToolAdapter(AbstractBaseTool):
             concurrency_safe=concurrency_safe,
             concurrent_tools=_normalize_concurrent_tools(concurrent_tools),
         )
+        self._runtime_bindings = runtime_bindings_from_config(connection)
+        self._connector_runtime = connector_runtime_from_config(connection)
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -201,8 +213,11 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Build field definitions for create_model
             fields: Dict[str, Any] = {}
+            runtime_bound_args = self._runtime_bound_tool_argument_names(properties)
 
             for field_name, field_schema in properties.items():
+                if field_name in runtime_bound_args:
+                    continue
                 field_type = self._json_schema_to_python_type(field_schema)
 
                 # Check if field is required
@@ -399,11 +414,28 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Validate arguments
             normalized_args = self._normalize_args_by_schema(args)
+            runtime_bound_args = self._runtime_bound_tool_argument_names(
+                self._input_schema_properties()
+            )
+            for field_name in runtime_bound_args:
+                if field_name in normalized_args:
+                    logger.warning(
+                        "Ignoring LLM-supplied runtime-bound MCP argument "
+                        "%s for tool %s",
+                        field_name,
+                        self.mcp_tool.name,
+                    )
+                    normalized_args.pop(field_name, None)
             parsed_args = self._args_type(**normalized_args)
             tool_args = parsed_args.model_dump(exclude_none=True)
+            tool_args.update(self._runtime_tool_arguments())
+            tool_meta = self._runtime_mcp_meta()
 
             logger.debug(
-                f"Executing MCP tool {self.mcp_tool.name} with args: {tool_args} for user {current_user_id}"
+                "Executing MCP tool %s with args keys: %s for user %s",
+                self.mcp_tool.name,
+                sorted(tool_args),
+                current_user_id,
             )
 
             # Set user context for execution
@@ -418,7 +450,11 @@ class MCPToolAdapter(AbstractBaseTool):
                     await session.initialize()
 
                     # Call MCP tool
-                    result = await session.call_tool(self.mcp_tool.name, tool_args)
+                    result = await session.call_tool(
+                        self.mcp_tool.name,
+                        tool_args,
+                        meta=tool_meta or None,
+                    )
 
                     # Convert result to our format
                     content = []
@@ -466,6 +502,63 @@ class MCPToolAdapter(AbstractBaseTool):
             "No user ID found in environment, MCP tool may not be properly isolated"
         )
         return None
+
+    def _input_schema_properties(self) -> dict[str, Any]:
+        schema = self.mcp_tool.inputSchema
+        if not isinstance(schema, dict):
+            return {}
+        properties = schema.get("properties")
+        return properties if isinstance(properties, dict) else {}
+
+    def _runtime_bound_tool_argument_names(
+        self, properties: Mapping[str, Any]
+    ) -> set[str]:
+        bound: set[str] = set()
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
+                continue
+            target_key = target.get("key")
+            if isinstance(target_key, str) and target_key in properties:
+                bound.add(target_key)
+        return bound
+
+    def _runtime_tool_arguments(self) -> dict[str, Any]:
+        properties = self._input_schema_properties()
+        runtime_args: dict[str, Any] = {}
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_TOOL_ARGUMENTS:
+                continue
+            target_key = target.get("key")
+            if not isinstance(target_key, str) or target_key not in properties:
+                continue
+            value = binding_source_value(
+                binding,
+                self._connector_runtime,
+                allowed_input_types={RUNTIME_INPUT_CONTEXT},
+            )
+            if value is not MISSING_RUNTIME_VALUE:
+                runtime_args[target_key] = value
+        return runtime_args
+
+    def _runtime_mcp_meta(self) -> dict[str, Any]:
+        meta: dict[str, Any] = {}
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_MCP_META:
+                continue
+            target_key = target.get("key")
+            if not isinstance(target_key, str) or not target_key:
+                continue
+            value = binding_source_value(
+                binding,
+                self._connector_runtime,
+                allowed_input_types={RUNTIME_INPUT_CONTEXT},
+            )
+            if value is not MISSING_RUNTIME_VALUE:
+                meta[target_key] = value
+        return meta
 
     def _is_user_allowed(self, user_id: Optional[str]) -> bool:
         """Check if user is allowed to use this tool."""

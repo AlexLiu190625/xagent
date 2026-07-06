@@ -1,4 +1,7 @@
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
+
+import pytest
 
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPToolAdapter,
@@ -241,3 +244,73 @@ def test_build_args_model_handles_multi_value_type_list():
 
     assert args_model(value="abc").value == "abc"
     assert args_model(value=123).value == 123
+
+
+@pytest.mark.asyncio
+async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
+    monkeypatch,
+):
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "account_id": {"type": "string"},
+            },
+            "required": ["query", "account_id"],
+        },
+    )
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "runtime_bindings": [
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "tool_arguments", "key": "account_id"},
+            },
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "mcp_meta", "key": "account_id"},
+            },
+        ],
+        "connector_runtime": {
+            "context": {"account_id": "6185"},
+            "secrets": {},
+            "auth_selector": {},
+        },
+    }
+    adapter = MCPToolAdapter(mcp_tool=mcp_tool, connection=connection)
+    captured = {}
+
+    class _FakeSession:
+        async def initialize(self):
+            return None
+
+        async def call_tool(self, name, arguments, **kwargs):
+            captured["name"] = name
+            captured["arguments"] = arguments
+            captured["kwargs"] = kwargs
+            return SimpleNamespace(content=[], isError=False)
+
+    @asynccontextmanager
+    async def _fake_create_session(_connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+
+    args_model = adapter.args_type()
+    assert "account_id" not in args_model.model_fields
+
+    result = await adapter.run_json_async(
+        {"query": "active", "account_id": "llm-supplied"}
+    )
+
+    assert result["is_error"] is False
+    assert captured["name"] == "list_clients"
+    assert captured["arguments"] == {"query": "active", "account_id": "6185"}
+    assert captured["kwargs"]["meta"] == {"account_id": "6185"}

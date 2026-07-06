@@ -448,6 +448,7 @@ async def create_default_tools(
     parent_task_id: Optional[str] = None,
     parent_tracer: Optional[Any] = None,
     agent_call_stack: Optional[List[int]] = None,
+    connector_runtime_turn_id: Optional[str] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -506,6 +507,7 @@ async def create_default_tools(
         parent_task_id=parent_task_id,
         parent_tracer=parent_tracer,
         agent_call_stack=agent_call_stack,
+        connector_runtime_turn_id=connector_runtime_turn_id,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -1226,6 +1228,7 @@ class AgentServiceManager:
             agent_call_stack=workforce_runtime.agent_call_stack
             if workforce_runtime
             else None,
+            connector_runtime_turn_id=None,
         )
 
     async def get_agent_for_task(
@@ -1235,6 +1238,7 @@ class AgentServiceManager:
         user: Optional[User] = None,
         task_setup_snapshot: Optional[TaskSetupSnapshot] = None,
         task_owner_user_id: Optional[int] = None,
+        connector_runtime_turn_id: Optional[str] = None,
     ) -> AgentService:
         """Get or create AgentService instance for specific task.
 
@@ -1687,6 +1691,7 @@ class AgentServiceManager:
                     agent_call_stack=workforce_runtime.agent_call_stack
                     if workforce_runtime
                     else None,
+                    connector_runtime_turn_id=connector_runtime_turn_id,
                 )
 
                 with UserContext(runtime_user_id):

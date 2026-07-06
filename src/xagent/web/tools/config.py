@@ -15,6 +15,16 @@ import httpx
 
 from ...config import get_uploads_dir
 from ...core.tools.adapters.vibe.config import BaseToolConfig
+from ...core.tools.adapters.vibe.connector_runtime import (
+    MISSING_RUNTIME_VALUE,
+    RUNTIME_INPUT_AUTH_SELECTOR,
+    RUNTIME_INPUT_SECRETS,
+    TARGET_TRANSPORT_HEADERS,
+    ConnectorRuntimeError,
+    binding_source_value,
+    binding_target,
+    runtime_bindings_from_config,
+)
 from ..services.tool_credentials import (
     get_sql_connection_map,
     get_user_tool_overrides,
@@ -179,6 +189,7 @@ class WebToolConfig(BaseToolConfig):
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
         mcp_auth_context: Optional[Dict[str, Any]] = None,
+        connector_runtime_turn_id: Optional[str] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -227,6 +238,13 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_auth_context = (
             mcp_auth_context if isinstance(mcp_auth_context, dict) else {}
         )
+        if connector_runtime_turn_id is None:
+            raw_turn_id = workspace_config.get("turn_id")
+            connector_runtime_turn_id = (
+                raw_turn_id if isinstance(raw_turn_id, str) else None
+            )
+        self._connector_runtime_turn_id = connector_runtime_turn_id
+        self._connector_runtime_view: Optional[Dict[str, Any]] = None
         self._mcp_oauth_diagnostics: List[Dict[str, Any]] = []
         self._explicit_vision_model = vision_model
         self._explicit_llm = llm
@@ -392,6 +410,105 @@ class WebToolConfig(BaseToolConfig):
     def get_mcp_oauth_diagnostics(self) -> List[Dict[str, Any]]:
         """Return structured MCP OAuth runtime diagnostics from the last load."""
         return list(self._mcp_oauth_diagnostics)
+
+    def _get_connector_runtime_for(
+        self, connector_type: str, connector_id: int
+    ) -> Optional[Dict[str, Any]]:
+        view = self._load_connector_runtime_view()
+        value = view.get(f"{connector_type}:{connector_id}")
+        return dict(value) if isinstance(value, dict) else None
+
+    def _load_connector_runtime_view(self) -> Dict[str, Any]:
+        if self._connector_runtime_view is not None:
+            return self._connector_runtime_view
+        self._connector_runtime_view = {}
+        task_id = self._parse_numeric_task_id()
+        if task_id is None or self._user_id is None:
+            return self._connector_runtime_view
+        try:
+            from ..services.connector_runtime import load_connector_runtime_view
+
+            self._connector_runtime_view = load_connector_runtime_view(
+                db=self.db,
+                task_id=task_id,
+                turn_id=self._connector_runtime_turn_id,
+                user_id=int(self._user_id),
+            )
+        except ConnectorRuntimeError:
+            raise
+        except Exception:
+            logging.getLogger(__name__).warning(
+                "Failed to resolve connector runtime view for task %s",
+                self._task_id,
+                exc_info=True,
+            )
+            self._connector_runtime_view = {}
+        return self._connector_runtime_view
+
+    def _parse_numeric_task_id(self) -> Optional[int]:
+        task_id = self._task_id
+        if not isinstance(task_id, str) or not task_id:
+            return None
+        if task_id.startswith("web_task_"):
+            task_id = task_id.removeprefix("web_task_")
+        try:
+            return int(task_id)
+        except (TypeError, ValueError):
+            return None
+
+    def _runtime_transport_headers(
+        self,
+        *,
+        runtime_values: Optional[Dict[str, Any]],
+        runtime_bindings: Any,
+        allow_delegated_authorization: bool,
+    ) -> Dict[str, str]:
+        if not isinstance(runtime_values, dict):
+            return {}
+        headers: Dict[str, str] = {}
+        for binding in runtime_bindings_from_config(
+            {"runtime_bindings": runtime_bindings}
+        ):
+            target = binding_target(binding)
+            if target.get("target_type") != TARGET_TRANSPORT_HEADERS:
+                continue
+            header_name = target.get("key")
+            if not isinstance(header_name, str) or not header_name:
+                continue
+            if (
+                header_name.lower() == "authorization"
+                and not allow_delegated_authorization
+            ):
+                logger.warning(
+                    "Ignoring runtime MCP Authorization header binding because "
+                    "delegated authorization is disabled"
+                )
+                continue
+            value = binding_source_value(
+                binding,
+                runtime_values,
+                allowed_input_types={RUNTIME_INPUT_SECRETS},
+            )
+            if value is MISSING_RUNTIME_VALUE or isinstance(value, (dict, list)):
+                continue
+            headers[header_name] = str(value)
+        return headers
+
+    def _mcp_auth_context_for_server(
+        self,
+        *,
+        server_id: int,
+        runtime_values: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        context = dict(self._mcp_auth_context)
+        auth_selector = (
+            runtime_values.get(RUNTIME_INPUT_AUTH_SELECTOR)
+            if isinstance(runtime_values, dict)
+            else None
+        )
+        if isinstance(auth_selector, dict) and auth_selector:
+            context[str(server_id)] = dict(auth_selector)
+        return context
 
     def get_embedding_model(self) -> Optional[str]:
         """Load default embedding model ID from database."""
@@ -755,11 +872,31 @@ class WebToolConfig(BaseToolConfig):
 
             for server in servers:
                 # Build config dict from server model
+                runtime_bindings = getattr(server, "runtime_bindings", None)
+                allow_delegated_authorization = bool(
+                    getattr(server, "allow_delegated_authorization", False)
+                )
+                runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
                 config: Dict[str, Any] = {
+                    "id": int(server.id),
                     "name": server.name,
                     "transport": server.transport,
                     "description": server.description,
+                    "runtime_input_schema": getattr(
+                        server, "runtime_input_schema", None
+                    ),
+                    "runtime_bindings": runtime_bindings,
+                    "allow_delegated_authorization": allow_delegated_authorization,
                 }
+                if runtime_values:
+                    context_values = runtime_values.get("context")
+                    config["connector_runtime"] = {
+                        "context": context_values
+                        if isinstance(context_values, dict)
+                        else {},
+                        "secrets": {},
+                        "auth_selector": {},
+                    }
 
                 # Add transport-specific configuration
                 transport_config: Dict[str, Any] = {}
@@ -910,21 +1047,46 @@ class WebToolConfig(BaseToolConfig):
                     from ...web.services.mcp_runtime import (
                         build_mcp_runtime_connection,
                         connection_to_transport_config,
+                        headers_without_authorization,
                     )
 
-                    runtime_build = await build_mcp_runtime_connection(
-                        self.db,
-                        server,
-                        user_id=self._user_id,
-                        mcp_auth_context=self._mcp_auth_context,
+                    delegated_headers = self._runtime_transport_headers(
+                        runtime_values=runtime_values,
+                        runtime_bindings=runtime_bindings,
+                        allow_delegated_authorization=allow_delegated_authorization,
                     )
-                    if runtime_build.connection is None:
-                        if runtime_build.diagnostic is not None:
-                            self._mcp_oauth_diagnostics.append(runtime_build.diagnostic)
-                        continue
-                    transport_config.update(
-                        connection_to_transport_config(runtime_build.connection)
-                    )
+                    if delegated_headers:
+                        connection = server.to_connection_dict()
+                        headers = headers_without_authorization(
+                            connection.get("headers")
+                            if isinstance(connection.get("headers"), dict)
+                            else None
+                        )
+                        headers.update(delegated_headers)
+                        connection["headers"] = headers
+                        connection.pop("auth", None)
+                        transport_config.update(
+                            connection_to_transport_config(connection)
+                        )
+                    else:
+                        runtime_build = await build_mcp_runtime_connection(
+                            self.db,
+                            server,
+                            user_id=self._user_id,
+                            mcp_auth_context=self._mcp_auth_context_for_server(
+                                server_id=int(server.id),
+                                runtime_values=runtime_values,
+                            ),
+                        )
+                        if runtime_build.connection is None:
+                            if runtime_build.diagnostic is not None:
+                                self._mcp_oauth_diagnostics.append(
+                                    runtime_build.diagnostic
+                                )
+                            continue
+                        transport_config.update(
+                            connection_to_transport_config(runtime_build.connection)
+                        )
 
                 transport_config["concurrency_safe"] = bool(
                     getattr(server, "concurrency_safe", False)
@@ -967,6 +1129,8 @@ class WebToolConfig(BaseToolConfig):
                     f"Loaded MCP server config: {server.name} ({server.transport})"
                 )
 
+        except ConnectorRuntimeError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
 
@@ -999,6 +1163,7 @@ class WebToolConfig(BaseToolConfig):
                 if api:
                     custom_api_configs.append(
                         {
+                            "id": int(api.id),
                             "name": api.name,
                             "description": api.description or "",
                             "url": api.url,
@@ -1006,10 +1171,22 @@ class WebToolConfig(BaseToolConfig):
                             "headers": api.headers or {},
                             "body": api.body,
                             "env": api.env or {},
+                            "runtime_input_schema": getattr(
+                                api, "runtime_input_schema", None
+                            ),
+                            "runtime_bindings": getattr(api, "runtime_bindings", None),
+                            "allow_delegated_authorization": bool(
+                                getattr(api, "allow_delegated_authorization", False)
+                            ),
+                            "connector_runtime": self._get_connector_runtime_for(
+                                "custom_api", int(api.id)
+                            ),
                         }
                     )
             return custom_api_configs
 
+        except ConnectorRuntimeError:
+            raise
         except Exception as e:
             logger.error(
                 f"Failed to get Custom API configs from database: {e}", exc_info=True

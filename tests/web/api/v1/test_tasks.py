@@ -15,10 +15,12 @@ drive the mapping.
 """
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.models.agent import Agent
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import (
@@ -27,10 +29,17 @@ from xagent.web.models.task import (
     TaskStatus,
     TraceEvent,
 )
+from xagent.web.services.connector_runtime import (
+    ConnectorRuntimeValues,
+    load_connector_runtime_view,
+    pop_ephemeral_runtime_values,
+    set_connector_runtime_resolver_for_testing,
+)
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
     set_cache_backend_for_testing,
 )
+from xagent.web.tools.config import WebToolConfig
 
 from ..conftest import _admin_headers, _direct_db_session, client
 
@@ -76,36 +85,71 @@ def _install_runtime_mcp_connector(
     *,
     selected: bool = True,
     required: bool = True,
+    auth_selector_required: bool = False,
+    secret_required: bool = False,
+    delegated_authorization_binding: bool = False,
 ) -> int:
     db = _direct_db_session()
     try:
         agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        runtime_input_schema = {
+            "context": {
+                "account_id": {
+                    "type": "string",
+                    "required": required,
+                }
+            }
+        }
+        if auth_selector_required:
+            runtime_input_schema["auth_selector"] = {
+                "resource_owner_key": {
+                    "type": "string",
+                    "required": True,
+                }
+            }
+        if secret_required:
+            runtime_input_schema["secrets"] = {
+                "authorization": {
+                    "type": "string",
+                    "required": True,
+                }
+            }
+
+        runtime_bindings = [
+            {
+                "source": {
+                    "input_type": "context",
+                    "key": "account_id",
+                },
+                "target": {
+                    "target_type": "mcp_meta",
+                    "key": "account_id",
+                },
+            }
+        ]
+        if delegated_authorization_binding:
+            runtime_bindings.append(
+                {
+                    "source": {
+                        "input_type": "secrets",
+                        "key": "authorization",
+                    },
+                    "target": {
+                        "target_type": "transport_headers",
+                        "key": "Authorization",
+                    },
+                }
+            )
+
         server = MCPServer(
             name="ShiftCare",
             description="ShiftCare MCP",
             managed="external",
             transport="streamable_http",
             url="https://mcp.shiftcare.test",
-            runtime_input_schema={
-                "context": {
-                    "account_id": {
-                        "type": "string",
-                        "required": required,
-                    }
-                }
-            },
-            runtime_bindings=[
-                {
-                    "source": {
-                        "input_type": "context",
-                        "key": "account_id",
-                    },
-                    "target": {
-                        "target_type": "mcp_meta",
-                        "key": "account_id",
-                    },
-                }
-            ],
+            runtime_input_schema=runtime_input_schema,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=delegated_authorization_binding,
         )
         db.add(server)
         db.flush()
@@ -312,6 +356,240 @@ def test_create_task_rejects_missing_required_runtime_context(mock_start_task):
     assert resp.status_code == 400
     assert resp.json()["error"]["code"] == "missing_runtime_context"
     assert mock_start_task.call_count == 0
+
+
+def test_create_task_rejects_missing_required_auth_selector(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, auth_selector_required=True
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    }
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
+    assert resp.json()["error"]["details"]["reason"] == "not_provided"
+    assert mock_start_task.call_count == 0
+
+
+def test_connector_runtime_view_loads_task_context(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        view = load_connector_runtime_view(
+            db=db,
+            task_id=task_id,
+            turn_id=turn_id,
+            user_id=int(task.user_id),
+        )
+    finally:
+        db.close()
+
+    assert view == {
+        f"mcp:{server_id}": {
+            "context": {"account_id": "6185"},
+            "secrets": {},
+            "auth_selector": {},
+        }
+    }
+
+
+def test_connector_runtime_view_reports_store_lost_for_missing_ephemeral(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer tenant-token"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    pop_ephemeral_runtime_values(turn_id)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        with pytest.raises(Exception) as exc_info:
+            load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+    finally:
+        db.close()
+
+    assert getattr(exc_info.value, "code", None) == "runtime_secret_unavailable"
+    assert getattr(exc_info.value, "details", {}).get("reason") == "store_lost"
+
+
+def test_connector_runtime_resolver_can_override_values(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id)
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+
+        def _resolver(_request):
+            return ConnectorRuntimeValues(
+                context={"account_id": "hooked"},
+                secrets={},
+                auth_selector={},
+            )
+
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert view[f"mcp:{server_id}"]["context"] == {"account_id": "hooked"}
+
+
+@pytest.mark.asyncio
+async def test_web_tool_config_applies_runtime_mcp_authorization_header(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        required=False,
+        secret_required=True,
+        delegated_authorization_binding=True,
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer tenant-token"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        tool_config = WebToolConfig(
+            db=db,
+            request=None,
+            user=SimpleNamespace(id=int(task.user_id), is_admin=False),
+            user_id=int(task.user_id),
+            is_admin=False,
+            task_id=f"web_task_{task_id}",
+            include_mcp_tools=True,
+            tool_selection_spec=ToolSelectionSpec.from_raw(
+                tool_categories=["mcp:ShiftCare"]
+            ),
+            connector_runtime_turn_id=turn_id,
+        )
+
+        configs = await tool_config.get_mcp_server_configs()
+    finally:
+        db.close()
+
+    assert len(configs) == 1
+    assert configs[0]["id"] == server_id
+    assert configs[0]["config"]["headers"]["Authorization"] == "Bearer tenant-token"
+    assert configs[0]["connector_runtime"]["secrets"] == {}
 
 
 def test_create_task_missing_authorization_returns_401(mock_start_task):
