@@ -112,6 +112,27 @@ class FakeSearchTool:
         }
 
 
+class FakeTraceSanitizingTool:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, Any]] = []
+
+        class Metadata:
+            name = "custom_api"
+            description = "Call a custom API."
+
+        self.metadata = Metadata()
+
+    def args_type(self) -> type[BaseModel]:
+        return BaseModel
+
+    def sanitize_tool_args_for_trace(self, args: dict[str, Any]) -> dict[str, Any]:
+        return {key: value for key, value in args.items() if key != "headers"}
+
+    async def run_json_async(self, args: dict[str, Any]) -> Any:
+        self.calls.append(args)
+        return {"success": True, "args": args}
+
+
 class FakeGroupedTool:
     def __init__(self, name: str, category: str) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -828,6 +849,41 @@ async def test_react_passes_runtime_step_to_browser_tool_call() -> None:
             "_xagent_step_id": "render_english_poster",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_react_sanitizes_tool_args_before_trace_and_execution() -> None:
+    class CapturingRuntime(PatternRuntime):
+        def __init__(self) -> None:
+            super().__init__()
+            self.started_args: dict[str, Any] | None = None
+
+        async def on_tool_start(self, *, tool_call: dict[str, Any]) -> None:
+            self.started_args = dict(tool_call.get("args") or {})
+
+    pattern = ReActPattern()
+    runtime = CapturingRuntime()
+    tool = FakeTraceSanitizingTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-custom-api",
+            "name": "custom_api",
+            "args": {
+                "headers": {"Authorization": "Bearer caller-token"},
+                "params": {"q": "client"},
+            },
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is True
+    assert runtime.started_args == {"params": {"q": "client"}}
+    assert tool.calls == [{"params": {"q": "client"}}]
+    record = pattern.tool_ledger["call-custom-api"]
+    assert record.args == {"params": {"q": "client"}}
+    assert "caller-token" not in repr(record.to_dict())
 
 
 @pytest.mark.asyncio

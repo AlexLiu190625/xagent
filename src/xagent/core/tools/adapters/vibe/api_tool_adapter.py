@@ -27,8 +27,8 @@ from .connector_runtime import (
 logger = logging.getLogger(__name__)
 
 
-class CustomApiToolArgs(BaseModel):
-    """Arguments for Custom API Tool."""
+class _CustomApiToolArgsBase(BaseModel):
+    """Shared arguments for Custom API tools."""
 
     url: Optional[str] = Field(
         default=None,
@@ -38,16 +38,8 @@ class CustomApiToolArgs(BaseModel):
         default=None,
         description="HTTP method (GET, POST, PUT, DELETE, etc.). Omit this to use the Custom API configured method.",
     )
-    headers: Optional[Dict[str, str]] = Field(
-        default=None,
-        description="HTTP headers. You can use variables like $SECRET_KEY in the header values.",
-    )
     params: Optional[Dict[str, Any]] = Field(
         default=None, description="Query parameters."
-    )
-    body: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="JSON body for the request. You can use variables like $SECRET_KEY in string values.",
     )
 
     @model_validator(mode="before")
@@ -62,6 +54,45 @@ class CustomApiToolArgs(BaseModel):
                     except json.JSONDecodeError:
                         pass
         return data
+
+
+class CustomApiToolArgs(_CustomApiToolArgsBase):
+    """Arguments for Custom API Tool."""
+
+    headers: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="HTTP headers. You can use variables like $SECRET_KEY in the header values.",
+    )
+    body: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="JSON body for the request. You can use variables like $SECRET_KEY in string values.",
+    )
+
+
+class _CustomApiToolArgsWithoutHeaders(_CustomApiToolArgsBase):
+    body: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="JSON body for the request. You can use variables like $SECRET_KEY in string values.",
+    )
+
+
+class _CustomApiToolArgsWithoutBody(_CustomApiToolArgsBase):
+    headers: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="HTTP headers. You can use variables like $SECRET_KEY in the header values.",
+    )
+
+
+class _CustomApiToolArgsWithoutHeadersAndBody(_CustomApiToolArgsBase):
+    pass
+
+
+_CUSTOM_API_ARGS_BY_RUNTIME_VISIBILITY: dict[tuple[bool, bool], Type[BaseModel]] = {
+    (False, False): CustomApiToolArgs,
+    (True, False): _CustomApiToolArgsWithoutHeaders,
+    (False, True): _CustomApiToolArgsWithoutBody,
+    (True, True): _CustomApiToolArgsWithoutHeadersAndBody,
+}
 
 
 class CustomApiToolResult(BaseModel):
@@ -168,7 +199,8 @@ class CustomApiTool(AbstractBaseTool):
         return ["api", "custom", "http"]
 
     def args_type(self) -> Type[BaseModel]:
-        return CustomApiToolArgs
+        hidden_headers, hidden_body = self._runtime_hidden_arg_fields()
+        return _CUSTOM_API_ARGS_BY_RUNTIME_VISIBILITY[(hidden_headers, hidden_body)]
 
     def return_type(self) -> Type[BaseModel]:
         return CustomApiToolResult
@@ -190,6 +222,37 @@ class CustomApiTool(AbstractBaseTool):
         elif isinstance(value, list):
             return [self._replace_secrets(v) for v in value]
         return value
+
+    def _runtime_hidden_arg_fields(self) -> tuple[bool, bool]:
+        hidden_headers = False
+        hidden_body = False
+        for binding in self._runtime_bindings:
+            target = binding_target(binding)
+            target_type = target.get("target_type")
+            if target_type == TARGET_HEADERS:
+                hidden_headers = True
+            elif target_type == TARGET_BODY_FIELD:
+                hidden_body = True
+        return hidden_headers, hidden_body
+
+    def sanitize_tool_args_for_trace(self, args: Mapping[str, Any]) -> Dict[str, Any]:
+        sanitized = dict(args)
+        hidden_headers, hidden_body = self._runtime_hidden_arg_fields()
+        if hidden_headers and "headers" in sanitized:
+            logger.warning(
+                "Runtime Custom API header binding ignores caller-supplied "
+                "headers for tool %s",
+                self._name,
+            )
+            sanitized.pop("headers", None)
+        if hidden_body and "body" in sanitized:
+            logger.warning(
+                "Runtime Custom API body binding ignores caller-supplied body "
+                "for tool %s",
+                self._name,
+            )
+            sanitized.pop("body", None)
+        return sanitized
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         try:

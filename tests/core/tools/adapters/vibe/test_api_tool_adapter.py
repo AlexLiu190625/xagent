@@ -241,6 +241,68 @@ async def test_run_json_async_applies_runtime_headers_and_body_fields():
         )
 
 
+def test_runtime_bindings_hide_custom_api_headers_and_body_from_llm_schema():
+    tool = CustomApiTool(
+        name="ShiftCare",
+        description="test",
+        env={},
+        url="https://api.example.com/clients",
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account"},
+            },
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {
+                    "target_type": "body_field",
+                    "path": "scope.account_id",
+                },
+            },
+        ],
+    )
+
+    fields = tool.args_type().model_fields
+
+    assert "headers" not in fields
+    assert "body" not in fields
+    assert "url" in fields
+    assert "method" in fields
+    assert "params" in fields
+
+
+def test_runtime_bindings_sanitize_custom_api_trace_args_before_execution():
+    tool = CustomApiTool(
+        name="ShiftCare",
+        description="test",
+        env={},
+        url="https://api.example.com/clients",
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account"},
+            },
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {
+                    "target_type": "body_field",
+                    "path": "scope.account_id",
+                },
+            },
+        ],
+    )
+
+    sanitized = tool.sanitize_tool_args_for_trace(
+        {
+            "headers": {"X-Account": "llm"},
+            "body": {"scope": {"account_id": "llm"}},
+            "params": {"q": "client"},
+        }
+    )
+
+    assert sanitized == {"params": {"q": "client"}}
+
+
 @pytest.mark.asyncio
 async def test_run_json_async_requires_flag_for_runtime_authorization_header():
     with patch(

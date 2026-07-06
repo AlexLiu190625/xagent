@@ -296,6 +296,49 @@ async def test_update_custom_api():
 
 
 @pytest.mark.asyncio
+async def test_update_custom_api_explicit_null_clears_runtime_config():
+    db = MagicMock(spec=Session)
+    user = User(id=1)
+
+    mock_api = CustomApi(
+        id=10,
+        name="old_name",
+        runtime_input_schema={"context": {"account_id": {"type": "string"}}},
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+        allow_delegated_authorization=True,
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    mock_user_api = UserCustomApi(
+        user_id=1,
+        custom_api_id=10,
+        can_edit=True,
+        is_active=True,
+        is_default=False,
+        custom_api=mock_api,
+    )
+    db.query().filter().first.return_value = mock_user_api
+
+    api_data = CustomApiUpdate(
+        runtime_input_schema=None,
+        runtime_bindings=None,
+        allow_delegated_authorization=False,
+    )
+
+    await update_custom_api(10, api_data, current_user=user, db=db)
+
+    assert mock_api.runtime_input_schema is None
+    assert mock_api.runtime_bindings is None
+    assert mock_api.allow_delegated_authorization is False
+    db.commit.assert_called()
+
+
+@pytest.mark.asyncio
 async def test_delete_custom_api():
     db = MagicMock(spec=Session)
     user = User(id=1)

@@ -80,6 +80,15 @@ def _delegated_authorization_failed_result() -> dict[str, Any]:
     }
 
 
+def _delegated_retry_failed_result() -> dict[str, Any]:
+    return {
+        "content": [
+            {"text": ("Error executing MCP tool after delegated authorization retry.")}
+        ],
+        "is_error": True,
+    }
+
+
 def _normalize_concurrent_tools(value: Any) -> list[str]:
     """Normalize raw MCP tool-name allowlists from server config."""
     if value is None:
@@ -562,18 +571,21 @@ class MCPToolAdapter(AbstractBaseTool):
         except BaseExceptionGroup as retry_exc:
             if _exception_indicates_http_401(retry_exc):
                 return _delegated_authorization_failed_result()
-            error_msg = _format_exception_group_messages(retry_exc)
-            return {
-                "content": [{"text": f"Error executing MCP tool: {error_msg}"}],
-                "is_error": True,
-            }
+            logger.error(
+                "MCP tool %s delegated authorization retry failed with %s",
+                self.mcp_tool.name,
+                type(retry_exc).__name__,
+            )
+            return _delegated_retry_failed_result()
         except Exception as retry_exc:
             if _exception_indicates_http_401(retry_exc):
                 return _delegated_authorization_failed_result()
-            return {
-                "content": [{"text": f"Error executing MCP tool: {retry_exc}"}],
-                "is_error": True,
-            }
+            logger.error(
+                "MCP tool %s delegated authorization retry failed with %s",
+                self.mcp_tool.name,
+                type(retry_exc).__name__,
+            )
+            return _delegated_retry_failed_result()
 
     def _get_current_user_id(self) -> Optional[str]:
         """Get current user ID from environment or context."""

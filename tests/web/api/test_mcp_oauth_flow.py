@@ -387,6 +387,39 @@ def test_update_mcp_server_persists_runtime_config(db_session):
     assert server.allow_delegated_authorization is True
 
 
+def test_update_mcp_server_explicit_null_clears_runtime_config(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    server.runtime_input_schema = {"context": {"account_id": {"type": "string"}}}
+    server.runtime_bindings = [
+        {
+            "source": {"input_type": "context", "key": "account_id"},
+            "target": {"target_type": "mcp_meta", "key": "account_id"},
+        }
+    ]
+    server.allow_delegated_authorization = True
+    db.commit()
+
+    response = update_mcp_server(
+        server.id,
+        MCPServerUpdate(
+            runtime_input_schema=None,
+            runtime_bindings=None,
+            allow_delegated_authorization=False,
+        ),
+        user,
+        db,
+    )
+
+    assert response.runtime_input_schema is None
+    assert response.runtime_bindings is None
+    assert response.allow_delegated_authorization is False
+    db.refresh(server)
+    assert server.runtime_input_schema is None
+    assert server.runtime_bindings is None
+    assert server.allow_delegated_authorization is False
+
+
 @pytest.mark.asyncio
 async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch):
     db, user, _ = db_session

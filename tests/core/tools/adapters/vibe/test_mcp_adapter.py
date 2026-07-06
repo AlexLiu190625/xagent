@@ -424,3 +424,65 @@ async def test_delegated_authorization_401_after_refresh_returns_safe_error(
     assert result["is_error"] is True
     assert "delegated_authorization_failed" in result["content"][0]["text"]
     assert "expired-token" not in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_delegated_authorization_retry_failure_does_not_leak_token(
+    monkeypatch,
+    caplog,
+):
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+
+    def _refresh_connection():
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "headers": {"Authorization": "Bearer fresh-runtime-token"},
+        }
+
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "headers": {"Authorization": "Bearer expired-token"},
+        "_connector_runtime_refresh": _refresh_connection,
+    }
+    adapter = MCPToolAdapter(mcp_tool=mcp_tool, connection=connection)
+    calls = 0
+
+    class _FakeSession:
+        def __init__(self, connection):
+            self._connection = connection
+
+        async def initialize(self):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("HTTP 401 Unauthorized")
+            raise RuntimeError(
+                f"transport failed with {self._connection['headers']['Authorization']}"
+            )
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession(connection)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert calls == 2
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == (
+        "Error executing MCP tool after delegated authorization retry."
+    )
+    public_output = repr(result) + caplog.text
+    assert "fresh-runtime-token" not in public_output
+    assert "expired-token" not in public_output

@@ -1941,6 +1941,7 @@ class ReActPattern(AgentPattern):
             tool_call["id"] = f"tool_call_{len(self.tool_ledger)}"
         tool_call = self._with_tool_call_content(tool_call)
         tool_call = self._with_runtime_step(tool_call, runtime)
+        tool_call = self._with_trace_safe_tool_args(tool_call, tools)
         self._record_tool_call(tool_call, status="running")
         recorded_terminal = False
         try:
@@ -1999,6 +2000,24 @@ class ReActPattern(AgentPattern):
                     status="failed",
                     error="tool execution aborted before completion",
                 )
+
+    def _with_trace_safe_tool_args(
+        self, tool_call: dict[str, Any], tools: list[Any]
+    ) -> dict[str, Any]:
+        try:
+            tool = self._find_tool(tool_call["name"], tools)
+        except Exception:  # noqa: BLE001
+            return tool_call
+
+        sanitizer = getattr(tool, "sanitize_tool_args_for_trace", None)
+        if not callable(sanitizer):
+            return tool_call
+
+        args = dict(tool_call.get("args", {}))
+        sanitized = sanitizer(args)
+        if not isinstance(sanitized, dict) or sanitized == args:
+            return tool_call
+        return {**tool_call, "args": sanitized}
 
     def _with_runtime_step(
         self, tool_call: dict[str, Any], runtime: PatternRuntime
