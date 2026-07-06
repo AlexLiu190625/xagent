@@ -93,15 +93,24 @@ ConnectorRuntimeResolver = Callable[
 
 
 _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
+_EPHEMERAL_RUNTIME_MANIFESTS: dict[str, dict[str, dict[str, set[str]]]] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
 _RUNTIME_RESOLVER: ConnectorRuntimeResolver | None = None
+
+
+def set_connector_runtime_resolver(
+    resolver: ConnectorRuntimeResolver | None,
+) -> None:
+    """Install the server-side hook that can supply runtime values."""
+
+    global _RUNTIME_RESOLVER
+    _RUNTIME_RESOLVER = resolver
 
 
 def set_connector_runtime_resolver_for_testing(
     resolver: ConnectorRuntimeResolver | None,
 ) -> None:
-    global _RUNTIME_RESOLVER
-    _RUNTIME_RESOLVER = resolver
+    set_connector_runtime_resolver(resolver)
 
 
 def store_ephemeral_runtime_values(
@@ -117,19 +126,54 @@ def store_ephemeral_runtime_values(
         }
         for ref, sections in values_by_ref.items()
     }
+    manifest = {
+        ref.storage_key: {
+            section: set(values)
+            for section, values in sections.items()
+            if isinstance(values, dict) and values
+        }
+        for ref, sections in values_by_ref.items()
+    }
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
         _EPHEMERAL_RUNTIME_VALUES[turn_id] = encoded
+        _EPHEMERAL_RUNTIME_MANIFESTS[turn_id] = manifest
 
 
 def pop_ephemeral_runtime_values(turn_id: str) -> dict[str, Any] | None:
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        _EPHEMERAL_RUNTIME_MANIFESTS.pop(turn_id, None)
         return _EPHEMERAL_RUNTIME_VALUES.pop(turn_id, None)
+
+
+def drop_ephemeral_runtime_values_for_testing(turn_id: str) -> None:
+    """Simulate losing the secret values while keeping safe provenance."""
+
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        _EPHEMERAL_RUNTIME_VALUES.pop(turn_id, None)
 
 
 def get_ephemeral_runtime_values(turn_id: str) -> dict[str, Any] | None:
     with _EPHEMERAL_RUNTIME_VALUES_LOCK:
         values = _EPHEMERAL_RUNTIME_VALUES.get(turn_id)
         return dict(values) if isinstance(values, dict) else None
+
+
+def get_ephemeral_runtime_manifest(
+    turn_id: str,
+) -> dict[str, dict[str, set[str]]] | None:
+    with _EPHEMERAL_RUNTIME_VALUES_LOCK:
+        manifest = _EPHEMERAL_RUNTIME_MANIFESTS.get(turn_id)
+        if not isinstance(manifest, dict):
+            return None
+        return {
+            ref_key: {
+                section: set(keys)
+                for section, keys in sections.items()
+                if isinstance(keys, set)
+            }
+            for ref_key, sections in manifest.items()
+            if isinstance(sections, dict)
+        }
 
 
 def load_connector_runtime_view(
@@ -152,6 +196,9 @@ def load_connector_runtime_view(
     persisted_context = _load_task_context_rows(db, task_id=task_id)
     ephemeral_by_ref = (
         get_ephemeral_runtime_values(turn_id) if isinstance(turn_id, str) else None
+    )
+    ephemeral_manifest = (
+        get_ephemeral_runtime_manifest(turn_id) if isinstance(turn_id, str) else None
     )
     visible = (
         _load_visible_runtime_connectors(db, user_id=user_id)
@@ -190,7 +237,9 @@ def load_connector_runtime_view(
             values=values,
         )
         _require_context_values(ref, connector, values.context)
-        _require_ephemeral_values_at_binding(ref, connector, values)
+        _require_ephemeral_values_at_binding(
+            ref, connector, values, ephemeral_manifest=ephemeral_manifest
+        )
         runtime_view[ref.storage_key] = values.to_runtime_config()
 
     return runtime_view
@@ -218,7 +267,8 @@ def prepare_create_connector_runtime(
         auth_selector = dict(payload.auth_selector) if payload is not None else {}
         _validate_values_against_schema(ref, connector, context, secrets, auth_selector)
         _require_context_values(ref, connector, context)
-        _require_ephemeral_values(ref, connector, secrets, auth_selector)
+        if _RUNTIME_RESOLVER is None:
+            _require_ephemeral_values(ref, connector, secrets, auth_selector)
         if context:
             context_by_ref[ref] = context
         if secrets or auth_selector:
@@ -272,7 +322,8 @@ def prepare_append_connector_runtime(
         secrets = dict(payload.secrets) if payload is not None else {}
         auth_selector = dict(payload.auth_selector) if payload is not None else {}
         _validate_values_against_schema(ref, connector, context, secrets, auth_selector)
-        _require_ephemeral_values(ref, connector, secrets, auth_selector)
+        if _RUNTIME_RESOLVER is None:
+            _require_ephemeral_values(ref, connector, secrets, auth_selector)
         stored = persisted_context.get(ref, {})
         _require_context_values(ref, connector, stored)
         if context and _canonical_json_value(context) != _canonical_json_value(stored):
@@ -560,6 +611,8 @@ def _require_ephemeral_values_at_binding(
     ref: ConnectorRef,
     connector: Any,
     values: ConnectorRuntimeValues,
+    *,
+    ephemeral_manifest: dict[str, dict[str, set[str]]] | None,
 ) -> None:
     schema = _runtime_input_schema(connector)
     for section_name, section_values in (
@@ -569,10 +622,17 @@ def _require_ephemeral_values_at_binding(
         declarations = _schema_section(schema, section_name)
         for key, declaration in declarations.items():
             if _is_required(declaration) and key not in section_values:
+                reason = (
+                    RUNTIME_SECRET_REASON_STORE_LOST
+                    if _manifest_has_ephemeral_key(
+                        ephemeral_manifest, ref, section_name, key
+                    )
+                    else RUNTIME_SECRET_REASON_NOT_PROVIDED
+                )
                 _raise_runtime_error(
                     ERROR_RUNTIME_SECRET_UNAVAILABLE,
                     ref,
-                    reason=RUNTIME_SECRET_REASON_STORE_LOST,
+                    reason=reason,
                 )
 
 
@@ -596,6 +656,21 @@ def _resolve_runtime_values(
         )
     )
     return resolved if resolved is not None else values
+
+
+def _manifest_has_ephemeral_key(
+    manifest: dict[str, dict[str, set[str]]] | None,
+    ref: ConnectorRef,
+    section_name: str,
+    key: str,
+) -> bool:
+    if not isinstance(manifest, dict):
+        return False
+    ref_manifest = manifest.get(ref.storage_key)
+    if not isinstance(ref_manifest, dict):
+        return False
+    keys = ref_manifest.get(section_name)
+    return isinstance(keys, set) and key in keys
 
 
 def _is_required(declaration: Any) -> bool:

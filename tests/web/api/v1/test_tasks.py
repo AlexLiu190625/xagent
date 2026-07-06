@@ -31,6 +31,7 @@ from xagent.web.models.task import (
 )
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
+    drop_ephemeral_runtime_values_for_testing,
     load_connector_runtime_view,
     pop_ephemeral_runtime_values,
     set_connector_runtime_resolver_for_testing,
@@ -387,6 +388,35 @@ def test_create_task_rejects_missing_required_auth_selector(mock_start_task):
     assert mock_start_task.call_count == 0
 
 
+def test_create_task_rejects_missing_required_secret_without_resolver(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    }
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
+    assert resp.json()["error"]["details"]["reason"] == "not_provided"
+    assert mock_start_task.call_count == 0
+
+
 def test_connector_runtime_view_loads_task_context(mock_start_task):
     agent_id, full_key = _create_agent_with_key()
     server_id = _install_runtime_mcp_connector(agent_id)
@@ -462,7 +492,7 @@ def test_connector_runtime_view_reports_store_lost_for_missing_ephemeral(
     assert resp.status_code == 202, resp.text
     task_id = resp.json()["task_id"]
     turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
-    pop_ephemeral_runtime_values(turn_id)
+    drop_ephemeral_runtime_values_for_testing(turn_id)
     db = _direct_db_session()
     try:
         task = db.query(Task).filter(Task.id == task_id).one()
@@ -478,6 +508,160 @@ def test_connector_runtime_view_reports_store_lost_for_missing_ephemeral(
 
     assert getattr(exc_info.value, "code", None) == "runtime_secret_unavailable"
     assert getattr(exc_info.value, "details", {}).get("reason") == "store_lost"
+
+
+def test_connector_runtime_resolver_can_supply_required_secret(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    def _resolver(request):
+        assert request.connector_ref.connector_id == server_id
+        assert request.values.secrets == {}
+        return ConnectorRuntimeValues(
+            context={},
+            secrets={"authorization": "Bearer hook-token"},
+            auth_selector={},
+        )
+
+    set_connector_runtime_resolver_for_testing(_resolver)
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert view[f"mcp:{server_id}"]["secrets"] == {"authorization": "Bearer hook-token"}
+
+
+def test_connector_runtime_resolver_can_supply_required_auth_selector(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, auth_selector_required=True
+    )
+
+    def _resolver(request):
+        assert request.connector_ref.connector_id == server_id
+        assert request.values.auth_selector == {}
+        return ConnectorRuntimeValues(
+            context={},
+            secrets={},
+            auth_selector={"resource_owner_key": "xagent:user:owner"},
+        )
+
+    set_connector_runtime_resolver_for_testing(_resolver)
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=turn_id,
+                user_id=int(task.user_id),
+            )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert view[f"mcp:{server_id}"]["auth_selector"] == {
+        "resource_owner_key": "xagent:user:owner"
+    }
+
+
+def test_connector_runtime_view_reports_not_provided_when_resolver_omits_secret(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    def _resolver(_request):
+        return None
+
+    set_connector_runtime_resolver_for_testing(_resolver)
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        set_connector_runtime_resolver_for_testing(_resolver)
+        try:
+            with pytest.raises(Exception) as exc_info:
+                load_connector_runtime_view(
+                    db=db,
+                    task_id=task_id,
+                    turn_id=turn_id,
+                    user_id=int(task.user_id),
+                )
+        finally:
+            set_connector_runtime_resolver_for_testing(None)
+    finally:
+        db.close()
+
+    assert getattr(exc_info.value, "code", None) == "runtime_secret_unavailable"
+    assert getattr(exc_info.value, "details", {}).get("reason") == "not_provided"
+    assert getattr(exc_info.value, "details", {}).get("connector_ref") == {
+        "connector_type": "mcp",
+        "connector_id": server_id,
+    }
 
 
 def test_create_task_marks_failed_when_runtime_secret_store_fails(mock_start_task):
