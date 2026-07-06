@@ -40,7 +40,9 @@ from xagent.web.services.connector_runtime import (
 )
 from xagent.web.services.hot_path_cache import (
     InMemoryTTLCache,
+    cache_get,
     set_cache_backend_for_testing,
+    task_steps_key,
 )
 from xagent.web.tools.config import WebToolConfig
 
@@ -2074,16 +2076,31 @@ def test_get_steps_redacts_runtime_secrets_before_cache_write(mock_start_task):
 
     set_cache_backend_for_testing(InMemoryTTLCache())
     try:
-        first = client.get(f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key))
-        second = client.get(
-            f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
-        )
+        from xagent.web.api.v1 import _step_mapping
+
+        with patch(
+            "xagent.web.api.v1.tasks.map_trace_events_to_public_steps",
+            wraps=_step_mapping.map_trace_events_to_public_steps,
+        ) as mapper:
+            first = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
+            cached = cache_get(task_steps_key(task_id))
+            second = client.get(
+                f"/v1/chat/tasks/{task_id}/steps", headers=_bearer(full_key)
+            )
     finally:
         set_cache_backend_for_testing(None)
 
     assert first.status_code == 200, first.text
     assert second.status_code == 200, second.text
     assert first.json() == second.json()
+    assert mapper.call_count == 1
+    assert isinstance(cached, dict)
+    assert "runtime-token" not in repr(cached)
+    assert "nested-token" not in repr(cached)
+    assert "xagent:user:owner" not in repr(cached)
+    assert "echoed-token" not in repr(cached)
     response_text = first.text + second.text
     assert "runtime-token" not in response_text
     assert "nested-token" not in response_text
