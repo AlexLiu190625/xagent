@@ -497,7 +497,7 @@ def _plan_selected_refs(
     )
     spec = ToolSelectionSpec.from_raw(tool_categories=tool_categories)
     selected: list[ConnectorRef] = []
-    scoped_mcp_servers = spec.scoped_mcp_servers() if spec is not None else None
+    scoped_mcp_servers = spec.scoped_mcp_servers()
     for ref, connector in visible.items():
         if not _has_runtime_declaration(connector):
             continue

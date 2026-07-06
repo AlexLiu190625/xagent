@@ -1256,7 +1256,7 @@ def _task_user_id(task: Any) -> int | None:
 async def execute_task_background(
     task_id: int,
     user_message: str,
-    context: Dict[str, Any],
+    context: Dict[str, Any] | None,
     agent_manager: Any,
     task_owner_user_id: int | None,
     before_message_id: int | None = None,
@@ -1296,6 +1296,7 @@ async def execute_task_background(
     db_gen = get_db()
     try:
         db = next(db_gen)
+        context_dict = context if isinstance(context, dict) else {}
         logger.info(f"Background task execution started for task {task_id}")
 
         task_user_id: Optional[int]
@@ -1344,8 +1345,8 @@ async def execute_task_background(
                 user=user,
                 task_setup_snapshot=task_setup_snapshot,
                 task_owner_user_id=effective_user_id,
-                connector_runtime_turn_id=context.get("turn_id")
-                if isinstance(context.get("turn_id"), str)
+                connector_runtime_turn_id=context_dict.get("turn_id")
+                if isinstance(context_dict.get("turn_id"), str)
                 else None,
             )
             if hasattr(agent_service, "set_outbound_message_handler"):
@@ -1367,7 +1368,7 @@ async def execute_task_background(
             )
             _register_uploaded_files_for_agent(
                 agent_service,
-                context.get("file_info", []),
+                context_dict.get("file_info", []),
                 db,
             )
 

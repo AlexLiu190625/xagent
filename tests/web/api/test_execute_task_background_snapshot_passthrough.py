@@ -238,6 +238,37 @@ async def test_snapshot_path_skips_task_query_keeps_user_query() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_task_background_accepts_missing_context() -> None:
+    """``context=None`` means no turn metadata, not a setup failure."""
+
+    db, _counter = _build_db_mock(task_row=_make_task_orm(), user_row=_make_user_orm())
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent_service))
+
+    with _Patches(_common_patches(db, agent_service)):
+        try:
+            await execute_task_background(
+                task_id=42,
+                user_message="hi",
+                context=None,
+                agent_manager=agent_manager,
+                task_owner_user_id=1,
+                task_setup_snapshot=snapshot,
+            )
+        except Exception:
+            # The test only covers setup argument shaping. Downstream finalize
+            # stubs may raise after get_agent_for_task has received the args.
+            pass
+
+    agent_manager.get_agent_for_task.assert_awaited_once()
+    assert (
+        agent_manager.get_agent_for_task.await_args.kwargs["connector_runtime_turn_id"]
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_legacy_path_runs_task_and_user_queries() -> None:
     """No snapshot (WS path) → both legacy queries fire exactly once."""
     db, counter = _build_db_mock(task_row=_make_task_orm(), user_row=_make_user_orm())
