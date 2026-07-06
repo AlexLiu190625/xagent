@@ -24,6 +24,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     ERROR_RUNTIME_CONTEXT_IMMUTABLE,
     ERROR_RUNTIME_SECRET_NOT_ALLOWED,
     ERROR_RUNTIME_SECRET_UNAVAILABLE,
+    ERROR_SCHEDULED_SECRET_UNAVAILABLE,
     RUNTIME_INPUT_AUTH_SELECTOR,
     RUNTIME_INPUT_CONTEXT,
     RUNTIME_INPUT_SECRETS,
@@ -250,10 +251,14 @@ def prepare_create_connector_runtime(
     db: Session,
     agent: Agent,
     payload_items: Iterable[Any] | None,
+    allow_ephemeral: bool = True,
+    missing_ephemeral_error_code: str = ERROR_RUNTIME_SECRET_UNAVAILABLE,
 ) -> ConnectorRuntimeCreatePlan:
     visible = _load_visible_runtime_connectors(db, user_id=int(agent.user_id))
     selected_refs = _plan_selected_refs(agent, visible)
     payload_by_ref = _parse_payload_items(payload_items)
+    if not allow_ephemeral:
+        _reject_ephemeral_payload_values(payload_by_ref)
     _validate_payload_refs(payload_by_ref, visible=visible, selected_refs=selected_refs)
 
     context_by_ref: dict[ConnectorRef, dict[str, Any]] = {}
@@ -268,7 +273,13 @@ def prepare_create_connector_runtime(
         _validate_values_against_schema(ref, connector, context, secrets, auth_selector)
         _require_context_values(ref, connector, context)
         if _RUNTIME_RESOLVER is None:
-            _require_ephemeral_values(ref, connector, secrets, auth_selector)
+            _require_ephemeral_values(
+                ref,
+                connector,
+                secrets,
+                auth_selector,
+                error_code=missing_ephemeral_error_code,
+            )
         if context:
             context_by_ref[ref] = context
         if secrets or auth_selector:
@@ -282,6 +293,14 @@ def prepare_create_connector_runtime(
         context_by_ref=context_by_ref,
         ephemeral_by_ref=ephemeral_by_ref,
     )
+
+
+def reject_ephemeral_connector_runtime_payload(
+    payload_items: Iterable[Any] | None,
+) -> None:
+    """Validate that persisted runtime payload contains no ephemeral values."""
+
+    _reject_ephemeral_payload_values(_parse_payload_items(payload_items))
 
 
 def persist_create_connector_runtime_context(
@@ -373,6 +392,14 @@ def _parse_payload_items(
             auth_selector=auth_selector,
         )
     return result
+
+
+def _reject_ephemeral_payload_values(
+    payload_by_ref: dict[ConnectorRef, ConnectorRuntimePayload],
+) -> None:
+    for ref, payload in payload_by_ref.items():
+        if payload.secrets or payload.auth_selector:
+            _raise_runtime_error(ERROR_RUNTIME_SECRET_NOT_ALLOWED, ref)
 
 
 def _read_field(item: Any, field: str) -> Any:
@@ -579,6 +606,8 @@ def _require_ephemeral_values(
     connector: Any,
     secrets: dict[str, Any],
     auth_selector: dict[str, Any],
+    *,
+    error_code: str = ERROR_RUNTIME_SECRET_UNAVAILABLE,
 ) -> None:
     schema = _runtime_input_schema(connector)
     for section_name, values in (
@@ -594,14 +623,8 @@ def _require_ephemeral_values(
                     ERROR_INVALID_RUNTIME_CONTEXT, ref, reason=str(exc)
                 )
             if _is_required(declaration) and key not in values:
-                if section_name == RUNTIME_INPUT_SECRETS:
-                    _raise_runtime_error(
-                        ERROR_RUNTIME_SECRET_UNAVAILABLE,
-                        ref,
-                        reason=RUNTIME_SECRET_REASON_NOT_PROVIDED,
-                    )
                 _raise_runtime_error(
-                    ERROR_RUNTIME_SECRET_UNAVAILABLE,
+                    error_code,
                     ref,
                     reason=RUNTIME_SECRET_REASON_NOT_PROVIDED,
                 )
@@ -706,6 +729,7 @@ def _message_for_code(code: str) -> str:
         ERROR_MISSING_RUNTIME_CONTEXT: "Required connector runtime context is missing.",
         ERROR_RUNTIME_CONTEXT_IMMUTABLE: "Connector runtime context cannot change after task creation.",
         ERROR_RUNTIME_SECRET_UNAVAILABLE: "Required runtime secret is unavailable.",
+        ERROR_SCHEDULED_SECRET_UNAVAILABLE: "Required scheduled runtime secret is unavailable.",
         ERROR_RUNTIME_SECRET_NOT_ALLOWED: "Runtime secret is not allowed for this entrypoint.",
     }.get(code, "Invalid connector runtime context.")
 

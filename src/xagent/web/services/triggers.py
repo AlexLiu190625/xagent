@@ -14,6 +14,11 @@ from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from ...core.tools.adapters.vibe.connector_runtime import (
+    ERROR_RUNTIME_SECRET_UNAVAILABLE,
+    ERROR_SCHEDULED_SECRET_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..models.agent import Agent
 from ..models.background_job import BackgroundJob, BackgroundJobType
@@ -21,6 +26,11 @@ from ..models.task import Task, TaskStatus
 from ..models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus, TriggerType
 from ..models.user_oauth import UserOAuth
 from .background_jobs import create_background_job, enqueue_background_job
+from .connector_runtime import (
+    persist_create_connector_runtime_context,
+    prepare_create_connector_runtime,
+    reject_ephemeral_connector_runtime_payload,
+)
 from .gmail_provisioning import (
     provision_gmail_trigger,
     release_gmail_mailbox_if_unused,
@@ -340,6 +350,7 @@ def _validate_config(
 
     if trigger_type == TriggerType.SCHEDULED.value:
         _compute_next_run_at(config)
+    _validate_persisted_connector_runtime_config(config)
     if trigger_type == TriggerType.GMAIL.value:
         return _resolve_gmail_resource(
             db,
@@ -347,6 +358,21 @@ def _validate_config(
             oauth_account_id=getattr(typed, "oauth_account_id", None),
         )
     return None
+
+
+def _trigger_connector_runtime_payload(config: dict[str, Any] | None) -> Any:
+    if not isinstance(config, dict):
+        return None
+    return config.get("connector_runtime_context")
+
+
+def _validate_persisted_connector_runtime_config(config: dict[str, Any]) -> None:
+    try:
+        reject_ephemeral_connector_runtime_payload(
+            _trigger_connector_runtime_payload(config)
+        )
+    except ConnectorRuntimeError as exc:
+        raise TriggerServiceError(exc.safe_message) from exc
 
 
 def _gmail_oauth_account_id(config: Any) -> int | None:
@@ -713,6 +739,20 @@ def _attach_task_to_trigger_run(
         test=test,
     )
     agent = db.query(Agent).filter(Agent.id == trigger.agent_id).first()
+    if agent is None:
+        raise TriggerServiceError("Agent not found")
+    missing_secret_error_code = (
+        ERROR_SCHEDULED_SECRET_UNAVAILABLE
+        if str(trigger.type) == TriggerType.SCHEDULED.value
+        else ERROR_RUNTIME_SECRET_UNAVAILABLE
+    )
+    runtime_plan = prepare_create_connector_runtime(
+        db=db,
+        agent=agent,
+        payload_items=_trigger_connector_runtime_payload(trigger.config),
+        allow_ephemeral=False,
+        missing_ephemeral_error_code=missing_secret_error_code,
+    )
     task = Task(
         user_id=int(trigger.user_id),
         title=_trigger_task_title(trigger, prompt),
@@ -728,9 +768,15 @@ def _attach_task_to_trigger_run(
             run=run,
             test=test,
         ),
+        connector_runtime_selected_refs=[
+            ref.to_wire() for ref in runtime_plan.selected_refs
+        ],
     )
     db.add(task)
     db.flush()
+    persist_create_connector_runtime_context(
+        db=db, task_id=int(task.id), plan=runtime_plan
+    )
     run.task_id = int(task.id)
     run.status = TriggerRunStatus.PENDING.value
     db.add(run)
