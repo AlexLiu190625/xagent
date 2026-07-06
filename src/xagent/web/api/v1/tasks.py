@@ -14,6 +14,7 @@ persist messages, schedule bg, sync output) is delegated to
 by the WebSocket UI path so both transports share one state machine.
 """
 
+import logging
 from typing import Tuple
 
 from fastapi import APIRouter, Depends
@@ -61,6 +62,9 @@ from .deps import get_agent_from_api_key
 from .errors import V1ApiError, V1ErrorCode
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
+
+_CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
 
 
 def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> None:
@@ -74,6 +78,50 @@ def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> None:
         message=exc.safe_message,
         details=exc.to_public_error().get("details"),
     ) from exc
+
+
+def _mark_task_failed_after_runtime_setup_error(db: Session, task_id: int) -> None:
+    """Best-effort terminal mark after pre-schedule runtime setup fails."""
+
+    try:
+        db.rollback()
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task is not None:
+            setattr(task, "status", TaskStatus.FAILED)
+            setattr(task, "error_message", _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE)
+            db.commit()
+    except Exception:
+        db.rollback()
+        logger.warning(
+            "Failed to mark task %s failed after connector runtime setup error",
+            task_id,
+        )
+
+
+def _store_connector_runtime_values_or_fail(
+    *,
+    db: Session,
+    task_id: int,
+    turn_id: str,
+    values_by_ref: dict,
+    mark_task_failed: bool,
+) -> None:
+    try:
+        store_ephemeral_runtime_values(turn_id, values_by_ref)
+    except Exception as exc:
+        pop_ephemeral_runtime_values(turn_id)
+        if mark_task_failed:
+            _mark_task_failed_after_runtime_setup_error(db, task_id)
+        logger.warning(
+            "Connector runtime setup failed for task %s turn %s",
+            task_id,
+            turn_id,
+        )
+        raise V1ApiError(
+            V1ErrorCode.INTERNAL_ERROR,
+            500,
+            message=_CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE,
+        ) from exc
 
 
 @router.post(
@@ -193,7 +241,13 @@ async def create_chat_task(
     # A brand-new task shouldn't ever hit busy -- but we map it
     # anyway for defense.
     payload = TaskTurnPayload(transcript_message=request.message.content)
-    store_ephemeral_runtime_values(payload.turn_id, runtime_plan.ephemeral_by_ref)
+    _store_connector_runtime_values_or_fail(
+        db=db,
+        task_id=int(task.id),
+        turn_id=payload.turn_id,
+        values_by_ref=runtime_plan.ephemeral_by_ref,
+        mark_task_failed=True,
+    )
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
@@ -361,7 +415,13 @@ async def append_message_to_task(
     # 409), persists the new user message, and schedules the bg turn
     # with a single-flight guard against concurrent kickoffs.
     payload = TaskTurnPayload(transcript_message=request.message.content)
-    store_ephemeral_runtime_values(payload.turn_id, runtime_plan.ephemeral_by_ref)
+    _store_connector_runtime_values_or_fail(
+        db=db,
+        task_id=int(task.id),
+        turn_id=payload.turn_id,
+        values_by_ref=runtime_plan.ephemeral_by_ref,
+        mark_task_failed=False,
+    )
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),

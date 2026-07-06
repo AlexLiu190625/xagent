@@ -480,6 +480,59 @@ def test_connector_runtime_view_reports_store_lost_for_missing_ephemeral(
     assert getattr(exc_info.value, "details", {}).get("reason") == "store_lost"
 
 
+def test_create_task_marks_failed_when_runtime_secret_store_fails(mock_start_task):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+
+    with patch(
+        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        side_effect=RuntimeError("store failed for Bearer tenant-token"),
+    ):
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {
+                    "role": "user",
+                    "content": "runtime secret store create failure",
+                },
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer tenant-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["message"] == "Connector runtime setup failed."
+    assert "tenant-token" not in resp.text
+    assert "store failed" not in resp.text
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        task = (
+            db.query(Task)
+            .filter(Task.agent_id == agent_id)
+            .filter(Task.input == "runtime secret store create failure")
+            .one()
+        )
+        assert task.status == TaskStatus.FAILED
+        assert task.error_message == "Connector runtime setup failed."
+    finally:
+        db.close()
+
+
 def test_connector_runtime_resolver_can_override_values(mock_start_task):
     agent_id, full_key = _create_agent_with_key()
     server_id = _install_runtime_mcp_connector(agent_id)
@@ -917,6 +970,76 @@ def test_append_message_accepts_same_connector_runtime_context(mock_start_task):
 
     assert resp.status_code == 202, resp.text
     assert mock_start_task.call_count == 1
+
+
+def test_append_message_keeps_task_state_when_runtime_secret_store_fails(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id, required=False, secret_required=True
+    )
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    pop_ephemeral_runtime_values(mock_start_task.call_args.kwargs["payload"].turn_id)
+    task_id = create_resp.json()["task_id"]
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    with patch(
+        "xagent.web.api.v1.tasks.store_ephemeral_runtime_values",
+        side_effect=RuntimeError("store failed for Bearer append-token"),
+    ):
+        resp = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+                "connector_runtime_context": [
+                    {
+                        "connector_ref": {
+                            "connector_type": "mcp",
+                            "connector_id": server_id,
+                        },
+                        "secrets": {"authorization": "Bearer append-token"},
+                    }
+                ],
+            },
+        )
+
+    assert resp.status_code == 500
+    body = resp.json()
+    assert body["error"]["code"] == "internal_error"
+    assert body["error"]["message"] == "Connector runtime setup failed."
+    assert "append-token" not in resp.text
+    assert "store failed" not in resp.text
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        assert task.status == TaskStatus.COMPLETED
+        assert task.input == "first turn"
+        assert task.error_message is None
+    finally:
+        db.close()
 
 
 def test_append_message_to_running_task_returns_409(mock_start_task):
