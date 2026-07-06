@@ -7,12 +7,15 @@ in the web application.
 
 import logging
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
+from ...core.tools.adapters.vibe.connector_runtime import (
+    validate_runtime_config_declaration,
+)
 from ...core.utils.encryption import encrypt_value
 from ..auth_dependencies import get_current_user
 from ..models.custom_api import CustomApi, UserCustomApi
@@ -37,6 +40,15 @@ class CustomApiCreate(BaseModel):
     env: Optional[Dict[str, str]] = Field(
         None, description="Environment variables (secrets)"
     )
+    runtime_input_schema: Optional[Dict[str, Any]] = Field(
+        None, description="Runtime input declarations"
+    )
+    runtime_bindings: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Runtime binding declarations"
+    )
+    allow_delegated_authorization: bool = Field(
+        False, description="Allow runtime Authorization header binding"
+    )
     is_active: bool = Field(True, description="Whether the API is active")
 
 
@@ -56,6 +68,15 @@ class CustomApiUpdate(BaseModel):
     env: Optional[Dict[str, str]] = Field(
         None, description="Environment variables (secrets)"
     )
+    runtime_input_schema: Optional[Dict[str, Any]] = Field(
+        None, description="Runtime input declarations"
+    )
+    runtime_bindings: Optional[List[Dict[str, Any]]] = Field(
+        None, description="Runtime binding declarations"
+    )
+    allow_delegated_authorization: Optional[bool] = Field(
+        None, description="Allow runtime Authorization header binding"
+    )
     is_active: Optional[bool] = Field(None, description="Whether the API is active")
 
 
@@ -71,6 +92,9 @@ class CustomApiResponse(BaseModel):
     headers: Optional[Dict[str, str]]
     body: Optional[str]
     env: Optional[Dict[str, str]]  # Will return masked values
+    runtime_input_schema: Optional[Dict[str, Any]] = None
+    runtime_bindings: Optional[List[Dict[str, Any]]] = None
+    allow_delegated_authorization: bool = False
     is_active: bool
     is_default: bool
     created_at: str
@@ -106,6 +130,9 @@ def _db_api_to_response(
         headers=api.headers,
         body=api.body,
         env=masked_env,
+        runtime_input_schema=api.runtime_input_schema,
+        runtime_bindings=api.runtime_bindings,
+        allow_delegated_authorization=bool(api.allow_delegated_authorization),
         is_active=user_api.is_active,
         is_default=user_api.is_default,
         created_at=str(api.created_at.isoformat()),
@@ -174,6 +201,19 @@ async def create_custom_api(
 
     # Process env variables
     encrypted_env = _process_env_vars(api_data.env)
+    try:
+        validate_runtime_config_declaration(
+            connector_type="custom_api",
+            runtime_input_schema=api_data.runtime_input_schema,
+            runtime_bindings=api_data.runtime_bindings,
+            allow_delegated_authorization=api_data.allow_delegated_authorization,
+            static_headers=api_data.headers,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid runtime configuration: {exc}",
+        ) from exc
 
     # Create CustomApi
     new_api = CustomApi(
@@ -184,6 +224,9 @@ async def create_custom_api(
         headers=api_data.headers,
         body=api_data.body,
         env=encrypted_env,
+        runtime_input_schema=api_data.runtime_input_schema,
+        runtime_bindings=api_data.runtime_bindings,
+        allow_delegated_authorization=api_data.allow_delegated_authorization,
     )
 
     db.add(new_api)
@@ -291,6 +334,42 @@ async def update_custom_api(
     if api_data.env is not None:
         existing_env = api.env if isinstance(api.env, dict) else {}
         api.env = _process_env_vars(api_data.env, existing_env)
+
+    fields_set = api_data.model_fields_set
+    runtime_input_schema = (
+        api_data.runtime_input_schema
+        if "runtime_input_schema" in fields_set
+        else api.runtime_input_schema
+    )
+    runtime_bindings = (
+        api_data.runtime_bindings
+        if "runtime_bindings" in fields_set
+        else api.runtime_bindings
+    )
+    allow_delegated_authorization = (
+        bool(api_data.allow_delegated_authorization)
+        if "allow_delegated_authorization" in fields_set
+        else bool(api.allow_delegated_authorization)
+    )
+    try:
+        validate_runtime_config_declaration(
+            connector_type="custom_api",
+            runtime_input_schema=runtime_input_schema,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=allow_delegated_authorization,
+            static_headers=api.headers,
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid runtime configuration: {exc}",
+        ) from exc
+    if "runtime_input_schema" in fields_set:
+        api.runtime_input_schema = runtime_input_schema
+    if "runtime_bindings" in fields_set:
+        api.runtime_bindings = runtime_bindings
+    if "allow_delegated_authorization" in fields_set:
+        api.allow_delegated_authorization = allow_delegated_authorization
 
     # Update UserCustomApi link
     if api_data.is_active is not None:

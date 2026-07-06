@@ -313,6 +313,15 @@ async def test_get_mcp_server_tools_rejects_inactive_user_server(db_session):
 def test_update_mcp_server_can_reactivate_inactive_user_server(db_session):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
+    server.runtime_input_schema = {"context": {"account_id": {"type": "string"}}}
+    server.runtime_bindings = [
+        {
+            "source": {"input_type": "context", "key": "account_id"},
+            "target": {"target_type": "mcp_meta", "key": "account_id"},
+        }
+    ]
+    server.allow_delegated_authorization = True
+    db.commit()
     _set_user_mcp_active(db, user, server, False)
 
     response = update_mcp_server(
@@ -324,6 +333,58 @@ def test_update_mcp_server_can_reactivate_inactive_user_server(db_session):
 
     assert response.description == "Updated while inactive"
     assert response.is_active is True
+    assert response.runtime_input_schema == {
+        "context": {"account_id": {"type": "string"}}
+    }
+    assert response.runtime_bindings == [
+        {
+            "source": {"input_type": "context", "key": "account_id"},
+            "target": {"target_type": "mcp_meta", "key": "account_id"},
+        }
+    ]
+    assert response.allow_delegated_authorization is True
+
+
+def test_update_mcp_server_persists_runtime_config(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    response = update_mcp_server(
+        server.id,
+        MCPServerUpdate(
+            runtime_input_schema={"secrets": {"authorization": {"type": "string"}}},
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "secrets", "key": "authorization"},
+                    "target": {
+                        "target_type": "transport_headers",
+                        "key": "Authorization",
+                    },
+                }
+            ],
+            allow_delegated_authorization=True,
+        ),
+        user,
+        db,
+    )
+
+    assert response.runtime_input_schema == {
+        "secrets": {"authorization": {"type": "string"}}
+    }
+    assert response.runtime_bindings == [
+        {
+            "source": {"input_type": "secrets", "key": "authorization"},
+            "target": {
+                "target_type": "transport_headers",
+                "key": "Authorization",
+            },
+        }
+    ]
+    assert response.allow_delegated_authorization is True
+    db.refresh(server)
+    assert server.runtime_input_schema == response.runtime_input_schema
+    assert server.runtime_bindings == response.runtime_bindings
+    assert server.allow_delegated_authorization is True
 
 
 @pytest.mark.asyncio

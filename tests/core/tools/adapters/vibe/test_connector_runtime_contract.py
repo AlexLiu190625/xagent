@@ -10,6 +10,7 @@ from xagent.core.tools.adapters.vibe.connector_runtime import (
     ConnectorRef,
     ConnectorRuntimeError,
     redact_runtime_value,
+    validate_runtime_config_declaration,
     validate_runtime_source_key,
 )
 
@@ -103,6 +104,88 @@ def test_redact_runtime_value_does_not_preserve_secret_material() -> None:
     }
     assert "secret-token" not in repr(redacted)
     assert "person-1" not in repr(redacted)
+
+
+def test_runtime_config_validation_rejects_mcp_context_to_transport_header() -> None:
+    with pytest.raises(ValueError, match="context cannot bind"):
+        validate_runtime_config_declaration(
+            connector_type="mcp",
+            runtime_input_schema={
+                "context": {"account_id": {"type": "string", "required": True}}
+            },
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {
+                        "target_type": "transport_headers",
+                        "key": "X-Account-ID",
+                    },
+                }
+            ],
+            allow_delegated_authorization=False,
+        )
+
+
+def test_runtime_config_validation_accepts_custom_api_context_header() -> None:
+    validate_runtime_config_declaration(
+        connector_type="custom_api",
+        runtime_input_schema={
+            "context": {"account_id": {"type": "string", "required": True}}
+        },
+        runtime_bindings=[
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ],
+        allow_delegated_authorization=False,
+    )
+
+
+def test_runtime_config_validation_rejects_object_header_binding() -> None:
+    with pytest.raises(ValueError, match="object runtime values cannot bind"):
+        validate_runtime_config_declaration(
+            connector_type="custom_api",
+            runtime_input_schema={"context": {"actor": {"type": "object"}}},
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "actor"},
+                    "target": {"target_type": "headers", "key": "X-Actor"},
+                }
+            ],
+            allow_delegated_authorization=False,
+        )
+
+
+def test_runtime_config_validation_requires_delegated_flag_for_authorization() -> None:
+    with pytest.raises(ValueError, match="requires delegated authorization"):
+        validate_runtime_config_declaration(
+            connector_type="custom_api",
+            runtime_input_schema={"secrets": {"authorization": {"type": "string"}}},
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "secrets", "key": "authorization"},
+                    "target": {"target_type": "headers", "key": "Authorization"},
+                }
+            ],
+            allow_delegated_authorization=False,
+        )
+
+
+def test_runtime_config_validation_rejects_static_header_conflict() -> None:
+    with pytest.raises(ValueError, match="conflicts with static header"):
+        validate_runtime_config_declaration(
+            connector_type="custom_api",
+            runtime_input_schema={"context": {"account_id": {"type": "string"}}},
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "headers", "key": "X-Account-ID"},
+                }
+            ],
+            allow_delegated_authorization=False,
+            static_headers={"x-account-id": "static"},
+        )
 
 
 @pytest.mark.asyncio

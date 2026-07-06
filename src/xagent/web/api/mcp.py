@@ -24,6 +24,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_app_base_url, get_session_secret
+from ...core.tools.adapters.vibe.connector_runtime import (
+    validate_runtime_config_declaration,
+)
 from ...core.tools.core.mcp.data_config import MCPServerConfig
 from ...core.tools.core.mcp.manager.db import DatabaseMCPServerManager
 from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIELDS
@@ -85,6 +88,15 @@ class MCPServerCreate(BaseModel):
     user_env: Optional[dict] = Field(
         None, description="Per-user env overrides (merged over global env at runtime)"
     )
+    runtime_input_schema: Optional[dict] = Field(
+        None, description="Runtime input declarations"
+    )
+    runtime_bindings: Optional[list[dict]] = Field(
+        None, description="Runtime binding declarations"
+    )
+    allow_delegated_authorization: bool = Field(
+        False, description="Allow runtime Authorization header binding"
+    )
 
 
 class MCPServerUpdate(BaseModel):
@@ -100,6 +112,15 @@ class MCPServerUpdate(BaseModel):
     user_env: Optional[dict] = Field(
         None, description="Per-user env overrides (merged over global env at runtime)"
     )
+    runtime_input_schema: Optional[dict] = Field(
+        None, description="Runtime input declarations"
+    )
+    runtime_bindings: Optional[list[dict]] = Field(
+        None, description="Runtime binding declarations"
+    )
+    allow_delegated_authorization: Optional[bool] = Field(
+        None, description="Allow runtime Authorization header binding"
+    )
 
 
 class MCPServerResponse(BaseModel):
@@ -114,6 +135,9 @@ class MCPServerResponse(BaseModel):
     is_active: bool
     is_default: bool
     user_env: Optional[dict] = None
+    runtime_input_schema: Optional[dict] = None
+    runtime_bindings: Optional[list[dict]] = None
+    allow_delegated_authorization: bool = False
     can_edit_global: bool = False
     transport_display: str
     created_at: Optional[str]
@@ -1072,6 +1096,23 @@ def _build_server_config(
     return MCPServerConfig(**config_dict)
 
 
+def _validate_mcp_runtime_config(
+    *,
+    runtime_input_schema: Any,
+    runtime_bindings: Any,
+    allow_delegated_authorization: bool,
+    static_headers: Any,
+) -> None:
+    headers = static_headers if isinstance(static_headers, dict) else None
+    validate_runtime_config_declaration(
+        connector_type="mcp",
+        runtime_input_schema=runtime_input_schema,
+        runtime_bindings=runtime_bindings,
+        allow_delegated_authorization=allow_delegated_authorization,
+        static_headers=headers,
+    )
+
+
 def _update_server_from_config(server: MCPServer, config: MCPServerConfig) -> None:
     """Update database server object from MCPServerConfig."""
     # Map config fields to database fields
@@ -1230,6 +1271,7 @@ def _auth_metadata_tampered(incoming_auth: Any, current_auth: Any) -> bool:
 
 def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> bool:
     """True if a payload changes owner-only global fields (non-secret ones)."""
+    fields_set = server_data.model_fields_set
     if server_data.name is not None and server_data.name != server.name:
         return True
     if server_data.transport is not None and server_data.transport != server.transport:
@@ -1245,6 +1287,20 @@ def _global_config_tampered(server_data: MCPServerUpdate, server: MCPServer) -> 
         key in incoming and incoming[key] != current.get(key)
         for key in _GLOBAL_CONFIG_KEYS
     ):
+        return True
+    if (
+        "runtime_input_schema" in fields_set
+        and server_data.runtime_input_schema != server.runtime_input_schema
+    ):
+        return True
+    if (
+        "runtime_bindings" in fields_set
+        and server_data.runtime_bindings != server.runtime_bindings
+    ):
+        return True
+    if "allow_delegated_authorization" in fields_set and bool(
+        server_data.allow_delegated_authorization
+    ) != bool(server.allow_delegated_authorization):
         return True
     return _auth_metadata_tampered(incoming.get("auth"), current.get("auth"))
 
@@ -1285,6 +1341,9 @@ def _db_server_to_response(
         is_active=user_mcp.is_active,
         is_default=user_mcp.is_default,
         user_env=_mask_env(getattr(user_mcp, "env", None)) if user_mcp.env else None,
+        runtime_input_schema=server.runtime_input_schema,
+        runtime_bindings=server.runtime_bindings,
+        allow_delegated_authorization=bool(server.allow_delegated_authorization),
         can_edit_global=_check_mcp_permission(user_mcp, is_admin, require="edit"),
         transport_display=server.transport_display,
         created_at=_format_optional_datetime(server.created_at),
@@ -1734,6 +1793,11 @@ def get_mcp_servers(
                     config=config_dict,
                     is_active=user_api.is_active,
                     is_default=user_api.is_default,
+                    runtime_input_schema=api.runtime_input_schema,
+                    runtime_bindings=api.runtime_bindings,
+                    allow_delegated_authorization=bool(
+                        api.allow_delegated_authorization
+                    ),
                     transport_display="Custom API",
                     created_at=_format_optional_datetime(api.created_at),
                     updated_at=_format_optional_datetime(api.updated_at),
@@ -1834,6 +1898,12 @@ def create_mcp_server(
         # Build and validate config
         try:
             config = _build_server_config(server_data)
+            _validate_mcp_runtime_config(
+                runtime_input_schema=server_data.runtime_input_schema,
+                runtime_bindings=server_data.runtime_bindings,
+                allow_delegated_authorization=server_data.allow_delegated_authorization,
+                static_headers=config.headers,
+            )
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1850,6 +1920,13 @@ def create_mcp_server(
                 status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 detail="Failed to create server",
             )
+        setattr(server, "runtime_input_schema", server_data.runtime_input_schema)
+        setattr(server, "runtime_bindings", server_data.runtime_bindings)
+        setattr(
+            server,
+            "allow_delegated_authorization",
+            server_data.allow_delegated_authorization,
+        )
 
         # Create user-server association. The creator owns the global config.
         from xagent.core.utils.encryption import encrypt_env_dict
@@ -1963,6 +2040,28 @@ def update_mcp_server(
         # Build and validate config
         try:
             config = _build_server_config(update_data, server)
+            fields_set = server_data.model_fields_set
+            runtime_input_schema = (
+                server_data.runtime_input_schema
+                if can_edit_global and "runtime_input_schema" in fields_set
+                else server.runtime_input_schema
+            )
+            runtime_bindings = (
+                server_data.runtime_bindings
+                if can_edit_global and "runtime_bindings" in fields_set
+                else server.runtime_bindings
+            )
+            allow_delegated_authorization = (
+                bool(server_data.allow_delegated_authorization)
+                if can_edit_global and "allow_delegated_authorization" in fields_set
+                else bool(server.allow_delegated_authorization)
+            )
+            _validate_mcp_runtime_config(
+                runtime_input_schema=runtime_input_schema,
+                runtime_bindings=runtime_bindings,
+                allow_delegated_authorization=allow_delegated_authorization,
+                static_headers=config.headers,
+            )
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1971,6 +2070,17 @@ def update_mcp_server(
 
         # Update server fields (global config; no-op values for non-owners)
         _update_server_from_config(server, config)
+        if can_edit_global:
+            if "runtime_input_schema" in fields_set:
+                setattr(server, "runtime_input_schema", runtime_input_schema)
+            if "runtime_bindings" in fields_set:
+                setattr(server, "runtime_bindings", runtime_bindings)
+            if "allow_delegated_authorization" in fields_set:
+                setattr(
+                    server,
+                    "allow_delegated_authorization",
+                    allow_delegated_authorization,
+                )
 
         # Store this user's per-user env override (masked values keep stored secrets)
         if server_data.user_env is not None:

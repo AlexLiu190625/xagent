@@ -186,3 +186,182 @@ def binding_source_value(
     if not isinstance(section, dict) or key not in section:
         return MISSING_RUNTIME_VALUE
     return section[key]
+
+
+def validate_runtime_config_declaration(
+    *,
+    connector_type: ConnectorType,
+    runtime_input_schema: Any,
+    runtime_bindings: Any,
+    allow_delegated_authorization: bool,
+    static_headers: Mapping[str, Any] | None = None,
+) -> None:
+    """Validate connector runtime declarations at config-save time."""
+
+    if connector_type not in ALLOWED_CONNECTOR_TYPES:
+        raise ValueError(f"unsupported connector_type: {connector_type!r}")
+
+    schema = _runtime_schema_or_empty(runtime_input_schema)
+    bindings = _runtime_bindings_or_empty(runtime_bindings)
+    declarations = _validate_runtime_schema(connector_type, schema)
+    static_header_keys = {
+        str(key).lower() for key in (static_headers or {}) if isinstance(key, str)
+    }
+
+    for binding in bindings:
+        source = binding_source(binding)
+        target = binding_target(binding)
+        input_type = source.get("input_type") or source.get("type")
+        source_key = source.get("key")
+        target_type = target.get("target_type") or target.get("type")
+
+        if not isinstance(input_type, str) or not isinstance(source_key, str):
+            raise ValueError("runtime binding source must include input_type and key")
+        validate_runtime_source_key(source_key)
+        declaration = declarations.get(input_type, {}).get(source_key)
+        if declaration is None:
+            raise ValueError(
+                f"runtime binding source {input_type}.{source_key} is not declared"
+            )
+        if not isinstance(target_type, str):
+            raise ValueError("runtime binding target must include target_type")
+
+        target_key = _validate_runtime_target(connector_type, target_type, target)
+        _validate_runtime_source_target(
+            connector_type=connector_type,
+            input_type=input_type,
+            source_key=source_key,
+            source_declaration=declaration,
+            target_type=target_type,
+            target_key=target_key,
+            allow_delegated_authorization=allow_delegated_authorization,
+            static_header_keys=static_header_keys,
+        )
+
+
+def _runtime_schema_or_empty(value: Any) -> dict[str, Any]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise ValueError("runtime_input_schema must be an object")
+    return value
+
+
+def _runtime_bindings_or_empty(value: Any) -> list[dict[str, Any]]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError("runtime_bindings must be an array")
+    if not all(isinstance(binding, dict) for binding in value):
+        raise ValueError("runtime_bindings entries must be objects")
+    return list(value)
+
+
+def _validate_runtime_schema(
+    connector_type: ConnectorType, schema: Mapping[str, Any]
+) -> dict[str, dict[str, Any]]:
+    allowed_sections = {RUNTIME_INPUT_CONTEXT, RUNTIME_INPUT_SECRETS}
+    if connector_type == CONNECTOR_TYPE_MCP:
+        allowed_sections.add(RUNTIME_INPUT_AUTH_SELECTOR)
+
+    declarations: dict[str, dict[str, Any]] = {}
+    for section_name, section in schema.items():
+        if section_name not in {
+            RUNTIME_INPUT_CONTEXT,
+            RUNTIME_INPUT_SECRETS,
+            RUNTIME_INPUT_AUTH_SELECTOR,
+        }:
+            raise ValueError(f"unsupported runtime input section: {section_name}")
+        if section_name not in allowed_sections:
+            raise ValueError(f"{section_name} is not supported for {connector_type}")
+        if not isinstance(section, dict):
+            raise ValueError(f"runtime_input_schema.{section_name} must be an object")
+        declarations[section_name] = {}
+        for key, declaration in section.items():
+            validate_runtime_source_key(key)
+            if declaration is not None and not isinstance(declaration, dict):
+                raise ValueError(
+                    f"runtime_input_schema.{section_name}.{key} must be an object"
+                )
+            declarations[section_name][key] = declaration or {}
+    return declarations
+
+
+def _validate_runtime_target(
+    connector_type: ConnectorType, target_type: str, target: Mapping[str, Any]
+) -> str:
+    allowed_targets = (
+        {TARGET_MCP_META, TARGET_TRANSPORT_HEADERS, TARGET_TOOL_ARGUMENTS}
+        if connector_type == CONNECTOR_TYPE_MCP
+        else {TARGET_HEADERS, TARGET_BODY_FIELD}
+    )
+    if target_type not in allowed_targets:
+        raise ValueError(f"{target_type} is not supported for {connector_type}")
+
+    if target_type in {
+        TARGET_MCP_META,
+        TARGET_TRANSPORT_HEADERS,
+        TARGET_TOOL_ARGUMENTS,
+        TARGET_HEADERS,
+    }:
+        key = target.get("key")
+        if not isinstance(key, str) or not key:
+            raise ValueError(f"{target_type} target requires key")
+        return key
+
+    path = target.get("path")
+    if not isinstance(path, str) or not path:
+        raise ValueError(f"{target_type} target requires path")
+    _validate_simple_body_path(path)
+    return path
+
+
+def _validate_simple_body_path(path: str) -> None:
+    if any(part == "" for part in path.split(".")):
+        raise ValueError("body_field path must be a simple dot path")
+    for part in path.split("."):
+        validate_runtime_source_key(part)
+
+
+def _validate_runtime_source_target(
+    *,
+    connector_type: ConnectorType,
+    input_type: str,
+    source_key: str,
+    source_declaration: Mapping[str, Any],
+    target_type: str,
+    target_key: str,
+    allow_delegated_authorization: bool,
+    static_header_keys: set[str],
+) -> None:
+    if input_type == RUNTIME_INPUT_AUTH_SELECTOR:
+        raise ValueError("auth_selector cannot be bound to connector targets")
+
+    if input_type == RUNTIME_INPUT_SECRETS:
+        allowed_secret_targets = {
+            CONNECTOR_TYPE_MCP: {TARGET_TRANSPORT_HEADERS},
+            CONNECTOR_TYPE_CUSTOM_API: {TARGET_HEADERS},
+        }[connector_type]
+        if target_type not in allowed_secret_targets:
+            raise ValueError("secrets can only bind to connector headers")
+    elif input_type == RUNTIME_INPUT_CONTEXT:
+        allowed_context_targets = {
+            CONNECTOR_TYPE_MCP: {TARGET_MCP_META, TARGET_TOOL_ARGUMENTS},
+            CONNECTOR_TYPE_CUSTOM_API: {TARGET_HEADERS, TARGET_BODY_FIELD},
+        }[connector_type]
+        if target_type not in allowed_context_targets:
+            raise ValueError(f"context cannot bind to {target_type}")
+    else:
+        raise ValueError(f"unsupported runtime binding source section: {input_type}")
+
+    if target_type in {TARGET_HEADERS, TARGET_TRANSPORT_HEADERS}:
+        if str(source_declaration.get("type") or "string") == "object":
+            raise ValueError("object runtime values cannot bind to headers")
+        if target_key.lower() == "authorization" and not allow_delegated_authorization:
+            raise ValueError(
+                "Authorization runtime binding requires delegated authorization"
+            )
+        if target_key.lower() in static_header_keys:
+            raise ValueError(
+                f"runtime binding conflicts with static header {target_key!r}"
+            )
