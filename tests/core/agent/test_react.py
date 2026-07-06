@@ -133,6 +133,14 @@ class FakeTraceSanitizingTool:
         return {"success": True, "args": args}
 
 
+class FakeInPlaceTraceSanitizingTool(FakeTraceSanitizingTool):
+    def sanitize_tool_args_for_trace(self, args: dict[str, Any]) -> dict[str, Any]:
+        args.pop("headers", None)
+        if isinstance(args.get("body"), dict):
+            args["body"].pop("secret", None)
+        return args
+
+
 class FakeGroupedTool:
     def __init__(self, name: str, category: str) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -918,6 +926,30 @@ def test_react_trace_safe_tool_args_ignores_non_mapping_args() -> None:
     result = pattern._with_trace_safe_tool_args(tool_call, [tool])
 
     assert result is tool_call
+
+
+def test_react_trace_safe_tool_args_detects_in_place_sanitizer() -> None:
+    pattern = ReActPattern()
+    tool = FakeInPlaceTraceSanitizingTool()
+    tool_call = {
+        "id": "call-custom-api",
+        "name": "custom_api",
+        "args": {
+            "headers": {"Authorization": "Bearer caller-token"},
+            "body": {"secret": "body-secret", "safe": "value"},
+        },
+    }
+
+    result = pattern._with_trace_safe_tool_args(tool_call, [tool])
+
+    assert result is not tool_call
+    assert result["args"] == {"body": {"safe": "value"}}
+    assert tool_call["args"] == {
+        "headers": {"Authorization": "Bearer caller-token"},
+        "body": {"secret": "body-secret", "safe": "value"},
+    }
+    assert "caller-token" not in repr(result)
+    assert "body-secret" not in repr(result)
 
 
 @pytest.mark.asyncio

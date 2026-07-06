@@ -29,6 +29,7 @@ making the loop byte-for-byte equivalent to the pre-concurrency behavior.
 from __future__ import annotations
 
 import asyncio
+import copy
 import inspect
 import json
 from dataclasses import dataclass, replace
@@ -2016,12 +2017,14 @@ class ReActPattern(AgentPattern):
         raw_args = tool_call.get("args")
         if raw_args is None:
             args: dict[str, Any] = {}
+            original_args: dict[str, Any] = {}
         elif isinstance(raw_args, dict):
-            args = dict(raw_args)
+            args = copy.deepcopy(raw_args)
+            original_args = copy.deepcopy(raw_args)
         else:
             return tool_call
         sanitized = sanitizer(args)
-        if not isinstance(sanitized, dict) or sanitized == args:
+        if not isinstance(sanitized, dict) or sanitized == original_args:
             return tool_call
         return {**tool_call, "args": sanitized}
 
