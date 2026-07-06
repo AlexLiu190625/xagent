@@ -906,6 +906,20 @@ async def test_react_trace_safe_tool_args_handles_null_args() -> None:
     assert tool.calls == [{}]
 
 
+def test_react_trace_safe_tool_args_ignores_non_mapping_args() -> None:
+    pattern = ReActPattern()
+    tool = FakeTraceSanitizingTool()
+    tool_call = {
+        "id": "call-custom-api",
+        "name": "custom_api",
+        "args": ["not", "a", "mapping"],
+    }
+
+    result = pattern._with_trace_safe_tool_args(tool_call, [tool])
+
+    assert result is tool_call
+
+
 @pytest.mark.asyncio
 async def test_react_pattern_unwraps_textual_final_answer_json() -> None:
     llm = FakeLLM(

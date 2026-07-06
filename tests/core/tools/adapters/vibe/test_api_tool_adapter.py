@@ -347,6 +347,55 @@ async def test_run_json_async_requires_flag_for_runtime_authorization_header():
 
 
 @pytest.mark.asyncio
+async def test_run_json_async_ignores_non_scalar_runtime_header_values():
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.return_value = {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": {"data": "test"},
+            "error": None,
+        }
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "tuple_value"},
+                    "target": {"target_type": "headers", "key": "X-Tuple"},
+                },
+                {
+                    "source": {"input_type": "context", "key": "set_value"},
+                    "target": {"target_type": "headers", "key": "X-Set"},
+                },
+            ],
+            connector_runtime={
+                "context": {
+                    "tuple_value": ("account", "6185"),
+                    "set_value": {"account", "6185"},
+                },
+                "secrets": {},
+                "auth_selector": {},
+            },
+        )
+
+        res = await tool.run_json_async({})
+        assert res["success"] is True
+
+        mock_call_api.assert_called_once_with(
+            url="https://api.example.com/clients",
+            method="GET",
+            headers={},
+            params={},
+            body=None,
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_json_async_returns_error_without_any_url():
     tool = CustomApiTool(name="test", description="test", env={})
 

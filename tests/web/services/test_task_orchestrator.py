@@ -1075,6 +1075,58 @@ async def test_schedule_bg_marks_task_failed_when_snapshot_load_raises(
 
 
 @pytest.mark.asyncio
+async def test_schedule_bg_cleanup_handles_missing_payload_turn_id(db_session) -> None:
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_service import TaskLease
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=MagicMock(),
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(),
+        ) as mock_exec,
+        patch(
+            "xagent.web.services.task_orchestrator.release_current_runner_task_lease_with_workforce_sync",
+        ) as mock_release,
+        patch(
+            "xagent.web.services.task_orchestrator.finish_turn",
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        bg_task = _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=None,  # type: ignore[arg-type]
+            force_fresh=False,
+            context=None,
+        )
+        await bg_task
+
+    mock_exec.assert_not_called()
+    mock_release.assert_called_once()
+
+
+@pytest.mark.asyncio
 async def test_schedule_bg_marks_task_failed_when_execute_raises(
     db_session,
 ) -> None:

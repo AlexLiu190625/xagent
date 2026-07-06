@@ -120,6 +120,7 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
             "secrets": {"authorization": "Bearer tenant-token"},
             "auth_selector": {"resource_owner_key": "xagent:user:owner"},
         },
+        "tuple_body": ({"refresh_token": "tuple-refresh-secret"}, {"safe": "value"}),
         "body": [{"refresh_token": "refresh-secret"}, {"safe": "value"}],
     }
 
@@ -140,6 +141,10 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
             "secrets": {"authorization": REDACTED_RUNTIME_SECRET},
             "auth_selector": {"resource_owner_key": REDACTED_RUNTIME_SECRET},
         },
+        "tuple_body": (
+            {"refresh_token": REDACTED_RUNTIME_SECRET},
+            {"safe": "value"},
+        ),
         "body": [
             {"refresh_token": REDACTED_RUNTIME_SECRET},
             {"safe": "value"},
@@ -151,6 +156,7 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
     assert "private-key-secret" not in repr(redacted)
     assert "tenant-token" not in repr(redacted)
     assert "xagent:user:owner" not in repr(redacted)
+    assert "tuple-refresh-secret" not in repr(redacted)
 
 
 def test_runtime_config_validation_rejects_mcp_context_to_transport_header() -> None:

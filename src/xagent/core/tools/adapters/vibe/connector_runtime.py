@@ -174,7 +174,13 @@ def redact_runtime_sensitive_payload(value: Any) -> Any:
         return redacted
     if isinstance(value, list):
         return [redact_runtime_sensitive_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_runtime_sensitive_payload(item) for item in value)
     return value
+
+
+def is_runtime_header_scalar(value: Any) -> bool:
+    return not isinstance(value, (dict, list, tuple, set))
 
 
 def _is_sensitive_runtime_key(key: Any) -> bool:

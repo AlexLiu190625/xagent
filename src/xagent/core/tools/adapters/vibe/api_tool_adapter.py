@@ -21,6 +21,7 @@ from .connector_runtime import (
     binding_source_value,
     binding_target,
     connector_runtime_from_config,
+    is_runtime_header_scalar,
     runtime_bindings_from_config,
 )
 
@@ -363,7 +364,7 @@ class CustomApiTool(AbstractBaseTool):
             )
             if value is MISSING_RUNTIME_VALUE:
                 continue
-            if isinstance(value, (dict, list)):
+            if not is_runtime_header_scalar(value):
                 logger.warning(
                     "Ignoring non-scalar runtime header binding %s for tool %s",
                     header_name,

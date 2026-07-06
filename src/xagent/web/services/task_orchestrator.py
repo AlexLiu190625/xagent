@@ -978,15 +978,17 @@ def _schedule_bg(
                             task_id,
                             e,
                         )
+            turn_id = getattr(payload, "turn_id", None)
             try:
                 from .connector_runtime import pop_ephemeral_runtime_values
 
-                pop_ephemeral_runtime_values(payload.turn_id)
+                if turn_id is not None:
+                    pop_ephemeral_runtime_values(turn_id)
             except Exception:
                 logger.warning(
                     "connector runtime cleanup failed for task %s turn %s",
                     task_id,
-                    payload.turn_id,
+                    turn_id,
                     exc_info=True,
                 )
 

@@ -171,8 +171,9 @@ class MCPToolAdapter(AbstractBaseTool):
             concurrency_safe=concurrency_safe,
             concurrent_tools=_normalize_concurrent_tools(concurrent_tools),
         )
-        self._runtime_bindings = runtime_bindings_from_config(connection)
-        self._connector_runtime = connector_runtime_from_config(connection)
+        runtime_config = connection if isinstance(connection, Mapping) else {}
+        self._runtime_bindings = runtime_bindings_from_config(runtime_config)
+        self._connector_runtime = connector_runtime_from_config(runtime_config)
         from .base import ToolCategory
 
         self.category = ToolCategory.MCP
@@ -549,9 +550,9 @@ class MCPToolAdapter(AbstractBaseTool):
     ) -> dict[str, Any] | None:
         if not _exception_indicates_http_401(exc):
             return None
-        refresh = cast(Mapping[str, Any], self.connection).get(
-            _RUNTIME_CONNECTION_REFRESH_KEY
-        )
+        if not isinstance(self.connection, Mapping):
+            return None
+        refresh = self.connection.get(_RUNTIME_CONNECTION_REFRESH_KEY)
         if not callable(refresh):
             return None
 

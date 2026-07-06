@@ -2013,7 +2013,13 @@ class ReActPattern(AgentPattern):
         if not callable(sanitizer):
             return tool_call
 
-        args = dict(tool_call.get("args") or {})
+        raw_args = tool_call.get("args")
+        if raw_args is None:
+            args: dict[str, Any] = {}
+        elif isinstance(raw_args, dict):
+            args = dict(raw_args)
+        else:
+            return tool_call
         sanitized = sanitizer(args)
         if not isinstance(sanitized, dict) or sanitized == args:
             return tool_call
