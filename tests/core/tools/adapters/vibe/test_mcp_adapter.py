@@ -86,7 +86,7 @@ def test_exception_indicates_http_401_uses_bounded_status_signals():
     assert _exception_indicates_http_401(StatusError("request failed"))
     assert _exception_indicates_http_401(RuntimeError("HTTP status 401"))
     assert _exception_indicates_http_401(RuntimeError("401 Unauthorized"))
-    assert _exception_indicates_http_401(RuntimeError("Unauthorized"))
+    assert not _exception_indicates_http_401(RuntimeError("Unauthorized"))
     assert not _exception_indicates_http_401(
         RuntimeError("connection reset on port 401")
     )
@@ -422,8 +422,40 @@ async def test_delegated_authorization_401_with_non_mapping_connection_does_not_
     result = await adapter.run_json_async({})
 
     assert result["is_error"] is True
-    assert "HTTP 401 Unauthorized" in result["content"][0]["text"]
+    assert result["content"][0]["text"] == "Error executing MCP tool."
     assert "AttributeError" not in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_tool_execution_error_does_not_echo_raw_exception(monkeypatch):
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={"type": "object", "properties": {}},
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={"transport": "streamable_http", "url": "https://mcp.example.test"},
+    )
+
+    class _FakeSession:
+        async def initialize(self):
+            raise RuntimeError("transport failed with Bearer runtime-token")
+
+    @asynccontextmanager
+    async def _fake_create_session(connection):
+        yield _FakeSession()
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.create_session",
+        _fake_create_session,
+    )
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is True
+    assert result["content"][0]["text"] == "Error executing MCP tool."
+    assert "runtime-token" not in repr(result)
 
 
 @pytest.mark.asyncio

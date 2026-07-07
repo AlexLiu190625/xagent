@@ -320,9 +320,17 @@ class CustomApiTool(AbstractBaseTool):
             ).model_dump()
 
         except Exception as e:
-            logger.error(f"Error executing Custom API {self._name}: {e}")
+            logger.error(
+                "Error executing Custom API %s with %s",
+                self._name,
+                type(e).__name__,
+            )
             return CustomApiToolResult(
-                success=False, status_code=0, headers={}, body=None, error=str(e)
+                success=False,
+                status_code=0,
+                headers={},
+                body=None,
+                error="Error executing Custom API.",
             ).model_dump()
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:

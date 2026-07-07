@@ -141,6 +141,28 @@ async def test_run_json_async_uses_configured_endpoint_defaults():
 
 
 @pytest.mark.asyncio
+async def test_run_json_async_error_does_not_echo_raw_exception():
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.side_effect = RuntimeError(
+            "transport failed with Bearer runtime-token"
+        )
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+        )
+
+        res = await tool.run_json_async({})
+
+        assert res["success"] is False
+        assert res["error"] == "Error executing Custom API."
+        assert "runtime-token" not in repr(res)
+
+
+@pytest.mark.asyncio
 async def test_run_json_async_merges_configured_and_call_headers():
     with (
         patch(

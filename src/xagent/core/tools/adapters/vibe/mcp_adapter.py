@@ -42,28 +42,10 @@ class EmptyArgsModel(BaseModel):
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
 _HTTP_401_TEXT_RE = re.compile(
-    r"\bunauthorized\b|"
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
     r"\b401\s+unauthorized\b",
     re.IGNORECASE,
 )
-
-
-def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
-    """Flatten nested exception groups into a readable error string."""
-    messages: list[str] = []
-
-    def _collect(group: BaseExceptionGroup) -> None:
-        for sub_exc in group.exceptions:
-            if isinstance(sub_exc, BaseExceptionGroup):
-                _collect(sub_exc)
-            else:
-                messages.append(str(sub_exc))
-
-    _collect(exc)
-    if not messages:
-        return str(exc)
-    return f"{exc}: " + ", ".join(messages)
 
 
 def _exception_indicates_http_401(exc: BaseException) -> bool:
@@ -509,18 +491,23 @@ class MCPToolAdapter(AbstractBaseTool):
 
         except BaseExceptionGroup as e:
             logger.error(
-                f"MCP tool {self.mcp_tool.name} execution failed with exception group: {e}"
+                "MCP tool %s execution failed with exception group %s",
+                self.mcp_tool.name,
+                type(e).__name__,
             )
-            error_msg = _format_exception_group_messages(e)
             return {
-                "content": [{"text": f"Error executing MCP tool: {error_msg}"}],
+                "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
             }
 
         except Exception as e:
-            logger.error(f"MCP tool {self.mcp_tool.name} execution failed: {e}")
+            logger.error(
+                "MCP tool %s execution failed with %s",
+                self.mcp_tool.name,
+                type(e).__name__,
+            )
             return {
-                "content": [{"text": f"Error executing MCP tool: {e}"}],
+                "content": [{"text": "Error executing MCP tool."}],
                 "is_error": True,
             }
 
