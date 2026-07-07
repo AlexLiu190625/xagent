@@ -103,6 +103,7 @@ export function ConnectMcpDialog({
     description: "",
     config: {} as Record<string, any>
   })
+  const [runtimeValidationError, setRuntimeValidationError] = useState<string | null>(null)
 
   const isAppConnected = (app: AppIntegration) => Boolean(app.is_connected)
 
@@ -145,6 +146,7 @@ export function ConnectMcpDialog({
       setLocalSelectedServers(selectedMcpServers || [])
       setActiveTab("library")
       setEditingCustomServerId(null)
+      setRuntimeValidationError(null)
     }
   }, [open, t, selectedMcpServers])
 
@@ -169,7 +171,7 @@ export function ConnectMcpDialog({
     let url = "";
     const method = editingCustomServerId ? 'PUT' : 'POST';
     const connectorType = payload.transport === "custom_api" ? "custom_api" : "mcp";
-    const runtimeError = getRuntimeConfigError(payload, connectorType);
+    const runtimeError = runtimeValidationError || getRuntimeConfigError(payload, connectorType);
     if (runtimeError) {
       toast.error(t(runtimeError));
       return;
@@ -442,7 +444,13 @@ export function ConnectMcpDialog({
 
   return (
     <>
-    <Dialog open={open} onOpenChange={onOpenChange}>
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        onOpenChange(nextOpen)
+        if (!nextOpen) setRuntimeValidationError(null)
+      }}
+    >
       <DialogContent className="sm:max-w-5xl md:max-w-6xl w-[95vw] h-[85vh] flex flex-col p-0 overflow-hidden gap-0 bg-slate-50">
         <DialogHeader className="px-6 py-4 border-b bg-white shrink-0 pr-10">
           <DialogTitle className="text-xl flex items-center gap-2 font-bold text-left">
@@ -464,6 +472,7 @@ export function ConnectMcpDialog({
                 className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-blue-600 data-[state=active]:text-blue-600 rounded-none h-full px-0 font-semibold flex items-center gap-2 text-slate-500"
                 onClick={() => {
                   setEditingCustomServerId(null)
+                  setRuntimeValidationError(null)
                   setMcpFormData({
                     name: "",
                     transport: "custom_api",
@@ -484,6 +493,7 @@ export function ConnectMcpDialog({
                     onConnectCustom()
                   } else {
                     setEditingCustomServerId(null)
+                    setRuntimeValidationError(null)
                     setMcpFormData({
                       name: "",
                       transport: "stdio",
@@ -763,6 +773,7 @@ export function ConnectMcpDialog({
                   setMcpFormData={setMcpFormData}
                   customApiEnv={customApiEnv}
                   setCustomApiEnv={setCustomApiEnv}
+                  onRuntimeValidationErrorChange={setRuntimeValidationError}
                   originalEnvObj={
                     editingCustomServerId
                       ? globalMcpServers.find(s => s.id === editingCustomServerId && s.transport === "custom_api")?.config?.env || {}
@@ -806,6 +817,7 @@ export function ConnectMcpDialog({
                     setMcpFormData={setMcpFormData}
                     serverId={editingCustomServerId}
                     onOAuthStatusChange={loadApps}
+                    onRuntimeValidationErrorChange={setRuntimeValidationError}
                   />
                 </div>
                 <div className="flex justify-end gap-3 mt-8">
@@ -899,6 +911,7 @@ export function ConnectMcpDialog({
           if (appToConfigure.is_custom && appToConfigure.server) {
             setSelectedApp(null);
             setEditingCustomServerId(appToConfigure.server.id);
+            setRuntimeValidationError(null);
             setMcpFormData({
               name: appToConfigure.server.name,
               transport: appToConfigure.server.transport,

@@ -18,6 +18,7 @@ interface CustomMcpFormProps {
   setMcpFormData: React.Dispatch<React.SetStateAction<MCPServerFormData>>
   serverId?: number | null
   onOAuthStatusChange?: () => void
+  onRuntimeValidationErrorChange?: (error: string | null) => void
 }
 
 interface McpOAuthGrantStatus {
@@ -73,7 +74,8 @@ export function CustomMcpForm({
   mcpFormData,
   setMcpFormData,
   serverId,
-  onOAuthStatusChange
+  onOAuthStatusChange,
+  onRuntimeValidationErrorChange,
 }: CustomMcpFormProps) {
   const { t } = useI18n()
   const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
@@ -937,6 +939,7 @@ export function CustomMcpForm({
         connectorType="mcp"
         formData={mcpFormData}
         setFormData={setMcpFormData}
+        onValidationErrorChange={onRuntimeValidationErrorChange}
         disabled={!canEditGlobal}
       />
 

@@ -31,6 +31,7 @@ interface CustomApiFormProps {
     customApiEnv: { key: string, value: string }[]
     setCustomApiEnv: React.Dispatch<React.SetStateAction<{ key: string, value: string }[]>>
     originalEnvObj?: Record<string, any>
+    onRuntimeValidationErrorChange?: (error: string | null) => void
 }
 
 export function CustomApiForm({
@@ -38,7 +39,8 @@ export function CustomApiForm({
     setMcpFormData,
     customApiEnv,
     setCustomApiEnv,
-    originalEnvObj = {}
+    originalEnvObj = {},
+    onRuntimeValidationErrorChange,
 }: CustomApiFormProps) {
     const { t } = useI18n()
 
@@ -401,6 +403,7 @@ export function CustomApiForm({
                 connectorType="custom_api"
                 formData={mcpFormData}
                 setFormData={setMcpFormData}
+                onValidationErrorChange={onRuntimeValidationErrorChange}
             />
 
             <Collapsible open={isAdvancedOpen} onOpenChange={setIsAdvancedOpen} className="w-full space-y-2 pt-4">

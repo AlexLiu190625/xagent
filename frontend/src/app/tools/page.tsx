@@ -159,6 +159,7 @@ function ToolsPageContent() {
     method: "GET",
     headers: {}
   })
+  const [runtimeValidationError, setRuntimeValidationError] = useState<string | null>(null)
 
   const { t } = useI18n()
   const { user } = useAuth()
@@ -459,6 +460,7 @@ function ToolsPageContent() {
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
       setEditingServer(server)
+      setRuntimeValidationError(null)
       setMcpFormData({
         name: server.name,
         transport: server.transport,
@@ -484,6 +486,7 @@ function ToolsPageContent() {
       setIsMcpDialogOpen(true)
     } else {
       setEditingServer(server)
+      setRuntimeValidationError(null)
       setMcpFormData({
         name: server.name,
         transport: server.transport,
@@ -510,7 +513,7 @@ function ToolsPageContent() {
 
     let payload: any = { ...mcpFormData }
     const connectorType = payload.transport === "custom_api" ? "custom_api" : "mcp"
-    const runtimeError = getRuntimeConfigError(payload, connectorType)
+    const runtimeError = runtimeValidationError || getRuntimeConfigError(payload, connectorType)
     if (runtimeError) {
       toast.error(t(runtimeError))
       return
@@ -917,7 +920,13 @@ function ToolsPageContent() {
             <span className="hidden sm:inline">{t('tools.mcp.addConnector')}</span>
             <span className="sm:hidden">{t('common.add') || t('tools.mcp.addConnector')}</span>
           </Button>
-          <Dialog open={isMcpDialogOpen} onOpenChange={setIsMcpDialogOpen}>
+          <Dialog
+            open={isMcpDialogOpen}
+            onOpenChange={(nextOpen) => {
+              setIsMcpDialogOpen(nextOpen)
+              if (!nextOpen) setRuntimeValidationError(null)
+            }}
+          >
             <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
               <DialogHeader>
                 <DialogTitle>
@@ -936,6 +945,7 @@ function ToolsPageContent() {
                       setMcpFormData={setMcpFormData}
                       customApiEnv={customApiEnv}
                       setCustomApiEnv={setCustomApiEnv}
+                      onRuntimeValidationErrorChange={setRuntimeValidationError}
                       originalEnvObj={(() => {
                         let originalEnvObj: Record<string, any> = {};
                         if (editingServer?.config?.env) {
@@ -961,6 +971,7 @@ function ToolsPageContent() {
                       setMcpFormData={setMcpFormData}
                       serverId={editingServer?.id}
                       onOAuthStatusChange={loadMCPServers}
+                      onRuntimeValidationErrorChange={setRuntimeValidationError}
                     />
                   </>
                 )}
@@ -1313,6 +1324,7 @@ function ToolsPageContent() {
           if (app.is_custom && app.server) {
             setIsOfficialAppDialogOpen(false);
             setEditingServer(app.server);
+            setRuntimeValidationError(null);
 
             if (app.server.transport === "custom_api") {
               const configObj = app.server.config || {};

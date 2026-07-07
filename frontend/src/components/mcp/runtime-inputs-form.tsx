@@ -69,6 +69,7 @@ interface RuntimeInputsFormProps {
   connectorType: ConnectorType
   formData: MCPServerFormData
   setFormData: React.Dispatch<React.SetStateAction<MCPServerFormData>>
+  onValidationErrorChange?: (error: string | null) => void
   disabled?: boolean
 }
 
@@ -300,6 +301,7 @@ export function RuntimeInputsForm({
   connectorType,
   formData,
   setFormData,
+  onValidationErrorChange,
   disabled = false,
 }: RuntimeInputsFormProps) {
   const { t } = useI18n()
@@ -373,9 +375,14 @@ export function RuntimeInputsForm({
     .map((binding) => bindingError(binding, inputs, connectorType, delegatedEnabled))
     .filter((error): error is string => Boolean(error))
   const duplicateInputError = duplicateRuntimeInputError(inputs)
+  const localValidationError = duplicateInputError || bindingErrors[0] || null
   const hasToolArgumentBinding = bindings.some(
     (binding) => binding.targetType === "tool_arguments",
   )
+
+  useEffect(() => {
+    onValidationErrorChange?.(localValidationError)
+  }, [localValidationError, onValidationErrorChange])
 
   return (
     <div className="space-y-4 rounded-md border bg-slate-50/60 p-4">
@@ -405,11 +412,11 @@ export function RuntimeInputsForm({
         </Alert>
       )}
 
-      {(duplicateInputError || bindingErrors.length > 0) && (
+      {localValidationError && (
         <Alert className="border-red-200 bg-red-50 text-red-900">
           <AlertTriangle className="h-4 w-4 text-red-700" />
           <AlertDescription className="text-red-800">
-            {t(duplicateInputError || bindingErrors[0])}
+            {t(localValidationError)}
           </AlertDescription>
         </Alert>
       )}

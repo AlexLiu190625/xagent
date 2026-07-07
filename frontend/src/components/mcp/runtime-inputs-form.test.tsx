@@ -1,5 +1,5 @@
 import React, { useState } from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { CustomApiForm } from "./custom-api-form"
@@ -18,8 +18,10 @@ afterEach(() => {
 
 function RuntimeFormHarness({
   connectorType = "mcp",
+  onValidationErrorChange,
 }: {
   connectorType?: "mcp" | "custom_api"
+  onValidationErrorChange?: (error: string | null) => void
 }) {
   const [formData, setFormData] = useState<MCPServerFormData>({
     name: "records",
@@ -34,6 +36,7 @@ function RuntimeFormHarness({
         connectorType={connectorType}
         formData={formData}
         setFormData={setFormData}
+        onValidationErrorChange={onValidationErrorChange}
       />
       <pre data-testid="form-state">{JSON.stringify(formData)}</pre>
     </>
@@ -153,6 +156,32 @@ describe("RuntimeInputsForm", () => {
     expect(
       screen.getByText("tools.mcp.runtime.errors.duplicateInput"),
     ).toBeInTheDocument()
+  })
+
+  it("reports duplicate runtime input errors before schema folding hides them", async () => {
+    const onValidationErrorChange = vi.fn()
+    render(
+      <RuntimeFormHarness
+        connectorType="mcp"
+        onValidationErrorChange={onValidationErrorChange}
+      />,
+    )
+
+    fireEvent.click(screen.getByText("tools.mcp.runtime.addInput"))
+    fireEvent.click(screen.getByText("tools.mcp.runtime.addInput"))
+    const keyInputs = screen.getAllByPlaceholderText("tools.mcp.runtime.key")
+    fireEvent.change(keyInputs[1], { target: { value: "account_id" } })
+
+    expect(formState().runtime_input_schema).toEqual({
+      context: {
+        account_id: { type: "string", required: false },
+      },
+    })
+    await waitFor(() => {
+      expect(onValidationErrorChange).toHaveBeenLastCalledWith(
+        "tools.mcp.runtime.errors.duplicateInput",
+      )
+    })
   })
 
   it("writes Custom API bindings and delegated authorization to top-level form data", () => {
