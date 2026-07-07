@@ -717,6 +717,143 @@ class TestCallbackPipeline:
         assert [a.outcome for a in audits] == ["rejected_disabled"]
         assert audits[0].trigger_id == sibling.id
 
+    async def test_mixed_target_batch_keeps_per_event_outcomes(
+        self, db_session, stub_provider
+    ):
+        """Batched trigger resolution preserves per-event behavior: valid,
+        missing, and disabled targets in one callback land the same outcomes
+        as they did with per-event lookups."""
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        default_trigger = _create_stub_trigger(
+            db_session, user, agent, resource_id="res-1"
+        )
+        sibling = _create_stub_trigger(
+            db_session,
+            user,
+            agent,
+            callback_id="cb-stub-sibling",
+            resource_id="res-1",
+        )
+        disabled_sibling = _create_stub_trigger(
+            db_session,
+            user,
+            agent,
+            callback_id="cb-stub-disabled",
+            resource_id="res-1",
+            enabled=False,
+        )
+
+        raw_body = json.dumps(
+            [
+                {"id": "evt-default", "type": "stub.event"},
+                {
+                    "id": "evt-sibling",
+                    "type": "stub.event",
+                    "target_trigger_id": int(sibling.id),
+                },
+                {
+                    "id": "evt-missing",
+                    "type": "stub.event",
+                    "target_trigger_id": 999_999,
+                },
+                {
+                    "id": "evt-disabled",
+                    "type": "stub.event",
+                    "target_trigger_id": int(disabled_sibling.id),
+                },
+            ]
+        ).encode()
+        result = await process_trigger_callback(
+            db_session,
+            context=_context(headers=_good_headers()),
+            raw_body=raw_body,
+        )
+
+        assert result.status_code == 200
+        assert result.outcome == TriggerAuditOutcome.ACCEPTED
+        assert sorted(int(run.trigger_id) for run in result.runs) == sorted(
+            [int(default_trigger.id), int(sibling.id)]
+        )
+        assert result.rejected_events == 2
+        audits = _audits(db_session)
+        assert [a.outcome for a in audits] == [
+            "rejected_resource",
+            "rejected_disabled",
+            "accepted",
+        ]
+        assert audits[0].detail["target_trigger_id"] == 999_999
+        assert audits[1].trigger_id == disabled_sibling.id
+
+    async def test_trigger_resolution_issues_one_query_per_callback(
+        self, db_session, stub_provider
+    ):
+        """Target-trigger resolution is batched into a single IN() query per
+        callback regardless of event count."""
+        from sqlalchemy import event as sa_event
+
+        from xagent.web.models.database import get_engine
+
+        user = _create_user(db_session)
+        agent = _create_agent(db_session, user)
+        _create_stub_trigger(db_session, user, agent, resource_id="res-1")
+        sibling_a = _create_stub_trigger(
+            db_session, user, agent, callback_id="cb-stub-a", resource_id="res-1"
+        )
+        sibling_b = _create_stub_trigger(
+            db_session, user, agent, callback_id="cb-stub-b", resource_id="res-1"
+        )
+
+        raw_body = json.dumps(
+            [
+                {"id": "evt-1", "type": "stub.event"},
+                {
+                    "id": "evt-2",
+                    "type": "stub.event",
+                    "target_trigger_id": int(sibling_a.id),
+                },
+                {
+                    "id": "evt-3",
+                    "type": "stub.event",
+                    "target_trigger_id": int(sibling_a.id),
+                },
+                {
+                    "id": "evt-4",
+                    "type": "stub.event",
+                    "target_trigger_id": int(sibling_b.id),
+                },
+            ]
+        ).encode()
+
+        statements: list[str] = []
+
+        def _track(conn, cursor, statement, parameters, context, executemany):
+            statements.append(statement)
+
+        engine = get_engine()
+        sa_event.listen(engine, "before_cursor_execute", _track)
+        try:
+            result = await process_trigger_callback(
+                db_session,
+                context=_context(headers=_good_headers()),
+                raw_body=raw_body,
+            )
+        finally:
+            sa_event.remove(engine, "before_cursor_execute", _track)
+
+        assert result.outcome == TriggerAuditOutcome.ACCEPTED
+        assert len(result.runs) == 4
+
+        # Per-event resolution filtered on agent_triggers.user_id; the batch
+        # query is the only statement with that predicate and must use IN().
+        resolution_queries = [
+            s
+            for s in statements
+            if "agent_triggers.user_id =" in s or "agent_triggers.id IN" in s
+        ]
+        assert len(resolution_queries) == 1
+        assert "agent_triggers.id IN" in resolution_queries[0]
+
     async def test_audit_rows_survive_trigger_deletion(self, db_session, stub_provider):
         user = _create_user(db_session)
         agent = _create_agent(db_session, user)

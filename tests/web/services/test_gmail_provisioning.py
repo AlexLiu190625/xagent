@@ -417,7 +417,11 @@ async def test_gmail_provider_register_unregister_offload_sync_sdk_work(
 
     provider = GmailProvider()
     result = await provider.register(db_session, trigger, object())
-    await provider.unregister(db_session, trigger, object())
+    # unregister resolves the binding from config alone; the trigger row may
+    # already be rebound or deleted when CRUD dispatches it.
+    await provider.unregister(
+        db_session, trigger, {"oauth_account_id": int(account.id)}
+    )
 
     assert result.status == TriggerProvisioningStatus.ACTIVE
     assert calls == [
@@ -551,6 +555,75 @@ def test_reconcile_copies_watch_state_status_onto_triggers(
 
     # Idempotent: nothing to update on a second pass.
     assert reconcile_gmail_trigger_provisioning(db_session) == 0
+
+
+@pytest.mark.parametrize(
+    ("candidate_count", "expected_page_queries"),
+    [
+        # Short final page (5 = 2+2+1): the len(page) < page_size branch
+        # terminates without an extra query.
+        (5, 3),
+        # Exact multiple of the page size (4 = 2+2): termination needs one
+        # extra empty-page query, taking the `if not page` branch.
+        (4, 3),
+    ],
+)
+def test_reconcile_full_scan_pages_candidates_with_bounded_queries(
+    db_session: Session,
+    candidate_count: int,
+    expected_page_queries: int,
+) -> None:
+    """The sweep-path reconcile (triggers=None) walks candidates in keyset
+    pages: every diverged trigger still reconciles, and every candidate
+    query carries the page bound instead of scanning system-wide."""
+    from sqlalchemy import event as sa_event
+
+    from xagent.web.models.database import get_engine
+
+    user = _create_user(db_session)
+    agent = _create_agent(db_session, user)
+    triggers = []
+    for index in range(candidate_count):
+        account = _create_oauth(db_session, user, email=f"owner{index}@gmail.example")
+        trigger = _create_gmail_trigger(db_session, user, agent, account)
+        setattr(trigger, "provisioning_status", TriggerProvisioningStatus.PENDING.value)
+        db_session.add(trigger)
+        db_session.add(
+            GmailWatchState(
+                user_id=int(user.id),
+                oauth_account_id=int(account.id),
+                email=str(account.email).lower(),
+                history_id=f"hist-{index}",
+                topic_name=f"projects/demo-project/topics/xagent-gmail-{index}",
+                status=TriggerProvisioningStatus.ACTIVE.value,
+            )
+        )
+        triggers.append(trigger)
+    db_session.commit()
+
+    statements: list[str] = []
+
+    def _track(conn, cursor, statement, parameters, context, executemany):
+        statements.append(statement)
+
+    engine = get_engine()
+    sa_event.listen(engine, "before_cursor_execute", _track)
+    try:
+        updated = reconcile_gmail_trigger_provisioning(db_session, batch_size=2)
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", _track)
+
+    assert updated == candidate_count
+    for trigger in triggers:
+        db_session.refresh(trigger)
+        assert trigger.provisioning_status == TriggerProvisioningStatus.ACTIVE.value
+
+    candidate_queries = [
+        s for s in statements if "FROM agent_triggers" in s and "SELECT" in s
+    ]
+    assert candidate_queries, "expected candidate page queries"
+    assert all("LIMIT" in s for s in candidate_queries)
+    assert len(candidate_queries) == expected_page_queries
 
 
 class ResyncFakeSubscriber(FakeSubscriber):

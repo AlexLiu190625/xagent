@@ -5,6 +5,8 @@ import hashlib
 import json
 import logging
 import secrets
+from collections.abc import Coroutine
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -30,10 +32,6 @@ from .connector_runtime import (
     persist_create_connector_runtime_context,
     prepare_create_connector_runtime,
     reject_ephemeral_connector_runtime_payload,
-)
-from .gmail_provisioning import (
-    provision_gmail_trigger,
-    release_gmail_mailbox_if_unused,
 )
 from .task_orchestrator import (
     TaskTurnError,
@@ -375,28 +373,52 @@ def _validate_persisted_connector_runtime_config(config: dict[str, Any]) -> None
         raise TriggerServiceError(exc.safe_message) from exc
 
 
-def _gmail_oauth_account_id(config: Any) -> int | None:
-    if not isinstance(config, dict):
-        return None
-    value = config.get("oauth_account_id")
-    if value is None:
-        return None
-    return int(value)
+def _run_provider_coro(coro: Coroutine[Any, Any, Any]) -> Any:
+    """Run an async provider call to completion from sync CRUD code.
+
+    CRUD helpers normally run in worker threads without an event loop
+    (routes wrap them in asyncio.to_thread), where asyncio.run suffices.
+    Callers that invoke CRUD from a thread already running a loop get the
+    coroutine executed on a private loop in a helper thread instead; either
+    way the call blocks until provisioning finishes, matching the
+    previously-synchronous behavior.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(asyncio.run, coro).result()
 
 
-def _provision_gmail_trigger_if_enabled(db: Session, trigger: AgentTrigger) -> None:
-    if str(trigger.type) != TriggerType.GMAIL.value or not bool(trigger.enabled):
+def _register_trigger_with_provider(db: Session, trigger: AgentTrigger) -> None:
+    """Provision provider-side delivery resources for an enabled trigger."""
+    if not bool(trigger.enabled):
         return
-    provision_gmail_trigger(db, trigger)
+    provider = maybe_get_trigger_provider(str(trigger.type))
+    if provider is None:
+        return
+    _run_provider_coro(provider.register(db, trigger, trigger.config))
     db.refresh(trigger)
 
 
-def _release_gmail_mailbox_if_bound(
-    db: Session, trigger_type: str, oauth_account_id: int | None
+def _unregister_trigger_binding(
+    db: Session,
+    trigger: AgentTrigger,
+    *,
+    trigger_type: str,
+    config: dict[str, Any],
 ) -> None:
-    if trigger_type != TriggerType.GMAIL.value or oauth_account_id is None:
+    """Tear down the delivery binding described by a trigger's previous config.
+
+    The trigger row may already hold a different binding or be deleted, so
+    the previous config is passed explicitly; providers resolve the binding
+    from it alone and no-op when other triggers still reference it.
+    """
+    provider = maybe_get_trigger_provider(trigger_type)
+    if provider is None:
         return
-    release_gmail_mailbox_if_unused(db, oauth_account_id)
+    _run_provider_coro(provider.unregister(db, trigger, config))
 
 
 def get_owned_agent(db: Session, *, user_id: int, agent_id: int) -> Agent | None:
@@ -479,7 +501,7 @@ def create_agent_trigger(
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
-    _provision_gmail_trigger_if_enabled(db, trigger)
+    _register_trigger_with_provider(db, trigger)
     return trigger, plain_secret
 
 
@@ -499,7 +521,7 @@ def update_agent_trigger(
 
     old_type = str(trigger.type)
     old_enabled = bool(trigger.enabled)
-    old_oauth_account_id = _gmail_oauth_account_id(trigger.config)
+    old_config = dict(trigger.config or {})
 
     plain_secret: str | None = None
     if "name" in updates and updates["name"] is not None:
@@ -542,12 +564,15 @@ def update_agent_trigger(
     db.add(trigger)
     db.commit()
     db.refresh(trigger)
-    new_oauth_account_id = _gmail_oauth_account_id(trigger.config)
-    if old_enabled and (
-        not bool(trigger.enabled) or old_oauth_account_id != new_oauth_account_id
-    ):
-        _release_gmail_mailbox_if_bound(db, old_type, old_oauth_account_id)
-    _provision_gmail_trigger_if_enabled(db, trigger)
+    # Unregister on any config change, not just a binding change: provider
+    # unregister is reference-counted teardown, so it no-ops while the
+    # (possibly unchanged) binding is still referenced by an enabled trigger.
+    new_config = dict(trigger.config or {})
+    if old_enabled and (not bool(trigger.enabled) or old_config != new_config):
+        _unregister_trigger_binding(
+            db, trigger, trigger_type=old_type, config=old_config
+        )
+    _register_trigger_with_provider(db, trigger)
     return trigger, plain_secret
 
 
@@ -564,10 +589,12 @@ def delete_agent_trigger(
     if trigger is None:
         raise TriggerNotFoundError("Trigger not found")
     trigger_type = str(trigger.type)
-    oauth_account_id = _gmail_oauth_account_id(trigger.config)
+    binding_config = dict(trigger.config or {})
     db.delete(trigger)
     db.commit()
-    _release_gmail_mailbox_if_bound(db, trigger_type, oauth_account_id)
+    _unregister_trigger_binding(
+        db, trigger, trigger_type=trigger_type, config=binding_config
+    )
 
 
 def render_trigger_prompt(

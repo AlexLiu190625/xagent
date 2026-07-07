@@ -155,6 +155,27 @@ def _terminal_task_error_payload(
                 error_message=message,
             )
             db.commit()
+            # Persist the error as an assistant message so failures that
+            # happen before agent execution starts (no trace events, e.g.
+            # sandbox capacity rejection) survive a history reload instead
+            # of degrading to a generic "Unknown error" bubble.
+            task_user_id = getattr(task, "user_id", None)
+            if task_user_id is not None:
+                from ..services.chat_history_service import persist_assistant_message
+
+                try:
+                    persist_assistant_message(
+                        db,
+                        task_id=task_id,
+                        user_id=int(task_user_id),
+                        content=message,
+                        message_type="chat_response",
+                    )
+                except Exception:
+                    logger.warning(
+                        "Failed to persist terminal error chat message",
+                        exc_info=True,
+                    )
         return _task_error_payload(
             db,
             task_id,

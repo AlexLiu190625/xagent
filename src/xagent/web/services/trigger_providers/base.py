@@ -119,11 +119,25 @@ class TriggerProvider(Protocol):
     async def register(
         self, db: Session, trigger: AgentTrigger, config: Any
     ) -> RegistrationResult:
-        """Provision provider-side delivery resources for a trigger."""
+        """Provision provider-side delivery resources for a trigger.
+
+        Trigger CRUD dispatches this after every create/update that leaves
+        the trigger enabled, so implementations must be idempotent for an
+        unchanged binding. Providers persist provisioning state on the
+        trigger themselves; the returned result is informational.
+        """
         ...
 
     async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
-        """Tear down provider-side delivery resources for a trigger."""
+        """Tear down the delivery binding described by ``config``.
+
+        Trigger CRUD dispatches this with the trigger's previous config when
+        a previously-enabled binding is disabled, changed, or deleted. The
+        trigger row may already hold a different binding or no longer exist,
+        so implementations must resolve the binding from ``config`` alone
+        and tolerate bindings still referenced by other triggers
+        (reference-counted teardown).
+        """
         ...
 
     async def parse_events(

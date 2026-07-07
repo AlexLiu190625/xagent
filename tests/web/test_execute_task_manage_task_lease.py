@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -151,6 +151,82 @@ async def test_execute_task_skips_lease_but_syncs_running_when_manage_false(
     mock_release.assert_not_called()
     mock_sync.assert_called_once()
     mock_stop_hb.assert_awaited_once_with(None, None)
+
+
+@pytest.mark.asyncio
+async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
+    db_session,
+) -> None:
+    """A reclaimed-sandbox raise from ``_acquire_sandbox_task`` must still
+    run the finally cleanup: heartbeat stop, lease release, and tracker
+    completion (whose only call site is that finally block)."""
+    user = User(username="lease-user3", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.commit()
+    task = Task(
+        user_id=user.id,
+        title="lease test",
+        description="test",
+        status=TaskStatus.RUNNING,
+        execution_mode="auto",
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    manager = AgentServiceManager()
+    tracker = MagicMock()
+    tracker.start_tracking = AsyncMock()
+    tracker.complete_tracking = AsyncMock()
+    agent_service = _FakeAgentService()
+    agent_service.execute_task = AsyncMock()  # type: ignore[method-assign]
+
+    with (
+        patch(
+            "xagent.web.api.chat.acquire_task_lease",
+            return_value=fake_lease,
+        ),
+        patch(
+            "xagent.web.api.chat.release_task_lease_with_workforce_sync",
+        ) as mock_release,
+        patch(
+            "xagent.web.api.chat.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ) as mock_stop_hb,
+        patch.object(
+            manager,
+            "_acquire_sandbox_task",
+            new=AsyncMock(side_effect=RuntimeError("sandbox reclaimed")),
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()) as mock_sbx,
+        patch(
+            "xagent.web.api.chat.sync_workforce_run_status",
+            return_value=False,
+        ),
+        patch(
+            "xagent.web.tracking.task_tracker.TaskTracker",
+            return_value=tracker,
+        ),
+    ):
+        with pytest.raises(RuntimeError, match="sandbox reclaimed"):
+            await manager.execute_task(
+                agent_service=agent_service,
+                task="hello",
+                tracking_task_id=str(task.id),
+                db_session=db_session,
+                manage_task_lease=True,
+            )
+
+    agent_service.execute_task.assert_not_awaited()
+    mock_stop_hb.assert_awaited_once()
+    mock_release.assert_called_once()
+    assert mock_release.call_args.kwargs["status"] == TaskStatus.FAILED
+    tracker.complete_tracking.assert_awaited_once()
+    mock_sbx.assert_awaited_once_with(None)
 
 
 def test_sync_workforce_run_status_running_is_idempotent(db_session) -> None:

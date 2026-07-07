@@ -6,7 +6,10 @@ import asyncio
 import logging
 import os
 import threading
-from collections.abc import Mapping
+import time
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
 
@@ -15,9 +18,12 @@ from ..config import (
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_host_storage_root,
+    get_sandbox_idle_ttl,
     get_sandbox_image,
     get_sandbox_max_concurrency,
+    get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_storage_root,
     get_uploads_dir,
@@ -31,6 +37,40 @@ from ..sandbox.base import Sandbox, SandboxConfig, SandboxTemplate
 logger = logging.getLogger(__name__)
 
 _WORKER_LIFECYCLE_MARKER = "::worker::"
+
+
+class SandboxCapacityError(RuntimeError):
+    """The sandbox container cap is reached and no idle sandbox is evictable.
+
+    Distinct from sandbox-service unavailability: by default the web layer
+    rejects the task with this error instead of falling back to local
+    execution (see XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY).
+    """
+
+    def __init__(self, *, cap: int, in_use: int) -> None:
+        super().__init__(
+            f"Sandbox capacity limit reached ({in_use} containers, cap {cap}) "
+            "and all sandboxes are busy. Please retry when a running task "
+            "finishes, or raise XAGENT_SANDBOX_MAX_CONTAINERS."
+        )
+        self.cap = cap
+        self.in_use = in_use
+
+
+@dataclass
+class _SandboxActivity:
+    """Per-lifecycle activity state used for reclamation decisions."""
+
+    ref_count: int = 0
+    last_activity: float = 0.0
+
+
+@dataclass
+class _LifecycleLockEntry:
+    """Per-lifecycle lock with holder/waiter tracking for safe eviction."""
+
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    waiters: int = 0
 
 
 class SandboxLease:
@@ -110,7 +150,15 @@ class SandboxLeaseProvider:
         self._available_slots.put_nowait(slot)
 
     async def get_worker_sandbox(self, slot: int) -> Sandbox:
-        """Get or lazily create a worker sandbox for a slot."""
+        """Get or lazily create a worker sandbox for a slot.
+
+        When the container cap leaves no room for a worker, the lease
+        degrades to the primary sandbox instead of failing the tool
+        mid-task — the same sharing semantics non-concurrency-safe leases
+        already have, trading isolation for availability. The degraded
+        result is not cached, so a later lease retries worker creation
+        once capacity frees up.
+        """
         if slot in self._workers:
             return self._workers[slot]
 
@@ -120,11 +168,22 @@ class SandboxLeaseProvider:
         async with self._worker_locks[slot]:
             if slot in self._workers:
                 return self._workers[slot]
-            worker = await self._manager.get_or_create_sandbox(
-                self._lifecycle_type,
-                f"{self._lifecycle_id}::worker::{slot}",
-                workspace_config=self._workspace_config,
-            )
+            try:
+                worker = await self._manager.get_or_create_sandbox(
+                    self._lifecycle_type,
+                    f"{self._lifecycle_id}::worker::{slot}",
+                    workspace_config=self._workspace_config,
+                )
+            except SandboxCapacityError as exc:
+                logger.warning(
+                    "No capacity for worker sandbox %s::%s::worker::%d; "
+                    "degrading to the primary sandbox: %s",
+                    self._lifecycle_type,
+                    self._lifecycle_id,
+                    slot,
+                    exc,
+                )
+                return self.primary_sandbox
             self._workers[slot] = worker
             return worker
 
@@ -208,8 +267,47 @@ class SandboxPathMapper:
 
 
 class SandboxManager:
-    """
-    Manages sandbox instances.
+    """Manages sandbox instances, their activity state, and reclamation.
+
+    Concurrency model — the invariants every change must preserve:
+
+    Synchronization primitives, from innermost to outermost:
+
+    - ``_activity_guard`` (one asyncio.Lock): makes compound check-then-act
+      decisions on activity state atomic — attach's provider-existence
+      check + ref-count increment, release's decrement + provider pop, and
+      the eviction claim (ref-count re-check + provider pop + instance
+      cache purge). Critical sections must stay fully synchronous: never
+      ``await`` while holding it, and never acquire it inside a ``finally``
+      (a cancellation delivered at that await point would skip the cleanup).
+      Independent single dict operations do NOT need it.
+    - ``_lifecycle_locks`` (per lifecycle key, waiter-counted): serialize
+      lease provider creation with release-to-zero worker cleanup and with
+      the idle sweep, per key. Entries are garbage-collected when the last
+      holder/waiter leaves.
+    - ``_locks`` + ``_locks_guard`` (per sandbox name): serialize container
+      creation per name inside ``get_or_create_sandbox``.
+    - ``_capacity_gate`` (global): serializes the cap check + eviction +
+      container creation so concurrent creations for different names cannot
+      all pass the count check.
+
+    Ordering rules:
+
+    - lifecycle lock -> per-name lock -> capacity gate is the only nesting
+      direction; never acquire a lifecycle lock while holding the gate
+      (a same-key creator holds its lifecycle lock while waiting for the
+      gate, so gate -> lifecycle closes a deadlock cycle). Capacity
+      eviction therefore does NOT lock the victim's lifecycle: it relies on
+      the gate plus the atomic claim purging the instance cache, which
+      forces any concurrent same-key re-creation to cache-miss and queue
+      behind the gate until the deletion finished.
+
+    Safety contract:
+
+    - A lifecycle with a non-zero ref-count is never deleted, stopped, or
+      evicted — by the sweep, by capacity eviction, or by any race between
+      them. Both reclamation paths go through ``_evict_idle_sandbox``,
+      whose claim re-validates the ref-count under ``_activity_guard``.
     """
 
     def __init__(self, service: SandboxService):
@@ -224,6 +322,18 @@ class SandboxManager:
         self._config_cache: dict[str, SandboxConfig] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._locks_guard = asyncio.Lock()
+        # Activity tracking: lease providers, active-task ref-counts, and
+        # last-activity timestamps keyed by the primary sandbox name. This is
+        # the single source of truth reclamation decisions are made from.
+        self._lease_providers: dict[str, SandboxLeaseProvider] = {}
+        self._activity: dict[str, _SandboxActivity] = {}
+        self._activity_guard = asyncio.Lock()
+        self._lifecycle_locks: dict[str, _LifecycleLockEntry] = {}
+        self._startup_monotonic = time.monotonic()
+        # Global gate serializing the capacity check with container creation:
+        # per-name locks cannot stop two concurrent creations for different
+        # names from both passing the count check.
+        self._capacity_gate = asyncio.Lock()
 
     @staticmethod
     def make_sandbox_name(lifecycle_type: str, lifecycle_id: str) -> str:
@@ -253,6 +363,141 @@ class SandboxManager:
             cls.make_sandbox_name(lifecycle_type, lifecycle_id)
             + _WORKER_LIFECYCLE_MARKER
         )
+
+    @classmethod
+    def _base_sandbox_name(cls, lifecycle_type: str, lifecycle_id: str) -> str:
+        """Primary sandbox name owning activity state for a lifecycle key."""
+        return cls.make_sandbox_name(
+            lifecycle_type, cls._base_lifecycle_id(lifecycle_id)
+        )
+
+    @asynccontextmanager
+    async def _lifecycle_locked(self, base_name: str) -> AsyncIterator[None]:
+        """Serialize provider creation and release-to-zero cleanup per key.
+
+        Entries are dropped once no holder or waiter remains, so the dict
+        does not grow with every lifecycle key ever seen.
+
+        The waiter bookkeeping is deliberately not guarded by
+        ``_activity_guard``: each step is a single synchronous operation
+        with no compound invariant, and awaiting a lock inside ``finally``
+        could leak the waiter count if the task were cancelled at that
+        await point.
+        """
+        entry = self._lifecycle_locks.get(base_name)
+        if entry is None:
+            entry = _LifecycleLockEntry()
+            self._lifecycle_locks[base_name] = entry
+        entry.waiters += 1
+
+        try:
+            await entry.lock.acquire()
+        except BaseException:
+            entry.waiters -= 1
+            self._drop_lifecycle_lock_if_unused(base_name, entry)
+            raise
+
+        try:
+            yield
+        finally:
+            entry.lock.release()
+            entry.waiters -= 1
+            self._drop_lifecycle_lock_if_unused(base_name, entry)
+
+    def _drop_lifecycle_lock_if_unused(
+        self, base_name: str, entry: _LifecycleLockEntry
+    ) -> None:
+        if entry.waiters > 0:
+            return
+        if self._lifecycle_locks.get(base_name) is entry:
+            self._lifecycle_locks.pop(base_name, None)
+
+    def _touch_locked(self, base_name: str) -> _SandboxActivity:
+        """Bump last-activity for a key; caller must hold ``_activity_guard``."""
+        activity = self._activity.get(base_name)
+        if activity is None:
+            activity = _SandboxActivity()
+            self._activity[base_name] = activity
+        activity.last_activity = time.monotonic()
+        return activity
+
+    async def attach(self, lifecycle_type: str, lifecycle_id: str) -> bool:
+        """Mark one task as actively using the lifecycle's lease provider.
+
+        Returns False when no lease provider is cached for the key — nothing
+        is attached and the caller must not release. A sandbox with a
+        non-zero ref-count is never reclaimed.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._activity_guard:
+            if base_name not in self._lease_providers:
+                return False
+            self._touch_locked(base_name).ref_count += 1
+        return True
+
+    async def release(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        on_last_release: Optional[Callable[[], None]] = None,
+    ) -> bool:
+        """Release one active task for a lifecycle key.
+
+        When the last task releases, the cached lease provider is dropped,
+        ``on_last_release`` is invoked (still under the per-key lifecycle
+        lock, before worker deletion, so callers can evict their own caches
+        exactly once), and the lifecycle's worker sandboxes are deleted.
+
+        A release without a matching attach (ref-count already zero) is
+        ignored with a warning: running the cleanup path anyway could tear
+        down a freshly created, not-yet-attached provider.
+
+        Returns True when this call released the last active task.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._lifecycle_locked(base_name):
+            async with self._activity_guard:
+                activity = self._touch_locked(base_name)
+                if activity.ref_count == 0:
+                    logger.warning(
+                        "Ignoring sandbox release without matching attach for %s",
+                        base_name,
+                    )
+                    return False
+                if activity.ref_count > 1:
+                    activity.ref_count -= 1
+                    return False
+                activity.ref_count = 0
+                self._lease_providers.pop(base_name, None)
+
+            if on_last_release is not None:
+                on_last_release()
+
+            await self.delete_worker_sandboxes(
+                lifecycle_type, self._base_lifecycle_id(lifecycle_id)
+            )
+        return True
+
+    def ref_count(self, lifecycle_type: str, lifecycle_id: str) -> int:
+        """Number of active tasks attached to a lifecycle key."""
+        activity = self._activity.get(
+            self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        )
+        return activity.ref_count if activity is not None else 0
+
+    def last_activity_at(self, lifecycle_type: str, lifecycle_id: str) -> float:
+        """Monotonic timestamp of the last recorded activity for a key.
+
+        Keys with no recorded activity (e.g. containers discovered after a
+        backend restart) report idle since manager startup.
+        """
+        activity = self._activity.get(
+            self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        )
+        if activity is None:
+            return self._startup_monotonic
+        return activity.last_activity
 
     def _get_sandbox_image_and_config(self) -> tuple[str, SandboxConfig]:
         """Get sandbox image and configuration from centralized config module."""
@@ -422,6 +667,9 @@ class SandboxManager:
             Sandbox instance
         """
         sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._activity_guard:
+            self._touch_locked(self._base_sandbox_name(lifecycle_type, lifecycle_id))
+
         image, desired_config = self._build_sandbox_config(
             lifecycle_type,
             lifecycle_id,
@@ -468,11 +716,21 @@ class SandboxManager:
             template = SandboxTemplate(type="image", image=image)
 
             logger.debug(f"Getting or creating sandbox for: {sandbox_name}")
-            sandbox = await self._service.get_or_create(
-                sandbox_name,
-                template=template,
-                config=config,
-            )
+            cap = get_sandbox_max_containers()
+            if cap is None:
+                sandbox = await self._service.get_or_create(
+                    sandbox_name,
+                    template=template,
+                    config=config,
+                )
+            else:
+                async with self._capacity_gate:
+                    await self._ensure_capacity_for(sandbox_name, cap)
+                    sandbox = await self._service.get_or_create(
+                        sandbox_name,
+                        template=template,
+                        config=config,
+                    )
 
             self._cache[sandbox_name] = sandbox
             self._config_cache[sandbox_name] = config
@@ -499,6 +757,196 @@ class SandboxManager:
             workspace_config=workspace_config,
             max_concurrency=get_sandbox_max_concurrency(),
         )
+
+    async def _list_managed_sandbox_names(self) -> set[str]:
+        """Names of existing managed containers (warmup/unparsable excluded)."""
+        names: set[str] = set()
+        listed_sandboxes = await self._service.list_sandboxes()
+        for sb in listed_sandboxes or []:
+            if not isinstance(sb.name, str):
+                continue
+            try:
+                self.parse_sandbox_name(sb.name)
+            except ValueError:
+                continue
+            names.add(sb.name)
+        return names
+
+    async def _pick_eviction_victim(
+        self, existing: set[str], protected_base: str, skip: set[str]
+    ) -> Optional[str]:
+        """Pick the LRU idle primary from ``existing`` (no claim).
+
+        Skips primaries with active tasks, the protected key, and keys whose
+        lifecycle lock is currently held or awaited (in-flight creation or
+        release-to-zero cleanup).
+        """
+        async with self._activity_guard:
+            candidates: list[tuple[float, str]] = []
+            for name in existing:
+                try:
+                    lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+                except ValueError:
+                    continue
+                base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+                if name != base_name:
+                    # Workers are deleted with their primary.
+                    continue
+                if base_name == protected_base or base_name in skip:
+                    continue
+                lock_entry = self._lifecycle_locks.get(base_name)
+                if lock_entry is not None and (
+                    lock_entry.lock.locked() or lock_entry.waiters > 0
+                ):
+                    continue
+                activity = self._activity.get(base_name)
+                if activity is not None and activity.ref_count > 0:
+                    continue
+                last_activity = (
+                    activity.last_activity
+                    if activity is not None
+                    else self._startup_monotonic
+                )
+                candidates.append((last_activity, base_name))
+
+            if not candidates:
+                return None
+            return min(candidates)[1]
+
+    async def _claim_idle_sandbox(self, base_name: str) -> bool:
+        """Atomically claim an idle lifecycle for deletion.
+
+        Under the activity guard: re-validates that no task is attached,
+        then drops the lease provider (new attaches fail) and the cached
+        sandbox/config instances for the primary and its workers. Purging
+        the instance cache is what makes eviction safe against a concurrent
+        same-key re-creation: with the cache empty, ``get_or_create_sandbox``
+        cannot short-circuit and hand out the doomed container — it falls
+        through to the capacity gate and recreates only after the deletion
+        has finished.
+
+        Returns False when the lifecycle became active since selection.
+        """
+        worker_prefix = base_name + _WORKER_LIFECYCLE_MARKER
+        async with self._activity_guard:
+            activity = self._activity.get(base_name)
+            if activity is not None and activity.ref_count > 0:
+                return False
+            self._lease_providers.pop(base_name, None)
+            for name in [
+                n for n in self._cache if n == base_name or n.startswith(worker_prefix)
+            ]:
+                self._cache.pop(name, None)
+                self._config_cache.pop(name, None)
+            return True
+
+    async def _evict_idle_sandbox(self, base_name: str, *, reason: str) -> bool:
+        """Claim and delete one idle primary together with its workers.
+
+        Shared primitive for the idle sweep and capacity eviction. The
+        caller must hold the context that excludes a concurrent same-key
+        re-creation from completing against the old container: the sweep
+        holds the victim's per-key lifecycle lock; capacity eviction holds
+        the global capacity gate (which every post-claim re-creation must
+        pass through, because the claim purged the instance cache).
+
+        Returns False when the lifecycle became active and must be spared.
+        """
+        if not await self._claim_idle_sandbox(base_name):
+            return False
+
+        logger.info("Reclaiming idle sandbox %s (%s)", base_name, reason)
+        lifecycle_type, lifecycle_id = self.parse_sandbox_name(base_name)
+        await self.delete_sandbox(lifecycle_type, lifecycle_id)
+        return True
+
+    async def _ensure_capacity_for(self, sandbox_name: str, cap: int) -> None:
+        """Make room under the container cap for one new sandbox.
+
+        Caller must hold ``_capacity_gate``. Evicts LRU idle primaries (with
+        their workers) until the new container fits; raises
+        ``SandboxCapacityError`` when nothing is evictable. If listing the
+        service fails, enforcement is skipped for this creation (fail-open:
+        the daemon being unreachable will fail the creation itself anyway).
+        """
+        try:
+            existing = await self._list_managed_sandbox_names()
+        except Exception as exc:
+            logger.warning(
+                "Failed to list sandboxes for capacity check; "
+                "skipping enforcement for %s: %s",
+                sandbox_name,
+                exc,
+            )
+            return
+
+        if sandbox_name in existing:
+            return
+
+        lifecycle_type, lifecycle_id = self.parse_sandbox_name(sandbox_name)
+        protected_base = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+
+        # Victims whose deletion was already attempted this pass: a failed
+        # delete leaves the container listed and would otherwise be re-picked
+        # forever.
+        tried_victims: set[str] = set()
+        while len(existing) >= cap:
+            victim = await self._pick_eviction_victim(
+                existing, protected_base, tried_victims
+            )
+            if victim is None:
+                raise SandboxCapacityError(cap=cap, in_use=len(existing))
+
+            if not await self._evict_idle_sandbox(
+                victim, reason=f"LRU eviction under container cap {cap}"
+            ):
+                # Became active between selection and claim; the picker's
+                # ref-count check will exclude it on the next round.
+                continue
+            tried_victims.add(victim)
+
+            try:
+                existing = await self._list_managed_sandbox_names()
+            except Exception as exc:
+                logger.warning(
+                    "Failed to re-list sandboxes after eviction; "
+                    "skipping further enforcement for %s: %s",
+                    sandbox_name,
+                    exc,
+                )
+                return
+
+    async def get_or_create_lease_provider(
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        *,
+        workspace_config: Mapping[str, Any] | None = None,
+    ) -> SandboxLeaseProvider:
+        """Get the cached lease provider for a lifecycle key or create one.
+
+        Creation is serialized per key with release-to-zero cleanup, so a new
+        provider can never create worker sandboxes while an old provider's
+        workers are still being deleted.
+        """
+        base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        async with self._lifecycle_locked(base_name):
+            async with self._activity_guard:
+                provider = self._lease_providers.get(base_name)
+                if provider is not None:
+                    self._touch_locked(base_name)
+                    return provider
+
+            provider = await self.create_lease_provider(
+                lifecycle_type,
+                lifecycle_id,
+                workspace_config=workspace_config,
+            )
+
+            async with self._activity_guard:
+                self._lease_providers[base_name] = provider
+                self._touch_locked(base_name)
+            return provider
 
     async def delete_sandbox(self, lifecycle_type: str, lifecycle_id: str) -> None:
         """
@@ -555,6 +1003,8 @@ class SandboxManager:
 
         for sb in listed_sandboxes or []:
             name = sb.name
+            if not isinstance(name, str):
+                continue
             if include_primary and name == sandbox_name:
                 sandbox_names.add(name)
             elif include_workers and name.startswith(worker_prefix):
@@ -575,6 +1025,112 @@ class SandboxManager:
                 self._cache.pop(name, None)
                 self._config_cache.pop(name, None)
                 self._locks.pop(name, None)
+                # Only primary names appear in these maps; worker names no-op.
+                # Plain pops on purpose: each is a single synchronous
+                # operation with no compound invariant, and awaiting
+                # ``_activity_guard`` inside ``finally`` would risk skipping
+                # the eviction entirely if the task were cancelled at that
+                # await point.
+                self._lease_providers.pop(name, None)
+                self._activity.pop(name, None)
+
+    async def sweep_idle_sandboxes(self, idle_ttl: float) -> list[str]:
+        """Delete sandboxes with no attached tasks that are idle past the TTL.
+
+        Candidates come from both the in-memory activity map and the sandbox
+        service listing, so containers surviving a backend restart are also
+        reclaimed: with no recorded activity they report idle since manager
+        startup and get one TTL grace period.
+
+        Each deletion re-checks ref-count and idle time under the per-key
+        lifecycle lock, and the eviction decision plus provider removal are
+        atomic under the activity guard, so a sweep can never delete a
+        sandbox a task is concurrently attaching or recreating. Workspace data lives on bind
+        mounts and survives; the next use recreates the sandbox.
+
+        Args:
+            idle_ttl: Idle threshold in seconds (> 0).
+
+        Returns:
+            Primary sandbox names that were reclaimed.
+        """
+        try:
+            listed_sandboxes = await self._service.list_sandboxes()
+        except Exception as exc:
+            logger.warning("Failed to list sandboxes for idle sweep: %s", exc)
+            listed_sandboxes = []
+
+        # Only keys with an existing container (or cached instance) are
+        # candidates; activity entries alone have nothing left to reclaim.
+        candidates: set[str] = set()
+        listed_names = [
+            sb.name for sb in listed_sandboxes or [] if isinstance(sb.name, str)
+        ]
+        for name in [*listed_names, *self._cache]:
+            try:
+                lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+            except ValueError:
+                continue
+            candidates.add(self._base_sandbox_name(lifecycle_type, lifecycle_id))
+
+        reclaimed: list[str] = []
+        for base_name in sorted(candidates):
+            try:
+                lifecycle_type, lifecycle_id = self.parse_sandbox_name(base_name)
+            except ValueError:
+                continue
+
+            async with self._lifecycle_locked(base_name):
+                idle_for = time.monotonic() - self.last_activity_at(
+                    lifecycle_type, lifecycle_id
+                )
+                if idle_for <= idle_ttl:
+                    continue
+
+                # _evict_idle_sandbox re-validates the ref-count and drops
+                # the provider in one atomic step under the activity guard:
+                # an attach can never land between the check and the pop
+                # that makes attaches fail.
+                if await self._evict_idle_sandbox(
+                    base_name,
+                    reason=f"idle for {idle_for:.0f}s, TTL {idle_ttl:.0f}s",
+                ):
+                    reclaimed.append(base_name)
+
+        return reclaimed
+
+    async def run_idle_sweep_loop(self) -> None:
+        """Periodically reclaim idle sandboxes until cancelled.
+
+        Reads XAGENT_SANDBOX_IDLE_TTL / XAGENT_SANDBOX_SWEEP_INTERVAL; when
+        no TTL is configured the loop exits immediately and behavior is
+        identical to deployments without idle reclamation.
+        """
+        idle_ttl = get_sandbox_idle_ttl()
+        if idle_ttl is None:
+            logger.debug("Sandbox idle reclamation disabled (no TTL configured)")
+            return
+
+        sweep_interval = get_sandbox_sweep_interval()
+        logger.info(
+            "Sandbox idle reclamation enabled: TTL %.0fs, sweep interval %.0fs",
+            idle_ttl,
+            sweep_interval,
+        )
+        while True:
+            await asyncio.sleep(sweep_interval)
+            try:
+                reclaimed = await self.sweep_idle_sandboxes(idle_ttl)
+                if reclaimed:
+                    logger.info(
+                        "Idle sweep reclaimed %d sandbox(es): %s",
+                        len(reclaimed),
+                        ", ".join(reclaimed),
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("Idle sandbox sweep failed: %s", exc)
 
     async def warmup(self) -> None:
         """
@@ -713,6 +1269,8 @@ class SandboxManager:
             self._cache.clear()
             self._config_cache.clear()
             self._locks.clear()
+            self._lease_providers.clear()
+            self._activity.clear()
             logger.info("Sandbox cleanup completed")
         except Exception as e:
             logger.error(f"Failed to cleanup sandboxes: {e}")

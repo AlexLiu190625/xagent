@@ -1077,3 +1077,74 @@ class TestWebToolConfigMCPAuth:
         assert (
             configs[0]["config"]["headers"]["Authorization"] == "Bearer test-token-123"
         )
+
+
+class TestAvailableToolsSandboxLifecycle:
+    """Sandbox lifecycle handling in /api/tools/available."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self, test_db):
+        ensure_system_initialized()
+        yield
+
+    def _login(self) -> str:
+        login_response = client.post(
+            "/api/auth/login", json={"username": "admin", "password": "admin123"}
+        )
+        assert login_response.status_code == 200
+        return login_response.json()["access_token"]
+
+    def test_reclaimed_provider_before_attach_lists_without_sandbox(
+        self, monkeypatch
+    ) -> None:
+        """attach() returning False (provider reclaimed between creation and
+        attach) must drop the stale reference and still serve the listing,
+        without releasing what was never attached."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        sandbox_manager = MagicMock()
+        sandbox_manager.get_or_create_lease_provider = AsyncMock(
+            return_value=MagicMock()
+        )
+        sandbox_manager.attach = AsyncMock(return_value=False)
+        sandbox_manager.release = AsyncMock()
+        monkeypatch.setattr(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            lambda: sandbox_manager,
+        )
+
+        token = self._login()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200
+        assert response.json()["count"] > 0
+        sandbox_manager.attach.assert_awaited_once()
+        sandbox_manager.release.assert_not_awaited()
+
+    def test_attached_sandbox_is_released_after_listing(self, monkeypatch) -> None:
+        """A successfully attached sandbox is released exactly once."""
+        from unittest.mock import AsyncMock, MagicMock
+
+        provider = MagicMock()
+        provider.exec = AsyncMock()
+        provider.primary_sandbox.exec = AsyncMock()
+        sandbox_manager = MagicMock()
+        sandbox_manager.get_or_create_lease_provider = AsyncMock(return_value=provider)
+        sandbox_manager.attach = AsyncMock(return_value=True)
+        sandbox_manager.release = AsyncMock()
+        monkeypatch.setattr(
+            "xagent.web.sandbox_manager.get_sandbox_manager",
+            lambda: sandbox_manager,
+        )
+
+        token = self._login()
+        response = client.get(
+            "/api/tools/available", headers={"Authorization": f"Bearer {token}"}
+        )
+
+        assert response.status_code == 200
+        sandbox_manager.release.assert_awaited_once()
+        release_args = sandbox_manager.release.await_args.args
+        assert release_args[0] == "tools"

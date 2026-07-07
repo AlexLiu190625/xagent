@@ -1,5 +1,6 @@
 """Test sandbox manager functionality."""
 
+import asyncio
 import os
 import threading
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -803,3 +804,194 @@ class TestSandboxManagerWarmup:
         # Should have default cpus/memory from SandboxConfig
         assert config.cpus == 1
         assert config.memory == 512
+
+
+class TestSandboxActivityTracking:
+    """Test attach/release ref-counting and last-activity tracking."""
+
+    @staticmethod
+    def _make_manager() -> SandboxManager:
+        service = AsyncMock()
+        service.list_sandboxes = AsyncMock(return_value=[])
+        service.delete = AsyncMock()
+        return SandboxManager(service)
+
+    @pytest.mark.asyncio
+    async def test_attach_without_provider_returns_false(self):
+        manager = self._make_manager()
+
+        assert await manager.attach("user", "7") is False
+        assert manager.ref_count("user", "7") == 0
+
+    @pytest.mark.asyncio
+    async def test_attach_release_ref_count_round_trip(self):
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+
+        assert await manager.attach("user", "7") is True
+        assert await manager.attach("user", "7") is True
+        assert manager.ref_count("user", "7") == 2
+
+        assert await manager.release("user", "7") is False
+        assert manager.ref_count("user", "7") == 1
+        assert "user::7" in manager._lease_providers
+
+        assert await manager.release("user", "7") is True
+        assert manager.ref_count("user", "7") == 0
+        assert "user::7" not in manager._lease_providers
+
+    @pytest.mark.asyncio
+    async def test_release_without_attach_is_ignored(self):
+        """A mismatched release must not tear down a fresh, not-yet-attached
+        provider or re-run the worker cleanup."""
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+        manager.delete_worker_sandboxes = AsyncMock()
+        evictions: list[str] = []
+
+        released = await manager.release(
+            "user", "7", on_last_release=lambda: evictions.append("user::7")
+        )
+
+        assert released is False
+        assert "user::7" in manager._lease_providers
+        assert evictions == []
+        manager.delete_worker_sandboxes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_release_to_zero_runs_cleanup_exactly_once(self):
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+        manager.delete_worker_sandboxes = AsyncMock()
+        evictions: list[str] = []
+
+        attach_count = 5
+        for _ in range(attach_count):
+            await manager.attach("user", "7")
+
+        results = await asyncio.gather(
+            *(
+                manager.release(
+                    "user", "7", on_last_release=lambda: evictions.append("user::7")
+                )
+                for _ in range(attach_count)
+            )
+        )
+
+        assert sum(results) == 1
+        assert evictions == ["user::7"]
+        manager.delete_worker_sandboxes.assert_awaited_once_with("user", "7")
+        assert manager.ref_count("user", "7") == 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_attach_release_is_race_free(self):
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+        manager.delete_worker_sandboxes = AsyncMock()
+
+        async def attach_then_release() -> None:
+            assert await manager.attach("user", "7")
+            await asyncio.sleep(0)
+            await manager.release("user", "7")
+
+        # Keep one attachment alive so the provider survives the churn.
+        await manager.attach("user", "7")
+        await asyncio.gather(*(attach_then_release() for _ in range(20)))
+
+        assert manager.ref_count("user", "7") == 1
+        assert "user::7" in manager._lease_providers
+        manager.delete_worker_sandboxes.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_worker_lifecycle_id_maps_to_primary_activity(self):
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+
+        assert await manager.attach("user", "7::worker::0") is True
+        assert manager.ref_count("user", "7") == 1
+        assert manager.ref_count("user", "7::worker::3") == 1
+
+    @pytest.mark.asyncio
+    async def test_last_activity_defaults_to_startup(self):
+        manager = self._make_manager()
+
+        assert manager.last_activity_at("user", "7") == manager._startup_monotonic
+
+    @pytest.mark.asyncio
+    async def test_attach_and_release_bump_last_activity(self):
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+
+        baseline = manager.last_activity_at("user", "7")
+        await manager.attach("user", "7")
+        after_attach = manager.last_activity_at("user", "7")
+        assert after_attach >= baseline
+
+        await manager.release("user", "7")
+        assert manager.last_activity_at("user", "7") >= after_attach
+
+    @pytest.mark.asyncio
+    async def test_lifecycle_lock_entries_do_not_leak(self):
+        manager = self._make_manager()
+        manager._lease_providers["user::7"] = MagicMock()
+
+        await manager.attach("user", "7")
+        await manager.release("user", "7")
+        await manager.get_or_create_lease_provider("user", "8")
+
+        assert manager._lifecycle_locks == {}
+
+
+class TestGetOrCreateLeaseProvider:
+    """Test the cached lease provider entry point."""
+
+    @staticmethod
+    def _make_manager() -> SandboxManager:
+        service = AsyncMock()
+        service.list_sandboxes = AsyncMock(return_value=[])
+        service.delete = AsyncMock()
+        return SandboxManager(service)
+
+    @pytest.mark.asyncio
+    async def test_returns_cached_provider_for_same_lifecycle(self):
+        manager = self._make_manager()
+        provider = MagicMock()
+        manager.create_lease_provider = AsyncMock(return_value=provider)
+
+        first = await manager.get_or_create_lease_provider("user", "7")
+        second = await manager.get_or_create_lease_provider("user", "7")
+
+        assert first is provider
+        assert second is provider
+        manager.create_lease_provider.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_concurrent_requests_create_single_provider(self):
+        manager = self._make_manager()
+
+        async def create_provider(*_args, **_kwargs):
+            await asyncio.sleep(0)
+            return MagicMock()
+
+        manager.create_lease_provider = AsyncMock(side_effect=create_provider)
+
+        providers = await asyncio.gather(
+            *(manager.get_or_create_lease_provider("user", "7") for _ in range(5))
+        )
+
+        assert len({id(p) for p in providers}) == 1
+        manager.create_lease_provider.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_release_to_zero_drops_cache_and_recreates(self):
+        manager = self._make_manager()
+        providers = [MagicMock(), MagicMock()]
+        manager.create_lease_provider = AsyncMock(side_effect=providers)
+
+        first = await manager.get_or_create_lease_provider("user", "7")
+        await manager.attach("user", "7")
+        await manager.release("user", "7")
+        second = await manager.get_or_create_lease_provider("user", "7")
+
+        assert first is providers[0]
+        assert second is providers[1]

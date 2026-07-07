@@ -16,12 +16,20 @@ from pydantic import ValidationError
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
-from ....config import get_gmail_pubsub_push_service_account
+from ....config import (
+    get_gmail_pubsub_project_id,
+    get_gmail_pubsub_push_service_account,
+)
 from ...models.gmail_watch import GmailWatchState
 from ...models.trigger import AgentTrigger, TriggerProvisioningStatus, TriggerType
 from ..gmail_provisioning import (
     provision_gmail_trigger,
     release_gmail_mailbox_if_unused,
+)
+from ..ops_signals import (
+    GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
+    clear_degradation,
+    register_degradation,
 )
 from .base import (
     CallbackRequestContext,
@@ -48,9 +56,37 @@ OidcVerifier = Callable[[str, str], Mapping[str, Any]]
 GOOGLE_OIDC_ISSUERS = frozenset({"https://accounts.google.com", "accounts.google.com"})
 
 
-def _gmail_oauth_account_id(trigger: AgentTrigger) -> int | None:
-    config: dict[str, Any] = trigger.config if isinstance(trigger.config, dict) else {}
-    value = config.get("oauth_account_id")
+def warn_if_gmail_oidc_verification_degraded() -> None:
+    """Startup config-drift check for Gmail OIDC verification.
+
+    Provisioning requires the push service account, so a configured Pub/Sub
+    project without one means inbound Gmail callbacks will verify with only
+    issuer/audience/signature checks. Registering the degradation at startup
+    surfaces the drift on /health before the first callback arrives; the
+    verify path keeps the signal current afterwards.
+    """
+    if not get_gmail_pubsub_project_id() or get_gmail_pubsub_push_service_account():
+        return
+    register_degradation(
+        GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT is not configured; "
+        "Gmail OIDC verification is running without service-account "
+        "email checks",
+    )
+    logger.warning(
+        "XAGENT_GMAIL_PUBSUB_PROJECT_ID is set but "
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT is not; Gmail OIDC "
+        "verification will skip service-account email checks"
+    )
+
+
+def _binding_oauth_account_id(config: Any) -> int | None:
+    """Read the bound OAuth account from a binding config.
+
+    CRUD dispatch always passes the previous config as a plain dict
+    (AgentTrigger.config is a JSON column).
+    """
+    value = (config or {}).get("oauth_account_id")
     return int(value) if value is not None else None
 
 
@@ -294,6 +330,7 @@ class GmailProvider:
 
         expected_service_account = get_gmail_pubsub_push_service_account()
         if expected_service_account:
+            clear_degradation(GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED)
             claim_email = _normalized_email(claims.get("email"))
             expected_email = expected_service_account.strip().lower()
             if claim_email != expected_email or not _claim_email_verified(
@@ -306,7 +343,15 @@ class GmailProvider:
         else:
             # Provisioning requires this env var, so its absence here means
             # config drift between the provisioning and callback processes;
-            # only issuer/audience/signature checks remain in that case.
+            # only issuer/audience/signature checks remain in that case. The
+            # degradation registry keeps this visible to monitoring (via
+            # /health) instead of only to log readers.
+            register_degradation(
+                GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
+                "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT is not configured; "
+                "Gmail OIDC verification is running without service-account "
+                "email checks",
+            )
             logger.warning(
                 "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT is not configured; "
                 "skipping Gmail OIDC service-account email verification for "
@@ -330,7 +375,9 @@ class GmailProvider:
         )
 
     async def unregister(self, db: Session, trigger: AgentTrigger, config: Any) -> None:
-        oauth_account_id = _gmail_oauth_account_id(trigger)
+        # The binding must come from config: CRUD passes the trigger's
+        # previous config, and on delete the trigger row no longer exists.
+        oauth_account_id = _binding_oauth_account_id(config)
         if oauth_account_id is not None:
             await asyncio.to_thread(
                 release_gmail_mailbox_if_unused, db, oauth_account_id

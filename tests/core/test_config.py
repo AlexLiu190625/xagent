@@ -47,12 +47,16 @@ from xagent.config import (
     PREVIEW_TMP_DIR,
     PUBLIC_API_BASE_URL,
     REDIS_URL,
+    SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY,
     SANDBOX_CPUS,
     SANDBOX_ENV,
     SANDBOX_HOST_PROJECT_ROOT,
     SANDBOX_HOST_STORAGE_ROOT,
+    SANDBOX_IDLE_TTL,
     SANDBOX_IMAGE,
+    SANDBOX_MAX_CONTAINERS,
     SANDBOX_MEMORY,
+    SANDBOX_SWEEP_INTERVAL,
     SANDBOX_VOLUMES,
     SMTP_FROM_EMAIL,
     SMTP_FROM_NAME,
@@ -114,12 +118,16 @@ from xagent.config import (
     get_preview_tmp_dir,
     get_public_api_base_url,
     get_redis_url,
+    get_sandbox_allow_local_fallback_on_capacity,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_host_project_root,
     get_sandbox_host_storage_root,
+    get_sandbox_idle_ttl,
     get_sandbox_image,
+    get_sandbox_max_containers,
     get_sandbox_memory,
+    get_sandbox_sweep_interval,
     get_sandbox_volumes,
     get_smtp_from_email,
     get_smtp_from_name,
@@ -1469,3 +1477,103 @@ class TestTriggerCallbackIpRateLimitConfig:
 
         monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT", "50/second")
         assert get_trigger_callback_ip_rate_limit() == "50/second"
+
+
+class TestGetSandboxIdleTtl:
+    """Test get_sandbox_idle_ttl() function."""
+
+    def test_no_env_var_disables_reclamation(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_IDLE_TTL, raising=False)
+        assert get_sandbox_idle_ttl() is None
+
+    def test_blank_env_var_disables_reclamation(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "   ")
+        assert get_sandbox_idle_ttl() is None
+
+    def test_valid_ttl_seconds(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "86400")
+        assert get_sandbox_idle_ttl() == 86400.0
+
+    def test_fractional_ttl_seconds(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "0.5")
+        assert get_sandbox_idle_ttl() == 0.5
+
+    def test_invalid_ttl_disables_reclamation(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "invalid")
+        assert get_sandbox_idle_ttl() is None
+
+    def test_non_positive_ttl_disables_reclamation(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "0")
+        assert get_sandbox_idle_ttl() is None
+        monkeypatch.setenv(SANDBOX_IDLE_TTL, "-60")
+        assert get_sandbox_idle_ttl() is None
+
+    def test_non_finite_ttl_disables_reclamation(self, monkeypatch):
+        for value in ("nan", "NaN", "inf", "-inf"):
+            monkeypatch.setenv(SANDBOX_IDLE_TTL, value)
+            assert get_sandbox_idle_ttl() is None
+
+
+class TestGetSandboxSweepInterval:
+    """Test get_sandbox_sweep_interval() function."""
+
+    def test_no_env_var_returns_default(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_SWEEP_INTERVAL, raising=False)
+        assert get_sandbox_sweep_interval() == 60.0
+
+    def test_valid_interval(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "5")
+        assert get_sandbox_sweep_interval() == 5.0
+
+    def test_invalid_interval_returns_default(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "invalid")
+        assert get_sandbox_sweep_interval() == 60.0
+
+    def test_non_positive_interval_returns_default(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, "0")
+        assert get_sandbox_sweep_interval() == 60.0
+
+    def test_non_finite_interval_returns_default(self, monkeypatch):
+        for value in ("nan", "inf", "-inf"):
+            monkeypatch.setenv(SANDBOX_SWEEP_INTERVAL, value)
+            assert get_sandbox_sweep_interval() == 60.0
+
+
+class TestGetSandboxMaxContainers:
+    """Test get_sandbox_max_containers() function."""
+
+    def test_no_env_var_disables_cap(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_MAX_CONTAINERS, raising=False)
+        assert get_sandbox_max_containers() is None
+
+    def test_valid_cap(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "20")
+        assert get_sandbox_max_containers() == 20
+
+    def test_invalid_cap_disables_cap(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "invalid")
+        assert get_sandbox_max_containers() is None
+
+    def test_non_positive_cap_disables_cap(self, monkeypatch):
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "0")
+        assert get_sandbox_max_containers() is None
+        monkeypatch.setenv(SANDBOX_MAX_CONTAINERS, "-5")
+        assert get_sandbox_max_containers() is None
+
+
+class TestGetSandboxAllowLocalFallbackOnCapacity:
+    """Test get_sandbox_allow_local_fallback_on_capacity() function."""
+
+    def test_defaults_to_false(self, monkeypatch):
+        monkeypatch.delenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, raising=False)
+        assert get_sandbox_allow_local_fallback_on_capacity() is False
+
+    def test_enabled_values(self, monkeypatch):
+        for value in ("1", "true", "True", "yes", "on"):
+            monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
+            assert get_sandbox_allow_local_fallback_on_capacity() is True
+
+    def test_disabled_values(self, monkeypatch):
+        for value in ("0", "false", "off", "junk"):
+            monkeypatch.setenv(SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY, value)
+            assert get_sandbox_allow_local_fallback_on_capacity() is False

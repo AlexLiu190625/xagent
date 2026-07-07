@@ -446,34 +446,63 @@ def provision_gmail_trigger(
 def reconcile_gmail_trigger_provisioning(
     db: Session,
     triggers: Sequence[AgentTrigger] | None = None,
+    *,
+    batch_size: int = 100,
 ) -> int:
     """Refresh Gmail triggers' provisioning status from their watch states.
 
     The background provisioning thread and the periodic sweep converge
     GmailWatchState without touching AgentTrigger, so the status the API
     reports would otherwise stay frozen at whatever the original synchronous
-    create/update call observed. One batched IN() lookup joins each enabled
-    Gmail trigger to its mailbox's watch state and copies status/last_error
-    over when they diverge. Returns the number of triggers updated.
+    create/update call observed. Each batch joins its enabled Gmail triggers
+    to their mailboxes' watch states with one IN() lookup and copies
+    status/last_error over when they diverge. Returns the number of triggers
+    updated.
+
+    Without an explicit trigger set (the sweep path), candidates are walked
+    in id-keyset pages of ``batch_size`` so every query stays bounded no
+    matter how many Gmail triggers exist system-wide.
     """
-    if triggers is None:
-        candidates = (
+    if triggers is not None:
+        return _reconcile_gmail_trigger_batch(
+            db,
+            [
+                trigger
+                for trigger in triggers
+                if str(trigger.type) == TriggerType.GMAIL.value
+                and bool(trigger.enabled)
+                and trigger.resource_id
+            ],
+        )
+
+    page_size = max(1, batch_size)
+    updated = 0
+    last_id = 0
+    while True:
+        page = (
             db.query(AgentTrigger)
             .filter(
                 AgentTrigger.type == TriggerType.GMAIL.value,
                 AgentTrigger.enabled.is_(True),
                 AgentTrigger.resource_id.isnot(None),
+                AgentTrigger.id > last_id,
             )
+            .order_by(AgentTrigger.id.asc())
+            .limit(page_size)
             .all()
         )
-    else:
-        candidates = [
-            trigger
-            for trigger in triggers
-            if str(trigger.type) == TriggerType.GMAIL.value
-            and bool(trigger.enabled)
-            and trigger.resource_id
-        ]
+        if not page:
+            return updated
+        last_id = int(page[-1].id)
+        updated += _reconcile_gmail_trigger_batch(db, page)
+        if len(page) < page_size:
+            return updated
+
+
+def _reconcile_gmail_trigger_batch(
+    db: Session, candidates: Sequence[AgentTrigger]
+) -> int:
+    """Copy diverged watch-state status onto one bounded candidate batch."""
     if not candidates:
         return 0
 
@@ -652,8 +681,8 @@ def sweep_gmail_provisioning(
         attempts += 1
     # Watch states that converged in a background thread (pending -> active)
     # are not sweep candidates, so the trigger-facing status is reconciled
-    # here unconditionally.
-    reconcile_gmail_trigger_provisioning(db)
+    # here unconditionally, paged by the sweep's own limit.
+    reconcile_gmail_trigger_provisioning(db, batch_size=max(1, min(limit, 500)))
     return attempts
 
 

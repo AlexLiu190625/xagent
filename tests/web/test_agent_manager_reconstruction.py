@@ -212,12 +212,17 @@ class TestAgentServiceManagerReconstruction:
         self, agent_manager, mock_db, sample_task, mock_user
     ):
         """A cached sandbox should not skip allowed_tools initialization."""
-        agent_manager._sandboxes["user:1"] = MagicMock()
+        sandbox_mgr = MagicMock()
+        sandbox_mgr.get_or_create_lease_provider = AsyncMock(return_value=MagicMock())
 
         with (
             patch("xagent.web.api.chat.AgentService") as mock_agent_service_class,
             patch("xagent.web.api.chat.resolve_llms_from_names") as mock_resolve_llms,
             patch("xagent.web.api.chat.get_memory_store") as mock_get_memory,
+            patch(
+                "xagent.web.sandbox_manager.get_sandbox_manager",
+                return_value=sandbox_mgr,
+            ),
             patch(
                 "xagent.core.tools.adapters.vibe.factory.ToolFactory"
             ) as mock_tool_factory,

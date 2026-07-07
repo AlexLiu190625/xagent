@@ -51,22 +51,37 @@ def _event_allowed_for_trigger(trigger: AgentTrigger, event: NormalizedEvent) ->
     return allow_list is None or event.event_type in allow_list
 
 
-def _resolve_event_trigger(
-    db: Session, default_trigger: AgentTrigger, event: NormalizedEvent
-) -> AgentTrigger | None:
-    target_trigger_id = event.target_trigger_id
-    if target_trigger_id is None or int(target_trigger_id) == int(default_trigger.id):
-        return default_trigger
-    return (
+def _resolve_event_triggers(
+    db: Session, default_trigger: AgentTrigger, events: list[NormalizedEvent]
+) -> dict[int, AgentTrigger]:
+    """Resolve every sibling trigger targeted by a callback's events at once.
+
+    One IN() query per callback regardless of event count. Targets that are
+    missing, owned by another user, or of a different type/provider are
+    simply absent from the map, which rejects them exactly like the previous
+    per-event lookup did.
+    """
+    resolved: dict[int, AgentTrigger] = {int(default_trigger.id): default_trigger}
+    target_ids = {
+        int(event.target_trigger_id)
+        for event in events
+        if event.target_trigger_id is not None
+    } - set(resolved)
+    if not target_ids:
+        return resolved
+    rows = (
         db.query(AgentTrigger)
         .filter(
-            AgentTrigger.id == int(target_trigger_id),
+            AgentTrigger.id.in_(target_ids),
             AgentTrigger.user_id == int(default_trigger.user_id),
             AgentTrigger.type == default_trigger.type,
             AgentTrigger.provider == default_trigger.provider,
         )
-        .first()
+        .all()
     )
+    for row in rows:
+        resolved[int(row.id)] = row
+    return resolved
 
 
 def _attested_resource_matches(
@@ -238,8 +253,14 @@ async def process_trigger_callback(
     rejected_disabled_events = 0
     filtered_count = 0
     failures: list[str] = []
+    event_triggers = _resolve_event_triggers(db, trigger, events)
     for event in events:
-        event_trigger = _resolve_event_trigger(db, trigger, event)
+        target_trigger_id = (
+            int(event.target_trigger_id)
+            if event.target_trigger_id is not None
+            else int(trigger.id)
+        )
+        event_trigger = event_triggers.get(target_trigger_id)
         if event_trigger is None:
             rejected_events += 1
             rejected_resource_events += 1

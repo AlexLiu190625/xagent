@@ -373,6 +373,28 @@ async def get_trigger_run(
         try:
             payload = decrypt_trigger_run_payload(run)
         except Exception as exc:
+            # A failed read of a stored payload (e.g. after key rotation) is
+            # as forensically relevant as a successful one; record it before
+            # the error propagates. Requests for runs that never stored a
+            # payload are plain validation errors and stay unaudited.
+            snapshot = run.payload_snapshot
+            if isinstance(snapshot, dict) and "encrypted_payload" in snapshot:
+                record_trigger_audit_best_effort(
+                    db,
+                    outcome=TriggerAuditOutcome.PAYLOAD_READ,
+                    provider=str(trigger.provider) if trigger.provider else None,
+                    callback_id=(
+                        str(trigger.callback_id) if trigger.callback_id else None
+                    ),
+                    trigger_id=int(trigger.id),
+                    detail={
+                        "trigger_run_id": int(run.id),
+                        "user_id": int(current_user.id),
+                        "success": False,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                    remote_ip=request.client.host if request.client else None,
+                )
             raise _handle_service_error(exc)
         record_trigger_audit(
             db,
@@ -383,6 +405,7 @@ async def get_trigger_run(
             detail={
                 "trigger_run_id": int(run.id),
                 "user_id": int(current_user.id),
+                "success": True,
             },
             remote_ip=request.client.host if request.client else None,
         )

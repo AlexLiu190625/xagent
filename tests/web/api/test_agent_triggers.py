@@ -746,7 +746,7 @@ def test_enabled_gmail_trigger_create_provisions_bound_mailbox(
         return TriggerProvisioningStatus.ACTIVE.value
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
@@ -791,7 +791,7 @@ def test_enabling_existing_gmail_trigger_provisions_bound_mailbox(
         return TriggerProvisioningStatus.ACTIVE.value
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
@@ -837,7 +837,7 @@ def test_listing_triggers_reflects_background_provisioning_convergence(
         return TriggerProvisioningStatus.PENDING.value
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
@@ -909,12 +909,12 @@ def test_gmail_trigger_update_releases_previous_mailbox_and_provisions_new_one(
         return True
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
     monkeypatch.setattr(
-        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
         fake_release_gmail_mailbox_if_unused,
         raising=False,
     )
@@ -969,12 +969,12 @@ def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
         return True
 
     monkeypatch.setattr(
-        "xagent.web.services.triggers.provision_gmail_trigger",
+        "xagent.web.services.trigger_providers.gmail.provision_gmail_trigger",
         fake_provision_gmail_trigger,
         raising=False,
     )
     monkeypatch.setattr(
-        "xagent.web.services.triggers.release_gmail_mailbox_if_unused",
+        "xagent.web.services.trigger_providers.gmail.release_gmail_mailbox_if_unused",
         fake_release_gmail_mailbox_if_unused,
         raising=False,
     )
@@ -1000,6 +1000,92 @@ def test_gmail_trigger_delete_releases_mailbox_after_row_is_deleted(
     assert deleted.status_code == 200, deleted.text
     assert provisioned == [account_id]
     assert released == [account_id]
+
+
+def test_trigger_crud_dispatches_through_provider_protocol() -> None:
+    """CRUD reaches provisioning only via TriggerProvider.register/unregister.
+
+    A recording provider swapped into the registry observes every CRUD
+    provisioning dispatch, proving the paths hold no provider-specific
+    branches: create registers, a binding change unregisters the previous
+    config and registers the new one, delete unregisters.
+    """
+    from xagent.web.services.trigger_providers.registry import (
+        get_trigger_provider,
+        register_trigger_provider,
+    )
+    from xagent.web.services.trigger_providers.schemas import RegistrationResult
+
+    real = get_trigger_provider("gmail")
+    calls: list[tuple[str, int]] = []
+
+    class RecordingProvider:
+        name = "gmail"
+        ack_policy = real.ack_policy
+
+        def validate_config(self, config):
+            return real.validate_config(config)
+
+        async def register(self, db, trigger, config) -> RegistrationResult:
+            calls.append(("register", int(config["oauth_account_id"])))
+            setattr(
+                trigger,
+                "provisioning_status",
+                TriggerProvisioningStatus.ACTIVE.value,
+            )
+            db.add(trigger)
+            db.commit()
+            return RegistrationResult(status=TriggerProvisioningStatus.ACTIVE)
+
+        async def unregister(self, db, trigger, config) -> None:
+            calls.append(("unregister", int(config["oauth_account_id"])))
+
+    register_trigger_provider(RecordingProvider(), replace=True)
+    try:
+        headers = _admin_headers()
+        agent_id = _create_agent(headers)
+        first_account_id = _connect_gmail_account(email="first@gmail.example")
+        second_account_id = _connect_gmail_account(email="second@gmail.example")
+
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "gmail",
+                "name": "Support inbox",
+                "config": {
+                    "watch_label": "INBOX",
+                    "oauth_account_id": first_account_id,
+                },
+            },
+        )
+        assert created.status_code == 200, created.text
+        assert calls == [("register", first_account_id)]
+
+        patched = client.patch(
+            f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+            headers=headers,
+            json={
+                "config": {
+                    "watch_label": "INBOX",
+                    "oauth_account_id": second_account_id,
+                }
+            },
+        )
+        assert patched.status_code == 200, patched.text
+        assert calls[1:] == [
+            ("unregister", first_account_id),
+            ("register", second_account_id),
+        ]
+
+        deleted = client.delete(
+            f"/api/agents/{agent_id}/triggers/{created.json()['id']}",
+            headers=headers,
+        )
+        assert deleted.status_code == 200, deleted.text
+        assert calls[3:] == [("unregister", second_account_id)]
+    finally:
+        register_trigger_provider(real, replace=True)
 
 
 def test_gmail_trigger_requires_watch_label() -> None:

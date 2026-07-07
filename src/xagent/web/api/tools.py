@@ -221,17 +221,39 @@ async def get_available_tools(
             self.credentials: Any | None = None
             self.user = user
 
-    # Get or create user sandbox for list mcp tools
+    # Get or create user sandbox for list mcp tools. Routed through the
+    # lease provider + attach/release (like chat.py) so this request
+    # participates in the manager's lifecycle-lock exclusion and
+    # ref-counting — a raw get_or_create_sandbox call could race the idle
+    # sweep and be handed a container about to be deleted.
     from ..sandbox_manager import get_sandbox_manager
 
     sandbox_manager = get_sandbox_manager()
     sandbox = None
-    if sandbox_manager:
-        user_id = int(current_user.id)
+    sandbox_attached = False
+    sandbox_user_id = str(int(current_user.id))
+    if sandbox_manager is not None:
         try:
-            sandbox = await sandbox_manager.get_or_create_sandbox("tools", str(user_id))
+            sandbox = await sandbox_manager.get_or_create_lease_provider(
+                "tools", sandbox_user_id
+            )
+            sandbox_attached = await sandbox_manager.attach("tools", sandbox_user_id)
+            if not sandbox_attached:
+                # The provider was reclaimed by a concurrent sweep/eviction
+                # between creation and attach. Drop the stale reference and
+                # list tools without a sandbox (same output as the
+                # sandbox-disabled path) rather than failing a metadata-only
+                # request. Call sites that execute inside the sandbox must
+                # treat attach() == False as an error instead (see chat.py).
+                logger.warning(
+                    "Sandbox for user %s was reclaimed before attach; "
+                    "listing tools without a sandbox",
+                    sandbox_user_id,
+                )
+                sandbox = None
         except Exception as e:
-            logger.error(f"Failed to create sandbox for user {user_id}: {e}")
+            sandbox = None
+            logger.error(f"Failed to create sandbox for user {sandbox_user_id}: {e}")
 
     # Create WebToolConfig, now includes MCP tools
     # Note: llm=None for tool listing (display only, no execution)
@@ -257,9 +279,15 @@ async def get_available_tools(
     # the list and can be shown as ``enabled=False`` in the UI.
     from ...core.tools.adapters.vibe.factory import ToolFactory
 
-    all_tools = await ToolFactory.create_all_tools(
-        tool_config, apply_user_override_filter=False
-    )
+    try:
+        all_tools = await ToolFactory.create_all_tools(
+            tool_config, apply_user_override_filter=False
+        )
+    finally:
+        # The sandbox is only needed while tools are constructed; the rest
+        # of the handler inspects metadata only.
+        if sandbox_manager is not None and sandbox_attached:
+            await sandbox_manager.release("tools", sandbox_user_id)
 
     # Helper function to get category from tool's metadata
     def get_tool_category(tool: Any) -> str:

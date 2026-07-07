@@ -448,6 +448,66 @@ def test_gmail_provider_rejects_unverified_push_service_account_email(
         db.close()
 
 
+def test_gmail_provider_verify_tracks_oidc_degradation_signal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """verify() keeps the ops-signal registry current: the degradation
+    registers when the push service account is unset and clears again once
+    verification runs with it configured."""
+    from xagent.web.services.ops_signals import (
+        GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED,
+        active_degradations,
+        clear_degradation,
+    )
+
+    clear_degradation(GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED)
+    db = _direct_db_session()
+    try:
+        user = _create_user(db, "gmail-oidc-signal-user")
+        oauth = _create_gmail_oauth(db, user)
+        trigger = _mark_unified_gmail_trigger(db, _create_gmail_trigger(db, user))
+        _create_gmail_watch_state(db, user, oauth, callback_id="cb-signal")
+
+        provider = GmailProvider(
+            oidc_verifier=lambda _token, audience: {
+                "iss": "https://accounts.google.com",
+                "aud": audience,
+                "email": "push-sa@example.iam.gserviceaccount.com",
+                "email_verified": True,
+            }
+        )
+        context = type(
+            "Context",
+            (),
+            {
+                "callback_id": "cb-signal",
+                "header": lambda _self, name: (
+                    "Bearer oidc-token" if name.lower() == "authorization" else None
+                ),
+            },
+        )()
+
+        monkeypatch.delenv("XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT", raising=False)
+        degraded = asyncio.run(
+            provider.verify(context, db=db, trigger=trigger, raw_body=b"{}")
+        )
+        assert degraded.verified is True
+        assert GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED in active_degradations()
+
+        monkeypatch.setenv(
+            "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+            "push-sa@example.iam.gserviceaccount.com",
+        )
+        healthy = asyncio.run(
+            provider.verify(context, db=db, trigger=trigger, raw_body=b"{}")
+        )
+        assert healthy.verified is True
+        assert GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED not in active_degradations()
+    finally:
+        clear_degradation(GMAIL_OIDC_SERVICE_ACCOUNT_UNVERIFIED)
+        db.close()
+
+
 def test_gmail_unified_callback_ingests_history_filters_and_deduplicates(
     mock_bg_scheduler,
 ) -> None:

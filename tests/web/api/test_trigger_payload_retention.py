@@ -177,6 +177,45 @@ def test_owner_include_payload_read_returns_decrypted_payload_and_audits() -> No
         assert len(audits) == 1
         assert audits[0].trigger_id == trigger["id"]
         assert audits[0].detail["trigger_run_id"] == run_id
+        assert audits[0].detail["success"] is True
+    finally:
+        db.close()
+
+
+def test_failed_payload_read_leaves_an_audit_trail() -> None:
+    """A stored payload that can no longer be decrypted (e.g. after key
+    rotation) still records a PAYLOAD_READ audit row with a failure outcome,
+    and the error keeps propagating to the caller."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    trigger = _create_webhook_trigger(headers, agent_id, store_full_payload=True)
+    run_id = _fire_webhook(trigger, SENSITIVE_PAYLOAD)
+
+    db = _direct_db_session()
+    try:
+        run = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
+        snapshot = dict(run.payload_snapshot)
+        snapshot["encrypted_payload"] = "not-decryptable-after-key-rotation"
+        run.payload_snapshot = snapshot
+        db.add(run)
+        db.commit()
+    finally:
+        db.close()
+
+    url = f"/api/agents/{agent_id}/triggers/{trigger['id']}/runs/{run_id}"
+    response = client.get(url, headers=headers, params={"include_payload": "true"})
+    assert response.status_code in (400, 500)
+
+    db = _direct_db_session()
+    try:
+        audits = (
+            db.query(TriggerAudit).filter(TriggerAudit.outcome == "payload_read").all()
+        )
+        assert len(audits) == 1
+        assert audits[0].trigger_id == trigger["id"]
+        assert audits[0].detail["trigger_run_id"] == run_id
+        assert audits[0].detail["success"] is False
+        assert audits[0].detail["error"]
     finally:
         db.close()
 

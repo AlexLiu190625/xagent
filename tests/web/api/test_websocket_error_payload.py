@@ -48,6 +48,48 @@ def test_terminal_task_error_payload_marks_task_failed(_test_db):
         db.close()
 
 
+def test_terminal_task_error_payload_persists_error_chat_message(_test_db):
+    """Failures before agent execution (no trace events, e.g. sandbox
+    capacity rejection) must persist the error as an assistant message so
+    a history reload shows the real error instead of a generic bubble."""
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        user = User(username="owner", password_hash="hash")
+        db.add(user)
+        db.commit()
+
+        task = Task(
+            user_id=user.id,
+            title="Rejected task",
+            description="Rejected task",
+            status=TaskStatus.RUNNING,
+            runner_id=get_runner_id(),
+            lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+        db.add(task)
+        db.commit()
+        task_id = task.id
+
+        error_text = "Sandbox capacity limit reached (2 containers, cap 2)"
+        _terminal_task_error_payload(task_id, error_text, event_type="task_error")
+
+        db.expire_all()
+        messages = (
+            db.query(TaskChatMessage)
+            .filter(
+                TaskChatMessage.task_id == task_id,
+                TaskChatMessage.role == "assistant",
+            )
+            .all()
+        )
+        assert len(messages) == 1
+        assert error_text in messages[0].content
+    finally:
+        db.close()
+
+
 @pytest.mark.asyncio
 async def test_handle_chat_message_access_denied_does_not_fail_task(
     _test_db, monkeypatch
