@@ -473,8 +473,8 @@ export function CustomApiForm({
                         {runtimeHeaderBindings.length > 0 && (
                             <div className="space-y-2 rounded-md border border-dashed bg-white p-3">
                                 <p className="text-xs font-medium text-slate-600">{t('tools.mcp.runtime.boundHeaders')}</p>
-                                {runtimeHeaderBindings.map((binding) => (
-                                    <div key={`${binding.sourceType}.${binding.sourceKey}:${binding.targetKey}`} className="flex gap-2 items-center">
+                                {runtimeHeaderBindings.map((binding, index) => (
+                                    <div key={`runtime-header-${index}`} className="flex gap-2 items-center">
                                         <Input value={binding.targetKey} disabled className="flex-1" />
                                         <span className="text-slate-400">:</span>
                                         <Input value={`$${binding.sourceKey}`} disabled className="flex-1 font-mono" />
@@ -506,8 +506,8 @@ export function CustomApiForm({
                                 {runtimeBodyBindings.length > 0 && (
                                     <div className="mt-2 space-y-2 rounded-md border border-dashed bg-white p-3">
                                         <p className="text-xs font-medium text-slate-600">{t('tools.mcp.runtime.boundBodyFields')}</p>
-                                        {runtimeBodyBindings.map((binding) => (
-                                            <div key={`${binding.sourceType}.${binding.sourceKey}:${binding.targetKey}`} className="flex gap-2 items-center">
+                                        {runtimeBodyBindings.map((binding, index) => (
+                                            <div key={`runtime-body-${index}`} className="flex gap-2 items-center">
                                                 <Input value={binding.targetKey} disabled className="flex-1" />
                                                 <span className="text-slate-400">=</span>
                                                 <Input value={`$${binding.sourceKey}`} disabled className="flex-1 font-mono" />

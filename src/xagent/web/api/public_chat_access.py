@@ -390,6 +390,12 @@ async def create_public_chat_task(
         elif agent_id != access_context.widget_agent_id:
             raise HTTPException(status_code=403, detail="Widget access is unavailable")
     agent = db.query(Agent).filter(Agent.id == agent_id).first() if agent_id else None
+    if agent is None and access_context.widget_agent_id is not None:
+        logger.info(
+            "Widget task create could not load agent %s; connector runtime "
+            "selection will be empty",
+            access_context.widget_agent_id,
+        )
     task_title = request.title or task_description or "Untitled Task"
     if task_title and len(task_title) > 50:
         task_title = task_title[:50] + "..."

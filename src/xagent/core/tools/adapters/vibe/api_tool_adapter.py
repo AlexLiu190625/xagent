@@ -395,7 +395,7 @@ class CustomApiTool(AbstractBaseTool):
                     path,
                     self._name,
                 )
-            _set_dot_path(merged_body, path, value)
+            _set_dot_path(merged_body, path, value, tool_name=self._name)
         return merged_body
 
     def _runtime_body_fields(self) -> Dict[str, Any]:
@@ -479,12 +479,22 @@ def _dot_path_exists(value: Mapping[str, Any], path: str) -> bool:
     return True
 
 
-def _set_dot_path(value: Dict[str, Any], path: str, field_value: Any) -> None:
+def _set_dot_path(
+    value: Dict[str, Any], path: str, field_value: Any, *, tool_name: str
+) -> None:
     current = value
     parts = path.split(".")
     for part in parts[:-1]:
         child = current.get(part)
         if not isinstance(child, dict):
+            if part in current:
+                logger.warning(
+                    "Runtime Custom API body binding overrides non-object "
+                    "intermediate field %s while setting %s for tool %s",
+                    part,
+                    path,
+                    tool_name,
+                )
             child = {}
             current[part] = child
         current = child

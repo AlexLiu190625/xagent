@@ -93,6 +93,10 @@ ConnectorRuntimeResolver = Callable[
 ]
 
 
+# The default OSS store is process-local and single-turn: it is only reliable
+# when the create/append request and the worker that consumes the turn run in
+# the same process. Multi-worker deployments should provide ephemeral secrets
+# through the resolver hook or a deployment-owned distributed secret store.
 _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
 _EPHEMERAL_RUNTIME_MANIFESTS: dict[str, dict[str, dict[str, set[str]]]] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()

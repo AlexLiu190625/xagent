@@ -928,6 +928,34 @@ def test_react_trace_safe_tool_args_ignores_non_mapping_args() -> None:
     assert result is tool_call
 
 
+@pytest.mark.parametrize("raw_args", [["not", "a", "mapping"], "not-a-mapping"])
+@pytest.mark.asyncio
+async def test_react_rejects_non_mapping_tool_args_without_crashing_ledger(
+    raw_args: Any,
+) -> None:
+    pattern = ReActPattern()
+    runtime = PatternRuntime()
+    tool = FakeTraceSanitizingTool()
+
+    result = await pattern._execute_tool_safely(
+        {
+            "id": "call-custom-api",
+            "name": "custom_api",
+            "args": raw_args,
+        },
+        [tool],
+        runtime,
+    )
+
+    assert result["success"] is False
+    assert result["error"] == "Tool call args must be a JSON object."
+    assert tool.calls == []
+    record = pattern.tool_ledger["call-custom-api"]
+    assert record.status == "failed"
+    assert record.args == {}
+    assert record.error == "Tool call args must be a JSON object."
+
+
 def test_react_trace_safe_tool_args_detects_in_place_sanitizer() -> None:
     pattern = ReActPattern()
     tool = FakeInPlaceTraceSanitizingTool()

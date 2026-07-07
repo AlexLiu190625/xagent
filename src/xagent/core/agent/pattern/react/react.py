@@ -2068,7 +2068,7 @@ class ReActPattern(AgentPattern):
         error: str | None = None,
     ) -> None:
         tool_call_id = str(tool_call.get("id") or f"tool_call_{len(self.tool_ledger)}")
-        args = dict(tool_call.get("args") or {})
+        args = self._tool_call_args_dict(tool_call)
         args_hash = self._args_hash(args)
         self.tool_ledger[tool_call_id] = ToolCallRecord(
             tool_call_id=tool_call_id,
@@ -2085,6 +2085,18 @@ class ReActPattern(AgentPattern):
             return json.dumps(args, sort_keys=True, default=str)
         except TypeError:
             return str(args)
+
+    def _tool_call_args_dict(
+        self, tool_call: dict[str, Any], *, require_mapping: bool = False
+    ) -> dict[str, Any]:
+        raw_args = tool_call.get("args")
+        if raw_args is None:
+            return {}
+        if isinstance(raw_args, dict):
+            return dict(raw_args)
+        if require_mapping:
+            raise ValueError("Tool call args must be a JSON object.")
+        return {}
 
     def _tool_name(self, tool: Any) -> str:
         metadata = getattr(tool, "metadata", None)
@@ -2194,7 +2206,7 @@ class ReActPattern(AgentPattern):
     def _tool_args_for_execution(
         self, tool_call: dict[str, Any], tool: Any
     ) -> dict[str, Any]:
-        args = dict(tool_call.get("args") or {})
+        args = self._tool_call_args_dict(tool_call, require_mapping=True)
         tool_name = self._tool_name(tool)
         if not tool_name.startswith("browser_"):
             return args
