@@ -1080,6 +1080,8 @@ Build when you need.`,
             secretTarget: "Secrets can only bind to connector headers.",
             contextTarget: "Context cannot bind to this target.",
             objectHeader: "Object values cannot bind to headers.",
+            duplicateInput: "Runtime input keys must be unique within the same input type.",
+            targetMissing: "This binding needs a target key or path.",
             authorizationRequiresDelegated: "Authorization bindings require delegated authorization."
           }
         },

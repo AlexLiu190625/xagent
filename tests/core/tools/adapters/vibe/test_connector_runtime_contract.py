@@ -111,6 +111,10 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
     value = {
         "headers": {"Authorization": "Bearer secret-token", "X-Safe": "ok"},
         "credentials": {
+            "apikey": "compact-api-key-secret",
+            "aws_secret_access_key": "aws-secret-access-key",
+            "service_access_key": "service-access-key-secret",
+            "secret_key": "secret-key-secret",
             "user_api_key": "api-key-secret",
             "api_key_v1": "versioned-api-key-secret",
             "private_key": "private-key-secret",
@@ -142,6 +146,10 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
             "X-Safe": "ok",
         },
         "credentials": {
+            "apikey": REDACTED_RUNTIME_SECRET,
+            "aws_secret_access_key": REDACTED_RUNTIME_SECRET,
+            "service_access_key": REDACTED_RUNTIME_SECRET,
+            "secret_key": REDACTED_RUNTIME_SECRET,
             "user_api_key": REDACTED_RUNTIME_SECRET,
             "api_key_v1": REDACTED_RUNTIME_SECRET,
             "private_key": REDACTED_RUNTIME_SECRET,
@@ -171,6 +179,10 @@ def test_redact_runtime_sensitive_payload_recursively_redacts_credentials() -> N
         ],
     }
     assert "secret-token" not in repr(redacted)
+    assert "compact-api-key-secret" not in repr(redacted)
+    assert "aws-secret-access-key" not in repr(redacted)
+    assert "service-access-key-secret" not in repr(redacted)
+    assert "secret-key-secret" not in repr(redacted)
     assert "api-key-secret" not in repr(redacted)
     assert "versioned-api-key-secret" not in repr(redacted)
     assert "private-key-secret" not in repr(redacted)

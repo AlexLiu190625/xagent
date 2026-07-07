@@ -396,6 +396,53 @@ async def test_run_json_async_ignores_non_scalar_runtime_header_values():
 
 
 @pytest.mark.asyncio
+async def test_run_json_async_warns_when_runtime_body_binding_discards_non_object_body(
+    caplog,
+):
+    with patch(
+        "xagent.core.tools.adapters.vibe.api_tool_adapter.call_api"
+    ) as mock_call_api:
+        mock_call_api.return_value = {
+            "success": True,
+            "status_code": 200,
+            "headers": {},
+            "body": {"data": "test"},
+            "error": None,
+        }
+        tool = CustomApiTool(
+            name="ShiftCare",
+            description="test",
+            env={},
+            url="https://api.example.com/clients",
+            body='"static text body"',
+            runtime_bindings=[
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "body_field", "path": "account.id"},
+                },
+            ],
+            connector_runtime={
+                "context": {"account_id": "6185"},
+                "secrets": {},
+                "auth_selector": {},
+            },
+        )
+
+        caplog.set_level("WARNING")
+        res = await tool.run_json_async({})
+
+        assert res["success"] is True
+        assert "discard non-object body" in caplog.text
+        mock_call_api.assert_called_once_with(
+            url="https://api.example.com/clients",
+            method="GET",
+            headers={},
+            params={},
+            body={"account": {"id": "6185"}},
+        )
+
+
+@pytest.mark.asyncio
 async def test_run_json_async_returns_error_without_any_url():
     tool = CustomApiTool(name="test", description="test", env={})
 

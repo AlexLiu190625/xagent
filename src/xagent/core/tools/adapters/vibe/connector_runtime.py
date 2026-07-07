@@ -31,12 +31,17 @@ REDACTED_RUNTIME_SECRET = "[REDACTED_RUNTIME_SECRET]"
 MISSING_RUNTIME_VALUE = object()
 _SENSITIVE_RUNTIME_KEY_PARTS = frozenset(
     {
+        "access_key",
+        "apikey",
         "authorization",
         "auth_selector",
         "bearer",
         "api_key",
+        "credential",
+        "credentials",
         "private_key",
         "password",
+        "secret_key",
     }
 )
 

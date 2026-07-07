@@ -320,6 +320,54 @@ async def test_waiting_for_user_with_no_history_still_runs_reconstruct() -> None
     reconstruct.assert_awaited_once_with(42, db)
 
 
+@pytest.mark.asyncio
+async def test_reconstruct_return_path_syncs_connector_runtime_turn() -> None:
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.PAUSED, agent_id=7)
+    agent_row = _make_agent()
+    db = _build_db(
+        task, trace_event=None, dag_execution=None, agent=agent_row, user=user
+    )
+
+    class _ToolConfig:
+        def __init__(self) -> None:
+            self.turn_ids: list[str] = []
+
+        def set_connector_runtime_turn_id(self, turn_id: str) -> bool:
+            self.turn_ids.append(turn_id)
+            return True
+
+    class _Agent:
+        def __init__(self) -> None:
+            self.tool_config = _ToolConfig()
+            self.invalidated = False
+
+        def invalidate_tools(self) -> None:
+            self.invalidated = True
+
+    reconstructed_agent = _Agent()
+
+    async def reconstruct(task_id: int, _db: Any) -> None:
+        manager._agents[task_id] = reconstructed_agent
+
+    with (
+        patch.object(manager, "_reconstruct_agent_from_history", reconstruct),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+    ):
+        agent = await manager.get_agent_for_task(
+            task_id=42,
+            db=db,
+            user=user,
+            connector_runtime_turn_id="turn-reconstructed",
+        )
+
+    assert agent is reconstructed_agent
+    assert reconstructed_agent.tool_config.turn_ids == ["turn-reconstructed"]
+    assert reconstructed_agent.invalidated is True
+
+
 class _Patches:
     """Compose a list of ``patch`` objects into a single context
     manager. Equivalent to ``with patch(a), patch(b), ...`` but

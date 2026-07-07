@@ -6,6 +6,7 @@ import pytest
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPToolAdapter,
     _build_mcp_tool_adapter,
+    _exception_indicates_http_401,
 )
 
 
@@ -76,6 +77,20 @@ def test_build_mcp_tool_adapter_marks_all_tools_safe_when_server_opts_in():
     )
 
     assert adapter.metadata.concurrency_safe is True
+
+
+def test_exception_indicates_http_401_uses_bounded_status_signals():
+    class StatusError(RuntimeError):
+        status_code = 401
+
+    assert _exception_indicates_http_401(StatusError("request failed"))
+    assert _exception_indicates_http_401(RuntimeError("HTTP status 401"))
+    assert _exception_indicates_http_401(RuntimeError("401 Unauthorized"))
+    assert _exception_indicates_http_401(RuntimeError("Unauthorized"))
+    assert not _exception_indicates_http_401(
+        RuntimeError("connection reset on port 401")
+    )
+    assert not _exception_indicates_http_401(RuntimeError("tool returned id 40123"))
 
 
 def test_build_mcp_tool_adapter_honors_concurrent_tool_allowlist():

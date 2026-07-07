@@ -1,4 +1,4 @@
-import React from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { AlertTriangle, Plus, Trash2 } from "lucide-react"
 
 import { Alert, AlertDescription } from "@/components/ui/alert"
@@ -34,11 +34,19 @@ interface RuntimeInputRow {
   required: boolean
 }
 
+interface EditableRuntimeInputRow extends RuntimeInputRow {
+  id: string
+}
+
 export interface RuntimeBindingRow {
   sourceType: RuntimeInputType
   sourceKey: string
   targetType: RuntimeTargetType
   targetKey: string
+}
+
+interface EditableRuntimeBindingRow extends RuntimeBindingRow {
+  id: string
 }
 
 interface RuntimeBindingConfig {
@@ -166,7 +174,7 @@ function bindingsToConfig(rows: RuntimeBindingRow[]): RuntimeBindingConfig[] | n
               .filter(Boolean)
               .join(".")
           : row.targetKey.trim()
-      if (!sourceKey || !targetKey) return acc
+      if (!sourceKey && !targetKey) return acc
       acc.push({
         source: { input_type: row.sourceType, key: sourceKey },
         target:
@@ -177,6 +185,20 @@ function bindingsToConfig(rows: RuntimeBindingRow[]): RuntimeBindingConfig[] | n
       return acc
     }, [])
   return bindings.length > 0 ? bindings : null
+}
+
+function withInputIds(
+  rows: RuntimeInputRow[],
+  nextId: () => string,
+): EditableRuntimeInputRow[] {
+  return rows.map((row) => ({ ...row, id: nextId() }))
+}
+
+function withBindingIds(
+  rows: RuntimeBindingRow[],
+  nextId: () => string,
+): EditableRuntimeBindingRow[] {
+  return rows.map((row) => ({ ...row, id: nextId() }))
 }
 
 function nextKey(rows: RuntimeInputRow[], base: string): string {
@@ -195,12 +217,25 @@ function targetNeedsPath(targetType: RuntimeTargetType): boolean {
   return targetType === "body_field"
 }
 
+function duplicateRuntimeInputError(inputs: RuntimeInputRow[]): string | null {
+  const seen = new Set<string>()
+  for (const input of inputs) {
+    const key = sanitizeRuntimeKey(input.key.trim())
+    if (!key) continue
+    const scopedKey = `${input.inputType}:${key}`
+    if (seen.has(scopedKey)) return "tools.mcp.runtime.errors.duplicateInput"
+    seen.add(scopedKey)
+  }
+  return null
+}
+
 function bindingError(
   binding: RuntimeBindingRow,
   inputs: RuntimeInputRow[],
   connectorType: ConnectorType,
   delegatedEnabled: boolean,
 ): string | null {
+  if (!binding.targetKey.trim()) return "tools.mcp.runtime.errors.targetMissing"
   const source = inputs.find(
     (row) => row.inputType === binding.sourceType && row.key === binding.sourceKey,
   )
@@ -245,6 +280,22 @@ function bindingError(
   return null
 }
 
+export function getRuntimeConfigError(
+  formData: MCPServerFormData,
+  connectorType: ConnectorType,
+): string | null {
+  const inputs = runtimeInputsFromSchema(formData.runtime_input_schema)
+  const bindings = runtimeBindingsFromConfig(formData.runtime_bindings)
+  const delegatedEnabled = Boolean(formData.allow_delegated_authorization)
+  return (
+    duplicateRuntimeInputError(inputs) ||
+    bindings
+      .map((binding) => bindingError(binding, inputs, connectorType, delegatedEnabled))
+      .find((error): error is string => Boolean(error)) ||
+    null
+  )
+}
+
 export function RuntimeInputsForm({
   connectorType,
   formData,
@@ -252,21 +303,51 @@ export function RuntimeInputsForm({
   disabled = false,
 }: RuntimeInputsFormProps) {
   const { t } = useI18n()
-  const inputs = runtimeInputsFromSchema(formData.runtime_input_schema)
-  const bindings = runtimeBindingsFromConfig(formData.runtime_bindings)
   const delegatedEnabled = Boolean(formData.allow_delegated_authorization)
+  const nextIdRef = useRef(0)
+  const nextRowId = useCallback(() => `runtime-row-${nextIdRef.current++}`, [])
+  const lastSchemaRef = useRef(formData.runtime_input_schema)
+  const lastBindingsRef = useRef(formData.runtime_bindings)
+  const [inputs, setInputs] = useState<EditableRuntimeInputRow[]>(() =>
+    withInputIds(runtimeInputsFromSchema(formData.runtime_input_schema), nextRowId),
+  )
+  const [bindings, setBindings] = useState<EditableRuntimeBindingRow[]>(() =>
+    withBindingIds(runtimeBindingsFromConfig(formData.runtime_bindings), nextRowId),
+  )
 
-  const updateInputs = (nextInputs: RuntimeInputRow[]) => {
+  useEffect(() => {
+    if (formData.runtime_input_schema === lastSchemaRef.current) return
+    lastSchemaRef.current = formData.runtime_input_schema
+    setInputs(
+      withInputIds(runtimeInputsFromSchema(formData.runtime_input_schema), nextRowId),
+    )
+  }, [formData.runtime_input_schema, nextRowId])
+
+  useEffect(() => {
+    if (formData.runtime_bindings === lastBindingsRef.current) return
+    lastBindingsRef.current = formData.runtime_bindings
+    setBindings(
+      withBindingIds(runtimeBindingsFromConfig(formData.runtime_bindings), nextRowId),
+    )
+  }, [formData.runtime_bindings, nextRowId])
+
+  const updateInputs = (nextInputs: EditableRuntimeInputRow[]) => {
+    const nextSchema = schemaFromInputs(nextInputs)
+    lastSchemaRef.current = nextSchema
+    setInputs(nextInputs)
     setFormData((prev) => ({
       ...prev,
-      runtime_input_schema: schemaFromInputs(nextInputs),
+      runtime_input_schema: nextSchema,
     }))
   }
 
-  const updateBindings = (nextBindings: RuntimeBindingRow[]) => {
+  const updateBindings = (nextBindings: EditableRuntimeBindingRow[]) => {
+    const nextConfig = bindingsToConfig(nextBindings)
+    lastBindingsRef.current = nextConfig
+    setBindings(nextBindings)
     setFormData((prev) => ({
       ...prev,
-      runtime_bindings: bindingsToConfig(nextBindings),
+      runtime_bindings: nextConfig,
     }))
   }
 
@@ -291,6 +372,7 @@ export function RuntimeInputsForm({
   const bindingErrors = bindings
     .map((binding) => bindingError(binding, inputs, connectorType, delegatedEnabled))
     .filter((error): error is string => Boolean(error))
+  const duplicateInputError = duplicateRuntimeInputError(inputs)
   const hasToolArgumentBinding = bindings.some(
     (binding) => binding.targetType === "tool_arguments",
   )
@@ -323,11 +405,11 @@ export function RuntimeInputsForm({
         </Alert>
       )}
 
-      {bindingErrors.length > 0 && (
+      {(duplicateInputError || bindingErrors.length > 0) && (
         <Alert className="border-red-200 bg-red-50 text-red-900">
           <AlertTriangle className="h-4 w-4 text-red-700" />
           <AlertDescription className="text-red-800">
-            {t(bindingErrors[0])}
+            {t(duplicateInputError || bindingErrors[0])}
           </AlertDescription>
         </Alert>
       )}
@@ -355,6 +437,7 @@ export function RuntimeInputsForm({
               updateInputs([
                 ...inputs,
                 {
+                  id: nextRowId(),
                   inputType: "context",
                   key: nextKey(inputs, "account_id"),
                   valueType: "string",
@@ -375,7 +458,7 @@ export function RuntimeInputsForm({
         ) : (
           <div className="space-y-2">
             {inputs.map((row, index) => (
-              <div key={`runtime-input-${index}`} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
+              <div key={row.id} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
                 <Select
                   value={row.inputType}
                   disabled={disabled}
@@ -476,6 +559,7 @@ export function RuntimeInputsForm({
               updateBindings([
                 ...bindings,
                 {
+                  id: nextRowId(),
                   sourceType: source?.inputType || "context",
                   sourceKey: source?.key || "account_id",
                   targetType: defaultTarget(connectorType),
@@ -498,7 +582,7 @@ export function RuntimeInputsForm({
             {bindings.map((row, index) => {
               const keys = inputKeysByType.get(row.sourceType) || []
               return (
-                <div key={`runtime-binding-${index}`} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
+                <div key={row.id} className="grid grid-cols-12 gap-2 rounded-md border bg-white p-2">
                   <Select
                     value={row.sourceType}
                     disabled={disabled}

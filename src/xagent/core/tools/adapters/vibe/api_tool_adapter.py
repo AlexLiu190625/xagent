@@ -379,6 +379,12 @@ class CustomApiTool(AbstractBaseTool):
         if not runtime_fields:
             return body
         if not isinstance(body, dict):
+            if body not in (None, ""):
+                logger.warning(
+                    "Runtime Custom API body bindings discard non-object body "
+                    "for tool %s",
+                    self._name,
+                )
             body = {}
         merged_body = dict(body)
         for path, value in runtime_fields.items():

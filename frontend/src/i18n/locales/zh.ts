@@ -1080,6 +1080,8 @@ Build when you need.`,
             secretTarget: "密钥只能绑定到连接器请求头。",
             contextTarget: "上下文不能绑定到这个目标位置。",
             objectHeader: "对象类型不能绑定到请求头。",
+            duplicateInput: "同一入参类型下的运行时字段不能重复。",
+            targetMissing: "该绑定需要填写目标字段或路径。",
             authorizationRequiresDelegated: "Authorization 绑定需要开启委托授权。"
           }
         },

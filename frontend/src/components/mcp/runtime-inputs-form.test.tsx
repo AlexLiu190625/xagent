@@ -4,7 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 
 import { CustomApiForm } from "./custom-api-form"
 import type { MCPServerFormData } from "./custom-api-form"
-import { RuntimeInputsForm } from "./runtime-inputs-form"
+import { RuntimeInputsForm, getRuntimeConfigError } from "./runtime-inputs-form"
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
@@ -121,6 +121,40 @@ describe("RuntimeInputsForm", () => {
     })
   })
 
+  it("keeps runtime input rows visible while a key is temporarily empty", () => {
+    render(<RuntimeFormHarness connectorType="mcp" />)
+
+    fireEvent.click(screen.getByText("tools.mcp.runtime.addInput"))
+    const keyInput = screen.getByPlaceholderText("tools.mcp.runtime.key")
+    keyInput.focus()
+
+    fireEvent.change(keyInput, { target: { value: "" } })
+
+    expect(document.activeElement).toBe(keyInput)
+    expect(screen.getByPlaceholderText("tools.mcp.runtime.key")).toBeInTheDocument()
+    expect(screen.queryByText("tools.mcp.runtime.noInputs")).not.toBeInTheDocument()
+
+    fireEvent.change(keyInput, { target: { value: "tenant_id" } })
+    expect(formState().runtime_input_schema).toEqual({
+      context: {
+        tenant_id: { type: "string", required: false },
+      },
+    })
+  })
+
+  it("warns when runtime input keys are duplicated within an input type", () => {
+    render(<RuntimeFormHarness connectorType="mcp" />)
+
+    fireEvent.click(screen.getByText("tools.mcp.runtime.addInput"))
+    fireEvent.click(screen.getByText("tools.mcp.runtime.addInput"))
+    const keyInputs = screen.getAllByPlaceholderText("tools.mcp.runtime.key")
+    fireEvent.change(keyInputs[1], { target: { value: "account_id" } })
+
+    expect(
+      screen.getByText("tools.mcp.runtime.errors.duplicateInput"),
+    ).toBeInTheDocument()
+  })
+
   it("writes Custom API bindings and delegated authorization to top-level form data", () => {
     render(<RuntimeFormHarness connectorType="custom_api" />)
 
@@ -170,6 +204,32 @@ describe("RuntimeInputsForm", () => {
     expect(
       screen.getByText("tools.mcp.runtime.errors.authorizationRequiresDelegated"),
     ).toBeInTheDocument()
+  })
+
+  it("returns a save-blocking validation error for invalid runtime bindings", () => {
+    expect(
+      getRuntimeConfigError(
+        {
+          name: "records",
+          transport: "custom_api",
+          description: "",
+          config: {},
+          runtime_input_schema: {
+            secrets: {
+              authorization: { type: "string", required: false },
+            },
+          },
+          runtime_bindings: [
+            {
+              source: { input_type: "secrets", key: "authorization" },
+              target: { target_type: "headers", key: "Authorization" },
+            },
+          ],
+          allow_delegated_authorization: false,
+        },
+        "custom_api",
+      ),
+    ).toBe("tools.mcp.runtime.errors.authorizationRequiresDelegated")
   })
 
   it("renders Custom API runtime-bound headers and body fields as read-only references", () => {

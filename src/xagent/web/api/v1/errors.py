@@ -81,8 +81,6 @@ class V1ErrorCode(str, Enum):
     RUNTIME_SECRET_NOT_ALLOWED = "runtime_secret_not_allowed"
     RUNTIME_SECRET_UNAVAILABLE = "runtime_secret_unavailable"
     SCHEDULED_SECRET_UNAVAILABLE = "scheduled_secret_unavailable"
-    RUNTIME_BINDING_NOT_ALLOWED = "runtime_binding_not_allowed"
-    RUNTIME_BINDING_CONFLICT = "runtime_binding_conflict"
     MCP_OAUTH_AUTHORIZATION_FAILED = "mcp_oauth_authorization_failed"
     DELEGATED_AUTHORIZATION_FAILED = "delegated_authorization_failed"
 
@@ -106,8 +104,6 @@ _DEFAULT_MESSAGES: dict[V1ErrorCode, str] = {
     V1ErrorCode.RUNTIME_SECRET_NOT_ALLOWED: "Runtime secret is not allowed for this entrypoint.",
     V1ErrorCode.RUNTIME_SECRET_UNAVAILABLE: "Required runtime secret is unavailable.",
     V1ErrorCode.SCHEDULED_SECRET_UNAVAILABLE: "Required scheduled runtime secret is unavailable.",
-    V1ErrorCode.RUNTIME_BINDING_NOT_ALLOWED: "Connector runtime binding is not allowed.",
-    V1ErrorCode.RUNTIME_BINDING_CONFLICT: "Connector runtime binding conflicts with static configuration.",
     V1ErrorCode.MCP_OAUTH_AUTHORIZATION_FAILED: "MCP OAuth authorization is unavailable.",
     V1ErrorCode.DELEGATED_AUTHORIZATION_FAILED: "Delegated authorization failed.",
 }

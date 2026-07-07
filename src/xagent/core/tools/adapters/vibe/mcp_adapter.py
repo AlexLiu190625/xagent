@@ -8,6 +8,7 @@ import asyncio
 import inspect
 import logging
 import os
+import re
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
 from mcp.types import Tool as MCPTool
@@ -40,6 +41,12 @@ class EmptyArgsModel(BaseModel):
 
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
+_HTTP_401_TEXT_RE = re.compile(
+    r"\bunauthorized\b|"
+    r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
+    r"\b401\s+unauthorized\b",
+    re.IGNORECASE,
+)
 
 
 def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
@@ -62,8 +69,17 @@ def _format_exception_group_messages(exc: BaseExceptionGroup) -> str:
 def _exception_indicates_http_401(exc: BaseException) -> bool:
     if isinstance(exc, BaseExceptionGroup):
         return any(_exception_indicates_http_401(sub_exc) for sub_exc in exc.exceptions)
+    for attr in ("status_code", "status", "code"):
+        value = getattr(exc, attr, None)
+        if value == 401 or value == "401":
+            return True
+    response = getattr(exc, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if status_code == 401 or status_code == "401":
+            return True
     text = str(exc).lower()
-    return "401" in text or "unauthorized" in text
+    return bool(_HTTP_401_TEXT_RE.search(text))
 
 
 def _delegated_authorization_failed_result() -> dict[str, Any]:

@@ -1401,6 +1401,9 @@ class AgentServiceManager:
                         self._load_persisted_conversation_history(task_id, db)
                         await self._load_persisted_execution_context(task_id, db)
                         self._agent_owner_ids[task_id] = runtime_user_id
+                        self._sync_connector_runtime_turn(
+                            task_id, connector_runtime_turn_id
+                        )
                         return self._agents[task_id]
                     except HTTPException:
                         raise
@@ -1828,19 +1831,53 @@ class AgentServiceManager:
                 # Re-raise the exception - no fallback logic allowed
                 raise
 
-        if task_id in self._agents and connector_runtime_turn_id:
-            tool_config = getattr(self._agents[task_id], "tool_config", None)
-            set_turn_id = getattr(tool_config, "set_connector_runtime_turn_id", None)
-            if callable(set_turn_id) and set_turn_id(connector_runtime_turn_id):
-                logger.info(
-                    "Refreshing connector runtime tools for task %s turn %s",
-                    task_id,
-                    connector_runtime_turn_id,
-                )
-                self._agents[task_id].invalidate_tools()
-
         self._agent_owner_ids[task_id] = runtime_user_id
+        self._sync_connector_runtime_turn(task_id, connector_runtime_turn_id)
         return self._agents[task_id]
+
+    def _sync_connector_runtime_turn(
+        self, task_id: int, connector_runtime_turn_id: Optional[str]
+    ) -> None:
+        if not connector_runtime_turn_id:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s: no turn id",
+                task_id,
+            )
+            return
+
+        agent = self._agents.get(task_id)
+        if agent is None:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s turn %s: "
+                "agent is not cached",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            return
+
+        tool_config = agent.tool_config
+        if tool_config is None:
+            logger.debug(
+                "Skipping connector runtime turn sync for task %s turn %s: "
+                "agent has no tool config",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            return
+
+        if tool_config.set_connector_runtime_turn_id(connector_runtime_turn_id):
+            logger.info(
+                "Refreshing connector runtime tools for task %s turn %s",
+                task_id,
+                connector_runtime_turn_id,
+            )
+            agent.invalidate_tools()
+        else:
+            logger.debug(
+                "Connector runtime tools already use task %s turn %s",
+                task_id,
+                connector_runtime_turn_id,
+            )
 
     def remove_agent(self, task_id: int, user_id: Optional[int] = None) -> None:
         """Remove AgentService instance for completed task"""

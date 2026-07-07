@@ -50,6 +50,7 @@ import type { AppIntegration } from "./types"
 import { OfficialMcpSettingsDialog } from "./official-mcp-settings-dialog"
 import { CustomApiForm, MCPServerFormData } from "./custom-api-form"
 import { CustomMcpForm } from "./custom-mcp-form"
+import { getRuntimeConfigError } from "./runtime-inputs-form"
 
 interface ConnectMcpDialogProps {
   open: boolean
@@ -166,7 +167,13 @@ export function ConnectMcpDialog({
 
     let payload = { ...mcpFormData };
     let url = "";
-    let method = editingCustomServerId ? 'PUT' : 'POST';
+    const method = editingCustomServerId ? 'PUT' : 'POST';
+    const connectorType = payload.transport === "custom_api" ? "custom_api" : "mcp";
+    const runtimeError = getRuntimeConfigError(payload, connectorType);
+    if (runtimeError) {
+      toast.error(t(runtimeError));
+      return;
+    }
 
     if (payload.transport === "custom_api") {
       if (!mcpFormData.url?.trim()) {

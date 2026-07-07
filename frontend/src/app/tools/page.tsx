@@ -42,6 +42,7 @@ import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-d
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
+import { getRuntimeConfigError } from "@/components/mcp/runtime-inputs-form"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
@@ -508,6 +509,13 @@ function ToolsPageContent() {
     }
 
     let payload: any = { ...mcpFormData }
+    const connectorType = payload.transport === "custom_api" ? "custom_api" : "mcp"
+    const runtimeError = getRuntimeConfigError(payload, connectorType)
+    if (runtimeError) {
+      toast.error(t(runtimeError))
+      return
+    }
+
     if (payload.transport === "custom_api") {
       if (!mcpFormData.url?.trim()) {
         toast.error(t('tools.mcp.alerts.urlRequired'));
