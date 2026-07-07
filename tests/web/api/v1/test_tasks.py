@@ -89,6 +89,7 @@ def _bearer(full_key: str) -> dict[str, str]:
 def _install_runtime_mcp_connector(
     agent_id: int,
     *,
+    name: str = "ShiftCare",
     selected: bool = True,
     required: bool = True,
     auth_selector_required: bool = False,
@@ -148,11 +149,11 @@ def _install_runtime_mcp_connector(
             )
 
         server = MCPServer(
-            name="ShiftCare",
-            description="ShiftCare MCP",
+            name=name,
+            description=f"{name} MCP",
             managed="external",
             transport="streamable_http",
-            url="https://mcp.shiftcare.test",
+            url=f"https://{name.lower()}.mcp.test",
             runtime_input_schema=runtime_input_schema,
             runtime_bindings=runtime_bindings,
             allow_delegated_authorization=delegated_authorization_binding,
@@ -169,7 +170,7 @@ def _install_runtime_mcp_connector(
             )
         )
         if selected:
-            agent.tool_categories = ["mcp:ShiftCare"]
+            agent.tool_categories = [f"mcp:{name}"]
         db.commit()
         return int(server.id)
     finally:
@@ -1357,6 +1358,85 @@ def test_append_message_accepts_same_connector_runtime_context(mock_start_task):
                         "connector_id": server_id,
                     },
                     "context": {"account_id": "6185"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert mock_start_task.call_count == 1
+
+
+def test_append_message_ignores_disabled_historical_connector_not_in_payload(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    stale_server_id = _install_runtime_mcp_connector(
+        agent_id, name="StaleCare", required=False, selected=False
+    )
+    active_server_id = _install_runtime_mcp_connector(
+        agent_id,
+        name="ActiveCare",
+        required=False,
+        secret_required=True,
+        selected=False,
+    )
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.tool_categories = ["mcp"]
+        db.commit()
+    finally:
+        db.close()
+
+    create_resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": active_server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_resp.status_code == 202, create_resp.text
+    task_id = create_resp.json()["task_id"]
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    db = _direct_db_session()
+    try:
+        junction = (
+            db.query(UserMCPServer)
+            .filter(UserMCPServer.mcpserver_id == stale_server_id)
+            .one()
+        )
+        junction.is_active = False
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "second turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": active_server_id,
+                    },
+                    "secrets": {"authorization": "Bearer append-token"},
                 }
             ],
         },

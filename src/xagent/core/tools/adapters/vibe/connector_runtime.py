@@ -47,15 +47,11 @@ ERROR_RUNTIME_CONTEXT_IMMUTABLE = "runtime_context_immutable"
 ERROR_RUNTIME_SECRET_NOT_ALLOWED = "runtime_secret_not_allowed"
 ERROR_RUNTIME_SECRET_UNAVAILABLE = "runtime_secret_unavailable"
 ERROR_SCHEDULED_SECRET_UNAVAILABLE = "scheduled_secret_unavailable"
-ERROR_RUNTIME_BINDING_NOT_ALLOWED = "runtime_binding_not_allowed"
-ERROR_RUNTIME_BINDING_CONFLICT = "runtime_binding_conflict"
 ERROR_MCP_OAUTH_AUTHORIZATION_FAILED = "mcp_oauth_authorization_failed"
 ERROR_DELEGATED_AUTHORIZATION_FAILED = "delegated_authorization_failed"
 
 RUNTIME_SECRET_REASON_NOT_PROVIDED = "not_provided"
 RUNTIME_SECRET_REASON_STORE_LOST = "store_lost"
-RUNTIME_SECRET_REASON_CLEANED = "cleaned"
-RUNTIME_SECRET_REASON_EXPIRED = "expired"
 
 
 @dataclass(frozen=True, order=True)

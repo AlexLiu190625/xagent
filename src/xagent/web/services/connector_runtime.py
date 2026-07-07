@@ -211,6 +211,9 @@ def load_connector_runtime_view(
     for ref in selected_refs:
         connector = visible.get(ref)
         if connector is None:
+            # Tool loading applies the same visibility filter before instantiating
+            # MCP/Custom API tools, so a now-hidden historical ref has no runtime
+            # tool to receive values on this turn.
             continue
         raw_ephemeral = (
             ephemeral_by_ref.get(ref.storage_key, {})
@@ -376,7 +379,10 @@ def prepare_append_connector_runtime(
     for ref in selected_refs:
         connector = visible.get(ref)
         if connector is None:
-            _raise_runtime_error(ERROR_CONNECTOR_NOT_FOUND, ref)
+            # Payload refs were already checked against current visibility above.
+            # A historical selected ref that was later disabled/deleted should not
+            # permanently block appends that do not try to supply values for it.
+            continue
         payload = payload_by_ref.get(ref)
         context = dict(payload.context) if payload is not None else {}
         secrets = dict(payload.secrets) if payload is not None else {}

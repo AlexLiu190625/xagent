@@ -483,14 +483,7 @@ class MCPToolAdapter(AbstractBaseTool):
                     return await self._execute_mcp_call(
                         self.connection, tool_args, tool_meta
                     )
-                except BaseExceptionGroup as exc:
-                    retry_result = await self._retry_delegated_401(
-                        exc, tool_args, tool_meta
-                    )
-                    if retry_result is not None:
-                        return retry_result
-                    raise
-                except Exception as exc:
+                except (BaseExceptionGroup, Exception) as exc:
                     retry_result = await self._retry_delegated_401(
                         exc, tool_args, tool_meta
                     )
@@ -569,16 +562,7 @@ class MCPToolAdapter(AbstractBaseTool):
             return await self._execute_mcp_call(
                 cast(Connection, refreshed), tool_args, tool_meta
             )
-        except BaseExceptionGroup as retry_exc:
-            if _exception_indicates_http_401(retry_exc):
-                return _delegated_authorization_failed_result()
-            logger.error(
-                "MCP tool %s delegated authorization retry failed with %s",
-                self.mcp_tool.name,
-                type(retry_exc).__name__,
-            )
-            return _delegated_retry_failed_result()
-        except Exception as retry_exc:
+        except (BaseExceptionGroup, Exception) as retry_exc:
             if _exception_indicates_http_401(retry_exc):
                 return _delegated_authorization_failed_result()
             logger.error(

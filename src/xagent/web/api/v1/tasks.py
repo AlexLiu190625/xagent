@@ -15,7 +15,7 @@ by the WebSocket UI path so both transports share one state machine.
 """
 
 import logging
-from typing import Any, Tuple, cast
+from typing import Any, NoReturn, Tuple, cast
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func
@@ -67,7 +67,7 @@ logger = logging.getLogger(__name__)
 _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
 
 
-def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> None:
+def _raise_v1_connector_runtime_error(exc: ConnectorRuntimeError) -> NoReturn:
     try:
         code = V1ErrorCode(exc.code)
     except ValueError:
