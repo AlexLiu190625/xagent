@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 class UploadedFileSnapshot:
     """Scalar upload metadata retained after closing the DB session."""
 
+    user_id: int
     file_id: str
     filename: str
     storage_path: str
@@ -98,6 +99,7 @@ def _get_tool_compatibility_facade() -> "KBToolCompatibilityFacade":
 
 def _snapshot_uploaded_file_record(record: Any) -> UploadedFileSnapshot:
     return UploadedFileSnapshot(
+        user_id=int(record.user_id),
         file_id=str(record.file_id),
         filename=str(record.filename),
         storage_path=str(record.storage_path),

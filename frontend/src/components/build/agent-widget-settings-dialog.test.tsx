@@ -77,7 +77,21 @@ describe("AgentWidgetSettingsDialog", () => {
     toastSuccessMock.mockReset()
     copyToClipboardMock.mockReset()
     copyToClipboardMock.mockResolvedValue(true)
-    apiRequestMock.mockImplementation((_url: string, options?: { body?: string }) => {
+    apiRequestMock.mockImplementation((url: string, options?: { body?: string }) => {
+      if (url.endsWith("/widget-key/rotate")) {
+        return Promise.resolve(jsonResponse({
+          agent_id: 42,
+          widget_enabled: true,
+          widget_key: "wk-rotated-key",
+        }))
+      }
+      if (url.endsWith("/widget-key")) {
+        return Promise.resolve(jsonResponse({
+          agent_id: 42,
+          widget_enabled: true,
+          widget_key: "wk-test-key",
+        }))
+      }
       const updates = options?.body ? JSON.parse(options.body) : {}
       return Promise.resolve(jsonResponse({
         id: 42,
@@ -87,6 +101,12 @@ describe("AgentWidgetSettingsDialog", () => {
       }))
     })
   })
+
+  function agentUpdateCalls() {
+    return apiRequestMock.mock.calls.filter(
+      ([, options]) => (options as { method?: string } | undefined)?.method === "PUT",
+    )
+  }
 
   afterEach(() => {
     cleanup()
@@ -143,7 +163,7 @@ describe("AgentWidgetSettingsDialog", () => {
       })
       fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.addDomain" }))
 
-      expect(apiRequestMock).not.toHaveBeenCalled()
+      expect(agentUpdateCalls()).toHaveLength(0)
       expect(screen.getByText("appWidget.dialog.invalidDomain")).toBeInTheDocument()
       expect(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder")).toHaveValue(invalidValue)
     }
@@ -203,12 +223,19 @@ describe("AgentWidgetSettingsDialog", () => {
     })
     fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.addDomain" }))
 
-    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(agentUpdateCalls()).toHaveLength(0)
   })
 
   it("shows an error and keeps local state unchanged when updates fail", async () => {
     const { onWidgetConfigUpdated } = renderDialog()
-    apiRequestMock.mockResolvedValueOnce(jsonResponse({ detail: "Nope" }, { status: 500 }))
+    // Let the on-open widget-key fetch settle first so the failure below
+    // lands on the domain update, not the key fetch.
+    await waitFor(() => {
+      expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+    })
+    apiRequestMock.mockImplementationOnce(() =>
+      Promise.resolve(jsonResponse({ detail: "Nope" }, { status: 500 })),
+    )
 
     fireEvent.change(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder"), {
       target: { value: "docs.example.com" },
@@ -224,8 +251,80 @@ describe("AgentWidgetSettingsDialog", () => {
     expect(screen.getByPlaceholderText("appWidget.dialog.domainPlaceholder")).toHaveValue("docs.example.com")
   })
 
-  it("copies the embed snippet for the selected agent", async () => {
+  it("fetches and shows the widget key when opened", async () => {
     renderDialog()
+
+    await waitFor(() => {
+      expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+    })
+    expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/agents/42/widget-key")
+  })
+
+  it("copies the widget key", async () => {
+    renderDialog()
+    await waitFor(() => {
+      expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.copyWidgetKey" }))
+
+    await waitFor(() => {
+      expect(copyToClipboardMock).toHaveBeenCalledWith("wk-test-key")
+    })
+    expect(toastSuccessMock).toHaveBeenCalledWith("common.copied")
+  })
+
+  it("rotates the widget key after the operator confirms", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true)
+    try {
+      renderDialog()
+      await waitFor(() => {
+        expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+      })
+
+      fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.rotateWidgetKey" }))
+
+      await waitFor(() => {
+        expect(apiRequestMock).toHaveBeenCalledWith(
+          "http://api.local/api/agents/42/widget-key/rotate",
+          { method: "POST" },
+        )
+      })
+      expect(confirmSpy).toHaveBeenCalledWith("appWidget.dialog.rotateWidgetKeyConfirm")
+      await waitFor(() => {
+        expect(screen.getByText("wk-rotated-key")).toBeInTheDocument()
+      })
+      expect(toastSuccessMock).toHaveBeenCalledWith("appWidget.messages.widgetKeyRotated")
+    } finally {
+      confirmSpy.mockRestore()
+    }
+  })
+
+  it("does not rotate the widget key when the operator declines", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false)
+    try {
+      renderDialog()
+      await waitFor(() => {
+        expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+      })
+
+      fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.rotateWidgetKey" }))
+
+      expect(apiRequestMock).not.toHaveBeenCalledWith(
+        "http://api.local/api/agents/42/widget-key/rotate",
+        { method: "POST" },
+      )
+      expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+    } finally {
+      confirmSpy.mockRestore()
+    }
+  })
+
+  it("copies the embed snippet with the widget key for the selected agent", async () => {
+    renderDialog()
+    await waitFor(() => {
+      expect(screen.getByText("wk-test-key")).toBeInTheDocument()
+    })
 
     fireEvent.click(screen.getByRole("button", { name: "appWidget.dialog.copySnippet" }))
 
@@ -234,7 +333,8 @@ describe("AgentWidgetSettingsDialog", () => {
     })
     expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('src="http://app.local/widget.js"'))
     expect(copyToClipboardMock).not.toHaveBeenCalledWith(expect.stringContaining("http://api.local/widget.js"))
-    expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('data-agent-id="42"'))
+    expect(copyToClipboardMock).toHaveBeenCalledWith(expect.stringContaining('data-widget-key="wk-test-key"'))
+    expect(copyToClipboardMock).not.toHaveBeenCalledWith(expect.stringContaining("data-agent-id"))
     expect(toastSuccessMock).toHaveBeenCalledWith("common.copied")
   })
 })

@@ -12,9 +12,15 @@ from typing import Any
 from filelock import FileLock, Timeout
 from sqlalchemy.orm import Session
 
-from ...core.file_storage import FsspecFileStorage, get_file_storage
+from ...core.file_storage import (
+    FsspecFileStorage,
+    ScopedFileStorage,
+    get_file_storage_backend,
+    get_user_file_storage,
+)
+from ...core.file_storage.keys import build_upload_storage_key
 from ..models.uploaded_file import UploadedFile
-from .managed_file_ref import ManagedFileRef, build_upload_storage_key
+from .managed_file_ref import ManagedFileRef
 
 logger = logging.getLogger(__name__)
 
@@ -40,10 +46,7 @@ def sync_registered_files_to_durable_storage(
     batch_size: int = 500,
 ) -> StartupFileStorageSyncResult:
     """Reconcile registered local files with S3-backed durable storage."""
-    resolved_storage = storage or get_file_storage()
-    backend = str(getattr(resolved_storage, "backend", ""))
-    if not backend:
-        backend = str(getattr(resolved_storage, "_backend", ""))
+    backend = _detect_backend(storage)
 
     if backend != "s3":
         logger.info(
@@ -62,7 +65,7 @@ def sync_registered_files_to_durable_storage(
 
         return _sync_registered_files(
             db,
-            storage=resolved_storage,
+            storage=storage,
             batch_size=batch_size,
         )
     finally:
@@ -86,10 +89,27 @@ def _wait_for_lock_holder() -> None:
     time.sleep(_FILE_LOCK_RETRY_INTERVAL_SECONDS)
 
 
+def _detect_backend(storage: FsspecFileStorage | Any | None) -> str:
+    if storage is None:
+        return get_file_storage_backend()
+    backend = str(getattr(storage, "backend", "") or "")
+    if not backend:
+        backend = str(getattr(storage, "_backend", "") or "")
+    return backend
+
+
+def _user_scoped_storage(
+    storage: FsspecFileStorage | Any | None, user_id: int
+) -> ScopedFileStorage:
+    if storage is None:
+        return get_user_file_storage(user_id)
+    return ScopedFileStorage(storage=storage, prefix=f"users/{user_id}")
+
+
 def _sync_registered_files(
     db: Session,
     *,
-    storage: FsspecFileStorage | Any,
+    storage: FsspecFileStorage | Any | None,
     batch_size: int,
 ) -> StartupFileStorageSyncResult:
     scanned = 0
@@ -104,15 +124,17 @@ def _sync_registered_files(
         .yield_per(batch_size)
     )
     current_user_id: int | None = None
+    user_storage: ScopedFileStorage | None = None
     remote_objects: dict[str, Any] = {}
     batch_updates = 0
 
     for record in rows:
         scanned += 1
         user_id = int(getattr(record, "user_id"))
-        if user_id != current_user_id:
+        if user_id != current_user_id or user_storage is None:
             current_user_id = user_id
-            remote_objects = _list_remote_objects_for_user(storage, user_id)
+            user_storage = _user_scoped_storage(storage, user_id)
+            remote_objects = _list_remote_objects_for_user(user_storage)
 
         expected_key = _expected_storage_key(record)
         remote_object = remote_objects.get(expected_key)
@@ -120,7 +142,7 @@ def _sync_registered_files(
             if not _has_complete_durable_metadata(record):
                 try:
                     adopt_result = ManagedFileRef(
-                        record, storage=storage
+                        record, storage=user_storage
                     ).adopt_existing_object(expected_key)
                 except Exception:
                     failed += 1
@@ -154,7 +176,9 @@ def _sync_registered_files(
             continue
 
         try:
-            stored_object = ManagedFileRef(record, storage=storage).sync_to_durable(
+            stored_object = ManagedFileRef(
+                record, storage=user_storage
+            ).sync_to_durable(
                 storage_key=expected_key,
                 mime_type=getattr(record, "mime_type", None),
             )
@@ -216,10 +240,8 @@ def _has_complete_durable_metadata(record: UploadedFile) -> bool:
     )
 
 
-def _list_remote_objects_for_user(
-    storage: FsspecFileStorage | Any, user_id: int
-) -> dict[str, Any]:
-    return {stored.key: stored for stored in storage.list(f"users/{user_id}")}
+def _list_remote_objects_for_user(storage: ScopedFileStorage) -> dict[str, Any]:
+    return {stored.key: stored for stored in storage.list(storage.prefix)}
 
 
 def _get_lock_file_path() -> str:

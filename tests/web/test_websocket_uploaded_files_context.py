@@ -5,7 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.trace import get_display_user_message
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import _build_task_agent_config
 from xagent.web.api.websocket import (
@@ -761,7 +761,7 @@ def test_normalize_file_outputs_registers_current_task_output_path(
     uploads_dir = tmp_path / "uploads"
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     _create_user(db_session, 1, "owner")
     _create_task(db_session, task_id=20, user_id=1)
     output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
@@ -776,7 +776,7 @@ def test_normalize_file_outputs_registers_current_task_output_path(
             file_outputs=[{"path": str(output_path), "filename": "report.txt"}],
         )
     finally:
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
     assert len(normalized_outputs) == 1
     assert normalized_outputs[0]["filename"] == "report.txt"

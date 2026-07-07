@@ -1,6 +1,7 @@
 """Integration tests for agent management endpoints."""
 
 import io
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -8,7 +9,11 @@ import pytest
 from jose import jwt as jose_jwt
 
 from xagent.config import get_uploads_dir
-from xagent.web.api.widget import EMBED_TICKET_TYPE
+from xagent.web.api.widget import (
+    EMBED_TICKET_TYPE,
+    WIDGET_CREDENTIAL_REQUIRED_DETAIL,
+    WIDGET_KEY_REQUIRED_DETAIL,
+)
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
@@ -60,9 +65,13 @@ def _create_agent_row(
     allowed_domains: list[str] | None = None,
     share_enabled: bool = False,
     share_token: str | None = None,
+    widget_key: str | None = None,
+    generate_widget_key: bool = True,
 ) -> int:
     db = _direct_db_session()
     try:
+        if widget_key is None and widget_enabled and generate_widget_key:
+            widget_key = f"wk-{secrets.token_urlsafe(24)}"
         agent = Agent(
             user_id=user_id,
             name=name,
@@ -75,11 +84,22 @@ def _create_agent_row(
             allowed_domains=allowed_domains or [],
             share_enabled=share_enabled,
             share_token=share_token,
+            widget_key=widget_key,
         )
         db.add(agent)
         db.commit()
         db.refresh(agent)
         return int(agent.id)
+    finally:
+        db.close()
+
+
+def _widget_key_for(agent_id: int) -> str:
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None and agent.widget_key
+        return str(agent.widget_key)
     finally:
         db.close()
 
@@ -112,10 +132,13 @@ def _authenticate_widget_guest(
     guest_id: str = "guest-1",
     origin: str = "https://example.com",
 ) -> dict[str, str]:
+    # Authenticate via the direct-visit widget-key flow, which needs no
+    # embedding origin. The origin arg is accepted for call-site compatibility
+    # but no longer gates auth.
+    del origin
     response = client.post(
         "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": guest_id},
-        headers={"origin": origin},
+        json={"widget_key": _widget_key_for(agent_id), "guest_id": guest_id},
     )
     assert response.status_code == 200, response.text
     access_token = response.json()["access_token"]
@@ -343,15 +366,17 @@ def test_generated_workforce_manager_agents_cannot_authenticate_widget() -> None
 
     response = client.post(
         "/api/widget/auth",
-        json={"agent_id": generated_manager_id, "guest_id": "guest-1"},
-        headers={"origin": "https://example.com"},
+        json={
+            "widget_key": _widget_key_for(generated_manager_id),
+            "guest_id": "guest-1",
+        },
     )
 
-    assert response.status_code == 401
-    assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid widget key"
 
 
-def test_widget_auth_matches_allowed_domains_case_insensitively() -> None:
+def test_embed_ticket_origin_matches_allowed_domains_case_insensitively() -> None:
     _admin_headers()
     owner_id = _user_id("admin")
     agent_id = _create_agent_row(
@@ -362,19 +387,17 @@ def test_widget_auth_matches_allowed_domains_case_insensitively() -> None:
         allowed_domains=["Example.com"],
     )
 
-    response = client.post(
-        "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": "guest-1"},
-        headers={"origin": "https://EXAMPLE.com"},
-    )
+    response = _issue_embed_ticket(agent_id, "https://EXAMPLE.com")
 
     assert response.status_code == 200, response.text
 
 
-def _issue_embed_ticket(agent_id: int, origin: str) -> Any:
+def _issue_embed_ticket(
+    agent_id: int, origin: str, widget_key: str | None = None
+) -> Any:
     return client.post(
         "/api/widget/embed-ticket",
-        json={"agent_id": agent_id},
+        json={"widget_key": widget_key or _widget_key_for(agent_id)},
         headers={"origin": origin},
     )
 
@@ -429,9 +452,136 @@ def test_widget_embed_ticket_rejected_for_disallowed_origin() -> None:
     assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
 
 
+def test_embed_ticket_requires_valid_widget_key_despite_spoofed_origin() -> None:
+    """#742 (embed-ticket path): a forged allowlisted Origin is worthless
+    without the unguessable per-agent widget key."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Key Gated Embed Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    ok = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["agent_id"] == agent_id
+
+    forged = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": "wk-not-the-real-key"},
+        headers={"origin": "https://trusted-site.com"},
+    )
+    assert forged.status_code == 403
+    assert forged.json()["detail"] == "Invalid widget key"
+
+
+def test_embed_ticket_rejects_numeric_agent_id_without_key() -> None:
+    """The enumerable numeric agent_id can no longer obtain a ticket, and a
+    key-less (legacy) request gets an actionable 403 rather than a bare 422."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Agent Id Only Embed Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/embed-ticket",
+        json={"agent_id": agent_id},
+        headers={"origin": "https://trusted-site.com"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == WIDGET_KEY_REQUIRED_DETAIL
+
+
+def test_embed_ticket_rejects_stale_key_after_rotation() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Rotated Key Embed Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    old_key = _widget_key_for(agent_id)
+
+    rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
+    assert rotate.status_code == 200, rotate.text
+    new_key = rotate.json()["widget_key"]
+    assert new_key != old_key
+
+    stale = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": old_key},
+        headers={"origin": "https://trusted-site.com"},
+    )
+    assert stale.status_code == 403
+    assert stale.json()["detail"] == "Invalid widget key"
+
+    fresh = _issue_embed_ticket(
+        agent_id, "https://trusted-site.com", widget_key=new_key
+    )
+    assert fresh.status_code == 200, fresh.text
+
+
+def test_embed_ticket_rejects_disabled_widget_like_an_unknown_key() -> None:
+    """Disabled-widget and unknown-key both return the same 403 so callers
+    cannot tell agents apart."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    _create_agent_row(
+        user_id=owner_id,
+        name="Disabled Widget Embed Ticket Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=False,
+        allowed_domains=["trusted-site.com"],
+        widget_key="wk-disabled-agent-key",
+        generate_widget_key=False,
+    )
+
+    response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": "wk-disabled-agent-key"},
+        headers={"origin": "https://trusted-site.com"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid widget key"
+
+
+def test_widget_auth_rejects_spoofed_origin_without_credential() -> None:
+    """#742 reproduction: a spoofed allowlisted Origin header plus an
+    enumerable agent_id, with no ticket and no widget key, authenticates
+    nothing now that the bare-header fallback is removed."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Spoofed Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+        headers={"origin": "https://trusted-site.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == WIDGET_CREDENTIAL_REQUIRED_DETAIL
+
+
 def test_widget_auth_ignores_client_supplied_embed_origin() -> None:
-    """A browser-JS attacker must not pass by self-reporting an allowed
-    origin in the request body (the pre-ticket design's flaw)."""
+    """A client self-reporting an allowed origin in the body (the pre-ticket
+    design's flaw) still gets nothing without a verifiable credential."""
     _admin_headers()
     owner_id = _user_id("admin")
     agent_id = _create_agent_row(
@@ -453,7 +603,56 @@ def test_widget_auth_ignores_client_supplied_embed_origin() -> None:
     )
 
     assert response.status_code == 403
-    assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
+    assert response.json()["detail"] == WIDGET_CREDENTIAL_REQUIRED_DETAIL
+
+
+def test_widget_auth_with_no_origin_and_no_credential_is_rejected() -> None:
+    """The absent-Origin row from #742's table: still 403 with no credential."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="No Origin Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1"},
+    )
+
+    assert response.status_code == 403
+
+
+def test_widget_auth_direct_visit_with_widget_key_succeeds() -> None:
+    """Direct (non-embedded) visits authenticate with the widget key alone;
+    no origin allowlist applies because a direct visit is not embedded."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Direct Visit Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+    widget_key = _widget_key_for(agent_id)
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"widget_key": widget_key, "guest_id": "guest-1"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_id"] == agent_id
+
+    stale = client.post(
+        "/api/widget/auth",
+        json={"widget_key": "wk-not-a-real-key", "guest_id": "guest-1"},
+    )
+    assert stale.status_code == 403
+    assert stale.json()["detail"] == "Invalid widget key"
 
 
 def test_widget_auth_rejects_tampered_or_mismatched_ticket() -> None:
@@ -486,7 +685,8 @@ def test_widget_auth_rejects_tampered_or_mismatched_ticket() -> None:
     assert response.status_code == 403
     assert response.json()["detail"] == "Invalid or expired embed ticket"
 
-    # Valid ticket, but issued for a different agent.
+    # A ticket authenticates only as the agent it was issued for; a spoofed
+    # agent_id in the body cannot redirect it to another agent.
     other_ticket = _issue_embed_ticket(
         other_agent_id, "https://trusted-site.com"
     ).json()["ticket"]
@@ -498,8 +698,8 @@ def test_widget_auth_rejects_tampered_or_mismatched_ticket() -> None:
             "embed_ticket": other_ticket,
         },
     )
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Invalid or expired embed ticket"
+    assert response.status_code == 200, response.text
+    assert response.json()["agent_id"] == other_agent_id
 
 
 def test_widget_auth_rejects_expired_embed_ticket() -> None:
@@ -603,26 +803,6 @@ def test_widget_auth_rechecks_ticket_origin_against_current_allowlist() -> None:
     assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
 
 
-def test_widget_auth_falls_back_to_origin_header_without_embed_ticket() -> None:
-    _admin_headers()
-    owner_id = _user_id("admin")
-    agent_id = _create_agent_row(
-        user_id=owner_id,
-        name="Header Fallback Widget Agent",
-        status=AgentStatus.PUBLISHED,
-        widget_enabled=True,
-        allowed_domains=["trusted-site.com"],
-    )
-
-    response = client.post(
-        "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": "guest-1"},
-        headers={"origin": "https://trusted-site.com"},
-    )
-
-    assert response.status_code == 200, response.text
-
-
 def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
     """allowed_domains matches on host[:port] only; the scheme is not part
     of the comparison, so an http origin matches an entry with no scheme."""
@@ -639,26 +819,6 @@ def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
     response = _issue_embed_ticket(agent_id, "http://trusted-site.com")
 
     assert response.status_code == 200, response.text
-
-
-def test_widget_auth_rejects_when_ticket_and_origin_both_absent() -> None:
-    _admin_headers()
-    owner_id = _user_id("admin")
-    agent_id = _create_agent_row(
-        user_id=owner_id,
-        name="No Origin Widget Agent",
-        status=AgentStatus.PUBLISHED,
-        widget_enabled=True,
-        allowed_domains=["trusted-site.com"],
-    )
-
-    response = client.post(
-        "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": "guest-1"},
-    )
-
-    assert response.status_code == 403
-    assert response.json()["detail"] == "Domain not allowed: "
 
 
 def test_widget_embed_ticket_wildcard_allows_any_origin() -> None:
@@ -698,14 +858,19 @@ def test_widget_embed_ticket_matches_subdomain_of_allowed_entry() -> None:
     assert spoofed.json()["detail"] == "Domain not allowed: eviltrusted-site.com"
 
 
-def test_embed_ticket_endpoint_rejects_unknown_agent() -> None:
+def test_embed_ticket_endpoint_rejects_unknown_key() -> None:
     _admin_headers()
-    response = _issue_embed_ticket(999999, "https://trusted-site.com")
-    assert response.status_code == 401
-    assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
+    response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": "wk-does-not-exist"},
+        headers={"origin": "https://trusted-site.com"},
+    )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Invalid widget key"
 
 
 def test_embed_ticket_endpoint_rejects_generated_manager_agent() -> None:
+    """A workforce-manager agent's key is treated the same as an unknown key."""
     _admin_headers()
     owner_id = _user_id("admin")
     manager_id = _create_agent_row(
@@ -717,23 +882,8 @@ def test_embed_ticket_endpoint_rejects_generated_manager_agent() -> None:
         allowed_domains=["*"],
     )
     response = _issue_embed_ticket(manager_id, "https://trusted-site.com")
-    assert response.status_code == 401
-    assert response.json()["detail"] == "Widget owner not found or invalid agent_id"
-
-
-def test_embed_ticket_endpoint_rejects_widget_disabled_agent() -> None:
-    _admin_headers()
-    owner_id = _user_id("admin")
-    agent_id = _create_agent_row(
-        user_id=owner_id,
-        name="Widget Disabled Ticket Agent",
-        status=AgentStatus.PUBLISHED,
-        widget_enabled=False,
-        allowed_domains=["trusted-site.com"],
-    )
-    response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
     assert response.status_code == 403
-    assert response.json()["detail"] == "Widget is disabled for this agent"
+    assert response.json()["detail"] == "Invalid widget key"
 
 
 def test_widget_public_tokens_cannot_create_tasks_for_other_agents() -> None:
@@ -880,6 +1030,100 @@ def test_share_link_can_be_enabled_rotated_and_disabled() -> None:
     disabled_agent = disable_response.json()
     assert disabled_agent["share_enabled"] is False
     assert disabled_agent["share_token"] is None
+
+
+def test_created_agents_get_a_widget_key() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Widget Key Agent")
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None
+        assert isinstance(agent.widget_key, str) and len(agent.widget_key) >= 32
+    finally:
+        db.close()
+
+
+def test_generic_agent_responses_do_not_expose_widget_key() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Hidden Widget Key Agent")
+
+    detail_response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert detail_response.status_code == 200, detail_response.text
+    assert "widget_key" not in detail_response.json()
+
+    list_response = client.get("/api/agents", headers=headers)
+    assert list_response.status_code == 200, list_response.text
+    list_item = next(item for item in list_response.json() if item["id"] == agent_id)
+    assert "widget_key" not in list_item
+
+
+def test_widget_key_endpoint_is_owner_only_and_heals_missing_keys() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    # Row created directly, predating the widget_key column (no key).
+    agent_id = _create_agent_row(user_id=owner_id, name="Legacy Widget Agent")
+
+    response = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["agent_id"] == agent_id
+    assert isinstance(payload["widget_key"], str) and len(payload["widget_key"]) >= 32
+
+    # Stable across reads once generated.
+    second = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert second.json()["widget_key"] == payload["widget_key"]
+
+    other_headers = _register_second_user()
+    for method, url in (
+        ("get", f"/api/agents/{agent_id}/widget-key"),
+        ("post", f"/api/agents/{agent_id}/widget-key/rotate"),
+    ):
+        other_response = getattr(client, method)(url, headers=other_headers)
+        assert other_response.status_code == 404
+
+
+def test_widget_key_can_be_rotated() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Rotating Widget Agent")
+
+    first = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert first.status_code == 200, first.text
+    first_key = first.json()["widget_key"]
+
+    rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
+    assert rotate.status_code == 200, rotate.text
+    rotated_key = rotate.json()["widget_key"]
+    assert isinstance(rotated_key, str) and rotated_key != first_key
+
+    after = client.get(f"/api/agents/{agent_id}/widget-key", headers=headers)
+    assert after.json()["widget_key"] == rotated_key
+
+
+def test_enabling_widget_generates_missing_key() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Disabled Widget Agent",
+        widget_enabled=False,
+    )
+
+    response = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"widget_enabled": True},
+    )
+    assert response.status_code == 200, response.text
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None
+        assert isinstance(agent.widget_key, str) and len(agent.widget_key) >= 32
+    finally:
+        db.close()
 
 
 def test_share_link_authenticates_public_chat_for_published_agent() -> None:
@@ -1194,3 +1438,40 @@ class TestDeleteAgent:
             )
         finally:
             db.close()
+
+
+def test_admin_can_read_other_users_agent_detail():
+    """管理员只读查看普通用户的 agent 详情。"""
+    admin = _admin_headers()
+    bob = _register_second_user("bob", "bobpass1")
+
+    created = client.post(
+        "/api/agents",
+        headers=bob,
+        json={
+            "name": "Bob Agent",
+            "instructions": "hi",
+            "tool_categories": ["mcp:foo"],
+        },
+    )
+    assert created.status_code == 200, created.text
+    agent_id = created.json()["id"]
+
+    resp = client.get(f"/api/agents/{agent_id}", headers=admin)
+    assert resp.status_code == 200, resp.text
+    assert "mcp:foo" in resp.json()["tool_categories"]
+
+
+def test_non_admin_cannot_read_other_users_agent_detail():
+    """普通用户读别人 agent 仍 404，不泄露存在性。"""
+    _admin_headers()
+    bob = _register_second_user("bob", "bobpass1")
+    carol = _register_second_user("carol", "carolpass1")
+
+    created = client.post(
+        "/api/agents", headers=bob, json={"name": "Bob Agent", "instructions": "hi"}
+    )
+    agent_id = created.json()["id"]
+
+    resp = client.get(f"/api/agents/{agent_id}", headers=carol)
+    assert resp.status_code == 404

@@ -1,4 +1,4 @@
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services.managed_file_ref import (
     ManagedFileRef,
@@ -13,7 +13,7 @@ def test_create_uploaded_file_from_local_path_stores_durable_object(
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     source = tmp_path / "uploads" / "input.txt"
     source.parent.mkdir()
@@ -67,7 +67,7 @@ def test_managed_file_ref_materialize_prefers_existing_local_path(tmp_path):
 def test_ensure_uploaded_file_local_path_restores_original_path(monkeypatch, tmp_path):
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     source = tmp_path / "uploads" / "restored.txt"
     source.parent.mkdir()
@@ -92,7 +92,7 @@ def test_create_uploaded_file_from_local_path_accepts_custom_storage_key(
 ):
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     source = tmp_path / "workspace" / "output" / "report.txt"
     source.parent.mkdir(parents=True)

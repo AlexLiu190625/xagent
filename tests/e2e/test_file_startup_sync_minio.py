@@ -19,7 +19,7 @@ from tests.e2e.app_harness import (
     seed_registered_local_file,
 )
 from tests.e2e.minio_harness import MinioStorage, run_minio_storage
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.models.uploaded_file import UploadedFile
 
 pytestmark = [pytest.mark.e2e, pytest.mark.docker]
@@ -64,7 +64,7 @@ def test_startup_sync_repairs_only_files_that_need_durable_storage(
         missing_local_key = (
             f"users/{user_id}/uploads/{missing_local_file_id}/missing-local.txt"
         )
-        existing_object = get_file_storage().put_bytes(
+        existing_object = get_unscoped_file_storage().put_bytes(
             b"already durable\n",
             existing_key,
             content_type="text/plain",

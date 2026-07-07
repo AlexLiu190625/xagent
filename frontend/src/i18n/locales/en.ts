@@ -3238,14 +3238,23 @@ Build when you need.`,
       invalidDomain: "Enter a domain like example.com or localhost:3000 (no scheme, path, or wildcard), or * to allow any domain.",
       removeDomain: "Remove domain",
       noDomains: "No domains configured. Widget requests are blocked until a domain or * is added.",
+      allowedDomainsSecurityNote: "Allowed domains are a browser-level restriction only, not a security boundary against non-browser clients. The widget key is the real access gate — keep it private and regenerate it if it leaks.",
       embedTitle: "Embed snippet",
       embedDescription: "Copy this script into the page where the chat bubble should appear.",
-      copySnippet: "Copy snippet"
+      copySnippet: "Copy snippet",
+      widgetKeyTitle: "Widget key",
+      widgetKeyDescription: "The credential that authorizes this widget. It is included in the embed snippet; anyone holding it can reach the agent, so rotate it if it leaks.",
+      copyWidgetKey: "Copy widget key",
+      rotateWidgetKey: "Regenerate",
+      rotateWidgetKeyConfirm: "Regenerate the widget key? Every already-deployed embed snippet stops working until it is replaced with the new one."
     },
     messages: {
       updated: "Widget configuration updated",
       updateFailed: "Failed to update widget configuration",
-      copyFailed: "Failed to copy widget snippet"
+      copyFailed: "Failed to copy widget snippet",
+      widgetKeyLoadFailed: "Failed to load widget key",
+      widgetKeyRotated: "Widget key regenerated. Update deployed embed snippets.",
+      widgetKeyRotateFailed: "Failed to regenerate widget key"
     }
   },
   apiKeysPage: {

@@ -20,6 +20,7 @@ interface PublicAgentChatPageProps {
   guestId?: string | null
   searchAgentId?: number | null
   embedTicket?: string | null
+  widgetKey?: string | null
 }
 
 type PublicAuthResult = {
@@ -261,6 +262,7 @@ export function PublicAgentChatPage({
   guestId,
   searchAgentId = null,
   embedTicket = null,
+  widgetKey = null,
 }: PublicAgentChatPageProps) {
   const { t } = useI18n()
   const normalizedGuestId = authMode === "widget" ? (guestId || "anonymous") : null
@@ -278,6 +280,9 @@ export function PublicAgentChatPage({
               guest_id: normalizedGuestId,
               agent_id: searchAgentId,
               embed_ticket: embedTicket || undefined,
+              // Direct visits (no embed ticket) authenticate with the widget
+              // key carried in the opened URL.
+              widget_key: embedTicket ? undefined : widgetKey || undefined,
             }
 
         const authResponse = await fetch(`${getApiUrl()}${authPath}`, {
@@ -306,7 +311,7 @@ export function PublicAgentChatPage({
 
     initPublicChat()
     return () => setPublicAccessToken(null)
-  }, [authMode, embedTicket, normalizedGuestId, routeToken, searchAgentId, t])
+  }, [authMode, embedTicket, widgetKey, normalizedGuestId, routeToken, searchAgentId, t])
 
   const publicAccessToken = authResult?.access_token ?? ""
 

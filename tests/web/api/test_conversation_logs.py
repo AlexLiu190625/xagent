@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import secrets
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any
@@ -10,7 +11,7 @@ from sqlalchemy import event
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import get_engine
-from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.trigger import AgentTrigger, TriggerRun, TriggerRunStatus
 from xagent.web.models.user import User
 
@@ -78,11 +79,22 @@ def _create_agent_row(
             allowed_domains=allowed_domains or ["example.com"],
             share_enabled=share_enabled,
             share_token=share_token,
+            widget_key=f"wk-{secrets.token_urlsafe(24)}" if widget_enabled else None,
         )
         db.add(agent)
         db.commit()
         db.refresh(agent)
         return int(agent.id)
+    finally:
+        db.close()
+
+
+def _widget_key_for(agent_id: int) -> str:
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).first()
+        assert agent is not None and agent.widget_key
+        return str(agent.widget_key)
     finally:
         db.close()
 
@@ -203,10 +215,10 @@ def _authenticate_widget_guest(
     guest_id: str = "guest-1",
     origin: str = "https://example.com",
 ) -> dict[str, str]:
+    del origin
     response = client.post(
         "/api/widget/auth",
-        json={"agent_id": agent_id, "guest_id": guest_id},
-        headers={"origin": origin},
+        json={"widget_key": _widget_key_for(agent_id), "guest_id": guest_id},
     )
     assert response.status_code == 200, response.text
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
@@ -701,3 +713,40 @@ def test_conversation_logs_list_batches_trigger_type_lookup() -> None:
         if "FROM trigger_runs" in statement or "FROM agent_triggers" in statement
     ]
     assert len(trigger_lookup_queries) <= 2
+
+
+def test_detail_returns_trace_events() -> None:
+    admin = _admin_headers()
+    admin_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=admin_id, name="Trace Agent")
+    task_id = _create_task_row(
+        user_id=admin_id,
+        title="Trace REST task",
+        source="sdk",
+        is_visible=False,
+        agent_id=agent_id,
+        input_text="hi",
+        output_text="done",
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id="evt-1",
+                event_type="tool_call_start",
+                timestamp=datetime.now(timezone.utc),
+                data={"tool_name": "search", "tool_args": {"q": "x"}},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.get(f"/api/conversation-logs/{task_id}", headers=admin)
+    assert resp.status_code == 200, resp.text
+    events = resp.json()["trace_events"]
+    assert len(events) == 1
+    assert events[0]["event_type"] == "tool_call_start"
+    assert events[0]["data"]["tool_name"] == "search"

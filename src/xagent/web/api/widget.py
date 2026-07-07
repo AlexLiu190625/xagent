@@ -40,21 +40,44 @@ widget_router = APIRouter(prefix="/api/widget", tags=["widget"])
 EMBED_TICKET_TYPE = "widget_embed_ticket"
 EMBED_TICKET_TTL_SECONDS = 60
 
+# Actionable errors for the removed legacy (agent_id / bare-header) auth paths,
+# so operators who miss the migration note can diagnose quickly.
+WIDGET_KEY_REQUIRED_DETAIL = (
+    "A widget key is required. Re-copy the embed snippet from the agent's "
+    "App Widget settings."
+)
+WIDGET_CREDENTIAL_REQUIRED_DETAIL = (
+    "Widget authentication requires a valid embed ticket or widget key. "
+    "Re-copy the embed snippet from the agent's App Widget settings."
+)
+
 
 class WidgetAuthRequest(BaseModel):
     guest_id: str = Field(max_length=256)
+    # Retained for backward compatibility with older embed pages; the agent is
+    # authoritatively resolved from the embed ticket or widget key, never from
+    # this client-supplied id.
     agent_id: Optional[int] = None
     # A signed embed ticket is a compact JWT; cap it to reject pathological
     # payloads, matching the length limits on sibling request models.
     embed_ticket: Optional[str] = Field(default=None, max_length=4096)
+    # Direct (non-embedded) visits carry the widget key instead of a ticket.
+    widget_key: Optional[str] = Field(default=None, max_length=512)
 
 
 class EmbedTicketRequest(BaseModel):
-    agent_id: int
+    # The widget key is the unguessable per-agent credential distributed in the
+    # embed snippet; capped like sibling request fields to reject junk payloads.
+    # Optional so a legacy (key-less) request yields an actionable 403 rather
+    # than a generic 422 validation error.
+    widget_key: Optional[str] = Field(default=None, max_length=512)
 
 
 class EmbedTicketResponse(BaseModel):
     ticket: str
+    # The agent id is not secret; returning it lets widget.js address the chat
+    # iframe without embedding the widget key inside the iframe URL.
+    agent_id: int
 
 
 WidgetAuthResponse = PublicChatAuthResponse
@@ -102,6 +125,28 @@ def _get_widget_enabled_agent(db: Session, agent_id: int) -> Agent:
     return agent
 
 
+def _get_widget_agent_by_key(db: Session, widget_key: str) -> Agent:
+    """Resolve a widget-enabled agent from its embed key.
+
+    All failure modes (unknown key, disabled widget, workforce-manager agent)
+    collapse into a single 403 so callers cannot enumerate agents or probe
+    which keys exist.
+    """
+    # Short-circuit blank/whitespace keys before hitting the database; a real
+    # key is a URL-safe token and never matches these anyway.
+    if not widget_key or not widget_key.strip():
+        raise HTTPException(status_code=403, detail="Invalid widget key")
+    agent = db.query(Agent).filter(Agent.widget_key == widget_key).first()
+    if (
+        agent is None
+        or not agent.widget_key
+        or is_workforce_generated_manager_agent(agent)
+        or not agent.widget_enabled
+    ):
+        raise HTTPException(status_code=403, detail="Invalid widget key")
+    return agent
+
+
 @widget_router.post("/embed-ticket", response_model=EmbedTicketResponse)
 async def issue_widget_embed_ticket(
     request: EmbedTicketRequest,
@@ -110,13 +155,24 @@ async def issue_widget_embed_ticket(
 ) -> Any:
     """Issue a short-lived signed embed ticket to the embedding page.
 
-    This endpoint is called by widget.js from the top-level embedding page,
-    so the browser-enforced Origin header carries the real embedding site —
-    unlike fetches from inside the widget iframe, whose Origin is the xagent
-    host itself. The signed ticket is the only way that validated origin is
-    trusted downstream; the widget never self-reports its parent's origin.
+    The agent is identified by its unguessable widget key, not an enumerable
+    agent id: a forged Origin header alone is worthless without the key, which
+    can only be obtained from a real deployment. This endpoint is called by
+    widget.js from the top-level embedding page, so the browser-enforced Origin
+    header carries the real embedding site — unlike fetches from inside the
+    widget iframe, whose Origin is the xagent host itself. The signed ticket is
+    the only way that validated origin is trusted downstream; the widget never
+    self-reports its parent's origin.
+
+    The Origin/allowed_domains check is retained as defense-in-depth: for
+    genuine browser traffic it still blocks embedding from non-allowlisted
+    sites, but it is no longer the boundary a non-browser client must defeat.
     """
-    agent = _get_widget_enabled_agent(db, request.agent_id)
+    if not request.widget_key or not request.widget_key.strip():
+        # Legacy key-less request (e.g. an old data-agent-id snippet): fail
+        # with an actionable error rather than a generic 422.
+        raise HTTPException(status_code=403, detail=WIDGET_KEY_REQUIRED_DETAIL)
+    agent = _get_widget_agent_by_key(db, request.widget_key)
 
     allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
     origin = req.headers.get("origin") or req.headers.get("referer", "")
@@ -135,96 +191,85 @@ async def issue_widget_embed_ticket(
         },
         expires_delta=timedelta(seconds=EMBED_TICKET_TTL_SECONDS),
     )
-    return EmbedTicketResponse(ticket=ticket)
+    return EmbedTicketResponse(ticket=ticket, agent_id=int(agent.id))
+
+
+def _agent_from_embed_ticket(db: Session, embed_ticket: str) -> Agent:
+    """Resolve the agent for the embedded flow from a signed embed ticket.
+
+    The auth fetch runs inside the widget iframe, so its Origin/Referer headers
+    reflect the xagent host, not the embedding site. The embedding page's origin
+    is instead carried by the backend-signed ticket issued by /embed-ticket,
+    where it was validated against the browser-enforced Origin header. A
+    client-supplied origin value is never trusted here, and the target agent is
+    taken from the ticket's claims rather than any client-supplied id.
+    """
+    try:
+        claims = jwt.decode(embed_ticket, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
+    except JWTError:
+        raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
+
+    ticket_agent_id = claims.get("agent_id")
+    if claims.get("type") != EMBED_TICKET_TYPE or not isinstance(ticket_agent_id, int):
+        raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
+
+    agent = _get_widget_enabled_agent(db, ticket_agent_id)
+    allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
+    origin_domain = str(claims.get("embed_origin") or "")
+    # Re-check so tickets die immediately if the allowlist shrinks.
+    _require_domain_allowed(origin_domain, allowed_domains)
+    return agent
+
+
+def _resolve_widget_auth_agent(db: Session, request: WidgetAuthRequest) -> Agent:
+    """Resolve the agent a widget guest token will be scoped to.
+
+    Guest tokens are only issued against a credential the backend can verify:
+    a signed embed ticket (embedded flow) or the widget key (direct visit). A
+    bare Origin/Referer header — spoofed or genuine — authenticates nothing.
+    """
+    if request.embed_ticket:
+        return _agent_from_embed_ticket(db, request.embed_ticket)
+    if request.widget_key:
+        # Direct visit (chat page opened outside an iframe): the key alone is
+        # the gate. No origin allowlist applies — the allowlist governs
+        # embedding sites, and a direct visit is not embedded.
+        return _get_widget_agent_by_key(db, request.widget_key)
+    raise HTTPException(status_code=403, detail=WIDGET_CREDENTIAL_REQUIRED_DETAIL)
 
 
 @widget_router.post("/auth", response_model=WidgetAuthResponse)
 async def authenticate_widget(
     request: WidgetAuthRequest,
-    req: Request,
     db: Session = Depends(get_db),
 ) -> Any:
     """Authenticate widget and issue a guest token"""
-    agent_id = request.agent_id
-    user = None
-    target_channel = None
-    agent = None
+    agent = _resolve_widget_auth_agent(db, request)
 
-    # Authenticate via agent_id directly (since web widget channel is deprecated)
-    origin_domain = ""
-    if agent_id:
-        agent = _get_widget_enabled_agent(db, agent_id)
-
-        allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
-
-        if request.embed_ticket:
-            # The auth fetch runs inside the widget iframe, so its
-            # Origin/Referer headers reflect the xagent host, not the
-            # embedding site. The embedding page's origin is instead carried
-            # by the backend-signed embed ticket issued by /embed-ticket,
-            # where it was validated against the browser-enforced Origin
-            # header. A client-supplied origin value is never trusted here.
-            try:
-                claims = jwt.decode(
-                    request.embed_ticket,
-                    JWT_SECRET_KEY,
-                    algorithms=[JWT_ALGORITHM],
-                )
-            except JWTError:
-                raise HTTPException(
-                    status_code=403, detail="Invalid or expired embed ticket"
-                )
-            if (
-                claims.get("type") != EMBED_TICKET_TYPE
-                or claims.get("agent_id") != agent_id
-            ):
-                raise HTTPException(
-                    status_code=403, detail="Invalid or expired embed ticket"
-                )
-            origin_domain = str(claims.get("embed_origin") or "")
-            # Re-check so tickets die immediately if the allowlist shrinks.
-            _require_domain_allowed(origin_domain, allowed_domains)
-        else:
-            # No ticket: direct page visits (not embedded via widget.js).
-            # Fall back to the request's own Origin/Referer headers.
-            origin = req.headers.get("origin") or req.headers.get("referer", "")
-            origin_domain = _origin_to_domain(origin)
-            _require_domain_allowed(origin_domain, allowed_domains)
-
-        user = db.query(User).filter(User.id == agent.user_id).first()
-
+    user = db.query(User).filter(User.id == agent.user_id).first()
     if not user:
         raise HTTPException(
             status_code=401, detail="Widget owner not found or invalid agent_id"
         )
 
-    # Get agent name if available
-    agent_name = None
-    agent_logo = None
-    if agent:
-        agent_name = agent.name
-        agent_logo = agent.logo_url
-
-    channel_id = target_channel.id if target_channel else None
-
     access_token = create_public_chat_access_token(
         {
             "sub": user.username,
             "user_id": user.id,
-            "channel_id": channel_id,
+            "channel_id": None,
             "guest_id": request.guest_id,
             "auth_mode": "widget",
-            "widget_agent_id": int(agent.id) if agent else None,
+            "widget_agent_id": int(agent.id),
         }
     )
 
     return WidgetAuthResponse(
         access_token=access_token,
-        agent_id=agent_id,
-        agent_name=agent_name,
-        agent_logo=agent_logo,
-        agent_description=agent.description if agent else None,
-        suggested_prompts=agent.suggested_prompts or [] if agent else [],
+        agent_id=int(agent.id),
+        agent_name=agent.name,
+        agent_logo=agent.logo_url,
+        agent_description=agent.description,
+        suggested_prompts=agent.suggested_prompts or [],
     )
 
 

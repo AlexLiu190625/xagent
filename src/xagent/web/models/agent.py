@@ -70,6 +70,10 @@ class Agent(Base):  # type: ignore
     allowed_domains = Column(
         JSON, nullable=True, default=list
     )  # List of allowed domains for the widget
+    # Unguessable per-agent credential distributed in the embed snippet; the
+    # real access gate for widget guest tokens (allowed_domains is only a
+    # browser-level restriction). Owner-visible, rotatable.
+    widget_key = Column(String(255), nullable=True, unique=True, index=True)
     share_enabled = Column(Boolean, default=False, nullable=False)
     share_token = Column(String(255), nullable=True, index=True)
     share_updated_at = Column(DateTime(timezone=True), nullable=True)

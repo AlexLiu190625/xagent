@@ -24,7 +24,7 @@ from tests.e2e.app_harness import (
     seed_registered_local_file,
 )
 from tests.e2e.scripted_llm import build_scripted_llm_from_json
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api.auth import hash_password
 from xagent.web.models.user import User
 
@@ -142,11 +142,11 @@ def run_minio_storage(monkeypatch: pytest.MonkeyPatch) -> Iterator[MinioStorage]
 
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", f"s3://{bucket}/xagent-test")
         monkeypatch.setenv("XAGENT_FILE_STORAGE_OPTIONS", json.dumps(storage_options))
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         yield MinioStorage(bucket=bucket, prefix="xagent-test", fs=fs)
     finally:
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
         container.remove(force=True)
 
 

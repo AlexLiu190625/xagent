@@ -2,7 +2,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -29,7 +29,7 @@ def test_create_from_local_path_persists_record_and_syncs_durable(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "input.txt"
@@ -49,13 +49,13 @@ def test_create_from_local_path_persists_record_and_syncs_durable(
     assert persisted.id == record.id
     assert persisted.storage_status == "available"
     assert persisted.storage_key == "users/1/uploads/file-store/input.txt"
-    with get_file_storage().open_read(str(persisted.storage_key)) as handle:
+    with get_unscoped_file_storage().open_read(str(persisted.storage_key)) as handle:
         assert handle.read() == b"store content"
 
 
 def test_sync_existing_refreshes_durable_object(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "refresh.txt"
@@ -74,13 +74,13 @@ def test_sync_existing_refreshes_durable_object(monkeypatch, tmp_path):
     store.sync_existing(record)
     db.commit()
 
-    with get_file_storage().open_read(storage_key) as handle:
+    with get_unscoped_file_storage().open_read(storage_key) as handle:
         assert handle.read() == b"new content"
 
 
 def test_delete_removes_local_durable_and_db_record(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "delete.txt"
@@ -95,19 +95,19 @@ def test_delete_removes_local_durable_and_db_record(monkeypatch, tmp_path):
     )
     storage_key = str(record.storage_key)
     assert source.exists()
-    assert get_file_storage().exists(storage_key)
+    assert get_unscoped_file_storage().exists(storage_key)
 
     store.delete(record, delete_local=True)
     db.commit()
 
     assert not source.exists()
-    assert not get_file_storage().exists(storage_key)
+    assert not get_unscoped_file_storage().exists(storage_key)
     assert db.query(UploadedFile).filter_by(file_id="file-delete").first() is None
 
 
 def test_delete_preserves_db_row_when_durable_cleanup_fails(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "delete-first.txt"
@@ -137,12 +137,12 @@ def test_delete_preserves_db_row_when_durable_cleanup_fails(monkeypatch, tmp_pat
         is not None
     )
     assert source.exists()
-    assert get_file_storage().exists(storage_key)
+    assert get_unscoped_file_storage().exists(storage_key)
 
 
 def test_delete_skips_local_file_outside_local_root(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "outside" / "unexpected.txt"
@@ -163,7 +163,7 @@ def test_delete_skips_local_file_outside_local_root(monkeypatch, tmp_path):
     db.commit()
 
     assert source.exists()
-    assert not get_file_storage().exists(storage_key)
+    assert not get_unscoped_file_storage().exists(storage_key)
     assert db.query(UploadedFile).filter_by(file_id="file-outside").first() is None
 
 
@@ -171,7 +171,7 @@ def test_upsert_by_storage_path_reuses_record_and_refreshes_durable(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "kb.md"
@@ -202,13 +202,13 @@ def test_upsert_by_storage_path_reuses_record_and_refreshes_durable(
     assert second.id == first.id
     assert second.filename == "kb-renamed.md"
     assert second.file_size == len("second")
-    with get_file_storage().open_read(first_key) as handle:
+    with get_unscoped_file_storage().open_read(first_key) as handle:
         assert handle.read() == b"second"
 
 
 def test_upsert_by_storage_path_refreshes_same_size_rewrite(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "kb.md"
@@ -239,7 +239,7 @@ def test_upsert_by_storage_path_refreshes_same_size_rewrite(monkeypatch, tmp_pat
 
     assert second.id == first.id
     assert second.checksum != old_checksum
-    with get_file_storage().open_read(first_key) as handle:
+    with get_unscoped_file_storage().open_read(first_key) as handle:
         assert handle.read() == b"new-data"
 
 
@@ -247,7 +247,7 @@ def test_upsert_by_storage_path_syncs_when_requested_storage_key_changes(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "kb.md"
@@ -280,7 +280,7 @@ def test_upsert_by_storage_path_syncs_when_requested_storage_key_changes(
     assert second.id == first.id
     assert first_key != second_key
     assert second.storage_key == second_key
-    with get_file_storage().open_read(second_key) as handle:
+    with get_unscoped_file_storage().open_read(second_key) as handle:
         assert handle.read() == b"same-bytes"
 
 
@@ -288,7 +288,7 @@ def test_upsert_by_storage_path_skips_durable_sync_when_file_unchanged(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "kb.md"
@@ -327,7 +327,7 @@ def test_create_from_local_path_removes_record_when_durable_write_fails(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     db = _session()
     user = _user(db)
     source = tmp_path / "uploads" / "output.txt"

@@ -5,7 +5,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.memory.in_memory import InMemoryMemoryStore
 from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
 from xagent.web.api.websocket import (
@@ -296,7 +296,7 @@ def test_normalize_file_outputs_rolls_back_when_durable_storage_fails(
 
 def test_normalize_file_outputs_refreshes_existing_output_row(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
     engine = create_engine("sqlite:///:memory:")
     SessionLocal = sessionmaker(bind=engine)
     Base.metadata.create_all(engine)
@@ -341,12 +341,12 @@ def test_normalize_file_outputs_refreshes_existing_output_row(monkeypatch, tmp_p
 
         db.refresh(record)
         assert record.checksum is not None
-        with get_file_storage().open_read(storage_key) as handle:
+        with get_unscoped_file_storage().open_read(storage_key) as handle:
             assert handle.read() == b"new-data"
     finally:
         db.close()
         engine.dispose()
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
 
 @pytest.mark.asyncio

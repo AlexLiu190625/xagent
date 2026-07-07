@@ -6,6 +6,38 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- **App Widget access is now gated by an unguessable per-agent widget key (breaking)**
+  The App Widget embed flow previously relied on the request `Origin`/`Referer`
+  header matching an agent's `allowed_domains`. Because those headers can be set
+  freely by any non-browser client (curl, scripts, a malicious server), the
+  allowlist was not an effective security boundary (advisory
+  GHSA-j2rx-g3hp-qg34, CWE-290). Access is now gated by a per-agent **widget
+  key**:
+  - The widget key is an unguessable, rotatable credential distributed inside
+    the embed snippet. It is the real access gate for widget guest tokens.
+  - `POST /api/widget/embed-ticket` now identifies the agent by widget key
+    instead of an enumerable numeric `agent_id`. `POST /api/widget/auth` now
+    requires a verifiable credential — a signed embed ticket (embedded flow) or
+    the widget key (direct visit); the previous bare `Origin`/`Referer` fallback
+    has been removed.
+  - `allowed_domains` is retained as a **browser-level, defense-in-depth**
+    restriction only. It controls which sites a real browser *without the key*
+    may embed the widget from; it cannot stop a client that already holds the
+    key.
+  - **Residual risk:** the key is visible in the HTML of any page that embeds
+    the widget, so anyone who can view such a page can extract it and mint
+    low-privilege guest tokens. This is inherent to public embeddable widgets.
+    Mitigations: rotate the key (revocation), the low privilege of guest tokens,
+    and disabling `widget_enabled` for agents that should not be public. Note
+    `widget_enabled` currently defaults to **on** for every agent, so operators
+    must actively disable it where appropriate.
+  - **Upgrade note:** previously deployed `data-agent-id` embed snippets stop
+    working. Re-copy the embed snippet (now `data-widget-key`) from the agent's
+    App Widget settings. There is intentionally no compatibility flag — the old
+    path is the vulnerability.
+
 ### Added
 
 - **Documented `LANCEDB_AUTO_MIGRATE` in environment template**

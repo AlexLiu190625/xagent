@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api.auth import hash_password
 from xagent.web.api.files import _content_disposition_header, file_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -138,7 +138,7 @@ def temp_uploads_dir(monkeypatch):
         import xagent.web.config
 
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (temp_path / "objects").as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
         monkeypatch.setattr(xagent.web.config, "get_uploads_dir", lambda: temp_path)
         monkeypatch.setattr(xagent.web.api.files, "get_uploads_dir", lambda: temp_path)
 
@@ -188,7 +188,7 @@ class TestFileUpload:
         """Uploaded files should download from durable storage, not local uploads."""
         object_root = tmp_path / "objects"
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         response = client.post(
             "/api/files/upload",
@@ -504,7 +504,7 @@ class TestFileUpload:
     ):
         object_root = tmp_path / "objects"
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         upload = client.post(
             "/api/files/upload",
@@ -541,7 +541,7 @@ class TestFileUpload:
         object_root = tmp_path / "objects"
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
         monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         upload = client.post(
             "/api/files/upload",
@@ -706,7 +706,7 @@ class TestFileUpload:
     ):
         object_root = tmp_path / "objects"
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         upload = client.post(
             "/api/files/upload",
@@ -742,7 +742,7 @@ class TestFileUpload:
         object_root = tmp_path / "objects"
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
         monkeypatch.setenv("XAGENT_FILE_DELIVERY_REDIRECT_ENABLED", "true")
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         upload = client.post(
             "/api/files/upload",
@@ -783,7 +783,7 @@ class TestFileUpload:
     ):
         object_root = tmp_path / "objects"
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         upload = client.post(
             "/api/files/upload",

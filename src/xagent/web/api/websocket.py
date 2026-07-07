@@ -41,6 +41,8 @@ from ..models.user import User
 
 if TYPE_CHECKING:
     from ..services.task_setup_snapshot import TaskSetupSnapshot
+
+from ...core.file_storage.keys import build_task_output_storage_key
 from ..services.chat_history_service import get_latest_waiting_question
 from ..services.hot_path_cache import (
     cache_get,
@@ -51,7 +53,6 @@ from ..services.hot_path_cache import (
 )
 from ..services.managed_file_ref import (
     DurableStorageOperationError,
-    build_task_output_storage_key,
     ensure_uploaded_file_local_path,
 )
 from ..services.task_lease_service import (

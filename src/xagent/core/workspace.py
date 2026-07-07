@@ -26,23 +26,6 @@ logger = logging.getLogger(__name__)
 _auto_register = contextvars.ContextVar("_auto_register", default=False)
 
 
-def _safe_storage_relative_path(relative_path: str) -> str:
-    path = Path(relative_path)
-    safe_parts = [part for part in path.parts if part not in ("", ".", "..")]
-    if not safe_parts:
-        return "file"
-    return "/".join(safe_parts)
-
-
-def _build_workspace_storage_key(
-    user_id: int, task_id: int, file_id: str, relative_path: str
-) -> str:
-    return (
-        f"users/{user_id}/tasks/{task_id}/outputs/"
-        f"{file_id}/{_safe_storage_relative_path(relative_path)}"
-    )
-
-
 @dataclass
 class AgentContext:
     """Agent execution context"""
@@ -337,7 +320,10 @@ class TaskWorkspace:
                 )
             )
 
+            # Import lazily: module-level file_storage imports would pull
+            # fsspec into sandboxed executions that ship minimal deps.
             from ..web.services.uploaded_file_store import UploadedFileStore
+            from .file_storage.keys import build_task_output_storage_key
 
             UploadedFileStore(db).create_from_local_path(
                 local_path=file_path,
@@ -345,7 +331,7 @@ class TaskWorkspace:
                 file_id=file_id,
                 task_id=task_id,
                 filename=file_path.name,
-                storage_key=_build_workspace_storage_key(
+                storage_key=build_task_output_storage_key(
                     int(task.user_id), task_id, file_id, relative_path
                 ),
                 workspace_relative_path=relative_path,
@@ -370,6 +356,7 @@ class TaskWorkspace:
         self, file_id: str, file_path: Path, db_session: Any = None
     ) -> None:
         """Sync an existing UploadedFile row with current local bytes."""
+        from .file_storage.keys import build_task_output_storage_key
         from .storage.manager import create_db_session
 
         if db_session:
@@ -442,7 +429,7 @@ class TaskWorkspace:
                     category=category,
                 )
             )
-            storage_key = _build_workspace_storage_key(
+            storage_key = build_task_output_storage_key(
                 user_id,
                 int(task_id) if task_id is not None else 0,
                 file_id,

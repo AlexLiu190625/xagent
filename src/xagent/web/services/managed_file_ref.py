@@ -10,7 +10,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, NoReturn, Protocol
 
-from ...core.file_storage import FsspecFileStorage, StoredObject, get_file_storage
+from ...core.file_storage import (
+    FsspecFileStorage,
+    ScopedFileStorage,
+    StoredObject,
+    get_user_file_storage,
+)
+from ...core.file_storage.keys import (
+    build_task_output_storage_key as build_task_output_storage_key,
+)
+from ...core.file_storage.keys import (
+    build_upload_storage_key as build_upload_storage_key,
+)
+from ...core.file_storage.keys import safe_storage_filename as safe_storage_filename
 from ..models.uploaded_file import UploadedFile
 
 logger = logging.getLogger(__name__)
@@ -35,6 +47,9 @@ class UploadedFileLocalPathRecord(Protocol):
     """Fields needed to restore or locate an uploaded file without an ORM session."""
 
     @property
+    def user_id(self) -> Any: ...
+
+    @property
     def file_id(self) -> Any: ...
 
     @property
@@ -51,24 +66,6 @@ class UploadedFileLocalPathRecord(Protocol):
 
     @property
     def checksum(self) -> Any: ...
-
-
-def safe_storage_filename(filename: str) -> str:
-    safe_name = Path(filename).name.strip()
-    return safe_name or "file"
-
-
-def build_upload_storage_key(user_id: int, file_id: str, filename: str) -> str:
-    return f"users/{user_id}/uploads/{file_id}/{safe_storage_filename(filename)}"
-
-
-def build_task_output_storage_key(
-    user_id: int, task_id: int, file_id: str, relative_path: str
-) -> str:
-    safe_relative_path = str(Path(relative_path.strip().lstrip("/")))
-    if not safe_relative_path or ".." in Path(safe_relative_path).parts:
-        safe_relative_path = safe_storage_filename(relative_path)
-    return f"users/{user_id}/tasks/{task_id}/outputs/{file_id}/{safe_relative_path}"
 
 
 def guess_media_type(filename: str) -> str:
@@ -130,7 +127,17 @@ class ManagedFileRef:
     """Registered file handle with local-first durable fallback semantics."""
 
     record: UploadedFileLocalPathRecord
-    storage: FsspecFileStorage = field(default_factory=get_file_storage)
+    storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.storage is None:
+            user_id = self.record.user_id
+            if user_id is None:
+                raise ValueError(
+                    "Record user_id is required to bind user-scoped storage; "
+                    "pass an explicit storage handle for records without an owner"
+                )
+            self.storage = get_user_file_storage(int(user_id))
 
     @property
     def local_path(self) -> Path:
@@ -251,8 +258,8 @@ class ManagedFileRef:
             storage_key
             or self.storage_key
             or build_upload_storage_key(
-                int(getattr(self.record, "user_id")),
-                str(getattr(self.record, "file_id")),
+                int(self.record.user_id),
+                str(self.record.file_id),
                 self.filename or path.name,
             )
         )

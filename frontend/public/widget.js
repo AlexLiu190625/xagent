@@ -2,11 +2,11 @@
   // Config
   var scriptTag = document.currentScript;
   var token = scriptTag.getAttribute('data-token') || 'default';
-  var agentId = scriptTag.getAttribute('data-agent-id');
+  var widgetKey = scriptTag.getAttribute('data-widget-key');
   var host = new URL(scriptTag.src).origin;
 
-  if (!agentId && token === 'default') {
-    console.error('Xagent Widget: Missing data-agent-id attribute.');
+  if (!widgetKey && token === 'default') {
+    console.error('Xagent Widget: Missing data-widget-key attribute. Re-copy the embed snippet from the agent widget settings.');
     return;
   }
 
@@ -113,16 +113,20 @@
   // Iframe
   var iframe = document.createElement('iframe');
   iframe.className = 'xagent-widget-iframe';
-  var iframeUrl = host + '/widget/chat/' + token + '?guest_id=' + guestId;
-  if (agentId) {
-    iframeUrl += '&agent_id=' + encodeURIComponent(agentId);
-  }
   panel.appendChild(iframe);
 
-  function loadIframe(ticket) {
-    iframe.src = ticket
-      ? iframeUrl + '&embed_ticket=' + encodeURIComponent(ticket)
-      : iframeUrl;
+  function loadIframe(ticket, agentId) {
+    // The widget key is deliberately NOT placed in the iframe URL: the ticket
+    // is sufficient to authenticate, and keeping the key out of the frame
+    // means the embedded widget has no credential to fall back on.
+    var url = host + '/widget/chat/' + token + '?guest_id=' + guestId;
+    if (agentId) {
+      url += '&agent_id=' + encodeURIComponent(agentId);
+    }
+    if (ticket) {
+      url += '&embed_ticket=' + encodeURIComponent(ticket);
+    }
+    iframe.src = url;
   }
 
   // Request a short-lived embed ticket from the top-level page. This fetch
@@ -130,30 +134,34 @@
   // the backend validates against allowed_domains before signing the ticket.
   // Fetches inside the iframe carry the iframe's own origin instead, so the
   // ticket is how the validated embedding origin reaches the auth call.
-  var numericAgentId = parseInt(agentId, 10);
-  if (agentId && isNaN(numericAgentId)) {
-    console.error('Xagent Widget: data-agent-id must be numeric, got "' + agentId + '".');
-    loadIframe(null);
-  } else if (agentId) {
+  if (widgetKey) {
     fetch(host + '/api/widget/embed-ticket', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ agent_id: numericAgentId })
+      body: JSON.stringify({ widget_key: widgetKey })
     })
       .then(function (res) {
         if (!res.ok) {
-          console.warn('Xagent Widget: embed ticket request failed (HTTP ' + res.status + '); loading widget without a ticket. If this page is not in the agent\'s allowed domains, authentication will fail.');
+          // Fail closed: no ticket means auth would fail, and loading the
+          // iframe anyway would let a non-allowlisted embed slip through the
+          // direct-visit path. Surface an actionable error instead.
+          console.error('Xagent Widget: embed authorization failed (HTTP ' + res.status + '). Check that this page is in the agent\'s allowed domains and that the embed snippet is current.');
           return null;
         }
         return res.json();
       })
-      .then(function (data) { loadIframe(data && data.ticket); })
+      .then(function (data) {
+        if (!data || !data.ticket) {
+          return;
+        }
+        loadIframe(data.ticket, data.agent_id);
+      })
       .catch(function (err) {
-        console.warn('Xagent Widget: embed ticket request failed (' + err + '); loading widget without a ticket.');
-        loadIframe(null);
+        console.error('Xagent Widget: embed authorization request failed (' + err + ').');
       });
   } else {
-    loadIframe(null);
+    // Deprecated data-token channel (dead server-side); loaded without a ticket.
+    loadIframe(null, null);
   }
 
   // FAB

@@ -355,6 +355,7 @@ async def test_create_kb_from_file_uses_shared_service(tmp_path):
     source_file = tmp_path / "notes.txt"
     source_file.write_text("hello", encoding="utf-8")
     file_record = SimpleNamespace(
+        user_id=7,
         filename="notes.txt",
         storage_path=str(source_file),
         file_id="file-1",
@@ -422,11 +423,13 @@ async def test_create_kb_from_file_continues_after_unexpected_ingest_error(tmp_p
     bad_file.write_text("bad", encoding="utf-8")
     good_file.write_text("good", encoding="utf-8")
     bad_record = SimpleNamespace(
+        user_id=7,
         filename="bad.txt",
         storage_path=str(bad_file),
         file_id="file-bad",
     )
     good_record = SimpleNamespace(
+        user_id=7,
         filename="good.txt",
         storage_path=str(good_file),
         file_id="file-good",
@@ -503,6 +506,7 @@ async def test_create_kb_from_file_failed_ingest_records_operation_outcome(
     source_file = tmp_path / "notes.txt"
     source_file.write_text("hello", encoding="utf-8")
     file_record = SimpleNamespace(
+        user_id=7,
         filename="notes.txt",
         storage_path=str(source_file),
         file_id="file-1",
@@ -608,6 +612,7 @@ async def test_create_kb_from_file_preserves_storage_context_in_executor(
     source_file = tmp_path / "notes.txt"
     source_file.write_text("hello", encoding="utf-8")
     file_record = SimpleNamespace(
+        user_id=7,
         filename="notes.txt",
         storage_path=str(source_file),
         file_id="file-1",
@@ -665,6 +670,7 @@ async def test_create_kb_from_file_restores_durable_only_upload_before_ingestion
     restored_source = tmp_path / "restored-notes.txt"
     restored_source.write_text("restored", encoding="utf-8")
     file_record = SimpleNamespace(
+        user_id=7,
         filename="notes.txt",
         storage_path=str(missing_source),
         file_id="file-1",
@@ -738,6 +744,7 @@ async def test_create_kb_from_file_returns_error_when_metadata_refresh_fails(tmp
     source_file = tmp_path / "notes.txt"
     source_file.write_text("hello", encoding="utf-8")
     file_record = SimpleNamespace(
+        user_id=7,
         filename="notes.txt",
         storage_path=str(source_file),
         file_id="file-1",

@@ -31,7 +31,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api.kb import (
     _WEB_FILE_LOCKS,
     _atomic_replace_file,
@@ -206,7 +206,7 @@ class TestWebIngestionUploadedFilePersistence:
     ):
         """Test creating a new file when no cache or DB record exists."""
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         with tempfile.TemporaryDirectory() as temp_dir:
             # Create a temporary markdown file
@@ -272,7 +272,7 @@ class TestWebIngestionUploadedFilePersistence:
                     assert file_record.storage_key
                     assert file_record.storage_uri
                     assert persistent_file.exists()
-                    with get_file_storage().open_read(
+                    with get_unscoped_file_storage().open_read(
                         str(file_record.storage_key)
                     ) as handle:
                         assert handle.read() == persistent_file.read_bytes()
@@ -454,7 +454,7 @@ class TestWebIngestionUploadedFilePersistence:
         monkeypatch.setenv(
             "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
         )
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         temp_dir = tmp_path / "ingest"
         temp_dir.mkdir()
@@ -525,7 +525,9 @@ class TestWebIngestionUploadedFilePersistence:
 
         assert atomic_replace.called
         assert existing_path.read_text(encoding="utf-8") == "old content"
-        with get_file_storage().open_read(str(existing_record.storage_key)) as handle:
+        with get_unscoped_file_storage().open_read(
+            str(existing_record.storage_key)
+        ) as handle:
             assert handle.read() == b"old content"
         mock_snapshot_runs.assert_called_once_with(str(existing_record.file_id))
         mock_restore_runs.assert_called_once_with(ingestion_runs_snapshot)
@@ -596,7 +598,7 @@ class TestWebIngestionUploadedFilePersistence:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         persistent_file = tmp_path / "uploads" / "web.md"
         persistent_file.parent.mkdir(parents=True)
@@ -614,7 +616,7 @@ class TestWebIngestionUploadedFilePersistence:
 
         rows = db_session.query(UploadedFile).all()
         assert rows == []
-        assert get_file_storage().list("users") == []
+        assert get_unscoped_file_storage().list("users") == []
 
     def test_refresh_existing_file_rolls_back_failed_upsert_before_restore(
         self,
@@ -628,7 +630,7 @@ class TestWebIngestionUploadedFilePersistence:
         monkeypatch.setenv(
             "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
         )
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         temp_dir = tmp_path / "ingest"
         temp_dir.mkdir()
@@ -698,7 +700,7 @@ class TestWebIngestionUploadedFilePersistence:
         monkeypatch.setenv(
             "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
         )
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         existing_path = tmp_path / "uploads" / "existing.md"
         existing_path.parent.mkdir()
@@ -759,7 +761,7 @@ class TestWebIngestionUploadedFilePersistence:
         monkeypatch.setenv(
             "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
         )
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         existing_path = tmp_path / "uploads" / "existing.md"
         existing_path.parent.mkdir()
@@ -808,7 +810,9 @@ class TestWebIngestionUploadedFilePersistence:
         assert result is not None
         assert existing_path.read_text(encoding="utf-8") == "new content"
         assert processed_urls == {"hash": str(existing_record.file_id)}
-        with get_file_storage().open_read(str(existing_record.storage_key)) as handle:
+        with get_unscoped_file_storage().open_read(
+            str(existing_record.storage_key)
+        ) as handle:
             assert handle.read() == b"new content"
 
     def test_recreate_missing_existing_file_removes_local_when_upsert_fails(
@@ -872,7 +876,7 @@ class TestWebIngestionUploadedFilePersistence:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         existing_path = tmp_path / "uploads" / "existing.md"
         existing_path.parent.mkdir(parents=True)
@@ -953,7 +957,7 @@ class TestWebIngestionUploadedFilePersistence:
                 )
 
         assert not existing_path.exists()
-        assert get_file_storage().list("users") == []
+        assert get_unscoped_file_storage().list("users") == []
         row = (
             db_session.query(UploadedFile)
             .filter(UploadedFile.file_id == old_file_id)
@@ -1281,7 +1285,7 @@ class TestIngestWebHandleWebFile:
         monkeypatch.setenv(
             "XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized")
         )
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
         uploads_root = tmp_path / "uploads"
         monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_root))
@@ -1331,7 +1335,7 @@ class TestIngestWebHandleWebFile:
                 filename,
             )
             assert expected_persistent.exists()
-            assert get_file_storage().exists(captured["storage_key"])
+            assert get_unscoped_file_storage().exists(captured["storage_key"])
 
             file_info["rollback_on_failure"](result)
             return result
@@ -1357,7 +1361,7 @@ class TestIngestWebHandleWebFile:
         assert response.status_code == 500
         assert captured["file_id"]
         assert not expected_persistent.exists()
-        assert not get_file_storage().exists(captured["storage_key"])
+        assert not get_unscoped_file_storage().exists(captured["storage_key"])
 
         session = TestingSessionLocal()
         try:

@@ -6,11 +6,11 @@ export interface AgentWidgetConfigUpdates {
   allowed_domains?: string[]
 }
 
-export function buildWidgetSnippet(agentId: number | string, appOrigin: string): string {
-  if (!agentId || !appOrigin) return ""
+export function buildWidgetSnippet(widgetKey: string, appOrigin: string): string {
+  if (!widgetKey || !appOrigin) return ""
   return `<script
   src="${appOrigin}/widget.js"
-  data-agent-id="${agentId}"
+  data-widget-key="${widgetKey}"
   data-button-size="60px"
   data-button-color="#000"
   data-icon-color="#fff"
@@ -58,6 +58,37 @@ export async function updateAgentWidgetConfig(
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(updates),
   })
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, fallbackErrorMessage)
+  }
+  return response.json()
+}
+
+export interface AgentWidgetKeyState {
+  agent_id: number
+  widget_enabled: boolean
+  widget_key: string
+}
+
+export async function fetchAgentWidgetKey(
+  agentId: number | string,
+  fallbackErrorMessage: string,
+): Promise<AgentWidgetKeyState> {
+  const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/widget-key`)
+  if (!response.ok) {
+    throw await parseAgentUpdateError(response, fallbackErrorMessage)
+  }
+  return response.json()
+}
+
+export async function rotateAgentWidgetKey(
+  agentId: number | string,
+  fallbackErrorMessage: string,
+): Promise<AgentWidgetKeyState> {
+  const response = await apiRequest(
+    `${getApiUrl()}/api/agents/${agentId}/widget-key/rotate`,
+    { method: "POST" },
+  )
   if (!response.ok) {
     throw await parseAgentUpdateError(response, fallbackErrorMessage)
   }

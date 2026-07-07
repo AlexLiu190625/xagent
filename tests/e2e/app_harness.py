@@ -14,7 +14,7 @@ import jwt
 import pytest
 from fastapi.testclient import TestClient
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import get_engine, get_session_local, init_db
 from xagent.web.models.uploaded_file import UploadedFile
@@ -215,7 +215,7 @@ def run_e2e_app_client(
             get_engine().dispose()
         except RuntimeError:
             pass
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
 
 def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:

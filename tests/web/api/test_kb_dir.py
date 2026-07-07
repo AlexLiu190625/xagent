@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from xagent.core.tools.core.RAG_tools.storage.contracts import DocumentRecord
 from xagent.core.tools.core.RAG_tools.utils.string_utils import (
@@ -3274,7 +3274,7 @@ def test_delete_document_prefers_file_id_and_cleans_orphan_file(
 ):
     """Deleting by file_id should remove the UploadedFile row when it becomes orphaned."""
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     app, headers, user, TestingSessionLocal = test_env
     client = TestClient(app)
@@ -3302,7 +3302,7 @@ def test_delete_document_prefers_file_id_and_cleans_orphan_file(
     finally:
         session.close()
 
-    assert get_file_storage().exists(storage_key)
+    assert get_unscoped_file_storage().exists(storage_key)
 
     document_state = [
         DocumentRecord(
@@ -3334,7 +3334,7 @@ def test_delete_document_prefers_file_id_and_cleans_orphan_file(
 
     assert response.status_code == 200
     assert not file_path.exists()
-    assert not get_file_storage().exists(storage_key)
+    assert not get_unscoped_file_storage().exists(storage_key)
 
     session = TestingSessionLocal()
     try:
@@ -4415,7 +4415,7 @@ def test_kb_delete_collection_cleans_file_id_managed_root_file(
 ):
     """Collection delete should clean orphan UploadedFile rows even outside collection dir."""
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     app, headers, user, TestingSessionLocal = test_env
     client = TestClient(app)
@@ -4443,7 +4443,7 @@ def test_kb_delete_collection_cleans_file_id_managed_root_file(
     finally:
         session.close()
 
-    assert get_file_storage().exists(storage_key)
+    assert get_unscoped_file_storage().exists(storage_key)
 
     document_state = [
         DocumentRecord(
@@ -4488,7 +4488,7 @@ def test_kb_delete_collection_cleans_file_id_managed_root_file(
 
     assert response.status_code == 200
     assert not file_path.exists()
-    assert not get_file_storage().exists(storage_key)
+    assert not get_unscoped_file_storage().exists(storage_key)
 
     session = TestingSessionLocal()
     try:

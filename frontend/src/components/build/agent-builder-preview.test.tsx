@@ -327,6 +327,13 @@ describe("AgentBuilder preview", () => {
       if (url === "http://api.local/api/agents/42/triggers") {
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
       }
+      if (url.endsWith("/api/agents/42/widget-key")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          agent_id: 42,
+          widget_enabled: true,
+          widget_key: "wk-preview-key",
+        }), { status: 200 }))
+      }
       if (url.endsWith("/api/kb/collections")) {
         return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))
       }
@@ -360,7 +367,9 @@ describe("AgentBuilder preview", () => {
     expect(await screen.findByText("appWidget.dialog.title")).toBeInTheDocument()
     expect(screen.getByText("example.com")).toBeInTheDocument()
     expect(screen.getByText((content) => content.includes("widget.js"))).toBeInTheDocument()
-    expect(screen.getByText((content) => content.includes('data-agent-id="42"'))).toBeInTheDocument()
+    expect(
+      await screen.findByText((content) => content.includes('data-widget-key="wk-preview-key"')),
+    ).toBeInTheDocument()
     expect(screen.queryByText("triggers.cards.appWidget.title")).not.toBeInTheDocument()
   })
 
@@ -391,6 +400,13 @@ describe("AgentBuilder preview", () => {
       }
       if (url === "http://api.local/api/agents/42/triggers") {
         return Promise.resolve(new Response(JSON.stringify([]), { status: 200 }))
+      }
+      if (url.endsWith("/api/agents/42/widget-key")) {
+        return Promise.resolve(new Response(JSON.stringify({
+          agent_id: 42,
+          widget_enabled: true,
+          widget_key: "wk-preview-key",
+        }), { status: 200 }))
       }
       if (url.endsWith("/api/kb/collections")) {
         return Promise.resolve(new Response(JSON.stringify({ collections: [] }), { status: 200 }))

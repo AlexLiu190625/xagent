@@ -9,7 +9,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.file_storage import get_file_storage
+from xagent.core.file_storage import get_unscoped_file_storage
 from xagent.web.models.database import Base
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -29,7 +29,7 @@ def compensation_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", objects_dir.as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
@@ -41,7 +41,7 @@ def compensation_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         yield db, uploads_dir
     finally:
         db.close()
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
 
 def test_compensate_new_uploaded_file_removes_row_local_and_durable(
@@ -62,7 +62,7 @@ def test_compensate_new_uploaded_file_removes_row_local_and_durable(
     )
     file_id = str(file_record.file_id)
     storage_key = str(file_record.storage_key)
-    assert get_file_storage().exists(storage_key)
+    assert get_unscoped_file_storage().exists(storage_key)
 
     result = compensate_new_uploaded_file(db, file_id=file_id, user_id=1)
     db.commit()
@@ -72,7 +72,7 @@ def test_compensate_new_uploaded_file_removes_row_local_and_durable(
         db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first() is None
     )
     assert not file_path.exists()
-    assert not get_file_storage().exists(storage_key)
+    assert not get_unscoped_file_storage().exists(storage_key)
 
     second = compensate_new_uploaded_file(db, file_id=file_id, user_id=1)
     assert second.complete
@@ -147,7 +147,7 @@ def test_restore_uploaded_file_refresh_snapshot_restores_row_local_and_durable(
     assert result.complete
     assert file_path.read_text(encoding="utf-8") == "old content"
     assert file_record.filename == "page.md"
-    with get_file_storage().open_read(storage_key) as handle:
+    with get_unscoped_file_storage().open_read(storage_key) as handle:
         assert handle.read() == b"old content"
 
 

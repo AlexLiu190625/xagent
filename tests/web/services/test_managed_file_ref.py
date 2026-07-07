@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.types import StoredObject
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services.managed_file_ref import (
@@ -16,7 +16,7 @@ from xagent.web.services.managed_file_ref import (
 def _configure_storage(monkeypatch, tmp_path):
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
     monkeypatch.setenv("XAGENT_FILE_MATERIALIZE_DIR", str(tmp_path / "materialized"))
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
 
 def _record(local_path, **overrides):
@@ -44,7 +44,7 @@ def test_ensure_local_returns_existing_local_file(tmp_path):
 
 def test_ensure_local_restores_missing_file_from_durable_storage(monkeypatch, tmp_path):
     _configure_storage(monkeypatch, tmp_path)
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"durable content", "users/7/uploads/file-123/local.txt")
     local_path = tmp_path / "uploads" / "local.txt"
     record = _record(
@@ -64,7 +64,7 @@ def test_ensure_local_restores_missing_file_from_durable_storage(monkeypatch, tm
 
 def test_materialize_uses_temp_dir_when_original_path_is_missing(monkeypatch, tmp_path):
     _configure_storage(monkeypatch, tmp_path)
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(
         b"preview content", "users/7/uploads/file-123/preview.txt"
     )
@@ -88,7 +88,7 @@ def test_materialize_uses_temp_dir_when_original_path_is_missing(monkeypatch, tm
 
 def test_ensure_local_rejects_restored_checksum_mismatch(monkeypatch, tmp_path):
     _configure_storage(monkeypatch, tmp_path)
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(
         b"wrong durable content", "users/7/uploads/file-123/bad.txt"
     )
@@ -113,7 +113,7 @@ def test_materialize_rejects_checksum_mismatch_and_discards_cache(
     monkeypatch, tmp_path
 ):
     _configure_storage(monkeypatch, tmp_path)
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(
         b"wrong preview content", "users/7/uploads/file-123/bad-preview.txt"
     )
@@ -139,7 +139,7 @@ def test_materialize_rejects_checksum_mismatch_and_discards_cache(
 
 def test_materialize_retries_once_after_discarding_bad_cache(monkeypatch, tmp_path):
     _configure_storage(monkeypatch, tmp_path)
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(
         b"correct preview content", "users/7/uploads/file-123/cached-preview.txt"
     )
@@ -166,7 +166,7 @@ def test_open_read_restores_and_validates_durable_when_local_missing(
     monkeypatch, tmp_path
 ):
     _configure_storage(monkeypatch, tmp_path)
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(b"stream me", "users/7/uploads/file-123/stream.txt")
     local_path = tmp_path / "uploads" / "stream.txt"
     record = _record(
@@ -185,7 +185,7 @@ def test_open_read_restores_and_validates_durable_when_local_missing(
 
 def test_open_read_prefers_existing_local_file_over_durable(monkeypatch, tmp_path):
     _configure_storage(monkeypatch, tmp_path)
-    storage = get_file_storage()
+    storage = get_unscoped_file_storage()
     stored = storage.put_bytes(
         b"stale durable content", "users/7/uploads/file-123/current.txt"
     )
@@ -320,7 +320,7 @@ def test_sync_to_durable_uploads_local_file_and_updates_record(monkeypatch, tmp_
     assert record.checksum is not None
     assert record.storage_status == "available"
     assert record.file_size == len("sync content")
-    with get_file_storage().open_read(stored.key) as handle:
+    with get_unscoped_file_storage().open_read(stored.key) as handle:
         assert handle.read() == b"sync content"
 
 

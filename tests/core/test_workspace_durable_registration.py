@@ -3,7 +3,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.service import AgentService
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.workspace import TaskWorkspace, WorkspaceManager
 from xagent.web.models import Base
@@ -19,7 +19,7 @@ def test_workspace_register_file_writes_durable_storage(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -69,7 +69,7 @@ def test_agent_workspace_register_file_uses_explicit_db_task_id(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -127,7 +127,7 @@ def test_agent_workspace_register_file_rebinds_existing_output_to_db_task_id(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -201,7 +201,7 @@ def test_agent_workspace_register_file_avoids_parent_output_name_collision(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -275,7 +275,7 @@ def test_agent_workspace_register_file_is_idempotent_after_canonicalization(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -397,7 +397,7 @@ def test_workspace_register_file_uses_uploaded_file_store_create(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     create_calls = []
 
@@ -472,7 +472,7 @@ def test_workspace_register_file_resyncs_existing_modified_file(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -521,7 +521,7 @@ def test_auto_register_files_resyncs_modified_existing_file(
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}
@@ -567,7 +567,7 @@ def test_workspace_register_file_resyncs_external_file_without_reclassifying_upl
     del mock_workspace_db
     object_root = tmp_path / "objects"
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     engine = create_engine(
         "sqlite:///:memory:", connect_args={"check_same_thread": False}

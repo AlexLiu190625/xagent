@@ -24,10 +24,10 @@ from ...config import (
     get_storage_root,
     get_uploads_dir,
 )
-from ...core.file_storage.factory import get_file_storage
+from ...core.file_storage import get_user_file_storage
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
-from ..auth_dependencies import get_current_user
+from ..auth_dependencies import get_current_user, is_admin_user
 from ..config import (
     BINARY_EXTENSIONS,
     MAX_FILE_SIZE,
@@ -304,7 +304,7 @@ async def store_uploaded_files(
         db.rollback()
         for storage_key in written_storage_keys:
             try:
-                get_file_storage().delete(storage_key)
+                get_user_file_storage(_user_id_value(user)).delete(storage_key)
             except Exception:
                 logger.warning("Failed to clean up durable upload: %s", storage_key)
         for path in written_paths:
@@ -319,7 +319,7 @@ async def store_uploaded_files(
         db.rollback()
         for storage_key in written_storage_keys:
             try:
-                get_file_storage().delete(storage_key)
+                get_user_file_storage(_user_id_value(user)).delete(storage_key)
             except Exception:
                 logger.warning("Failed to clean up durable upload: %s", storage_key)
         for path in written_paths:
@@ -361,7 +361,7 @@ def _file_user_id_value(file_record: UploadedFile) -> int:
 
 
 def _is_admin_user(user: User) -> bool:
-    return bool(getattr(user, "is_admin", False))
+    return is_admin_user(user)
 
 
 def _parse_task_id(task_id: Optional[str]) -> Optional[int]:
@@ -1548,7 +1548,9 @@ async def delete_file(
         storage_status = str(file_record.storage_status or "")
         if storage_key and storage_status == "available":
             try:
-                get_file_storage().delete(storage_key)
+                get_user_file_storage(_file_user_id_value(file_record)).delete(
+                    storage_key
+                )
             except Exception as exc:
                 logger.warning(
                     "Failed to clean up durable file before deleting row: %s",

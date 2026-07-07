@@ -45,6 +45,7 @@ from googleapiclient.http import MediaIoBaseDownload  # type: ignore
 from pydantic import BaseModel, Field, ValidationError
 from sqlalchemy.orm import Session
 
+from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.core.RAG_tools.core.config import DEFAULT_VECTOR_STORE_SCAN_LIMIT
 from ...core.tools.core.RAG_tools.core.parser_registry import (
     get_supported_parsers,
@@ -149,7 +150,6 @@ from ..services.kb_ingest_targets import (
 from ..services.managed_file_ref import (
     DurableObjectMissingError,
     ManagedFileRef,
-    build_upload_storage_key,
 )
 from ..services.uploaded_file_store import UploadedFileStore
 from .cloud_storage import get_google_credentials

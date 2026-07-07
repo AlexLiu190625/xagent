@@ -11,9 +11,53 @@ from .types import StoredObject
 
 _SHA256_METADATA_KEY = "xagent-sha256"
 
+_REJECTED_KEY_COMPONENTS = ("", ".", "..")
+
+
+def normalize_storage_key(key: str, *, strict: bool = True) -> str:
+    """Structurally validate a storage key and return its normalized form.
+
+    The key is stripped of surrounding whitespace and slashes, then validated
+    component by component: empty, ``.`` and ``..`` components are always
+    rejected. In strict mode (the default, required for every write and any
+    request-derived key) components containing backslashes or control
+    characters are rejected as well. Tolerant mode (``strict=False``) admits
+    those characters and exists only for keys already persisted in the
+    database, which may embed legacy POSIX filenames. Null bytes are rejected
+    in both modes: they cannot appear in any POSIX filename (so no persisted
+    key can contain one) and can truncate paths in native layers.
+
+    Raises:
+        ValueError: If the key is structurally invalid.
+    """
+    if "\x00" in key:
+        raise ValueError(f"Invalid storage key: {key!r} (null byte)")
+    normalized = key.strip().strip("/")
+    if not normalized:
+        raise ValueError(f"Invalid storage key: {key!r}")
+    components = normalized.split("/")
+    for component in components:
+        if component in _REJECTED_KEY_COMPONENTS:
+            raise ValueError(f"Invalid storage key: {key!r}")
+        if strict and _component_has_forbidden_characters(component):
+            raise ValueError(
+                f"Invalid storage key: {key!r} "
+                "(backslash or control character in component)"
+            )
+    return "/".join(components)
+
+
+def _component_has_forbidden_characters(component: str) -> bool:
+    return any(ch == "\\" or ord(ch) < 32 or ord(ch) == 127 for ch in component)
+
 
 class FsspecFileStorage:
-    """Small fsspec-backed storage wrapper using keys relative to a root URI."""
+    """Small fsspec-backed storage wrapper using keys relative to a root URI.
+
+    Key validation policy: write operations and ``list`` normalize keys in
+    strict mode; read and delete operations use tolerant mode because their
+    keys may come from persisted DB records that embed legacy filenames.
+    """
 
     def __init__(
         self,
@@ -29,6 +73,10 @@ class FsspecFileStorage:
         self._backend = backend
         self._base_uri = base_uri.rstrip("/")
         self._materialize_dir = materialize_dir
+
+    @property
+    def backend(self) -> str:
+        return self._backend
 
     def put_file(
         self, source: Path, key: str, content_type: str | None = None
@@ -67,14 +115,18 @@ class FsspecFileStorage:
     def open_read(self, key: str) -> BinaryIO:
         return cast(
             BinaryIO,
-            self._fs.open(self._full_path(self._normalize_key(key)), "rb"),
+            self._fs.open(
+                self._full_path(self._normalize_key(key, strict=False)), "rb"
+            ),
         )
 
     def exists(self, key: str) -> bool:
-        return bool(self._fs.exists(self._full_path(self._normalize_key(key))))
+        return bool(
+            self._fs.exists(self._full_path(self._normalize_key(key, strict=False)))
+        )
 
     def stat(self, key: str) -> StoredObject:
-        return self._stored_object(self._normalize_key(key))
+        return self._stored_object(self._normalize_key(key, strict=False))
 
     def signed_url(
         self,
@@ -94,14 +146,14 @@ class FsspecFileStorage:
         if content_disposition:
             url_kwargs["ResponseContentDisposition"] = content_disposition
 
-        full_path = self._full_path(self._normalize_key(key))
+        full_path = self._full_path(self._normalize_key(key, strict=False))
         try:
             return str(self._fs.url(full_path, expires=expires, **url_kwargs))
         except TypeError:
             return str(self._fs.url(full_path, expires=expires))
 
     def content_hash(self, key: str) -> str:
-        normalized_key = self._normalize_key(key)
+        normalized_key = self._normalize_key(key, strict=False)
         if self._backend == "file":
             return self._sha256(Path(self._full_path(normalized_key)))
 
@@ -121,7 +173,7 @@ class FsspecFileStorage:
         )
 
     def list(self, prefix: str) -> list[StoredObject]:
-        normalized_prefix = self._normalize_key(prefix).rstrip("/")
+        normalized_prefix = self._normalize_key(prefix)
         full_prefix = self._full_path(normalized_prefix)
         if not self._fs.exists(full_prefix):
             return []
@@ -133,12 +185,12 @@ class FsspecFileStorage:
         ]
 
     def delete(self, key: str) -> None:
-        full_path = self._full_path(self._normalize_key(key))
+        full_path = self._full_path(self._normalize_key(key, strict=False))
         if self._fs.exists(full_path):
             self._fs.rm(full_path)
 
     def materialize(self, key: str, filename: str | None = None) -> Path:
-        normalized_key = self._normalize_key(key)
+        normalized_key = self._normalize_key(key, strict=False)
         target_name = Path(filename or normalized_key).name or "file"
         key_digest = hashlib.sha256(normalized_key.encode("utf-8")).hexdigest()[:16]
         target_path = (
@@ -154,7 +206,9 @@ class FsspecFileStorage:
 
     def copy_to_path(self, key: str, target_path: Path) -> Path:
         target_path.parent.mkdir(parents=True, exist_ok=True)
-        return self._copy_to_path_atomic(self._normalize_key(key), target_path)
+        return self._copy_to_path_atomic(
+            self._normalize_key(key, strict=False), target_path
+        )
 
     def _copy_to_path_atomic(self, key: str, target_path: Path) -> Path:
         temp_file = tempfile.NamedTemporaryFile(
@@ -227,11 +281,8 @@ class FsspecFileStorage:
         return {"content_type": content_type}
 
     @staticmethod
-    def _normalize_key(key: str) -> str:
-        normalized = key.strip().lstrip("/")
-        if not normalized or ".." in Path(normalized).parts:
-            raise ValueError(f"Invalid storage key: {key!r}")
-        return normalized
+    def _normalize_key(key: str, *, strict: bool = True) -> str:
+        return normalize_storage_key(key, strict=strict)
 
     def _store_content_hash(
         self, key: str, checksum: str, *, content_type: str | None

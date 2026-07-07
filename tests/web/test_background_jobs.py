@@ -1135,11 +1135,11 @@ def test_kb_web_job_existing_collection_partial_restores_previous_config(
 def test_background_web_file_new_branch_returns_rollback_callback(
     tmp_path, monkeypatch
 ):
-    from xagent.core.file_storage.factory import get_file_storage
+    from xagent.core.file_storage.factory import get_unscoped_file_storage
     from xagent.web.jobs.kb_tasks import _handle_web_file
 
     monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-    get_file_storage.cache_clear()
+    get_unscoped_file_storage.cache_clear()
 
     SessionLocal = _init_test_db(tmp_path / "web-file-handler.db")
     db = SessionLocal()
@@ -1197,7 +1197,7 @@ def test_background_web_file_new_branch_returns_rollback_callback(
         mock_rollback_rag.assert_called_once()
     finally:
         db.close()
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
 
 
 def test_requeue_stale_background_jobs_marks_old_running_pending(tmp_path, monkeypatch):

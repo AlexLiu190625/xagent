@@ -18,7 +18,7 @@ import { getApiSnippetTarget } from "@/lib/api-snippet-base-url"
 import { formatAgentApiSnippets, type ApiSnippetTab } from "@/lib/api-snippet-format"
 import type { ApiSnippetTarget } from "@/lib/api-snippet-target"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
-import { buildWidgetSnippet, isValidAllowedDomain, normalizeAllowedDomain, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
+import { buildWidgetSnippet, fetchAgentWidgetKey, isValidAllowedDomain, normalizeAllowedDomain, updateAgentWidgetConfig } from "@/lib/agent-widget-config"
 
 export interface Agent {
   id: number
@@ -66,6 +66,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   const [isUpdatingShare, setIsUpdatingShare] = useState(false)
   const [isLoadingShareLink, setIsLoadingShareLink] = useState(false)
   const [shareLink, setShareLink] = useState<ShareLinkResponse | null>(null)
+  const [widgetKey, setWidgetKey] = useState<string | null>(null)
   const [newDomain, setNewDomain] = useState("")
   const [appOrigin, setAppOrigin] = useState("")
   const isPublished = deployAgent?.status === "published"
@@ -88,7 +89,32 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
   useEffect(() => {
     setShareLink(null)
     setCopiedShareLink(false)
+    setWidgetKey(null)
   }, [deployAgent?.id])
+
+  useEffect(() => {
+    if (activeView !== "embed" || !deployAgent) {
+      return
+    }
+    let cancelled = false
+    const fallback = t("appWidget.messages.widgetKeyLoadFailed") || "Failed to load widget key"
+    fetchAgentWidgetKey(deployAgent.id, fallback)
+      .then((state) => {
+        if (!cancelled) setWidgetKey(state.widget_key)
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          console.error(err)
+          toast.error(err instanceof Error ? err.message : fallback)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+    // `t` excluded on purpose: only used for the error toast; depending on it
+    // would refetch on every render where the i18n function identity changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeView, deployAgent?.id])
 
   useEffect(() => {
     if (activeView !== "share" || !deployAgent || !isPublished) {
@@ -213,7 +239,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
 
   const handleCopySnippet = () => {
     if (!deployAgent) return
-    const snippet = buildWidgetSnippet(deployAgent.id, appOrigin)
+    const snippet = buildWidgetSnippet(widgetKey ?? "", appOrigin)
     if (!snippet) return
     navigator.clipboard.writeText(snippet)
     setCopiedSnippet(true)
@@ -520,7 +546,7 @@ export function DeployAgentDialog({ deployAgent, onClose, onUpdate, onManageApiK
               </div>
               <div className="bg-muted p-4 rounded-md text-xs font-mono relative overflow-hidden group mt-4">
                 <pre className="whitespace-pre-wrap break-all text-muted-foreground">
-                  {buildWidgetSnippet(deployAgent?.id ?? "", appOrigin)}
+                  {widgetKey ? buildWidgetSnippet(widgetKey, appOrigin) : "…"}
                 </pre>
                 <Button
                   variant="secondary"

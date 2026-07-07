@@ -1,7 +1,7 @@
 "use client"
 
 import React, { useEffect, useMemo, useState } from "react"
-import { Check, ChevronLeft, Code2, Copy, X, Zap } from "lucide-react"
+import { Check, ChevronLeft, Code2, Copy, KeyRound, RefreshCw, X, Zap } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -12,8 +12,10 @@ import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
 import {
   buildWidgetSnippet,
+  fetchAgentWidgetKey,
   isValidAllowedDomain,
   normalizeAllowedDomain,
+  rotateAgentWidgetKey,
   updateAgentWidgetConfig,
 } from "@/lib/agent-widget-config"
 import { getBrowserLocationOrigin } from "@/lib/browser-location"
@@ -48,12 +50,41 @@ export function AgentWidgetSettingsDialog({
   const [domainError, setDomainError] = useState<string | null>(null)
   const [isUpdating, setIsUpdating] = useState(false)
   const [copiedSnippet, setCopiedSnippet] = useState(false)
+  const [widgetKey, setWidgetKey] = useState<string | null>(null)
+  const [isRotatingKey, setIsRotatingKey] = useState(false)
+  const [copiedKey, setCopiedKey] = useState(false)
 
   useEffect(() => {
     if (open) {
       setAppOrigin(getBrowserLocationOrigin())
     }
   }, [open])
+
+  useEffect(() => {
+    if (!open || !agentId) {
+      setWidgetKey(null)
+      return
+    }
+    let cancelled = false
+    fetchAgentWidgetKey(agentId, t("appWidget.messages.widgetKeyLoadFailed"))
+      .then((state) => {
+        if (!cancelled) setWidgetKey(state.widget_key)
+      })
+      .catch((error) => {
+        if (!cancelled) {
+          toast.error(
+            error instanceof Error ? error.message : t("appWidget.messages.widgetKeyLoadFailed"),
+          )
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+    // `t` is intentionally excluded: it is only used for the error toast, and
+    // depending on it would re-fetch (and clobber a freshly rotated key) on
+    // every render where the i18n function identity changes.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open, agentId])
 
   useEffect(() => {
     if (!open) return
@@ -71,8 +102,8 @@ export function AgentWidgetSettingsDialog({
     : []
 
   const widgetSnippet = useMemo(
-    () => buildWidgetSnippet(agentId ?? "", appOrigin),
-    [agentId, appOrigin],
+    () => buildWidgetSnippet(widgetKey ?? "", appOrigin),
+    [widgetKey, appOrigin],
   )
 
   const handleWidgetConfigUpdate = async (updates: Partial<AgentWidgetConfig>): Promise<boolean> => {
@@ -102,6 +133,37 @@ export function AgentWidgetSettingsDialog({
       return false
     } finally {
       setIsUpdating(false)
+    }
+  }
+
+  const handleCopyWidgetKey = async () => {
+    if (!widgetKey) return
+    if (await copyToClipboard(widgetKey)) {
+      setCopiedKey(true)
+      toast.success(t("common.copied"))
+      window.setTimeout(() => setCopiedKey(false), 2000)
+    } else {
+      toast.error(t("appWidget.messages.copyFailed"))
+    }
+  }
+
+  const handleRotateWidgetKey = async () => {
+    if (!agentId) return
+    if (!window.confirm(t("appWidget.dialog.rotateWidgetKeyConfirm"))) return
+    setIsRotatingKey(true)
+    try {
+      const state = await rotateAgentWidgetKey(
+        agentId,
+        t("appWidget.messages.widgetKeyRotateFailed"),
+      )
+      setWidgetKey(state.widget_key)
+      toast.success(t("appWidget.messages.widgetKeyRotated"))
+    } catch (error) {
+      toast.error(
+        error instanceof Error ? error.message : t("appWidget.messages.widgetKeyRotateFailed"),
+      )
+    } finally {
+      setIsRotatingKey(false)
     }
   }
 
@@ -188,6 +250,9 @@ export function AgentWidgetSettingsDialog({
                 <p className="text-xs text-muted-foreground">
                   {t("deploy_agent.access_control.allowed_domains_desc")}
                 </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {t("appWidget.dialog.allowedDomainsSecurityNote")}
+                </p>
               </div>
               <div className="flex gap-2">
                 <Input
@@ -241,6 +306,46 @@ export function AgentWidgetSettingsDialog({
                     {t("appWidget.dialog.noDomains")}
                   </span>
                 )}
+              </div>
+            </section>
+
+            <section className="space-y-3">
+              <div>
+                <h3 className="flex items-center gap-1.5 text-sm font-medium">
+                  <KeyRound className="h-3.5 w-3.5" />
+                  {t("appWidget.dialog.widgetKeyTitle")}
+                </h3>
+                <p className="text-xs text-muted-foreground">
+                  {t("appWidget.dialog.widgetKeyDescription")}
+                </p>
+              </div>
+              <div className="flex items-center gap-2">
+                <code className="min-w-0 flex-1 truncate rounded-md bg-muted px-3 py-2 font-mono text-xs text-muted-foreground">
+                  {widgetKey ?? "…"}
+                </code>
+                <Button
+                  type="button"
+                  variant="secondary"
+                  size="icon"
+                  onClick={() => void handleCopyWidgetKey()}
+                  disabled={!widgetKey}
+                  aria-label={t("appWidget.dialog.copyWidgetKey")}
+                  title={t("appWidget.dialog.copyWidgetKey")}
+                  className="h-8 w-8 shrink-0"
+                >
+                  {copiedKey ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => void handleRotateWidgetKey()}
+                  disabled={!agentId || !widgetKey || isRotatingKey}
+                  className="shrink-0"
+                >
+                  <RefreshCw className={`mr-1 h-3.5 w-3.5 ${isRotatingKey ? "animate-spin" : ""}`} />
+                  {t("appWidget.dialog.rotateWidgetKey")}
+                </Button>
               </div>
             </section>
 

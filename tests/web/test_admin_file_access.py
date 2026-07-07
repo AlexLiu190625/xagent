@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
-from xagent.core.file_storage.factory import get_file_storage
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.api.auth import hash_password
 from xagent.web.api.files import file_router
 from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
@@ -376,7 +376,7 @@ class TestAdminFileAccess:
         self, test_db, temp_uploads_dir, monkeypatch, tmp_path
     ):
         monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", (tmp_path / "objects").as_uri())
-        get_file_storage.cache_clear()
+        get_unscoped_file_storage.cache_clear()
         admin_user, regular_user, test_app, session = test_db
         del admin_user
         regular_user_id = int(cast(Any, regular_user.id))
@@ -405,7 +405,7 @@ class TestAdminFileAccess:
             f"users/{regular_user_id}/tasks/{task.id}/outputs/asset-file/"
             "output/assets/app.js"
         )
-        stored_object = get_file_storage().put_file(
+        stored_object = get_unscoped_file_storage().put_file(
             asset_path,
             storage_key,
             "application/javascript",
