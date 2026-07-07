@@ -1,7 +1,7 @@
 """add connector runtime context persistence
 
 Revision ID: 20260706_add_connector_runtime_context
-Revises: 20260703_add_multi_key_support_to_agent_api_keys
+Revises: 20260707_merge_alembic_heads
 Create Date: 2026-07-06 00:00:00.000000
 
 """
@@ -12,7 +12,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "20260706_add_connector_runtime_context"
-down_revision: Union[str, None] = "20260703_add_multi_key_support_to_agent_api_keys"
+down_revision: Union[str, None] = "20260707_merge_alembic_heads"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
