@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import secrets
 import shutil
 import tempfile
 from collections.abc import Iterator
@@ -104,6 +105,7 @@ def _create_agent(
         status=AgentStatus.PUBLISHED,
         tool_categories=tool_categories or [],
         widget_enabled=widget_enabled,
+        widget_key=f"wk-{secrets.token_urlsafe(24)}" if widget_enabled else None,
         allowed_domains=["example.com"] if widget_enabled else [],
         share_enabled=share_enabled,
         share_token=share_token,
@@ -343,8 +345,7 @@ def test_widget_and_share_create_snapshot_and_ignore_smuggled_payload(
 
     widget_auth = client.post(
         "/api/widget/auth",
-        json={"agent_id": int(agent.id), "guest_id": "guest-runtime"},
-        headers={"origin": "https://example.com"},
+        json={"widget_key": agent.widget_key, "guest_id": "guest-runtime"},
     )
     assert widget_auth.status_code == 200, widget_auth.text
     widget_headers = {"Authorization": f"Bearer {widget_auth.json()['access_token']}"}
