@@ -331,6 +331,42 @@ async def test_runtime_bindings_hide_and_inject_mcp_meta_and_tool_arguments(
     assert captured["kwargs"]["meta"] == {"account_id": "6185"}
 
 
+def test_mcp_runtime_tool_argument_missing_source_warns(caplog):
+    mcp_tool = SimpleNamespace(
+        name="list_clients",
+        description="List clients",
+        inputSchema={
+            "type": "object",
+            "properties": {"account_id": {"type": "string"}},
+            "required": ["account_id"],
+        },
+    )
+    adapter = MCPToolAdapter(
+        mcp_tool=mcp_tool,
+        connection={
+            "transport": "stdio",
+            "command": "python",
+            "args": [],
+            "runtime_bindings": [
+                {
+                    "source": {"input_type": "context", "key": "account_id"},
+                    "target": {"target_type": "tool_arguments", "key": "account_id"},
+                },
+            ],
+            "connector_runtime": {"context": {}, "secrets": {}, "auth_selector": {}},
+        },
+    )
+
+    caplog.set_level("WARNING")
+    assert adapter._runtime_tool_arguments() == {}
+    assert (
+        "Skipping runtime MCP tool argument binding for missing context source"
+        in caplog.text
+    )
+    assert "account_id" in caplog.text
+    assert "list_clients" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_delegated_authorization_401_refreshes_connection_once(monkeypatch):
     mcp_tool = SimpleNamespace(

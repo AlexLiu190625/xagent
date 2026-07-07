@@ -100,3 +100,31 @@ def test_connector_runtime_turn_switch_invalidates_runtime_caches():
     assert cfg._connector_runtime_turn_id == "turn-2"
     assert cfg._connector_runtime_view is None
     assert cfg._cached_mcp_configs is None
+
+
+def test_connector_runtime_view_resolution_errors_fail_closed(monkeypatch):
+    def _raise_runtime_lookup_error(**_kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(
+        "xagent.web.services.connector_runtime.load_connector_runtime_view",
+        _raise_runtime_lookup_error,
+    )
+    cfg = WebToolConfig(
+        db=object(),
+        request=None,
+        task_id="web_task_123",
+        user_id=1,
+        connector_runtime_turn_id="turn-1",
+    )
+
+    try:
+        try:
+            cfg._load_connector_runtime_view()
+        except RuntimeError as exc:
+            assert str(exc) == "database unavailable"
+        else:
+            raise AssertionError("runtime view lookup error was swallowed")
+        assert cfg._connector_runtime_view is None
+    finally:
+        cfg.close()

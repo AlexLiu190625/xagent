@@ -442,7 +442,8 @@ class WebToolConfig(BaseToolConfig):
                 self._task_id,
                 exc_info=True,
             )
-            self._connector_runtime_view = {}
+            self._connector_runtime_view = None
+            raise
         return self._connector_runtime_view
 
     def set_connector_runtime_turn_id(self, turn_id: Optional[str]) -> bool:

@@ -624,8 +624,15 @@ class MCPToolAdapter(AbstractBaseTool):
                 self._connector_runtime,
                 allowed_input_types={RUNTIME_INPUT_CONTEXT},
             )
-            if value is not MISSING_RUNTIME_VALUE:
-                runtime_args[target_key] = value
+            if value is MISSING_RUNTIME_VALUE:
+                logger.warning(
+                    "Skipping runtime MCP tool argument binding for missing "
+                    "context source while setting %s on tool %s",
+                    target_key,
+                    self.mcp_tool.name,
+                )
+                continue
+            runtime_args[target_key] = value
         return runtime_args
 
     def _runtime_mcp_meta(self) -> dict[str, Any]:
