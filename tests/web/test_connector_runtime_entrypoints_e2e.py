@@ -5,6 +5,7 @@ import secrets
 import shutil
 import tempfile
 from collections.abc import Iterator
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,11 +18,14 @@ from xagent.web.api.chat import AgentServiceManager, chat_router
 from xagent.web.api.share import share_router
 from xagent.web.api.websocket import handle_chat_message
 from xagent.web.api.widget import widget_router
+from xagent.web.channels.feishu.bot import FeishuBotInstance
+from xagent.web.channels.telegram.bot import TelegramBotInstance
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.task import Task, TaskConnectorRuntimeContext, TaskStatus
 from xagent.web.models.user import User
+from xagent.web.models.user_channel import UserChannel
 
 
 def _override_get_db() -> Iterator[Session]:
@@ -195,6 +199,42 @@ class _FakeWebSocket:
 
     async def send_text(self, message: str) -> None:
         self.messages.append(message)
+
+
+class _FakeTracer:
+    def __init__(self) -> None:
+        self.handlers: list[Any] = []
+
+    def add_handler(self, handler: Any) -> None:
+        self.handlers.append(handler)
+
+
+class _FakeAgentService:
+    def __init__(self) -> None:
+        self.tracer = _FakeTracer()
+
+    def set_execution_context_messages(self, _messages: list[Any]) -> None:
+        pass
+
+    def set_recovered_skill_context(self, _skill_context: Any) -> None:
+        pass
+
+
+class _FakeAgentManager:
+    def __init__(self) -> None:
+        self.service = _FakeAgentService()
+
+    async def get_agent_for_task(
+        self,
+        _task_id: int,
+        _db: Session,
+        *,
+        user: User,
+    ) -> _FakeAgentService:
+        return self.service
+
+    async def execute_task(self, **_kwargs: Any) -> dict[str, Any]:
+        return {"success": True, "output": "done"}
 
 
 def test_web_chat_create_filters_runtime_declared_connectors_and_ignores_payload(
@@ -445,5 +485,191 @@ async def test_websocket_context_payload_does_not_persist_runtime_context(
         assert _context_row_count(task_id) == 0
         db.refresh(task)
         assert task.connector_runtime_selected_refs == []
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_websocket_missing_task_auto_create_fallback_snapshots_empty(
+    e2e_db: None,
+) -> None:
+    _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        missing_task_id = 246802
+
+        websocket = _FakeWebSocket()
+        await handle_chat_message(
+            websocket,  # type: ignore[arg-type]
+            missing_task_id,
+            {
+                "message": "hello from websocket",
+                "context": {"connector_runtime_context": _smuggled_payload()},
+                "user": user,
+            },
+        )
+
+        task = (
+            db.query(Task)
+            .filter(
+                Task.user_id == user.id,
+                Task.title.like("Chat: hello from websocket%"),
+            )
+            .one_or_none()
+        )
+        assert task is not None
+        assert task.connector_runtime_selected_refs == []
+        assert _context_row_count(int(task.id)) == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_feishu_new_task_fallback_snapshots_empty(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        channel = UserChannel(
+            user_id=user.id,
+            channel_type="feishu",
+            channel_name="Feishu test",
+            config={},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        db.refresh(channel)
+
+        monkeypatch.setattr(
+            "xagent.web.channels.feishu.bot.get_agent_manager",
+            lambda: _FakeAgentManager(),
+        )
+
+        bot = object.__new__(FeishuBotInstance)
+        bot.channel_id = int(channel.id)
+        bot.channel_name = "Feishu test"
+        bot.active_tasks = {}
+        bot.api_client = object()
+        bot._save_active_tasks = lambda: None
+
+        async def _send_text(_chat_id: str, _text: str) -> None:
+            return None
+
+        bot._send_text = _send_text
+
+        message = SimpleNamespace(
+            event=SimpleNamespace(
+                message=SimpleNamespace(
+                    chat_id="chat-1",
+                    message_id="msg-1",
+                    message_type="text",
+                    content='{"text": "hello from feishu"}',
+                )
+            )
+        )
+        await bot._process_messages_batch("open-id-1", [message])
+
+        task = (
+            db.query(Task)
+            .filter(Task.user_id == user.id, Task.title == "hello from feishu")
+            .one_or_none()
+        )
+        assert task is not None
+        assert task.connector_runtime_selected_refs == []
+        assert _context_row_count(int(task.id)) == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_telegram_new_task_fallback_snapshots_empty(
+    e2e_db: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _setup_admin_headers()
+    db = _db_session()
+    try:
+        user = _admin_user(db)
+        channel = UserChannel(
+            user_id=user.id,
+            channel_type="telegram",
+            channel_name="Telegram test",
+            config={},
+            is_active=True,
+        )
+        db.add(channel)
+        db.commit()
+        db.refresh(channel)
+
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.get_agent_manager",
+            lambda: _FakeAgentManager(),
+        )
+
+        async def _restore_telegram_task_context(*_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.restore_telegram_task_context",
+            _restore_telegram_task_context,
+        )
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.persist_user_message",
+            lambda **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            "xagent.web.channels.telegram.bot.persist_telegram_assistant_turn",
+            lambda **_kwargs: None,
+        )
+
+        bot = object.__new__(TelegramBotInstance)
+        bot.channel_id = int(channel.id)
+        bot.channel_name = "Telegram test"
+        bot.active_tasks = {}
+        bot.bot = object()
+        bot.user_preparing_executions = set()
+        bot.user_stop_events = {}
+        bot.user_active_executions = {}
+        bot._save_active_tasks = lambda: None
+        bot._clear_user_stop_request = lambda _user_id: None
+        bot._consume_user_stop_request = lambda _user_id: False
+
+        async def _extract_message_content(_message: Any) -> tuple[str, list[Any]]:
+            return "hello from telegram", []
+
+        async def _await_execution(_user_id: int, execution, *, reason: str) -> dict:
+            return await execution
+
+        bot._extract_message_content = _extract_message_content
+        bot._await_execution_with_stop_monitor = _await_execution
+
+        class _LoadingMessage:
+            message_id = 33
+
+            async def edit_text(self, _text: str, **_kwargs: Any) -> None:
+                pass
+
+        class _TelegramMessage:
+            from_user = SimpleNamespace(id=123)
+            chat = SimpleNamespace(id=456)
+
+            async def answer(self, _text: str, **_kwargs: Any) -> _LoadingMessage:
+                return _LoadingMessage()
+
+        await bot._process_user_messages_batch(123, [_TelegramMessage()])
+
+        task = (
+            db.query(Task)
+            .filter(Task.user_id == user.id, Task.title == "hello from telegram")
+            .one_or_none()
+        )
+        assert task is not None
+        assert task.connector_runtime_selected_refs == []
+        assert _context_row_count(int(task.id)) == 0
     finally:
         db.close()
