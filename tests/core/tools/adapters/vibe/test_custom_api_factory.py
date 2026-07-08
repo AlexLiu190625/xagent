@@ -3,6 +3,10 @@ from unittest.mock import MagicMock
 import pytest
 
 from xagent.core.tools.adapters.vibe.config import BaseToolConfig
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
 from xagent.core.tools.adapters.vibe.custom_api_factory import (
     create_db_custom_api_tools,
 )
@@ -76,3 +80,21 @@ async def test_create_db_custom_api_tools_exception():
 
     tools = await create_db_custom_api_tools(config)
     assert tools == []
+
+
+@pytest.mark.asyncio
+async def test_create_db_custom_api_tools_propagates_connector_runtime_error():
+    config = MagicMock(spec=BaseToolConfig)
+    config.get_user_id.return_value = 1
+    config.get_custom_api_configs.side_effect = ConnectorRuntimeError(
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+        "Connector runtime context is unavailable.",
+        details={"reason": "runtime_view_resolution_failed"},
+        status_code=503,
+    )
+
+    with pytest.raises(ConnectorRuntimeError) as exc_info:
+        await create_db_custom_api_tools(config)
+
+    assert exc_info.value.code == ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
+    assert exc_info.value.status_code == 503

@@ -155,6 +155,7 @@ def test_connector_runtime_view_resolution_errors_fail_closed(monkeypatch):
         with pytest.raises(ConnectorRuntimeError) as exc_info:
             cfg._load_connector_runtime_view()
         assert exc_info.value.code == ERROR_CONNECTOR_RUNTIME_UNAVAILABLE
+        assert exc_info.value.status_code == 503
         assert isinstance(exc_info.value.__cause__, RuntimeError)
         assert str(exc_info.value.__cause__) == "database unavailable"
         assert cfg._connector_runtime_view is None

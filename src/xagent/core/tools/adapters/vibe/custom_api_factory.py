@@ -10,6 +10,7 @@ from typing import Sequence
 from .api_tool_adapter import create_custom_api_tools
 from .base import Tool
 from .config import BaseToolConfig
+from .connector_runtime import ConnectorRuntimeError
 from .factory import register_tool
 
 logger = logging.getLogger(__name__)
@@ -55,6 +56,8 @@ async def create_db_custom_api_tools(config: BaseToolConfig) -> Sequence[Tool]:
 
         return create_custom_api_tools(custom_api_configs)
 
+    except ConnectorRuntimeError:
+        raise
     except Exception as e:
         logger.error(
             f"Failed to create Custom API tools from config: {e}", exc_info=True

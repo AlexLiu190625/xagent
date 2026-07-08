@@ -448,7 +448,7 @@ class WebToolConfig(BaseToolConfig):
                 ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
                 "Connector runtime context is unavailable.",
                 details={"reason": "runtime_view_resolution_failed"},
-                status_code=500,
+                status_code=503,
             ) from exc
         return self._connector_runtime_view
 
