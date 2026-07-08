@@ -12,6 +12,7 @@ from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
 from ..tools.adapters.vibe import Tool
+from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .trace import Tracer
 from .transcript import normalize_transcript_messages
@@ -635,6 +636,8 @@ class AgentService:
                     self._execution_adapter.config.tools = self.tools
                 self._tools_initialized = True
                 self._tool_policy_signature = policy_signature
+            except ConnectorRuntimeError:
+                raise
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)
                 raise RuntimeError(

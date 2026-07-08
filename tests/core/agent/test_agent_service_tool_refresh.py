@@ -5,6 +5,10 @@ from typing import Any
 import pytest
 
 from xagent.core.agent.service import AgentService
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
 
 
 class NamedTool:
@@ -178,3 +182,38 @@ async def test_agent_service_refreshes_when_delegation_parent_context_changes(
     tool_config.parent_tracer = object()
     await service._ensure_tools_initialized()
     assert [tool.name for tool in service.tools] == ["new-tracer"]
+
+
+@pytest.mark.asyncio
+async def test_agent_service_preserves_connector_runtime_initialization_errors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_config = AllowedToolsConfig()
+    runtime_error = ConnectorRuntimeError(
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+        "Connector runtime context is unavailable.",
+        details={"reason": "runtime_view_resolution_failed"},
+        status_code=503,
+    )
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        raise runtime_error
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+
+    service = AgentService(
+        name="runtime-error-test",
+        id="runtime-error-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    with pytest.raises(ConnectorRuntimeError) as exc_info:
+        await service._ensure_tools_initialized()
+
+    assert exc_info.value is runtime_error
+    assert exc_info.value.status_code == 503

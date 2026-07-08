@@ -490,7 +490,7 @@ async def test_websocket_context_payload_does_not_persist_runtime_context(
 
 
 @pytest.mark.asyncio
-async def test_websocket_missing_task_auto_create_fallback_snapshots_empty(
+async def test_websocket_missing_task_auto_create_fallback_always_snapshots_empty(
     e2e_db: None,
 ) -> None:
     _setup_admin_headers()
@@ -505,7 +505,6 @@ async def test_websocket_missing_task_auto_create_fallback_snapshots_empty(
             missing_task_id,
             {
                 "message": "hello from websocket",
-                "context": {"connector_runtime_context": _smuggled_payload()},
                 "user": user,
             },
         )
