@@ -329,6 +329,77 @@ async def test_launch_config_args_none_matches_user_oauth_shape(db_session):
 
 
 @pytest.mark.asyncio
+async def test_launch_config_env_mapping_none_matches_user_oauth_shape(db_session):
+    db, user = db_session
+    launch_config = _launch_config()
+    launch_config["env_mapping"] = None
+    _add_oauth_server(db, user, launch_config=launch_config)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    hook_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+    set_oauth_token_resolver_hook(None)
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+    user_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert "GOOGLE_ACCESS_TOKEN" not in hook_config["config"]["env"]
+    assert hook_config == user_config
+
+
+@pytest.mark.asyncio
+async def test_launch_config_missing_command_skips_only_that_server_for_hook(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_stdio_server(db, user, name="before")
+    launch_config = _launch_config()
+    launch_config.pop("command")
+    _add_oauth_server(db, user, launch_config=launch_config)
+    _add_stdio_server(db, user, name="after")
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["before", "after"]
+    assert "launch_config.command is invalid" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_launch_config_missing_command_skips_only_that_server_for_user_oauth(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_stdio_server(db, user, name="before")
+    launch_config = _launch_config()
+    launch_config.pop("command")
+    _add_oauth_server(db, user, launch_config=launch_config)
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+    _add_stdio_server(db, user, name="after")
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["before", "after"]
+    assert "launch_config.command is invalid" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_hook_is_not_asked_without_app_info(db_session):
     db, user = db_session
     _add_oauth_server(db, user, name="Unregistered OAuth", register_app=False)

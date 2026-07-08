@@ -105,6 +105,12 @@ class _OAuthTokenResolverFailed(Exception):
         self.exception_type = exception_type
 
 
+class _OAuthLaunchConfigInvalid(Exception):
+    def __init__(self, *, field: str) -> None:
+        super().__init__(field)
+        self.field = field
+
+
 def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
     text = str(value)
     if len(text) <= max_length:
@@ -147,6 +153,27 @@ def _oauth_launch_config_args(launch_config: Mapping[str, Any]) -> list[Any]:
         return args.copy()
     logger.warning("Ignoring OAuth MCP launch config args because args must be a list")
     return []
+
+
+def _oauth_launch_config_command(launch_config: Mapping[str, Any]) -> str:
+    command = launch_config.get("command")
+    if isinstance(command, str) and command:
+        return command
+    raise _OAuthLaunchConfigInvalid(field="command")
+
+
+def _oauth_launch_config_env_mapping(
+    launch_config: Mapping[str, Any],
+) -> Mapping[str, Any]:
+    env_mapping = launch_config.get("env_mapping")
+    if env_mapping is None:
+        return {}
+    if isinstance(env_mapping, Mapping):
+        return env_mapping
+    logger.warning(
+        "Ignoring OAuth MCP launch config env_mapping because env_mapping must be a mapping"
+    )
+    return {}
 
 
 async def refresh_oauth_token_if_needed(
@@ -1208,12 +1235,14 @@ class WebToolConfig(BaseToolConfig):
         if launch_config:
             transport_config: Dict[str, Any] = {
                 "transport": "stdio",
-                "command": launch_config["command"],
+                "command": _oauth_launch_config_command(launch_config),
                 "args": _oauth_launch_config_args(launch_config),
             }
 
             env = {}
-            for env_key, token_type in launch_config.get("env_mapping", {}).items():
+            for env_key, token_type in _oauth_launch_config_env_mapping(
+                launch_config
+            ).items():
                 if token_type == "access_token":
                     env[env_key] = access_token
 
@@ -1359,13 +1388,23 @@ class WebToolConfig(BaseToolConfig):
 
                     if hook_token is not None:
                         assert app_info is not None
+                        try:
+                            transport_config = (
+                                self._build_oauth_mcp_stdio_transport_config(
+                                    server=server,
+                                    app_info=app_info,
+                                    access_token=hook_token.access_token,
+                                )
+                            )
+                        except _OAuthLaunchConfigInvalid as error:
+                            logger.warning(
+                                "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
+                                getattr(server, "name", "<unknown>"),
+                                error.field,
+                            )
+                            continue
                         self._mark_hook_token_cache_metadata(hook_token)
                         config["transport"] = "stdio"
-                        transport_config = self._build_oauth_mcp_stdio_transport_config(
-                            server=server,
-                            app_info=app_info,
-                            access_token=hook_token.access_token,
-                        )
                         logger.info(
                             "OAuth token resolver supplied token for MCP server '%s' via provider '%s'",
                             getattr(server, "name", "<unknown>"),
@@ -1424,14 +1463,22 @@ class WebToolConfig(BaseToolConfig):
                                 logger.info(
                                     f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
                                 )
-                                config["transport"] = "stdio"
-                                transport_config = (
-                                    self._build_oauth_mcp_stdio_transport_config(
-                                        server=server,
-                                        app_info=app_info,
-                                        access_token=oauth_account.access_token,
+                                try:
+                                    transport_config = (
+                                        self._build_oauth_mcp_stdio_transport_config(
+                                            server=server,
+                                            app_info=app_info,
+                                            access_token=oauth_account.access_token,
+                                        )
                                     )
-                                )
+                                except _OAuthLaunchConfigInvalid as error:
+                                    logger.warning(
+                                        "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
+                                        getattr(server, "name", "<unknown>"),
+                                        error.field,
+                                    )
+                                    continue
+                                config["transport"] = "stdio"
 
                         else:
                             logger.info(
