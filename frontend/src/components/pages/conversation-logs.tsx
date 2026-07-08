@@ -5,6 +5,7 @@ import { Bot, ChevronLeft, ChevronRight, Inbox } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
+import { CompactionNotice } from "@/components/chat/CompactionNotice"
 import { TraceEventRenderer } from "@/components/chat/TraceEventRenderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { SearchInput } from "@/components/ui/search-input"
@@ -403,6 +404,15 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
         ) : (
           <div className="space-y-4">
             {detail.transcript.map((message) => (
+              message.message_type === "compaction" ? (
+                <CompactionNotice
+                  key={message.id}
+                  text={t("agent.logs.event.messages.compactNotice", {
+                    original: message.compaction?.original_tokens ?? "?",
+                    compacted: message.compaction?.compacted_tokens ?? "?",
+                  })}
+                />
+              ) : (
               <div
                 key={message.id}
                 className={cn(
@@ -438,6 +448,7 @@ function ConversationLogDetail({ detail }: { detail: ConversationLogDetailRespon
                   </div>
                 ) : null}
               </div>
+              )
             ))}
           </div>
         )}

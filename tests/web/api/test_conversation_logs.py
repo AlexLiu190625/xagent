@@ -209,6 +209,36 @@ def _add_chat_message(
         db.close()
 
 
+def _add_compact_event(
+    *,
+    task_id: int,
+    event_id: str,
+    timestamp: datetime,
+    original_tokens: int,
+    compacted_tokens: int,
+) -> None:
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                event_id=event_id,
+                event_type="action_end_compact",
+                timestamp=timestamp,
+                step_id="react_x",
+                data={
+                    "original_tokens": original_tokens,
+                    "compacted_tokens": compacted_tokens,
+                    "compression_ratio": "0.8%",
+                    "success": True,
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 def _authenticate_widget_guest(
     *,
     agent_id: int,
@@ -427,6 +457,56 @@ def test_conversation_log_detail_returns_read_only_transcript_and_audit_metadata
         "Event handled",
     ]
     assert body["read_only"] is True
+
+
+def test_conversation_log_detail_interleaves_compaction_notices() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Compact Agent")
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="Compaction log",
+        source="widget",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    base = datetime(2026, 7, 7, 6, 31, 0, tzinfo=timezone.utc)
+    _add_chat_message(
+        task_id=task_id,
+        user_id=user_id,
+        role="user",
+        content="Do a long task",
+        created_at=base,
+    )
+    _add_compact_event(
+        task_id=task_id,
+        event_id="compact-evt-1",
+        timestamp=base.replace(second=18),
+        original_tokens=56860,
+        compacted_tokens=449,
+    )
+    _add_chat_message(
+        task_id=task_id,
+        user_id=user_id,
+        role="assistant",
+        content="All done",
+        created_at=base.replace(second=53),
+    )
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    transcript = response.json()["transcript"]
+
+    # Compaction notice sits between the user turn and the assistant reply.
+    assert [item["message_type"] for item in transcript] == [
+        "chat",
+        "compaction",
+        "chat",
+    ]
+    compaction = transcript[1]
+    assert compaction["role"] == "system"
+    assert compaction["compaction"]["original_tokens"] == 56860
+    assert compaction["compaction"]["compacted_tokens"] == 449
 
 
 def test_conversation_log_detail_rejects_non_owner_external_task() -> None:
@@ -750,3 +830,41 @@ def test_detail_returns_trace_events() -> None:
     assert len(events) == 1
     assert events[0]["event_type"] == "tool_call_start"
     assert events[0]["data"]["tool_name"] == "search"
+
+
+def test_compaction_notice_sorts_between_messages_on_equal_timestamp() -> None:
+    headers = _admin_headers()
+    user_id = _user_id("admin")
+    agent_id = _create_agent_row(user_id=user_id, name="Tie Agent")
+    task_id = _create_task_row(
+        user_id=user_id,
+        title="Tie-break log",
+        source="widget",
+        is_visible=False,
+        agent_id=agent_id,
+    )
+    # User message, compaction event and assistant reply all share one timestamp,
+    # so ordering is decided purely by the three-way kind tie-break.
+    ts = datetime(2026, 7, 7, 6, 31, 0, tzinfo=timezone.utc)
+    _add_chat_message(
+        task_id=task_id, user_id=user_id, role="user", content="Q", created_at=ts
+    )
+    _add_compact_event(
+        task_id=task_id,
+        event_id="compact-tie",
+        timestamp=ts,
+        original_tokens=40000,
+        compacted_tokens=300,
+    )
+    _add_chat_message(
+        task_id=task_id, user_id=user_id, role="assistant", content="A", created_at=ts
+    )
+
+    response = client.get(f"/api/conversation-logs/{task_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    transcript = response.json()["transcript"]
+    assert [item["message_type"] for item in transcript] == [
+        "chat",
+        "compaction",
+        "chat",
+    ]

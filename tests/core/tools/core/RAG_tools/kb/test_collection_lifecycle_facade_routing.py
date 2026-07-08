@@ -41,6 +41,10 @@ def _make_mock_handle() -> MagicMock:
     # H05 additions
     handle.list_collection_documents = MagicMock(return_value=[])
     handle.count_documents = MagicMock(return_value=0)
+    handle.load_ingestion_status = MagicMock(return_value=[{"doc_id": "d1"}])
+    handle.load_ingestion_status_async = AsyncMock(return_value=[{"doc_id": "d2"}])
+    handle.promote_version_main = MagicMock(return_value={"promoted": True})
+    handle.list_candidates = MagicMock(return_value={"candidates": []})
     return handle
 
 
@@ -740,3 +744,141 @@ class TestRenameFacadeCoordinatorEarlyReturn:
 
         mock_store.rename_collection_status.assert_called_once()
         assert isinstance(result, list)
+
+
+class TestIngestionStatusReadRouting:
+    """#514: load_ingestion_status(_async) must route through the handle,
+    not the injected storage shim."""
+
+    def test_load_ingestion_status_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.load_ingestion_status = MagicMock(return_value=[{"doc_id": "d1"}])
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.load_ingestion_status(
+                "docs", doc_id="d1", user_id=7, is_admin=False
+            )
+        )
+
+        assert result == [{"doc_id": "d1"}]
+        handle.load_ingestion_status.assert_called_once_with(
+            doc_id="d1", user_id=7, is_admin=False
+        )
+        coordinator._storage_shim.get_ingestion_status_store.assert_not_called()
+
+    def test_load_ingestion_status_async_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.load_ingestion_status_async = AsyncMock(return_value=[{"doc_id": "d2"}])
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.load_ingestion_status_async(
+                "docs", doc_id="d2", user_id=None, is_admin=True
+            )
+        )
+
+        assert result == [{"doc_id": "d2"}]
+        handle.load_ingestion_status_async.assert_awaited_once_with(
+            doc_id="d2", user_id=None, is_admin=True
+        )
+        coordinator._storage_shim.get_ingestion_status_store.assert_not_called()
+
+
+class TestVersionPromotionRouting:
+    """#514: version promotion/listing must route through the handle."""
+
+    def test_promote_version_main_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.promote_version_main = MagicMock(return_value={"promoted": True})
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(
+            coordinator.promote_version_main(
+                "docs", "doc-1", "parse", "cand-9", operator="alice", confirm=True
+            )
+        )
+
+        assert result == {"promoted": True}
+        handle.promote_version_main.assert_called_once_with(
+            "doc-1",
+            "parse",
+            "cand-9",
+            operator="alice",
+            preview_only=False,
+            confirm=True,
+            model_tag=None,
+        )
+
+    def test_list_candidates_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.list_candidates = MagicMock(return_value={"candidates": []})
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        result = asyncio.run(coordinator.list_candidates("docs", "doc-1", "parse"))
+
+        assert result == {"candidates": []}
+        handle.list_candidates.assert_called_once_with(
+            "doc-1", "parse", None, None, 50, "created_at desc"
+        )
+
+
+class TestRollbackRestoreRouting:
+    """#514 rollback additions: rollback data-plane restore routes through the handle."""
+
+    def test_restore_main_pointer_snapshot_routes_through_handle(self) -> None:
+        handle = _make_mock_handle()
+        handle.restore_main_pointer_snapshot = MagicMock(return_value=True)
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        snapshot = MagicMock()
+        snapshot.collection = "docs"
+
+        result = asyncio.run(
+            coordinator.restore_main_pointer_snapshot(snapshot, operator="bob")
+        )
+
+        assert result is True
+        handle.restore_main_pointer_snapshot.assert_called_once_with(
+            snapshot, operator="bob"
+        )
+
+
+class TestCrossOwnerRollbackRouting:
+    """#514: multi-owner rollback opens the handle with the snapshot's OWN
+    owner identity, not the caller's — orchestration stays coordinator-owned."""
+
+    def test_restore_candidate_cleanup_uses_snapshot_owner(self) -> None:
+        handle = _make_mock_handle()
+        handle.restore_candidate_cleanup_snapshot = MagicMock(
+            return_value={"rolled_back": True}
+        )
+        coordinator = _make_coordinator_with_mock_handle(handle)
+
+        captured: list = []
+
+        async def _spy_open(request):
+            captured.append(request)
+            return handle
+
+        coordinator.open_collection = _spy_open
+
+        snapshot = MagicMock()
+        snapshot.collection = "docs"
+        snapshot.user_id = 42
+        snapshot.is_admin = False
+
+        result = asyncio.run(
+            coordinator.restore_candidate_cleanup_snapshot(
+                snapshot, cleanup_executed=True
+            )
+        )
+
+        assert result == {"rolled_back": True}
+        assert len(captured) == 1
+        assert captured[0].collection == "docs"
+        assert captured[0].user_id == 42
+        assert captured[0].is_admin is False
+        handle.restore_candidate_cleanup_snapshot.assert_called_once_with(
+            snapshot, cleanup_executed=True
+        )
