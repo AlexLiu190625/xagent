@@ -476,6 +476,40 @@ async def test_mcp_no_per_server_filter_when_spec_lacks_servers(monkeypatch):
     assert [c["name"] for c in received[0]] == ["Gmail", "Slack"]
 
 
+async def test_mcp_creator_propagates_connector_runtime_error(monkeypatch):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+    from xagent.core.tools.adapters.vibe.connector_runtime import (
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+        ConnectorRuntimeError,
+    )
+    from xagent.core.tools.adapters.vibe.factory import ToolFactory
+
+    runtime_error = ConnectorRuntimeError(
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+        "Connector runtime context is unavailable.",
+        details={"reason": "runtime_view_resolution_failed"},
+        status_code=503,
+    )
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        assert [config["name"] for config in mcp_configs] == ["Gmail"]
+        raise runtime_error
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+
+    cfg = _MCPConfig([{"name": "Gmail"}])
+
+    with pytest.raises(ConnectorRuntimeError) as exc_info:
+        await mcp_tools.create_mcp_tools(cfg)
+
+    assert exc_info.value is runtime_error
+    assert exc_info.value.status_code == 503
+
+
 def test_scoped_mcp_servers_parent_child_table() -> None:
     """``scoped_mcp_servers()`` encodes the pre-build restriction in one
     place: frozenset()=none, None=all (parent mcp / ALL), non-empty=scoped."""
