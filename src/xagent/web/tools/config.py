@@ -7,9 +7,10 @@ and other web-specific sources.
 
 import logging
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
 
 import httpx
 
@@ -35,6 +36,109 @@ from ..services.tool_credentials import (
 logger = logging.getLogger(__name__)
 
 
+OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
+OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
+OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
+UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+
+
+@dataclass(frozen=True)
+class TokenRequest:
+    """Request passed to the OAuth token resolver hook.
+
+    Providers are requested in the same candidate order used by the built-in
+    UserOAuth lookup: provider name first, then app id, de-duplicated. The
+    first resolver hit wins. ``scope`` is the current execution scope from
+    ``WebToolConfig.get_execution_scope()`` when present; it is typed as
+    Optional[Any] to avoid importing the core scope type into this config layer.
+    """
+
+    provider: str
+    user_id: int
+    scope: Optional[Any] = None
+
+
+@dataclass(frozen=True)
+class ResolvedToken:
+    """OAuth access token supplied by the resolver hook.
+
+    ``expires_at`` should be an aware UTC datetime when set. Naive datetimes
+    are interpreted as UTC for compatibility with the existing OAuth refresh
+    comparison. Resolvers SHOULD set ``expires_at`` to enable MCP config
+    caching; ``expires_at=None`` means the token is usable for this build only
+    and this ``WebToolConfig`` instance will reload MCP configs on later calls.
+    """
+
+    access_token: str
+    expires_at: datetime | None = None
+
+
+TokenResolver = Callable[[TokenRequest], Awaitable[ResolvedToken | None]]
+
+_oauth_token_resolver_hook: TokenResolver | None = None
+_oauth_token_resolver_generation = 0
+
+
+def set_oauth_token_resolver_hook(resolver: TokenResolver | None) -> None:
+    """Register or clear the process-wide OAuth token resolver hook."""
+    global _oauth_token_resolver_generation, _oauth_token_resolver_hook
+
+    _oauth_token_resolver_hook = resolver
+    _oauth_token_resolver_generation += 1
+
+
+def _get_oauth_token_resolver_hook() -> tuple[TokenResolver | None, int]:
+    return _oauth_token_resolver_hook, _oauth_token_resolver_generation
+
+
+@dataclass(frozen=True)
+class _ResolvedHookToken:
+    provider: str
+    access_token: str
+    expires_at: datetime | None
+
+
+class _OAuthTokenResolverFailed(Exception):
+    def __init__(self, *, providers: list[str], exception_type: str) -> None:
+        super().__init__(OAUTH_TOKEN_RESOLVER_FAILURE_CODE)
+        self.providers = providers
+        self.exception_type = exception_type
+
+
+def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
+    text = str(value)
+    if len(text) <= max_length:
+        return text
+    return f"{text[: max_length - 3]}..."
+
+
+def _normalize_oauth_expires_at(expires_at: datetime | None) -> datetime | None:
+    if expires_at is None:
+        return None
+    if expires_at.tzinfo is None:
+        return expires_at.replace(tzinfo=timezone.utc)
+    return expires_at.astimezone(timezone.utc)
+
+
+def _oauth_token_is_expired(expires_at: datetime) -> bool:
+    return expires_at <= datetime.now(timezone.utc)
+
+
+def _oauth_token_expires_after_cache_window(expires_at: datetime) -> bool:
+    return expires_at > datetime.now(timezone.utc) + OAUTH_TOKEN_EXPIRY_SKEW
+
+
+def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
+    candidates: list[str] = []
+    for key in ("provider", "id"):
+        value = app_info.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        if value not in candidates:
+            candidates.append(value)
+    return candidates
+
+
 async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
@@ -50,7 +154,7 @@ async def refresh_oauth_token_if_needed(
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
 
-    if expires_at > now + timedelta(minutes=5):
+    if expires_at > now + OAUTH_TOKEN_EXPIRY_SKEW:
         return True  # Token is still valid
 
     logger.info(f"Token expired for {provider_name}, attempting to refresh...")
