@@ -117,6 +117,62 @@ def _mcp_tool_is_concurrency_safe(
     return tool_name in set(concurrent_tools)
 
 
+def _get_current_mcp_user_id() -> Optional[str]:
+    """Get current user ID from environment or context."""
+    # Try to get user ID from environment variable (set by web system)
+    user_id = os.environ.get("XAGENT_USER_ID")
+    if user_id:
+        return user_id
+
+    # If no user ID found, this might be a system-level execution
+    # In production, this should be replaced with proper context passing
+    logger.warning(
+        "No user ID found in environment, MCP tool may not be properly isolated"
+    )
+    return None
+
+
+def _is_mcp_user_allowed(
+    user_id: Optional[str], allow_users: Optional[List[str]]
+) -> bool:
+    if not user_id:
+        # If no user ID, this might be a system execution. For security, deny
+        # access unless the tool explicitly allows the system identity.
+        return allow_users is None or "system" in allow_users
+
+    if allow_users is None:
+        return True
+
+    return user_id in allow_users
+
+
+def _mcp_access_denied_result(user_id: Optional[str], tool_name: str) -> dict[str, Any]:
+    error_msg = f"User {user_id} is not authorized to use tool {tool_name}"
+    logger.warning(error_msg)
+    return {
+        "content": [{"text": f"Access denied: {error_msg}"}],
+        "is_error": True,
+    }
+
+
+def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
+    from .selection_spec import normalize_mcp_server_name
+
+    normalized_server = re.sub(
+        r"[^A-Za-z0-9_]+", "_", normalize_mcp_server_name(server_name)
+    ).strip("_")
+    parts = ["mcp"]
+    if normalized_server:
+        parts.append(normalized_server)
+    if server_id is not None:
+        normalized_id = re.sub(r"[^A-Za-z0-9_]+", "_", str(server_id)).strip("_")
+        if normalized_id:
+            parts.append(normalized_id)
+    parts.append("unavailable")
+    name = "_".join(parts)
+    return name if name != "mcp_unavailable" else "mcp_server_unavailable"
+
+
 class MCPToolAdapter(AbstractBaseTool):
     """
     Adapter that converts an MCP tool into an Agent system Tool.
@@ -437,12 +493,7 @@ class MCPToolAdapter(AbstractBaseTool):
 
             # Validate user permissions
             if not self._is_user_allowed(current_user_id):
-                error_msg = f"User {current_user_id} is not authorized to use tool {self.mcp_tool.name}"
-                logger.warning(error_msg)
-                return {
-                    "content": [{"text": f"Access denied: {error_msg}"}],
-                    "is_error": True,
-                }
+                return _mcp_access_denied_result(current_user_id, self.mcp_tool.name)
 
             # Validate arguments
             normalized_args = self._normalize_args_by_schema(args)
@@ -577,17 +628,7 @@ class MCPToolAdapter(AbstractBaseTool):
 
     def _get_current_user_id(self) -> Optional[str]:
         """Get current user ID from environment or context."""
-        # Try to get user ID from environment variable (set by web system)
-        user_id = os.environ.get("XAGENT_USER_ID")
-        if user_id:
-            return user_id
-
-        # If no user ID found, this might be a system-level execution
-        # In production, this should be replaced with proper context passing
-        logger.warning(
-            "No user ID found in environment, MCP tool may not be properly isolated"
-        )
-        return None
+        return _get_current_mcp_user_id()
 
     def _input_schema_properties(self) -> dict[str, Any]:
         schema = self.mcp_tool.inputSchema
@@ -655,16 +696,7 @@ class MCPToolAdapter(AbstractBaseTool):
 
     def _is_user_allowed(self, user_id: Optional[str]) -> bool:
         """Check if user is allowed to use this tool."""
-        if not user_id:
-            # If no user ID, this might be a system execution
-            # For security, we should deny access unless explicitly allowed
-            return self._allow_users is None or "system" in self._allow_users
-
-        if self._allow_users is None:
-            # No specific user restrictions, allow access
-            return True
-
-        return user_id in self._allow_users
+        return _is_mcp_user_allowed(user_id, self._allow_users)
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         """MCP tools are async only."""
@@ -687,6 +719,116 @@ class MCPToolAdapter(AbstractBaseTool):
                 content = value.get("content", [])
                 if content:
                     # Extract text from content items
+                    texts = []
+                    for item in content:
+                        if isinstance(item, dict) and "text" in item:
+                            texts.append(item["text"])
+                        else:
+                            texts.append(str(item))
+                    return "\n".join(texts)
+                return "No content returned"
+            return str(value)
+        except Exception as e:
+            logger.warning(f"Failed to convert return value to string: {e}")
+            return str(value)
+
+
+class _UnavailableMCPToolResult(BaseModel):
+    content: List[Dict[str, Any]] = Field(
+        default_factory=list, description="Tool execution result content"
+    )
+    is_error: bool = Field(
+        default=True,
+        description="Whether the tool execution resulted in an error",
+    )
+
+
+class UnavailableMCPTool(AbstractBaseTool):
+    """Server-level MCP tool returned when credentials are unavailable."""
+
+    read_only = True
+    concurrency_safe = True
+
+    def __init__(
+        self,
+        *,
+        server_name: str,
+        server_id: Any | None,
+        allow_users: Optional[List[str]] = None,
+    ) -> None:
+        from .base import ToolCategory
+        from .selection_spec import normalize_mcp_server_name
+
+        self._server_name = server_name
+        self._server_id = server_id
+        self._allow_users = allow_users
+        self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
+        self.source_server = normalize_mcp_server_name(server_name)
+        self.category = ToolCategory.MCP
+
+    @property
+    def name(self) -> str:
+        return self._name
+
+    @property
+    def description(self) -> str:
+        return "MCP server credentials are unavailable."
+
+    @property
+    def tags(self) -> List[str]:
+        return ["mcp"]
+
+    def args_type(self) -> Type[BaseModel]:
+        return EmptyArgsModel
+
+    def return_type(self) -> Type[BaseModel]:
+        return _UnavailableMCPToolResult
+
+    def state_type(self) -> Optional[Type[BaseModel]]:
+        return None
+
+    def _credential_unavailable_result(self) -> Dict[str, Any]:
+        return {
+            "content": [
+                {
+                    "text": (
+                        "MCP server credentials are unavailable. Please reconnect "
+                        "the MCP server credentials and retry."
+                    )
+                }
+            ],
+            "is_error": True,
+        }
+
+    def _check_access(self) -> dict[str, Any] | None:
+        current_user_id = _get_current_mcp_user_id()
+        if not _is_mcp_user_allowed(current_user_id, self._allow_users):
+            return _mcp_access_denied_result(current_user_id, self.name)
+        return None
+
+    async def run_json_async(self, args: Mapping[str, Any]) -> Any:
+        access_denied = self._check_access()
+        if access_denied is not None:
+            return access_denied
+        return self._credential_unavailable_result()
+
+    def run_json_sync(self, args: Mapping[str, Any]) -> Any:
+        access_denied = self._check_access()
+        if access_denied is not None:
+            return access_denied
+        return self._credential_unavailable_result()
+
+    async def save_state_json(self) -> Mapping[str, Any]:
+        return {}
+
+    async def load_state_json(self, state: Mapping[str, Any]) -> None:
+        pass
+
+    def return_value_as_string(self, value: Any) -> str:
+        try:
+            if isinstance(value, dict):
+                content = value.get("content", [])
+                if content:
                     texts = []
                     for item in content:
                         if isinstance(item, dict) and "text" in item:
