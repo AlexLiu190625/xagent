@@ -52,6 +52,7 @@ ERROR_RUNTIME_CONTEXT_IMMUTABLE = "runtime_context_immutable"
 ERROR_RUNTIME_SECRET_NOT_ALLOWED = "runtime_secret_not_allowed"
 ERROR_RUNTIME_SECRET_UNAVAILABLE = "runtime_secret_unavailable"
 ERROR_SCHEDULED_SECRET_UNAVAILABLE = "scheduled_secret_unavailable"
+ERROR_CONNECTOR_RUNTIME_UNAVAILABLE = "connector_runtime_unavailable"
 ERROR_MCP_OAUTH_AUTHORIZATION_FAILED = "mcp_oauth_authorization_failed"
 ERROR_DELEGATED_AUTHORIZATION_FAILED = "delegated_authorization_failed"
 

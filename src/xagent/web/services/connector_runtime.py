@@ -19,6 +19,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     CONNECTOR_TYPE_CUSTOM_API,
     CONNECTOR_TYPE_MCP,
     ERROR_CONNECTOR_NOT_FOUND,
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ERROR_INVALID_RUNTIME_CONTEXT,
     ERROR_MISSING_RUNTIME_CONTEXT,
     ERROR_RUNTIME_CONTEXT_IMMUTABLE,
@@ -798,6 +799,7 @@ def _message_for_code(code: str) -> str:
         ERROR_RUNTIME_SECRET_UNAVAILABLE: "Required runtime secret is unavailable.",
         ERROR_SCHEDULED_SECRET_UNAVAILABLE: "Required scheduled runtime secret is unavailable.",
         ERROR_RUNTIME_SECRET_NOT_ALLOWED: "Runtime secret is not allowed for this entrypoint.",
+        ERROR_CONNECTOR_RUNTIME_UNAVAILABLE: "Connector runtime context is unavailable.",
     }.get(code, "Invalid connector runtime context.")
 
 

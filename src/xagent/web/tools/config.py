@@ -16,6 +16,7 @@ import httpx
 from ...config import get_uploads_dir
 from ...core.tools.adapters.vibe.config import BaseToolConfig
 from ...core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     MISSING_RUNTIME_VALUE,
     RUNTIME_INPUT_AUTH_SELECTOR,
     RUNTIME_INPUT_SECRETS,
@@ -436,14 +437,19 @@ class WebToolConfig(BaseToolConfig):
             )
         except ConnectorRuntimeError:
             raise
-        except Exception:
+        except Exception as exc:
             logging.getLogger(__name__).warning(
                 "Failed to resolve connector runtime view for task %s",
                 self._task_id,
                 exc_info=True,
             )
             self._connector_runtime_view = None
-            raise
+            raise ConnectorRuntimeError(
+                ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+                "Connector runtime context is unavailable.",
+                details={"reason": "runtime_view_resolution_failed"},
+                status_code=500,
+            ) from exc
         return self._connector_runtime_view
 
     def set_connector_runtime_turn_id(self, turn_id: Optional[str]) -> bool:
@@ -1129,10 +1135,12 @@ class WebToolConfig(BaseToolConfig):
                         delegated_connection["_connector_runtime_refresh"] = (
                             lambda _server=server,
                             _runtime_bindings=runtime_bindings,
-                            _allow_delegated_authorization=allow_delegated_authorization: self._refresh_delegated_mcp_connection(
-                                server=_server,
-                                runtime_bindings=_runtime_bindings,
-                                allow_delegated_authorization=_allow_delegated_authorization,
+                            _allow_delegated_authorization=allow_delegated_authorization: (
+                                self._refresh_delegated_mcp_connection(
+                                    server=_server,
+                                    runtime_bindings=_runtime_bindings,
+                                    allow_delegated_authorization=_allow_delegated_authorization,
+                                )
                             )
                         )
                         transport_config.update(
