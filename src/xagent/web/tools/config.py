@@ -7,6 +7,7 @@ and other web-specific sources.
 
 import logging
 import os
+import shlex
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -151,6 +152,15 @@ def _oauth_launch_config_args(launch_config: Mapping[str, Any]) -> list[Any]:
         return []
     if isinstance(args, list):
         return args.copy()
+    if isinstance(args, str):
+        try:
+            return shlex.split(args)
+        except ValueError as exc:
+            logger.warning(
+                "Falling back to whitespace split for OAuth MCP launch config args because args string could not be parsed: %s",
+                type(exc).__name__,
+            )
+            return args.split()
     logger.warning("Ignoring OAuth MCP launch config args because args must be a list")
     return []
 

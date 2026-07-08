@@ -329,6 +329,36 @@ async def test_launch_config_args_none_matches_user_oauth_shape(db_session):
 
 
 @pytest.mark.asyncio
+async def test_launch_config_args_string_matches_user_oauth_shape(db_session):
+    db, user = db_session
+    launch_config = _launch_config()
+    launch_config["args"] = '--flag "two words"'
+    _add_oauth_server(db, user, launch_config=launch_config)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    hook_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+    set_oauth_token_resolver_hook(None)
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+    user_config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert hook_config["config"]["args"] == ["--flag", "two words"]
+    _assert_same_oauth_config_except_token(
+        hook_config,
+        user_config,
+        token_key="GOOGLE_ACCESS_TOKEN",
+        hook_token="hook-token",
+        user_token="user-token",
+    )
+
+
+@pytest.mark.asyncio
 async def test_launch_config_env_mapping_none_matches_user_oauth_shape(db_session):
     db, user = db_session
     launch_config = _launch_config()
