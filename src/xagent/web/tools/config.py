@@ -395,6 +395,10 @@ class WebToolConfig(BaseToolConfig):
         self._cached_tts_models: Optional[Dict[str, Any]] = None
         self._cached_tts_model: Optional[Any] = None
         self._cached_mcp_configs: Optional[List[Dict[str, Any]]] = None
+        self._mcp_hook_token_cache_expires_at: datetime | None = None
+        self._mcp_hook_token_cache_uncacheable = False
+        self._mcp_hook_generation_at_load: int | None = None
+        self._mcp_hook_resolution_failed = False
         self._cached_embedding_model: Optional[str] = None
         self._cached_rerank_model: Optional[str] = None
 
@@ -518,9 +522,41 @@ class WebToolConfig(BaseToolConfig):
         if not self._include_mcp_tools:
             return []
 
-        if self._cached_mcp_configs is None:
-            self._cached_mcp_configs = await self._load_mcp_server_configs()
-        return self._cached_mcp_configs
+        if self._cached_mcp_configs is not None and self._mcp_config_cache_is_valid():
+            return self._cached_mcp_configs
+
+        configs = await self._load_mcp_server_configs()
+        self._store_mcp_config_cache_if_cacheable(configs)
+        return configs
+
+    def _mcp_config_cache_is_valid(self) -> bool:
+        _, current_generation = _get_oauth_token_resolver_hook()
+        if self._mcp_hook_generation_at_load != current_generation:
+            return False
+        if self._mcp_hook_resolution_failed:
+            return False
+        if self._mcp_hook_token_cache_uncacheable:
+            return False
+        if self._mcp_hook_token_cache_expires_at is not None:
+            return _oauth_token_expires_after_cache_window(
+                self._mcp_hook_token_cache_expires_at
+            )
+        return True
+
+    def _reset_mcp_config_load_cache_state(self) -> None:
+        _, current_generation = _get_oauth_token_resolver_hook()
+        self._mcp_hook_token_cache_expires_at = None
+        self._mcp_hook_token_cache_uncacheable = False
+        self._mcp_hook_generation_at_load = current_generation
+        self._mcp_hook_resolution_failed = False
+
+    def _store_mcp_config_cache_if_cacheable(
+        self, configs: List[Dict[str, Any]]
+    ) -> None:
+        if self._mcp_hook_resolution_failed or self._mcp_hook_token_cache_uncacheable:
+            self._cached_mcp_configs = None
+            return
+        self._cached_mcp_configs = configs
 
     def get_mcp_oauth_diagnostics(self) -> List[Dict[str, Any]]:
         """Return structured MCP OAuth runtime diagnostics from the last load."""
@@ -1025,6 +1061,132 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default TTS model: {e}")
             return None
 
+    async def _resolve_oauth_token_from_hook(
+        self,
+        *,
+        providers: list[str],
+    ) -> _ResolvedHookToken | None:
+        resolver, _ = _get_oauth_token_resolver_hook()
+        if resolver is None or not providers or self._user_id is None:
+            return None
+
+        for provider in providers:
+            request = TokenRequest(
+                provider=provider,
+                user_id=int(self._user_id),
+                scope=self.get_execution_scope(),
+            )
+            try:
+                resolved = await resolver(request)
+            except Exception as exc:
+                raise _OAuthTokenResolverFailed(
+                    providers=providers,
+                    exception_type=_bounded_oauth_metadata(type(exc).__name__),
+                ) from exc
+
+            if resolved is None:
+                continue
+            return self._validate_resolved_oauth_token(
+                provider=provider,
+                providers=providers,
+                resolved=resolved,
+            )
+
+        return None
+
+    def _validate_resolved_oauth_token(
+        self,
+        *,
+        provider: str,
+        providers: list[str],
+        resolved: ResolvedToken,
+    ) -> _ResolvedHookToken:
+        if not isinstance(resolved, ResolvedToken):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type=_bounded_oauth_metadata(type(resolved).__name__),
+            )
+        if not isinstance(resolved.access_token, str) or not resolved.access_token:
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidAccessToken",
+            )
+        if resolved.expires_at is not None and not isinstance(
+            resolved.expires_at, datetime
+        ):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidExpiresAt",
+            )
+
+        expires_at = _normalize_oauth_expires_at(resolved.expires_at)
+        if expires_at is not None and _oauth_token_is_expired(expires_at):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="ExpiredAccessToken",
+            )
+
+        return _ResolvedHookToken(
+            provider=provider,
+            access_token=resolved.access_token,
+            expires_at=expires_at,
+        )
+
+    def _mark_hook_token_cache_metadata(self, resolved: _ResolvedHookToken) -> None:
+        if resolved.expires_at is None:
+            self._mcp_hook_token_cache_uncacheable = True
+            return
+        if not _oauth_token_expires_after_cache_window(resolved.expires_at):
+            self._mcp_hook_token_cache_uncacheable = True
+            return
+        if self._mcp_hook_token_cache_expires_at is None:
+            self._mcp_hook_token_cache_expires_at = resolved.expires_at
+            return
+        self._mcp_hook_token_cache_expires_at = min(
+            self._mcp_hook_token_cache_expires_at,
+            resolved.expires_at,
+        )
+
+    def _build_oauth_token_resolver_diagnostic(
+        self,
+        *,
+        server: Any,
+        error: _OAuthTokenResolverFailed,
+    ) -> Dict[str, Any]:
+        from ...web.services.mcp_runtime import mcp_oauth_runtime_diagnostic
+
+        diagnostic = mcp_oauth_runtime_diagnostic(
+            server,
+            code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+            message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
+        )
+        diagnostic["providers"] = [
+            _bounded_oauth_metadata(provider) for provider in error.providers[:2]
+        ]
+        diagnostic["exception_type"] = _bounded_oauth_metadata(error.exception_type)
+        return diagnostic
+
+    def _build_unavailable_oauth_mcp_config(
+        self,
+        *,
+        server: Any,
+        diagnostic: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        return {
+            "name": server.name,
+            "transport": "unavailable",
+            "description": server.description,
+            "config": {
+                "unavailable": True,
+                "reason": OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+                "message": UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                "server_id": getattr(server, "id", None),
+                "diagnostic": diagnostic,
+            },
+            "user_id": str(self._user_id),
+            "allow_users": [str(self._user_id)],
+        }
+
     def _build_oauth_mcp_stdio_transport_config(
         self,
         *,
@@ -1080,6 +1242,7 @@ class WebToolConfig(BaseToolConfig):
         logger = logging.getLogger(__name__)
         configs = []
         self._mcp_oauth_diagnostics = []
+        self._reset_mcp_config_load_cache_state()
 
         try:
             from ...web.models.mcp import MCPServer, UserMCPServer
@@ -1155,71 +1318,115 @@ class WebToolConfig(BaseToolConfig):
                     # For example, "google-drive" instead of "google"
                     app_id = app_info.get("id") if app_info else None
 
-                    if app_id:
-                        providers_to_check = [provider_name, app_id]
-                        oauth_account = (
-                            self.db.query(UserOAuth)
-                            .filter(
-                                UserOAuth.user_id == self._user_id,
-                                UserOAuth.provider.in_(providers_to_check),
+                    hook_token: _ResolvedHookToken | None = None
+                    if app_info:
+                        providers_to_resolve = _oauth_token_provider_candidates(
+                            app_info
+                        )
+                        try:
+                            hook_token = await self._resolve_oauth_token_from_hook(
+                                providers=providers_to_resolve
                             )
-                            .first()
-                        )
-                        logger.info(
-                            f"OAUTH CONFIG: Checked providers {providers_to_check} for user {self._user_id}. Found: {oauth_account is not None}"
-                        )
-                    else:
-                        oauth_account = (
-                            self.db.query(UserOAuth)
-                            .filter(
-                                UserOAuth.user_id == self._user_id,
-                                UserOAuth.provider == provider_name,
+                        except _OAuthTokenResolverFailed as error:
+                            self._mcp_hook_resolution_failed = True
+                            diagnostic = self._build_oauth_token_resolver_diagnostic(
+                                server=server,
+                                error=error,
                             )
-                            .first()
-                        )
-                        logger.info(
-                            f"OAUTH CONFIG: Checked provider '{provider_name}' for user {self._user_id}. Found: {oauth_account is not None}"
-                        )
-
-                    if oauth_account and oauth_account.access_token:
-                        logger.info(
-                            f"OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
-                        )
-                        # Check and refresh token if needed before using it
-                        is_valid = await refresh_oauth_token_if_needed(
-                            self.db,
-                            oauth_account,
-                            str(provider_name) if provider_name else "",
-                        )
-
-                        if not is_valid:
+                            self._mcp_oauth_diagnostics.append(diagnostic)
                             logger.warning(
-                                f"OAUTH CONFIG: Token for '{provider_name}' is invalid and could not be refreshed. "
-                                "Deleting OAuth record to prompt user for reconnection."
+                                "OAuth token resolver failed for MCP server '%s' with %s",
+                                getattr(server, "name", "<unknown>"),
+                                error.exception_type,
                             )
-                            # Delete the invalid oauth record so UI shows it as disconnected
-                            self.db.delete(oauth_account)
-                            self.db.commit()
-                            continue
-
-                        if is_valid and app_info:
-                            app_id = app_info.get("id")
-                            logger.info(
-                                f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
-                            )
-                            config["transport"] = "stdio"
-                            transport_config = (
-                                self._build_oauth_mcp_stdio_transport_config(
+                            configs.append(
+                                self._build_unavailable_oauth_mcp_config(
                                     server=server,
-                                    app_info=app_info,
-                                    access_token=oauth_account.access_token,
+                                    diagnostic=diagnostic,
                                 )
                             )
+                            continue
 
-                    else:
-                        logger.info(
-                            f"OAUTH CONFIG: No valid token found for '{provider_name}'."
+                    if hook_token is not None:
+                        assert app_info is not None
+                        self._mark_hook_token_cache_metadata(hook_token)
+                        config["transport"] = "stdio"
+                        transport_config = self._build_oauth_mcp_stdio_transport_config(
+                            server=server,
+                            app_info=app_info,
+                            access_token=hook_token.access_token,
                         )
+                        logger.info(
+                            "OAuth token resolver supplied token for MCP server '%s' via provider '%s'",
+                            getattr(server, "name", "<unknown>"),
+                            hook_token.provider,
+                        )
+                    else:
+                        if app_id:
+                            providers_to_check = [provider_name, app_id]
+                            oauth_account = (
+                                self.db.query(UserOAuth)
+                                .filter(
+                                    UserOAuth.user_id == self._user_id,
+                                    UserOAuth.provider.in_(providers_to_check),
+                                )
+                                .first()
+                            )
+                            logger.info(
+                                f"OAUTH CONFIG: Checked providers {providers_to_check} for user {self._user_id}. Found: {oauth_account is not None}"
+                            )
+                        else:
+                            oauth_account = (
+                                self.db.query(UserOAuth)
+                                .filter(
+                                    UserOAuth.user_id == self._user_id,
+                                    UserOAuth.provider == provider_name,
+                                )
+                                .first()
+                            )
+                            logger.info(
+                                f"OAUTH CONFIG: Checked provider '{provider_name}' for user {self._user_id}. Found: {oauth_account is not None}"
+                            )
+
+                        if oauth_account and oauth_account.access_token:
+                            logger.info(
+                                f"OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
+                            )
+                            # Check and refresh token if needed before using it
+                            is_valid = await refresh_oauth_token_if_needed(
+                                self.db,
+                                oauth_account,
+                                str(provider_name) if provider_name else "",
+                            )
+
+                            if not is_valid:
+                                logger.warning(
+                                    f"OAUTH CONFIG: Token for '{provider_name}' is invalid and could not be refreshed. "
+                                    "Deleting OAuth record to prompt user for reconnection."
+                                )
+                                # Delete the invalid oauth record so UI shows it as disconnected
+                                self.db.delete(oauth_account)
+                                self.db.commit()
+                                continue
+
+                            if is_valid and app_info:
+                                app_id = app_info.get("id")
+                                logger.info(
+                                    f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
+                                )
+                                config["transport"] = "stdio"
+                                transport_config = (
+                                    self._build_oauth_mcp_stdio_transport_config(
+                                        server=server,
+                                        app_info=app_info,
+                                        access_token=oauth_account.access_token,
+                                    )
+                                )
+
+                        else:
+                            logger.info(
+                                f"OAUTH CONFIG: No valid token found for '{provider_name}'."
+                            )
 
                 if server.transport == "stdio":
                     if server.command:
