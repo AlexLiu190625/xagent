@@ -139,6 +139,16 @@ def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
     return candidates
 
 
+def _oauth_launch_config_args(launch_config: Mapping[str, Any]) -> list[Any]:
+    args = launch_config.get("args")
+    if args is None:
+        return []
+    if isinstance(args, list):
+        return args.copy()
+    logger.warning("Ignoring OAuth MCP launch config args because args must be a list")
+    return []
+
+
 async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
@@ -1199,7 +1209,7 @@ class WebToolConfig(BaseToolConfig):
             transport_config: Dict[str, Any] = {
                 "transport": "stdio",
                 "command": launch_config["command"],
-                "args": launch_config.get("args", []).copy(),
+                "args": _oauth_launch_config_args(launch_config),
             }
 
             env = {}
