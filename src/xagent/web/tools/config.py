@@ -9,7 +9,7 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional
 
 import httpx
 
@@ -921,6 +921,56 @@ class WebToolConfig(BaseToolConfig):
             logger.warning(f"Failed to load default TTS model: {e}")
             return None
 
+    def _build_oauth_mcp_stdio_transport_config(
+        self,
+        *,
+        server: Any,
+        app_info: Mapping[str, Any],
+        access_token: str,
+    ) -> Dict[str, Any]:
+        launch_config = app_info.get("launch_config")
+        if launch_config:
+            transport_config: Dict[str, Any] = {
+                "transport": "stdio",
+                "command": launch_config["command"],
+                "args": launch_config.get("args", []).copy(),
+            }
+
+            env = {}
+            for env_key, token_type in launch_config.get("env_mapping", {}).items():
+                if token_type == "access_token":
+                    env[env_key] = access_token
+
+            env.update(
+                {
+                    "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", ""),
+                    "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
+                    "https_proxy": os.environ.get("https_proxy", ""),
+                    "http_proxy": os.environ.get("http_proxy", ""),
+                }
+            )
+            allowed_file_dirs = self._build_mcp_file_allowed_dirs()
+            if allowed_file_dirs:
+                env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = allowed_file_dirs
+            transport_config["env"] = env
+            return transport_config
+
+        return {
+            "transport": "stdio",
+            "command": "npx",
+            "args": [
+                "-y",
+                f"@mcp-servers/{str(server.name).lower().replace(' ', '-')}",
+            ],
+            "env": {
+                f"{str(server.name).upper().replace(' ', '_')}_ACCESS_TOKEN": access_token,
+                "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", ""),
+                "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
+                "https_proxy": os.environ.get("https_proxy", ""),
+                "http_proxy": os.environ.get("http_proxy", ""),
+            },
+        }
+
     async def _load_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Load MCP server configurations from database with user context."""
         logger = logging.getLogger(__name__)
@@ -1053,56 +1103,14 @@ class WebToolConfig(BaseToolConfig):
                             logger.info(
                                 f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
                             )
-
-                            launch_config = app_info.get("launch_config")
-                            if launch_config:
-                                config["transport"] = "stdio"
-                                transport_config["transport"] = "stdio"
-                                transport_config["command"] = launch_config["command"]
-                                transport_config["args"] = launch_config.get(
-                                    "args", []
-                                ).copy()
-
-                                env = {}
-                                for env_key, token_type in launch_config.get(
-                                    "env_mapping", {}
-                                ).items():
-                                    if token_type == "access_token":
-                                        env[env_key] = oauth_account.access_token
-
-                                env.update(
-                                    {
-                                        "HTTPS_PROXY": os.environ.get(
-                                            "HTTPS_PROXY", ""
-                                        ),
-                                        "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
-                                        "https_proxy": os.environ.get(
-                                            "https_proxy", ""
-                                        ),
-                                        "http_proxy": os.environ.get("http_proxy", ""),
-                                    }
+                            config["transport"] = "stdio"
+                            transport_config = (
+                                self._build_oauth_mcp_stdio_transport_config(
+                                    server=server,
+                                    app_info=app_info,
+                                    access_token=oauth_account.access_token,
                                 )
-                                allowed_file_dirs = self._build_mcp_file_allowed_dirs()
-                                if allowed_file_dirs:
-                                    env["XAGENT_LINKEDIN_IMAGE_ALLOWED_DIRS"] = (
-                                        allowed_file_dirs
-                                    )
-                                transport_config["env"] = env
-                            else:
-                                config["transport"] = "stdio"
-                                transport_config["transport"] = "stdio"
-                                transport_config["command"] = "npx"
-                                transport_config["args"] = [
-                                    "-y",
-                                    f"@mcp-servers/{str(server.name).lower().replace(' ', '-')}",
-                                ]
-                                transport_config["env"] = {
-                                    f"{str(server.name).upper().replace(' ', '_')}_ACCESS_TOKEN": oauth_account.access_token,
-                                    "HTTPS_PROXY": os.environ.get("HTTPS_PROXY", ""),
-                                    "HTTP_PROXY": os.environ.get("HTTP_PROXY", ""),
-                                    "https_proxy": os.environ.get("https_proxy", ""),
-                                    "http_proxy": os.environ.get("http_proxy", ""),
-                                }
+                            )
 
                     else:
                         logger.info(
