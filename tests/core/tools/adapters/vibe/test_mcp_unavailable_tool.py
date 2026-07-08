@@ -6,6 +6,8 @@ import pytest
 from mcp.types import Tool as MCPTool
 
 from xagent.core.tools.adapters.vibe.base import ToolCategory
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPToolAdapter,
     UnavailableMCPTool,
@@ -24,6 +26,26 @@ def _unavailable_tool(
         server_id=server_id,
         allow_users=allow_users,
     )
+
+
+def _unavailable_config(
+    *,
+    name: str | None = "Google Drive",
+    server_id: int | None = 42,
+    allow_users: list[str] | None = None,
+) -> dict:
+    return {
+        "name": name,
+        "transport": "unavailable",
+        "description": f"{name} server",
+        "config": {
+            "unavailable": True,
+            "reason": "oauth_token_resolver_failed",
+            "message": "MCP server credentials are unavailable.",
+            "server_id": server_id,
+        },
+        "allow_users": allow_users,
+    }
 
 
 def test_unavailable_tool_name_is_llm_safe_and_uses_server_id():
@@ -176,6 +198,173 @@ def test_unavailable_tool_return_value_as_string_extracts_text():
         )
         == "first\nsecond"
     )
+
+
+@pytest.mark.asyncio
+async def test_factory_builds_unavailable_tools_without_normal_loader(monkeypatch):
+    async def fail_loader(*args, **kwargs):
+        raise AssertionError("normal loader should not be called")
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        fail_loader,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs([_unavailable_config()])
+
+    assert [tool.name for tool in tools] == ["mcp_google_drive_42_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_factory_normal_loader_failure_keeps_unavailable_tool(monkeypatch):
+    async def fail_loader(*args, **kwargs):
+        raise RuntimeError("loader failed")
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        fail_loader,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            _unavailable_config(),
+            {"name": "normal", "transport": "stdio", "config": {"command": "echo"}},
+        ]
+    )
+
+    assert [tool.name for tool in tools] == ["mcp_google_drive_42_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_factory_does_not_pass_unavailable_config_to_normal_loader(monkeypatch):
+    seen_connections = None
+
+    async def loader(connections, **kwargs):
+        nonlocal seen_connections
+        seen_connections = connections
+        return []
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        loader,
+    )
+
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            _unavailable_config(),
+            {
+                "name": "normal",
+                "transport": "stdio",
+                "config": {"command": "echo", "args": "--flag value"},
+            },
+        ]
+    )
+
+    assert seen_connections == {
+        "normal": {"transport": "stdio", "command": "echo", "args": ["--flag", "value"]}
+    }
+
+
+@pytest.mark.asyncio
+async def test_factory_preserves_runtime_keys_for_normal_configs(monkeypatch):
+    seen_connections = None
+
+    async def loader(connections, **kwargs):
+        nonlocal seen_connections
+        seen_connections = connections
+        return []
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        loader,
+    )
+
+    await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "name": "normal",
+                "transport": "streamable_http",
+                "config": {"url": "https://mcp.example.test"},
+                "runtime_bindings": [{"binding": "value"}],
+                "runtime_input_schema": {"context": {"account": {"type": "string"}}},
+                "connector_runtime": {"context": {"account": "a"}},
+                "allow_delegated_authorization": True,
+            },
+        ]
+    )
+
+    assert seen_connections == {
+        "normal": {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "runtime_bindings": [{"binding": "value"}],
+            "runtime_input_schema": {"context": {"account": {"type": "string"}}},
+            "connector_runtime": {"context": {"account": "a"}},
+            "allow_delegated_authorization": True,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_factory_propagates_connector_runtime_error(monkeypatch):
+    async def fail_loader(*args, **kwargs):
+        raise ConnectorRuntimeError(
+            "connector_runtime_unavailable",
+            "Connector runtime context is unavailable.",
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        fail_loader,
+    )
+
+    with pytest.raises(ConnectorRuntimeError):
+        await ToolFactory._create_mcp_tools_from_configs(
+            [
+                _unavailable_config(),
+                {"name": "normal", "transport": "stdio", "config": {"command": "echo"}},
+            ]
+        )
+
+
+@pytest.mark.asyncio
+async def test_factory_returns_unavailable_tools_before_normal_tools(monkeypatch):
+    normal_tool = _unavailable_tool(server_name="Normal", server_id=99)
+
+    async def loader(connections, **kwargs):
+        return [normal_tool]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        loader,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {"name": "normal", "transport": "stdio", "config": {"command": "echo"}},
+            _unavailable_config(),
+        ]
+    )
+
+    assert [tool.name for tool in tools] == [
+        "mcp_google_drive_42_unavailable",
+        "mcp_normal_99_unavailable",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_factory_malformed_unavailable_config_does_not_drop_valid_one():
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            _unavailable_config(name=None, server_id=None),
+            _unavailable_config(name="Google Drive", server_id=42),
+        ]
+    )
+
+    assert [tool.name for tool in tools] == [
+        "mcp_server_unavailable",
+        "mcp_google_drive_42_unavailable",
+    ]
 
 
 def test_selection_plain_mcp_admits_unavailable_tool():
