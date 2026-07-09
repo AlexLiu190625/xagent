@@ -1175,7 +1175,7 @@ class WebToolConfig(BaseToolConfig):
 
             if resolved is None:
                 continue
-            return self._validate_resolved_oauth_token(
+            return self._normalize_resolved_oauth_token_from_hook(
                 provider=provider,
                 providers=providers,
                 resource=resource,
@@ -1184,13 +1184,13 @@ class WebToolConfig(BaseToolConfig):
 
         return None
 
-    def _validate_resolved_oauth_token(
+    def _normalize_resolved_oauth_token_from_hook(
         self,
         *,
         provider: str,
         providers: list[str],
         resource: str | None,
-        resolved: ResolvedToken,
+        resolved: object,
     ) -> _ResolvedHookToken:
         if not isinstance(resolved, ResolvedToken):
             raise _OAuthTokenResolverFailed(
