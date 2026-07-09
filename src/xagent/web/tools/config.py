@@ -208,6 +208,16 @@ def _oauth_launch_config_env_mapping(
     return {}
 
 
+def _oauth_launch_config_mapping(
+    launch_config: Any,
+) -> Mapping[str, Any] | None:
+    if launch_config is None:
+        return None
+    if isinstance(launch_config, Mapping):
+        return launch_config
+    raise _OAuthLaunchConfigInvalid(field="type")
+
+
 async def refresh_oauth_token_if_needed(
     db: Any, oauth_account: Any, provider_name: str
 ) -> bool:
@@ -1275,7 +1285,7 @@ class WebToolConfig(BaseToolConfig):
         app_info: Mapping[str, Any],
         access_token: str,
     ) -> Dict[str, Any]:
-        launch_config = app_info.get("launch_config")
+        launch_config = _oauth_launch_config_mapping(app_info.get("launch_config"))
         if launch_config:
             transport_config: Dict[str, Any] = {
                 "transport": "stdio",

@@ -67,7 +67,7 @@ def _add_oauth_server(
     name: str = "Google Drive",
     app_id: str | None = "google-drive",
     provider: str | None = "google",
-    launch_config: dict | None = None,
+    launch_config: object | None = None,
     register_app: bool = True,
 ) -> MCPServer:
     server = MCPServer(
@@ -462,6 +462,49 @@ async def test_launch_config_missing_command_skips_only_that_server_for_user_oau
 
     assert [config["name"] for config in configs] == ["before", "after"]
     assert "launch_config.command is invalid" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_launch_config_non_mapping_skips_only_that_server_for_hook(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_stdio_server(db, user, name="before")
+    _add_oauth_server(db, user, launch_config="not-a-mapping")
+    _add_stdio_server(db, user, name="after")
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["before", "after"]
+    assert "launch_config.type is invalid" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_launch_config_non_mapping_skips_only_that_server_for_user_oauth(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_stdio_server(db, user, name="before")
+    _add_oauth_server(db, user, launch_config=["not", "a", "mapping"])
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+    _add_stdio_server(db, user, name="after")
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["before", "after"]
+    assert "launch_config.type is invalid" in caplog.text
 
 
 @pytest.mark.asyncio
