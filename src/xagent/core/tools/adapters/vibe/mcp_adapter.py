@@ -155,6 +155,25 @@ def _mcp_access_denied_result(user_id: Optional[str], tool_name: str) -> dict[st
     }
 
 
+def _mcp_return_value_as_string(value: Any) -> str:
+    try:
+        if isinstance(value, dict):
+            content = value.get("content", [])
+            if content:
+                texts = []
+                for item in content:
+                    if isinstance(item, dict) and "text" in item:
+                        texts.append(item["text"])
+                    else:
+                        texts.append(str(item))
+                return "\n".join(texts)
+            return "No content returned"
+        return str(value)
+    except Exception as e:
+        logger.warning(f"Failed to convert return value to string: {e}")
+        return str(value)
+
+
 def _format_unavailable_mcp_tool_name(server_name: str, server_id: Any | None) -> str:
     from .selection_spec import normalize_mcp_server_name
 
@@ -714,23 +733,7 @@ class MCPToolAdapter(AbstractBaseTool):
 
     def return_value_as_string(self, value: Any) -> str:
         """Convert return value to string representation."""
-        try:
-            if isinstance(value, dict):
-                content = value.get("content", [])
-                if content:
-                    # Extract text from content items
-                    texts = []
-                    for item in content:
-                        if isinstance(item, dict) and "text" in item:
-                            texts.append(item["text"])
-                        else:
-                            texts.append(str(item))
-                    return "\n".join(texts)
-                return "No content returned"
-            return str(value)
-        except Exception as e:
-            logger.warning(f"Failed to convert return value to string: {e}")
-            return str(value)
+        return _mcp_return_value_as_string(value)
 
 
 class _UnavailableMCPToolResult(BaseModel):
@@ -787,7 +790,10 @@ class UnavailableMCPTool(AbstractBaseTool):
     def state_type(self) -> Optional[Type[BaseModel]]:
         return None
 
-    def _credential_unavailable_result(self) -> Dict[str, Any]:
+    def _run_unavailable(self) -> Dict[str, Any]:
+        current_user_id = _get_current_mcp_user_id()
+        if not _is_mcp_user_allowed(current_user_id, self._allow_users):
+            return _mcp_access_denied_result(current_user_id, self.name)
         return {
             "content": [
                 {
@@ -800,23 +806,11 @@ class UnavailableMCPTool(AbstractBaseTool):
             "is_error": True,
         }
 
-    def _check_access(self) -> dict[str, Any] | None:
-        current_user_id = _get_current_mcp_user_id()
-        if not _is_mcp_user_allowed(current_user_id, self._allow_users):
-            return _mcp_access_denied_result(current_user_id, self.name)
-        return None
-
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
-        access_denied = self._check_access()
-        if access_denied is not None:
-            return access_denied
-        return self._credential_unavailable_result()
+        return self._run_unavailable()
 
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
-        access_denied = self._check_access()
-        if access_denied is not None:
-            return access_denied
-        return self._credential_unavailable_result()
+        return self._run_unavailable()
 
     async def save_state_json(self) -> Mapping[str, Any]:
         return {}
@@ -825,22 +819,7 @@ class UnavailableMCPTool(AbstractBaseTool):
         pass
 
     def return_value_as_string(self, value: Any) -> str:
-        try:
-            if isinstance(value, dict):
-                content = value.get("content", [])
-                if content:
-                    texts = []
-                    for item in content:
-                        if isinstance(item, dict) and "text" in item:
-                            texts.append(item["text"])
-                        else:
-                            texts.append(str(item))
-                    return "\n".join(texts)
-                return "No content returned"
-            return str(value)
-        except Exception as e:
-            logger.warning(f"Failed to convert return value to string: {e}")
-            return str(value)
+        return _mcp_return_value_as_string(value)
 
 
 def _build_mcp_tool_adapter(

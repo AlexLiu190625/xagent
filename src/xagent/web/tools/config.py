@@ -84,7 +84,13 @@ _oauth_token_resolver_generation = 0
 
 
 def set_oauth_token_resolver_hook(resolver: TokenResolver | None) -> None:
-    """Register or clear the process-wide OAuth token resolver hook."""
+    """Register or clear the process-wide OAuth token resolver hook.
+
+    Every registration invalidates existing per-instance MCP config caches, even
+    when the callable identity is unchanged. Embedders can re-register the hook
+    after external token-store changes to force already-created ``WebToolConfig``
+    instances to reload credentials.
+    """
     global _oauth_token_resolver_generation, _oauth_token_resolver_hook
 
     _oauth_token_resolver_hook = resolver
@@ -146,14 +152,13 @@ def _oauth_token_expires_after_cache_window(expires_at: datetime) -> bool:
 
 
 def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
-    candidates: list[str] = []
-    for key in ("provider", "id"):
-        value = app_info.get(key)
-        if not isinstance(value, str) or not value:
-            continue
-        if value not in candidates:
-            candidates.append(value)
-    return candidates
+    return list(
+        dict.fromkeys(
+            value
+            for value in (app_info.get("provider"), app_info.get("id"))
+            if isinstance(value, str) and value
+        )
+    )
 
 
 def _oauth_token_configured_resource(app_info: Mapping[str, Any]) -> str | None:
@@ -609,6 +614,8 @@ class WebToolConfig(BaseToolConfig):
         return configs
 
     def _mcp_config_cache_is_valid(self) -> bool:
+        # MCP config caching is aware of hook-supplied token expiry only. The
+        # legacy UserOAuth path keeps the pre-existing per-instance cache shape.
         _, current_generation = _get_oauth_token_resolver_hook()
         if self._mcp_hook_generation_at_load != current_generation:
             return False
@@ -1651,6 +1658,9 @@ class WebToolConfig(BaseToolConfig):
         except ConnectorRuntimeError:
             raise
         except Exception as e:
+            # Preserve the legacy partial-return behavior for unrelated load
+            # errors. Resolver and OAuth launch-config failures are handled
+            # per server above so later servers can still load.
             logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
 
         logger.info(f"Loaded {len(configs)} MCP server configurations")
