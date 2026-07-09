@@ -5,6 +5,7 @@ Provides web-specific configuration classes that load from database
 and other web-specific sources.
 """
 
+import inspect
 import logging
 import os
 import shlex
@@ -77,7 +78,8 @@ class ResolvedToken:
     expires_at: datetime | None = None
 
 
-TokenResolver = Callable[[TokenRequest], Awaitable[ResolvedToken | None]]
+TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
+TokenResolver = Callable[[TokenRequest], TokenResolverResult]
 
 _oauth_token_resolver_hook: TokenResolver | None = None
 _oauth_token_resolver_generation = 0
@@ -85,6 +87,9 @@ _oauth_token_resolver_generation = 0
 
 def set_oauth_token_resolver_hook(resolver: TokenResolver | None) -> None:
     """Register or clear the process-wide OAuth token resolver hook.
+
+    Resolvers may return ``ResolvedToken`` or ``None`` directly, or return an
+    awaitable that resolves to either value.
 
     Every registration invalidates existing per-instance MCP config caches, even
     when the callable identity is unchanged. Embedders can re-register the hook
@@ -99,6 +104,12 @@ def set_oauth_token_resolver_hook(resolver: TokenResolver | None) -> None:
 
 def _get_oauth_token_resolver_hook() -> tuple[TokenResolver | None, int]:
     return _oauth_token_resolver_hook, _oauth_token_resolver_generation
+
+
+async def _maybe_await_oauth_token_resolver_result(result: object) -> object:
+    if inspect.isawaitable(result):
+        return await result
+    return result
 
 
 @dataclass(frozen=True)
@@ -1167,7 +1178,9 @@ class WebToolConfig(BaseToolConfig):
                 resource=resource,
             )
             try:
-                resolved = await resolver(request)
+                resolved = await _maybe_await_oauth_token_resolver_result(
+                    resolver(request)
+                )
             except Exception as exc:
                 raise _OAuthTokenResolverFailed(
                     providers=providers,

@@ -207,6 +207,28 @@ async def test_hook_receives_provider_candidates_in_order_and_first_hit_wins(
 
 
 @pytest.mark.asyncio
+async def test_hook_accepts_sync_resolver(db_session):
+    db, user = db_session
+    _add_oauth_server(db, user, launch_config=_launch_config())
+    seen: list[str] = []
+
+    def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen.append(request.provider)
+        return ResolvedToken(
+            access_token="sync-hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert seen == ["google"]
+    assert configs[0]["transport"] == "stdio"
+    assert _access_token_env(configs[0]) == "sync-hook-token"
+
+
+@pytest.mark.asyncio
 async def test_hook_dedupes_provider_candidates(db_session):
     db, user = db_session
     _add_oauth_server(
