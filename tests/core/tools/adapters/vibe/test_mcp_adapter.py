@@ -7,6 +7,7 @@ from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPToolAdapter,
     _build_mcp_tool_adapter,
     _exception_indicates_http_401,
+    _mcp_return_value_as_string,
 )
 
 
@@ -91,6 +92,10 @@ def test_exception_indicates_http_401_uses_bounded_status_signals():
         RuntimeError("connection reset on port 401")
     )
     assert not _exception_indicates_http_401(RuntimeError("tool returned id 40123"))
+
+
+def test_mcp_return_value_as_string_keeps_malformed_scalar_content_together():
+    assert _mcp_return_value_as_string({"content": "error"}) == "error"
 
 
 def test_build_mcp_tool_adapter_honors_concurrent_tool_allowlist():

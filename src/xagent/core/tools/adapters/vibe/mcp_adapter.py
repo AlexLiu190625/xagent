@@ -159,7 +159,7 @@ def _mcp_return_value_as_string(value: Any) -> str:
     try:
         if isinstance(value, dict):
             content = value.get("content", [])
-            if content:
+            if isinstance(content, list) and content:
                 texts = []
                 for item in content:
                     if isinstance(item, dict) and "text" in item:
@@ -167,6 +167,8 @@ def _mcp_return_value_as_string(value: Any) -> str:
                     else:
                         texts.append(str(item))
                 return "\n".join(texts)
+            if content:
+                return str(content)
             return "No content returned"
         return str(value)
     except Exception as e:
