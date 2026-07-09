@@ -47,12 +47,17 @@ def db_session(tmp_path):
     engine.dispose()
 
 
-def _launch_config(env_key: str = "GOOGLE_ACCESS_TOKEN") -> dict:
-    return {
+def _launch_config(
+    env_key: str = "GOOGLE_ACCESS_TOKEN", resource: str | None = None
+) -> dict:
+    launch_config = {
         "command": "npx",
         "args": ["-y", "@mcp-servers/google-drive"],
         "env_mapping": {env_key: "access_token", "IGNORED": "refresh_token"},
     }
+    if resource is not None:
+        launch_config["resource"] = resource
+    return launch_config
 
 
 def _add_oauth_server(
@@ -221,6 +226,36 @@ async def test_hook_dedupes_provider_candidates(db_session):
     await _tool_config(db, user).get_mcp_server_configs()
 
     assert seen == ["google"]
+
+
+@pytest.mark.asyncio
+async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_session):
+    db, user = db_session
+    scope = object()
+    resource = "https://MCP.EXAMPLE.com:443/mcp/%7Euser/?Q=1#Fragment"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+    seen: list[tuple[str, str | None, object | None]] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen.append((request.provider, request.resource, request.scope))
+        if request.provider == "google-drive":
+            return ResolvedToken(
+                access_token="hook-token",
+                expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            )
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(
+        db, user, execution_scope=scope
+    ).get_mcp_server_configs()
+
+    assert seen == [
+        ("google", resource, scope),
+        ("google-drive", resource, scope),
+    ]
+    assert _access_token_env(configs[0]) == "hook-token"
 
 
 @pytest.mark.asyncio
@@ -498,6 +533,26 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
             "exception_type": "RuntimeError",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_diagnostic_includes_bounded_resource(db_session):
+    db, user = db_session
+    resource = "https://mcp.example.com/" + "r" * 160
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise RuntimeError("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert diagnostic["resource"] == f"{resource[:125]}..."
+    assert len(diagnostic["resource"]) == 128
 
 
 @pytest.mark.asyncio

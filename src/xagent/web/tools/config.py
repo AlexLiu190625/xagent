@@ -49,7 +49,9 @@ class TokenRequest:
 
     Providers are requested in the same candidate order used by the built-in
     UserOAuth lookup: provider name first, then app id, de-duplicated. The
-    first resolver hit wins. ``scope`` is the current execution scope from
+    first resolver hit wins. ``resource`` is the configured MCP OAuth resource
+    URI for the current app/server when present, passed verbatim without
+    canonicalization. ``scope`` is the current execution scope from
     ``WebToolConfig.get_execution_scope()`` when present; it is typed as
     Optional[Any] to avoid importing the core scope type into this config layer.
     """
@@ -57,6 +59,7 @@ class TokenRequest:
     provider: str
     user_id: int
     scope: Optional[Any] = None
+    resource: str | None = None
 
 
 @dataclass(frozen=True)
@@ -100,10 +103,17 @@ class _ResolvedHookToken:
 
 
 class _OAuthTokenResolverFailed(Exception):
-    def __init__(self, *, providers: list[str], exception_type: str) -> None:
+    def __init__(
+        self,
+        *,
+        providers: list[str],
+        exception_type: str,
+        resource: str | None = None,
+    ) -> None:
         super().__init__(OAUTH_TOKEN_RESOLVER_FAILURE_CODE)
         self.providers = providers
         self.exception_type = exception_type
+        self.resource = resource
 
 
 class _OAuthLaunchConfigInvalid(Exception):
@@ -144,6 +154,18 @@ def _oauth_token_provider_candidates(app_info: Mapping[str, Any]) -> list[str]:
         if value not in candidates:
             candidates.append(value)
     return candidates
+
+
+def _oauth_token_configured_resource(app_info: Mapping[str, Any]) -> str | None:
+    resource = app_info.get("resource")
+    if isinstance(resource, str) and resource != "":
+        return resource
+    launch_config = app_info.get("launch_config")
+    if isinstance(launch_config, Mapping):
+        resource = launch_config.get("resource")
+        if isinstance(resource, str) and resource != "":
+            return resource
+    return None
 
 
 def _oauth_launch_config_args(launch_config: Mapping[str, Any]) -> list[Any]:
@@ -1112,6 +1134,7 @@ class WebToolConfig(BaseToolConfig):
         self,
         *,
         providers: list[str],
+        resource: str | None,
     ) -> _ResolvedHookToken | None:
         resolver, _ = _get_oauth_token_resolver_hook()
         if resolver is None or not providers or self._user_id is None:
@@ -1122,6 +1145,7 @@ class WebToolConfig(BaseToolConfig):
                 provider=provider,
                 user_id=int(self._user_id),
                 scope=self.get_execution_scope(),
+                resource=resource,
             )
             try:
                 resolved = await resolver(request)
@@ -1129,6 +1153,7 @@ class WebToolConfig(BaseToolConfig):
                 raise _OAuthTokenResolverFailed(
                     providers=providers,
                     exception_type=_bounded_oauth_metadata(type(exc).__name__),
+                    resource=resource,
                 ) from exc
 
             if resolved is None:
@@ -1136,6 +1161,7 @@ class WebToolConfig(BaseToolConfig):
             return self._validate_resolved_oauth_token(
                 provider=provider,
                 providers=providers,
+                resource=resource,
                 resolved=resolved,
             )
 
@@ -1146,17 +1172,20 @@ class WebToolConfig(BaseToolConfig):
         *,
         provider: str,
         providers: list[str],
+        resource: str | None,
         resolved: ResolvedToken,
     ) -> _ResolvedHookToken:
         if not isinstance(resolved, ResolvedToken):
             raise _OAuthTokenResolverFailed(
                 providers=providers,
                 exception_type=_bounded_oauth_metadata(type(resolved).__name__),
+                resource=resource,
             )
         if not isinstance(resolved.access_token, str) or not resolved.access_token:
             raise _OAuthTokenResolverFailed(
                 providers=providers,
                 exception_type="InvalidAccessToken",
+                resource=resource,
             )
         if resolved.expires_at is not None and not isinstance(
             resolved.expires_at, datetime
@@ -1164,6 +1193,7 @@ class WebToolConfig(BaseToolConfig):
             raise _OAuthTokenResolverFailed(
                 providers=providers,
                 exception_type="InvalidExpiresAt",
+                resource=resource,
             )
 
         expires_at = _normalize_oauth_expires_at(resolved.expires_at)
@@ -1171,6 +1201,7 @@ class WebToolConfig(BaseToolConfig):
             raise _OAuthTokenResolverFailed(
                 providers=providers,
                 exception_type="ExpiredAccessToken",
+                resource=resource,
             )
 
         return _ResolvedHookToken(
@@ -1206,6 +1237,9 @@ class WebToolConfig(BaseToolConfig):
             server,
             code=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
             message=OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE,
+            resource=_bounded_oauth_metadata(error.resource)
+            if error.resource is not None
+            else None,
         )
         diagnostic["providers"] = [
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
@@ -1369,12 +1403,14 @@ class WebToolConfig(BaseToolConfig):
 
                     hook_token: _ResolvedHookToken | None = None
                     if app_info:
+                        configured_resource = _oauth_token_configured_resource(app_info)
                         providers_to_resolve = _oauth_token_provider_candidates(
                             app_info
                         )
                         try:
                             hook_token = await self._resolve_oauth_token_from_hook(
-                                providers=providers_to_resolve
+                                providers=providers_to_resolve,
+                                resource=configured_resource,
                             )
                         except _OAuthTokenResolverFailed as error:
                             self._mcp_hook_resolution_failed = True
