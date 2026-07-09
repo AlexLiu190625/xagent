@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 
 import pytest
@@ -233,6 +234,22 @@ async def test_factory_normal_loader_failure_keeps_unavailable_tool(monkeypatch)
     )
 
     assert [tool.name for tool in tools] == ["mcp_google_drive_42_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_factory_malformed_normal_config_keeps_unavailable_tool(caplog):
+    caplog.set_level(logging.WARNING)
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            _unavailable_config(),
+            {"name": "normal", "transport": "stdio", "config": None},
+        ]
+    )
+
+    assert [tool.name for tool in tools] == ["mcp_google_drive_42_unavailable"]
+    assert "MCP server config 'config' field for server 'normal'" in caplog.text
+    assert "dictionary, got NoneType" in caplog.text
 
 
 @pytest.mark.asyncio

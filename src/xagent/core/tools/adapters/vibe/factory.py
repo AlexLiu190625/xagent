@@ -535,47 +535,54 @@ class ToolFactory:
 
             normal_tools: List[Tool] = []
             if normal_configs:
-                # Convert configs to connection format
-                connections = {}
-
-                for config in normal_configs:
-                    connection_config = {
-                        "transport": config["transport"],
-                        **config["config"],
-                    }
-                    for runtime_key in (
-                        "runtime_bindings",
-                        "runtime_input_schema",
-                        "connector_runtime",
-                        "allow_delegated_authorization",
-                    ):
-                        if runtime_key in config:
-                            connection_config[runtime_key] = config[runtime_key]
-
-                    # Fix args field if it's a string instead of list
-                    if "args" in connection_config and isinstance(
-                        connection_config["args"], str
-                    ):
-                        # Split args string to list, handling quoted arguments
-                        import shlex
-
-                        try:
-                            connection_config["args"] = shlex.split(
-                                connection_config["args"]
-                            )
-                            logger.info(
-                                f"Converted args string to list: {connection_config['args']}"
-                            )
-                        except Exception as e:
-                            logger.warning(f"Failed to parse args string: {e}")
-                            # Fallback to simple split
-                            connection_config["args"] = connection_config[
-                                "args"
-                            ].split()
-
-                    connections[config["name"]] = connection_config
-
                 try:
+                    # Convert configs to connection format
+                    connections = {}
+
+                    for config in normal_configs:
+                        inner_config = config.get("config")
+                        if not isinstance(inner_config, dict):
+                            raise ValueError(
+                                "MCP server config 'config' field for server "
+                                f"'{config.get('name', '<unknown>')}' must be a "
+                                f"dictionary, got {type(inner_config).__name__}"
+                            )
+                        connection_config = {
+                            "transport": config["transport"],
+                            **inner_config,
+                        }
+                        for runtime_key in (
+                            "runtime_bindings",
+                            "runtime_input_schema",
+                            "connector_runtime",
+                            "allow_delegated_authorization",
+                        ):
+                            if runtime_key in config:
+                                connection_config[runtime_key] = config[runtime_key]
+
+                        # Fix args field if it's a string instead of list
+                        if "args" in connection_config and isinstance(
+                            connection_config["args"], str
+                        ):
+                            # Split args string to list, handling quoted arguments
+                            import shlex
+
+                            try:
+                                connection_config["args"] = shlex.split(
+                                    connection_config["args"]
+                                )
+                                logger.info(
+                                    f"Converted args string to list: {connection_config['args']}"
+                                )
+                            except Exception as e:
+                                logger.warning(f"Failed to parse args string: {e}")
+                                # Fallback to simple split
+                                connection_config["args"] = connection_config[
+                                    "args"
+                                ].split()
+
+                        connections[config["name"]] = connection_config
+
                     # Load MCP tools
                     mcp_tools = await load_mcp_tools_as_agent_tools(
                         connections,
