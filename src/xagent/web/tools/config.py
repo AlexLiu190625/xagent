@@ -1433,7 +1433,10 @@ class WebToolConfig(BaseToolConfig):
                             continue
 
                     if hook_token is not None:
-                        assert app_info is not None
+                        if app_info is None:
+                            raise RuntimeError(
+                                "OAuth token resolver supplied a token without app metadata"
+                            )
                         try:
                             transport_config = (
                                 self._build_oauth_mcp_stdio_transport_config(
