@@ -1443,6 +1443,7 @@ class WebToolConfig(BaseToolConfig):
                             continue
 
                     if app_info and hook_token is not None:
+                        self._mark_hook_token_cache_metadata(hook_token)
                         try:
                             transport_config = (
                                 self._build_oauth_mcp_stdio_transport_config(
@@ -1458,7 +1459,6 @@ class WebToolConfig(BaseToolConfig):
                                 error.field,
                             )
                             continue
-                        self._mark_hook_token_cache_metadata(hook_token)
                         config["transport"] = "stdio"
                         logger.info(
                             "OAuth token resolver supplied token for MCP server '%s' via provider '%s'",

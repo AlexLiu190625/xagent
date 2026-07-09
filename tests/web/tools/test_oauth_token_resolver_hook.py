@@ -599,6 +599,89 @@ async def test_hook_failure_diagnostic_includes_bounded_resource(db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolved", "exception_type"),
+    [
+        (object(), "object"),
+        (ResolvedToken(access_token="", expires_at=None), "InvalidAccessToken"),
+        (ResolvedToken(access_token=123, expires_at=None), "InvalidAccessToken"),
+        (
+            ResolvedToken(access_token="hook-token", expires_at="soon"),
+            "InvalidExpiresAt",
+        ),
+    ],
+)
+async def test_hook_malformed_token_creates_unavailable_config(
+    db_session,
+    resolved,
+    exception_type,
+):
+    db, user = db_session
+    server = _add_oauth_server(db, user, launch_config=_launch_config())
+
+    async def resolver(request: TokenRequest):
+        return resolved
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["server_id"] == server.id
+    assert cfg.get_mcp_oauth_diagnostics()[0]["exception_type"] == exception_type
+
+
+@pytest.mark.asyncio
+async def test_hook_is_skipped_when_user_id_is_none(db_session):
+    db, user = db_session
+    seen: list[TokenRequest] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        seen.append(request)
+        return ResolvedToken(access_token="hook-token", expires_at=None)
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    cfg._user_id = None
+    resolved = await cfg._resolve_oauth_token_from_hook(
+        providers=["google"],
+        resource=None,
+    )
+
+    assert resolved is None
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_invalid_launch_config_with_uncacheable_hook_token_is_not_cached(
+    db_session,
+):
+    db, user = db_session
+    _add_oauth_server(db, user, launch_config="not-a-mapping")
+    calls = 0
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        nonlocal calls
+        calls += 1
+        return ResolvedToken(access_token=f"hook-token-{calls}", expires_at=None)
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    first = await cfg.get_mcp_server_configs()
+    app = db.query(PublicMCPApp).filter(PublicMCPApp.name == "Google Drive").one()
+    app.launch_config = _launch_config()
+    db.commit()
+    second = await cfg.get_mcp_server_configs()
+
+    assert first == []
+    assert calls == 2
+    assert _access_token_env(second[0]) == "hook-token-2"
+
+
+@pytest.mark.asyncio
 async def test_hook_expires_at_none_is_used_but_not_cached(db_session):
     db, user = db_session
     _add_oauth_server(db, user, launch_config=_launch_config())
