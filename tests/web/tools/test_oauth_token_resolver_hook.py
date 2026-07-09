@@ -394,6 +394,34 @@ async def test_launch_config_args_string_matches_user_oauth_shape(db_session):
 
 
 @pytest.mark.asyncio
+async def test_launch_config_args_unsupported_type_warning_matches_contract(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    launch_config = _launch_config()
+    launch_config["args"] = {"not": "supported"}
+    _add_oauth_server(db, user, launch_config=launch_config)
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    config = (await _tool_config(db, user).get_mcp_server_configs())[0]
+
+    assert config["config"]["args"] == []
+    assert (
+        "Ignoring OAuth MCP launch config args because args must be a list or a string"
+        in caplog.text
+    )
+
+
+@pytest.mark.asyncio
 async def test_launch_config_env_mapping_none_matches_user_oauth_shape(db_session):
     db, user = db_session
     launch_config = _launch_config()

@@ -188,7 +188,9 @@ def _oauth_launch_config_args(launch_config: Mapping[str, Any]) -> list[Any]:
                 type(exc).__name__,
             )
             return args.split()
-    logger.warning("Ignoring OAuth MCP launch config args because args must be a list")
+    logger.warning(
+        "Ignoring OAuth MCP launch config args because args must be a list or a string"
+    )
     return []
 
 
