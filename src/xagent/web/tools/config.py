@@ -1181,6 +1181,8 @@ class WebToolConfig(BaseToolConfig):
                 resolved = await _maybe_await_oauth_token_resolver_result(
                     resolver(request)
                 )
+            except ConnectorRuntimeError:
+                raise
             except Exception as exc:
                 raise _OAuthTokenResolverFailed(
                     providers=providers,
@@ -1451,6 +1453,8 @@ class WebToolConfig(BaseToolConfig):
                                 error=error,
                             )
                             self._mcp_oauth_diagnostics.append(diagnostic)
+                            # Do not log the resolver exception message or
+                            # traceback here; they can contain token material.
                             logger.warning(
                                 "OAuth token resolver failed for MCP server '%s' with %s",
                                 getattr(server, "name", "<unknown>"),

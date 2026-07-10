@@ -7,6 +7,7 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -626,6 +627,28 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
             "exception_type": "RuntimeError",
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_hook_connector_runtime_error_propagates(db_session):
+    db, user = db_session
+    _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_user_oauth(db, user, provider="google", access_token="user-token")
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ConnectorRuntimeError(
+            "connector_runtime_unavailable",
+            "Connector runtime context is unavailable.",
+            status_code=503,
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    with pytest.raises(ConnectorRuntimeError):
+        await cfg.get_mcp_server_configs()
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
 
 
 @pytest.mark.asyncio
