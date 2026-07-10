@@ -135,7 +135,7 @@ export function DefaultModelsSettings() {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState<string | null>(null)
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
-  const { t } = useI18n()
+  const { t, tDynamic } = useI18n()
 
   useEffect(() => {
     loadModelsAndDefaults()
@@ -278,7 +278,10 @@ export function DefaultModelsSettings() {
                               {getModelProviderLabel(currentDefault.model)}
                             </Badge>
                             <Badge variant="outline" className="text-xs">
-                              {t(`models.tabs.${getModelCategory(currentDefault.model)}`)}
+                              {tDynamic(
+                                `models.tabs.${getModelCategory(currentDefault.model)}`,
+                                getModelCategory(currentDefault.model),
+                              )}
                             </Badge>
                           </div>
                         </div>

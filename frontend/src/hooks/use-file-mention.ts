@@ -3,6 +3,7 @@ import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { toast } from "@/components/ui/sonner";
 import { createFileChipHTML } from "@/components/chat/FileChip";
+import type { Translate } from "@/contexts/i18n-context"
 
 export interface FileItem {
   file_id: string;
@@ -19,7 +20,7 @@ export function useFileMention(
   editorRef: React.RefObject<HTMLElement | null>,
   containerRef: React.RefObject<HTMLElement | null>,
   onInput: () => void,
-  t: (key: string) => string
+  t: Translate
 ) {
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [fileList, setFileList] = useState<FileItem[]>([]);

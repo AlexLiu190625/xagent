@@ -48,6 +48,7 @@ vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
     locale: "en-US",
     t: translateMock,
+    tDynamic: (key: string) => translateMock(key),
   }),
 }))
 

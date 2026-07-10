@@ -7,7 +7,7 @@ import { Menu } from "lucide-react";
 import { Sidebar } from "@/components/layout/sidebar";
 import { Button } from "@/components/ui/button";
 import { Sheet, SheetContent, SheetTitle, SheetTrigger } from "@/components/ui/sheet";
-import { useI18n } from "@/contexts/i18n-context";
+import { useI18n, type Translate } from "@/contexts/i18n-context";
 import { getBrandingFromEnv } from "@/lib/branding";
 
 interface HeaderMeta {
@@ -15,7 +15,7 @@ interface HeaderMeta {
   title: string;
 }
 
-function resolveHeaderMeta(pathname: string, t: (key: string) => string, appName: string): HeaderMeta {
+function resolveHeaderMeta(pathname: string, t: Translate, appName: string): HeaderMeta {
   if (pathname === "/") {
     return { eyebrow: appName, title: t("nav.home") };
   }

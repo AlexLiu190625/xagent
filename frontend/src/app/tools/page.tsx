@@ -42,7 +42,10 @@ import { ConnectMcpDialog, AppIntegration } from "@/components/mcp/connect-mcp-d
 import { OfficialMcpSettingsDialog } from "@/components/mcp/official-mcp-settings-dialog"
 import { CustomApiForm, MCPServerFormData } from "@/components/mcp/custom-api-form"
 import { CustomMcpForm } from "@/components/mcp/custom-mcp-form"
-import { getRuntimeConfigError } from "@/components/mcp/runtime-inputs-form"
+import {
+  getRuntimeConfigError,
+  type RuntimeConfigErrorKey,
+} from "@/components/mcp/runtime-inputs-form"
 import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
@@ -159,9 +162,9 @@ function ToolsPageContent() {
     method: "GET",
     headers: {}
   })
-  const [runtimeValidationError, setRuntimeValidationError] = useState<string | null>(null)
+  const [runtimeValidationError, setRuntimeValidationError] = useState<RuntimeConfigErrorKey | null>(null)
 
-  const { t } = useI18n()
+  const { t, tDynamic } = useI18n()
   const { user } = useAuth()
   const { getAppIcon } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
@@ -606,23 +609,13 @@ function ToolsPageContent() {
     // Check special cases first
     if (categoryDisplayMap[category]) {
       const key = `tools.categories.${category}`
-      const translated = t(key)
-      // If translation exists and is not just the key itself, use it
-      if (translated !== key) {
-        return translated
-      }
-      // Otherwise use the special case mapping
-      return categoryDisplayMap[category]
+      return tDynamic(key, categoryDisplayMap[category])
     }
 
     // Try translation
     const key = `tools.categories.${category}`
-    const translated = t(key)
-    if (translated === key) {
-      // Fallback: capitalize and replace underscores
-      return category.charAt(0).toUpperCase() + category.slice(1).replace(/_/g, ' ')
-    }
-    return translated
+    const fallback = category.charAt(0).toUpperCase() + category.slice(1).replace(/_/g, ' ')
+    return tDynamic(key, fallback)
   }
 
   const getToolIcon = (name: string, type: string, category?: string) => {

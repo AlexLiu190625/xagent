@@ -50,7 +50,10 @@ import type { AppIntegration } from "./types"
 import { OfficialMcpSettingsDialog } from "./official-mcp-settings-dialog"
 import { CustomApiForm, MCPServerFormData } from "./custom-api-form"
 import { CustomMcpForm } from "./custom-mcp-form"
-import { getRuntimeConfigError } from "./runtime-inputs-form"
+import {
+  getRuntimeConfigError,
+  type RuntimeConfigErrorKey,
+} from "./runtime-inputs-form"
 
 interface ConnectMcpDialogProps {
   open: boolean
@@ -103,7 +106,7 @@ export function ConnectMcpDialog({
     description: "",
     config: {} as Record<string, any>
   })
-  const [runtimeValidationError, setRuntimeValidationError] = useState<string | null>(null)
+  const [runtimeValidationError, setRuntimeValidationError] = useState<RuntimeConfigErrorKey | null>(null)
 
   const isAppConnected = (app: AppIntegration) => Boolean(app.is_connected)
 
@@ -409,7 +412,7 @@ export function ConnectMcpDialog({
           method: 'DELETE'
         });
         if (response.ok) {
-          toast.success(t('tools.mcp.alerts.deleteSuccess') || "Disconnected successfully");
+          toast.success(t('tools.mcp.dialog.disconnectSuccess', { name: app.name }));
           if (onSuccess) onSuccess();
           setSelectedApp(null);
           // Reload apps to refresh the is_connected state visually

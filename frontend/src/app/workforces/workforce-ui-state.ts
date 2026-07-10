@@ -1,4 +1,4 @@
-type Translate = (key: string) => string
+import type { Translate } from "@/contexts/i18n-context"
 
 export function getRunDisabledReason(status: string | null | undefined, t: Translate) {
   if (status === "active") return null

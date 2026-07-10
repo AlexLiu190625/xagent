@@ -2,6 +2,8 @@
  * Shared utilities for MCP Server and Custom API configurations
  */
 
+import type { TranslationKey } from "@/i18n/translations"
+
 export function isValidMcpName(name: string): boolean {
     const nameRegex = /^[a-zA-Z0-9_-]+$/;
     return nameRegex.test(name.trim());
@@ -10,7 +12,7 @@ export function isValidMcpName(name: string): boolean {
 export function buildCustomApiPayload(
     mcpFormData: Record<string, any>,
     customApiEnv: { key: string; value: string }[]
-): { isValid: boolean; payload?: any; errorKey?: string } {
+): { isValid: boolean; payload?: any; errorKey?: TranslationKey } {
     const validEnv = customApiEnv.filter(env => env.key.trim() && env.value.trim());
 
     // Allow empty env for Custom APIs that don't need authentication

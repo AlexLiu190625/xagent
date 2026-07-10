@@ -18,7 +18,7 @@ import {
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
-import { useI18n } from '@/contexts/i18n-context';
+import { useI18n, type Translate } from '@/contexts/i18n-context';
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
@@ -195,7 +195,7 @@ const isAgentProgressEvent = (event: TraceEvent): boolean => (
 // (e.g. tool_call_id attribution under in-turn tool concurrency).
 export function processTraceEvents(
   events: TraceEvent[],
-  t: (key: string, vars?: Record<string, string | number>) => string,
+  t: Translate,
   taskStatus?: string,
 ): ProcessedStep[] {
     const stepsMap = new Map<string, ProcessedStep>();
@@ -735,7 +735,7 @@ const CopyButton = ({ text, title }: { text: string, title?: string }) => {
   );
 };
 
-const ToolArtifactsDisplay = ({ artifacts, onFileClick, t }: { artifacts?: ToolArtifact[]; onFileClick?: (filePath: string, fileName: string) => void; t: (key: string) => string }) => {
+const ToolArtifactsDisplay = ({ artifacts, onFileClick, t }: { artifacts?: ToolArtifact[]; onFileClick?: (filePath: string, fileName: string) => void; t: Translate }) => {
   const displayArtifacts = (artifacts || []).filter(
     artifact => artifact && (artifact.preview_url || artifact.file_id) && (artifact.display === undefined || artifact.display === 'inline')
   );

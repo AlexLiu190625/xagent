@@ -6,7 +6,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import type { WorkforceStatus } from "@/types/workforce"
 
 interface WorkforceStatusBadgeProps {
-  status: WorkforceStatus | string
+  status: WorkforceStatus
 }
 
 function statusVariant(status: string) {

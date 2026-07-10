@@ -10,6 +10,7 @@ import { TraceEventRenderer } from "@/components/chat/TraceEventRenderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { SearchInput } from "@/components/ui/search-input"
 import { useI18n } from "@/contexts/i18n-context"
+import type { TranslationKey } from "@/i18n/translations"
 import {
   type ConversationLogDetailResponse,
   type ConversationLogListResponse,
@@ -22,7 +23,7 @@ import { cn } from "@/lib/utils"
 
 const SOURCE_TABS: Array<{
   id: ConversationLogSource
-  labelKey: string
+  labelKey: TranslationKey
 }> = [
   { id: "all", labelKey: "conversationLogs.sources.all" },
   { id: "widget", labelKey: "conversationLogs.sources.widget" },

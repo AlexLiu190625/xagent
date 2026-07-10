@@ -9,6 +9,7 @@ import { ChevronDown, ChevronRight, Plus } from "lucide-react"
 import {
     RuntimeInputsForm,
     runtimeBindingsFromConfig,
+    type RuntimeConfigErrorKey,
 } from "./runtime-inputs-form"
 
 export interface MCPServerFormData {
@@ -31,7 +32,7 @@ interface CustomApiFormProps {
     customApiEnv: { key: string, value: string }[]
     setCustomApiEnv: React.Dispatch<React.SetStateAction<{ key: string, value: string }[]>>
     originalEnvObj?: Record<string, any>
-    onRuntimeValidationErrorChange?: (error: string | null) => void
+    onRuntimeValidationErrorChange?: (error: RuntimeConfigErrorKey | null) => void
 }
 
 export function CustomApiForm({

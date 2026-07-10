@@ -282,7 +282,7 @@ export function ChatMessage({
   showEmptyStatus = true,
   onSendInteraction,
 }: ChatMessageProps) {
-  const { t } = useI18n();
+  const { t, tDynamic } = useI18n();
   const { openFilePreview } = useApp();
   const router = useRouter();
   const isUser = role === "user";
@@ -330,10 +330,7 @@ export function ChatMessage({
     const action = (typeof e.data?.action === "string" ? (e.data!.action as string) : "") || type;
     if (type) {
       const key = `agent.logs.event.actions.${type}`;
-      const label = t(key);
-      if (label !== key) {
-        return label;
-      }
+      return tDynamic(key, action || type);
     }
     return action || t("traceEventRenderer.taskExecution");
   };

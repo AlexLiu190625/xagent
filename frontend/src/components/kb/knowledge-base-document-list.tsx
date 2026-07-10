@@ -8,6 +8,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { toast } from "@/components/ui/sonner"
+import type { Translate } from "@/contexts/i18n-context"
 
 import { buildDeleteDocumentUrl, CollectionDocumentInfo, CollectionDocumentSource, getCollectionDocuments, getDeleteErrorMessage } from "./knowledge-base-detail-helpers"
 
@@ -15,7 +16,7 @@ interface KnowledgeBaseDocumentListProps {
   collectionInfo: CollectionDocumentSource
   collectionName: string
   onRefresh: () => Promise<void>
-  t: (key: string, vars?: Record<string, string | number>) => string
+  t: Translate
 }
 
 export function KnowledgeBaseDocumentList({

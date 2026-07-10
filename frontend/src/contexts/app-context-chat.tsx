@@ -2930,8 +2930,8 @@ export function AppProvider({
               step_id: eventData.step_id,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.reactTaskEnd') || 'Task Completed',
-                message: t('agent.logs.event.messages.reactTaskEnd') || 'ReAct Task Completed',
+                action: t('agent.logs.event.actions.react_task_end'),
+                message: t('agent.logs.event.messages.reactTaskCompleted'),
                 ...eventData
               }
             }
@@ -2966,8 +2966,8 @@ export function AppProvider({
               step_id: eventData.step_id,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.reactTaskFailed') || 'Task Failed',
-                message: t('agent.logs.event.messages.reactTaskFailed') || 'ReAct Task Failed',
+                action: t('agent.logs.event.actions.react_task_failed'),
+                message: t('agent.logs.event.messages.reactTaskFailed'),
                 error: eventData.error || eventData.message,
                 ...eventData
               }
@@ -2996,7 +2996,7 @@ export function AppProvider({
               step_id: stepId,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.llmCallStart') || 'LLM Call Start',
+                action: t('agent.logs.event.actions.llm_call_start'),
                 ...eventData
               }
             }
@@ -3009,7 +3009,7 @@ export function AppProvider({
               step_id: stepId,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.llmCallEnd') || 'LLM Call End',
+                action: t('agent.logs.event.actions.llm_call_end'),
                 ...eventData
               }
             }
@@ -3022,7 +3022,7 @@ export function AppProvider({
               step_id: stepId,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.llmCallFailed') || 'LLM Call Failed',
+                action: t('agent.logs.event.actions.llm_call_failed'),
                 ...eventData
               }
             }
@@ -3047,7 +3047,7 @@ export function AppProvider({
               event_type: eventType,
               timestamp: message.timestamp,
               data: {
-                action: t('agent.logs.event.actions.taskCompleted'),
+                action: t('agent.logs.event.actions.task_completion'),
                 message: t('agent.logs.event.messages.taskCompleted'),
                 result: eventData.result,
                 success: eventData.success
@@ -3983,7 +3983,7 @@ export function AppProvider({
           payload: {
             id: generateMessageId("msg"),
             role: "assistant",
-            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknownError')}`,
+            content: `${t('agent.logs.event.messages.errorPrefix')} ${agentErrorMessage || t('common.errors.unknown')}`,
             timestamp: message.timestamp,
             status: "failed",
           },

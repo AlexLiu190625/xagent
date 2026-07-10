@@ -118,7 +118,7 @@ export function ModelManagementDialog({
   onSuccess
 }: ModelManagementDialogProps) {
   const { user, token } = useAuth()
-  const { t } = useI18n()
+  const { t, tDynamic } = useI18n()
 
   const [viewMode, setViewMode] = useState<'list' | 'connect' | 'form' | 'defaults'>(initialViewMode)
   const [editingModel, setEditingModel] = useState<Model | null>(initialEditingModel || null)
@@ -673,7 +673,7 @@ export function ModelManagementDialog({
 
                               return (
                                 <Badge key={type} variant="secondary" className="text-xs px-2 py-0.5 h-auto whitespace-normal text-primary">
-                                  {t(labelKey)}
+                                  {tDynamic(labelKey, type.replace(/_/g, " "))}
                                 </Badge>
                               )
                             })}
@@ -1125,7 +1125,9 @@ export function ModelManagementDialog({
 
                                   return (
                                     <div key={type} className="flex justify-between items-center text-sm">
-                                      <span className="text-muted-foreground">{t(labelKey)}</span>
+                                      <span className="text-muted-foreground">
+                                        {tDynamic(labelKey, type.replace(/_/g, " "))}
+                                      </span>
                                       <span className="font-medium truncate max-w-[200px]" title={model.model_name}>
                                         {model.model_name}
                                       </span>
@@ -1255,7 +1257,9 @@ export function ModelManagementDialog({
 
                             return (
                               <div key={type} className="flex justify-between items-center text-sm gap-4">
-                                <span className="text-muted-foreground shrink-0">{t(labelKey)}</span>
+                                <span className="text-muted-foreground shrink-0">
+                                  {tDynamic(labelKey, type.replace(/_/g, " "))}
+                                </span>
                                 <span className="font-medium truncate" title={model.model_name}>
                                   {model.model_name}
                                 </span>

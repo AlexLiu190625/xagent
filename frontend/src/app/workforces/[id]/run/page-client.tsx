@@ -17,7 +17,7 @@ import {
 import "@xyflow/react/dist/style.css"
 import { ArrowLeft, Crown, GitBranch, Pencil, Users, X } from "lucide-react"
 import { Button } from "@/components/ui/button"
-import { useI18n } from "@/contexts/i18n-context"
+import { useI18n, type Translate } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
 import { type TaskStatus } from "@/lib/task-status"
@@ -432,7 +432,7 @@ function ChatArea({
   taskStarted: boolean
   managerName: string
   handleSend: (content: string, config?: unknown, files?: (File & { file_id?: string })[]) => Promise<void>
-  t: (key: string, params?: Record<string, string | number>) => string
+  t: Translate
 }) {
   if (!taskStarted) {
     return (

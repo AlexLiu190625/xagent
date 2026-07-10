@@ -1,4 +1,5 @@
 import type { ComponentType, SVGProps } from "react"
+import type { TranslationKey } from "@/i18n/translations"
 import {
     Activity,
     FileText,
@@ -30,12 +31,12 @@ export interface NavigationItem {
     color?: string
     children?: NavigationItem[]
     showTasks?: boolean
-    nameKey?: string
+    nameKey?: TranslationKey
 }
 
 export interface NavigationGroup {
     title: string
-    titleKey?: string
+    titleKey?: TranslationKey
     items: NavigationItem[]
 }
 

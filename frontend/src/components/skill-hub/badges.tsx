@@ -5,7 +5,12 @@ import { ShieldAlert, ShieldCheck } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import type { ScanStatus, SkillSource } from "@/types/skill-hub";
 
-export function badgeForSource(source: SkillSource) {
+interface SourceBadge {
+  label: "builtin" | "user" | "team" | "external"
+  classes: string
+}
+
+export function badgeForSource(source: SkillSource): SourceBadge {
   switch (source) {
     case "builtin":
       return { label: "builtin", classes: "bg-violet-500/10 text-violet-600 border-violet-500/30" };

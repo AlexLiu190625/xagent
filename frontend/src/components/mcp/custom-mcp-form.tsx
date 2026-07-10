@@ -11,14 +11,17 @@ import { toast } from "@/components/ui/sonner"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { MCPServerFormData } from "./custom-api-form"
-import { RuntimeInputsForm } from "./runtime-inputs-form"
+import {
+  RuntimeInputsForm,
+  type RuntimeConfigErrorKey,
+} from "./runtime-inputs-form"
 
 interface CustomMcpFormProps {
   mcpFormData: MCPServerFormData
   setMcpFormData: React.Dispatch<React.SetStateAction<MCPServerFormData>>
   serverId?: number | null
   onOAuthStatusChange?: () => void
-  onRuntimeValidationErrorChange?: (error: string | null) => void
+  onRuntimeValidationErrorChange?: (error: RuntimeConfigErrorKey | null) => void
 }
 
 interface McpOAuthGrantStatus {

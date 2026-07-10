@@ -8,6 +8,7 @@ import { JSONSyntaxHighlighter } from "@/components/ui/json-syntax-highlighter"
 import { ChevronDown, ChevronRight, Bot, Wrench, Play, CheckCircle, XCircle, Info, Brain, Search, Sparkles } from "lucide-react"
 import { MessagesPreview } from "./messages-preview"
 import { useI18n } from "@/contexts/i18n-context"
+import type { TranslationKey } from "@/i18n/translations"
 
 interface TraceEvent {
   event_id: string
@@ -21,15 +22,21 @@ interface LogEventProps {
   event: TraceEvent
 }
 
+interface ActionConfig {
+  icon: React.ReactNode
+  color: string
+  labelKey: TranslationKey
+}
+
 // Common log summary component
 function LogSummary({ event }: LogEventProps) {
   const data = event.data as Record<string, any> || {}
   const stepName = data.step_name || data.name || ''
-  const { t } = useI18n()
+  const { t, tDynamic } = useI18n()
 
   // Select icon and color based on action type
-  const getActionConfig = () => {
-    const configs: Record<string, { icon: React.ReactNode, color: string, labelKey: string }> = {
+  const getActionConfig = (): ActionConfig => {
+    const configs: Record<string, ActionConfig> = {
       "dag_step_start": { icon: <Play className="h-4 w-4" />, color: "text-blue-500", labelKey: "agent.logs.event.labels.start" },
       "dag_step_end": { icon: <CheckCircle className="h-4 w-4" />, color: "text-green-500", labelKey: "agent.logs.event.labels.completed" },
       "dag_step_failed": { icon: <XCircle className="h-4 w-4" />, color: "text-red-500", labelKey: "agent.logs.event.labels.failed" },
@@ -68,7 +75,9 @@ function LogSummary({ event }: LogEventProps) {
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className={config.color}>{config.icon}</span>
-          <span className="text-sm font-medium">{t(`agent.logs.event.actions.${event.event_type}`)}</span>
+          <span className="text-sm font-medium">
+            {tDynamic(`agent.logs.event.actions.${event.event_type}`, event.event_type)}
+          </span>
         </div>
         <div className="flex items-center gap-2">
           <Badge variant="outline" className="text-xs border-muted-foreground/30">

@@ -20,7 +20,7 @@ export function ApiExample() {
     onConnect: () => setWsStatus(t('agent.header.connection.connected')),
     onDisconnect: () => setWsStatus(t('agent.header.connection.disconnected')),
     onError: (error) => {
-      setWsStatus(`${t('vibe.descriptions.process.examples.apiExample.labels.wsError')} ${error.message}`)
+      setWsStatus(`${t('agent.vibeMode.descriptions.think.examples.apiExample.labels.wsError')} ${error.message}`)
     },
   })
 
@@ -47,7 +47,7 @@ export function ApiExample() {
         const data = await response.json()
         setManualResult(data)
       } else {
-        setManualResult({ error: t('vibe.descriptions.process.examples.apiExample.manualApi.failed') })
+        setManualResult({ error: t('agent.vibeMode.descriptions.think.examples.apiExample.manualApi.failed') })
       }
     } catch (error) {
       setManualResult({ error: error instanceof Error ? error.message : t('common.errors.unknown') })
@@ -61,41 +61,41 @@ export function ApiExample() {
   return (
     <div className="p-6 space-y-6">
       <div className="bg-white rounded-lg shadow p-6">
-        <h2 className="text-xl font-bold mb-4">{t('vibe.descriptions.process.examples.apiExample.title')}</h2>
+        <h2 className="text-xl font-bold mb-4">{t('agent.vibeMode.descriptions.think.examples.apiExample.title')}</h2>
 
         <div className="space-y-4">
           <div className="p-4 bg-gray-50 rounded">
-            <p><strong>{t('vibe.descriptions.process.examples.apiExample.labels.currentUser')}</strong> {user.username}</p>
-            <p><strong>{t('vibe.descriptions.process.examples.apiExample.labels.accessTokenStatus')}</strong> {token ? t('vibe.descriptions.process.examples.apiExample.status.obtained') : t('vibe.descriptions.process.examples.apiExample.status.notObtained')}</p>
-            <p><strong>{t('vibe.descriptions.process.examples.apiExample.labels.refreshTokenStatus')}</strong> {refreshToken ? t('vibe.descriptions.process.examples.apiExample.status.obtained') : t('vibe.descriptions.process.examples.apiExample.status.notObtained')}</p>
-            <p><strong>{t('vibe.descriptions.process.examples.apiExample.labels.wsStatus')}</strong> {wsStatus}</p>
-            {wsError && <p className="text-red-600"><strong>{t('vibe.descriptions.process.examples.apiExample.labels.wsError')}</strong> {wsError.message}</p>}
+            <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.currentUser')}</strong> {user.username}</p>
+            <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.accessTokenStatus')}</strong> {token ? t('agent.vibeMode.descriptions.think.examples.apiExample.status.obtained') : t('agent.vibeMode.descriptions.think.examples.apiExample.status.notObtained')}</p>
+            <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.refreshTokenStatus')}</strong> {refreshToken ? t('agent.vibeMode.descriptions.think.examples.apiExample.status.obtained') : t('agent.vibeMode.descriptions.think.examples.apiExample.status.notObtained')}</p>
+            <p><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.wsStatus')}</strong> {wsStatus}</p>
+            {wsError && <p className="text-red-600"><strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.labels.wsError')}</strong> {wsError.message}</p>}
           </div>
 
           <div className="p-4 bg-blue-50 rounded">
-            <h3 className="font-semibold mb-2">{t('vibe.descriptions.process.examples.apiExample.autoApi.title')}</h3>
+            <h3 className="font-semibold mb-2">{t('agent.vibeMode.descriptions.think.examples.apiExample.autoApi.title')}</h3>
             {loading && <p>{t('common.loading')}</p>}
-            {error && <p className="text-red-600">{t('vibe.descriptions.process.examples.apiExample.common.errorPrefix')} {error.message}</p>}
+            {error && <p className="text-red-600">{t('agent.vibeMode.descriptions.think.examples.apiExample.common.errorPrefix')} {error.message}</p>}
             {models as any && Array.isArray(models) && (
               <div>
-                <p className="text-green-600">{t('vibe.descriptions.process.examples.apiExample.models.success', { count: (models.length || 0) as number })}</p>
+                <p className="text-green-600">{t('agent.vibeMode.descriptions.think.examples.apiExample.models.success', { count: (models.length || 0) as number })}</p>
                 <button
                   onClick={() => refetch()}
                   className="mt-2 px-4 py-2 bg-blue-500 text-white rounded hover:bg-blue-600"
                 >
-                  {t('vibe.descriptions.process.examples.apiExample.models.refetch')}
+                  {t('agent.vibeMode.descriptions.think.examples.apiExample.models.refetch')}
                 </button>
               </div>
             )}
           </div>
 
           <div className="p-4 bg-green-50 rounded">
-            <h3 className="font-semibold mb-2">{t('vibe.descriptions.process.examples.apiExample.manualApi.title')}</h3>
+            <h3 className="font-semibold mb-2">{t('agent.vibeMode.descriptions.think.examples.apiExample.manualApi.title')}</h3>
             <button
               onClick={handleManualCall}
               className="px-4 py-2 bg-green-500 text-white rounded hover:bg-green-600"
             >
-              {t('vibe.descriptions.process.examples.apiExample.manualApi.button')}
+              {t('agent.vibeMode.descriptions.think.examples.apiExample.manualApi.button')}
             </button>
             {manualResult && (
               <pre className="mt-2 p-2 bg-gray-100 rounded text-sm overflow-auto">
@@ -110,17 +110,17 @@ export function ApiExample() {
         <div className="flex">
           <div className="ml-3">
             <p className="text-sm text-yellow-700">
-              <strong>{t('vibe.descriptions.process.examples.apiExample.guide.title')}</strong>
+              <strong>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.title')}</strong>
             </p>
             <ul className="mt-1 text-sm text-yellow-700 list-disc list-inside">
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.accessToken')}</li>
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.refreshToken')}</li>
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.autoRefresh')}</li>
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.offlineRecovery')}</li>
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.wsSupport')}</li>
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.tokenRotation')}</li>
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.seamless')}</li>
-              <li>{t('vibe.descriptions.process.examples.apiExample.guide.smartCache')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.accessToken')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.refreshToken')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.autoRefresh')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.offlineRecovery')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.wsSupport')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.tokenRotation')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.seamless')}</li>
+              <li>{t('agent.vibeMode.descriptions.think.examples.apiExample.guide.smartCache')}</li>
             </ul>
           </div>
         </div>

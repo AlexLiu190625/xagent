@@ -60,7 +60,7 @@ interface MemoryFilters {
 }
 
 export function MemoryPage() {
-  const { t, locale } = useI18n()
+  const { t, tDynamic, locale } = useI18n()
   const [memories, setMemories] = useState<MemoryItem[]>([])
   const [stats, setStats] = useState<MemoryStats | null>(null)
   const [loading, setLoading] = useState(true)
@@ -408,7 +408,7 @@ export function MemoryPage() {
                         cat === 'react_memory' ? 'bg-purple-400' :
                           'bg-blue-400'
                     )} />
-                    {t(`memory.filters.categoryOptions.${cat}`)}
+                    {tDynamic(`memory.filters.categoryOptions.${cat}`, cat.replace(/_/g, " "))}
                     {stats?.category_counts[cat] ? (
                       <span className="ml-2 md:ml-auto text-xs text-muted-foreground">
                         {stats.category_counts[cat]}
@@ -433,7 +433,12 @@ export function MemoryPage() {
                 onChange={handleSelectAll}
               />
               <h2 className="text-base sm:text-lg font-semibold truncate">
-                {filters.category ? t(`memory.filters.categoryOptions.${filters.category}`) : t("memory.sidebar.allMemories")}
+                {filters.category
+                  ? tDynamic(
+                      `memory.filters.categoryOptions.${filters.category}`,
+                      filters.category.replace(/_/g, " "),
+                    )
+                  : t("memory.sidebar.allMemories")}
               </h2>
             </div>
             <div className="flex items-center gap-2">
@@ -536,9 +541,10 @@ export function MemoryPage() {
                           <div className="flex-1 min-w-0 space-y-2">
                             <div className="flex flex-col sm:flex-row sm:items-center gap-1 sm:gap-3">
                               <Badge variant="outline" className={cn("w-fit rounded-md border-0 px-2 py-0.5 text-[10px] sm:text-xs font-medium uppercase tracking-wide", badgeColorClass)}>
-                                {t(`memory.filters.categoryOptions.${memory.category}`) === `memory.filters.categoryOptions.${memory.category}`
-                                  ? memory.category.replace(/_/g, ' ')
-                                  : t(`memory.filters.categoryOptions.${memory.category}`)}
+                                {tDynamic(
+                                  `memory.filters.categoryOptions.${memory.category}`,
+                                  memory.category.replace(/_/g, " "),
+                                )}
                               </Badge>
                               <span className="text-[10px] sm:text-xs text-muted-foreground">
                                 {memory.category === 'general' ? t("memory.item.addedManually") : t("memory.item.addedAutomatically")} • {formatDate(memory.timestamp)}

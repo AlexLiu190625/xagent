@@ -31,7 +31,7 @@ export function ReviewStep({
   agents,
   getAgentHref = (agentId) => `/build/${agentId}`,
 }: ReviewStepProps) {
-  const { t } = useI18n()
+  const { t, tDynamic } = useI18n()
   const manager = agents.find((agent) => String(agent.id) === managerAgentId)
 
   const warnings: string[] = []
@@ -109,7 +109,9 @@ export function ReviewStep({
               <div className="flex items-center gap-2 font-medium">
                 <span>{manager?.name || t("workforces.common.notSelected")}</span>
                 {manager ? (
-                  <Badge variant="outline">{t(`workforces.status.${manager.status}`)}</Badge>
+                  <Badge variant="outline">
+                    {tDynamic(`workforces.status.${manager.status}`, manager.status)}
+                  </Badge>
                 ) : null}
                 {manager && !canEditAgent(manager) ? (
                   <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>
@@ -172,7 +174,9 @@ export function ReviewStep({
                           {t(`workforces.sourceTypes.${worker.source_type}`)}
                         </Badge>
                         {agent ? (
-                          <Badge variant="secondary">{t(`workforces.status.${agent.status}`)}</Badge>
+                          <Badge variant="secondary">
+                            {tDynamic(`workforces.status.${agent.status}`, agent.status)}
+                          </Badge>
                         ) : null}
                         {agent && !canEditAgent(agent) ? (
                           <Badge variant="secondary">{t("workforces.actions.readOnly")}</Badge>

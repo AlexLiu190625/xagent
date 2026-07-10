@@ -2,6 +2,7 @@ import React from "react";
 import { Loader2, File as FileIcon } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { FileItem } from "@/hooks/use-file-mention";
+import type { Translate } from "@/contexts/i18n-context"
 
 interface FileMentionDropdownProps {
   show: boolean;
@@ -9,7 +10,7 @@ interface FileMentionDropdownProps {
   filteredFiles: FileItem[];
   selectedFileIndex: number;
   onInsert: (file: FileItem) => void;
-  t: (key: string) => string;
+  t: Translate;
   position?: { top?: number; bottom?: number; left: number } | null;
 }
 

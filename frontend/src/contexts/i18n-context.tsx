@@ -1,23 +1,40 @@
 "use client"
 
 import React, { createContext, useContext, useEffect, useMemo, useState } from "react"
-import { translations } from "@/i18n/translations"
+import {
+  resolveDynamicTranslation,
+  resolveTranslation,
+  type Locale,
+  type TranslationKey,
+  type TranslationVariables,
+} from "@/i18n/translations"
 
-export type Locale = "en" | "zh"
+export type { Locale } from "@/i18n/translations"
 
-type TFunc = (key: string, vars?: Record<string, string | number>) => string
+export type Translate = (
+  key: TranslationKey,
+  vars?: TranslationVariables,
+) => string
+export type TranslateDynamic = (
+  key: string,
+  fallback: string,
+  vars?: TranslationVariables,
+) => string
 
 interface I18nContextValue {
   locale: Locale
   setLocale: (l: Locale) => void
-  t: TFunc
+  t: Translate
+  tDynamic: TranslateDynamic
 }
 
 const I18nContext = createContext<I18nContextValue | undefined>(undefined)
+const reportedMissingKeys = new Set<string>()
 
-function interpolate(str: string, vars?: Record<string, string | number>) {
-  if (!vars) return str
-  return Object.entries(vars).reduce((s, [k, v]) => s.replace(new RegExp(`\\{${k}\\}`, "g"), String(v)), str)
+function reportMissingTranslation(key: string): void {
+  if (process.env.NODE_ENV === "production" || reportedMissingKeys.has(key)) return
+  reportedMissingKeys.add(key)
+  console.warn(`Missing translation key: ${key}`)
 }
 
 export function I18nProvider({
@@ -59,16 +76,26 @@ export function I18nProvider({
     }
   }, [locale])
 
-  const t: TFunc = useMemo(() => {
-    return (key, vars) => {
-      const dict: any = translations[locale] || {}
-      const value = key.split(".").reduce((acc: any, part: string) => (acc && acc[part] !== undefined ? acc[part] : undefined), dict)
-      const str = typeof value === "string" ? value : key
-      return interpolate(str, vars)
-    }
-  }, [locale])
+  const t = useMemo<Translate>(
+    () => (key, vars) =>
+      resolveTranslation(locale, key, vars, {
+        onMissing: reportMissingTranslation,
+      }),
+    [locale],
+  )
 
-  const value = useMemo(() => ({ locale, setLocale, t }), [locale, t])
+  const tDynamic = useMemo<TranslateDynamic>(
+    () => (key, fallback, vars) =>
+      resolveDynamicTranslation(locale, key, fallback, vars, {
+        onMissing: reportMissingTranslation,
+      }),
+    [locale],
+  )
+
+  const value = useMemo(
+    () => ({ locale, setLocale, t, tDynamic }),
+    [locale, t, tDynamic],
+  )
 
   return <I18nContext.Provider value={value}>{children}</I18nContext.Provider>
 }

@@ -10,6 +10,7 @@ import type { Template } from "@/types/template";
 import { FeaturedTemplateCard } from "@/components/templates/featured-template-card";
 import { LibraryTemplateCard } from "@/components/templates/library-template-card";
 import { SegmentedTabs } from "@/components/ui/segmented-tabs";
+import type { TranslationKey } from "@/i18n/translations";
 
 interface CategorySection {
   id: string;
@@ -17,7 +18,7 @@ interface CategorySection {
   templates: Template[];
 }
 
-const CATEGORY_LABEL_KEYS: Record<string, string> = {
+const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   sales: "templates.categoryTitles.sales",
   marketing: "templates.categoryTitles.marketing",
   support: "templates.categoryTitles.support",

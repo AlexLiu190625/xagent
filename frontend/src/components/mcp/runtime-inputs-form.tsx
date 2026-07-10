@@ -14,6 +14,7 @@ import {
 } from "@/components/ui/select-radix"
 import { Switch } from "@/components/ui/switch"
 import { useI18n } from "@/contexts/i18n-context"
+import type { TranslationKey } from "@/i18n/translations"
 
 import type { MCPServerFormData } from "./custom-api-form"
 
@@ -69,9 +70,14 @@ interface RuntimeInputsFormProps {
   connectorType: ConnectorType
   formData: MCPServerFormData
   setFormData: React.Dispatch<React.SetStateAction<MCPServerFormData>>
-  onValidationErrorChange?: (error: string | null) => void
+  onValidationErrorChange?: (error: RuntimeConfigErrorKey | null) => void
   disabled?: boolean
 }
+
+export type RuntimeConfigErrorKey = Extract<
+  TranslationKey,
+  `tools.mcp.runtime.errors.${string}`
+>
 
 const SOURCE_KEY_RE = /[^A-Za-z0-9_-]/g
 
@@ -218,7 +224,9 @@ function targetNeedsPath(targetType: RuntimeTargetType): boolean {
   return targetType === "body_field"
 }
 
-function duplicateRuntimeInputError(inputs: RuntimeInputRow[]): string | null {
+function duplicateRuntimeInputError(
+  inputs: RuntimeInputRow[],
+): RuntimeConfigErrorKey | null {
   const seen = new Set<string>()
   for (const input of inputs) {
     const key = sanitizeRuntimeKey(input.key.trim())
@@ -235,7 +243,7 @@ function bindingError(
   inputs: RuntimeInputRow[],
   connectorType: ConnectorType,
   delegatedEnabled: boolean,
-): string | null {
+): RuntimeConfigErrorKey | null {
   if (!binding.targetKey.trim()) return "tools.mcp.runtime.errors.targetMissing"
   const source = inputs.find(
     (row) => row.inputType === binding.sourceType && row.key === binding.sourceKey,
@@ -284,7 +292,7 @@ function bindingError(
 export function getRuntimeConfigError(
   formData: MCPServerFormData,
   connectorType: ConnectorType,
-): string | null {
+): RuntimeConfigErrorKey | null {
   const inputs = runtimeInputsFromSchema(formData.runtime_input_schema)
   const bindings = runtimeBindingsFromConfig(formData.runtime_bindings)
   const delegatedEnabled = Boolean(formData.allow_delegated_authorization)
@@ -292,7 +300,7 @@ export function getRuntimeConfigError(
     duplicateRuntimeInputError(inputs) ||
     bindings
       .map((binding) => bindingError(binding, inputs, connectorType, delegatedEnabled))
-      .find((error): error is string => Boolean(error)) ||
+      .find((error): error is RuntimeConfigErrorKey => Boolean(error)) ||
     null
   )
 }
@@ -373,7 +381,7 @@ export function RuntimeInputsForm({
   )
   const bindingErrors = bindings
     .map((binding) => bindingError(binding, inputs, connectorType, delegatedEnabled))
-    .filter((error): error is string => Boolean(error))
+    .filter((error): error is RuntimeConfigErrorKey => Boolean(error))
   const duplicateInputError = duplicateRuntimeInputError(inputs)
   const localValidationError = duplicateInputError || bindingErrors[0] || null
   const hasToolArgumentBinding = bindings.some(

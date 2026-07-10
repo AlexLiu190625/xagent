@@ -49,7 +49,7 @@ export function ReplayControls({
           variant="ghost"
           onClick={isPlaying ? onPause : onPlay}
           className="h-7 w-7 p-0"
-          title={isPlaying ? t('agent.replay.controls.pause') : t('agent.logs.replay.controls.play')}
+          title={isPlaying ? t('agent.replay.controls.pause') : t('agent.replay.controls.play')}
         >
           {isPlaying ? (
             <Pause className="h-3 w-3" />

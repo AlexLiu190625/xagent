@@ -26,7 +26,7 @@ import { storeAuthTokenPayload } from "@/lib/auth-cache"
 
 export function LoginPage() {
   const branding = getBrandingFromEnv()
-  const { t } = useI18n()
+  const { t, tDynamic } = useI18n()
   const [showPassword, setShowPassword] = useState(false)
   const [isLoading, setIsLoading] = useState(false)
   const [isGoogleConfigured, setIsGoogleConfigured] = useState<boolean | null>(null)
@@ -44,11 +44,11 @@ export function LoginPage() {
     const params = new URLSearchParams(window.location.search)
     const oidcError = params.get("oidc_error")
     if (oidcError) {
-      const translatedError = t(`login.oidc_errors.${oidcError}`)
       setError(
-        translatedError === `login.oidc_errors.${oidcError}`
-          ? t("login.alerts.google_failed")
-          : translatedError
+        tDynamic(
+          `login.oidc_errors.${oidcError}`,
+          t("login.alerts.google_failed"),
+        ),
       )
     }
 
