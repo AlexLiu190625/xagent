@@ -989,6 +989,52 @@ Build when you need.`,
       description: "Manage your Model Context Protocol (MCP) server configurations",
       addConnector: "Add Connector",
       badge: "Connector",
+      runtime: {
+        title: "Runtime Inputs",
+        delegatedAuthorization: "Delegated Authorization",
+        authorizationRequiresDelegated: "Authorization bindings require delegated authorization.",
+        inputs: "Inputs",
+        bindings: "Bindings",
+        addInput: "Add Input",
+        addBinding: "Add Binding",
+        noInputs: "No runtime inputs",
+        noBindings: "No runtime bindings",
+        noSourceKeys: "No keys",
+        boundHeaders: "Runtime-bound headers",
+        boundBodyFields: "Runtime-bound body fields",
+        toolArgumentsHidden: "Runtime-bound tool arguments are hidden from the model and injected only at connector call time.",
+        key: "key",
+        path: "path",
+        required: "Required",
+        inputTypes: {
+          context: "Context",
+          secrets: "Secret",
+          auth_selector: "OAuth Selector"
+        },
+        valueTypes: {
+          string: "String",
+          object: "Object"
+        },
+        targetTypes: {
+          mcp_meta: "MCP _meta",
+          tool_arguments: "Tool Argument",
+          transport_headers: "Transport Header",
+          headers: "Header",
+          body_field: "Body Field"
+        },
+        errors: {
+          sourceMissing: "This binding references an input that is not declared.",
+          sourceUnsupported: "This input type is not supported for this connector.",
+          targetUnsupported: "This target is not supported for this connector.",
+          authSelectorBinding: "OAuth selectors cannot be bound directly to connector targets.",
+          secretTarget: "Secrets can only bind to connector headers.",
+          contextTarget: "Context cannot bind to this target.",
+          objectHeader: "Object values cannot bind to headers.",
+          duplicateInput: "Runtime input keys must be unique within the same input type.",
+          targetMissing: "This binding needs a target key or path.",
+          authorizationRequiresDelegated: "Authorization bindings require delegated authorization."
+        }
+      },
       dialog: {
         addTitle: "Add MCP Server",
         editTitle: "Edit MCP Server",
@@ -1054,52 +1100,6 @@ Build when you need.`,
           basic: "Basic Auth",
           oauth2: "OAuth 2.0",
           mcpOAuth: "MCP OAuth"
-        },
-        runtime: {
-          title: "Runtime Inputs",
-          delegatedAuthorization: "Delegated Authorization",
-          authorizationRequiresDelegated: "Authorization bindings require delegated authorization.",
-          inputs: "Inputs",
-          bindings: "Bindings",
-          addInput: "Add Input",
-          addBinding: "Add Binding",
-          noInputs: "No runtime inputs",
-          noBindings: "No runtime bindings",
-          noSourceKeys: "No keys",
-          boundHeaders: "Runtime-bound headers",
-          boundBodyFields: "Runtime-bound body fields",
-          toolArgumentsHidden: "Runtime-bound tool arguments are hidden from the model and injected only at connector call time.",
-          key: "key",
-          path: "path",
-          required: "Required",
-          inputTypes: {
-            context: "Context",
-            secrets: "Secret",
-            auth_selector: "OAuth Selector"
-          },
-          valueTypes: {
-            string: "String",
-            object: "Object"
-          },
-          targetTypes: {
-            mcp_meta: "MCP _meta",
-            tool_arguments: "Tool Argument",
-            transport_headers: "Transport Header",
-            headers: "Header",
-            body_field: "Body Field"
-          },
-          errors: {
-            sourceMissing: "This binding references an input that is not declared.",
-            sourceUnsupported: "This input type is not supported for this connector.",
-            targetUnsupported: "This target is not supported for this connector.",
-            authSelectorBinding: "OAuth selectors cannot be bound directly to connector targets.",
-            secretTarget: "Secrets can only bind to connector headers.",
-            contextTarget: "Context cannot bind to this target.",
-            objectHeader: "Object values cannot bind to headers.",
-            duplicateInput: "Runtime input keys must be unique within the same input type.",
-            targetMissing: "This binding needs a target key or path.",
-            authorizationRequiresDelegated: "Authorization bindings require delegated authorization."
-          }
         },
         headerName: "Header Name",
         headerNamePlaceholder: "e.g. X-API-Key",

@@ -989,6 +989,52 @@ Build when you need.`,
       description: "管理您的 Model Context Protocol (MCP) 服务器配置",
       addConnector: "添加连接器",
       badge: "连接器",
+      runtime: {
+        title: "运行时入参",
+        delegatedAuthorization: "委托授权",
+        authorizationRequiresDelegated: "Authorization 绑定需要开启委托授权。",
+        inputs: "入参",
+        bindings: "绑定",
+        addInput: "添加入参",
+        addBinding: "添加绑定",
+        noInputs: "暂无运行时入参",
+        noBindings: "暂无运行时绑定",
+        noSourceKeys: "暂无字段",
+        boundHeaders: "运行时绑定的请求头",
+        boundBodyFields: "运行时绑定的请求体字段",
+        toolArgumentsHidden: "运行时绑定的工具参数不会暴露给模型，只会在连接器调用时注入。",
+        key: "字段",
+        path: "路径",
+        required: "必填",
+        inputTypes: {
+          context: "上下文",
+          secrets: "密钥",
+          auth_selector: "OAuth 选择器"
+        },
+        valueTypes: {
+          string: "字符串",
+          object: "对象"
+        },
+        targetTypes: {
+          mcp_meta: "MCP _meta",
+          tool_arguments: "工具参数",
+          transport_headers: "传输请求头",
+          headers: "请求头",
+          body_field: "请求体字段"
+        },
+        errors: {
+          sourceMissing: "该绑定引用了未声明的入参。",
+          sourceUnsupported: "该连接器不支持这个入参类型。",
+          targetUnsupported: "该连接器不支持这个目标位置。",
+          authSelectorBinding: "OAuth 选择器不能直接绑定到连接器目标。",
+          secretTarget: "密钥只能绑定到连接器请求头。",
+          contextTarget: "上下文不能绑定到这个目标位置。",
+          objectHeader: "对象类型不能绑定到请求头。",
+          duplicateInput: "同一入参类型下的运行时字段不能重复。",
+          targetMissing: "该绑定需要填写目标字段或路径。",
+          authorizationRequiresDelegated: "Authorization 绑定需要开启委托授权。"
+        }
+      },
       dialog: {
         addTitle: "添加 MCP 服务器",
         editTitle: "编辑 MCP 服务器",
@@ -1054,52 +1100,6 @@ Build when you need.`,
           basic: "Basic Auth",
           oauth2: "OAuth 2.0",
           mcpOAuth: "MCP OAuth"
-        },
-        runtime: {
-          title: "运行时入参",
-          delegatedAuthorization: "委托授权",
-          authorizationRequiresDelegated: "Authorization 绑定需要开启委托授权。",
-          inputs: "入参",
-          bindings: "绑定",
-          addInput: "添加入参",
-          addBinding: "添加绑定",
-          noInputs: "暂无运行时入参",
-          noBindings: "暂无运行时绑定",
-          noSourceKeys: "暂无字段",
-          boundHeaders: "运行时绑定的请求头",
-          boundBodyFields: "运行时绑定的请求体字段",
-          toolArgumentsHidden: "运行时绑定的工具参数不会暴露给模型，只会在连接器调用时注入。",
-          key: "字段",
-          path: "路径",
-          required: "必填",
-          inputTypes: {
-            context: "上下文",
-            secrets: "密钥",
-            auth_selector: "OAuth 选择器"
-          },
-          valueTypes: {
-            string: "字符串",
-            object: "对象"
-          },
-          targetTypes: {
-            mcp_meta: "MCP _meta",
-            tool_arguments: "工具参数",
-            transport_headers: "传输请求头",
-            headers: "请求头",
-            body_field: "请求体字段"
-          },
-          errors: {
-            sourceMissing: "该绑定引用了未声明的入参。",
-            sourceUnsupported: "该连接器不支持这个入参类型。",
-            targetUnsupported: "该连接器不支持这个目标位置。",
-            authSelectorBinding: "OAuth 选择器不能直接绑定到连接器目标。",
-            secretTarget: "密钥只能绑定到连接器请求头。",
-            contextTarget: "上下文不能绑定到这个目标位置。",
-            objectHeader: "对象类型不能绑定到请求头。",
-            duplicateInput: "同一入参类型下的运行时字段不能重复。",
-            targetMissing: "该绑定需要填写目标字段或路径。",
-            authorizationRequiresDelegated: "Authorization 绑定需要开启委托授权。"
-          }
         },
         headerName: "请求头名称",
         headerNamePlaceholder: "例如 X-API-Key",
