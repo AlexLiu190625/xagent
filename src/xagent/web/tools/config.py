@@ -149,7 +149,10 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
 
 
 def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
-    raw_actor_id = getattr(exc, "oauth_token_resolver_diagnostic_actor_id", None)
+    try:
+        raw_actor_id = getattr(exc, "oauth_token_resolver_diagnostic_actor_id", None)
+    except Exception:
+        return None
     if not isinstance(raw_actor_id, str):
         return None
     return _bounded_oauth_metadata(raw_actor_id)
