@@ -1300,7 +1300,7 @@ class WebToolConfig(BaseToolConfig):
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
         ]
         diagnostic["exception_type"] = _bounded_oauth_metadata(error.exception_type)
-        if error.actor_id is not None:
+        if error.actor_id:
             diagnostic["actor_id"] = error.actor_id
         return diagnostic
 

@@ -787,6 +787,32 @@ async def test_hook_failure_with_raising_actor_string_subclass_stays_sanitized(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("raw_actor_id", [123, 1.5, True, ""])
+async def test_hook_failure_drops_non_string_or_empty_actor_id(
+    db_session,
+    raw_actor_id,
+):
+    db, user = db_session
+    _add_oauth_server(db, user, launch_config=_launch_config())
+
+    class ResolverFailure(RuntimeError):
+        oauth_token_resolver_diagnostic_actor_id = raw_actor_id
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ResolverFailure("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert configs[0]["transport"] == "unavailable"
+    assert diagnostic["exception_type"] == "ResolverFailure"
+    assert "actor_id" not in diagnostic
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resolved", "exception_type"),
     [
