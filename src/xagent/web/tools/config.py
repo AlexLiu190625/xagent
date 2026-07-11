@@ -126,11 +126,13 @@ class _OAuthTokenResolverFailed(Exception):
         providers: list[str],
         exception_type: str,
         resource: str | None = None,
+        actor_id: str | None = None,
     ) -> None:
         super().__init__(OAUTH_TOKEN_RESOLVER_FAILURE_CODE)
         self.providers = providers
         self.exception_type = exception_type
         self.resource = resource
+        self.actor_id = actor_id
 
 
 class _OAuthLaunchConfigInvalid(Exception):
@@ -144,6 +146,13 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
     if len(text) <= max_length:
         return text
     return f"{text[: max_length - 3]}..."
+
+
+def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
+    raw_actor_id = getattr(exc, "oauth_token_resolver_diagnostic_actor_id", None)
+    if not isinstance(raw_actor_id, str):
+        return None
+    return _bounded_oauth_metadata(raw_actor_id)
 
 
 def _normalize_oauth_expires_at(expires_at: datetime | None) -> datetime | None:
@@ -1196,6 +1205,7 @@ class WebToolConfig(BaseToolConfig):
                     providers=providers,
                     exception_type=_bounded_oauth_metadata(type(exc).__name__),
                     resource=resource,
+                    actor_id=_extract_oauth_token_resolver_diagnostic_actor_id(exc),
                 ) from exc
 
             if resolved is None:
@@ -1287,6 +1297,8 @@ class WebToolConfig(BaseToolConfig):
             _bounded_oauth_metadata(provider) for provider in error.providers[:2]
         ]
         diagnostic["exception_type"] = _bounded_oauth_metadata(error.exception_type)
+        if error.actor_id is not None:
+            diagnostic["actor_id"] = error.actor_id
         return diagnostic
 
     def _build_unavailable_oauth_mcp_config(

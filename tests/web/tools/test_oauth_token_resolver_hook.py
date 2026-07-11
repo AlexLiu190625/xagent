@@ -613,7 +613,9 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
     assert "runtime_bindings" not in unavailable
     assert "allow_delegated_authorization" not in unavailable
     assert "connector_runtime" not in unavailable
-    assert cfg.get_mcp_oauth_diagnostics() == [
+    diagnostics = cfg.get_mcp_oauth_diagnostics()
+    assert "actor_id" not in diagnostics[0]
+    assert diagnostics == [
         {
             "code": "oauth_token_resolver_failed",
             "message": "OAuth token resolver failed",
@@ -669,6 +671,39 @@ async def test_hook_failure_diagnostic_includes_bounded_resource(db_session):
     diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
     assert diagnostic["resource"] == f"{resource[:125]}..."
     assert len(diagnostic["resource"]) == 128
+
+
+@pytest.mark.asyncio
+async def test_hook_failure_diagnostic_includes_bounded_actor_id_without_secrets(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    resource = "https://mcp.example.com/oauth/resource"
+    _add_oauth_server(db, user, launch_config=_launch_config(resource=resource))
+    actor_id = "actor-" + "x" * 200
+
+    class DelegatedRefreshFailure(RuntimeError):
+        oauth_token_resolver_diagnostic_actor_id = actor_id
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise DelegatedRefreshFailure("secret-token-in-exception")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    unavailable = configs[0]
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert unavailable["transport"] == "unavailable"
+    assert diagnostic["resource"] == resource
+    assert diagnostic["actor_id"] == f"{actor_id[:125]}..."
+    assert len(diagnostic["actor_id"]) == 128
+    assert "secret-token-in-exception" not in str(unavailable)
+    assert "secret-token-in-exception" not in diagnostic["message"]
+    assert "secret-token-in-exception" not in caplog.text
 
 
 @pytest.mark.asyncio
