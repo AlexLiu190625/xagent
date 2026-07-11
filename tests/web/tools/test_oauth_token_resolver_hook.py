@@ -746,6 +746,47 @@ async def test_hook_failure_with_raising_actor_attribute_stays_sanitized(
 
 
 @pytest.mark.asyncio
+async def test_hook_failure_with_raising_actor_string_subclass_stays_sanitized(
+    db_session,
+    caplog,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    _add_stdio_server(db, user, name="before")
+    oauth_server = _add_oauth_server(db, user, launch_config=_launch_config())
+    _add_stdio_server(db, user, name="after")
+
+    class RaisingStr(str):
+        def __str__(self) -> str:
+            raise RuntimeError("secret-from-string-conversion")
+
+    class ResolverFailure(RuntimeError):
+        oauth_token_resolver_diagnostic_actor_id = RaisingStr("actor-1")
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        raise ResolverFailure("resolver failed")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == [
+        "before",
+        "Google Drive",
+        "after",
+    ]
+    unavailable = configs[1]
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert unavailable["transport"] == "unavailable"
+    assert unavailable["config"]["server_id"] == oauth_server.id
+    assert diagnostic["exception_type"] == "ResolverFailure"
+    assert "actor_id" not in diagnostic
+    assert "secret-from-string-conversion" not in str(unavailable)
+    assert "secret-from-string-conversion" not in caplog.text
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("resolved", "exception_type"),
     [

@@ -151,11 +151,11 @@ def _bounded_oauth_metadata(value: Any, *, max_length: int = 128) -> str:
 def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | None:
     try:
         raw_actor_id = getattr(exc, "oauth_token_resolver_diagnostic_actor_id", None)
+        if type(raw_actor_id) is not str:
+            return None
+        return _bounded_oauth_metadata(raw_actor_id)
     except Exception:
         return None
-    if not isinstance(raw_actor_id, str):
-        return None
-    return _bounded_oauth_metadata(raw_actor_id)
 
 
 def _normalize_oauth_expires_at(expires_at: datetime | None) -> datetime | None:
