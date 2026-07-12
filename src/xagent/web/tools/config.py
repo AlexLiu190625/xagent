@@ -1925,35 +1925,38 @@ class WebToolConfig(BaseToolConfig):
                         server_id=int(server.id),
                         runtime_values=runtime_values,
                     )
-                    app_info = get_app_by_name(self.db, str(server.name))
-                    providers_to_resolve = (
-                        _oauth_token_provider_candidates(app_info)
-                        if app_info
-                        else [str(server.name)]
-                    )
-                    configured_resource = effective_mcp_oauth_resource(
-                        server,
-                        mcp_auth_context=auth_context,
-                    )
                     resolver, registration_generation = _get_oauth_token_resolver_hook()
+                    remote_providers_to_resolve: list[str] = []
+                    remote_configured_resource: str | None = None
                     remote_hook_token: _ResolvedHookToken | None = None
-                    if resolver is not None and providers_to_resolve:
-                        try:
-                            remote_hook_token = (
-                                await self._resolve_oauth_token_from_hook(
-                                    providers=providers_to_resolve,
-                                    resource=configured_resource,
-                                    resolver=resolver,
+                    if resolver is not None:
+                        app_info = get_app_by_name(self.db, str(server.name))
+                        remote_providers_to_resolve = (
+                            _oauth_token_provider_candidates(app_info)
+                            if app_info
+                            else [str(server.name)]
+                        )
+                        remote_configured_resource = effective_mcp_oauth_resource(
+                            server,
+                            mcp_auth_context=auth_context,
+                        )
+                        if remote_providers_to_resolve:
+                            try:
+                                remote_hook_token = (
+                                    await self._resolve_oauth_token_from_hook(
+                                        providers=remote_providers_to_resolve,
+                                        resource=remote_configured_resource,
+                                        resolver=resolver,
+                                    )
                                 )
-                            )
-                        except _OAuthTokenResolverFailed as error:
-                            configs.append(
-                                self._resolver_failure_config(
-                                    server=server,
-                                    error=error,
+                            except _OAuthTokenResolverFailed as error:
+                                configs.append(
+                                    self._resolver_failure_config(
+                                        server=server,
+                                        error=error,
+                                    )
                                 )
-                            )
-                            continue
+                                continue
 
                     if remote_hook_token is not None and resolver is not None:
                         self._mark_hook_token_cache_metadata(remote_hook_token)
@@ -1961,10 +1964,10 @@ class WebToolConfig(BaseToolConfig):
                             resolver=resolver,
                             registration_generation=registration_generation,
                             resolved=remote_hook_token,
-                            providers=providers_to_resolve,
+                            providers=remote_providers_to_resolve,
                             user_id=int(self._user_id),
                             scope=self.get_execution_scope(),
-                            resource=configured_resource,
+                            resource=remote_configured_resource,
                             non_auth_connection=self._non_auth_mcp_connection(
                                 server=server,
                                 runtime_values=runtime_values,

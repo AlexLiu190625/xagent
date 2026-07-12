@@ -1250,6 +1250,72 @@ def _challenge() -> MCPAuthorizationChallenge:
 
 
 @pytest.mark.asyncio
+async def test_remote_without_hook_skips_resolver_candidate_work(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    _add_remote_server(
+        db,
+        user,
+        headers={"X-Static": "static", "Authorization": "Bearer static-token"},
+    )
+
+    def unexpected_resolver_work(*args, **kwargs):
+        pytest.fail("resolver-specific work ran without a registered hook")
+
+    monkeypatch.setattr("xagent.web.mcp_apps.get_app_by_name", unexpected_resolver_work)
+    monkeypatch.setattr(
+        "xagent.web.services.mcp_runtime.effective_mcp_oauth_resource",
+        unexpected_resolver_work,
+    )
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert configs[0]["config"]["headers"] == {
+        "X-Static": "static",
+        "Authorization": "Bearer static-token",
+    }
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_future_expiry_is_cached_until_registration_changes(
+    db_session,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+    calls = 0
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        nonlocal calls
+        calls += 1
+        return ResolvedToken(
+            access_token=f"remote-hook-token-{calls}",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            generation=f"remote-generation-{calls}",
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    first = await cfg.get_mcp_server_configs()
+    second = await cfg.get_mcp_server_configs()
+    set_oauth_token_resolver_hook(resolver)
+    third = await cfg.get_mcp_server_configs()
+
+    assert calls == 2
+    assert first[0]["config"]["headers"]["Authorization"] == (
+        "Bearer remote-hook-token-1"
+    )
+    assert second[0]["config"]["headers"]["Authorization"] == (
+        "Bearer remote-hook-token-1"
+    )
+    assert third[0]["config"]["headers"]["Authorization"] == (
+        "Bearer remote-hook-token-2"
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
     db_session,
     caplog,
