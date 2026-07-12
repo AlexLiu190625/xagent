@@ -886,7 +886,9 @@ class MCPToolAdapter(AbstractBaseTool):
 class _UnavailableMCPToolResult(BaseModel):
     success: bool = Field(default=False, description="Whether execution succeeded")
     status: str = Field(default="error", description="Tool execution status")
-    error: str = Field(description="Public-safe tool failure message")
+    error: str | None = Field(
+        default=None, description="Public-safe tool failure message when available"
+    )
     failure_code: str | None = Field(
         default=None, description="Allowlisted public tool failure classification"
     )

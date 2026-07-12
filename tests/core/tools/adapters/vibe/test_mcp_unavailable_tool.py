@@ -161,6 +161,17 @@ async def test_unavailable_tool_async_unauthorized_uses_mcp_access_denied(
     }
 
 
+def test_unavailable_tool_return_schema_accepts_access_denied_result(monkeypatch):
+    monkeypatch.setenv("XAGENT_USER_ID", "8")
+    tool = _unavailable_tool(allow_users=["7"])
+
+    result = tool.run_json_sync({})
+    parsed = tool.return_type().model_validate(result)
+
+    assert parsed.error is None
+    assert parsed.is_error is True
+
+
 def test_unavailable_tool_sync_unauthorized_uses_mcp_access_denied(monkeypatch):
     monkeypatch.setenv("XAGENT_USER_ID", "8")
     tool = _unavailable_tool(allow_users=["7"])
