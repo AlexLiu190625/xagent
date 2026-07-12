@@ -659,6 +659,26 @@ async def test_hook_is_not_asked_without_app_info(db_session):
 
 
 @pytest.mark.asyncio
+async def test_remote_hook_without_app_info_can_claim_authorization(db_session):
+    db, user = db_session
+    server = _add_remote_server(db, user, name="Unregistered Remote")
+    db.query(PublicMCPApp).filter(PublicMCPApp.name == server.name).delete()
+    db.commit()
+    seen: list[TokenRequest] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        seen.append(request)
+        return ResolvedToken(access_token="resolver-token", generation="generation-1")
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [request.provider for request in seen] == ["Unregistered Remote"]
+    assert configs[0]["config"]["headers"]["Authorization"] == ("Bearer resolver-token")
+
+
+@pytest.mark.asyncio
 async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
     db_session,
     caplog,
@@ -1697,6 +1717,29 @@ async def test_remote_hook_refresh_invalid_results_fail_closed(
     refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
 
     assert await refresh(_challenge()) is None
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_missing_initial_generation_does_not_call_refresh_resolver(
+    db_session,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+    refresh_calls = 0
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        nonlocal refresh_calls
+        if request.refresh is None:
+            return ResolvedToken(access_token="initial-token")
+        refresh_calls += 1
+        return ResolvedToken(access_token="refreshed-token", generation="generation-2")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    assert await refresh(_challenge()) is None
+    assert refresh_calls == 0
 
 
 @pytest.mark.asyncio

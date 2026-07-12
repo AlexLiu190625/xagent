@@ -62,11 +62,12 @@ class OAuthRefreshContext:
 class TokenRequest:
     """Request passed to the OAuth token resolver hook.
 
-    Providers are requested in the same candidate order used by the built-in
-    UserOAuth lookup: provider name first, then app id, de-duplicated. The
-    first resolver hit wins. ``resource`` is the configured MCP OAuth resource
-    URI for the current app/server when present, passed verbatim without
-    canonicalization. ``scope`` is the current execution scope from
+    Registered MCP apps use provider name followed by app id, de-duplicated.
+    Remote MCP servers without a matching app use the server name as a neutral
+    compatibility candidate; embedders must not treat that name as an identity
+    boundary. The first resolver hit wins. ``resource`` is the configured MCP
+    OAuth resource URI for the current app/server when present, passed verbatim
+    without canonicalization. ``scope`` is the current execution scope from
     ``WebToolConfig.get_execution_scope()`` when present; it is typed as
     Optional[Any] to avoid importing the core scope type into this config layer.
     """
@@ -1378,7 +1379,10 @@ class WebToolConfig(BaseToolConfig):
     ) -> dict[str, Any] | None:
         from ...web.services.mcp_oauth import MCPAuthorizationChallenge
 
-        if not isinstance(challenge, MCPAuthorizationChallenge):
+        if (
+            not isinstance(challenge, MCPAuthorizationChallenge)
+            or failed_generation is None
+        ):
             return None
         current_resolver, current_generation = _get_oauth_token_resolver_hook()
         if (
@@ -1914,7 +1918,9 @@ class WebToolConfig(BaseToolConfig):
                     )
                     app_info = get_app_by_name(self.db, str(server.name))
                     providers_to_resolve = (
-                        _oauth_token_provider_candidates(app_info) if app_info else []
+                        _oauth_token_provider_candidates(app_info)
+                        if app_info
+                        else [str(server.name)]
                     )
                     configured_resource = effective_mcp_oauth_resource(
                         server,
