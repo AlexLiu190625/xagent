@@ -13,12 +13,42 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
     ResolvedToken,
     TokenRequest,
     WebToolConfig,
     set_oauth_token_resolver_hook,
 )
+
+
+def test_token_request_refresh_defaults_to_none():
+    request = TokenRequest(provider="google", user_id=1)
+
+    assert request.refresh is None
+
+
+def test_resolver_contract_repr_hides_token_and_generation():
+    refresh = web_tools_config.OAuthRefreshContext(
+        reason="invalid_token",
+        resource_metadata_url=None,
+        challenge_scope=None,
+        failed_generation="failed-generation-secret",
+    )
+    token = ResolvedToken(
+        access_token="access-token-secret",
+        generation="current-generation-secret",
+    )
+
+    rendered = repr((refresh, token))
+
+    assert "access-token-secret" not in rendered
+    assert "failed-generation-secret" not in rendered
+    assert "current-generation-secret" not in rendered
+
+
+def test_oauth_token_generation_max_length_is_1024():
+    assert web_tools_config.OAUTH_TOKEN_GENERATION_MAX_LENGTH == 1024
 
 
 @pytest.fixture(autouse=True)
@@ -844,6 +874,85 @@ async def test_hook_malformed_token_creates_unavailable_config(
     assert configs[0]["transport"] == "unavailable"
     assert configs[0]["config"]["server_id"] == server.id
     assert cfg.get_mcp_oauth_diagnostics()[0]["exception_type"] == exception_type
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("generation", [None, " generation-v1 "])
+async def test_hook_preserves_valid_generation_during_normalization(
+    db_session,
+    generation,
+):
+    db, user = db_session
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="access-token-secret",
+            expires_at=None,
+            generation=generation,
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    resolved = await _tool_config(db, user)._resolve_oauth_token_from_hook(
+        providers=["google"],
+        resource=None,
+    )
+
+    assert resolved is not None
+    assert resolved.provider == "google"
+    assert resolved.access_token == "access-token-secret"
+    assert resolved.generation == generation
+    assert "access-token-secret" not in repr(resolved)
+    if generation is not None:
+        assert generation not in repr(resolved)
+
+
+class _SecretStringGeneration(str):
+    pass
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("generation", "secret_marker"),
+    [
+        ("", None),
+        (
+            _SecretStringGeneration("wrong-type-generation-secret"),
+            "wrong-type-generation-secret",
+        ),
+        ("oversized-generation-secret" + "x" * 1024, "oversized-generation-secret"),
+    ],
+    ids=["empty", "wrong-type", "oversized"],
+)
+async def test_hook_invalid_generation_creates_sanitized_unavailable_config(
+    db_session,
+    caplog,
+    generation,
+    secret_marker,
+):
+    db, user = db_session
+    caplog.set_level(logging.WARNING)
+    server = _add_oauth_server(db, user, launch_config=_launch_config())
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=None,
+            generation=generation,
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    cfg = _tool_config(db, user)
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["server_id"] == server.id
+    assert cfg.get_mcp_oauth_diagnostics()[0]["exception_type"] == ("InvalidGeneration")
+    if secret_marker is not None:
+        assert secret_marker not in repr(configs)
+        assert secret_marker not in repr(cfg.get_mcp_oauth_diagnostics())
+        assert secret_marker not in caplog.text
 
 
 @pytest.mark.asyncio

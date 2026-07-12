@@ -9,10 +9,10 @@ import inspect
 import logging
 import os
 import shlex
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional
 
 import httpx
 
@@ -43,9 +43,18 @@ logger = logging.getLogger(__name__)
 
 
 OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
+OAUTH_TOKEN_GENERATION_MAX_LENGTH = 1024
 OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+
+
+@dataclass(frozen=True)
+class OAuthRefreshContext:
+    reason: Literal["invalid_token"]
+    resource_metadata_url: str | None
+    challenge_scope: str | None
+    failed_generation: str | None = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -65,6 +74,7 @@ class TokenRequest:
     user_id: int
     scope: Optional[Any] = None
     resource: str | None = None
+    refresh: OAuthRefreshContext | None = None
 
 
 @dataclass(frozen=True)
@@ -78,8 +88,9 @@ class ResolvedToken:
     and this ``WebToolConfig`` instance will reload MCP configs on later calls.
     """
 
-    access_token: str
+    access_token: str = field(repr=False)
     expires_at: datetime | None = None
+    generation: str | None = field(default=None, repr=False)
 
 
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
@@ -119,8 +130,9 @@ async def _maybe_await_oauth_token_resolver_result(result: object) -> object:
 @dataclass(frozen=True)
 class _ResolvedHookToken:
     provider: str
-    access_token: str
+    access_token: str = field(repr=False)
     expires_at: datetime | None
+    generation: str | None = field(repr=False)
 
 
 class _OAuthTokenResolverFailed(Exception):
@@ -1354,6 +1366,16 @@ class WebToolConfig(BaseToolConfig):
                 exception_type="InvalidExpiresAt",
                 resource=resource,
             )
+        if resolved.generation is not None and (
+            type(resolved.generation) is not str
+            or not resolved.generation
+            or len(resolved.generation) > OAUTH_TOKEN_GENERATION_MAX_LENGTH
+        ):
+            raise _OAuthTokenResolverFailed(
+                providers=providers,
+                exception_type="InvalidGeneration",
+                resource=resource,
+            )
 
         expires_at = _normalize_oauth_expires_at(resolved.expires_at)
         if expires_at is not None and _oauth_token_is_expired(expires_at):
@@ -1367,6 +1389,7 @@ class WebToolConfig(BaseToolConfig):
             provider=provider,
             access_token=resolved.access_token,
             expires_at=expires_at,
+            generation=resolved.generation,
         )
 
     def _mark_hook_token_cache_metadata(self, resolved: _ResolvedHookToken) -> None:
