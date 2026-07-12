@@ -9,8 +9,10 @@ import inspect
 import logging
 import os
 import re
+from collections.abc import Iterator
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
+import httpx
 from mcp.types import Tool as MCPTool
 from pydantic import BaseModel, Field, create_model
 
@@ -41,11 +43,62 @@ class EmptyArgsModel(BaseModel):
 
 logger = logging.getLogger(__name__)
 _RUNTIME_CONNECTION_REFRESH_KEY = "_connector_runtime_refresh"
+_OAUTH_TOKEN_RESOLVER_REFRESH_KEY = "_oauth_token_resolver_refresh"
+_RESOLVER_HTTP_401_NODE_LIMIT = 64
 _HTTP_401_TEXT_RE = re.compile(
     r"\b(?:http(?:\s+status)?|status(?:\s+code)?|response|code)\s*[:=]?\s*401\b|"
     r"\b401\s+unauthorized\b",
     re.IGNORECASE,
 )
+
+
+def _bounded_exception_nodes(
+    exc: BaseException, *, excluded_ids: set[int] | None = None
+) -> Iterator[BaseException]:
+    pending = [exc]
+    visited: set[int] = set(excluded_ids or ())
+    visited_count = 0
+    while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
+        current = pending.pop()
+        current_id = id(current)
+        if current_id in visited:
+            continue
+        visited.add(current_id)
+        visited_count += 1
+        yield current
+
+        linked: list[BaseException] = []
+        if isinstance(current, BaseExceptionGroup):
+            linked.extend(current.exceptions)
+        if isinstance(current.__cause__, BaseException):
+            linked.append(current.__cause__)
+        if isinstance(current.__context__, BaseException):
+            linked.append(current.__context__)
+        pending.extend(reversed(linked))
+
+
+def _strict_http_401_responses(
+    exc: BaseException, *, excluded_ids: set[int] | None = None
+) -> Iterator[httpx.Response]:
+    for current in _bounded_exception_nodes(exc, excluded_ids=excluded_ids):
+        if not isinstance(current, httpx.HTTPStatusError):
+            continue
+        response = current.response
+        if isinstance(response, httpx.Response) and response.status_code == 401:
+            yield response
+
+
+def _resolver_invalid_token_challenge(exc: BaseException) -> Any | None:
+    # Lazy import keeps the core adapter independent from the web layer at import time.
+    from .....web.services.mcp_oauth import parse_www_authenticate_bearer
+
+    for response in _strict_http_401_responses(exc):
+        challenge = parse_www_authenticate_bearer(
+            response.headers.get_list("WWW-Authenticate")
+        )
+        if challenge is not None and challenge.params.get("error") == "invalid_token":
+            return challenge
+    return None
 
 
 def _exception_indicates_http_401(exc: BaseException) -> bool:
@@ -616,6 +669,11 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any] | None:
+        if isinstance(self.connection, Mapping) and (
+            _OAUTH_TOKEN_RESOLVER_REFRESH_KEY in self.connection
+        ):
+            return await self._retry_resolver_401(exc, tool_args, tool_meta)
+
         if not _exception_indicates_http_401(exc):
             return None
         if not isinstance(self.connection, Mapping):
@@ -642,6 +700,65 @@ class MCPToolAdapter(AbstractBaseTool):
                 return _delegated_authorization_failed_result()
             logger.error(
                 "MCP tool %s delegated authorization retry failed with %s",
+                self.mcp_tool.name,
+                type(retry_exc).__name__,
+            )
+            return _delegated_retry_failed_result()
+
+    async def _retry_resolver_401(
+        self,
+        exc: BaseException,
+        tool_args: Mapping[str, Any],
+        tool_meta: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        strict_401 = next(_strict_http_401_responses(exc), None)
+        if strict_401 is None:
+            return None
+
+        challenge = _resolver_invalid_token_challenge(exc)
+        refresh = self.connection.get(_OAUTH_TOKEN_RESOLVER_REFRESH_KEY)
+        if challenge is None or not callable(refresh):
+            return _delegated_authorization_failed_result()
+
+        logger.info(
+            "Retrying MCP tool %s after resolver authorization failure",
+            self.mcp_tool.name,
+        )
+        try:
+            refreshed = refresh(challenge)
+            if inspect.isawaitable(refreshed):
+                refreshed = await refreshed
+        except (BaseExceptionGroup, Exception) as refresh_exc:
+            logger.error(
+                "MCP tool %s resolver authorization refresh failed with %s",
+                self.mcp_tool.name,
+                type(refresh_exc).__name__,
+            )
+            return _delegated_authorization_failed_result()
+
+        if not isinstance(refreshed, dict):
+            return _delegated_authorization_failed_result()
+
+        try:
+            return await self._execute_mcp_call(
+                cast(Connection, refreshed), tool_args, tool_meta
+            )
+        except (BaseExceptionGroup, Exception) as retry_exc:
+            original_exception_ids = {
+                id(node) for node in _bounded_exception_nodes(exc)
+            }
+            if (
+                next(
+                    _strict_http_401_responses(
+                        retry_exc, excluded_ids=original_exception_ids
+                    ),
+                    None,
+                )
+                is not None
+            ):
+                return _delegated_authorization_failed_result()
+            logger.error(
+                "MCP tool %s resolver authorization retry failed with %s",
                 self.mcp_tool.name,
                 type(retry_exc).__name__,
             )

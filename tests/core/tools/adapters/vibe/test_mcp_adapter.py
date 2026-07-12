@@ -1,14 +1,29 @@
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
+import httpx
 import pytest
 
+from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPToolAdapter,
     _build_mcp_tool_adapter,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
 )
+
+
+def _http_status_error(
+    *, status_code: int = 401, authenticate: list[str] | None = None
+) -> httpx.HTTPStatusError:
+    request = httpx.Request("POST", "https://mcp.example.test/tools")
+    headers = [(b"www-authenticate", value.encode()) for value in (authenticate or [])]
+    response = httpx.Response(status_code, headers=headers, request=request)
+    return httpx.HTTPStatusError(
+        "planted-secret-must-not-be-evidence",
+        request=request,
+        response=response,
+    )
 
 
 def test_build_mcp_tool_adapter_stamps_normalized_source_server():
@@ -92,6 +107,82 @@ def test_exception_indicates_http_401_uses_bounded_status_signals():
         RuntimeError("connection reset on port 401")
     )
     assert not _exception_indicates_http_401(RuntimeError("tool returned id 40123"))
+
+
+def test_resolver_challenge_extracts_from_nested_group_cause_and_context():
+    cause = RuntimeError("outer")
+    cause.__cause__ = _http_status_error(
+        authenticate=['Bearer error="invalid_token", scope="records.read"']
+    )
+    context = RuntimeError("context")
+    context.__context__ = cause
+    nested = ExceptionGroup("nested", [RuntimeError("noise"), context])
+
+    challenge = mcp_adapter_module._resolver_invalid_token_challenge(
+        ExceptionGroup("root", [nested])
+    )
+
+    assert challenge is not None
+    assert challenge.params["error"] == "invalid_token"
+    assert challenge.scope == "records.read"
+
+
+def test_resolver_challenge_traversal_handles_cycles():
+    outer = RuntimeError("outer")
+    inner = RuntimeError("inner")
+    outer.__cause__ = inner
+    inner.__context__ = outer
+
+    assert mcp_adapter_module._resolver_invalid_token_challenge(outer) is None
+
+
+def test_resolver_challenge_traversal_stops_at_named_node_budget():
+    current: BaseException = _http_status_error(
+        authenticate=['Bearer error="invalid_token"']
+    )
+    for index in range(mcp_adapter_module._RESOLVER_HTTP_401_NODE_LIMIT):
+        wrapper = RuntimeError(f"wrapper-{index}")
+        wrapper.__cause__ = current
+        current = wrapper
+
+    assert mcp_adapter_module._resolver_invalid_token_challenge(current) is None
+
+
+def test_resolver_challenge_uses_all_www_authenticate_header_values():
+    exc = _http_status_error(
+        authenticate=[
+            'Basic realm="legacy"',
+            (
+                'Bearer error="invalid_token", '
+                'resource_metadata="https://mcp.example.test/.well-known/resource"'
+            ),
+        ]
+    )
+
+    challenge = mcp_adapter_module._resolver_invalid_token_challenge(exc)
+
+    assert challenge is not None
+    assert challenge.resource_metadata_url == (
+        "https://mcp.example.test/.well-known/resource"
+    )
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        _http_status_error(authenticate=[]),
+        _http_status_error(authenticate=['Bearer error="invalid_token']),
+        _http_status_error(authenticate=['Basic error="invalid_token"']),
+        _http_status_error(authenticate=['Bearer error="insufficient_scope"']),
+        _http_status_error(authenticate=['Bearer scope="records.read"']),
+        _http_status_error(
+            status_code=403, authenticate=['Bearer error="invalid_token"']
+        ),
+        RuntimeError("HTTP 401 Unauthorized; Bearer error=invalid_token"),
+    ],
+)
+def test_resolver_challenge_rejects_non_refreshable_evidence(exc):
+    assert mcp_adapter_module._resolver_invalid_token_challenge(exc) is None
 
 
 def test_mcp_return_value_as_string_keeps_malformed_scalar_content_together():
@@ -370,6 +461,271 @@ def test_mcp_runtime_tool_argument_missing_source_warns(caplog):
     )
     assert "account_id" in caplog.text
     assert "list_clients" in caplog.text
+
+
+def _resolver_retry_adapter(connection):
+    return MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="list_clients",
+            description="List clients",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection=connection,
+    )
+
+
+@pytest.mark.asyncio
+async def test_resolver_401_has_priority_and_retries_rebuilt_connection_once(
+    monkeypatch,
+):
+    resolver_calls = []
+    connector_calls = 0
+    fresh_connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "headers": {"Authorization": "Bearer fresh-token"},
+    }
+
+    async def _resolver_refresh(challenge):
+        resolver_calls.append(challenge)
+        return fresh_connection
+
+    def _connector_refresh():
+        nonlocal connector_calls
+        connector_calls += 1
+        return fresh_connection
+
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "_oauth_token_resolver_refresh": _resolver_refresh,
+        "_connector_runtime_refresh": _connector_refresh,
+    }
+    adapter = _resolver_retry_adapter(connection)
+    attempted_connections = []
+
+    async def _execute(attempted, tool_args, tool_meta):
+        attempted_connections.append(attempted)
+        if attempted is connection:
+            raise _http_status_error(
+                authenticate=['Bearer error="invalid_token", scope="records.read"']
+            )
+        return {"content": [{"text": "ok"}], "is_error": False}
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert result == {"content": [{"text": "ok"}], "is_error": False}
+    assert len(resolver_calls) == 1
+    assert resolver_calls[0].params["error"] == "invalid_token"
+    assert connector_calls == 0
+    assert attempted_connections == [connection, fresh_connection]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "authenticate",
+    [
+        [],
+        ['Bearer error="invalid_token'],
+        ['Basic error="invalid_token"'],
+        ['Bearer error="insufficient_scope"'],
+        ['Bearer scope="records.read"'],
+    ],
+)
+async def test_resolver_owned_invalid_401_challenge_fails_without_connector_fallback(
+    monkeypatch, authenticate
+):
+    resolver_calls = 0
+    connector_calls = 0
+
+    def _resolver_refresh(challenge):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return {}
+
+    def _connector_refresh():
+        nonlocal connector_calls
+        connector_calls += 1
+        return {}
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+            "_connector_runtime_refresh": _connector_refresh,
+        }
+    )
+
+    async def _execute(connection, tool_args, tool_meta):
+        raise _http_status_error(authenticate=authenticate)
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is True
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+    assert resolver_calls == 0
+    assert connector_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_resolver_owned_text_only_401_does_not_use_either_refresh_callback(
+    monkeypatch,
+):
+    resolver_calls = 0
+    connector_calls = 0
+
+    def _resolver_refresh(challenge):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return {}
+
+    def _connector_refresh():
+        nonlocal connector_calls
+        connector_calls += 1
+        return {}
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+            "_connector_runtime_refresh": _connector_refresh,
+        }
+    )
+
+    async def _execute(connection, tool_args, tool_meta):
+        raise RuntimeError("HTTP 401 Unauthorized; Bearer error=invalid_token")
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [{"text": "Error executing MCP tool."}],
+        "is_error": True,
+    }
+    assert resolver_calls == 0
+    assert connector_calls == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("refresh_behavior", ["none", "raise", "malformed"])
+async def test_resolver_refresh_failure_is_fixed_and_sanitized(
+    monkeypatch, caplog, refresh_behavior
+):
+    secret = f"resolver-{refresh_behavior}-secret"
+
+    async def _resolver_refresh(challenge):
+        if refresh_behavior == "raise":
+            raise RuntimeError(secret)
+        if refresh_behavior == "malformed":
+            return SimpleNamespace(secret=secret)
+        return None
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+    )
+
+    async def _execute(connection, tool_args, tool_meta):
+        raise _http_status_error(authenticate=['Bearer error="invalid_token"'])
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is True
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+    assert secret not in repr(result) + caplog.text
+
+
+@pytest.mark.asyncio
+async def test_resolver_retry_second_401_does_not_refresh_twice(monkeypatch):
+    refresh_calls = 0
+
+    async def _resolver_refresh(challenge):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+    )
+    execution_calls = 0
+
+    async def _execute(connection, tool_args, tool_meta):
+        nonlocal execution_calls
+        execution_calls += 1
+        raise _http_status_error(authenticate=['Bearer error="invalid_token"'])
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert execution_calls == 2
+    assert refresh_calls == 1
+    assert result["is_error"] is True
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_resolver_retry_non_401_failure_does_not_leak_secrets(
+    monkeypatch, caplog
+):
+    initial_secret = "initial-resolver-secret"
+    refreshed_secret = "refreshed-resolver-secret"
+
+    async def _resolver_refresh(challenge):
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "headers": {"Authorization": f"Bearer {refreshed_secret}"},
+        }
+
+    initial_connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "headers": {"Authorization": f"Bearer {initial_secret}"},
+        "_oauth_token_resolver_refresh": _resolver_refresh,
+    }
+    adapter = _resolver_retry_adapter(initial_connection)
+
+    async def _execute(connection, tool_args, tool_meta):
+        if connection is initial_connection:
+            raise _http_status_error(authenticate=['Bearer error="invalid_token"'])
+        raise RuntimeError(f"transport failed with {refreshed_secret}")
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result == {
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
+        "is_error": True,
+    }
+    public_output = repr(result) + caplog.text
+    assert initial_secret not in public_output
+    assert refreshed_secret not in public_output
 
 
 @pytest.mark.asyncio
