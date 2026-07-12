@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from xagent.core.agent.result import (
+    ClassifiedToolFailure,
     normalize_tool_failure_code,
     tool_result_succeeded,
 )
@@ -26,6 +27,15 @@ class _FailureCodeStringSubclass(str):
 )
 def test_normalize_tool_failure_code_uses_exact_allowlist(value, expected):
     assert normalize_tool_failure_code(value) == expected
+
+
+def test_classified_tool_failure_accepts_only_allowlisted_plain_string():
+    outcome = ClassifiedToolFailure(failure_code="oauth_token_required")
+
+    assert outcome.failure_code == "oauth_token_required"
+
+    with pytest.raises(ValueError, match="invalid tool failure code"):
+        ClassifiedToolFailure(failure_code="other_valid_code")
 
 
 @pytest.mark.parametrize(

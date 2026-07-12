@@ -3,12 +3,17 @@ from __future__ import annotations
 import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+from typing import Any
 
+import httpx
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
+from xagent.core.tools.adapters.vibe.mcp_adapter import MCPToolAdapter
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
@@ -1734,6 +1739,63 @@ async def test_remote_hook_refresh_rejects_registration_change_during_await(
 
 
 @pytest.mark.asyncio
+async def test_remote_hook_refresh_classification_rejects_registration_change_during_await(
+    db_session,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    class RefreshFailure(RuntimeError):
+        oauth_token_resolver_failure_code = "oauth_token_required"
+
+    async def resolver(request: TokenRequest):
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        refresh_started.set()
+        await release_refresh.wait()
+        raise RefreshFailure("refresh-private-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    pending = asyncio.create_task(refresh(_challenge()))
+    await refresh_started.wait()
+    set_oauth_token_resolver_hook(resolver)
+    release_refresh.set()
+
+    assert await pending is None
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_refresh_unknown_failure_code_remains_unclassified(
+    db_session,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+
+    class RefreshFailure(RuntimeError):
+        oauth_token_resolver_failure_code = "other_valid_code"
+
+    async def resolver(request: TokenRequest):
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        raise RefreshFailure("refresh-private-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    assert await refresh(_challenge()) is None
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "refresh_result",
     [
@@ -1828,3 +1890,89 @@ async def test_remote_hook_refresh_resolver_raise_has_no_authorization_fallback(
     refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
 
     assert await refresh(_challenge()) is None
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_refresh_classification_reaches_tool_failure_trace(
+    db_session,
+    monkeypatch,
+    caplog,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+    private_exception_text = "refresh-private-exception-secret"
+
+    class RefreshFailure(RuntimeError):
+        oauth_token_resolver_failure_code = "oauth_token_required"
+
+    async def resolver(request: TokenRequest):
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        raise RefreshFailure(private_exception_text)
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    connection = {
+        "transport": configs[0]["transport"],
+        **configs[0]["config"],
+    }
+    adapter = MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="list_records",
+            description="List records",
+            inputSchema={"type": "object", "properties": {}},
+        ),
+        connection=connection,
+        allow_users=configs[0]["allow_users"],
+    )
+    request = httpx.Request("POST", "https://mcp.example/api")
+    response = httpx.Response(
+        401,
+        headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+        request=request,
+    )
+    execution_error = httpx.HTTPStatusError(
+        "http-private-exception-secret",
+        request=request,
+        response=response,
+    )
+
+    async def execute(connection, tool_args, tool_meta):
+        raise execution_error
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", execute)
+    monkeypatch.setenv("XAGENT_USER_ID", str(user.id))
+    caplog.set_level("ERROR")
+
+    result = await adapter.run_json_async({})
+
+    assert result["is_error"] is True
+    assert result["failure_code"] == "oauth_token_required"
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-refresh-required")
+    await runtime.on_tool_end(
+        tool_call={"name": adapter.name, "id": "call-1"},
+        result=result,
+    )
+
+    assert tracer.events[0]["type"] == "action_error_tool"
+    assert tracer.events[0]["data"]["failure_code"] == "oauth_token_required"
+    public_output = repr(result) + repr(tracer.events) + caplog.text
+    assert private_exception_text not in public_output
+    assert "http-private-exception-secret" not in public_output

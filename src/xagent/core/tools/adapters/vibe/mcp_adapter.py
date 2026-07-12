@@ -131,8 +131,12 @@ def _exception_indicates_http_401(exc: BaseException) -> bool:
     return bool(_HTTP_401_TEXT_RE.search(text))
 
 
-def _delegated_authorization_failed_result() -> dict[str, Any]:
-    return {
+def _delegated_authorization_failed_result(
+    *, failure_code: object = None
+) -> dict[str, Any]:
+    from ....agent.result import normalize_tool_failure_code
+
+    result: dict[str, Any] = {
         "content": [
             {
                 "text": (
@@ -143,6 +147,10 @@ def _delegated_authorization_failed_result() -> dict[str, Any]:
         ],
         "is_error": True,
     }
+    normalized_failure_code = normalize_tool_failure_code(failure_code)
+    if normalized_failure_code is not None:
+        result["failure_code"] = normalized_failure_code
+    return result
 
 
 def _delegated_retry_failed_result() -> dict[str, Any]:
@@ -749,6 +757,13 @@ class MCPToolAdapter(AbstractBaseTool):
                 type(refresh_exc).__name__,
             )
             return _delegated_authorization_failed_result()
+
+        from ....agent.result import ClassifiedToolFailure
+
+        if isinstance(refreshed, ClassifiedToolFailure):
+            return _delegated_authorization_failed_result(
+                failure_code=refreshed.failure_code
+            )
 
         if not _is_executable_connection(refreshed):
             return _delegated_authorization_failed_result()

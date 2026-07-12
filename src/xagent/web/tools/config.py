@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optio
 import httpx
 
 from ...config import get_uploads_dir
-from ...core.agent.result import normalize_tool_failure_code
+from ...core.agent.result import ClassifiedToolFailure, normalize_tool_failure_code
 from ...core.tools.adapters.vibe.config import (
     BaseToolConfig,
     normalize_tool_allowlist,
@@ -122,6 +122,15 @@ def set_oauth_token_resolver_hook(resolver: TokenResolver | None) -> None:
 
 def _get_oauth_token_resolver_hook() -> tuple[TokenResolver | None, int]:
     return _oauth_token_resolver_hook, _oauth_token_resolver_generation
+
+
+def _oauth_token_resolver_registration_matches(
+    resolver: TokenResolver, registration_generation: int
+) -> bool:
+    current_resolver, current_generation = _get_oauth_token_resolver_hook()
+    return (
+        current_resolver is resolver and current_generation == registration_generation
+    )
 
 
 async def _maybe_await_oauth_token_resolver_result(result: object) -> object:
@@ -1388,7 +1397,7 @@ class WebToolConfig(BaseToolConfig):
         resource: str | None,
         failed_generation: str | None,
         non_auth_connection: dict[str, Any],
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any] | ClassifiedToolFailure | None:
         from ...web.services.mcp_oauth import MCPAuthorizationChallenge
 
         if (
@@ -1396,10 +1405,8 @@ class WebToolConfig(BaseToolConfig):
             or failed_generation is None
         ):
             return None
-        current_resolver, current_generation = _get_oauth_token_resolver_hook()
-        if (
-            current_resolver is not resolver
-            or current_generation != registration_generation
+        if not _oauth_token_resolver_registration_matches(
+            resolver, registration_generation
         ):
             return None
 
@@ -1417,13 +1424,20 @@ class WebToolConfig(BaseToolConfig):
         )
         try:
             resolved = await _maybe_await_oauth_token_resolver_result(resolver(request))
-        except Exception:
+        except Exception as exc:
+            if not _oauth_token_resolver_registration_matches(
+                resolver, registration_generation
+            ):
+                return None
+            failure_code = _extract_oauth_token_resolver_failure_code(exc)
+            if failure_code is not None:
+                return ClassifiedToolFailure(failure_code=failure_code)
             return None
 
-        current_resolver, current_generation = _get_oauth_token_resolver_hook()
         if (
-            current_resolver is not resolver
-            or current_generation != registration_generation
+            not _oauth_token_resolver_registration_matches(
+                resolver, registration_generation
+            )
             or resolved is None
         ):
             return None
@@ -1488,7 +1502,9 @@ class WebToolConfig(BaseToolConfig):
     ) -> dict[str, Any]:
         from ...web.services.mcp_runtime import connection_with_bearer_authorization
 
-        async def refresh(challenge: object) -> dict[str, Any] | None:
+        async def refresh(
+            challenge: object,
+        ) -> dict[str, Any] | ClassifiedToolFailure | None:
             return await self._refresh_resolver_owned_mcp_connection(
                 challenge=challenge,
                 resolver=resolver,
