@@ -1,3 +1,4 @@
+import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -521,6 +522,200 @@ async def test_resolver_401_has_priority_and_retries_rebuilt_connection_once(
     assert resolver_calls[0].params["error"] == "invalid_token"
     assert connector_calls == 0
     assert attempted_connections == [connection, fresh_connection]
+
+
+@pytest.mark.asyncio
+async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, caplog):
+    initial_token = "real-initial-access-token-secret"
+    refreshed_token = "real-refreshed-access-token-secret"
+    generation = "real-resolver-generation-secret"
+    raw_exception_secret = "real-http-status-error-secret"
+    tool_args = {"query": "active", "account_id": "6185"}
+    tool_meta = {"account_id": "6185"}
+    initial_requests = []
+    refreshed_requests = []
+    initial_client_builds = 0
+    refreshed_client_builds = 0
+    refresh_calls = []
+
+    async def _initial_handler(request):
+        payload = json.loads(request.content) if request.content else {}
+        initial_requests.append((request, payload))
+        assert payload["method"] == "initialize"
+        return httpx.Response(
+            401,
+            headers={
+                "WWW-Authenticate": (
+                    'Bearer error="invalid_token", scope="records.read"'
+                )
+            },
+            extensions={"reason_phrase": raw_exception_secret.encode()},
+            request=request,
+        )
+
+    async def _refreshed_handler(request):
+        payload = json.loads(request.content) if request.content else {}
+        refreshed_requests.append((request, payload))
+        method = payload.get("method")
+        if method == "initialize":
+            result = {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "mock-mcp", "version": "1"},
+            }
+        elif method == "tools/call":
+            result = {
+                "content": [{"type": "text", "text": "clients-ok"}],
+                "isError": False,
+            }
+        elif method == "tools/list":
+            result = {
+                "tools": [
+                    {
+                        "name": "list_clients",
+                        "description": "List clients",
+                        "inputSchema": {"type": "object"},
+                    }
+                ]
+            }
+        else:
+            return httpx.Response(405 if request.method == "GET" else 202)
+        return httpx.Response(
+            200,
+            headers={
+                "content-type": "application/json",
+                "mcp-session-id": "refreshed-session",
+            },
+            json={"jsonrpc": "2.0", "id": payload["id"], "result": result},
+            request=request,
+        )
+
+    def _initial_client_factory(headers=None, timeout=None, auth=None):
+        nonlocal initial_client_builds
+        initial_client_builds += 1
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(_initial_handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    def _refreshed_client_factory(headers=None, timeout=None, auth=None):
+        nonlocal refreshed_client_builds
+        refreshed_client_builds += 1
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(_refreshed_handler),
+            headers=headers,
+            timeout=timeout,
+            auth=auth,
+        )
+
+    async def _resolver_refresh(challenge):
+        refresh_calls.append((challenge, generation))
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "headers": {"Authorization": f"Bearer {refreshed_token}"},
+            "httpx_client_factory": _refreshed_client_factory,
+            "terminate_on_close": False,
+        }
+
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "headers": {"Authorization": f"Bearer {initial_token}"},
+        "httpx_client_factory": _initial_client_factory,
+        "terminate_on_close": False,
+        "runtime_bindings": [
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "tool_arguments", "key": "account_id"},
+            },
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "mcp_meta", "key": "account_id"},
+            },
+        ],
+        "connector_runtime": {
+            "context": {"account_id": "6185"},
+            "secrets": {},
+            "auth_selector": {},
+        },
+        "_oauth_token_resolver_refresh": _resolver_refresh,
+    }
+    adapter = MCPToolAdapter(
+        mcp_tool=SimpleNamespace(
+            name="list_clients",
+            description="List clients",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "account_id": {"type": "string"},
+                },
+                "required": ["query", "account_id"],
+            },
+        ),
+        connection=connection,
+    )
+    nested_failures = []
+    retry = adapter._retry_delegated_401
+
+    async def _observe_nested_failure(exc, attempted_args, attempted_meta):
+        nested_failures.append(exc)
+        responses = list(mcp_adapter_module._strict_http_401_responses(exc))
+        assert len(responses) == 1
+        assert responses[0].headers.get_list("WWW-Authenticate") == [
+            'Bearer error="invalid_token", scope="records.read"'
+        ]
+        return await retry(exc, attempted_args, attempted_meta)
+
+    monkeypatch.setattr(adapter, "_retry_delegated_401", _observe_nested_failure)
+    caplog.set_level("DEBUG")
+
+    result = await adapter.run_json_async(
+        {"query": "active", "account_id": "llm-supplied"}
+    )
+
+    assert result == {
+        "content": [
+            {
+                "type": "text",
+                "text": "clients-ok",
+                "annotations": None,
+                "meta": None,
+            }
+        ],
+        "is_error": False,
+    }
+    assert initial_client_builds == 1
+    assert refreshed_client_builds == 1
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0][0].params["error"] == "invalid_token"
+    assert refresh_calls[0][0].scope == "records.read"
+    assert len(nested_failures) == 1
+    assert raw_exception_secret in repr(nested_failures[0])
+    assert len(initial_requests) == 1
+    assert initial_requests[0][0].headers["Authorization"] == (
+        f"Bearer {initial_token}"
+    )
+    tool_calls = [
+        (request, payload)
+        for request, payload in refreshed_requests
+        if payload.get("method") == "tools/call"
+    ]
+    assert len(tool_calls) == 1
+    assert tool_calls[0][0].headers["Authorization"] == f"Bearer {refreshed_token}"
+    assert tool_calls[0][1]["params"] == {
+        "_meta": tool_meta,
+        "name": "list_clients",
+        "arguments": tool_args,
+    }
+    public_output = repr(result) + caplog.text
+    assert initial_token not in public_output
+    assert refreshed_token not in public_output
+    assert generation not in public_output
+    assert raw_exception_secret not in public_output
 
 
 @pytest.mark.asyncio
