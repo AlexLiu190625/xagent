@@ -220,13 +220,9 @@ async def build_mcp_runtime_connection(
             ),
         )
 
-    headers = headers_without_authorization(
-        connection.get("headers")
-        if isinstance(connection.get("headers"), dict)
-        else None
+    connection = connection_with_bearer_authorization(
+        connection, runtime_auth.access_token
     )
-    headers["Authorization"] = f"Bearer {runtime_auth.access_token}"
-    connection["headers"] = headers
     connection.pop("auth", None)
     return MCPRuntimeConnectionBuild(connection=connection)
 
@@ -246,6 +242,51 @@ def mcp_oauth_selection(
     """Return the runtime grant selection for one server."""
     selection = (mcp_auth_context or {}).get(str(server_id))
     return selection if isinstance(selection, dict) else {}
+
+
+def effective_mcp_oauth_resource(
+    server: Any, *, mcp_auth_context: dict[str, Any] | None
+) -> str | None:
+    """Select the first configured OAuth resource without normalizing it."""
+    server_id = getattr(server, "id", None)
+    selection = (
+        mcp_oauth_selection(mcp_auth_context, server_id)
+        if isinstance(server_id, int)
+        else {}
+    )
+    auth_config = server._decrypt_auth_config(getattr(server, "auth", None))
+    configured_resource = (
+        auth_config.get("resource") if isinstance(auth_config, dict) else None
+    )
+    for resource in (
+        selection.get("resource"),
+        configured_resource,
+        getattr(server, "url", None),
+    ):
+        if isinstance(resource, str) and resource:
+            return resource
+    return None
+
+
+def connection_without_authorization(
+    connection: dict[str, Any],
+) -> dict[str, Any]:
+    """Copy a connection and its headers while removing Authorization values."""
+    copied_connection = dict(connection)
+    raw_headers = connection.get("headers")
+    copied_connection["headers"] = headers_without_authorization(
+        raw_headers if isinstance(raw_headers, dict) else None
+    )
+    return copied_connection
+
+
+def connection_with_bearer_authorization(
+    connection: dict[str, Any], access_token: str
+) -> dict[str, Any]:
+    """Copy a connection and replace static authorization with a Bearer token."""
+    copied_connection = connection_without_authorization(connection)
+    copied_connection["headers"]["Authorization"] = f"Bearer {access_token}"
+    return copied_connection
 
 
 def headers_without_authorization(headers: dict[str, Any] | None) -> dict[str, Any]:

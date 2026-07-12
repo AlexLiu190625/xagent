@@ -14,6 +14,11 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.mcp_oauth import MCPOAuthClient, MCPOAuthGrant
 from xagent.web.models.user import User
 from xagent.web.services import mcp_oauth as mcp_oauth_service
+from xagent.web.services.mcp_runtime import (
+    connection_with_bearer_authorization,
+    connection_without_authorization,
+    effective_mcp_oauth_resource,
+)
 from xagent.web.tools.config import WebToolConfig
 
 
@@ -148,6 +153,112 @@ async def _load_configs(db, user: User, **kwargs):
     return await cfg.get_mcp_server_configs(), cfg
 
 
+def test_effective_mcp_oauth_resource_prefers_selector_verbatim(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+
+    assert (
+        effective_mcp_oauth_resource(
+            server,
+            mcp_auth_context={
+                str(server.id): {"resource": " https://selector.example/mcp "}
+            },
+        )
+        == " https://selector.example/mcp "
+    )
+
+
+def test_effective_mcp_oauth_resource_falls_back_to_auth_verbatim(db_session):
+    db, user, _ = db_session
+    configured_server = _add_mcp_oauth_server(
+        db,
+        user,
+        resource=" https://configured.example/mcp ",
+    )
+
+    assert (
+        effective_mcp_oauth_resource(
+            configured_server,
+            mcp_auth_context={
+                str(configured_server.id): {"resource": ""},
+            },
+        )
+        == " https://configured.example/mcp "
+    )
+
+
+def test_effective_mcp_oauth_resource_falls_back_to_server_url(db_session):
+    db, user, _ = db_session
+    transport_server = _add_mcp_oauth_server(db, user, resource="")
+
+    assert (
+        effective_mcp_oauth_resource(
+            transport_server,
+            mcp_auth_context={
+                str(transport_server.id): {"resource": object()},
+            },
+        )
+        == "https://mcp.example.com/mcp"
+    )
+
+
+def test_connection_without_authorization_copies_and_filters_headers():
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.com/mcp",
+        "headers": {
+            "Authorization": "Bearer uppercase",
+            "authorization": "Bearer lowercase",
+            "AUTHORIZATION": "Bearer shouting",
+            "X-Request-Source": "xagent",
+        },
+        "auth": {"type": "mcp_oauth"},
+    }
+
+    result = connection_without_authorization(connection)
+
+    assert result == {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.com/mcp",
+        "headers": {"X-Request-Source": "xagent"},
+        "auth": {"type": "mcp_oauth"},
+    }
+    assert result is not connection
+    assert result["headers"] is not connection["headers"]
+    assert connection["headers"] == {
+        "Authorization": "Bearer uppercase",
+        "authorization": "Bearer lowercase",
+        "AUTHORIZATION": "Bearer shouting",
+        "X-Request-Source": "xagent",
+    }
+
+
+def test_connection_with_bearer_authorization_replaces_static_auth_without_mutation():
+    connection = {
+        "url": "https://mcp.example.com/mcp",
+        "headers": {
+            "authorization": "Basic static-credential",
+            "X-Request-Source": "xagent",
+        },
+    }
+
+    result = connection_with_bearer_authorization(connection, "runtime-token")
+
+    assert result == {
+        "url": "https://mcp.example.com/mcp",
+        "headers": {
+            "X-Request-Source": "xagent",
+            "Authorization": "Bearer runtime-token",
+        },
+    }
+    assert result is not connection
+    assert result["headers"] is not connection["headers"]
+    assert connection["headers"] == {
+        "authorization": "Basic static-credential",
+        "X-Request-Source": "xagent",
+    }
+
+
 @pytest.mark.asyncio
 async def test_mcp_oauth_missing_grant_does_not_fall_back_to_static_headers(
     db_session,
@@ -201,8 +312,11 @@ async def test_mcp_oauth_runtime_selects_resource_owner_grant(db_session):
     assert cfg.get_mcp_oauth_diagnostics() == []
     assert len(configs) == 1
     headers = configs[0]["config"]["headers"]
-    assert headers["X-Request-Source"] == "xagent"
-    assert headers["Authorization"] == "Bearer access-token-b"
+    assert headers == {
+        "X-Request-Source": "xagent",
+        "Authorization": "Bearer access-token-b",
+    }
+    assert "auth" not in configs[0]["config"]
 
 
 @pytest.mark.asyncio
