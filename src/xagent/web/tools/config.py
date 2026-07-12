@@ -775,6 +775,7 @@ class WebToolConfig(BaseToolConfig):
         runtime_values: Optional[Dict[str, Any]],
         runtime_bindings: Any,
         allow_delegated_authorization: bool,
+        warn_on_rejected_authorization: bool = True,
     ) -> Dict[str, str]:
         if not isinstance(runtime_values, dict):
             return {}
@@ -792,10 +793,11 @@ class WebToolConfig(BaseToolConfig):
                 header_name.lower() == "authorization"
                 and not allow_delegated_authorization
             ):
-                logger.warning(
-                    "Ignoring runtime MCP Authorization header binding because "
-                    "delegated authorization is disabled"
-                )
+                if warn_on_rejected_authorization:
+                    logger.warning(
+                        "Ignoring runtime MCP Authorization header binding because "
+                        "delegated authorization is disabled"
+                    )
                 continue
             value = binding_source_value(
                 binding,
@@ -822,12 +824,19 @@ class WebToolConfig(BaseToolConfig):
         )
         if not delegated_headers:
             return None
-        connection = self._non_auth_mcp_connection(
-            server=server,
-            runtime_values=runtime_values,
-            runtime_bindings=runtime_bindings,
+        return self._mcp_connection_with_runtime_headers(
+            server=server, runtime_headers=delegated_headers
         )
-        connection["headers"].update(delegated_headers)
+
+    @staticmethod
+    def _mcp_connection_with_runtime_headers(
+        *, server: Any, runtime_headers: Mapping[str, str]
+    ) -> dict[str, Any]:
+        from ...web.services.mcp_runtime import connection_without_authorization
+
+        connection = connection_without_authorization(server.to_connection_dict())
+        connection["headers"].update(runtime_headers)
+        connection.pop("auth", None)
         return connection
 
     def _non_auth_mcp_connection(
@@ -837,18 +846,15 @@ class WebToolConfig(BaseToolConfig):
         runtime_values: Optional[Dict[str, Any]],
         runtime_bindings: Any,
     ) -> dict[str, Any]:
-        from ...web.services.mcp_runtime import connection_without_authorization
-
-        connection = connection_without_authorization(server.to_connection_dict())
-        connection["headers"].update(
-            self._runtime_transport_headers(
-                runtime_values=runtime_values,
-                runtime_bindings=runtime_bindings,
-                allow_delegated_authorization=False,
-            )
+        runtime_headers = self._runtime_transport_headers(
+            runtime_values=runtime_values,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=False,
+            warn_on_rejected_authorization=False,
         )
-        connection.pop("auth", None)
-        return connection
+        return self._mcp_connection_with_runtime_headers(
+            server=server, runtime_headers=runtime_headers
+        )
 
     def _refresh_delegated_mcp_connection(
         self,
@@ -1368,10 +1374,8 @@ class WebToolConfig(BaseToolConfig):
         resource: str | None,
         failed_generation: str | None,
         non_auth_connection: dict[str, Any],
-        refresh_callback: Callable[[object], Awaitable[dict[str, Any] | None]],
     ) -> dict[str, Any] | None:
         from ...web.services.mcp_oauth import MCPAuthorizationChallenge
-        from ...web.services.mcp_runtime import connection_with_bearer_authorization
 
         if not isinstance(challenge, MCPAuthorizationChallenge):
             return None
@@ -1418,12 +1422,16 @@ class WebToolConfig(BaseToolConfig):
         if normalized.generation is None or normalized.generation == failed_generation:
             return None
 
-        connection = connection_with_bearer_authorization(
-            non_auth_connection, normalized.access_token
+        return self._build_resolver_owned_mcp_connection(
+            resolver=resolver,
+            registration_generation=registration_generation,
+            resolved=normalized,
+            providers=providers,
+            user_id=user_id,
+            scope=scope,
+            resource=resource,
+            non_auth_connection=non_auth_connection,
         )
-        connection["_oauth_token_resolver_refresh"] = refresh_callback
-        connection.pop("_connector_runtime_refresh", None)
-        return connection
 
     def _resolver_owned_mcp_connection(
         self,
@@ -1435,10 +1443,33 @@ class WebToolConfig(BaseToolConfig):
         resource: str | None,
         non_auth_connection: dict[str, Any],
     ) -> dict[str, Any]:
-        from ...web.services.mcp_runtime import connection_with_bearer_authorization
-
         user_id = int(self._user_id)
         scope = self.get_execution_scope()
+
+        return self._build_resolver_owned_mcp_connection(
+            resolver=resolver,
+            registration_generation=registration_generation,
+            resolved=resolved,
+            providers=providers,
+            user_id=user_id,
+            scope=scope,
+            resource=resource,
+            non_auth_connection=non_auth_connection,
+        )
+
+    def _build_resolver_owned_mcp_connection(
+        self,
+        *,
+        resolver: TokenResolver,
+        registration_generation: int,
+        resolved: _ResolvedHookToken,
+        providers: list[str],
+        user_id: int,
+        scope: Any,
+        resource: str | None,
+        non_auth_connection: dict[str, Any],
+    ) -> dict[str, Any]:
+        from ...web.services.mcp_runtime import connection_with_bearer_authorization
 
         async def refresh(challenge: object) -> dict[str, Any] | None:
             return await self._refresh_resolver_owned_mcp_connection(
@@ -1452,7 +1483,6 @@ class WebToolConfig(BaseToolConfig):
                 resource=resource,
                 failed_generation=resolved.generation,
                 non_auth_connection=non_auth_connection,
-                refresh_callback=refresh,
             )
 
         connection = connection_with_bearer_authorization(

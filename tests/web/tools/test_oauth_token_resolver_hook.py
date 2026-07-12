@@ -1227,6 +1227,7 @@ def _challenge() -> MCPAuthorizationChallenge:
 @pytest.mark.asyncio
 async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
     db_session,
+    caplog,
 ):
     db, user = db_session
     scope = object()
@@ -1268,7 +1269,8 @@ async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
         }
     }
 
-    configs = await cfg.get_mcp_server_configs()
+    with caplog.at_level("WARNING"):
+        configs = await cfg.get_mcp_server_configs()
 
     assert [
         (request.provider, request.resource, request.scope) for request in requests
@@ -1286,6 +1288,7 @@ async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
         "auth_selector": {},
     }
     assert configs[0]["runtime_bindings"] == _remote_runtime_bindings()
+    assert "delegated authorization is disabled" not in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1440,7 +1443,7 @@ async def test_remote_hook_initial_raise_fails_closed(db_session):
 
 
 @pytest.mark.asyncio
-async def test_remote_hook_refresh_uses_challenge_and_changed_generation(db_session):
+async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_session):
     db, user = db_session
     server = _add_remote_server(
         db,
@@ -1478,8 +1481,68 @@ async def test_remote_hook_refresh_uses_challenge_and_changed_generation(db_sess
         "Authorization": "Bearer refreshed-token",
     }
     assert "auth" not in refreshed
-    assert refreshed["_oauth_token_resolver_refresh"] is refresh
+    next_refresh = refreshed["_oauth_token_resolver_refresh"]
+    assert next_refresh is not refresh
     assert "_connector_runtime_refresh" not in refreshed
+
+    assert await next_refresh(_challenge()) is None
+    assert requests[2].refresh == web_tools_config.OAuthRefreshContext(
+        reason="invalid_token",
+        resource_metadata_url=(
+            "https://mcp.example/.well-known/oauth-protected-resource"
+        ),
+        challenge_scope="records.read",
+        failed_generation="generation-2",
+    )
+
+
+@pytest.mark.asyncio
+async def test_delegated_remote_evaluates_bindings_once_without_false_warning(
+    db_session,
+    monkeypatch,
+    caplog,
+):
+    db, user = db_session
+    server = _add_remote_server(
+        db,
+        user,
+        runtime_bindings=_remote_runtime_bindings(),
+        allow_delegated_authorization=True,
+    )
+    evaluations = 0
+    original = web_tools_config.runtime_bindings_from_config
+
+    def counted_runtime_bindings_from_config(config):
+        nonlocal evaluations
+        evaluations += 1
+        return original(config)
+
+    monkeypatch.setattr(
+        web_tools_config,
+        "runtime_bindings_from_config",
+        counted_runtime_bindings_from_config,
+    )
+    cfg = _tool_config(db, user)
+    cfg._connector_runtime_view = {
+        f"mcp:{server.id}": {
+            "context": {},
+            "secrets": {
+                "runtime_header": "runtime",
+                "authorization": "Bearer delegated-token",
+            },
+            "auth_selector": {},
+        }
+    }
+
+    with caplog.at_level("WARNING"):
+        configs = await cfg.get_mcp_server_configs()
+
+    assert evaluations == 1
+    assert configs[0]["config"]["headers"] == {
+        "X-Runtime": "runtime",
+        "Authorization": "Bearer delegated-token",
+    }
+    assert "delegated authorization is disabled" not in caplog.text
 
 
 @pytest.mark.asyncio
