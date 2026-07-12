@@ -703,7 +703,7 @@ class MCPToolAdapter(AbstractBaseTool):
         refreshed = refresh()
         if inspect.isawaitable(refreshed):
             refreshed = await refreshed
-        if not _is_executable_connection(refreshed):
+        if not isinstance(refreshed, dict):
             return _delegated_authorization_failed_result()
         try:
             return await self._execute_mcp_call(

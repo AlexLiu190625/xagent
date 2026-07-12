@@ -819,6 +819,37 @@ async def test_resolver_retry_non_401_failure_does_not_leak_secrets(
 
 
 @pytest.mark.asyncio
+async def test_connector_refresh_empty_dict_preserves_legacy_retry_failure(
+    monkeypatch,
+):
+    connection = {
+        "transport": "streamable_http",
+        "url": "https://mcp.example.test",
+        "_connector_runtime_refresh": lambda: {},
+    }
+    adapter = _resolver_retry_adapter(connection)
+    attempted_connections = []
+
+    async def _execute(attempted, tool_args, tool_meta):
+        attempted_connections.append(attempted)
+        if attempted is connection:
+            raise RuntimeError("HTTP 401 Unauthorized")
+        raise RuntimeError("malformed connector retry connection")
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert attempted_connections == [connection, {}]
+    assert result == {
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
+        "is_error": True,
+    }
+
+
+@pytest.mark.asyncio
 async def test_delegated_authorization_401_refreshes_connection_once(monkeypatch):
     mcp_tool = SimpleNamespace(
         name="list_clients",
