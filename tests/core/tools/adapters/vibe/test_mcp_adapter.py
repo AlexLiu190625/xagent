@@ -649,6 +649,56 @@ async def test_resolver_refresh_failure_is_fixed_and_sanitized(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refreshed_connection",
+    [
+        {},
+        {"transport": "unsupported", "url": "https://mcp.example.test"},
+        {"transport": "stdio"},
+        {"transport": "stdio", "command": ""},
+        {"transport": "stdio", "command": ["python"]},
+        {"transport": "sse"},
+        {"transport": "streamable_http"},
+        {"transport": "streamable_http", "url": ""},
+        {"transport": "streamable_http", "url": 42},
+        {"transport": "websocket"},
+    ],
+)
+async def test_resolver_refresh_rejects_non_executable_connection_before_retry(
+    monkeypatch, refreshed_connection
+):
+    refresh_calls = 0
+
+    async def _resolver_refresh(challenge):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return refreshed_connection
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+    )
+    execution_calls = 0
+
+    async def _execute(connection, tool_args, tool_meta):
+        nonlocal execution_calls
+        execution_calls += 1
+        raise _http_status_error(authenticate=['Bearer error="invalid_token"'])
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert refresh_calls == 1
+    assert execution_calls == 1
+    assert result["is_error"] is True
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
 async def test_resolver_retry_second_401_does_not_refresh_twice(monkeypatch):
     refresh_calls = 0
 
@@ -674,6 +724,46 @@ async def test_resolver_retry_second_401_does_not_refresh_twice(monkeypatch):
         nonlocal execution_calls
         execution_calls += 1
         raise _http_status_error(authenticate=['Bearer error="invalid_token"'])
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert execution_calls == 2
+    assert refresh_calls == 1
+    assert result["is_error"] is True
+    assert "delegated_authorization_failed" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_resolver_retry_classifies_same_401_instance_without_second_refresh(
+    monkeypatch,
+):
+    refresh_calls = 0
+
+    async def _resolver_refresh(challenge):
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+    )
+    execution_calls = 0
+    repeated_error = _http_status_error(authenticate=['Bearer error="invalid_token"'])
+
+    async def _execute(connection, tool_args, tool_meta):
+        nonlocal execution_calls
+        execution_calls += 1
+        raise repeated_error
 
     monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
 

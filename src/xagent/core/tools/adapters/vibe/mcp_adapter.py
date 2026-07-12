@@ -55,18 +55,21 @@ _HTTP_401_TEXT_RE = re.compile(
 def _bounded_exception_nodes(
     exc: BaseException, *, excluded_ids: set[int] | None = None
 ) -> Iterator[BaseException]:
-    pending = [exc]
-    visited: set[int] = set(excluded_ids or ())
+    excluded = set(excluded_ids or ())
+    pending = [(exc, True)]
+    visited: set[int] = set()
     visited_count = 0
     while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
-        current = pending.pop()
+        current, is_root = pending.pop()
         current_id = id(current)
-        if current_id in visited:
+        if current_id in visited or (current_id in excluded and not is_root):
             continue
         visited.add(current_id)
         visited_count += 1
         yield current
 
+        if current_id in excluded:
+            continue
         linked: list[BaseException] = []
         if isinstance(current, BaseExceptionGroup):
             linked.extend(current.exceptions)
@@ -74,7 +77,7 @@ def _bounded_exception_nodes(
             linked.append(current.__cause__)
         if isinstance(current.__context__, BaseException):
             linked.append(current.__context__)
-        pending.extend(reversed(linked))
+        pending.extend((node, False) for node in reversed(linked))
 
 
 def _strict_http_401_responses(
@@ -99,6 +102,17 @@ def _resolver_invalid_token_challenge(exc: BaseException) -> Any | None:
         if challenge is not None and challenge.params.get("error") == "invalid_token":
             return challenge
     return None
+
+
+def _is_executable_connection(value: Any) -> bool:
+    if not isinstance(value, dict):
+        return False
+    transport = value.get("transport")
+    required_key = "command" if transport == "stdio" else "url"
+    if transport not in {"stdio", "sse", "streamable_http", "websocket"}:
+        return False
+    required_value = value.get(required_key)
+    return isinstance(required_value, str) and bool(required_value)
 
 
 def _exception_indicates_http_401(exc: BaseException) -> bool:
@@ -689,7 +703,7 @@ class MCPToolAdapter(AbstractBaseTool):
         refreshed = refresh()
         if inspect.isawaitable(refreshed):
             refreshed = await refreshed
-        if not isinstance(refreshed, dict):
+        if not _is_executable_connection(refreshed):
             return _delegated_authorization_failed_result()
         try:
             return await self._execute_mcp_call(
@@ -736,7 +750,7 @@ class MCPToolAdapter(AbstractBaseTool):
             )
             return _delegated_authorization_failed_result()
 
-        if not isinstance(refreshed, dict):
+        if not _is_executable_connection(refreshed):
             return _delegated_authorization_failed_result()
 
         try:
