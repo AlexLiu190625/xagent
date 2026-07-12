@@ -11,6 +11,7 @@ import os
 import shlex
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from functools import partial
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional
 
@@ -1965,14 +1966,11 @@ class WebToolConfig(BaseToolConfig):
                         )
                         if delegated_connection:
                             delegated_connection["_connector_runtime_refresh"] = (
-                                lambda _server=server,
-                                _runtime_bindings=runtime_bindings,
-                                _allow_delegated_authorization=allow_delegated_authorization: (
-                                    self._refresh_delegated_mcp_connection(
-                                        server=_server,
-                                        runtime_bindings=_runtime_bindings,
-                                        allow_delegated_authorization=_allow_delegated_authorization,
-                                    )
+                                partial(
+                                    self._refresh_delegated_mcp_connection,
+                                    server=server,
+                                    runtime_bindings=runtime_bindings,
+                                    allow_delegated_authorization=allow_delegated_authorization,
                                 )
                             )
                             transport_config.update(
