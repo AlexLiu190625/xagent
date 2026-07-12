@@ -24,6 +24,7 @@ from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.agent import Agent
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.task import (
     Task,
     TaskConnectorRuntimeContext,
@@ -45,7 +46,13 @@ from xagent.web.services.hot_path_cache import (
     set_cache_backend_for_testing,
     task_steps_key,
 )
-from xagent.web.tools.config import WebToolConfig
+from xagent.web.services.mcp_oauth import MCPAuthorizationChallenge
+from xagent.web.tools.config import (
+    ResolvedToken,
+    TokenRequest,
+    WebToolConfig,
+    set_oauth_token_resolver_hook,
+)
 
 from ..conftest import _admin_headers, _direct_db_session, client
 
@@ -998,6 +1005,97 @@ async def test_web_tool_config_applies_runtime_mcp_authorization_header(
     assert configs[0]["config"]["headers"]["Authorization"] == "Bearer tenant-token"
     assert refreshed_connection["headers"]["Authorization"] == "Bearer refreshed-token"
     assert configs[0]["connector_runtime"]["secrets"] == {}
+
+
+@pytest.mark.asyncio
+async def test_web_tool_config_resolver_owned_remote_keeps_adapter_runtime_data(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(agent_id, required=False)
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            PublicMCPApp(
+                app_id="shiftcare-runtime",
+                name="ShiftCare",
+                description="ShiftCare runtime app",
+                transport="streamable_http",
+                provider_name="shiftcare",
+                launch_config={},
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    resp = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first user message"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "context": {"account_id": "tenant-account"},
+                }
+            ],
+        },
+    )
+
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    requests: list[TokenRequest] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        requests.append(request)
+        generation = "generation-1" if request.refresh is None else "generation-2"
+        return ResolvedToken(access_token=generation, generation=generation)
+
+    set_oauth_token_resolver_hook(resolver)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        tool_config = WebToolConfig(
+            db=db,
+            request=None,
+            user=SimpleNamespace(id=int(task.user_id), is_admin=False),
+            user_id=int(task.user_id),
+            is_admin=False,
+            task_id=f"web_task_{task_id}",
+            include_mcp_tools=True,
+            tool_selection_spec=ToolSelectionSpec.from_raw(
+                tool_categories=["mcp:ShiftCare"]
+            ),
+            connector_runtime_turn_id=turn_id,
+        )
+        configs = await tool_config.get_mcp_server_configs()
+        refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+        refreshed = await refresh(
+            MCPAuthorizationChallenge(
+                resource_metadata_url=None,
+                scope="shiftcare.read",
+                params={},
+            )
+        )
+    finally:
+        set_oauth_token_resolver_hook(None)
+        db.close()
+
+    assert requests[0].provider == "shiftcare"
+    assert configs[0]["connector_runtime"] == {
+        "context": {"account_id": "tenant-account"},
+        "secrets": {},
+        "auth_selector": {},
+    }
+    assert configs[0]["runtime_bindings"][0]["target"]["target_type"] == "mcp_meta"
+    assert refreshed["headers"]["Authorization"] == "Bearer generation-2"
 
 
 def test_connector_runtime_secrets_do_not_enter_task_transcript(mock_start_task):

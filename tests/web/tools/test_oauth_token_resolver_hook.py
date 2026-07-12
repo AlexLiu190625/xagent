@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -13,6 +14,7 @@ from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.mcp_oauth import MCPAuthorizationChallenge
 from xagent.web.tools import config as web_tools_config
 from xagent.web.tools.config import (
     ResolvedToken,
@@ -151,6 +153,54 @@ def _add_stdio_server(db, user: User, *, name: str) -> MCPServer:
             mcpserver_id=server.id,
             is_owner=True,
             is_active=True,
+        )
+    )
+    db.commit()
+    return server
+
+
+def _add_remote_server(
+    db,
+    user: User,
+    *,
+    name: str = "Remote Records",
+    app_id: str = "remote-records",
+    provider: str = "records",
+    auth: object | None = None,
+    headers: dict | None = None,
+    runtime_bindings: list[dict] | None = None,
+    allow_delegated_authorization: bool = False,
+) -> MCPServer:
+    server = MCPServer(
+        name=name,
+        description=f"{name} server",
+        managed="external",
+        transport="streamable_http",
+        url="https://mcp.example/api",
+        auth=auth,
+        headers=headers,
+        runtime_bindings=runtime_bindings,
+        allow_delegated_authorization=allow_delegated_authorization,
+    )
+    db.add(server)
+    db.commit()
+    db.refresh(server)
+    db.add(
+        UserMCPServer(
+            user_id=user.id,
+            mcpserver_id=server.id,
+            is_owner=True,
+            is_active=True,
+        )
+    )
+    db.add(
+        PublicMCPApp(
+            app_id=app_id,
+            name=name,
+            description=f"{name} app",
+            transport="streamable_http",
+            provider_name=provider,
+            launch_config={},
         )
     )
     db.commit()
@@ -1143,3 +1193,469 @@ async def test_hook_request_receives_execution_scope(db_session):
 
     assert seen_scope == [scope]
     assert _access_token_env(configs[0]) == "hook-token"
+
+
+def _remote_runtime_bindings() -> list[dict]:
+    return [
+        {
+            "source": {"input_type": "secrets", "key": "runtime_header"},
+            "target": {
+                "target_type": "transport_headers",
+                "key": "X-Runtime",
+            },
+        },
+        {
+            "source": {"input_type": "secrets", "key": "authorization"},
+            "target": {
+                "target_type": "transport_headers",
+                "key": "Authorization",
+            },
+        },
+    ]
+
+
+def _challenge() -> MCPAuthorizationChallenge:
+    return MCPAuthorizationChallenge(
+        resource_metadata_url=(
+            "https://mcp.example/.well-known/oauth-protected-resource"
+        ),
+        scope="records.read",
+        params={},
+    )
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
+    db_session,
+):
+    db, user = db_session
+    scope = object()
+    server = _add_remote_server(
+        db,
+        user,
+        auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+        headers={"X-Static": "static", "authorization": "Bearer static-token"},
+        runtime_bindings=_remote_runtime_bindings(),
+        allow_delegated_authorization=True,
+    )
+    requests: list[TokenRequest] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        requests.append(request)
+        return ResolvedToken(
+            access_token="resolver-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+            generation="generation-1",
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(
+        db,
+        user,
+        execution_scope=scope,
+        mcp_auth_context={
+            str(server.id): {"resource": " https://selector.example/resource "}
+        },
+    )
+    cfg._connector_runtime_view = {
+        f"mcp:{server.id}": {
+            "context": {"account_id": "account-1"},
+            "secrets": {
+                "runtime_header": "runtime",
+                "authorization": "Bearer delegated-token",
+            },
+            "auth_selector": {},
+        }
+    }
+
+    configs = await cfg.get_mcp_server_configs()
+
+    assert [
+        (request.provider, request.resource, request.scope) for request in requests
+    ] == [("records", " https://selector.example/resource ", scope)]
+    assert configs[0]["config"]["headers"] == {
+        "X-Static": "static",
+        "X-Runtime": "runtime",
+        "Authorization": "Bearer resolver-token",
+    }
+    assert callable(configs[0]["config"]["_oauth_token_resolver_refresh"])
+    assert "_connector_runtime_refresh" not in configs[0]["config"]
+    assert configs[0]["connector_runtime"] == {
+        "context": {"account_id": "account-1"},
+        "secrets": {},
+        "auth_selector": {},
+    }
+    assert configs[0]["runtime_bindings"] == _remote_runtime_bindings()
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_checks_all_candidates_before_existing_plain_path(
+    db_session,
+):
+    db, user = db_session
+    _add_remote_server(
+        db,
+        user,
+        headers={"X-Static": "static", "Authorization": "Bearer static-token"},
+    )
+    seen: list[str] = []
+
+    async def resolver(request: TokenRequest) -> None:
+        seen.append(request.provider)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert seen == ["records", "remote-records"]
+    assert configs[0]["config"]["headers"] == {
+        "X-Static": "static",
+        "Authorization": "Bearer static-token",
+    }
+    assert "_oauth_token_resolver_refresh" not in configs[0]["config"]
+    assert "_connector_runtime_refresh" not in configs[0]["config"]
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_decline_preserves_delegated_runtime_path(db_session):
+    db, user = db_session
+    server = _add_remote_server(
+        db,
+        user,
+        headers={"X-Static": "static"},
+        runtime_bindings=_remote_runtime_bindings(),
+        allow_delegated_authorization=True,
+    )
+    seen: list[str] = []
+
+    async def resolver(request: TokenRequest) -> None:
+        seen.append(request.provider)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+    cfg._connector_runtime_view = {
+        f"mcp:{server.id}": {
+            "context": {},
+            "secrets": {
+                "runtime_header": "runtime",
+                "authorization": "Bearer delegated-token",
+            },
+            "auth_selector": {},
+        }
+    }
+
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen == ["records", "remote-records"]
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer delegated-token"
+    )
+    assert callable(configs[0]["config"]["_connector_runtime_refresh"])
+    assert "_oauth_token_resolver_refresh" not in configs[0]["config"]
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_decline_preserves_standard_oauth_path(db_session):
+    db, user = db_session
+    _add_remote_server(
+        db,
+        user,
+        auth={"type": "mcp_oauth", "resource": "https://auth.example/resource"},
+    )
+    seen: list[str] = []
+
+    async def resolver(request: TokenRequest) -> None:
+        seen.append(request.provider)
+        return None
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    configs = await cfg.get_mcp_server_configs()
+
+    assert seen == ["records", "remote-records"]
+    assert configs == []
+    assert cfg.get_mcp_oauth_diagnostics()[0]["code"] == "authorization_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resolved", "exception_type"),
+    [
+        (object(), "object"),
+        (
+            ResolvedToken(access_token="", generation="generation-1"),
+            "InvalidAccessToken",
+        ),
+    ],
+)
+async def test_remote_hook_malformed_initial_result_fails_closed(
+    db_session,
+    resolved,
+    exception_type,
+):
+    db, user = db_session
+    server = _add_remote_server(
+        db,
+        user,
+        headers={"Authorization": "Bearer static-token"},
+        auth={"type": "bearer", "bearer_token": "fallback-token"},
+    )
+
+    async def resolver(request: TokenRequest):
+        return resolved
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert configs[0]["config"]["server_id"] == server.id
+    assert cfg.get_mcp_oauth_diagnostics()[0]["exception_type"] == exception_type
+    assert "fallback-token" not in repr(configs)
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_initial_raise_fails_closed(db_session):
+    db, user = db_session
+    _add_remote_server(
+        db,
+        user,
+        headers={"Authorization": "Bearer static-token"},
+    )
+
+    async def resolver(request: TokenRequest):
+        raise RuntimeError("resolver-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "resolver-secret" not in repr(configs)
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_refresh_uses_challenge_and_changed_generation(db_session):
+    db, user = db_session
+    server = _add_remote_server(
+        db,
+        user,
+        headers={"X-Static": "static", "Authorization": "Bearer static-token"},
+    )
+    requests: list[TokenRequest] = []
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        requests.append(request)
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        return ResolvedToken(access_token="refreshed-token", generation="generation-2")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    refreshed = await refresh(_challenge())
+
+    assert requests[1].provider == requests[0].provider == "records"
+    assert requests[1].resource == requests[0].resource == server.url
+    assert requests[1].refresh == web_tools_config.OAuthRefreshContext(
+        reason="invalid_token",
+        resource_metadata_url=(
+            "https://mcp.example/.well-known/oauth-protected-resource"
+        ),
+        challenge_scope="records.read",
+        failed_generation="generation-1",
+    )
+    assert refreshed["headers"] == {
+        "X-Static": "static",
+        "Authorization": "Bearer refreshed-token",
+    }
+    assert "auth" not in refreshed
+    assert refreshed["_oauth_token_resolver_refresh"] is refresh
+    assert "_connector_runtime_refresh" not in refreshed
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_refresh_reuses_captured_non_auth_runtime_snapshot(
+    db_session,
+):
+    db, user = db_session
+    server = _add_remote_server(
+        db,
+        user,
+        headers={"X-Static": "static"},
+        runtime_bindings=_remote_runtime_bindings(),
+    )
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        return ResolvedToken(access_token="refreshed-token", generation="generation-2")
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+    cfg._connector_runtime_view = {
+        f"mcp:{server.id}": {
+            "context": {},
+            "secrets": {"runtime_header": "captured-runtime"},
+            "auth_selector": {},
+        }
+    }
+    configs = await cfg.get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+    cfg._connector_runtime_view = {
+        f"mcp:{server.id}": {
+            "context": {},
+            "secrets": {"runtime_header": "later-runtime"},
+            "auth_selector": {},
+        }
+    }
+
+    refreshed = await refresh(_challenge())
+
+    assert refreshed["headers"]["X-Runtime"] == "captured-runtime"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("registration_action", ["same", "replace", "clear"])
+async def test_remote_hook_refresh_rejects_changed_registration(
+    db_session,
+    registration_action,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+    calls = 0
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        nonlocal calls
+        calls += 1
+        return ResolvedToken(
+            access_token=f"token-{calls}", generation=f"generation-{calls}"
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    if registration_action == "same":
+        set_oauth_token_resolver_hook(resolver)
+    elif registration_action == "replace":
+        set_oauth_token_resolver_hook(lambda request: None)
+    else:
+        set_oauth_token_resolver_hook(None)
+
+    assert await refresh(_challenge()) is None
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_refresh_rejects_registration_change_during_await(
+    db_session,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+    refresh_started = asyncio.Event()
+    release_refresh = asyncio.Event()
+
+    async def resolver(request: TokenRequest) -> ResolvedToken:
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        refresh_started.set()
+        await release_refresh.wait()
+        return ResolvedToken(access_token="refreshed-token", generation="generation-2")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    pending = asyncio.create_task(refresh(_challenge()))
+    await refresh_started.wait()
+    set_oauth_token_resolver_hook(resolver)
+    release_refresh.set()
+
+    assert await pending is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "refresh_result",
+    [
+        None,
+        object(),
+        ResolvedToken(access_token="refreshed", generation=None),
+        ResolvedToken(access_token="refreshed", generation="generation-1"),
+        ResolvedToken(access_token="refreshed", generation=""),
+        ResolvedToken(
+            access_token="refreshed",
+            generation="generation-2",
+            expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+        ),
+    ],
+    ids=[
+        "none",
+        "invalid",
+        "missing-generation",
+        "unchanged",
+        "invalid-generation",
+        "expired",
+    ],
+)
+async def test_remote_hook_refresh_invalid_results_fail_closed(
+    db_session,
+    refresh_result,
+):
+    db, user = db_session
+    _add_remote_server(
+        db,
+        user,
+        headers={"Authorization": "Bearer static-token"},
+    )
+
+    async def resolver(request: TokenRequest):
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        return refresh_result
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    assert await refresh(_challenge()) is None
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_refresh_resolver_raise_has_no_authorization_fallback(
+    db_session,
+):
+    db, user = db_session
+    _add_remote_server(
+        db,
+        user,
+        headers={"Authorization": "Bearer static-token"},
+    )
+
+    async def resolver(request: TokenRequest):
+        if request.refresh is None:
+            return ResolvedToken(
+                access_token="initial-token", generation="generation-1"
+            )
+        raise RuntimeError("refresh-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+    refresh = configs[0]["config"]["_oauth_token_resolver_refresh"]
+
+    assert await refresh(_challenge()) is None
