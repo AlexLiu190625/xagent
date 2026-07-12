@@ -1464,30 +1464,6 @@ class WebToolConfig(BaseToolConfig):
             non_auth_connection=non_auth_connection,
         )
 
-    def _resolver_owned_mcp_connection(
-        self,
-        *,
-        resolver: TokenResolver,
-        registration_generation: int,
-        resolved: _ResolvedHookToken,
-        providers: list[str],
-        resource: str | None,
-        non_auth_connection: dict[str, Any],
-    ) -> dict[str, Any]:
-        user_id = int(self._user_id)
-        scope = self.get_execution_scope()
-
-        return self._build_resolver_owned_mcp_connection(
-            resolver=resolver,
-            registration_generation=registration_generation,
-            resolved=resolved,
-            providers=providers,
-            user_id=user_id,
-            scope=scope,
-            resource=resource,
-            non_auth_connection=non_auth_connection,
-        )
-
     def _build_resolver_owned_mcp_connection(
         self,
         *,
@@ -1981,11 +1957,13 @@ class WebToolConfig(BaseToolConfig):
 
                     if remote_hook_token is not None and resolver is not None:
                         self._mark_hook_token_cache_metadata(remote_hook_token)
-                        resolver_connection = self._resolver_owned_mcp_connection(
+                        resolver_connection = self._build_resolver_owned_mcp_connection(
                             resolver=resolver,
                             registration_generation=registration_generation,
                             resolved=remote_hook_token,
                             providers=providers_to_resolve,
+                            user_id=int(self._user_id),
+                            scope=self.get_execution_scope(),
                             resource=configured_resource,
                             non_auth_connection=self._non_auth_mcp_connection(
                                 server=server,

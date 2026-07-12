@@ -104,15 +104,14 @@ def _resolver_invalid_token_challenge(exc: BaseException) -> Any | None:
     return None
 
 
-def _is_executable_connection(value: Any) -> bool:
+def _is_executable_remote_connection(value: Any) -> bool:
     if not isinstance(value, dict):
         return False
     transport = value.get("transport")
-    required_key = "command" if transport == "stdio" else "url"
-    if transport not in {"stdio", "sse", "streamable_http", "websocket"}:
+    if transport not in {"sse", "streamable_http", "websocket"}:
         return False
-    required_value = value.get(required_key)
-    return isinstance(required_value, str) and bool(required_value)
+    url = value.get("url")
+    return isinstance(url, str) and bool(url)
 
 
 def _exception_indicates_http_401(exc: BaseException) -> bool:
@@ -629,7 +628,7 @@ class MCPToolAdapter(AbstractBaseTool):
                         self.connection, tool_args, tool_meta
                     )
                 except (BaseExceptionGroup, Exception) as exc:
-                    retry_result = await self._retry_delegated_401(
+                    retry_result = await self._retry_after_authorization_failure(
                         exc, tool_args, tool_meta
                     )
                     if retry_result is not None:
@@ -685,7 +684,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 "is_error": result.isError if hasattr(result, "isError") else False,
             }
 
-    async def _retry_delegated_401(
+    async def _retry_after_authorization_failure(
         self,
         exc: BaseException,
         tool_args: Mapping[str, Any],
@@ -765,7 +764,7 @@ class MCPToolAdapter(AbstractBaseTool):
                 failure_code=refreshed.failure_code
             )
 
-        if not _is_executable_connection(refreshed):
+        if not _is_executable_remote_connection(refreshed):
             return _delegated_authorization_failed_result()
 
         try:

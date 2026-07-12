@@ -284,6 +284,22 @@ async def test_concurrent_batch_updates_consecutive_group_count() -> None:
     assert pattern._consecutive_successful_tool_group_count(group) == 3
 
 
+async def test_mcp_error_result_stops_consecutive_successful_group_count() -> None:
+    group = "search"
+    tool = FakeTool("s1", concurrency_safe=True, decision_group=group)
+    pattern = make_react(parallel=True)
+    pattern._tool_decision_groups_by_name = pattern._tool_decision_groups_for_tools(
+        [tool]
+    )
+    pattern._record_tool_call(
+        make_tool_call("s1"),
+        status="completed",
+        result={"content": [{"text": "failed"}], "is_error": True},
+    )
+
+    assert pattern._consecutive_successful_tool_group_count(group) == 0
+
+
 async def test_concurrent_batch_with_failure_counts_work_calls() -> None:
     tools = [
         FakeTool("s1", concurrency_safe=True),

@@ -659,7 +659,7 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
         connection=connection,
     )
     nested_failures = []
-    retry = adapter._retry_delegated_401
+    retry = adapter._retry_after_authorization_failure
 
     async def _observe_nested_failure(exc, attempted_args, attempted_meta):
         nested_failures.append(exc)
@@ -670,7 +670,9 @@ async def test_real_mcp_session_retries_nested_resolver_401_once(monkeypatch, ca
         ]
         return await retry(exc, attempted_args, attempted_meta)
 
-    monkeypatch.setattr(adapter, "_retry_delegated_401", _observe_nested_failure)
+    monkeypatch.setattr(
+        adapter, "_retry_after_authorization_failure", _observe_nested_failure
+    )
     caplog.set_level("DEBUG")
 
     result = await adapter.run_json_async(
@@ -852,6 +854,7 @@ async def test_resolver_refresh_failure_is_fixed_and_sanitized(
         {"transport": "stdio"},
         {"transport": "stdio", "command": ""},
         {"transport": "stdio", "command": ["python"]},
+        {"transport": "stdio", "command": "python"},
         {"transport": "sse"},
         {"transport": "streamable_http"},
         {"transport": "streamable_http", "url": ""},

@@ -2908,7 +2908,7 @@ async def test_react_pattern_mcp_is_error_result_is_failed_without_failure_code(
             {"content": "Recovered after MCP tool failure."},
         ]
     )
-    pattern = ReActPattern(max_iterations=3)
+    pattern = ReActPattern(max_iterations=3, finalize_after_tool_result=True)
     context = ExecutionContext(execution_id="is-error-result")
     context.add_user_message("Recover")
     runtime = PatternRuntime(tracer=tracer)
@@ -2924,6 +2924,7 @@ async def test_react_pattern_mcp_is_error_result_is_failed_without_failure_code(
     tool_message = context.get_messages_by_role("tool")[0]
     assert tool_message.metadata["raw_result"]["is_error"] is True
     assert pattern.tool_ledger["call_is_error_result"].status == "failed"
+    assert llm.calls[1]["tools"] is not None
     failure_events = [
         event for event in tracer.events if event["event_type"] == "action_error_tool"
     ]

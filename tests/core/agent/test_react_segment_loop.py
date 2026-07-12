@@ -172,6 +172,23 @@ async def test_concurrent_batch_then_unsafe_serial_preserves_order() -> None:
     assert "before_tool" in statuses  # u1 serial
 
 
+async def test_concurrent_mcp_error_results_do_not_force_final_answer() -> None:
+    mcp_error = {"content": [{"text": "failed"}], "is_error": True}
+    tools = [
+        FakeTool("s1", read_only=True, result=mcp_error),
+        FakeTool("s2", read_only=True, result=mcp_error),
+    ]
+    pattern = _make_pattern(finalize_after_tool_result=True)
+    pattern.pending_tool_calls = [make_tool_call("s1"), make_tool_call("s2")]
+
+    result = await pattern._execute_pending_tool_calls(
+        context=RecordingContext(), tools=tools, llm=None, runtime=FakeRuntime()
+    )
+
+    assert result is None
+    assert pattern.force_final_answer_next is False
+
+
 async def test_flag_off_runs_everything_serially() -> None:
     # With the flag off, two safe tools each run as their own serial segment.
     tools = [FakeTool("s1", read_only=True), FakeTool("s2", read_only=True)]
