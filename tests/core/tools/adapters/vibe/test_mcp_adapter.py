@@ -476,6 +476,45 @@ def _resolver_retry_adapter(connection):
 
 
 @pytest.mark.asyncio
+async def test_resolver_retry_analyzes_initial_401_chain_once(monkeypatch):
+    from xagent.core.agent.result import ClassifiedToolFailure
+
+    strict_401_calls = 0
+    strict_401_responses = mcp_adapter_module._strict_http_401_responses
+
+    def counting_strict_401_responses(exc, **kwargs):
+        nonlocal strict_401_calls
+        strict_401_calls += 1
+        yield from strict_401_responses(exc, **kwargs)
+
+    async def _resolver_refresh(challenge):
+        return ClassifiedToolFailure(failure_code="oauth_token_required")
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+    )
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "_strict_http_401_responses",
+        counting_strict_401_responses,
+    )
+
+    result = await adapter._retry_resolver_401(
+        _http_status_error(authenticate=['Bearer error="invalid_token"']),
+        {},
+        {},
+    )
+
+    assert strict_401_calls == 1
+    assert result is not None
+    assert result["failure_code"] == "oauth_token_required"
+
+
+@pytest.mark.asyncio
 async def test_resolver_401_has_priority_and_retries_rebuilt_connection_once(
     monkeypatch,
 ):
@@ -971,6 +1010,104 @@ async def test_resolver_retry_classifies_same_401_instance_without_second_refres
     assert refresh_calls == 1
     assert result["is_error"] is True
     assert "delegated_authorization_failed" in result["content"][0]["text"]
+
+
+@pytest.mark.asyncio
+async def test_resolver_retry_ignores_rewrapped_initial_401_response(monkeypatch):
+    async def _resolver_refresh(challenge):
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+    )
+    initial_error = _http_status_error(authenticate=['Bearer error="invalid_token"'])
+    rewrapped_initial_response = httpx.HTTPStatusError(
+        "rewrapped initial response",
+        request=initial_error.request,
+        response=initial_error.response,
+    )
+    execution_calls = 0
+
+    async def _execute(connection, tool_args, tool_meta):
+        nonlocal execution_calls
+        execution_calls += 1
+        if execution_calls == 1:
+            raise initial_error
+        raise rewrapped_initial_response
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert execution_calls == 2
+    assert result == {
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
+        "is_error": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_resolver_retry_prunes_over_budget_initial_exception_subtree(
+    monkeypatch,
+):
+    async def _resolver_refresh(challenge):
+        return {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+
+    adapter = _resolver_retry_adapter(
+        {
+            "transport": "streamable_http",
+            "url": "https://mcp.example.test",
+            "_oauth_token_resolver_refresh": _resolver_refresh,
+        }
+    )
+    deep_original: BaseException = _http_status_error(
+        authenticate=['Bearer error="invalid_token"']
+    )
+    for index in range(mcp_adapter_module._RESOLVER_HTTP_401_NODE_LIMIT + 1):
+        wrapper = RuntimeError(f"initial-wrapper-{index}")
+        wrapper.__cause__ = deep_original
+        deep_original = wrapper
+    initial_error = ExceptionGroup(
+        "initial",
+        [
+            _http_status_error(authenticate=['Bearer error="invalid_token"']),
+            deep_original,
+        ],
+    )
+    execution_calls = 0
+
+    async def _execute(connection, tool_args, tool_meta):
+        nonlocal execution_calls
+        execution_calls += 1
+        if execution_calls == 1:
+            raise initial_error
+        raise RuntimeError("retry transport failed")
+
+    monkeypatch.setattr(adapter, "_execute_mcp_call", _execute)
+
+    result = await adapter.run_json_async({})
+
+    assert execution_calls == 2
+    assert result == {
+        "content": [
+            {"text": "Error executing MCP tool after delegated authorization retry."}
+        ],
+        "is_error": True,
+    }
 
 
 @pytest.mark.asyncio

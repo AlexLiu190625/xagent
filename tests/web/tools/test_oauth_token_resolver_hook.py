@@ -1316,6 +1316,36 @@ async def test_remote_hook_future_expiry_is_cached_until_registration_changes(
 
 
 @pytest.mark.asyncio
+async def test_remote_hook_near_expiry_token_is_used_but_not_cached(db_session):
+    db, user = db_session
+    _add_remote_server(db, user)
+    calls = 0
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        nonlocal calls
+        calls += 1
+        return ResolvedToken(
+            access_token=f"remote-hook-token-{calls}",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=1),
+            generation=f"remote-generation-{calls}",
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    first = await cfg.get_mcp_server_configs()
+    second = await cfg.get_mcp_server_configs()
+
+    assert calls == 2
+    assert first[0]["config"]["headers"]["Authorization"] == (
+        "Bearer remote-hook-token-1"
+    )
+    assert second[0]["config"]["headers"]["Authorization"] == (
+        "Bearer remote-hook-token-2"
+    )
+
+
+@pytest.mark.asyncio
 async def test_remote_hook_owns_connection_and_preserves_non_auth_snapshot(
     db_session,
     caplog,

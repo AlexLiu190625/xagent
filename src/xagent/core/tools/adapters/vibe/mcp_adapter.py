@@ -53,22 +53,23 @@ _HTTP_401_TEXT_RE = re.compile(
 
 
 def _bounded_exception_nodes(
-    exc: BaseException, *, excluded_ids: set[int] | None = None
+    exc: BaseException, *, excluded_subtree_ids: frozenset[int] = frozenset()
 ) -> Iterator[BaseException]:
-    excluded = set(excluded_ids or ())
     pending = [(exc, True)]
     visited: set[int] = set()
     visited_count = 0
     while pending and visited_count < _RESOLVER_HTTP_401_NODE_LIMIT:
         current, is_root = pending.pop()
         current_id = id(current)
-        if current_id in visited or (current_id in excluded and not is_root):
+        if current_id in visited or (
+            current_id in excluded_subtree_ids and not is_root
+        ):
             continue
         visited.add(current_id)
         visited_count += 1
         yield current
 
-        if current_id in excluded:
+        if current_id in excluded_subtree_ids:
             continue
         linked: list[BaseException] = []
         if isinstance(current, BaseExceptionGroup):
@@ -81,27 +82,46 @@ def _bounded_exception_nodes(
 
 
 def _strict_http_401_responses(
-    exc: BaseException, *, excluded_ids: set[int] | None = None
+    exc: BaseException,
+    *,
+    excluded_response_ids: frozenset[int] = frozenset(),
+    excluded_subtree_ids: frozenset[int] = frozenset(),
 ) -> Iterator[httpx.Response]:
-    for current in _bounded_exception_nodes(exc, excluded_ids=excluded_ids):
+    for current in _bounded_exception_nodes(
+        exc, excluded_subtree_ids=excluded_subtree_ids
+    ):
         if not isinstance(current, httpx.HTTPStatusError):
             continue
         response = current.response
-        if isinstance(response, httpx.Response) and response.status_code == 401:
+        if (
+            isinstance(response, httpx.Response)
+            and response.status_code == 401
+            and id(response) not in excluded_response_ids
+        ):
             yield response
 
 
-def _resolver_invalid_token_challenge(exc: BaseException) -> Any | None:
+def _resolver_401_evidence(exc: BaseException) -> tuple[Any | None, frozenset[int]]:
     # Lazy import keeps the core adapter independent from the web layer at import time.
     from .....web.services.mcp_oauth import parse_www_authenticate_bearer
 
+    challenge = None
+    response_ids: set[int] = set()
     for response in _strict_http_401_responses(exc):
-        challenge = parse_www_authenticate_bearer(
+        response_ids.add(id(response))
+        if challenge is not None:
+            continue
+        candidate = parse_www_authenticate_bearer(
             response.headers.get_list("WWW-Authenticate")
         )
-        if challenge is not None and challenge.params.get("error") == "invalid_token":
-            return challenge
-    return None
+        if candidate is not None and candidate.params.get("error") == "invalid_token":
+            challenge = candidate
+    return challenge, frozenset(response_ids)
+
+
+def _resolver_invalid_token_challenge(exc: BaseException) -> Any | None:
+    challenge, _ = _resolver_401_evidence(exc)
+    return challenge
 
 
 def _is_executable_remote_connection(value: Any) -> bool:
@@ -732,11 +752,10 @@ class MCPToolAdapter(AbstractBaseTool):
         tool_args: Mapping[str, Any],
         tool_meta: Mapping[str, Any],
     ) -> dict[str, Any] | None:
-        strict_401 = next(_strict_http_401_responses(exc), None)
-        if strict_401 is None:
+        challenge, initial_response_ids = _resolver_401_evidence(exc)
+        if not initial_response_ids:
             return None
 
-        challenge = _resolver_invalid_token_challenge(exc)
         refresh = self.connection.get(_OAUTH_TOKEN_RESOLVER_REFRESH_KEY)
         if challenge is None or not callable(refresh):
             return _delegated_authorization_failed_result()
@@ -772,13 +791,15 @@ class MCPToolAdapter(AbstractBaseTool):
                 cast(Connection, refreshed), tool_args, tool_meta
             )
         except (BaseExceptionGroup, Exception) as retry_exc:
-            original_exception_ids = {
-                id(node) for node in _bounded_exception_nodes(exc)
-            }
+            excluded_response_ids = (
+                frozenset() if retry_exc is exc else initial_response_ids
+            )
             if (
                 next(
                     _strict_http_401_responses(
-                        retry_exc, excluded_ids=original_exception_ids
+                        retry_exc,
+                        excluded_response_ids=excluded_response_ids,
+                        excluded_subtree_ids=frozenset({id(exc)}),
                     ),
                     None,
                 )
