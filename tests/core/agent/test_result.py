@@ -8,6 +8,10 @@ from xagent.core.agent.result import (
 )
 
 
+class _FailureCodeStringSubclass(str):
+    pass
+
+
 @pytest.mark.parametrize(
     ("value", "expected"),
     [
@@ -17,6 +21,7 @@ from xagent.core.agent.result import (
         ("OAUTH_TOKEN_REQUIRED", None),
         (None, None),
         (123, None),
+        (_FailureCodeStringSubclass("oauth_token_required"), None),
     ],
 )
 def test_normalize_tool_failure_code_uses_exact_allowlist(value, expected):

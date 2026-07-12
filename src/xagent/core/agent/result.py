@@ -9,7 +9,7 @@ TOOL_FAILURE_CODES = frozenset({"oauth_token_required"})
 def normalize_tool_failure_code(value: Any) -> str | None:
     """Return an exact public tool failure code when it is allowlisted."""
 
-    return value if isinstance(value, str) and value in TOOL_FAILURE_CODES else None
+    return value if type(value) is str and value in TOOL_FAILURE_CODES else None
 
 
 def tool_result_succeeded(result: Any) -> bool:
