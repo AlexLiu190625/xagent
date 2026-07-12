@@ -3,6 +3,25 @@ from __future__ import annotations
 import json
 from typing import Any
 
+TOOL_FAILURE_CODES = frozenset({"oauth_token_required"})
+
+
+def normalize_tool_failure_code(value: Any) -> str | None:
+    """Return an exact public tool failure code when it is allowlisted."""
+
+    return value if isinstance(value, str) and value in TOOL_FAILURE_CODES else None
+
+
+def tool_result_succeeded(result: Any) -> bool:
+    """Classify the supported structured tool-result failure shapes."""
+
+    if not isinstance(result, dict):
+        return True
+    if result.get("success") is False or result.get("is_error") is True:
+        return False
+    status = result.get("status")
+    return not (isinstance(status, str) and status.lower() == "error")
+
 
 def extract_assistant_message(result: dict[str, Any]) -> str | None:
     """Return the assistant-facing output from a normalized pattern result."""

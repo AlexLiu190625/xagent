@@ -520,6 +520,7 @@ class ToolFactory:
     ) -> List[Tool]:
         """Create MCP tools from configurations."""
         try:
+            from ....agent.result import normalize_tool_failure_code
             from .mcp_adapter import UnavailableMCPTool, load_mcp_tools_as_agent_tools
 
             unavailable_tools: List[Tool] = []
@@ -540,6 +541,9 @@ class ToolFactory:
                                 allow_users=allow_users
                                 if isinstance(allow_users, list)
                                 else None,
+                                failure_code=normalize_tool_failure_code(
+                                    inner_config.get("failure_code")
+                                ),
                             )
                         )
                     except Exception as e:

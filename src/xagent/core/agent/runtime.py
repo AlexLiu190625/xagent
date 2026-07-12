@@ -16,6 +16,7 @@ from ..agent.trace import (
 )
 from ..model.chat.basic.base import BaseLLM
 from ..model.chat.types import ChunkType
+from .result import normalize_tool_failure_code, tool_result_succeeded
 from .streaming import merge_streamed_tool_call_arguments
 
 logger = logging.getLogger(__name__)
@@ -632,7 +633,9 @@ class PatternRuntime:
         success = self._tool_result_success(result)
         if not success:
             await self.on_tool_error(
-                tool_call=tool_call, error=self._tool_result_error(result)
+                tool_call=tool_call,
+                error=self._tool_result_error(result),
+                result=result,
             )
             return
 
@@ -676,6 +679,11 @@ class PatternRuntime:
         }
         if result is not None:
             data["result"] = result
+        failure_code = normalize_tool_failure_code(
+            result.get("failure_code") if isinstance(result, dict) else None
+        )
+        if failure_code is not None:
+            data["failure_code"] = failure_code
 
         await self._emit_trace_event(
             TraceEventType(TraceScope.ACTION, TraceAction.ERROR, TraceCategory.TOOL),
@@ -696,13 +704,7 @@ class PatternRuntime:
             await self._maybe_await(finish_span(**payload))
 
     def _tool_result_success(self, result: Any) -> bool:
-        if isinstance(result, dict):
-            if result.get("success") is False:
-                return False
-            status = result.get("status")
-            if isinstance(status, str) and status.lower() == "error":
-                return False
-        return True
+        return tool_result_succeeded(result)
 
     def _tool_result_error(self, result: Any) -> Exception:
         if isinstance(result, dict):

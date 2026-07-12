@@ -1463,6 +1463,69 @@ async def test_remote_hook_initial_raise_fails_closed(db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_failure_code", "expected_failure_code"),
+    [
+        ("oauth_token_required", "oauth_token_required"),
+        ("other_valid_code", None),
+        (" oauth_token_required", None),
+        (123, None),
+    ],
+)
+async def test_remote_hook_preserves_only_allowlisted_resolver_failure_code(
+    db_session,
+    raw_failure_code,
+    expected_failure_code,
+):
+    db, user = db_session
+    _add_remote_server(db, user)
+
+    class ResolverFailure(RuntimeError):
+        oauth_token_resolver_failure_code = raw_failure_code
+
+    async def resolver(request: TokenRequest):
+        raise ResolverFailure("resolver-internal-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    configs = await cfg.get_mcp_server_configs()
+
+    unavailable_config = configs[0]["config"]
+    if expected_failure_code is None:
+        assert "failure_code" not in unavailable_config
+    else:
+        assert unavailable_config["failure_code"] == expected_failure_code
+    assert "failure_code" not in cfg.get_mcp_oauth_diagnostics()[0]
+    assert "resolver-internal-secret" not in repr(configs)
+
+
+@pytest.mark.asyncio
+async def test_remote_hook_failure_code_property_error_is_sanitized(db_session):
+    db, user = db_session
+    _add_remote_server(db, user)
+
+    class ResolverFailure(RuntimeError):
+        @property
+        def oauth_token_resolver_failure_code(self):
+            raise RuntimeError("failure-code-property-secret")
+
+    async def resolver(request: TokenRequest):
+        raise ResolverFailure("resolver-internal-secret")
+
+    set_oauth_token_resolver_hook(resolver)
+    cfg = _tool_config(db, user)
+
+    configs = await cfg.get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "unavailable"
+    assert "failure_code" not in configs[0]["config"]
+    public_output = repr(configs) + repr(cfg.get_mcp_oauth_diagnostics())
+    assert "failure-code-property-secret" not in public_output
+    assert "resolver-internal-secret" not in public_output
+
+
+@pytest.mark.asyncio
 async def test_remote_hook_consecutive_refreshes_advance_failed_generation(db_session):
     db, user = db_session
     server = _add_remote_server(

@@ -669,6 +669,54 @@ async def test_tool_invocation_counts_one_action_each() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_failure_code", "expected_failure_code"),
+    [
+        ("oauth_token_required", "oauth_token_required"),
+        ("other_valid_code", None),
+        (" oauth_token_required", None),
+        ({"failure_code": "oauth_token_required"}, None),
+    ],
+)
+async def test_on_tool_end_emits_only_allowlisted_top_level_failure_code(
+    raw_failure_code,
+    expected_failure_code,
+) -> None:
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-failure-code")
+    result = {
+        "is_error": True,
+        "error": "MCP server credentials are unavailable.",
+        "failure_code": raw_failure_code,
+    }
+
+    await runtime.on_tool_end(
+        tool_call={"name": "mcp_unavailable", "id": "call-1"},
+        result=result,
+    )
+
+    assert [event["type"] for event in tracer.events] == ["action_error_tool"]
+    event_data = tracer.events[0]["data"]
+    assert event_data["result"] == result
+    if expected_failure_code is None:
+        assert "failure_code" not in event_data
+    else:
+        assert event_data["failure_code"] == expected_failure_code
+
+
+@pytest.mark.asyncio
 async def test_concurrent_tool_calls_all_count() -> None:
     """A concurrent batch (asyncio.gather) increments the shared counter once per tool.
 

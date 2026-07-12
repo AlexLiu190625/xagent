@@ -18,6 +18,7 @@ from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optio
 import httpx
 
 from ...config import get_uploads_dir
+from ...core.agent.result import normalize_tool_failure_code
 from ...core.tools.adapters.vibe.config import (
     BaseToolConfig,
     normalize_tool_allowlist,
@@ -145,12 +146,14 @@ class _OAuthTokenResolverFailed(Exception):
         exception_type: str,
         resource: str | None = None,
         actor_id: str | None = None,
+        failure_code: str | None = None,
     ) -> None:
         super().__init__(OAUTH_TOKEN_RESOLVER_FAILURE_CODE)
         self.providers = providers
         self.exception_type = exception_type
         self.resource = resource
         self.actor_id = actor_id
+        self.failure_code = normalize_tool_failure_code(failure_code)
 
 
 class _OAuthLaunchConfigInvalid(Exception):
@@ -174,6 +177,14 @@ def _extract_oauth_token_resolver_diagnostic_actor_id(exc: Exception) -> str | N
         return _bounded_oauth_metadata(raw_actor_id)
     except Exception:
         return None
+
+
+def _extract_oauth_token_resolver_failure_code(exc: Exception) -> str | None:
+    try:
+        raw_failure_code = getattr(exc, "oauth_token_resolver_failure_code", None)
+    except Exception:
+        return None
+    return normalize_tool_failure_code(raw_failure_code)
 
 
 def _normalize_oauth_expires_at(expires_at: datetime | None) -> datetime | None:
@@ -1350,6 +1361,7 @@ class WebToolConfig(BaseToolConfig):
                     exception_type=_bounded_oauth_metadata(type(exc).__name__),
                     resource=resource,
                     actor_id=_extract_oauth_token_resolver_diagnostic_actor_id(exc),
+                    failure_code=_extract_oauth_token_resolver_failure_code(exc),
                 ) from exc
 
             if resolved is None:
@@ -1610,6 +1622,7 @@ class WebToolConfig(BaseToolConfig):
         return self._build_unavailable_oauth_mcp_config(
             server=server,
             diagnostic=diagnostic,
+            failure_code=error.failure_code,
         )
 
     def _build_unavailable_oauth_mcp_config(
@@ -1617,18 +1630,22 @@ class WebToolConfig(BaseToolConfig):
         *,
         server: Any,
         diagnostic: Dict[str, Any],
+        failure_code: str | None,
     ) -> Dict[str, Any]:
+        inner_config: Dict[str, Any] = {
+            "unavailable": True,
+            "reason": OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+            "message": UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+            "server_id": getattr(server, "id", None),
+            "diagnostic": diagnostic,
+        }
+        if failure_code is not None:
+            inner_config["failure_code"] = failure_code
         return {
             "name": server.name,
             "transport": "unavailable",
             "description": server.description,
-            "config": {
-                "unavailable": True,
-                "reason": OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
-                "message": UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
-                "server_id": getattr(server, "id", None),
-                "diagnostic": diagnostic,
-            },
+            "config": inner_config,
             "user_id": str(self._user_id),
             "allow_users": [str(self._user_id)],
         }

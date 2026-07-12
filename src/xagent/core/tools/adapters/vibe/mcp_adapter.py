@@ -870,6 +870,12 @@ class MCPToolAdapter(AbstractBaseTool):
 
 
 class _UnavailableMCPToolResult(BaseModel):
+    success: bool = Field(default=False, description="Whether execution succeeded")
+    status: str = Field(default="error", description="Tool execution status")
+    error: str = Field(description="Public-safe tool failure message")
+    failure_code: str | None = Field(
+        default=None, description="Allowlisted public tool failure classification"
+    )
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool execution result content"
     )
@@ -891,13 +897,16 @@ class UnavailableMCPTool(AbstractBaseTool):
         server_name: str,
         server_id: Any | None,
         allow_users: Optional[List[str]] = None,
+        failure_code: str | None = None,
     ) -> None:
+        from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
         from .selection_spec import normalize_mcp_server_name
 
         self._server_name = server_name
         self._server_id = server_id
         self._allow_users = allow_users
+        self._failure_code = normalize_tool_failure_code(failure_code)
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
         self.category = ToolCategory.MCP
@@ -927,7 +936,10 @@ class UnavailableMCPTool(AbstractBaseTool):
         current_user_id = _get_current_mcp_user_id()
         if not _is_mcp_user_allowed(current_user_id, self._allow_users):
             return _mcp_access_denied_result(current_user_id, self.name)
-        return {
+        result: Dict[str, Any] = {
+            "success": False,
+            "status": "error",
+            "error": "MCP server credentials are unavailable.",
             "content": [
                 {
                     "text": (
@@ -938,6 +950,9 @@ class UnavailableMCPTool(AbstractBaseTool):
             ],
             "is_error": True,
         }
+        if self._failure_code is not None:
+            result["failure_code"] = self._failure_code
+        return result
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         return self._run_unavailable()

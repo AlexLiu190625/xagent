@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import logging
 import re
+from typing import Any
 
 import pytest
 from mcp.types import Tool as MCPTool
 
+from xagent.core.agent.runtime import PatternRuntime
 from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
@@ -21,11 +23,13 @@ def _unavailable_tool(
     server_name: str = "Google Drive",
     server_id: int | None = 42,
     allow_users: list[str] | None = None,
+    failure_code: str | None = None,
 ) -> UnavailableMCPTool:
     return UnavailableMCPTool(
         server_name=server_name,
         server_id=server_id,
         allow_users=allow_users,
+        failure_code=failure_code,
     )
 
 
@@ -34,8 +38,9 @@ def _unavailable_config(
     name: str | None = "Google Drive",
     server_id: int | None = 42,
     allow_users: list[str] | None = None,
+    failure_code: object | None = None,
 ) -> dict:
-    return {
+    config = {
         "name": name,
         "transport": "unavailable",
         "description": f"{name} server",
@@ -47,6 +52,9 @@ def _unavailable_config(
         },
         "allow_users": allow_users,
     }
+    if failure_code is not None:
+        config["config"]["failure_code"] = failure_code
+    return config
 
 
 def test_unavailable_tool_name_is_llm_safe_and_uses_server_id():
@@ -95,6 +103,30 @@ async def test_unavailable_tool_async_authorized_returns_clean_error(monkeypatch
     assert "resolver" not in text
     assert "provider" not in text
     assert "RuntimeError" not in text
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_authorized_returns_classified_failure(monkeypatch):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(allow_users=["7"], failure_code="oauth_token_required")
+
+    result = await tool.run_json_async({})
+
+    assert result == {
+        "success": False,
+        "status": "error",
+        "is_error": True,
+        "error": "MCP server credentials are unavailable.",
+        "failure_code": "oauth_token_required",
+        "content": [
+            {
+                "text": (
+                    "MCP server credentials are unavailable. Please reconnect "
+                    "the MCP server credentials and retry."
+                )
+            }
+        ],
+    }
 
 
 def test_unavailable_tool_sync_authorized_returns_clean_error(monkeypatch):
@@ -214,6 +246,78 @@ async def test_factory_builds_unavailable_tools_without_normal_loader(monkeypatc
     tools = await ToolFactory._create_mcp_tools_from_configs([_unavailable_config()])
 
     assert [tool.name for tool in tools] == ["mcp_google_drive_42_unavailable"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("raw_failure_code", "expected_failure_code"),
+    [
+        ("oauth_token_required", "oauth_token_required"),
+        ("other_valid_code", None),
+        (" oauth_token_required", None),
+        (123, None),
+    ],
+)
+async def test_factory_revalidates_unavailable_failure_code(
+    monkeypatch,
+    raw_failure_code,
+    expected_failure_code,
+):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    config = _unavailable_config(allow_users=["7"], failure_code=raw_failure_code)
+    config["config"]["diagnostic"] = {
+        "actor": "internal-actor",
+        "resource": "internal-resource",
+        "provider": "internal-provider",
+        "access_token": "internal-token",
+    }
+
+    tools = await ToolFactory._create_mcp_tools_from_configs([config])
+    result = await tools[0].run_json_async({})
+
+    assert result.get("failure_code") == expected_failure_code
+    assert "internal-" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_unavailable_config_failure_code_reaches_tool_failure_trace(monkeypatch):
+    class CapturingTracer:
+        def __init__(self) -> None:
+            self.events: list[dict[str, Any]] = []
+
+        async def trace_event(self, event_type: Any, **kwargs: Any) -> None:
+            self.events.append(
+                {
+                    "type": getattr(event_type, "value", str(event_type)),
+                    "data": kwargs.get("data") or {},
+                }
+            )
+
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    config = _unavailable_config(allow_users=["7"], failure_code="oauth_token_required")
+    config["config"]["diagnostic"] = {
+        "actor": "internal-actor",
+        "resource": "internal-resource",
+        "provider": "internal-provider",
+        "access_token": "internal-token",
+        "refresh_payload": "internal-refresh-payload",
+        "webhook_url": "https://internal.example/webhook",
+    }
+    tools = await ToolFactory._create_mcp_tools_from_configs([config])
+    result = await tools[0].run_json_async({})
+    tracer = CapturingTracer()
+    runtime = PatternRuntime(tracer=tracer, execution_id="task-oauth-required")
+
+    await runtime.on_tool_end(
+        tool_call={"name": tools[0].name, "id": "call-1"},
+        result=result,
+    )
+
+    assert tracer.events[0]["type"] == "action_error_tool"
+    assert tracer.events[0]["data"]["failure_code"] == "oauth_token_required"
+    public_payload = repr(result) + repr(tracer.events)
+    assert "internal-" not in public_payload
+    assert "webhook" not in public_payload
 
 
 @pytest.mark.asyncio
