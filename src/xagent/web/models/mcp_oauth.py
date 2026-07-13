@@ -5,7 +5,7 @@ from typing import Any
 
 from sqlalchemy import JSON, Column, DateTime, ForeignKey, Integer, String, Text, event
 from sqlalchemy.orm import relationship
-from sqlalchemy.schema import UniqueConstraint
+from sqlalchemy.schema import Index, UniqueConstraint
 from sqlalchemy.sql import func
 
 from .database import Base
@@ -29,6 +29,23 @@ def mcp_oauth_client_lookup_hash(
     client_id: object,
 ) -> str:
     return _lookup_hash((mcp_server_id, issuer, client_id))
+
+
+def mcp_oauth_client_registration_lookup_hash(
+    mcp_server_id: object,
+    issuer: object,
+    redirect_uri: object,
+) -> str:
+    """Identify one reusable public-client registration profile."""
+
+    return _lookup_hash(
+        (
+            mcp_server_id,
+            issuer,
+            redirect_uri,
+            "public-auth-code-pkce-v1",
+        )
+    )
 
 
 def mcp_oauth_grant_lookup_hash(
@@ -62,6 +79,11 @@ class MCPOAuthClient(Base):  # type: ignore
             "lookup_hash",
             name="uq_mcp_oauth_clients_server_issuer_client",
         ),
+        Index(
+            "ux_mcp_oauth_clients_registration_lookup_hash",
+            "registration_lookup_hash",
+            unique=True,
+        ),
     )
 
     id = Column(Integer, primary_key=True)
@@ -71,6 +93,7 @@ class MCPOAuthClient(Base):  # type: ignore
         nullable=False,
     )
     lookup_hash = Column(String(64), nullable=False)
+    registration_lookup_hash = Column(String(64), nullable=True)
     issuer = Column(String(1000), nullable=False)
     authorization_endpoint = Column(String(1000), nullable=False)
     token_endpoint = Column(String(1000), nullable=False)

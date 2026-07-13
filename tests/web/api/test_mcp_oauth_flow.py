@@ -31,7 +31,9 @@ from xagent.web.api.mcp import (
 from xagent.web.models import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
+from xagent.web.models.mcp_oauth import mcp_oauth_client_registration_lookup_hash
 from xagent.web.models.user import User
+from xagent.web.services import mcp_oauth as mcp_oauth_service
 from xagent.web.services.mcp_oauth import (
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
     MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH,
@@ -109,6 +111,7 @@ def _discovery() -> SimpleNamespace:
             issuer="https://auth.example.com",
             authorization_endpoint="https://auth.example.com/authorize",
             token_endpoint="https://auth.example.com/token",
+            registration_endpoint="https://auth.example.com/register",
             client_id_metadata_document_supported=True,
             raw={"issuer": "https://auth.example.com"},
         ),
@@ -122,6 +125,9 @@ def _add_mcp_oauth_server(
     scope: str = "records.read",
     transport: str = "streamable_http",
     client_id: str = "client-123",
+    client_secret: str | None = "client-secret",
+    redirect_uri: str | None = "https://xagent.example.com/api/mcp/oauth/callback",
+    token_endpoint_auth_method: str = "client_secret_post",
 ) -> MCPServer:
     server = MCPServer.from_config(
         {
@@ -135,9 +141,9 @@ def _add_mcp_oauth_server(
                 "issuer": "https://auth.example.com",
                 "scope": scope,
                 "client_id": client_id,
-                "client_secret": "client-secret",
-                "redirect_uri": "https://xagent.example.com/api/mcp/oauth/callback",
-                "token_endpoint_auth_method": "client_secret_post",
+                "client_secret": client_secret,
+                "redirect_uri": redirect_uri,
+                "token_endpoint_auth_method": token_endpoint_auth_method,
             },
         }
     )
@@ -471,6 +477,130 @@ async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch)
     assert flow_state.mcp_oauth_client_id == client.id
 
 
+@pytest.mark.asyncio
+async def test_connect_dynamically_registers_public_client_when_client_id_is_empty(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        redirect_uri=None,
+        token_endpoint_auth_method="none",
+    )
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/")
+
+    async def fake_discover(*args, **kwargs):
+        return _discovery()
+
+    registration_requests: list[httpx.Request] = []
+
+    def registration_handler(request: httpx.Request) -> httpx.Response:
+        registration_requests.append(request)
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "dynamic-client-123",
+                "token_endpoint_auth_method": "none",
+            },
+        )
+
+    registration_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(registration_handler)
+    )
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: registration_client,
+    )
+
+    response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+
+    query = parse_qs(urlparse(response.headers["location"]).query)
+    assert query["client_id"] == ["dynamic-client-123"]
+    assert query["redirect_uri"] == ["https://api.xagent.test/api/mcp/oauth/callback"]
+    assert len(registration_requests) == 1
+    assert str(registration_requests[0].url) == "https://auth.example.com/register"
+    assert json.loads(registration_requests[0].content) == {
+        "application_type": "web",
+        "client_name": "Xagent",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "redirect_uris": ["https://api.xagent.test/api/mcp/oauth/callback"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+    client = db.query(MCPOAuthClient).one()
+    assert client.client_id == "dynamic-client-123"
+    assert client.client_secret is None
+    assert client.token_endpoint_auth_method == "none"
+
+    second_response = await connect_mcp_oauth(
+        server.id,
+        MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+        user,
+        db,
+    )
+    second_query = parse_qs(urlparse(second_response.headers["location"]).query)
+    assert second_query["client_id"] == ["dynamic-client-123"]
+    assert len(registration_requests) == 1
+    assert db.query(MCPOAuthClient).count() == 1
+
+
+def test_default_mcp_oauth_redirect_uri_prefers_public_api_base(monkeypatch):
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.xagent.test/base/")
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://frontend.xagent.test/")
+
+    assert mcp_api._default_mcp_oauth_redirect_uri() == (
+        "https://api.xagent.test/base/api/mcp/oauth/callback"
+    )
+
+
+@pytest.mark.asyncio
+async def test_connect_without_client_id_or_registration_endpoint_requires_preregistration(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(
+        db,
+        user,
+        client_id="",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+    )
+
+    async def fake_discover(*args, **kwargs):
+        discovery = _discovery()
+        discovery.authorization_server.registration_endpoint = None
+        return discovery
+
+    monkeypatch.setattr(mcp_api, "discover_mcp_oauth_metadata", fake_discover)
+
+    with pytest.raises(HTTPException) as exc:
+        await connect_mcp_oauth(
+            server.id,
+            MCPOAuthConnectRequest(redirect_after="/settings/mcp"),
+            user,
+            db,
+        )
+
+    assert exc.value.status_code == 400
+    assert exc.value.detail == {
+        "code": "client_registration_unavailable",
+        "message": (
+            "Authorization server does not support dynamic client registration; "
+            "configure a pre-registered MCP OAuth client_id"
+        ),
+    }
+
+
 def test_upsert_oauth_client_preserves_existing_masked_client_secret(db_session):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -543,6 +673,61 @@ def test_upsert_oauth_client_recovers_from_concurrent_insert(db_session, monkeyp
     assert client.token_endpoint == "https://auth.example.com/token"
     assert client.token_endpoint_auth_method == "client_secret_post"
     assert decrypt_value(client.client_secret) == "client-secret"
+
+
+def test_dynamic_client_conflict_adopts_registered_winner(db_session, monkeypatch):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user, client_id="", client_secret=None)
+    SessionLocal = sessionmaker(bind=db.get_bind(), autoflush=False, autocommit=False)
+    real_flush = db.flush
+    registration_lookup_hash = mcp_oauth_client_registration_lookup_hash(
+        server.id,
+        "https://auth.example.com",
+        "https://xagent.example.com/api/mcp/oauth/callback",
+    )
+    flush_calls = 0
+
+    def insert_winner_before_first_flush(*args, **kwargs):
+        nonlocal flush_calls
+        if flush_calls == 0:
+            flush_calls += 1
+            concurrent_db = SessionLocal()
+            try:
+                concurrent_db.add(
+                    MCPOAuthClient(
+                        mcp_server_id=server.id,
+                        registration_lookup_hash=registration_lookup_hash,
+                        issuer="https://auth.example.com",
+                        authorization_endpoint="https://auth.example.com/authorize",
+                        token_endpoint="https://auth.example.com/token",
+                        client_id="winner-client",
+                        token_endpoint_auth_method="none",
+                        redirect_uri=(
+                            "https://xagent.example.com/api/mcp/oauth/callback"
+                        ),
+                    )
+                )
+                concurrent_db.commit()
+            finally:
+                concurrent_db.close()
+            raise IntegrityError("insert", {}, Exception("duplicate registration"))
+        return real_flush(*args, **kwargs)
+
+    monkeypatch.setattr(db, "flush", insert_winner_before_first_flush)
+
+    client = mcp_api._upsert_mcp_oauth_client(
+        db,
+        server_id=server.id,
+        discovery=_discovery(),
+        client_id="loser-client",
+        client_secret=None,
+        token_endpoint_auth_method="none",
+        redirect_uri="https://xagent.example.com/api/mcp/oauth/callback",
+        registration_lookup_hash=registration_lookup_hash,
+    )
+
+    assert client.client_id == "winner-client"
+    assert db.query(MCPOAuthClient).count() == 1
 
 
 def test_upsert_oauth_client_rejects_masked_client_secret_without_existing_value(
@@ -878,6 +1063,7 @@ async def test_oauth_routes_reject_inactive_user_mcp_server(db_session, monkeypa
 async def test_callback_exchanges_code_and_stores_encrypted_grant(
     db_session, monkeypatch
 ):
+    monkeypatch.setenv("XAGENT_APP_BASE_URL", "https://app.example.com/")
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
     client = _add_oauth_client(
@@ -933,7 +1119,7 @@ async def test_callback_exchanges_code_and_stores_encrypted_grant(
     )
 
     assert response.status_code == 307
-    assert response.headers["location"] == "/mcp"
+    assert response.headers["location"] == "https://app.example.com/mcp"
     grant = db.query(MCPOAuthGrant).one()
     assert grant.resource_owner_key == "resource-owner-a"
     assert grant.access_token != "plain-access-token"
@@ -1751,3 +1937,28 @@ async def test_status_only_reports_grants_matching_current_oauth_config(db_sessi
     status_response = await get_mcp_oauth_status(server.id, user, db)
 
     assert [grant.id for grant in status_response.grants] == [current_grant.id]
+
+
+@pytest.mark.asyncio
+async def test_status_reports_discovered_grant_without_configured_selectors(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    server.auth = {"type": "mcp_oauth", "scope": "records.read"}
+    client = _add_oauth_client(db, server, client_id="dynamically-registered-client")
+    grant = MCPOAuthGrant(
+        mcp_server_id=server.id,
+        user_id=user.id,
+        mcp_oauth_client_id=client.id,
+        resource_owner_key=f"xagent:user:{user.id}",
+        issuer="https://auth.example.com",
+        resource="https://mcp.example.com/mcp",
+        scope="records.read",
+        access_token=mcp_api.encrypt_value("access-token"),
+    )
+    db.add(grant)
+    db.commit()
+    db.refresh(grant)
+
+    status_response = await get_mcp_oauth_status(server.id, user, db)
+
+    assert [item.id for item in status_response.grants] == [grant.id]

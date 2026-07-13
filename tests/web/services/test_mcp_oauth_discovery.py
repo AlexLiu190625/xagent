@@ -8,6 +8,7 @@ from xagent.web.services.mcp_oauth import (
     MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
     MCP_OAUTH_PERSISTED_VALUE_MAX_LENGTH,
     MCPOAuthDiscoveryError,
+    OAuthAuthorizationServerMetadata,
     SafeOAuthAsyncHTTPTransport,
     _same_url,
     authorization_server_metadata_urls,
@@ -16,6 +17,7 @@ from xagent.web.services.mcp_oauth import (
     oauth_post,
     parse_www_authenticate_bearer,
     protected_resource_metadata_urls,
+    register_mcp_oauth_public_client,
     validate_oauth_http_url,
 )
 
@@ -407,6 +409,20 @@ async def test_oauth_get_rejects_malformed_redirect_location():
 
 
 @pytest.mark.asyncio
+async def test_oauth_get_sanitizes_response_protocol_failures():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("secret response detail", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_get("https://auth.example.com/metadata", client=client)
+
+    assert exc.value.code == "metadata_not_found"
+    assert exc.value.message == "OAuth metadata response could not be read"
+    assert "secret" not in exc.value.message
+
+
+@pytest.mark.asyncio
 async def test_oauth_post_rejects_redirect_without_following():
     requested_urls: list[str] = []
 
@@ -420,6 +436,80 @@ async def test_oauth_post_rejects_redirect_without_following():
 
     assert exc.value.code == "invalid_resource"
     assert requested_urls == ["https://auth.example.com/token"]
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_sanitizes_response_protocol_failures():
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.RemoteProtocolError("secret response detail", request=request)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_post(
+                "https://auth.example.com/register",
+                client=client,
+                max_response_bytes=1024,
+                json={"client_name": "Xagent"},
+            )
+
+    assert exc.value.code == "invalid_resource"
+    assert exc.value.message == "OAuth endpoint response could not be read"
+    assert "secret" not in exc.value.message
+
+
+@pytest.mark.asyncio
+async def test_oauth_post_rejects_response_larger_than_streaming_limit():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b"response-too-large")
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(MCPOAuthDiscoveryError) as exc:
+            await oauth_post(
+                "https://auth.example.com/register",
+                client=client,
+                max_response_bytes=8,
+                json={"client_name": "Xagent"},
+            )
+
+    assert exc.value.code == "response_too_large"
+
+
+@pytest.mark.asyncio
+async def test_dynamic_registration_rejects_confidential_client_response(monkeypatch):
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            json={
+                "client_id": "confidential-client",
+                "client_secret": "must-not-be-used",
+                "token_endpoint_auth_method": "client_secret_post",
+            },
+        )
+
+    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(
+        mcp_oauth_service,
+        "create_mcp_oauth_http_client",
+        lambda **kwargs: client,
+    )
+    metadata = OAuthAuthorizationServerMetadata(
+        url="https://auth.example.com/.well-known/oauth-authorization-server",
+        issuer="https://auth.example.com",
+        authorization_endpoint="https://auth.example.com/authorize",
+        token_endpoint="https://auth.example.com/token",
+        registration_endpoint="https://auth.example.com/register",
+        client_id_metadata_document_supported=True,
+        raw={},
+    )
+
+    with pytest.raises(MCPOAuthDiscoveryError) as exc:
+        await register_mcp_oauth_public_client(
+            metadata,
+            redirect_uri="https://api.xagent.test/api/mcp/oauth/callback",
+        )
+
+    assert exc.value.code == "client_registration_failed"
+    assert "public client" in exc.value.message
 
 
 def test_owned_oauth_paths_use_shared_helpers_without_redirect_following():

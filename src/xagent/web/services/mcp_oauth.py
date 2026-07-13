@@ -31,6 +31,7 @@ MCP_OAUTH_SCOPE_MAX_LENGTH = 1000
 MCP_OAUTH_RESOURCE_OWNER_KEY_MAX_LENGTH = 512
 MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH = 100
 MCP_OAUTH_TOKEN_TYPE_MAX_LENGTH = 50
+MCP_OAUTH_CLIENT_REGISTRATION_MAX_RESPONSE_BYTES = 64 * 1024
 OAUTH_ERROR_MESSAGE_MAX_LENGTH = 500
 OAUTH_LOG_PAYLOAD_MAX_LENGTH = 2000
 OAUTH_REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
@@ -109,6 +110,14 @@ class MCPOAuthDiscoveryResult:
     authorization_server: OAuthAuthorizationServerMetadata
     resource: str
     scopes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class MCPOAuthClientRegistration:
+    """Public OAuth client metadata returned by RFC 7591 registration."""
+
+    client_id: str
+    token_endpoint_auth_method: str
 
 
 @dataclass(frozen=True)
@@ -204,7 +213,7 @@ async def oauth_get(
         except httpx.RemoteProtocolError as exc:
             raise MCPOAuthDiscoveryError(
                 "metadata_not_found",
-                "OAuth metadata redirect Location was invalid",
+                "OAuth metadata response could not be read",
             ) from exc
         if not allow_redirects or response.status_code not in OAUTH_REDIRECT_STATUSES:
             return response
@@ -244,16 +253,53 @@ async def oauth_post(
     *,
     client: httpx.AsyncClient,
     resolve_dns_for_url_policy: bool = False,
+    max_response_bytes: int | None = None,
     **request_kwargs: Any,
 ) -> httpx.Response:
     """POST to an OAuth token-like endpoint without following redirects."""
     await validate_oauth_http_url(url, resolve_dns=resolve_dns_for_url_policy)
     try:
-        response = await client.post(url, follow_redirects=False, **request_kwargs)
+        if max_response_bytes is None:
+            response = await client.post(
+                url,
+                follow_redirects=False,
+                **request_kwargs,
+            )
+        else:
+            async with client.stream(
+                "POST",
+                url,
+                follow_redirects=False,
+                **request_kwargs,
+            ) as streamed_response:
+                if 300 <= streamed_response.status_code < 400:
+                    raise MCPOAuthDiscoveryError(
+                        "invalid_resource",
+                        "OAuth token endpoint redirects are not supported",
+                    )
+                content = bytearray()
+                async for chunk in streamed_response.aiter_bytes():
+                    content.extend(chunk)
+                    if len(content) > max_response_bytes:
+                        raise MCPOAuthDiscoveryError(
+                            "response_too_large",
+                            "OAuth endpoint response exceeded the allowed size",
+                        )
+                response = httpx.Response(
+                    streamed_response.status_code,
+                    headers=[
+                        (name, value)
+                        for name, value in streamed_response.headers.multi_items()
+                        if name.lower() not in {"content-encoding", "content-length"}
+                    ],
+                    content=bytes(content),
+                    request=streamed_response.request,
+                    extensions=streamed_response.extensions,
+                )
     except httpx.RemoteProtocolError as exc:
         raise MCPOAuthDiscoveryError(
             "invalid_resource",
-            "OAuth token endpoint redirects are not supported",
+            "OAuth endpoint response could not be read",
         ) from exc
     if 300 <= response.status_code < 400:
         raise MCPOAuthDiscoveryError(
@@ -261,6 +307,99 @@ async def oauth_post(
             "OAuth token endpoint redirects are not supported",
         )
     return response
+
+
+def _dcr_application_type(redirect_uri: str) -> str:
+    parts = urlsplit(redirect_uri)
+    hostname = (parts.hostname or "").lower()
+    is_loopback = hostname in {"localhost", "127.0.0.1", "::1"}
+    if parts.scheme == "https":
+        return "web"
+    if parts.scheme == "http" and is_loopback:
+        return "native"
+    raise MCPOAuthDiscoveryError(
+        "client_registration_failed",
+        "MCP OAuth dynamic client registration requires an HTTPS or loopback callback URI",
+    )
+
+
+async def register_mcp_oauth_public_client(
+    authorization_server: OAuthAuthorizationServerMetadata,
+    *,
+    redirect_uri: str,
+) -> MCPOAuthClientRegistration:
+    """Register an RFC 7591 public client for one MCP authorization server."""
+
+    registration_endpoint = authorization_server.registration_endpoint
+    if not registration_endpoint:
+        raise MCPOAuthDiscoveryError(
+            "client_registration_unavailable",
+            "Authorization server does not support dynamic client registration; "
+            "configure a pre-registered MCP OAuth client_id",
+        )
+    redirect_uri = validate_mcp_oauth_persisted_value(
+        redirect_uri, field_name="redirect_uri"
+    )
+    request_payload = {
+        "application_type": _dcr_application_type(redirect_uri),
+        "client_name": "Xagent",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "redirect_uris": [redirect_uri],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "none",
+    }
+
+    try:
+        async with create_mcp_oauth_http_client(
+            timeout=MCP_OAUTH_HTTP_TIMEOUT_SECONDS,
+        ) as client:
+            response = await oauth_post(
+                registration_endpoint,
+                client=client,
+                max_response_bytes=MCP_OAUTH_CLIENT_REGISTRATION_MAX_RESPONSE_BYTES,
+                json=request_payload,
+                headers={"Content-Type": "application/json"},
+            )
+        payload = response.json()
+    except MCPOAuthDiscoveryError as exc:
+        if exc.code == "response_too_large":
+            raise MCPOAuthDiscoveryError(
+                "client_registration_failed",
+                "OAuth client registration response exceeded the allowed size",
+            ) from exc
+        raise
+    except (httpx.HTTPError, ValueError) as exc:
+        raise MCPOAuthDiscoveryError(
+            "client_registration_failed",
+            oauth_exception_message(exc, "OAuth client registration failed"),
+        ) from exc
+
+    if response.status_code >= 400 or not isinstance(payload, dict):
+        raise MCPOAuthDiscoveryError(
+            "client_registration_failed",
+            oauth_error_message(payload, "OAuth client registration failed"),
+        )
+    client_id = payload.get("client_id")
+    if not isinstance(client_id, str) or not client_id.strip():
+        raise MCPOAuthDiscoveryError(
+            "client_registration_failed",
+            "OAuth client registration response did not include client_id",
+        )
+    client_id = validate_mcp_oauth_persisted_value(
+        client_id.strip(), field_name="client_id"
+    )
+    token_endpoint_auth_method = str(
+        payload.get("token_endpoint_auth_method") or "none"
+    )
+    if token_endpoint_auth_method != "none":
+        raise MCPOAuthDiscoveryError(
+            "client_registration_failed",
+            "OAuth client registration did not create a public client",
+        )
+    return MCPOAuthClientRegistration(
+        client_id=client_id,
+        token_endpoint_auth_method=token_endpoint_auth_method,
+    )
 
 
 def parse_www_authenticate_bearer(
@@ -417,11 +556,6 @@ async def resolve_mcp_oauth_runtime_auth(  # noqa: PLR0913
         )
     except MCPOAuthDiscoveryError as exc:
         raise MCPOAuthRuntimeError(exc.code, exc.message) from exc
-    if not normalized_resource:
-        raise MCPOAuthRuntimeError(
-            "authorization_required",
-            "MCP OAuth runtime requires a configured resource or runtime resource",
-        )
 
     required_scopes = _scope_set(normalized_scope) if normalized_scope else set()
 
@@ -682,8 +816,6 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
     selected_scope = scope if scope is not None else auth_config.get("scope")
     normalized_scope = _normalize_scope(selected_scope) if selected_scope else None
     configured_client_id = _runtime_config_value(None, auth_config, "client_id")
-    if not normalized_resource:
-        return []
 
     query = (
         db.query(MCPOAuthGrant)
@@ -691,11 +823,12 @@ def select_mcp_oauth_grants(  # noqa: PLR0913
         .filter(
             MCPOAuthGrant.mcp_server_id == server_id,
             MCPOAuthGrant.user_id == user_id,
-            MCPOAuthGrant.resource == normalized_resource,
             MCPOAuthGrant.status == "active",
             MCPOAuthClient.mcp_server_id == server_id,
         )
     )
+    if normalized_resource:
+        query = query.filter(MCPOAuthGrant.resource == normalized_resource)
     if resource_owner_key:
         query = query.filter(MCPOAuthGrant.resource_owner_key == resource_owner_key)
     if normalized_issuer:

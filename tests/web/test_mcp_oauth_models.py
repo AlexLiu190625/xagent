@@ -10,6 +10,7 @@ from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.mcp_oauth import (
     mcp_oauth_client_lookup_hash,
+    mcp_oauth_client_registration_lookup_hash,
     mcp_oauth_grant_lookup_hash,
 )
 from xagent.web.models.user import User
@@ -96,6 +97,7 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
         column["name"] for column in inspector.get_columns("mcp_oauth_grants")
     }
     assert "lookup_hash" in client_columns
+    assert "registration_lookup_hash" in client_columns
     assert "metadata" in grant_columns
     assert "lookup_hash" in grant_columns
     grant_column_types = {
@@ -115,9 +117,12 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
         MCP_OAUTH_TOKEN_ENDPOINT_AUTH_METHOD_MAX_LENGTH
     )
     client_indexes = {
-        index["name"] for index in inspector.get_indexes("mcp_oauth_clients")
+        index["name"]: index for index in inspector.get_indexes("mcp_oauth_clients")
     }
     assert "ix_mcp_oauth_clients_issuer" not in client_indexes
+    registration_index = client_indexes["ux_mcp_oauth_clients_registration_lookup_hash"]
+    assert registration_index["column_names"] == ["registration_lookup_hash"]
+    assert registration_index["unique"] == 1
 
     stored_grant = db_session.query(MCPOAuthGrant).one()
     assert stored_grant.mcp_server_id == server.id
@@ -132,6 +137,7 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
         "xagent-client",
     )
     assert len(client.lookup_hash) == 64
+    assert client.registration_lookup_hash is None
     assert stored_grant.lookup_hash == mcp_oauth_grant_lookup_hash(
         server.id,
         user.id,
@@ -142,6 +148,26 @@ def test_mcp_oauth_models_map_metadata_column_without_new_mcp_server_model(
         "records.read",
     )
     assert len(stored_grant.lookup_hash) == 64
+
+
+def test_mcp_oauth_registration_lookup_hash_identifies_public_client_profile():
+    lookup_hash = mcp_oauth_client_registration_lookup_hash(
+        10,
+        "https://auth.example.com",
+        "https://xagent.example.com/api/mcp/oauth/callback",
+    )
+
+    assert len(lookup_hash) == 64
+    assert lookup_hash == mcp_oauth_client_registration_lookup_hash(
+        10,
+        "https://auth.example.com",
+        "https://xagent.example.com/api/mcp/oauth/callback",
+    )
+    assert lookup_hash != mcp_oauth_client_registration_lookup_hash(
+        10,
+        "https://auth.example.com",
+        "https://other.example.com/api/mcp/oauth/callback",
+    )
 
 
 def test_mcp_oauth_grant_lookup_uniqueness_includes_resource_owner_key(db_session):

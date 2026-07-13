@@ -715,11 +715,11 @@ def get_public_api_base_url() -> str | None:
 
     Priority:
         1. XAGENT_PUBLIC_API_BASE_URL environment variable
-        2. None (Gmail registration fails explicitly)
+        2. None (consumers apply their own compatibility or validation policy)
 
     Deliberately separate from XAGENT_APP_BASE_URL (the frontend URL used in
-    e.g. password-reset emails): Pub/Sub OIDC audiences must match backend
-    callback URLs, so the frontend base URL is never a valid substitute.
+    e.g. password-reset emails): provider callback URLs should normally use
+    the public backend origin.
     """
     value = (os.getenv(PUBLIC_API_BASE_URL) or "").strip()
     return value.rstrip("/") or None

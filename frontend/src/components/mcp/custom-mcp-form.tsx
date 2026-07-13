@@ -272,6 +272,7 @@ export function CustomMcpForm({
       }
       const response = await apiRequest(`${getApiUrl()}/api/mcp/${serverId}/oauth/connect`, {
         method: "POST",
+        credentials: "include",
         headers: {
           "Accept": "application/json",
           "Content-Type": "application/json"
@@ -788,16 +789,16 @@ export function CustomMcpForm({
 
               <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
                 <div className="space-y-2">
-                  <Label htmlFor="mcp_oauth_client_id">{t('tools.mcp.dialog.clientId')}</Label>
+                  <Label htmlFor="mcp_oauth_client_id">{t('tools.mcp.dialog.oauthClientId')}</Label>
                   <Input
                     id="mcp_oauth_client_id"
                     value={mcpFormData.config?.auth?.client_id || ""}
                     onChange={(e) => updateAuth("client_id", e.target.value)}
-                    placeholder={t('tools.mcp.dialog.clientIdPlaceholder')}
+                    placeholder={t('tools.mcp.dialog.oauthClientIdPlaceholder')}
                   />
                 </div>
                 <div className="space-y-2">
-                  <Label htmlFor="mcp_oauth_client_secret">{t('tools.mcp.dialog.clientSecret')}</Label>
+                  <Label htmlFor="mcp_oauth_client_secret">{t('tools.mcp.dialog.oauthClientSecret')}</Label>
                   <Input
                     id="mcp_oauth_client_secret"
                     type="password"
@@ -809,7 +810,7 @@ export function CustomMcpForm({
                     onBlur={() => {
                       blurSecretAuth("client_secret", mcpFormData.config?.auth?.client_secret, originalAuth.client_secret)
                     }}
-                    placeholder={t('tools.mcp.dialog.clientSecretPlaceholder')}
+                    placeholder={t('tools.mcp.dialog.oauthClientSecretPlaceholder')}
                   />
                 </div>
               </div>

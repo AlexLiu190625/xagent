@@ -135,6 +135,7 @@ describe("CustomMcpForm MCP OAuth", () => {
       "http://api.local/api/mcp/42/oauth/connect",
       expect.objectContaining({
         method: "POST",
+        credentials: "include",
         headers: expect.objectContaining({
           Accept: "application/json",
           "Content-Type": "application/json",
@@ -476,7 +477,7 @@ describe("CustomMcpForm MCP OAuth", () => {
     )
 
     await waitFor(() => {
-      expect(screen.getByLabelText("tools.mcp.dialog.clientSecret")).toHaveValue(
+      expect(screen.getByLabelText("tools.mcp.dialog.oauthClientSecret")).toHaveValue(
         "********"
       )
     })
@@ -499,7 +500,7 @@ describe("CustomMcpForm MCP OAuth", () => {
       />
     )
 
-    fireEvent.blur(screen.getByLabelText("tools.mcp.dialog.clientSecret"))
+    fireEvent.blur(screen.getByLabelText("tools.mcp.dialog.oauthClientSecret"))
 
     const updater = setMcpFormData.mock.calls.at(-1)?.[0]
     expect(typeof updater).toBe("function")
@@ -538,7 +539,7 @@ describe("CustomMcpForm MCP OAuth", () => {
     }
 
     render(<Harness />)
-    const clientSecret = screen.getByLabelText("tools.mcp.dialog.clientSecret")
+    const clientSecret = screen.getByLabelText("tools.mcp.dialog.oauthClientSecret")
 
     fireEvent.focus(clientSecret)
     expect(clientSecret).toHaveValue("")
