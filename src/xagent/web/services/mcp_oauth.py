@@ -290,7 +290,12 @@ async def oauth_post(
                     headers=[
                         (name, value)
                         for name, value in streamed_response.headers.multi_items()
-                        if name.lower() not in {"content-encoding", "content-length"}
+                        if name.lower()
+                        not in {
+                            "content-encoding",
+                            "content-length",
+                            "transfer-encoding",
+                        }
                     ],
                     content=bytes(content),
                     request=streamed_response.request,
@@ -1308,7 +1313,7 @@ def _runtime_grant_matches(  # noqa: PLR0913
         grant.mcp_server_id == server_id
         and grant.user_id == user_id
         and grant.resource_owner_key == resource_owner_key
-        and grant.resource == normalized_resource
+        and (normalized_resource is None or grant.resource == normalized_resource)
         and grant.status == "active"
         and (not normalized_issuer or grant.issuer == normalized_issuer)
         and (

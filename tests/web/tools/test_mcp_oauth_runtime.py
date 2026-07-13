@@ -618,6 +618,52 @@ async def test_mcp_oauth_runtime_refreshes_expired_grant(db_session, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_mcp_oauth_runtime_refreshes_discovered_grant_without_resource_selector(
+    db_session, monkeypatch
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    server.auth = {"type": "mcp_oauth", "scope": "records.read"}
+    db.commit()
+    grant = _add_grant(
+        db,
+        server=server,
+        user=user,
+        resource_owner_key=f"xagent:user:{user.id}",
+        access_token="expired-access-token",
+        refresh_token="refresh-token-123",
+        expires_at=datetime.now(timezone.utc) - timedelta(minutes=1),
+    )
+
+    async def fake_refresh_grant(oauth_client, *, refresh_token, resource, client):
+        assert oauth_client.client_id == "client-123"
+        assert refresh_token == "refresh-token-123"
+        assert resource == "https://mcp.example.com/mcp"
+        assert client is None
+        return {
+            "access_token": "fresh-access-token",
+            "refresh_token": "fresh-refresh-token",
+            "token_type": "Bearer",
+            "expires_in": 3600,
+            "scope": "records.read",
+        }
+
+    monkeypatch.setattr(
+        mcp_oauth_service, "_refresh_mcp_oauth_grant", fake_refresh_grant
+    )
+
+    configs, cfg = await _load_configs(db, user)
+
+    assert cfg.get_mcp_oauth_diagnostics() == []
+    assert configs[0]["config"]["headers"]["Authorization"] == (
+        "Bearer fresh-access-token"
+    )
+    db.refresh(grant)
+    assert decrypt_value(grant.access_token) == "fresh-access-token"
+    assert decrypt_value(grant.refresh_token) == "fresh-refresh-token"
+
+
+@pytest.mark.asyncio
 async def test_mcp_oauth_runtime_refresh_calls_token_endpoint_before_row_lock(
     db_session, monkeypatch
 ):

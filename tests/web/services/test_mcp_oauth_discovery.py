@@ -475,6 +475,32 @@ async def test_oauth_post_rejects_response_larger_than_streaming_limit():
 
 
 @pytest.mark.asyncio
+async def test_oauth_post_strips_framing_headers_from_buffered_response():
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            201,
+            content=b'{"client_id":"dynamic-client"}',
+            headers={
+                "Content-Type": "application/json",
+                "Content-Length": "999",
+                "Transfer-Encoding": "chunked",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        response = await oauth_post(
+            "https://auth.example.com/register",
+            client=client,
+            max_response_bytes=1024,
+            json={"client_name": "Xagent"},
+        )
+
+    assert response.json() == {"client_id": "dynamic-client"}
+    assert response.headers["content-length"] == str(len(response.content))
+    assert "transfer-encoding" not in response.headers
+
+
+@pytest.mark.asyncio
 async def test_dynamic_registration_rejects_confidential_client_response(monkeypatch):
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

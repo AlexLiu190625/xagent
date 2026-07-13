@@ -32,7 +32,7 @@ def upgrade() -> None:
     columns = {column["name"] for column in inspector.get_columns(TABLE)}
     if COLUMN not in columns:
         op.add_column(TABLE, sa.Column(COLUMN, sa.String(64), nullable=True))
-    indexes = {index["name"] for index in sa.inspect(op.get_bind()).get_indexes(TABLE)}
+    indexes = {index["name"] for index in inspector.get_indexes(TABLE)}
     if INDEX not in indexes:
         op.create_index(INDEX, TABLE, [COLUMN], unique=True)
 
@@ -48,8 +48,6 @@ def downgrade() -> None:
     indexes = {index["name"] for index in inspector.get_indexes(TABLE)}
     if INDEX in indexes:
         op.drop_index(INDEX, table_name=TABLE)
-    columns = {
-        column["name"] for column in sa.inspect(op.get_bind()).get_columns(TABLE)
-    }
+    columns = {column["name"] for column in inspector.get_columns(TABLE)}
     if COLUMN in columns:
         op.drop_column(TABLE, COLUMN)
