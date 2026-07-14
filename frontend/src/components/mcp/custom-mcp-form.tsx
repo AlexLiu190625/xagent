@@ -522,6 +522,14 @@ export function CustomMcpForm({
                   variant="ghost"
                   size="icon"
                   onClick={() => {
+                    if (
+                      e.persistedKey !== undefined
+                      && !window.confirm(t('tools.mcp.dialog.removeSecretConfirm', {
+                        key: e.persistedKey,
+                      }))
+                    ) {
+                      return
+                    }
                     const newList = [...list]
                     newList.splice(i, 1)
                     sync(newList)
