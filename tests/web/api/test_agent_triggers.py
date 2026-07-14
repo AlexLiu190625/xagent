@@ -21,6 +21,10 @@ from xagent.web.models.trigger import (
 )
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
+from xagent.web.services.agent_team_scope import (
+    AgentTeamScope,
+    set_agent_team_scope_hook,
+)
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     load_connector_runtime_view,
@@ -35,9 +39,21 @@ from xagent.web.services.triggers import (
     scan_due_scheduled_triggers,
 )
 
-from .conftest import _admin_headers, _direct_db_session, client
+from .conftest import (
+    _admin_headers,
+    _direct_db_session,
+    _register_second_user,
+    client,
+)
 
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+@pytest.fixture(autouse=True)
+def reset_connector_runtime_resolver():
+    set_connector_runtime_resolver_for_testing(None)
+    yield
+    set_connector_runtime_resolver_for_testing(None)
 
 
 @pytest.fixture(autouse=True)
@@ -92,6 +108,7 @@ def _install_runtime_mcp_connector(
     *,
     context_required: bool = True,
     secret_required: bool = False,
+    connector_user_id: int | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
@@ -138,7 +155,11 @@ def _install_runtime_mcp_connector(
         db.flush()
         db.add(
             UserMCPServer(
-                user_id=int(agent.user_id),
+                user_id=(
+                    int(connector_user_id)
+                    if connector_user_id is not None
+                    else int(agent.user_id)
+                ),
                 mcpserver_id=int(server.id),
                 is_owner=True,
                 can_edit=True,
@@ -1501,6 +1522,80 @@ def test_scheduled_scan_persists_connector_runtime_context() -> None:
         db.close()
 
 
+def test_trigger_runtime_visibility_uses_trigger_task_owner() -> None:
+    admin_headers = _admin_headers()
+    teammate_headers = _register_second_user("trigger-teammate")
+    db = _direct_db_session()
+    try:
+        admin_user_id = int(db.query(User).filter(User.username == "admin").one().id)
+        trigger_owner_id = int(
+            db.query(User).filter(User.username == "trigger-teammate").one().id
+        )
+    finally:
+        db.close()
+
+    set_agent_team_scope_hook(
+        lambda _db, user_id: (
+            AgentTeamScope(team_id=100, is_team_admin=False)
+            if user_id in {admin_user_id, trigger_owner_id}
+            else None
+        )
+    )
+    try:
+        agent_id = _create_agent(admin_headers)
+        server_id = _install_runtime_mcp_connector(
+            agent_id,
+            connector_user_id=trigger_owner_id,
+        )
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=teammate_headers,
+            json={
+                "type": "scheduled",
+                "name": "Task owner connector visibility",
+                "config": {
+                    "interval_seconds": 60,
+                    "connector_runtime_context": [
+                        {
+                            "connector_ref": {
+                                "connector_type": "mcp",
+                                "connector_id": server_id,
+                            },
+                            "context": {"account_id": "owner-account"},
+                        }
+                    ],
+                },
+            },
+        )
+        assert created.status_code == 200, created.text
+
+        db = _direct_db_session()
+        try:
+            trigger = (
+                db.query(AgentTrigger)
+                .filter(AgentTrigger.id == created.json()["id"])
+                .one()
+            )
+            assert int(trigger.user_id) == trigger_owner_id
+            trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            db.add(trigger)
+            db.commit()
+
+            runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+            assert len(runs) == 1
+            run = db.query(TriggerRun).filter(TriggerRun.id == runs[0].id).one()
+            assert run.status == TriggerRunStatus.PENDING.value
+            task = db.query(Task).filter(Task.id == run.task_id).one()
+            assert int(task.user_id) == trigger_owner_id
+            assert task.connector_runtime_selected_refs == [
+                {"connector_type": "mcp", "connector_id": server_id}
+            ]
+        finally:
+            db.close()
+    finally:
+        set_agent_team_scope_hook(None)
+
+
 def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
@@ -1538,6 +1633,56 @@ def test_scheduled_scan_fails_fast_when_required_runtime_secret_has_no_source() 
         db.close()
 
 
+def test_external_scoped_resolver_does_not_defer_scheduled_secret() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    _install_runtime_mcp_connector(
+        agent_id,
+        context_required=False,
+        secret_required=True,
+    )
+    resolver_calls = 0
+
+    def resolver(request):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return request.values
+
+    set_connector_runtime_resolver_for_testing(resolver, task_sources={"external"})
+    try:
+        created = client.post(
+            f"/api/agents/{agent_id}/triggers",
+            headers=headers,
+            json={
+                "type": "scheduled",
+                "name": "External-only resolver",
+                "config": {"interval_seconds": 60},
+            },
+        )
+        assert created.status_code == 200, created.text
+        trigger_id = created.json()["id"]
+
+        db = _direct_db_session()
+        try:
+            trigger = db.query(AgentTrigger).filter(AgentTrigger.id == trigger_id).one()
+            trigger.next_run_at = datetime.now(timezone.utc) - timedelta(seconds=5)
+            db.add(trigger)
+            db.commit()
+
+            runs = scan_due_scheduled_triggers(db, now=datetime.now(timezone.utc))
+            assert len(runs) == 1
+            run = db.query(TriggerRun).filter(TriggerRun.id == runs[0].id).one()
+            assert run.status == TriggerRunStatus.FAILED.value
+            assert run.task_id is None
+            assert "scheduled_secret_unavailable" in str(run.error_message)
+        finally:
+            db.close()
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resolver_calls == 0
+
+
 def test_scheduled_scan_allows_resolver_to_supply_required_runtime_secret() -> None:
     headers = _admin_headers()
     agent_id = _create_agent(headers)
@@ -1547,14 +1692,17 @@ def test_scheduled_scan_allows_resolver_to_supply_required_runtime_secret() -> N
         secret_required=True,
     )
 
-    def resolver(_request):
+    resolver_requests = []
+
+    def resolver(request):
+        resolver_requests.append(request)
         return ConnectorRuntimeValues(
             context={},
             secrets={"authorization": "Bearer fresh"},
             auth_selector={},
         )
 
-    set_connector_runtime_resolver_for_testing(resolver)
+    set_connector_runtime_resolver_for_testing(resolver, task_sources={"trigger"})
     try:
         created = client.post(
             f"/api/agents/{agent_id}/triggers",
@@ -1581,13 +1729,25 @@ def test_scheduled_scan_allows_resolver_to_supply_required_runtime_secret() -> N
             assert run.status == TriggerRunStatus.PENDING.value
             assert run.task_id is not None
             task = db.query(Task).filter(Task.id == run.task_id).one()
+            task_owner_user_id = int(task.user_id)
             assert task.connector_runtime_selected_refs == [
                 {"connector_type": "mcp", "connector_id": server_id}
             ]
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=int(task.id),
+                turn_id="scheduled-turn",
+                user_id=None,
+            )
         finally:
             db.close()
     finally:
         set_connector_runtime_resolver_for_testing(None)
+
+    assert view[f"mcp:{server_id}"]["secrets"] == {"authorization": "Bearer fresh"}
+    assert len(resolver_requests) == 1
+    assert resolver_requests[0].task_source == "trigger"
+    assert resolver_requests[0].user_id == task_owner_user_id
 
 
 def test_scheduled_runtime_view_reports_scheduled_secret_when_resolver_omits_secret() -> (

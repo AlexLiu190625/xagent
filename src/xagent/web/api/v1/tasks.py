@@ -40,6 +40,7 @@ from ...schemas.v1 import (
     UploadFilesResponse,
 )
 from ...services.connector_runtime import (
+    bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
     pop_ephemeral_runtime_values,
     prepare_append_connector_runtime,
@@ -343,6 +344,8 @@ async def create_chat_task(
             exception message stays out of the response.
     """
     agent, _key = authed
+    task_source = "sdk"
+    task_owner_user_id = int(agent.user_id)
 
     # Server-side agent_id consistency check. The key already binds an
     # agent; ``body.agent_id`` is required by the SDK contract for
@@ -363,15 +366,6 @@ async def create_chat_task(
         task_id=None,
     )
 
-    try:
-        runtime_plan = prepare_create_connector_runtime(
-            db=db,
-            agent=agent,
-            payload_items=request.connector_runtime_context,
-        )
-    except ConnectorRuntimeError as exc:
-        _raise_v1_connector_runtime_error(exc)
-
     # title is what the web UI shows in its task list. Truncate to
     # 50 chars (matches the WS handler convention) so very long
     # user inputs don't fill the sidebar with a one-line wall of
@@ -387,18 +381,27 @@ async def create_chat_task(
     # user message so GET endpoint can return it without going through
     # task_chat_messages.
     task = Task(
-        user_id=agent.user_id,
+        user_id=task_owner_user_id,
         title=title,
         description=request.message.content,
         status=TaskStatus.PENDING,
         agent_id=agent.id,
         input=request.message.content,
-        source="sdk",
+        source=task_source,
         is_visible=False,
-        connector_runtime_selected_refs=[
-            ref.to_wire() for ref in runtime_plan.selected_refs
-        ],
     )
+    try:
+        runtime_plan = prepare_create_connector_runtime(
+            db=db,
+            agent=agent,
+            task_source=task_source,
+            connector_user_id=task_owner_user_id,
+            payload_items=request.connector_runtime_context,
+        )
+        bind_create_connector_runtime_plan(task=task, plan=runtime_plan)
+    except ConnectorRuntimeError as exc:
+        _raise_v1_connector_runtime_error(exc)
+
     db.add(task)
     db.flush()
     persist_create_connector_runtime_context(
@@ -598,6 +601,7 @@ async def append_message_to_task(
             db=db,
             agent=agent,
             task=task,
+            connector_user_id=int(task.user_id),
             payload_items=request.connector_runtime_context,
         )
     except ConnectorRuntimeError as exc:

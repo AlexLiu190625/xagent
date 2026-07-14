@@ -21,6 +21,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
+from xagent.core.tools.adapters.vibe.connector_runtime import (
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+    ConnectorRuntimeError,
+)
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.agent import Agent
@@ -86,6 +90,13 @@ def _create_agent_with_key_for(headers: dict[str, str]) -> tuple[int, str]:
 # note in test_agent_api_keys.py for why we use ``usefixtures`` with a
 # string name rather than importing the fixture.
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+@pytest.fixture(autouse=True)
+def reset_connector_runtime_resolver():
+    set_connector_runtime_resolver_for_testing(None)
+    yield
+    set_connector_runtime_resolver_for_testing(None)
 
 
 # ===== helpers =====
@@ -863,6 +874,82 @@ def test_create_task_rejects_missing_required_secret_without_resolver(mock_start
     assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
     assert resp.json()["error"]["details"]["reason"] == "not_provided"
     assert mock_start_task.call_count == 0
+
+
+def test_external_scoped_resolver_does_not_defer_sdk_required_secret(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    _install_runtime_mcp_connector(agent_id, required=False, secret_required=True)
+    resolver_calls = 0
+
+    def _resolver(request):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return request.values
+
+    set_connector_runtime_resolver_for_testing(_resolver, task_sources={"external"})
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
+    assert resp.json()["error"]["details"]["reason"] == "not_provided"
+    assert mock_start_task.call_count == 0
+    assert resolver_calls == 0
+
+
+def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_start_task,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+
+    def reject_mismatched_identity(*, task, plan) -> None:
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector runtime context is unavailable.",
+            details={"reason": "runtime_task_identity_mismatch"},
+            status_code=503,
+        )
+
+    monkeypatch.setattr(
+        v1_tasks,
+        "bind_create_connector_runtime_plan",
+        reject_mismatched_identity,
+    )
+
+    response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "identity mismatch"},
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "connector_runtime_unavailable",
+        "message": "Connector runtime context is unavailable.",
+        "details": {"reason": "runtime_task_identity_mismatch"},
+    }
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0
+    finally:
+        db.close()
 
 
 def test_connector_runtime_view_loads_task_context(mock_start_task):
@@ -1732,6 +1819,123 @@ def test_append_message_happy_path(mock_start_task):
         db.close()
 
     assert mock_start_task.call_count == 1
+
+
+@pytest.mark.parametrize(
+    ("task_sources", "expected_status"),
+    [
+        (None, 202),
+        ({"sdk"}, 202),
+        ({"external"}, 400),
+    ],
+    ids=["legacy-global", "matching-sdk", "non-matching-external"],
+)
+def test_append_message_resolver_scope_follows_persisted_sdk_source(
+    mock_start_task,
+    task_sources: set[str] | None,
+    expected_status: int,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        required=False,
+        secret_required=True,
+    )
+    create_response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_response.status_code == 202, create_response.text
+    task_id = create_response.json()["task_id"]
+    initial_turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    db = _direct_db_session()
+    try:
+        task_owner_user_id = int(
+            db.query(Task.user_id).filter(Task.id == task_id).one()[0]
+        )
+    finally:
+        db.close()
+
+    resolver_requests = []
+
+    def resolver(request):
+        resolver_requests.append(request)
+        return ConnectorRuntimeValues(
+            context=request.values.context,
+            secrets={"authorization": "Bearer resolver-token"},
+            auth_selector=request.values.auth_selector,
+        )
+
+    append_turn_id: str | None = None
+    set_connector_runtime_resolver_for_testing(
+        resolver,
+        task_sources=task_sources,
+    )
+    try:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+            },
+        )
+        assert response.status_code == expected_status, response.text
+
+        if expected_status == 202:
+            assert mock_start_task.call_count == 1
+            append_turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+            runtime_turn_id = append_turn_id
+        else:
+            assert response.json()["error"]["code"] == "runtime_secret_unavailable"
+            assert response.json()["error"]["details"]["reason"] == "not_provided"
+            assert mock_start_task.call_count == 0
+            runtime_turn_id = initial_turn_id
+
+        db = _direct_db_session()
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=runtime_turn_id,
+                user_id=task_owner_user_id,
+            )
+        finally:
+            db.close()
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+        pop_ephemeral_runtime_values(initial_turn_id)
+        if append_turn_id is not None:
+            pop_ephemeral_runtime_values(append_turn_id)
+
+    if expected_status == 202:
+        assert view[f"mcp:{server_id}"]["secrets"] == {
+            "authorization": "Bearer resolver-token"
+        }
+        assert len(resolver_requests) == 1
+        assert resolver_requests[0].task_source == "sdk"
+        assert resolver_requests[0].user_id == task_owner_user_id
+    else:
+        assert view[f"mcp:{server_id}"]["secrets"] == {
+            "authorization": "Bearer initial-token"
+        }
+        assert resolver_requests == []
 
 
 def test_append_message_rejects_changed_connector_runtime_context(mock_start_task):
