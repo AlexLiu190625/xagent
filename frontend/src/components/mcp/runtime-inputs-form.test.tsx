@@ -5,6 +5,11 @@ import { afterEach, describe, expect, it, vi } from "vitest"
 import { CustomApiForm } from "./custom-api-form"
 import type { MCPServerFormData } from "./custom-api-form"
 import { RuntimeInputsForm, getRuntimeConfigError } from "./runtime-inputs-form"
+import {
+  buildCustomApiPayload,
+  customApiDetailToEditState,
+  type CustomApiDetail,
+} from "../../lib/mcp-utils"
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
@@ -14,6 +19,7 @@ vi.mock("@/contexts/i18n-context", () => ({
 
 afterEach(() => {
   cleanup()
+  vi.restoreAllMocks()
 })
 
 function RuntimeFormHarness({
@@ -84,6 +90,117 @@ function CustomApiHarness() {
       customApiEnv={env}
       setCustomApiEnv={setEnv}
     />
+  )
+}
+
+const storedEnvDetail: CustomApiDetail = {
+  id: 51,
+  name: "records",
+  description: "Stored description",
+  url: "https://example.com/records",
+  method: "POST",
+  headers: { Authorization: "Bearer $BEARER_TOKEN" },
+  body: "{}",
+  env: {
+    BEARER_TOKEN: "********",
+    BASIC_AUTH: "********",
+    TENANT: "********",
+  },
+  runtime_input_schema: null,
+  runtime_bindings: null,
+  allow_delegated_authorization: false,
+}
+
+function CustomApiStoredEnvHarness() {
+  const initial = customApiDetailToEditState(storedEnvDetail)
+  const [formData, setFormData] = useState<MCPServerFormData>(initial.formData)
+  const [env, setEnv] = useState(initial.env)
+  const payload = buildCustomApiPayload(formData, env, storedEnvDetail).payload
+
+  return (
+    <>
+      <CustomApiForm
+        mcpFormData={formData}
+        setMcpFormData={setFormData}
+        customApiEnv={env}
+        setCustomApiEnv={setEnv}
+        originalEnvObj={storedEnvDetail.env ?? {}}
+      />
+      <pre data-testid="stored-form-state">{JSON.stringify(formData)}</pre>
+      <pre data-testid="stored-env-state">{JSON.stringify(env)}</pre>
+      <pre data-testid="stored-payload">{JSON.stringify(payload)}</pre>
+    </>
+  )
+}
+
+const nonCanonicalAuthDetail: CustomApiDetail = {
+  id: 52,
+  name: "records",
+  description: "Stored description",
+  url: "https://example.com/records?key=$API_KEY",
+  method: "POST",
+  headers: {
+    Authorization: "Bearer ${BEARER_TOKEN}",
+    "X-Basic-Backup": "$BASIC_AUTH",
+  },
+  body: '{"key":"${API_KEY}"}',
+  env: {
+    BEARER_TOKEN: "********",
+    API_KEY: "********",
+    BASIC_AUTH: "********",
+    TENANT: "********",
+  },
+  runtime_input_schema: null,
+  runtime_bindings: null,
+  allow_delegated_authorization: false,
+}
+
+function CustomApiNonCanonicalAuthHarness() {
+  const initial = customApiDetailToEditState(nonCanonicalAuthDetail)
+  const [formData, setFormData] = useState<MCPServerFormData>(initial.formData)
+  const [env, setEnv] = useState(initial.env)
+  const payload = buildCustomApiPayload(formData, env, nonCanonicalAuthDetail).payload
+
+  return (
+    <>
+      <CustomApiForm
+        mcpFormData={formData}
+        setMcpFormData={setFormData}
+        customApiEnv={env}
+        setCustomApiEnv={setEnv}
+        originalEnvObj={nonCanonicalAuthDetail.env ?? {}}
+      />
+      <pre data-testid="non-canonical-env-state">{JSON.stringify(env)}</pre>
+      <pre data-testid="non-canonical-payload">{JSON.stringify(payload)}</pre>
+    </>
+  )
+}
+
+function CustomApiSessionAuthHarness() {
+  const [formData, setFormData] = useState<MCPServerFormData>({
+    name: "records",
+    transport: "custom_api",
+    description: "",
+    url: "https://example.com/records",
+    method: "GET",
+    headers: {},
+    config: {},
+    runtime_input_schema: null,
+    runtime_bindings: null,
+    allow_delegated_authorization: false,
+  })
+  const [env, setEnv] = useState<{ key: string; value: string }[]>([])
+
+  return (
+    <>
+      <CustomApiForm
+        mcpFormData={formData}
+        setMcpFormData={setFormData}
+        customApiEnv={env}
+        setCustomApiEnv={setEnv}
+      />
+      <pre data-testid="session-env-state">{JSON.stringify(env)}</pre>
+    </>
   )
 }
 
@@ -275,5 +392,197 @@ describe("RuntimeInputsForm", () => {
     expect(
       screen.getAllByDisplayValue("account.id").some((item) => item.hasAttribute("disabled")),
     ).toBe(true)
+  })
+
+  it("preserves non-auth environment entries while initializing and editing an authenticated API", async () => {
+    render(<CustomApiStoredEnvHarness />)
+
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("stored-env-state").textContent || "[]")).toEqual([
+        { key: "BEARER_TOKEN", value: "********" },
+        { key: "BASIC_AUTH", value: "********" },
+        { key: "TENANT", value: "********" },
+      ])
+    })
+
+    fireEvent.change(screen.getByLabelText("tools.mcp.form.descriptionLabel"), {
+      target: { value: "Updated description" },
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("stored-form-state").textContent || "{}")
+          .description,
+      ).toBe("Updated description")
+      expect(JSON.parse(screen.getByTestId("stored-env-state").textContent || "[]")).toEqual([
+        { key: "BEARER_TOKEN", value: "********" },
+        { key: "BASIC_AUTH", value: "********" },
+        { key: "TENANT", value: "********" },
+      ])
+    })
+  })
+
+  it("keeps a persisted secret key immutable while allowing its value to change", async () => {
+    render(<CustomApiStoredEnvHarness />)
+
+    fireEvent.click(screen.getByText("tools.mcp.dialog.advancedOptions"))
+    const keyInput = await screen.findByLabelText(
+      "tools.mcp.dialog.customApiSecretName TENANT",
+    )
+    const valueInput = screen.getByLabelText(
+      "tools.mcp.dialog.customApiSecretValue TENANT",
+    )
+
+    expect(keyInput).toBeDisabled()
+    fireEvent.change(valueInput, { target: { value: "replacement-secret" } })
+    await waitFor(() => expect(valueInput).toHaveValue("replacement-secret"))
+    expect(keyInput).toBeDisabled()
+
+    fireEvent.change(valueInput, { target: { value: "" } })
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("stored-payload").textContent || "{}")).toEqual({})
+    })
+    fireEvent.blur(valueInput)
+    await waitFor(() => expect(valueInput).toHaveValue("********"))
+  })
+
+  it("does not turn non-canonical reserved-name secrets into an edit delta", async () => {
+    render(<CustomApiNonCanonicalAuthHarness />)
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("non-canonical-env-state").textContent || "[]"),
+      ).toEqual([
+        { key: "BEARER_TOKEN", value: "********" },
+        { key: "API_KEY", value: "********" },
+        { key: "BASIC_AUTH", value: "********" },
+        { key: "TENANT", value: "********" },
+      ])
+      expect(
+        JSON.parse(screen.getByTestId("non-canonical-payload").textContent || "{}"),
+      ).toEqual({})
+    })
+
+    fireEvent.change(screen.getByLabelText("tools.mcp.form.descriptionLabel"), {
+      target: { value: "Updated description" },
+    })
+
+    await waitFor(() => {
+      expect(
+        JSON.parse(screen.getByTestId("non-canonical-payload").textContent || "{}"),
+      ).toEqual({ description: "Updated description" })
+    })
+  })
+
+  it("preserves baseline secrets while switching authentication types", async () => {
+    window.HTMLElement.prototype.scrollIntoView = vi.fn()
+    render(<CustomApiStoredEnvHarness />)
+
+    await waitFor(() => {
+      expect(screen.getByRole("combobox")).toHaveTextContent(
+        "tools.mcp.dialog.authTypes.bearer",
+      )
+    })
+
+    fireEvent.click(screen.getByRole("combobox"))
+    fireEvent.click(await screen.findByText("tools.mcp.dialog.authTypes.apiKey"))
+
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("stored-env-state").textContent || "[]")).toEqual([
+        { key: "BEARER_TOKEN", value: "********" },
+        { key: "BASIC_AUTH", value: "********" },
+        { key: "TENANT", value: "********" },
+        { key: "API_KEY", value: "" },
+      ])
+    })
+  })
+
+  it("removes only authentication secrets created in the current form session", async () => {
+    window.HTMLElement.prototype.scrollIntoView = vi.fn()
+    render(<CustomApiSessionAuthHarness />)
+
+    fireEvent.click(screen.getByRole("combobox"))
+    fireEvent.click(await screen.findByText("tools.mcp.dialog.authTypes.bearer"))
+    fireEvent.change(screen.getByLabelText("tools.mcp.dialog.token"), {
+      target: { value: "new-token" },
+    })
+
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("session-env-state").textContent || "[]")).toEqual([
+        { key: "BEARER_TOKEN", value: "new-token" },
+      ])
+    })
+
+    fireEvent.click(screen.getByRole("combobox"))
+    fireEvent.click(await screen.findByText("tools.mcp.dialog.authTypes.none"))
+
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("session-env-state").textContent || "[]")).toEqual([])
+    })
+  })
+
+  it("removes a persisted canonical authentication secret only through an explicit action", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    render(<CustomApiStoredEnvHarness />)
+
+    fireEvent.click(screen.getByText("tools.mcp.dialog.advancedOptions"))
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "tools.mcp.dialog.removeSecret BEARER_TOKEN",
+    }))
+
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("stored-env-state").textContent || "[]")).toEqual([
+        { key: "BASIC_AUTH", value: "********" },
+        { key: "TENANT", value: "********" },
+      ])
+      expect(
+        JSON.parse(screen.getByTestId("stored-form-state").textContent || "{}").headers,
+      ).toEqual({})
+      expect(JSON.parse(screen.getByTestId("stored-payload").textContent || "{}")).toEqual({
+        headers: {},
+        env: {
+          BASIC_AUTH: "********",
+          TENANT: "********",
+        },
+      })
+    })
+  })
+
+  it("removes a non-auth secret without changing canonical authentication", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(true)
+    render(<CustomApiStoredEnvHarness />)
+    fireEvent.click(screen.getByText("tools.mcp.dialog.advancedOptions"))
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "tools.mcp.dialog.removeSecret TENANT",
+    }))
+
+    await waitFor(() => {
+      expect(JSON.parse(screen.getByTestId("stored-env-state").textContent || "[]")).toEqual([
+        { key: "BEARER_TOKEN", value: "********" },
+        { key: "BASIC_AUTH", value: "********" },
+      ])
+      expect(
+        JSON.parse(screen.getByTestId("stored-form-state").textContent || "{}").headers,
+      ).toEqual({ Authorization: "Bearer $BEARER_TOKEN" })
+    })
+  })
+
+  it("keeps a persisted secret when explicit removal is cancelled", async () => {
+    vi.spyOn(window, "confirm").mockReturnValue(false)
+    render(<CustomApiStoredEnvHarness />)
+    fireEvent.click(screen.getByText("tools.mcp.dialog.advancedOptions"))
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "tools.mcp.dialog.removeSecret BEARER_TOKEN",
+    }))
+
+    expect(JSON.parse(screen.getByTestId("stored-payload").textContent || "{}")).toEqual({})
+    expect(JSON.parse(screen.getByTestId("stored-env-state").textContent || "[]")).toEqual([
+      { key: "BEARER_TOKEN", value: "********" },
+      { key: "BASIC_AUTH", value: "********" },
+      { key: "TENANT", value: "********" },
+    ])
   })
 })

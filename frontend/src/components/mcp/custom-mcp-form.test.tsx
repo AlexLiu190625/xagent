@@ -555,3 +555,49 @@ describe("CustomMcpForm MCP OAuth", () => {
     expect(clientSecret).toHaveValue("")
   })
 })
+
+describe("CustomMcpForm environment key identity", () => {
+  afterEach(() => cleanup())
+
+  it("keeps persisted masked env key identities immutable", async () => {
+    function Harness() {
+      const [formData, setFormData] = React.useState<MCPServerFormData>({
+        name: "local",
+        transport: "stdio",
+        description: "",
+        config: {
+          command: "python",
+          env: { GLOBAL_TOKEN: "********" },
+        },
+        user_env: { USER_TOKEN: "********" },
+        can_edit_global: true,
+      })
+      return (
+        <CustomMcpForm
+          mcpFormData={formData}
+          setMcpFormData={setFormData}
+          serverId={42}
+        />
+      )
+    }
+
+    render(<Harness />)
+    const keyInputs = screen.getAllByPlaceholderText("tools.mcp.dialog.envKeyPlaceholder")
+    const valueInputs = screen.getAllByPlaceholderText("tools.mcp.dialog.envValuePlaceholder")
+
+    expect(keyInputs).toHaveLength(2)
+    expect(keyInputs[0]).toHaveValue("USER_TOKEN")
+    expect(keyInputs[0]).toBeDisabled()
+    expect(keyInputs[1]).toHaveValue("GLOBAL_TOKEN")
+    expect(keyInputs[1]).toBeDisabled()
+
+    fireEvent.change(valueInputs[0], { target: { value: "replacement-secret" } })
+    await waitFor(() => expect(valueInputs[0]).toHaveValue("replacement-secret"))
+    expect(keyInputs[0]).toBeDisabled()
+    expect(keyInputs[1]).toBeDisabled()
+
+    fireEvent.change(valueInputs[0], { target: { value: "" } })
+    fireEvent.blur(valueInputs[0])
+    await waitFor(() => expect(valueInputs[0]).toHaveValue("********"))
+  })
+})

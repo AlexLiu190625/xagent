@@ -92,9 +92,9 @@ class CustomApiResponse(BaseModel):
     headers: Optional[Dict[str, str]]
     body: Optional[str]
     env: Optional[Dict[str, str]]  # Will return masked values
-    runtime_input_schema: Optional[Dict[str, Any]] = None
-    runtime_bindings: Optional[List[Dict[str, Any]]] = None
-    allow_delegated_authorization: bool = False
+    runtime_input_schema: Optional[Dict[str, Any]]
+    runtime_bindings: Optional[List[Dict[str, Any]]]
+    allow_delegated_authorization: bool
     is_active: bool
     is_default: bool
     created_at: str
@@ -143,7 +143,7 @@ def _db_api_to_response(
 def _process_env_vars(
     env: Optional[Dict[str, str]], existing_env: Optional[Dict[str, str]] = None
 ) -> Optional[Dict[str, str]]:
-    """Encrypt environment variables, keeping existing ones if masked."""
+    """Encrypt environment variables, retaining masks only for the same key."""
     if not env:
         return env
 
@@ -156,7 +156,9 @@ def _process_env_vars(
             if k in existing_env:
                 encrypted_env[k] = existing_env[k]
             else:
-                logger.warning(f"Masked key {k} not found in existing env, skipping")
+                raise ValueError(
+                    f"Masked secret '{k}' has no stored value; provide a new value"
+                )
         else:
             encrypted_env[k] = encrypt_value(v)
 
@@ -199,8 +201,14 @@ async def create_custom_api(
             detail=f"Custom API with name '{api_data.name}' already exists",
         )
 
-    # Process env variables
-    encrypted_env = _process_env_vars(api_data.env)
+    # A masked value is a same-key retention token, never a transferable secret.
+    try:
+        encrypted_env = _process_env_vars(api_data.env)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid environment variables: {exc}",
+        ) from exc
     try:
         validate_runtime_config_declaration(
             connector_type="custom_api",
@@ -333,7 +341,14 @@ async def update_custom_api(
     # Process env variables
     if api_data.env is not None:
         existing_env = api.env if isinstance(api.env, dict) else {}
-        api.env = _process_env_vars(api_data.env, existing_env)
+        try:
+            processed_env = _process_env_vars(api_data.env, existing_env)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid environment variables: {exc}",
+            ) from exc
+        api.env = processed_env
 
     fields_set = api_data.model_fields_set
     runtime_input_schema = (

@@ -1,0 +1,380 @@
+import React from "react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+import { ConnectMcpDialog } from "./connect-mcp-dialog"
+
+const apiRequestMock = vi.hoisted(() => vi.fn())
+const toastErrorMock = vi.hoisted(() => vi.fn())
+const translateMock = vi.hoisted(() => (key: string) => key)
+
+vi.mock("@/lib/api-wrapper", () => ({ apiRequest: apiRequestMock }))
+
+vi.mock("@/lib/utils", async () => {
+  const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
+  return { ...actual, getApiUrl: () => "http://api.local" }
+})
+
+vi.mock("@/contexts/auth-context", () => ({
+  useAuth: () => ({ token: "token" }),
+}))
+
+vi.mock("@/contexts/i18n-context", () => ({
+  useI18n: () => ({ t: translateMock }),
+}))
+
+vi.mock("@/contexts/mcp-apps-context", () => ({
+  useMcpApps: () => ({ apps: [] }),
+}))
+
+vi.mock("@/components/ui/sonner", () => ({
+  toast: { error: toastErrorMock, success: vi.fn() },
+}))
+
+vi.mock("@/components/ui/dialog", () => ({
+  Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
+    open ? <div>{children}</div> : null,
+  DialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogTitle: ({ children }: { children: React.ReactNode }) => <h1>{children}</h1>,
+}))
+
+vi.mock("@/components/ui/tabs", () => ({
+  Tabs: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  TabsList: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  TabsTrigger: ({ children, onClick }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
+    <button type="button" onClick={onClick}>{children}</button>
+  ),
+  TabsContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+}))
+
+vi.mock("./custom-api-form", () => ({
+  CustomApiForm: ({ mcpFormData }: { mcpFormData: { name?: string } }) => (
+    <output data-testid="custom-api-edit-name">{mcpFormData.name ?? ""}</output>
+  ),
+}))
+
+vi.mock("./custom-mcp-form", () => ({
+  CustomMcpForm: ({
+    mcpFormData,
+    setMcpFormData,
+  }: {
+    mcpFormData: { user_env?: Record<string, string> }
+    setMcpFormData: React.Dispatch<React.SetStateAction<Record<string, unknown>>>
+  }) => (
+    <div>
+      <output data-testid="mcp-edit-state">{JSON.stringify(mcpFormData)}</output>
+      <button
+        type="button"
+        onClick={() => setMcpFormData((previous) => ({
+          ...previous,
+          description: "Updated MCP description",
+        }))}
+      >
+        change-mcp-description
+      </button>
+      <button
+        type="button"
+        onClick={() => setMcpFormData((previous) => ({
+          ...previous,
+          user_env: {
+            ...((previous.user_env as Record<string, string> | undefined) ?? {}),
+            NEW_TOKEN: "new-secret",
+          },
+        }))}
+      >
+        add-mcp-env
+      </button>
+    </div>
+  ),
+}))
+
+vi.mock("./official-mcp-settings-dialog", () => ({
+  OfficialMcpSettingsDialog: ({
+    onConfigure,
+    onOpenChange,
+  }: {
+    onConfigure: (app: object) => void
+    onOpenChange: (open: boolean) => void
+  }) => (
+    <div>
+      <button
+        type="button"
+        onClick={() => onConfigure(customApiApp(1, "aggregated-a"))}
+      >
+        configure-a
+      </button>
+      <button
+        type="button"
+        onClick={() => onConfigure(customApiApp(2, "aggregated-b"))}
+      >
+        configure-b
+      </button>
+      <button type="button" onClick={() => onConfigure(mcpApp(3, "aggregated-mcp"))}>
+        configure-mcp
+      </button>
+      <button type="button" onClick={() => onOpenChange(false)}>
+        close-settings
+      </button>
+    </div>
+  ),
+}))
+
+interface Deferred<T> {
+  promise: Promise<T>
+  resolve: (value: T) => void
+}
+
+function deferred<T>(): Deferred<T> {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>((next) => {
+    resolve = next
+  })
+  return { promise, resolve }
+}
+
+function customApiApp(id: number, name: string) {
+  return {
+    id: name,
+    name,
+    description: "",
+    icon: "",
+    is_custom: true,
+    is_connected: true,
+    is_local: true,
+    server_id: id,
+    transport: "custom_api",
+  }
+}
+
+function mcpApp(id: number, name: string) {
+  return {
+    id: name,
+    name,
+    description: "",
+    icon: "",
+    is_custom: true,
+    is_connected: true,
+    is_local: true,
+    server_id: id,
+    transport: "streamable_http",
+  }
+}
+
+function detailResponse(id: number, name: string) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      id,
+      user_id: 7,
+      name,
+      description: `${name} description`,
+      url: `https://${name}.example.com`,
+      method: "POST",
+      headers: { "X-Test": name },
+      body: "{}",
+      env: { TOKEN: "********" },
+      runtime_input_schema: {
+        type: "object",
+        properties: { delegated_token: { type: "string" } },
+      },
+      runtime_bindings: [{ source: "delegated_token", target: "header.Authorization" }],
+      allow_delegated_authorization: true,
+    }),
+  }
+}
+
+function mcpDetailResponse(id: number, name: string) {
+  return {
+    ok: true,
+    status: 200,
+    json: async () => ({
+      id,
+      user_id: 7,
+      name,
+      transport: "streamable_http",
+      description: "authoritative MCP",
+      config: { url: "https://mcp.example.com" },
+      is_active: true,
+      is_default: false,
+      user_env: { EXISTING_TOKEN: "********" },
+      env_source: "own",
+      runtime_input_schema: {
+        context: { account_id: { type: "string", required: true } },
+      },
+      runtime_bindings: [
+        {
+          source: { input_type: "context", key: "account_id" },
+          target: { target_type: "mcp_meta", key: "account_id" },
+        },
+      ],
+      allow_delegated_authorization: true,
+      can_edit_global: false,
+      transport_display: "Streamable HTTP",
+      created_at: null,
+      updated_at: null,
+    }),
+  }
+}
+
+const selectedMcpServers: string[] = []
+function renderDialog() {
+  return render(
+    <ConnectMcpDialog
+      open
+      onOpenChange={vi.fn()}
+      selectedMcpServers={selectedMcpServers}
+    />,
+  )
+}
+
+function saveMcpEditor() {
+  const editor = screen.getByTestId("mcp-edit-state").closest(".max-w-2xl")
+  if (!editor) throw new Error("MCP editor container was not rendered")
+  fireEvent.click(within(editor as HTMLElement).getByRole("button", {
+    name: "tools.mcp.buttons.save",
+  }))
+}
+
+describe("ConnectMcpDialog Custom API detail loading", () => {
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    toastErrorMock.mockReset()
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("keeps the latest requested Custom API when detail responses finish out of order", async () => {
+    const detailA = deferred<ReturnType<typeof detailResponse>>()
+    const detailB = deferred<ReturnType<typeof detailResponse>>()
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url.endsWith("/api/custom-apis/1")) return detailA.promise
+      if (url.endsWith("/api/custom-apis/2")) return detailB.promise
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+
+    fireEvent.click(screen.getByRole("button", { name: "configure-a" }))
+    fireEvent.click(screen.getByRole("button", { name: "configure-b" }))
+
+    await act(async () => {
+      detailB.resolve(detailResponse(2, "authoritative-b"))
+      await detailB.promise
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("custom-api-edit-name")).toHaveTextContent("authoritative-b")
+    })
+
+    await act(async () => {
+      detailA.resolve(detailResponse(1, "authoritative-a"))
+      await detailA.promise
+    })
+
+    expect(screen.getByTestId("custom-api-edit-name")).toHaveTextContent("authoritative-b")
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("ignores a late detail response after the settings dialog closes", async () => {
+    const detailA = deferred<ReturnType<typeof detailResponse>>()
+
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url.endsWith("/api/custom-apis/1")) return detailA.promise
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+
+    fireEvent.click(screen.getByRole("button", { name: "configure-a" }))
+    fireEvent.click(screen.getByRole("button", { name: "close-settings" }))
+
+    await act(async () => {
+      detailA.resolve(detailResponse(1, "authoritative-a"))
+      await detailA.promise
+    })
+
+    expect(screen.getByTestId("custom-api-edit-name")).toHaveTextContent("")
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("hydrates authoritative MCP detail and saves only an unrelated delta", async () => {
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url.endsWith("/api/mcp/servers/3")) {
+        if (options?.method === "PUT") {
+          return Promise.resolve({ ok: true, json: async () => ({}) })
+        }
+        return Promise.resolve(mcpDetailResponse(3, "authoritative-mcp"))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    fireEvent.click(screen.getByRole("button", { name: "configure-mcp" }))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith("http://api.local/api/mcp/servers/3")
+      expect(JSON.parse(screen.getByTestId("mcp-edit-state").textContent || "{}")).toMatchObject({
+        name: "authoritative-mcp",
+        user_env: { EXISTING_TOKEN: "********" },
+        can_edit_global: false,
+      })
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "change-mcp-description" }))
+    saveMcpEditor()
+
+    await waitFor(() => {
+      const updateCall = apiRequestMock.mock.calls.find(([, options]) => options?.method === "PUT")
+      expect(updateCall?.[0]).toBe("http://api.local/api/mcp/servers/3")
+      expect(JSON.parse(updateCall?.[1]?.body as string)).toEqual({
+        description: "Updated MCP description",
+      })
+    })
+  })
+
+  it("keeps masked baseline entries in an MCP user-env replacement", async () => {
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      if (url.endsWith("/api/mcp/servers/3")) {
+        if (options?.method === "PUT") {
+          return Promise.resolve({ ok: true, json: async () => ({}) })
+        }
+        return Promise.resolve(mcpDetailResponse(3, "authoritative-mcp"))
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+
+    renderDialog()
+    fireEvent.click(screen.getByRole("button", { name: "configure-mcp" }))
+    await screen.findByText("authoritative-mcp")
+
+    fireEvent.click(screen.getByRole("button", { name: "add-mcp-env" }))
+    saveMcpEditor()
+
+    await waitFor(() => {
+      const updateCall = apiRequestMock.mock.calls.find(([, options]) => options?.method === "PUT")
+      expect(JSON.parse(updateCall?.[1]?.body as string)).toEqual({
+        user_env: {
+          EXISTING_TOKEN: "********",
+          NEW_TOKEN: "new-secret",
+        },
+      })
+    })
+  })
+})

@@ -24,6 +24,12 @@ interface CustomMcpFormProps {
   onRuntimeValidationErrorChange?: (error: RuntimeConfigErrorKey | null) => void
 }
 
+interface EnvRow {
+  key: string
+  value: string
+  persistedKey?: string
+}
+
 interface McpOAuthGrantStatus {
   id: number
   resource_owner_key: string
@@ -368,13 +374,17 @@ export function CustomMcpForm({
 
   // Handle stdio env vars state (array of {key, value} for the UI, but config expects an object)
   const envObj = mcpFormData.config?.env || {}
-  const [envList, setEnvList] = useState<{ key: string, value: string }[]>(
+  const [envList, setEnvList] = useState<EnvRow[]>(
     Object.keys(envObj).length > 0
-      ? Object.entries(envObj).map(([k, v]) => ({ key: k, value: String(v) }))
+      ? Object.entries(envObj).map(([k, v]) => ({
+        key: k,
+        value: String(v),
+        persistedKey: String(v) === MASKED_SECRET_VALUE ? k : undefined,
+      }))
       : []
   )
 
-  const syncEnv = (newList: { key: string, value: string }[]) => {
+  const syncEnv = (newList: EnvRow[]) => {
     setEnvList(newList)
     const newEnvObj: Record<string, string> = {}
     newList.forEach(e => {
@@ -388,13 +398,17 @@ export function CustomMcpForm({
 
   // Per-user env overrides (top-level user_env, merged over global env at runtime).
   const userEnvObj = mcpFormData.user_env || {}
-  const [userEnvList, setUserEnvList] = useState<{ key: string, value: string }[]>(
+  const [userEnvList, setUserEnvList] = useState<EnvRow[]>(
     Object.keys(userEnvObj).length > 0
-      ? Object.entries(userEnvObj).map(([k, v]) => ({ key: k, value: String(v) }))
+      ? Object.entries(userEnvObj).map(([k, v]) => ({
+        key: k,
+        value: String(v),
+        persistedKey: String(v) === MASKED_SECRET_VALUE ? k : undefined,
+      }))
       : []
   )
 
-  const syncUserEnv = (newList: { key: string, value: string }[]) => {
+  const syncUserEnv = (newList: EnvRow[]) => {
     setUserEnvList(newList)
     const obj: Record<string, string> = {}
     newList.forEach(e => {
@@ -456,8 +470,8 @@ export function CustomMcpForm({
   }
 
   const renderEnvRows = (
-    list: { key: string, value: string }[],
-    sync: (l: { key: string, value: string }[]) => void,
+    list: EnvRow[],
+    sync: (l: EnvRow[]) => void,
     readOnly: boolean
   ) => (
     <>
@@ -470,7 +484,7 @@ export function CustomMcpForm({
               <Input
                 placeholder={t('tools.mcp.dialog.envKeyPlaceholder')}
                 value={e.key}
-                disabled={readOnly}
+                disabled={readOnly || e.persistedKey !== undefined}
                 onChange={(ev) => {
                   const newList = [...list]
                   newList[i] = { ...newList[i], key: ev.target.value }
@@ -483,9 +497,8 @@ export function CustomMcpForm({
                 placeholder={t('tools.mcp.dialog.envValuePlaceholder')}
                 value={e.value}
                 disabled={readOnly}
-                // Select-all on focus so typing replaces the mask; we never write
-                // an empty intermediate value, so an early submit can't wipe the
-                // stored secret. If the user appends instead, strip the leading mask.
+                // Select-all on focus so typing replaces the mask. Persisted rows
+                // keep their key identity; deletion uses the explicit trash action.
                 onFocus={(ev) => ev.target.select()}
                 onChange={(ev) => {
                   let value = ev.target.value
@@ -494,6 +507,12 @@ export function CustomMcpForm({
                   }
                   const newList = [...list]
                   newList[i] = { ...newList[i], value }
+                  sync(newList)
+                }}
+                onBlur={() => {
+                  if (e.persistedKey === undefined || e.value.trim() !== "") return
+                  const newList = [...list]
+                  newList[i] = { ...newList[i], value: MASKED_SECRET_VALUE }
                   sync(newList)
                 }}
                 className="flex-1"

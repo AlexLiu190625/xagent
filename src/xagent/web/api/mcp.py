@@ -33,6 +33,7 @@ from ...core.tools.core.mcp.model import MASKED_SECRET_VALUE, SENSITIVE_AUTH_FIE
 from ...core.utils.encryption import decrypt_value, encrypt_value
 from ..auth_dependencies import get_current_user, is_admin_user
 from ..mcp_apps import get_all_mcp_apps, get_app_by_name
+from ..models.custom_api import CustomApi, UserCustomApi
 from ..models.database import get_db
 from ..models.mcp import MCPServer, UserMCPServer
 from ..models.mcp_oauth import (
@@ -159,12 +160,12 @@ class MCPServerResponse(BaseModel):
     config: dict
     is_active: bool
     is_default: bool
-    user_env: Optional[dict] = None
+    user_env: Optional[dict]
     env_source: Optional[Literal["own", "shared", "platform"]] = None
-    runtime_input_schema: Optional[dict] = None
-    runtime_bindings: Optional[list[dict]] = None
-    allow_delegated_authorization: bool = False
-    can_edit_global: bool = False
+    runtime_input_schema: Optional[dict]
+    runtime_bindings: Optional[list[dict]]
+    allow_delegated_authorization: bool
+    can_edit_global: bool
     transport_display: str
     created_at: Optional[str]
     updated_at: Optional[str]
@@ -1270,14 +1271,19 @@ def _mask_env(env: Any) -> dict:
 def _merge_masked_env(new_env: dict, old_env: dict) -> dict:
     """Apply an incoming env dict, restoring the stored value for masked entries.
 
-    A masked entry with no stored value (e.g. a renamed key) is dropped rather
-    than persisted as None, which would crash stdio subprocess launch.
+    The mask is a same-key retention token. Rejecting an unknown masked key
+    prevents a rename from silently deleting the old credential while reporting
+    a successful replacement.
     """
     merged = {}
     for k, v in new_env.items():
         if v == MASKED_SECRET_VALUE:
             if k in old_env and old_env[k] is not None:
                 merged[k] = old_env[k]
+            else:
+                raise ValueError(
+                    f"Masked secret '{k}' has no stored value; provide a new value"
+                )
         else:
             merged[k] = v
     return merged
@@ -1402,6 +1408,38 @@ def _db_server_to_response(
         connected_account=connected_account,
         app_id=app_id,
         provider=provider,
+    )
+
+
+def _custom_api_to_mcp_response(
+    api: CustomApi,
+    user_api: UserCustomApi,
+) -> MCPServerResponse:
+    """Project a Custom API into the aggregate connector response contract."""
+    masked_env: dict[str, Any] = _mask_env(api.env) if isinstance(api.env, dict) else {}
+    config: dict[str, Any] = {"env": masked_env}
+    for field_name in ("url", "method", "headers", "body"):
+        value = getattr(api, field_name)
+        if value:
+            config[field_name] = value
+
+    return MCPServerResponse(
+        id=api.id,
+        user_id=user_api.user_id,
+        name=api.name,
+        transport="custom_api",
+        description=api.description,
+        config=config,
+        is_active=user_api.is_active,
+        is_default=user_api.is_default,
+        user_env=None,
+        runtime_input_schema=api.runtime_input_schema,
+        runtime_bindings=api.runtime_bindings,
+        allow_delegated_authorization=bool(api.allow_delegated_authorization),
+        can_edit_global=bool(user_api.can_edit),
+        transport_display="Custom API",
+        created_at=_format_optional_datetime(api.created_at),
+        updated_at=_format_optional_datetime(api.updated_at),
     )
 
 
@@ -1856,12 +1894,11 @@ def list_mcp_apps(
                     "category": "Local",
                     "is_local": True,
                     "server_id": server.id,
+                    "is_custom": True,
                 }
             )
 
         # Append Custom APIs
-        from ..models.custom_api import CustomApi, UserCustomApi
-
         user_custom_apis = (
             db.query(UserCustomApi, CustomApi)
             .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
@@ -1961,8 +1998,6 @@ def get_mcp_servers(
             )
 
         # Append Custom APIs
-        from ..models.custom_api import CustomApi, UserCustomApi
-
         user_custom_apis = (
             db.query(UserCustomApi, CustomApi)
             .join(CustomApi, UserCustomApi.custom_api_id == CustomApi.id)
@@ -1971,36 +2006,7 @@ def get_mcp_servers(
         )
 
         for user_api, api in user_custom_apis:
-            # Mask env values
-            masked_env = {}
-            if api.env and isinstance(api.env, dict):
-                masked_env = {k: "********" for k in api.env.keys()}
-
-            config_dict = {"env": masked_env}
-            if api.url:
-                config_dict["url"] = api.url
-            if api.method:
-                config_dict["method"] = api.method
-            if api.headers:
-                config_dict["headers"] = api.headers
-            if api.body:
-                config_dict["body"] = api.body
-
-            responses.append(
-                MCPServerResponse(
-                    id=api.id,
-                    user_id=user_api.user_id,
-                    name=api.name,
-                    transport="custom_api",
-                    description=api.description,
-                    config=config_dict,
-                    is_active=user_api.is_active,
-                    is_default=user_api.is_default,
-                    transport_display="Custom API",
-                    created_at=_format_optional_datetime(api.created_at),
-                    updated_at=_format_optional_datetime(api.updated_at),
-                )
-            )
+            responses.append(_custom_api_to_mcp_response(api, user_api))
 
         return responses
 
@@ -2233,7 +2239,14 @@ def connect_mcp_app(
             and str(v).strip()
         }
         existing = decrypt_env_dict(getattr(a, "env", None)) if a else {}
-        return encrypt_env_dict(_merge_masked_env(provided, existing or {})) or None
+        try:
+            merged = _merge_masked_env(provided, existing or {})
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid environment variables: {exc}",
+            ) from exc
+        return encrypt_env_dict(merged) or None
 
     # env_source is validated at the API boundary by the request model's Literal
     # (own | shared | platform | None); no manual check needed here.
@@ -2317,6 +2330,20 @@ def create_mcp_server(
         manager = DatabaseMCPServerManager(db)
         user_id = current_user.id
 
+        # Validate per-user masks before manager.add_server can persist the
+        # global row. New connectors have no stored value a mask could retain.
+        try:
+            created_user_env = (
+                _merge_masked_env(server_data.user_env, {})
+                if server_data.user_env
+                else None
+            )
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid user environment variables: {exc}",
+            ) from exc
+
         # Check if server name already exists
         existing = (
             db.query(MCPServer).filter(MCPServer.name == server_data.name).first()
@@ -2350,6 +2377,8 @@ def create_mcp_server(
                 allow_delegated_authorization=server_data.allow_delegated_authorization,
                 static_headers=config.headers,
             )
+            if isinstance(config.env, dict):
+                _merge_masked_env(config.env, {})
         except ValueError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -2376,12 +2405,10 @@ def create_mcp_server(
         # Create user-server association. The creator owns the global config.
         from xagent.core.utils.encryption import encrypt_env_dict
 
-        created_user_env = None
-        if server_data.user_env:
+        encrypted_user_env = None
+        if created_user_env:
             # No stored values yet: drop masked entries, then encrypt at rest.
-            created_user_env = (
-                encrypt_env_dict(_merge_masked_env(server_data.user_env, {})) or None
-            )
+            encrypted_user_env = encrypt_env_dict(created_user_env) or None
         user_mcp = UserMCPServer(
             user_id=user_id,
             mcpserver_id=server.id,
@@ -2389,7 +2416,7 @@ def create_mcp_server(
             is_owner=True,
             can_edit=True,
             can_delete=True,
-            env=created_user_env,
+            env=encrypted_user_env,
         )
         db.add(user_mcp)
         db.commit()
@@ -2524,7 +2551,14 @@ def update_mcp_server(
             )
 
         # Update server fields (global config; no-op values for non-owners)
-        _update_server_from_config(server, config)
+        try:
+            _update_server_from_config(server, config)
+        except ValueError as exc:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid environment variables: {exc}",
+            ) from exc
         if can_edit_global:
             orm_server = cast(Any, server)
             if "runtime_input_schema" in fields_set:
@@ -2538,9 +2572,16 @@ def update_mcp_server(
         if server_data.user_env is not None:
             from xagent.core.utils.encryption import encrypt_env_dict
 
-            merged_user_env = _merge_masked_env(
-                server_data.user_env, getattr(user_mcp, "env", None) or {}
-            )
+            try:
+                merged_user_env = _merge_masked_env(
+                    server_data.user_env, getattr(user_mcp, "env", None) or {}
+                )
+            except ValueError as exc:
+                db.rollback()
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid user environment variables: {exc}",
+                ) from exc
             user_mcp.env = encrypt_env_dict(merged_user_env) or None
 
         # Update user association if needed

@@ -3,10 +3,12 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 
 from xagent.web.api.custom_api import (
     CustomApiCreate,
+    CustomApiResponse,
     CustomApiUpdate,
     _process_env_vars,
     create_custom_api,
@@ -52,6 +54,35 @@ def test_custom_api_models_env_validation():
     assert runtime_api.runtime_bindings is not None
 
 
+def test_custom_api_response_requires_runtime_projection_fields():
+    """Custom API response mappers must project every persisted runtime field."""
+    response_data = {
+        "id": 1,
+        "user_id": 1,
+        "name": "runtime",
+        "description": None,
+        "url": None,
+        "method": "GET",
+        "headers": None,
+        "body": None,
+        "env": None,
+        "is_active": True,
+        "is_default": False,
+        "created_at": "2026-07-14T00:00:00",
+        "updated_at": "2026-07-14T00:00:00",
+    }
+
+    with pytest.raises(ValidationError) as exc_info:
+        CustomApiResponse(**response_data)
+
+    missing_fields = {error["loc"] for error in exc_info.value.errors()}
+    assert missing_fields == {
+        ("runtime_input_schema",),
+        ("runtime_bindings",),
+        ("allow_delegated_authorization",),
+    }
+
+
 def test_process_env_vars():
     with patch(
         "xagent.web.api.custom_api.encrypt_value", side_effect=lambda x: f"enc_{x}"
@@ -70,9 +101,9 @@ def test_process_env_vars():
         res_masked = _process_env_vars(env_with_mask, existing)
         assert res_masked == {"key1": "enc_old1", "key3": "enc_val3"}
 
-        # Test masked value without existing
-        res_missing = _process_env_vars({"new_key": "********"}, existing)
-        assert res_missing == {}
+        # A mask cannot be moved to a new key identity.
+        with pytest.raises(ValueError, match="new_key"):
+            _process_env_vars({"new_key": "********"}, existing)
 
 
 @pytest.mark.asyncio
@@ -293,6 +324,74 @@ async def test_update_custom_api():
             }
         ]
         db.commit.assert_called()
+
+
+@pytest.mark.asyncio
+async def test_update_custom_api_env_replacement_deletes_only_the_omitted_secret():
+    db = MagicMock(spec=Session)
+    user = User(id=1)
+    mock_api = CustomApi(
+        id=10,
+        name="records",
+        env={"BEARER_TOKEN": "enc_bearer", "TENANT": "enc_tenant"},
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    mock_user_api = UserCustomApi(
+        user_id=1,
+        custom_api_id=10,
+        can_edit=True,
+        is_active=True,
+        is_default=False,
+        custom_api=mock_api,
+    )
+    db.query().filter().first.return_value = mock_user_api
+
+    with patch(
+        "xagent.web.api.custom_api.encrypt_value", side_effect=lambda x: f"enc_{x}"
+    ):
+        await update_custom_api(
+            10,
+            CustomApiUpdate(env={"TENANT": "********"}),
+            current_user=user,
+            db=db,
+        )
+
+    assert mock_api.env == {"TENANT": "enc_tenant"}
+
+
+@pytest.mark.asyncio
+async def test_update_custom_api_rejects_renamed_masked_secret():
+    db = MagicMock(spec=Session)
+    user = User(id=1)
+    mock_api = CustomApi(
+        id=10,
+        name="records",
+        env={"TOKEN": "encrypted-token"},
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+    )
+    mock_user_api = UserCustomApi(
+        user_id=1,
+        custom_api_id=10,
+        can_edit=True,
+        is_active=True,
+        is_default=False,
+        custom_api=mock_api,
+    )
+    db.query().filter().first.return_value = mock_user_api
+
+    with pytest.raises(HTTPException) as exc_info:
+        await update_custom_api(
+            10,
+            CustomApiUpdate(env={"RENAMED_TOKEN": "********"}),
+            current_user=user,
+            db=db,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert mock_api.env == {"TOKEN": "encrypted-token"}
+    db.commit.assert_not_called()
 
 
 @pytest.mark.asyncio

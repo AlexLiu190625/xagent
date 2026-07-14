@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { useI18n } from "@/contexts/i18n-context"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select-radix"
 import { Collapsible, CollapsibleTrigger, CollapsibleContent } from "@/components/ui/collapsible"
-import { ChevronDown, ChevronRight, Plus } from "lucide-react"
+import { ChevronDown, ChevronRight, Plus, Trash2 } from "lucide-react"
 import {
     RuntimeInputsForm,
     runtimeBindingsFromConfig,
@@ -35,6 +35,54 @@ interface CustomApiFormProps {
     onRuntimeValidationErrorChange?: (error: RuntimeConfigErrorKey | null) => void
 }
 
+type CustomApiAuthType = "none" | "bearer" | "api_key" | "basic"
+type AuthEnvKey = "BEARER_TOKEN" | "API_KEY" | "BASIC_AUTH"
+const MASKED_SECRET_VALUE = "********"
+
+function authEnvKeyForType(authType: CustomApiAuthType): AuthEnvKey | null {
+    if (authType === "bearer") return "BEARER_TOKEN"
+    if (authType === "api_key") return "API_KEY"
+    if (authType === "basic") return "BASIC_AUTH"
+    return null
+}
+
+function hasOriginalEnvEntry(originalEnvObj: Record<string, any>, key: string): boolean {
+    return Object.prototype.hasOwnProperty.call(originalEnvObj, key)
+}
+
+function valueReferencesEnvKey(value: unknown, key: string): boolean {
+    if (typeof value !== "string" || !key) return false
+    return value.includes(`$${key}`) || value.includes("${" + key + "}")
+}
+
+function reconcileAuthEnvEntries(
+    previous: { key: string, value: string }[],
+    previousSessionAuthKey: AuthEnvKey | null,
+    nextAuthEntries: { key: string, value: string }[],
+    originalEnvObj: Record<string, any>,
+): { key: string, value: string }[] {
+    const pendingAuthEntries = new Map(nextAuthEntries.map(entry => [entry.key, entry]))
+    const merged: { key: string, value: string }[] = []
+
+    previous.forEach(entry => {
+        const replacement = pendingAuthEntries.get(entry.key)
+        if (replacement) {
+            merged.push(replacement)
+            pendingAuthEntries.delete(entry.key)
+            return
+        }
+
+        const isRemovableSessionEntry = entry.key === previousSessionAuthKey
+            && !hasOriginalEnvEntry(originalEnvObj, entry.key)
+        if (!isRemovableSessionEntry) {
+            merged.push(entry)
+        }
+    })
+
+    pendingAuthEntries.forEach(entry => merged.push(entry))
+    return merged
+}
+
 export function CustomApiForm({
     mcpFormData,
     setMcpFormData,
@@ -45,11 +93,12 @@ export function CustomApiForm({
 }: CustomApiFormProps) {
     const { t } = useI18n()
 
-    const [authType, setAuthType] = useState<"none" | "bearer" | "api_key" | "basic">("none")
+    const [authType, setAuthType] = useState<CustomApiAuthType>("none")
     const [authHeaderName, setAuthHeaderName] = useState("")
     const [authSecret, setAuthSecret] = useState("")
     const [basicUsername, setBasicUsername] = useState("")
     const [basicPassword, setBasicPassword] = useState("")
+    const [isAuthStateInitialized, setIsAuthStateInitialized] = useState(false)
 
     const [isAdvancedOpen, setIsAdvancedOpen] = useState(false)
     const [customHeaders, setCustomHeaders] = useState<{ key: string, value: string }[]>([])
@@ -57,13 +106,19 @@ export function CustomApiForm({
     // Tracks the last props-derived auth state we synced to local state.
     // Only updated inside the props-sync useEffect so user edits are never compared against themselves.
     const lastSyncedRef = React.useRef({
-        authType: "none" as "none" | "bearer" | "api_key" | "basic",
+        authType: "none" as CustomApiAuthType,
         authHeaderName: "",
         authSecret: "",
         basicUsername: "",
         basicPassword: "",
         customHeaders: [] as { key: string, value: string }[],
     })
+    // Existing env keys belong to the persisted connector baseline. Only an
+    // auth key introduced during this mounted form session may be removed
+    // automatically when the user changes authentication type.
+    const sessionAuthEnvKeyRef = React.useRef<AuthEnvKey | null>(null)
+    const userSelectedAuthTypeRef = React.useRef<CustomApiAuthType | null>(null)
+    const authStateHydratedRef = React.useRef(false)
 
     // Track if the update came from internal state changes
     const internalUpdateRef = React.useRef(false)
@@ -95,7 +150,7 @@ export function CustomApiForm({
             return
         }
 
-        let aType: "none" | "bearer" | "api_key" | "basic" = "none"
+        let aType: CustomApiAuthType = "none"
         let aHeaderName = ""
         let aSecret = ""
         const bUsername = ""
@@ -143,17 +198,10 @@ export function CustomApiForm({
         // 1. Re-syncing when props reference changed but content didn't
         // 2. Overwriting user edits that haven't propagated back through props yet
         if (info.authType !== snap.authType && info.authType !== authType) {
-            // When inferred authType is "none" but customApiEnv still has auth secrets,
-            // the user is in the middle of configuring auth (e.g. switched to api_key
-            // but hasn't filled the header name yet). Don't overwrite their choice.
-            if (info.authType === "none") {
-                const hasAuthSecret = customApiEnv.some(e =>
-                    e.key === "BEARER_TOKEN" || e.key === "API_KEY" || e.key === "BASIC_AUTH"
-                )
-                if (!hasAuthSecret) {
-                    setAuthType(info.authType)
-                }
-            } else {
+            // An incomplete auth selection (for example API key without a header
+            // name yet) cannot be inferred from headers. Keep the explicit local
+            // selection instead of treating reserved env key names as ownership.
+            if (info.authType !== "none" || userSelectedAuthTypeRef.current === null) {
                 setAuthType(info.authType)
             }
         }
@@ -168,7 +216,16 @@ export function CustomApiForm({
             info.customHeaders.every((h, i) => h.key === customHeaders[i]?.key && h.value === customHeaders[i]?.value)
         if (!headersEqualSnap && !headersEqualCurrent) setCustomHeaders(info.customHeaders)
 
+        if (!authStateHydratedRef.current) {
+            const inferredKey = authEnvKeyForType(info.authType)
+            sessionAuthEnvKeyRef.current = inferredKey
+                && !hasOriginalEnvEntry(originalEnvObj, inferredKey)
+                ? inferredKey
+                : null
+            authStateHydratedRef.current = true
+        }
         lastSyncedRef.current = info
+        setIsAuthStateInitialized(true)
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [mcpFormData.headers, customApiEnv])
 
@@ -180,6 +237,8 @@ export function CustomApiForm({
 
     // Sync auth state to headers and env
     useEffect(() => {
+        if (!isAuthStateInitialized) return
+
         let newHeaders: Record<string, string> = {}
         let newEnv: { key: string, value: string }[] = []
 
@@ -223,17 +282,65 @@ export function CustomApiForm({
         })
 
         setCustomApiEnv(prev => {
-            const targetEnv = authType !== "none" ? newEnv : []
+            const targetEnv = reconcileAuthEnvEntries(
+                prev,
+                sessionAuthEnvKeyRef.current,
+                authType !== "none" ? newEnv : [],
+                originalEnvObj,
+            )
             const isEnvEqual = prev.length === targetEnv.length &&
                 prev.every((item, i) => item.key === targetEnv[i].key && item.value === targetEnv[i].value)
 
             if (isEnvEqual) {
+                const nextKey = newEnv[0]?.key as AuthEnvKey | undefined
+                sessionAuthEnvKeyRef.current = nextKey
+                    && !hasOriginalEnvEntry(originalEnvObj, nextKey)
+                    ? nextKey
+                    : null
                 return prev
             }
             internalUpdateRef.current = true
+            const nextKey = newEnv[0]?.key as AuthEnvKey | undefined
+            sessionAuthEnvKeyRef.current = nextKey
+                && !hasOriginalEnvEntry(originalEnvObj, nextKey)
+                ? nextKey
+                : null
             return targetEnv
         })
-    }, [authType, authHeaderName, authSecret, basicUsername, basicPassword, customHeaders, runtimeHeaderKeys, setMcpFormData, setCustomApiEnv])
+    }, [authType, authHeaderName, authSecret, basicUsername, basicPassword, customHeaders, isAuthStateInitialized, originalEnvObj, runtimeHeaderKeys, setMcpFormData, setCustomApiEnv])
+
+    const activeAuthEnvKey = authEnvKeyForType(authType)
+
+    const removeSecret = (index: number) => {
+        const entry = customApiEnv[index]
+        if (!entry) return
+        const key = entry.key.trim()
+        const isReferenced = key !== "" && [
+            mcpFormData.url,
+            mcpFormData.body,
+            ...Object.values(mcpFormData.headers || {}),
+        ].some(value => valueReferencesEnvKey(value, key))
+        const isPersisted = key !== "" && hasOriginalEnvEntry(originalEnvObj, key)
+        if (isPersisted || isReferenced) {
+            const confirmationKey = isReferenced
+                ? 'tools.mcp.dialog.removeReferencedSecretConfirm'
+                : 'tools.mcp.dialog.removeSecretConfirm'
+            if (!window.confirm(t(confirmationKey, { key }))) return
+        }
+
+        if (key && key === activeAuthEnvKey) {
+            userSelectedAuthTypeRef.current = "none"
+            sessionAuthEnvKeyRef.current = null
+            setAuthType("none")
+            setAuthHeaderName("")
+            setAuthSecret("")
+            setBasicUsername("")
+            setBasicPassword("")
+        }
+        setCustomApiEnv(previous => key
+            ? previous.filter(item => item.key.trim() !== key)
+            : previous.filter((_, itemIndex) => itemIndex !== index))
+    }
 
     const methods = ["GET", "POST", "PUT", "PATCH", "DELETE"]
 
@@ -291,9 +398,14 @@ export function CustomApiForm({
                 <Label>{t('tools.mcp.dialog.authentication')}</Label>
                 <Select
                     value={authType}
-                    onValueChange={(val: "none" | "bearer" | "api_key" | "basic") => {
+                    onValueChange={(val: CustomApiAuthType) => {
+                        userSelectedAuthTypeRef.current = val
                         setAuthType(val)
-                        setAuthSecret("") // Reset secret when changing auth type
+                        const envKey = authEnvKeyForType(val)
+                        const existingEntry = envKey
+                            ? customApiEnv.find(entry => entry.key === envKey)
+                            : undefined
+                        setAuthSecret(existingEntry?.value ?? "")
                     }}
                 >
                     <SelectTrigger>
@@ -493,6 +605,89 @@ export function CustomApiForm({
                         >
                             <Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.addHeader')}
                         </Button>
+
+                        <div className="pt-4 border-t border-slate-200 space-y-3">
+                            <div>
+                                <Label className="text-sm font-semibold">{t('tools.mcp.dialog.customApiSecrets')}</Label>
+                                <p className="text-xs text-slate-500">{t('tools.mcp.dialog.customApiSecretsDesc')}</p>
+                            </div>
+                            {customApiEnv.length === 0 ? (
+                                <p className="text-sm text-slate-500">{t('tools.mcp.dialog.noCustomApiSecrets')}</p>
+                            ) : (
+                                <div className="space-y-2">
+                                    {customApiEnv.map((entry, index) => {
+                                        const isActiveAuthSecret = entry.key.trim() === activeAuthEnvKey
+                                        const isPersistedSecret = hasOriginalEnvEntry(
+                                            originalEnvObj,
+                                            entry.key.trim(),
+                                        )
+                                        return (
+                                            <div key={`${entry.key}-${index}`} className="flex gap-2 items-center">
+                                                <Input
+                                                    aria-label={`${t('tools.mcp.dialog.customApiSecretName')} ${entry.key}`}
+                                                    placeholder={t('tools.mcp.dialog.customApiSecretName')}
+                                                    value={entry.key}
+                                                    disabled={isActiveAuthSecret || isPersistedSecret}
+                                                    onChange={(event) => {
+                                                        const next = [...customApiEnv]
+                                                        next[index] = { ...next[index], key: event.target.value }
+                                                        setCustomApiEnv(next)
+                                                    }}
+                                                    className="flex-1"
+                                                />
+                                                <Input
+                                                    aria-label={`${t('tools.mcp.dialog.customApiSecretValue')} ${entry.key}`}
+                                                    type="password"
+                                                    placeholder={t('tools.mcp.dialog.customApiSecretValuePlaceholder')}
+                                                    value={entry.value}
+                                                    disabled={isActiveAuthSecret}
+                                                    onFocus={(event) => event.currentTarget.select()}
+                                                    onChange={(event) => {
+                                                        let value = event.target.value
+                                                        if (
+                                                            entry.value === "********"
+                                                            && value !== "********"
+                                                            && value.startsWith("********")
+                                                        ) {
+                                                            value = value.slice("********".length)
+                                                        }
+                                                        const next = [...customApiEnv]
+                                                        next[index] = { ...next[index], value }
+                                                        setCustomApiEnv(next)
+                                                    }}
+                                                    onBlur={() => {
+                                                        if (!isPersistedSecret || entry.value.trim() !== "") return
+                                                        const next = [...customApiEnv]
+                                                        next[index] = { ...next[index], value: MASKED_SECRET_VALUE }
+                                                        setCustomApiEnv(next)
+                                                    }}
+                                                    className="flex-1"
+                                                />
+                                                <Button
+                                                    type="button"
+                                                    variant="ghost"
+                                                    size="icon"
+                                                    aria-label={`${t('tools.mcp.dialog.removeSecret')} ${entry.key}`}
+                                                    onClick={() => removeSecret(index)}
+                                                    className="text-red-500 hover:text-red-700"
+                                                >
+                                                    <Trash2 className="h-4 w-4" />
+                                                </Button>
+                                            </div>
+                                        )
+                                    })}
+                                </div>
+                            )}
+                            <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="w-full border-dashed text-blue-600 border-blue-200 hover:bg-blue-50 hover:text-blue-700"
+                                onClick={() => setCustomApiEnv(previous => [...previous, { key: "", value: "" }])}
+                            >
+                                <Plus className="h-4 w-4 mr-2" /> {t('tools.mcp.dialog.customApiAddSecret')}
+                            </Button>
+                        </div>
 
                         {mcpFormData.method && !["GET", "DELETE"].includes(mcpFormData.method) && (
                             <div className="pt-4 border-t border-slate-200">

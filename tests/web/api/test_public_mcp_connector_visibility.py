@@ -227,6 +227,43 @@ def test_connected_non_oauth_public_app_is_marked_connected() -> None:
             pass
 
 
+def test_local_custom_mcp_app_is_a_self_contained_actor_scoped_edit_reference() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        register_response = client.post(
+            "/api/auth/register",
+            json={
+                "username": "regular",
+                "email": "regular@example.com",
+                "password": "password123",
+            },
+        )
+        assert register_response.status_code == 200
+        regular_headers = _login("regular", "password123")
+        _connect_custom_stdio_mcp_for_user("regular", "Private Local MCP")
+
+        response = client.get(
+            "/api/mcp/apps?location=local&search=private",
+            headers=regular_headers,
+        )
+        assert response.status_code == 200, response.text
+        local_app = next(
+            app for app in response.json() if app["id"] == "Private Local MCP"
+        )
+        assert isinstance(local_app["server_id"], int)
+        assert local_app["transport"] == "stdio"
+        assert local_app["is_custom"] is True
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_non_oauth_public_app_matches_space_hyphen_name_variant() -> None:
     temp_dir = _setup_test_db()
     try:

@@ -426,6 +426,54 @@ def test_update_mcp_server_explicit_null_clears_runtime_config(db_session):
     assert server.allow_delegated_authorization is False
 
 
+def test_update_mcp_server_rejects_renamed_masked_global_env_key(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    encrypted_secret = encrypt_value("global-secret")
+    server.env = {"TOKEN": encrypted_secret}
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        update_mcp_server(
+            server.id,
+            MCPServerUpdate(config={"env": {"RENAMED_TOKEN": "********"}}),
+            user,
+            db,
+        )
+
+    assert exc_info.value.status_code == 400
+    db.refresh(server)
+    assert server.env == {"TOKEN": encrypted_secret}
+
+
+def test_update_mcp_server_rejects_renamed_masked_user_env_key(db_session):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    user_mcp = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .one()
+    )
+    encrypted_secret = encrypt_value("user-secret")
+    user_mcp.env = {"TOKEN": encrypted_secret}
+    db.commit()
+
+    with pytest.raises(HTTPException) as exc_info:
+        update_mcp_server(
+            server.id,
+            MCPServerUpdate(user_env={"RENAMED_TOKEN": "********"}),
+            user,
+            db,
+        )
+
+    assert exc_info.value.status_code == 400
+    db.refresh(user_mcp)
+    assert user_mcp.env == {"TOKEN": encrypted_secret}
+
+
 @pytest.mark.asyncio
 async def test_connect_creates_pkce_state_and_redirects(db_session, monkeypatch):
     db, user, _ = db_session

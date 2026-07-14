@@ -39,7 +39,17 @@ import { Label } from "@/components/ui/label"
 import { RadioGroup, RadioGroupItem } from "@/components/ui/radio-group"
 import { useEffect } from "react"
 
-import { isValidMcpName, buildCustomApiPayload } from "@/lib/mcp-utils"
+import {
+  isValidMcpName,
+  buildCustomApiPayload,
+  buildMcpServerPayload,
+  customApiDetailToEditState,
+  mcpServerDetailToEditState,
+  parseCustomApiDetail,
+  parseMcpServerDetail,
+  type CustomApiDetail,
+  type McpServerDetail,
+} from "@/lib/mcp-utils"
 
 // Matches the backend mask; a masked value submitted unchanged keeps the stored secret.
 const MASKED_SECRET_VALUE = "********"
@@ -59,7 +69,6 @@ interface ConnectMcpDialogProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   onConnectCustom?: () => void
-  globalMcpServers?: any[]
   selectedMcpServers?: string[]
   onConnectSelected?: (selectedApps: string[]) => void
   customContent?: React.ReactNode
@@ -70,7 +79,6 @@ export function ConnectMcpDialog({
   open,
   onOpenChange,
   onConnectCustom,
-  globalMcpServers = [],
   selectedMcpServers = [],
   onConnectSelected,
   customContent,
@@ -96,6 +104,9 @@ export function ConnectMcpDialog({
   const [localSelectedServers, setLocalSelectedServers] = useState<string[]>([])
   const [activeTab, setActiveTab] = useState("library")
   const [editingCustomServerId, setEditingCustomServerId] = useState<number | null>(null)
+  const [customApiEditBaseline, setCustomApiEditBaseline] = useState<CustomApiDetail | null>(null)
+  const [mcpEditBaseline, setMcpEditBaseline] = useState<McpServerDetail | null>(null)
+  const connectorEditRequestRef = React.useRef(0)
 
   // Custom MCP Server state
   const [isSavingCustom, setIsSavingCustom] = useState(false)
@@ -149,15 +160,82 @@ export function ConnectMcpDialog({
       setLocalSelectedServers(selectedMcpServers || [])
       setActiveTab("library")
       setEditingCustomServerId(null)
+      setCustomApiEditBaseline(null)
+      setMcpEditBaseline(null)
       setRuntimeValidationError(null)
+    } else {
+      connectorEditRequestRef.current += 1
     }
   }, [open, t, selectedMcpServers])
+
+  useEffect(() => () => {
+    connectorEditRequestRef.current += 1
+  }, [])
 
   useEffect(() => {
     if (open) {
       loadApps()
     }
   }, [open, debouncedSearch, activeCategory, activeLocation, activeStatus])
+
+  const openCustomApiEditor = async (serverId: number): Promise<boolean> => {
+    const requestId = connectorEditRequestRef.current + 1
+    connectorEditRequestRef.current = requestId
+
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/custom-apis/${serverId}`)
+      if (!response.ok) throw new Error(`Custom API detail request failed (${response.status})`)
+
+      const detail = parseCustomApiDetail(await response.json())
+      if (detail.id !== serverId) throw new Error("Custom API detail response ID mismatch")
+      if (requestId !== connectorEditRequestRef.current || !open) return false
+
+      const editState = customApiDetailToEditState(detail)
+      setSelectedApp(null)
+      setEditingCustomServerId(detail.id)
+      setCustomApiEditBaseline(detail)
+      setMcpEditBaseline(null)
+      setRuntimeValidationError(null)
+      setMcpFormData(editState.formData)
+      setCustomApiEnv(editState.env)
+      setActiveTab("custom_api")
+      return true
+    } catch (error) {
+      if (requestId !== connectorEditRequestRef.current || !open) return false
+      console.error("Failed to load Custom API detail:", error)
+      toast.error(t('tools.mcp.dialog.customApiDetailFetchError'))
+      return false
+    }
+  }
+
+  const openMcpServerEditor = async (serverId: number): Promise<boolean> => {
+    const requestId = connectorEditRequestRef.current + 1
+    connectorEditRequestRef.current = requestId
+
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/servers/${serverId}`)
+      if (!response.ok) throw new Error(`MCP server detail request failed (${response.status})`)
+
+      const detail = parseMcpServerDetail(await response.json())
+      if (detail.id !== serverId) throw new Error("MCP server detail response ID mismatch")
+      if (requestId !== connectorEditRequestRef.current || !open) return false
+
+      const editState = mcpServerDetailToEditState(detail)
+      setSelectedApp(null)
+      setEditingCustomServerId(detail.id)
+      setCustomApiEditBaseline(null)
+      setMcpEditBaseline(detail)
+      setRuntimeValidationError(null)
+      setMcpFormData(editState.formData)
+      setActiveTab("custom")
+      return true
+    } catch (error) {
+      if (requestId !== connectorEditRequestRef.current || !open) return false
+      console.error("Failed to load MCP server detail:", error)
+      toast.error(t('tools.mcp.dialog.mcpDetailFetchError'))
+      return false
+    }
+  }
 
   const handleSaveCustomMcp = async () => {
     if (!mcpFormData.name.trim()) {
@@ -170,23 +248,32 @@ export function ConnectMcpDialog({
       return;
     }
 
-    let payload = { ...mcpFormData };
+    const formPayload = { ...mcpFormData };
+    let payload: object = formPayload;
     let url = "";
     const method = editingCustomServerId ? 'PUT' : 'POST';
-    const connectorType = payload.transport === "custom_api" ? "custom_api" : "mcp";
-    const runtimeError = runtimeValidationError || getRuntimeConfigError(payload, connectorType);
+    const connectorType = formPayload.transport === "custom_api" ? "custom_api" : "mcp";
+    const runtimeError = runtimeValidationError || getRuntimeConfigError(formPayload, connectorType);
     if (runtimeError) {
       toast.error(t(runtimeError));
       return;
     }
 
-    if (payload.transport === "custom_api") {
+    if (formPayload.transport === "custom_api") {
       if (!mcpFormData.url?.trim()) {
         toast.error(t('tools.mcp.alerts.urlRequired'));
         return;
       }
 
-      const buildResult = buildCustomApiPayload(payload, customApiEnv);
+      if (editingCustomServerId && !customApiEditBaseline) {
+        toast.error(t('tools.mcp.dialog.customApiDetailFetchError'))
+        return
+      }
+      const buildResult = buildCustomApiPayload(
+        payload,
+        customApiEnv,
+        editingCustomServerId ? customApiEditBaseline ?? undefined : undefined,
+      );
       if (!buildResult.isValid) {
         toast.error(t(buildResult.errorKey || 'tools.mcp.alerts.atLeastOneSecret'));
         return;
@@ -214,6 +301,14 @@ export function ConnectMcpDialog({
     }
 
     // Regular MCP logic
+    if (editingCustomServerId && !mcpEditBaseline) {
+      toast.error(t('tools.mcp.dialog.mcpDetailFetchError'))
+      return
+    }
+    payload = buildMcpServerPayload(
+      formPayload,
+      editingCustomServerId ? mcpEditBaseline ?? undefined : undefined,
+    )
     setIsSavingCustom(true)
     try {
       url = editingCustomServerId
@@ -255,6 +350,8 @@ export function ConnectMcpDialog({
       }
 
       setEditingCustomServerId(null)
+      setCustomApiEditBaseline(null)
+      setMcpEditBaseline(null)
       setMcpFormData({ name: "", transport: "stdio", description: "", config: {}, user_env: {}, can_edit_global: true })
     } else {
       const error = await response.json()
@@ -397,44 +494,6 @@ export function ConnectMcpDialog({
     }, 500);
   }
 
-  const handleDisconnectApp = async (app: AppIntegration) => {
-    // Determine if it's a custom API or an MCP server
-    const isCustomApi = app.transport === 'custom_api' || app.is_custom;
-    const server = globalMcpServers.find(s =>
-      (s.name.toLowerCase() === app.id.toLowerCase() || s.name.toLowerCase() === app.name.toLowerCase()) &&
-      (isCustomApi ? s.transport === 'custom_api' : s.transport !== 'custom_api')
-    );
-
-    // For custom APIs, we might not have them in globalMcpServers since that fetches from /api/mcp/servers
-    // We should use app.server_id if available
-    const serverId = server ? server.id : app.server_id;
-
-    if (serverId) {
-      try {
-        const endpoint = isCustomApi
-          ? `${getApiUrl()}/api/custom-apis/${serverId}`
-          : `${getApiUrl()}/api/mcp/servers/${serverId}`;
-
-        const response = await apiRequest(endpoint, {
-          method: 'DELETE'
-        });
-        if (response.ok) {
-          toast.success(t('tools.mcp.dialog.disconnectSuccess', { name: app.name }));
-          if (onSuccess) onSuccess();
-          setSelectedApp(null);
-          // Reload apps to refresh the is_connected state visually
-          loadApps();
-        } else {
-          const err = await response.json();
-          toast.error(err.detail || "Failed to disconnect");
-        }
-      } catch (e) {
-        console.error(e);
-        toast.error("Failed to disconnect");
-      }
-    }
-  }
-
   const handleCardClick = (app: AppIntegration, isGloballyConnected: boolean) => {
     if (isSelectMode && isGloballyConnected) {
       setLocalSelectedServers(prev =>
@@ -457,6 +516,11 @@ export function ConnectMcpDialog({
     <Dialog
       open={open}
       onOpenChange={(nextOpen) => {
+        if (!nextOpen) {
+          connectorEditRequestRef.current += 1
+          setCustomApiEditBaseline(null)
+          setMcpEditBaseline(null)
+        }
         onOpenChange(nextOpen)
         if (!nextOpen) setRuntimeValidationError(null)
       }}
@@ -481,7 +545,10 @@ export function ConnectMcpDialog({
                 value="custom_api"
                 className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-blue-600 data-[state=active]:text-blue-600 rounded-none h-full px-0 font-semibold flex items-center gap-2 text-slate-500"
                 onClick={() => {
+                  connectorEditRequestRef.current += 1
                   setEditingCustomServerId(null)
+                  setCustomApiEditBaseline(null)
+                  setMcpEditBaseline(null)
                   setRuntimeValidationError(null)
                   setMcpFormData({
                     name: "",
@@ -498,11 +565,14 @@ export function ConnectMcpDialog({
                 value="custom"
                 className="data-[state=active]:bg-transparent data-[state=active]:shadow-none data-[state=active]:border-b-2 data-[state=active]:border-blue-600 data-[state=active]:text-blue-600 rounded-none h-full px-0 font-semibold flex items-center gap-2 text-slate-500"
                 onClick={(e) => {
+                  connectorEditRequestRef.current += 1
                   if (onConnectCustom) {
                     e.preventDefault()
                     onConnectCustom()
                   } else {
                     setEditingCustomServerId(null)
+                    setCustomApiEditBaseline(null)
+                    setMcpEditBaseline(null)
                     setRuntimeValidationError(null)
                     setMcpFormData({
                       name: "",
@@ -785,9 +855,7 @@ export function ConnectMcpDialog({
                   setCustomApiEnv={setCustomApiEnv}
                   onRuntimeValidationErrorChange={setRuntimeValidationError}
                   originalEnvObj={
-                    editingCustomServerId
-                      ? globalMcpServers.find(s => s.id === editingCustomServerId && s.transport === "custom_api")?.config?.env || {}
-                      : {}
+                    editingCustomServerId ? customApiEditBaseline?.env ?? {} : {}
                   }
                 />
               </div>
@@ -872,27 +940,13 @@ export function ConnectMcpDialog({
       {/* App Details Sub-Dialog */}
       <OfficialMcpSettingsDialog
         open={!!selectedApp}
-        onOpenChange={(open) => !open && setSelectedApp(null)}
-        app={(() => {
-          if (!selectedApp) return null;
-          // Find the actual server from globalMcpServers to get the real numeric ID
-          const isCustomApi = selectedApp.transport === 'custom_api' || selectedApp.is_custom;
-          const server = globalMcpServers.find(s =>
-            (s.name.toLowerCase() === selectedApp.id.toLowerCase() || s.name.toLowerCase() === selectedApp.name.toLowerCase()) &&
-            (isCustomApi ? s.transport === 'custom_api' : s.transport !== 'custom_api')
-          );
-
-          if (server) {
-            // Merge the server ID into the app object so the child dialog can use it for deletion
-            return {
-              ...selectedApp,
-              server_id: server.id,
-              server: server,
-              is_custom: server.transport !== 'oauth'
-            };
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) {
+            connectorEditRequestRef.current += 1
+            setSelectedApp(null)
           }
-          return selectedApp;
-        })()}
+        }}
+        app={selectedApp}
         isGloballyConnected={selectedApp ? isAppConnected(selectedApp) : false}
         onSuccess={() => {
           if (onSuccess) onSuccess();
@@ -918,56 +972,13 @@ export function ConnectMcpDialog({
           openKeyConnect(appToManage);
         }}
         onConfigure={(appToConfigure) => {
-          if (appToConfigure.is_custom && appToConfigure.server) {
-            setSelectedApp(null);
-            setEditingCustomServerId(appToConfigure.server.id);
-            setRuntimeValidationError(null);
-            setMcpFormData({
-              name: appToConfigure.server.name,
-              transport: appToConfigure.server.transport,
-              description: appToConfigure.server.description || "",
-              config: appToConfigure.server.config || {},
-              runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
-              runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
-              allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
-            });
-            if (appToConfigure.server.transport === "custom_api") {
-              const configObj = appToConfigure.server.config || {};
-              const envObj = configObj.env || {};
-              const envList = Object.entries(envObj).map(([k, v]) => ({ key: k, value: v as string }));
-              if (envList.length === 0) {
-                envList.push({ key: "", value: "" });
-              }
-              setCustomApiEnv(envList);
-
-              // Map url, method, headers to top level for form component since custom-api-form expects them there
-              setMcpFormData({
-                name: appToConfigure.server.name,
-                transport: "custom_api",
-                description: appToConfigure.server.description || "",
-                url: configObj.url || "",
-                method: configObj.method || "GET",
-                headers: configObj.headers || {},
-                body: configObj.body || "",
-                config: configObj,
-                runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
-                runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
-                allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
-              });
-            } else {
-              setMcpFormData({
-                name: appToConfigure.server.name,
-                transport: appToConfigure.server.transport,
-                description: appToConfigure.server.description || "",
-                config: appToConfigure.server.config || {},
-                user_env: appToConfigure.server.user_env || {},
-                can_edit_global: appToConfigure.server.can_edit_global ?? true,
-                runtime_input_schema: appToConfigure.server.runtime_input_schema ?? null,
-                runtime_bindings: appToConfigure.server.runtime_bindings ?? null,
-                allow_delegated_authorization: Boolean(appToConfigure.server.allow_delegated_authorization),
-              });
-            }
-            setActiveTab(appToConfigure.server.transport === "custom_api" ? "custom_api" : "custom");
+          if (!appToConfigure.is_custom || !Number.isInteger(appToConfigure.server_id)) {
+            return
+          }
+          if (appToConfigure.transport === "custom_api") {
+            void openCustomApiEditor(appToConfigure.server_id as number)
+          } else {
+            void openMcpServerEditor(appToConfigure.server_id as number)
           }
         }}
       />

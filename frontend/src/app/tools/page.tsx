@@ -1,6 +1,6 @@
 "use client"
 
-import { Suspense, useState, useEffect } from "react"
+import { Suspense, useState, useEffect, useRef } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import { Card, CardContent } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -50,7 +50,17 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useAuth } from "@/contexts/auth-context"
 import { useMcpApps } from "@/contexts/mcp-apps-context"
 import { toast } from "@/components/ui/sonner"
-import { isValidMcpName, buildCustomApiPayload } from "@/lib/mcp-utils"
+import {
+  isValidMcpName,
+  buildCustomApiPayload,
+  buildMcpServerPayload,
+  customApiDetailToEditState,
+  mcpServerDetailToEditState,
+  parseCustomApiDetail,
+  parseMcpServerDetail,
+  type CustomApiDetail,
+  type McpServerDetail,
+} from "@/lib/mcp-utils"
 
 interface Tool {
   name: string
@@ -151,6 +161,9 @@ function ToolsPageContent() {
   const [sqlFormSqlitePath, setSqlFormSqlitePath] = useState("")
   const [isSavingSql, setIsSavingSql] = useState(false)
   const [editingServer, setEditingServer] = useState<MCPServer | null>(null)
+  const [customApiEditBaseline, setCustomApiEditBaseline] = useState<CustomApiDetail | null>(null)
+  const [mcpEditBaseline, setMcpEditBaseline] = useState<McpServerDetail | null>(null)
+  const connectorEditRequestRef = useRef(0)
   const [searchQuery, setSearchQuery] = useState("")
   const [activeTab, setActiveTab] = useState<string>("all")
   const [mcpFormData, setMcpFormData] = useState<MCPServerFormData>({
@@ -434,11 +447,73 @@ function ToolsPageContent() {
     }
   }
 
-  const handleEditMcpServer = (server: MCPServer) => {
+  const openCustomApiEditor = async (server: MCPServer): Promise<boolean> => {
+    const requestId = connectorEditRequestRef.current + 1
+    connectorEditRequestRef.current = requestId
+
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/custom-apis/${server.id}`)
+      if (!response.ok) throw new Error(`Custom API detail request failed (${response.status})`)
+
+      const detail = parseCustomApiDetail(await response.json())
+      if (detail.id !== server.id) throw new Error("Custom API detail response ID mismatch")
+      if (requestId !== connectorEditRequestRef.current) return false
+
+      const editState = customApiDetailToEditState(detail)
+      setEditingServer(server)
+      setCustomApiEditBaseline(detail)
+      setMcpEditBaseline(null)
+      setRuntimeValidationError(null)
+      setMcpFormData(editState.formData)
+      setCustomApiEnv(editState.env)
+      setIsMcpDialogOpen(true)
+      return true
+    } catch (error) {
+      if (requestId !== connectorEditRequestRef.current) return false
+      console.error("Failed to load Custom API detail:", error)
+      toast.error(t('tools.mcp.dialog.customApiDetailFetchError'))
+      return false
+    }
+  }
+
+  const openMcpServerEditor = async (server: MCPServer): Promise<boolean> => {
+    const requestId = connectorEditRequestRef.current + 1
+    connectorEditRequestRef.current = requestId
+
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/servers/${server.id}`)
+      if (!response.ok) throw new Error(`MCP server detail request failed (${response.status})`)
+
+      const detail = parseMcpServerDetail(await response.json())
+      if (detail.id !== server.id) throw new Error("MCP server detail response ID mismatch")
+      if (requestId !== connectorEditRequestRef.current) return false
+
+      const editState = mcpServerDetailToEditState(detail)
+      setEditingServer(server)
+      setCustomApiEditBaseline(null)
+      setMcpEditBaseline(detail)
+      setRuntimeValidationError(null)
+      setMcpFormData(editState.formData)
+      setIsMcpDialogOpen(true)
+      return true
+    } catch (error) {
+      if (requestId !== connectorEditRequestRef.current) return false
+      console.error("Failed to load MCP server detail:", error)
+      toast.error(t('tools.mcp.dialog.mcpDetailFetchError'))
+      return false
+    }
+  }
+
+  useEffect(() => () => {
+    connectorEditRequestRef.current += 1
+  }, [])
+
+  const handleEditMcpServer = async (server: MCPServer) => {
     // Check if this is an official integration (from library)
     const isOfficial = server.transport === 'oauth'
 
     if (isOfficial) {
+      connectorEditRequestRef.current += 1
       const isGoogle = server.name.toLowerCase().includes('google') || server.name.toLowerCase() === 'gmail'
       const provider = server.provider || (isGoogle ? 'google' : 'linkedin')
 
@@ -466,44 +541,9 @@ function ToolsPageContent() {
       })
       setIsOfficialAppDialogOpen(true)
     } else if (server.transport === "custom_api") {
-      setEditingServer(server)
-      setRuntimeValidationError(null)
-      setMcpFormData({
-        name: server.name,
-        transport: server.transport,
-        description: server.description || "",
-        url: server.config?.url || "",
-        method: server.config?.method || "GET",
-        headers: server.config?.headers || {},
-        body: server.config?.body || "",
-        config: server.config || {},
-        runtime_input_schema: server.runtime_input_schema ?? null,
-        runtime_bindings: server.runtime_bindings ?? null,
-        allow_delegated_authorization: Boolean(server.allow_delegated_authorization),
-      })
-
-      const configObj = server.config || {};
-      const envObj = configObj.env || {};
-      const envList = Object.entries(envObj).map(([k, v]) => ({ key: k, value: v as string }));
-      if (envList.length === 0) {
-        envList.push({ key: "", value: "" });
-      }
-      setCustomApiEnv(envList);
-
-      setIsMcpDialogOpen(true)
+      await openCustomApiEditor(server)
     } else {
-      setEditingServer(server)
-      setRuntimeValidationError(null)
-      setMcpFormData({
-        name: server.name,
-        transport: server.transport,
-        description: server.description || "",
-        config: server.config || {},
-        runtime_input_schema: server.runtime_input_schema ?? null,
-        runtime_bindings: server.runtime_bindings ?? null,
-        allow_delegated_authorization: Boolean(server.allow_delegated_authorization),
-      })
-      setIsMcpDialogOpen(true)
+      await openMcpServerEditor(server)
     }
   }
 
@@ -531,12 +571,29 @@ function ToolsPageContent() {
         toast.error(t('tools.mcp.alerts.urlRequired'));
         return;
       }
-      const buildResult = buildCustomApiPayload(payload, customApiEnv);
+      if (editingServer && !customApiEditBaseline) {
+        toast.error(t('tools.mcp.dialog.customApiDetailFetchError'))
+        return
+      }
+      const buildResult = buildCustomApiPayload(
+        payload,
+        customApiEnv,
+        editingServer ? customApiEditBaseline ?? undefined : undefined,
+      );
       if (!buildResult.isValid) {
         toast.error(t(buildResult.errorKey || 'tools.mcp.alerts.atLeastOneSecret') || "At least one valid secret is required");
         return;
       }
       payload = buildResult.payload;
+    } else {
+      if (editingServer && !mcpEditBaseline) {
+        toast.error(t('tools.mcp.dialog.mcpDetailFetchError'))
+        return
+      }
+      payload = buildMcpServerPayload(
+        payload,
+        editingServer ? mcpEditBaseline ?? undefined : undefined,
+      )
     }
 
     setIsLoading(true)
@@ -921,7 +978,12 @@ function ToolsPageContent() {
             open={isMcpDialogOpen}
             onOpenChange={(nextOpen) => {
               setIsMcpDialogOpen(nextOpen)
-              if (!nextOpen) setRuntimeValidationError(null)
+              if (!nextOpen) {
+                connectorEditRequestRef.current += 1
+                setCustomApiEditBaseline(null)
+                setMcpEditBaseline(null)
+                setRuntimeValidationError(null)
+              }
             }}
           >
             <DialogContent className="max-w-2xl max-h-[80vh] overflow-y-auto">
@@ -943,22 +1005,7 @@ function ToolsPageContent() {
                       customApiEnv={customApiEnv}
                       setCustomApiEnv={setCustomApiEnv}
                       onRuntimeValidationErrorChange={setRuntimeValidationError}
-                      originalEnvObj={(() => {
-                        let originalEnvObj: Record<string, any> = {};
-                        if (editingServer?.config?.env) {
-                          if (typeof editingServer.config.env === 'string') {
-                            try {
-                              originalEnvObj = JSON.parse(editingServer.config.env);
-                            } catch (e) {
-                              console.error("Failed to parse env:", e);
-                              originalEnvObj = {};
-                            }
-                          } else {
-                            originalEnvObj = editingServer.config.env;
-                          }
-                        }
-                        return originalEnvObj;
-                      })()}
+                      originalEnvObj={customApiEditBaseline?.env ?? {}}
                     />
                   </>
                 ) : (
@@ -1307,59 +1354,18 @@ function ToolsPageContent() {
       <ConnectMcpDialog
         open={isConnectMcpOpen}
         onOpenChange={setIsConnectMcpOpen}
-        globalMcpServers={mcpServers}
         selectedMcpServers={[]} // No pre-selection logic on tools page
         onSuccess={loadMCPServers}
       />
       <OfficialMcpSettingsDialog
         open={isOfficialAppDialogOpen}
-        onOpenChange={setIsOfficialAppDialogOpen}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) connectorEditRequestRef.current += 1
+          setIsOfficialAppDialogOpen(nextOpen)
+        }}
         app={editingOfficialApp}
         isGloballyConnected={true} // In tools page, official apps are always already connected
         onSuccess={loadMCPServers}
-        onConfigure={(app) => {
-          if (app.is_custom && app.server) {
-            setIsOfficialAppDialogOpen(false);
-            setEditingServer(app.server);
-            setRuntimeValidationError(null);
-
-            if (app.server.transport === "custom_api") {
-              const configObj = app.server.config || {};
-              const envObj = configObj.env || {};
-              const envList = typeof envObj === 'object' && !Array.isArray(envObj)
-                ? Object.entries(envObj).map(([k, v]) => ({ key: k, value: v as string }))
-                : [];
-              if (envList.length === 0) {
-                envList.push({ key: "", value: "" });
-              }
-              setCustomApiEnv(envList);
-
-              setMcpFormData({
-                name: app.server.name,
-                transport: "custom_api",
-                description: app.server.description || "",
-                url: configObj.url || "",
-                method: configObj.method || "GET",
-                headers: configObj.headers || {},
-                config: configObj,
-                runtime_input_schema: app.server.runtime_input_schema ?? null,
-                runtime_bindings: app.server.runtime_bindings ?? null,
-                allow_delegated_authorization: Boolean(app.server.allow_delegated_authorization),
-              });
-            } else {
-              setMcpFormData({
-                name: app.server.name,
-                transport: app.server.transport,
-                description: app.server.description || "",
-                config: app.server.config || {},
-                runtime_input_schema: app.server.runtime_input_schema ?? null,
-                runtime_bindings: app.server.runtime_bindings ?? null,
-                allow_delegated_authorization: Boolean(app.server.allow_delegated_authorization),
-              });
-            }
-            setIsMcpDialogOpen(true);
-          }
-        }}
       />
     </div>
   )

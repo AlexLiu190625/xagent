@@ -2338,22 +2338,23 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           </div>
         </div>
       )}
-      <ConnectMcpDialog
-        open={isConnectMcpOpen}
-        onOpenChange={setIsConnectMcpOpen}
-        globalMcpServers={mcpServers}
-        selectedMcpServers={selectedMcpServers}
-        onConnectSelected={(selectedApps) => {
-          setSelectedMcpServers(selectedApps)
-        }}
-        onSuccess={() => {
-          refreshMcpApps().catch(console.error)
-          apiRequest(`${getApiUrl()}/api/mcp/servers`)
-            .then(res => res.json())
-            .then(data => setMcpServers(data || []))
-            .catch(console.error)
-        }}
-      />
+      {!readOnly && !loadingAgent && (
+        <ConnectMcpDialog
+          open={isConnectMcpOpen}
+          onOpenChange={setIsConnectMcpOpen}
+          selectedMcpServers={selectedMcpServers}
+          onConnectSelected={(selectedApps) => {
+            setSelectedMcpServers(selectedApps)
+          }}
+          onSuccess={() => {
+            refreshMcpApps().catch(console.error)
+            apiRequest(`${getApiUrl()}/api/mcp/servers`)
+              .then(res => res.json())
+              .then(data => setMcpServers(data || []))
+              .catch(console.error)
+          }}
+        />
+      )}
     </div>
   )
 }

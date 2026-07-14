@@ -92,7 +92,11 @@ vi.mock("@/components/build/agent-builder-chat", () => ({ AgentBuilderChat: () =
 vi.mock("@/components/kb/knowledge-base-creation-dialog", () => ({
   KnowledgeBaseCreationDialog: () => null,
 }))
-vi.mock("@/components/mcp/connect-mcp-dialog", () => ({ ConnectMcpDialog: () => null }))
+vi.mock("@/components/mcp/connect-mcp-dialog", () => ({
+  ConnectMcpDialog: ({ open }: { open: boolean }) => (
+    <output data-testid="connect-mcp-dialog">{String(open)}</output>
+  ),
+}))
 vi.mock("@/components/chat/FileMentionDropdown", () => ({ FileMentionDropdown: () => null }))
 vi.mock("@/hooks/use-file-mention", () => ({
   useFileMention: () => ({
@@ -220,6 +224,7 @@ describe("AgentBuilder admin cross-user MCP list", () => {
     const editor = container.querySelector('div[role="textbox"]')
     expect(editor).not.toBeNull()
     expect(editor).toHaveAttribute("contenteditable", "false")
+    expect(screen.queryByTestId("connect-mcp-dialog")).toBeNull()
   })
 
   it("does not fire the owner-scoped fetch if unmounted before the agent load resolves", async () => {

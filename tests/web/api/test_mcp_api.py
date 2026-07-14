@@ -5,6 +5,7 @@ Test MCP API endpoints and functions
 from unittest.mock import MagicMock
 
 import pytest
+from pydantic import ValidationError
 
 from xagent.web.api.mcp import (
     MCPServerCreate,
@@ -16,9 +17,12 @@ from xagent.web.api.mcp import (
     _global_config_tampered,
     _mask_env,
     _merge_masked_env,
+    get_mcp_servers,
     get_supported_transports,
 )
+from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.mcp import MCPServer
+from xagent.web.models.user import User
 
 
 class TestMCPServerModel:
@@ -415,6 +419,61 @@ class TestMCPApiFunctions:
         # Non-owner cannot edit the global fallback
         assert response.can_edit_global is False
 
+    def test_get_mcp_servers_projects_custom_api_runtime_configuration(self):
+        """The aggregate connector list must not lose Custom API runtime fields."""
+        runtime_input_schema = {
+            "context": {"account_id": {"type": "string", "required": True}}
+        }
+        runtime_bindings = [
+            {
+                "source": {"input_type": "context", "key": "account_id"},
+                "target": {"target_type": "headers", "key": "X-Account-ID"},
+            }
+        ]
+        api = CustomApi(
+            id=12,
+            name="accounts",
+            description="Account lookup",
+            url="https://api.example.com/accounts",
+            method="GET",
+            env={"API_KEY": "encrypted"},
+            runtime_input_schema=runtime_input_schema,
+            runtime_bindings=runtime_bindings,
+            allow_delegated_authorization=True,
+            created_at=None,
+            updated_at=None,
+        )
+        user_api = UserCustomApi(
+            user_id=7,
+            custom_api_id=12,
+            is_active=True,
+            is_default=False,
+        )
+
+        def query_result(rows):
+            query = MagicMock()
+            query.join.return_value = query
+            query.filter.return_value = query
+            query.order_by.return_value = query
+            query.all.return_value = rows
+            return query
+
+        db = MagicMock()
+        db.query.side_effect = [
+            query_result([]),
+            query_result([]),
+            query_result([(user_api, api)]),
+        ]
+
+        responses = get_mcp_servers(current_user=User(id=7), db=db)
+
+        assert len(responses) == 1
+        response = responses[0]
+        assert response.runtime_input_schema == runtime_input_schema
+        assert response.runtime_bindings == runtime_bindings
+        assert response.allow_delegated_authorization is True
+        assert response.config["env"] == {"API_KEY": "********"}
+
     def test_merge_masked_env_preserves_stored_secrets(self):
         """Masked values keep the stored secret; real values overwrite; new keys added."""
         merged = _merge_masked_env(
@@ -423,11 +482,10 @@ class TestMCPApiFunctions:
         )
         assert merged == {"API_KEY": "old-secret", "TOKEN": "new", "EXTRA": "x"}
 
-    def test_merge_masked_env_drops_masked_key_without_stored_value(self):
-        """A masked key with no stored value (e.g. renamed) is dropped, never None."""
-        merged = _merge_masked_env({"NEW": "********"}, {"OLD": "secret"})
-        assert merged == {}
-        assert None not in merged.values()
+    def test_merge_masked_env_rejects_masked_key_without_stored_value(self):
+        """A mask cannot be moved to a different key identity."""
+        with pytest.raises(ValueError, match="NEW"):
+            _merge_masked_env({"NEW": "********"}, {"OLD": "secret"})
 
     def test_check_mcp_permission(self):
         """Owner gates edit; owner-or-can_delete gates delete; admin bypasses."""
@@ -575,6 +633,11 @@ class TestMCPApiModels:
                 "command": "python",
                 "args": ["server.py"],
             },
+            "user_env": None,
+            "runtime_input_schema": None,
+            "runtime_bindings": None,
+            "allow_delegated_authorization": False,
+            "can_edit_global": True,
             "transport_display": "STDIO",
             "created_at": "2024-01-01T00:00:00",
             "updated_at": "2024-01-01T00:00:00",
@@ -587,6 +650,36 @@ class TestMCPApiModels:
         assert response.is_active is True
         assert response.config["command"] == "python"
         assert response.config["args"] == ["server.py"]
+
+    def test_mcp_server_response_requires_runtime_projection_fields(self):
+        """Mapper drift must fail validation instead of silently using defaults."""
+        response_data = {
+            "id": 1,
+            "user_id": 1,
+            "is_default": False,
+            "name": "test_server",
+            "transport": "stdio",
+            "description": None,
+            "is_active": True,
+            "config": {},
+            "transport_display": "STDIO",
+            "created_at": None,
+            "updated_at": None,
+        }
+
+        from xagent.web.api.mcp import MCPServerResponse
+
+        with pytest.raises(ValidationError) as exc_info:
+            MCPServerResponse(**response_data)
+
+        missing_fields = {error["loc"] for error in exc_info.value.errors()}
+        assert missing_fields == {
+            ("user_env",),
+            ("runtime_input_schema",),
+            ("runtime_bindings",),
+            ("allow_delegated_authorization",),
+            ("can_edit_global",),
+        }
 
     def test_mcp_connection_test_models(self):
         """Test MCP connection test models."""
