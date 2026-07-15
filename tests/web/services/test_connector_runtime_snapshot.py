@@ -607,6 +607,20 @@ def test_resolver_registration_rejects_empty_source_scope() -> None:
         )
 
 
+@pytest.mark.parametrize("task_source", [" external", "external ", "\texternal\n"])
+def test_resolver_registration_rejects_source_scope_with_surrounding_whitespace(
+    task_source: str,
+) -> None:
+    try:
+        with pytest.raises(ValueError, match="surrounding whitespace"):
+            set_connector_runtime_resolver_for_testing(
+                lambda request: request.values,
+                task_sources={task_source},
+            )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+
 def test_resolver_registration_copies_mutable_source_scope(
     db_session: Session,
 ) -> None:

@@ -156,6 +156,8 @@ def _normalize_resolver_task_sources(
         raise ValueError("task_sources must contain at least one source")
     if any(not isinstance(source, str) or not source for source in normalized):
         raise ValueError("task_sources must contain non-empty strings")
+    if any(source != source.strip() for source in normalized):
+        raise ValueError("task_sources must not contain surrounding whitespace")
     return normalized
 
 
@@ -408,6 +410,8 @@ def bind_create_connector_runtime_plan(
 ) -> None:
     """Validate and bind a create plan before the Task is persisted."""
 
+    # Keep this service-boundary assertion even when a caller derives the Task
+    # and plan from the same owner/source values.
     if (
         int(task.user_id) != plan.connector_user_id
         or _task_source(task) != plan.task_source
@@ -813,6 +817,8 @@ def _binding_missing_ephemeral_error_code(task: Task) -> str:
 
 def _require_task_runtime_owner(task: Task, *, expected_user_id: int | None) -> int:
     task_owner_user_id = int(task.user_id)
+    # ``Task.user_id`` remains the owner SSOT; the optional expected value is a
+    # defensive assertion for service callers that carry an independent owner.
     if expected_user_id is not None and int(expected_user_id) != task_owner_user_id:
         raise ConnectorRuntimeError(
             ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,

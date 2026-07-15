@@ -14,6 +14,7 @@ real :class:`TraceEvent` rows inserted directly into the test DB to
 drive the mapping.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -21,10 +22,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from fastapi import HTTPException
 
-from xagent.core.tools.adapters.vibe.connector_runtime import (
-    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-    ConnectorRuntimeError,
-)
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
 from xagent.web.models.agent import Agent
@@ -914,19 +911,19 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
     mock_start_task,
 ) -> None:
     agent_id, full_key = _create_agent_with_key()
+    prepare_runtime_plan = v1_tasks.prepare_create_connector_runtime
 
-    def reject_mismatched_identity(*, task, plan) -> None:
-        raise ConnectorRuntimeError(
-            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
-            "Connector runtime context is unavailable.",
-            details={"reason": "runtime_task_identity_mismatch"},
-            status_code=503,
+    def prepare_mismatched_identity(**kwargs):
+        plan = prepare_runtime_plan(**kwargs)
+        return replace(
+            plan,
+            connector_user_id=plan.connector_user_id + 1,
         )
 
     monkeypatch.setattr(
         v1_tasks,
-        "bind_create_connector_runtime_plan",
-        reject_mismatched_identity,
+        "prepare_create_connector_runtime",
+        prepare_mismatched_identity,
     )
 
     response = client.post(
