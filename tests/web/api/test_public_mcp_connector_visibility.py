@@ -1013,3 +1013,284 @@ def test_admin_list_apps_does_not_500_on_partial_launch_config_row() -> None:
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def test_admin_app_responses_derive_builtin_ownership() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "custom-owned",
+                "name": "Custom Owned",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "custom-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert created.status_code == 200
+        assert created.json()["is_builtin"] is False
+
+        listed = client.get("/api/admin/mcp/apps", headers=admin_headers)
+        assert listed.status_code == 200
+        apps = {app["app_id"]: app for app in listed.json()}
+        assert apps["gmail"]["is_builtin"] is True
+        assert apps["custom-owned"]["is_builtin"] is False
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("app_id", "renamed-gmail"),
+        ("name", "Renamed Gmail"),
+        ("transport", "stdio"),
+        ("provider_name", "wrong-provider"),
+        ("oauth_scopes", ["wrong-scope"]),
+        (
+            "launch_config",
+            {
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+                "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+            },
+        ),
+    ],
+)
+def test_admin_patch_rejects_builtin_execution_field_changes(
+    field: str, replacement: object
+) -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app_pk = app.id
+            before = {
+                column.name: getattr(app, column.name)
+                for column in PublicMCPApp.__table__.columns
+            }
+        finally:
+            db.close()
+
+        response = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={field: replacement},
+        )
+
+        assert response.status_code == 409
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            after = {
+                column.name: getattr(app, column.name)
+                for column in PublicMCPApp.__table__.columns
+            }
+            assert after == before
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_patch_allows_builtin_presentation_fields() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app_pk = app.id
+            original_launch_config = app.launch_config
+        finally:
+            db.close()
+
+        response = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "description": "Managed Gmail description",
+                "icon": "https://example.com/managed-gmail.png",
+                "category": "Managed Communication",
+                "is_visible_in_connector": False,
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["is_builtin"] is True
+        assert body["description"] == "Managed Gmail description"
+        assert body["icon"] == "https://example.com/managed-gmail.png"
+        assert body["category"] == "Managed Communication"
+        assert body["is_visible_in_connector"] is False
+        assert body["launch_config"] == original_launch_config
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_legacy_put_accepts_canonical_builtin_execution_fields() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp.id)
+                .filter(PublicMCPApp.app_id == "gmail")
+                .scalar()
+            )
+        finally:
+            db.close()
+        canonical = get_builtin_public_mcp_app("gmail")
+        assert canonical is not None
+        canonical["description"] = "Legacy client presentation update"
+
+        response = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json=canonical,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["is_builtin"] is True
+        assert response.json()["description"] == "Legacy client presentation update"
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_custom_patch_validates_merged_state_and_keeps_app_id_immutable() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "custom-patch",
+                "name": "Custom Patch",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "old-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        updated = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={
+                "launch_config": {
+                    "command": "new-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                }
+            },
+        )
+        assert updated.status_code == 200
+        assert updated.json()["launch_config"]["command"] == "new-command"
+        assert updated.json()["is_builtin"] is False
+
+        invalid = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"launch_config": {"command": "incomplete-command"}},
+        )
+        assert invalid.status_code == 422
+
+        renamed = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"app_id": "custom-patch-renamed"},
+        )
+        assert renamed.status_code == 409
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            db.delete(app)
+            db.commit()
+        finally:
+            db.close()
+        canonical = get_builtin_public_mcp_app("gmail")
+        assert canonical is not None
+
+        response = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json=canonical,
+        )
+
+        assert response.status_code == 409
+        db = next(get_db())
+        try:
+            assert (
+                db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
+                is None
+            )
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
