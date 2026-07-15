@@ -22,6 +22,7 @@ from .selection_spec import ToolSelectionSpec
 
 if TYPE_CHECKING:
     from .....sandbox.base import Sandbox
+    from .mcp_adapter import MCPServerLoadFailure
 
 logger = logging.getLogger(__name__)
 
@@ -514,14 +515,70 @@ class ToolFactory:
             return None
 
     @staticmethod
+    def _create_unavailable_mcp_tool(
+        *,
+        server_name: object,
+        server_id: object = None,
+        allow_users: object = None,
+        reason: object = None,
+        message: object = None,
+        failure_code: object = None,
+    ) -> Tool:
+        """Build the shared server-scoped unavailable MCP tool."""
+        from ....agent.result import normalize_tool_failure_code
+        from .mcp_adapter import UnavailableMCPTool
+
+        kwargs: Dict[str, Any] = {
+            "server_name": server_name if isinstance(server_name, str) else "",
+            "server_id": server_id,
+            "allow_users": allow_users if isinstance(allow_users, list) else None,
+            "failure_code": normalize_tool_failure_code(failure_code),
+        }
+        if isinstance(reason, str):
+            kwargs["reason"] = reason
+        if isinstance(message, str):
+            kwargs["message"] = message
+        return UnavailableMCPTool(**kwargs)
+
+    @classmethod
+    def _unavailable_mcp_tools_from_load_failures(
+        cls,
+        failures: Tuple["MCPServerLoadFailure", ...],
+        configs_by_name: Dict[str, Dict[str, Any]],
+    ) -> List[Tool]:
+        """Convert structured load failures to one unavailable tool per server."""
+        from .mcp_adapter import mcp_load_failure_message
+
+        tools: List[Tool] = []
+        seen_servers: set[str] = set()
+        for failure in failures:
+            if failure.server_name in seen_servers:
+                continue
+            seen_servers.add(failure.server_name)
+            config = configs_by_name.get(failure.server_name, {})
+            inner_config = config.get("config")
+            server_id = config.get("id")
+            if server_id is None and isinstance(inner_config, dict):
+                server_id = inner_config.get("server_id")
+            tools.append(
+                cls._create_unavailable_mcp_tool(
+                    server_name=failure.server_name,
+                    server_id=server_id,
+                    allow_users=config.get("allow_users"),
+                    reason=failure.phase.value,
+                    message=mcp_load_failure_message(failure.phase),
+                )
+            )
+        return tools
+
+    @staticmethod
     async def _create_mcp_tools_from_configs(
         mcp_configs: List[Dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
     ) -> List[Tool]:
         """Create MCP tools from configurations."""
         try:
-            from ....agent.result import normalize_tool_failure_code
-            from .mcp_adapter import UnavailableMCPTool, load_mcp_tools_as_agent_tools
+            from .mcp_adapter import load_mcp_tools_as_agent_tools
 
             unavailable_tools: List[Tool] = []
             normal_configs: List[Dict[str, Any]] = []
@@ -533,17 +590,13 @@ class ToolFactory:
                         server_name = config.get("name")
                         allow_users = config.get("allow_users")
                         unavailable_tools.append(
-                            UnavailableMCPTool(
-                                server_name=server_name
-                                if isinstance(server_name, str)
-                                else "",
+                            ToolFactory._create_unavailable_mcp_tool(
+                                server_name=server_name,
                                 server_id=inner_config.get("server_id"),
-                                allow_users=allow_users
-                                if isinstance(allow_users, list)
-                                else None,
-                                failure_code=normalize_tool_failure_code(
-                                    inner_config.get("failure_code")
-                                ),
+                                allow_users=allow_users,
+                                reason=inner_config.get("reason"),
+                                message=inner_config.get("message"),
+                                failure_code=inner_config.get("failure_code"),
                             )
                         )
                     except Exception as e:
@@ -557,20 +610,55 @@ class ToolFactory:
 
             normal_tools: List[Tool] = []
             if normal_configs:
+                connections: Dict[str, Any] = {}
+                configs_by_name: Dict[str, Dict[str, Any]] = {}
                 try:
                     # Convert configs to connection format
-                    connections = {}
-
                     for config in normal_configs:
                         inner_config = config.get("config")
                         if not isinstance(inner_config, dict):
-                            raise ValueError(
+                            logger.warning(
                                 "MCP server config 'config' field for server "
-                                f"'{config.get('name', '<unknown>')}' must be a "
-                                f"dictionary, got {type(inner_config).__name__}"
+                                "'%s' must be a dictionary, got %s",
+                                config.get("name", "<unknown>"),
+                                type(inner_config).__name__,
                             )
+                            unavailable_tools.append(
+                                ToolFactory._create_unavailable_mcp_tool(
+                                    server_name=config.get("name"),
+                                    server_id=config.get("id"),
+                                    allow_users=config.get("allow_users"),
+                                    reason="invalid_config",
+                                    message="MCP server configuration is unavailable.",
+                                )
+                            )
+                            continue
+                        server_name = config.get("name")
+                        if not isinstance(server_name, str):
+                            unavailable_tools.append(
+                                ToolFactory._create_unavailable_mcp_tool(
+                                    server_name=server_name,
+                                    server_id=config.get("id"),
+                                    allow_users=config.get("allow_users"),
+                                    reason="invalid_config",
+                                    message="MCP server configuration is unavailable.",
+                                )
+                            )
+                            continue
+                        transport = config.get("transport")
+                        if not isinstance(transport, str):
+                            unavailable_tools.append(
+                                ToolFactory._create_unavailable_mcp_tool(
+                                    server_name=server_name,
+                                    server_id=config.get("id"),
+                                    allow_users=config.get("allow_users"),
+                                    reason="invalid_config",
+                                    message="MCP server configuration is unavailable.",
+                                )
+                            )
+                            continue
                         connection_config = {
-                            "transport": config["transport"],
+                            "transport": transport,
                             **inner_config,
                         }
                         for runtime_key in (
@@ -603,18 +691,36 @@ class ToolFactory:
                                     "args"
                                 ].split()
 
-                        connections[config["name"]] = connection_config
+                        connections[server_name] = connection_config
+                        configs_by_name[server_name] = config
 
                     # Load MCP tools
-                    mcp_tools = await load_mcp_tools_as_agent_tools(
-                        connections,
-                        sandbox=sandbox,
-                    )  # type: ignore[arg-type]
-                    normal_tools = mcp_tools if mcp_tools else []  # type: ignore[assignment]
+                    if connections:
+                        load_result = await load_mcp_tools_as_agent_tools(
+                            connections,
+                            sandbox=sandbox,
+                        )  # type: ignore[arg-type]
+                        normal_tools = list(load_result.tools)
+                        unavailable_tools.extend(
+                            ToolFactory._unavailable_mcp_tools_from_load_failures(
+                                load_result.failures,
+                                configs_by_name,
+                            )
+                        )
                 except ConnectorRuntimeError:
                     raise
                 except Exception as e:
-                    logger.warning(f"Failed to create MCP tools: {e}")
+                    logger.warning("Failed to create MCP tools (%s)", type(e).__name__)
+                    for server_name, config in configs_by_name.items():
+                        unavailable_tools.append(
+                            ToolFactory._create_unavailable_mcp_tool(
+                                server_name=server_name,
+                                server_id=config.get("id"),
+                                allow_users=config.get("allow_users"),
+                                reason="loader_failed",
+                                message="MCP server tools could not be loaded.",
+                            )
+                        )
 
             return unavailable_tools + normal_tools
         except ConnectorRuntimeError:
@@ -654,37 +760,100 @@ class ToolFactory:
             shared_env_overrides = load_shared_env_overrides(db, user_id)
             env_source_overrides = load_user_env_sources(db, user_id)
 
-            connections = {}
+            connections: Dict[str, Any] = {}
+            configs_by_name: Dict[str, Dict[str, Any]] = {}
+            unavailable_tools: List[Tool] = []
             for server in query.all():
                 if isinstance(server, tuple):
                     server = server[0]
-                build = await build_mcp_runtime_connection(
-                    db,
-                    server,
-                    user_id=user_id,
-                    user_env_overrides=user_env_overrides,
-                    shared_env_overrides=shared_env_overrides,
-                    env_source_overrides=env_source_overrides,
-                )
+                try:
+                    build = await build_mcp_runtime_connection(
+                        db,
+                        server,
+                        user_id=user_id,
+                        user_env_overrides=user_env_overrides,
+                        shared_env_overrides=shared_env_overrides,
+                        env_source_overrides=env_source_overrides,
+                    )
+                except ConnectorRuntimeError:
+                    raise
+                except Exception as e:
+                    logger.warning(
+                        "MCP runtime connection build failed for server '%s' (%s)",
+                        getattr(server, "name", "<unknown>"),
+                        type(e).__name__,
+                    )
+                    unavailable_tools.append(
+                        cls._create_unavailable_mcp_tool(
+                            server_name=getattr(server, "name", ""),
+                            server_id=getattr(server, "id", None),
+                            allow_users=[str(user_id)] if user_id is not None else None,
+                            reason="runtime_connection_failed",
+                            message="MCP server configuration is unavailable.",
+                        )
+                    )
+                    continue
                 if build.connection is not None:
-                    connections[str(server.name)] = build.connection
+                    server_name = str(server.name)
+                    connections[server_name] = build.connection
+                    configs_by_name[server_name] = {
+                        "id": getattr(server, "id", None),
+                        "name": server_name,
+                        "allow_users": [str(user_id)] if user_id is not None else None,
+                    }
                     continue
                 diagnostic = build.diagnostic or {}
                 logger.warning(
-                    "Skipping MCP server '%s' in ToolFactory runtime build: %s",
+                    "MCP runtime connection unavailable for server '%s' (%s)",
                     getattr(server, "name", "<unknown>"),
-                    diagnostic.get("message", "runtime connection unavailable"),
+                    diagnostic.get("code", "runtime_connection_unavailable"),
+                )
+                unavailable_tools.append(
+                    cls._create_unavailable_mcp_tool(
+                        server_name=getattr(server, "name", ""),
+                        server_id=getattr(server, "id", None),
+                        allow_users=[str(user_id)] if user_id is not None else None,
+                        reason=diagnostic.get("code", "runtime_connection_unavailable"),
+                        message="MCP server configuration is unavailable.",
+                    )
                 )
 
             if not connections:
-                return []
+                return unavailable_tools
 
             # Load MCP tools
-            mcp_tools = await load_mcp_tools_as_agent_tools(connections)
+            try:
+                load_result = await load_mcp_tools_as_agent_tools(connections)
+            except ConnectorRuntimeError:
+                raise
+            except Exception as e:
+                logger.warning(
+                    "Failed to create MCP tools from database (%s)", type(e).__name__
+                )
+                unavailable_tools.extend(
+                    cls._create_unavailable_mcp_tool(
+                        server_name=server_name,
+                        server_id=config.get("id"),
+                        reason="loader_failed",
+                        message="MCP server tools could not be loaded.",
+                    )
+                    for server_name, config in configs_by_name.items()
+                )
+                return unavailable_tools
 
-            return mcp_tools
+            unavailable_tools.extend(
+                cls._unavailable_mcp_tools_from_load_failures(
+                    load_result.failures,
+                    configs_by_name,
+                )
+            )
+            return unavailable_tools + list(load_result.tools)
+        except ConnectorRuntimeError:
+            raise
         except Exception as e:
-            logger.warning(f"Failed to create MCP tools from database: {e}")
+            logger.warning(
+                "Failed to create MCP tools from database (%s)", type(e).__name__
+            )
             return []
 
     @classmethod

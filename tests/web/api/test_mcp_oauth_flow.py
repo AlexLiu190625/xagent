@@ -13,6 +13,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 from starlette.requests import Request
 
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPLoadResult,
+    MCPServerLoadFailure,
+)
 from xagent.core.utils.encryption import decrypt_value, encrypt_value
 from xagent.web.api import mcp as mcp_api
 from xagent.web.api.mcp import (
@@ -289,7 +294,13 @@ async def test_get_mcp_server_tools_injects_runtime_oauth_grant(
 
     async def fake_load_tools(connections, name_prefix):
         captured_connections.append(connections)
-        return [SimpleNamespace(name="search_records", description="Search records")]
+        return MCPLoadResult(
+            tools=(
+                SimpleNamespace(name="search_records", description="Search records"),
+            ),
+            loaded_servers=("records",),
+            failures=(),
+        )
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
@@ -302,6 +313,59 @@ async def test_get_mcp_server_tools_injects_runtime_oauth_grant(
     connection = captured_connections[0]["records"]
     assert connection["headers"]["Authorization"] == "Bearer runtime-token"
     assert connection["headers"]["X-Request-Source"] == "xagent"
+
+
+@pytest.mark.asyncio
+async def test_get_mcp_server_tools_reports_structured_runtime_failure(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server, client_id="client-123")
+    db.add(
+        MCPOAuthGrant(
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=f"xagent:user:{user.id}",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            access_token=encrypt_value("runtime-token"),
+            status="active",
+        )
+    )
+    db.commit()
+
+    async def failed_load(*args, **kwargs):
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="records",
+                    phase=MCPFailurePhase.LIST_TOOLS,
+                    error_type="BearerSecretError",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        failed_load,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        await get_mcp_server_tools(server.id, user, db)
+
+    assert exc_info.value.status_code == 502
+    assert exc_info.value.detail == {
+        "code": "mcp_tools_unavailable",
+        "message": "MCP server tools could not be loaded.",
+        "failures": [{"server_name": "records", "phase": "list_tools", "attempts": 1}],
+    }
+    assert "BearerSecretError" not in repr(exc_info.value.detail)
 
 
 @pytest.mark.asyncio

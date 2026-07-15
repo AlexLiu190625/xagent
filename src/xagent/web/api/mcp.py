@@ -194,6 +194,33 @@ class MCPConnectionTestResponse(BaseModel):
     details: Optional[dict] = None
 
 
+def _mcp_load_failure_response(
+    load_result: Any,
+) -> tuple[str, list[dict[str, Any]]]:
+    """Shape structured MCP load failures without exposing exception details."""
+    from ...core.tools.adapters.vibe.mcp_adapter import (
+        MCPFailurePhase,
+        MCPServerLoadFailure,
+        mcp_load_failure_message,
+    )
+
+    failures = [
+        failure
+        for failure in getattr(load_result, "failures", ())
+        if isinstance(failure, MCPServerLoadFailure)
+    ]
+    if not failures:
+        return mcp_load_failure_message(MCPFailurePhase.NO_TOOLS_RETURNED), []
+    return mcp_load_failure_message(failures[0].phase), [
+        {
+            "server_name": failure.server_name,
+            "phase": failure.phase.value,
+            "attempts": failure.attempts,
+        }
+        for failure in failures
+    ]
+
+
 class MCPOAuthDiscoverRequest(BaseModel):
     """Request model for MCP OAuth metadata discovery."""
 
@@ -2852,36 +2879,51 @@ async def test_mcp_connection(
 
         try:
             connections_dict: Dict[str, Any] = {"test": connection}
-            tools = await load_mcp_tools_as_agent_tools(
+            load_result = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix="test_"
             )
 
-            if tools:
+            if load_result.failures:
+                message, failures = _mcp_load_failure_response(load_result)
+                return MCPConnectionTestResponse(
+                    success=False,
+                    message=message,
+                    details={
+                        "tool_count": len(load_result.tools),
+                        "failures": failures,
+                    },
+                )
+            if load_result.tools:
                 return MCPConnectionTestResponse(
                     success=True,
-                    message=f"Successfully connected to {test_data.name}. Loaded {len(tools)} tools.",
-                    details={"tool_count": len(tools)},
+                    message=f"Successfully connected to {test_data.name}. Loaded {len(load_result.tools)} tools.",
+                    details={"tool_count": len(load_result.tools)},
                 )
-            else:
-                return MCPConnectionTestResponse(
-                    success=True,
-                    message=f"Connected to {test_data.name}, but no tools were loaded.",
-                    details={"tool_count": 0},
-                )
-
-        except Exception as conn_error:
+            message, failures = _mcp_load_failure_response(load_result)
             return MCPConnectionTestResponse(
                 success=False,
-                message=f"Failed to connect to {test_data.name}: {str(conn_error)}",
-                details={"error": str(conn_error)},
+                message=message,
+                details={"tool_count": 0, "failures": failures},
+            )
+
+        except Exception as conn_error:
+            logger.warning(
+                "MCP connection test failed for '%s' (%s)",
+                test_data.name,
+                type(conn_error).__name__,
+            )
+            return MCPConnectionTestResponse(
+                success=False,
+                message=f"Failed to connect to {test_data.name}.",
+                details={"error": "mcp_connection_test_failed"},
             )
 
     except Exception as e:
-        logger.error(f"Failed to test MCP connection: {e}")
+        logger.error("Failed to test MCP connection (%s)", type(e).__name__)
         return MCPConnectionTestResponse(
             success=False,
-            message=f"Connection test failed: {str(e)}",
-            details={"error": str(e)},
+            message="Connection test failed.",
+            details={"error": "mcp_connection_test_failed"},
         )
 
 
@@ -3039,15 +3081,24 @@ async def get_mcp_server_tools(
         tools: List[Any] = []
         if isinstance(server_name, str):
             connections_dict: Dict[str, Any] = {server_name: connection}
-            tools = await load_mcp_tools_as_agent_tools(
+            load_result = await load_mcp_tools_as_agent_tools(
                 connections_dict, name_prefix=f"server_{server_id}_"
             )
-
-        tools_list: List[Any] = tools if isinstance(tools, list) else []
+            if load_result.failures or not load_result.tools:
+                message, failures = _mcp_load_failure_response(load_result)
+                raise HTTPException(
+                    status_code=status.HTTP_502_BAD_GATEWAY,
+                    detail={
+                        "code": "mcp_tools_unavailable",
+                        "message": message,
+                        "failures": failures,
+                    },
+                )
+            tools = list(load_result.tools)
 
         return {
             "server_name": server.name,
-            "tool_count": len(tools_list),
+            "tool_count": len(tools),
             "tools": [
                 {
                     "name": getattr(tool, "name", str(tool)),
@@ -3055,14 +3106,14 @@ async def get_mcp_server_tools(
                         tool, "description", "No description available"
                     ),
                 }
-                for tool in tools_list
+                for tool in tools
             ],
         }
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Failed to get MCP server tools: {e}")
+        logger.error("Failed to get MCP server tools (%s)", type(e).__name__)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to get MCP server tools",

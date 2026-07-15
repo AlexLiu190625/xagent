@@ -76,5 +76,5 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     except ConnectorRuntimeError:
         raise
     except Exception as e:
-        logger.warning(f"Failed to create MCP tools: {e}")
+        logger.warning("Failed to create MCP tools (%s)", type(e).__name__)
         return []

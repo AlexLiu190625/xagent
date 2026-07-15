@@ -7,7 +7,13 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPLoadResult,
+    MCPServerLoadFailure,
+)
 from xagent.web.api.mcp import (
+    MCPConnectionTest,
     MCPServerCreate,
     MCPServerUpdate,
     _auth_metadata_tampered,
@@ -19,10 +25,99 @@ from xagent.web.api.mcp import (
     _merge_masked_env,
     get_mcp_servers,
     get_supported_transports,
+    test_mcp_connection as run_mcp_connection_test,
 )
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.user import User
+
+
+@pytest.mark.asyncio
+async def test_connection_test_reports_successful_structured_load(monkeypatch):
+    tool = MagicMock()
+
+    async def load_tools(*args, **kwargs):
+        return MCPLoadResult(tools=(tool,), loaded_servers=("test",), failures=())
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        load_tools,
+    )
+
+    response = await run_mcp_connection_test(
+        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MagicMock(),
+    )
+
+    assert response.success is True
+    assert response.details == {"tool_count": 1}
+
+
+@pytest.mark.asyncio
+async def test_connection_test_reports_structured_load_failure_without_exception_text(
+    monkeypatch,
+):
+    async def load_tools(*args, **kwargs):
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="test",
+                    phase=MCPFailurePhase.INITIALIZE,
+                    error_type="BearerSecretError",
+                    attempts=3,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        load_tools,
+    )
+
+    response = await run_mcp_connection_test(
+        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MagicMock(),
+    )
+
+    assert response.success is False
+    assert response.message == "MCP server initialization failed."
+    assert response.details == {
+        "tool_count": 0,
+        "failures": [{"server_name": "test", "phase": "initialize", "attempts": 3}],
+    }
+    assert "BearerSecretError" not in repr(response)
+
+
+@pytest.mark.asyncio
+async def test_connection_test_reports_no_tools_as_failure(monkeypatch):
+    async def load_tools(*args, **kwargs):
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="test",
+                    phase=MCPFailurePhase.NO_TOOLS_RETURNED,
+                    error_type=None,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        load_tools,
+    )
+
+    response = await run_mcp_connection_test(
+        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MagicMock(),
+    )
+
+    assert response.success is False
+    assert response.message == "MCP server returned no available tools."
+    assert response.details["tool_count"] == 0
 
 
 class TestMCPServerModel:

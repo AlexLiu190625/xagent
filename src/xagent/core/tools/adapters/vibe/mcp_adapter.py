@@ -51,6 +51,25 @@ class MCPFailurePhase(str, Enum):
     NO_TOOLS_RETURNED = "no_tools_returned"
 
 
+_DEFAULT_UNAVAILABLE_MCP_MESSAGE = "MCP server credentials are unavailable."
+_MCP_LOAD_FAILURE_MESSAGES: dict[MCPFailurePhase, str] = {
+    MCPFailurePhase.SESSION_START: "MCP server could not be started.",
+    MCPFailurePhase.INITIALIZE: "MCP server initialization failed.",
+    MCPFailurePhase.LIST_TOOLS: "MCP server tools could not be loaded.",
+    MCPFailurePhase.ADAPTER_CONSTRUCTION: (
+        "Some MCP server tools could not be prepared."
+    ),
+    MCPFailurePhase.SANDBOX_LIST_TOOLS: "MCP server tools could not be loaded.",
+    MCPFailurePhase.SANDBOX_TOOL_WRAP: ("Some MCP server tools could not be prepared."),
+    MCPFailurePhase.NO_TOOLS_RETURNED: "MCP server returned no available tools.",
+}
+
+
+def mcp_load_failure_message(phase: MCPFailurePhase) -> str:
+    """Return the public-safe message owned by an MCP load failure phase."""
+    return _MCP_LOAD_FAILURE_MESSAGES[phase]
+
+
 @dataclass(frozen=True)
 class MCPServerLoadFailure:
     """Safe MCP load failure data that excludes raw exception details."""
@@ -946,6 +965,9 @@ class _UnavailableMCPToolResult(BaseModel):
     failure_code: str | None = Field(
         default=None, description="Allowlisted public tool failure classification"
     )
+    reason: str | None = Field(
+        default=None, description="Public-safe MCP unavailability reason"
+    )
     content: List[Dict[str, Any]] = Field(
         default_factory=list, description="Tool execution result content"
     )
@@ -956,7 +978,7 @@ class _UnavailableMCPToolResult(BaseModel):
 
 
 class UnavailableMCPTool(AbstractBaseTool):
-    """Server-level MCP tool returned when credentials are unavailable."""
+    """Server-level MCP tool returned when a selected server is unavailable."""
 
     read_only = True
     concurrency_safe = True
@@ -968,6 +990,8 @@ class UnavailableMCPTool(AbstractBaseTool):
         server_id: Any | None,
         allow_users: Optional[List[str]] = None,
         failure_code: str | None = None,
+        reason: str | None = None,
+        message: str = _DEFAULT_UNAVAILABLE_MCP_MESSAGE,
     ) -> None:
         from ....agent.result import normalize_tool_failure_code
         from .base import ToolCategory
@@ -977,6 +1001,8 @@ class UnavailableMCPTool(AbstractBaseTool):
         self._server_id = server_id
         self._allow_users = allow_users
         self._failure_code = normalize_tool_failure_code(failure_code)
+        self._reason = reason
+        self._message = message
         self._name = _format_unavailable_mcp_tool_name(server_name, server_id)
         self.source_server = normalize_mcp_server_name(server_name)
         self.category = ToolCategory.MCP
@@ -987,7 +1013,7 @@ class UnavailableMCPTool(AbstractBaseTool):
 
     @property
     def description(self) -> str:
-        return "MCP server credentials are unavailable."
+        return self._message
 
     @property
     def tags(self) -> List[str]:
@@ -1006,20 +1032,21 @@ class UnavailableMCPTool(AbstractBaseTool):
         current_user_id = _get_current_mcp_user_id()
         if not _is_mcp_user_allowed(current_user_id, self._allow_users):
             return _mcp_access_denied_result(current_user_id, self.name)
+        content_message = self._message
+        if self._message == _DEFAULT_UNAVAILABLE_MCP_MESSAGE:
+            content_message = (
+                "MCP server credentials are unavailable. Please reconnect "
+                "the MCP server credentials and retry."
+            )
         result: Dict[str, Any] = {
             "success": False,
             "status": "error",
-            "error": "MCP server credentials are unavailable.",
-            "content": [
-                {
-                    "text": (
-                        "MCP server credentials are unavailable. Please reconnect "
-                        "the MCP server credentials and retry."
-                    )
-                }
-            ],
+            "error": self._message,
+            "content": [{"text": content_message}],
             "is_error": True,
         }
+        if self._reason is not None:
+            result["reason"] = self._reason
         if self._failure_code is not None:
             result["failure_code"] = self._failure_code
         return result

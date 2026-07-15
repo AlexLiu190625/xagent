@@ -12,6 +12,9 @@ from xagent.core.tools.adapters.vibe.base import ToolCategory
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPLoadResult,
+    MCPServerLoadFailure,
     MCPToolAdapter,
     UnavailableMCPTool,
 )
@@ -24,12 +27,21 @@ def _unavailable_tool(
     server_id: int | None = 42,
     allow_users: list[str] | None = None,
     failure_code: str | None = None,
+    reason: str | None = None,
+    message: str | None = None,
 ) -> UnavailableMCPTool:
+    kwargs: dict[str, Any] = {
+        "server_name": server_name,
+        "server_id": server_id,
+        "allow_users": allow_users,
+        "failure_code": failure_code,
+    }
+    if reason is not None:
+        kwargs["reason"] = reason
+    if message is not None:
+        kwargs["message"] = message
     return UnavailableMCPTool(
-        server_name=server_name,
-        server_id=server_id,
-        allow_users=allow_users,
-        failure_code=failure_code,
+        **kwargs,
     )
 
 
@@ -127,6 +139,46 @@ async def test_unavailable_tool_authorized_returns_classified_failure(monkeypatc
             }
         ],
     }
+
+
+@pytest.mark.asyncio
+async def test_unavailable_tool_accepts_public_runtime_reason_and_message(monkeypatch):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    tool = _unavailable_tool(
+        allow_users=["7"],
+        reason="initialize",
+        message="MCP server initialization failed.",
+    )
+
+    result = await tool.run_json_async({})
+
+    assert tool.description == "MCP server initialization failed."
+    assert result == {
+        "success": False,
+        "status": "error",
+        "is_error": True,
+        "error": "MCP server initialization failed.",
+        "reason": "initialize",
+        "content": [{"text": "MCP server initialization failed."}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("reason", "message"),
+    [
+        ("session_start", "MCP server could not be started."),
+        ("initialize", "MCP server initialization failed."),
+        ("list_tools", "MCP server tools could not be loaded."),
+    ],
+)
+def test_unavailable_tool_supports_public_load_phase_messages(reason, message):
+    tool = _unavailable_tool(reason=reason, message=message)
+
+    result = tool.run_json_sync({})
+
+    assert result["reason"] == reason
+    assert result["error"] == message
+    assert result["content"] == [{"text": message}]
 
 
 def test_unavailable_tool_sync_authorized_returns_clean_error(monkeypatch):
@@ -348,7 +400,161 @@ async def test_factory_normal_loader_failure_keeps_unavailable_tool(monkeypatch)
         ]
     )
 
-    assert [tool.name for tool in tools] == ["mcp_google_drive_42_unavailable"]
+    assert [tool.name for tool in tools] == [
+        "mcp_google_drive_42_unavailable",
+        "mcp_normal_unavailable",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_factory_keeps_successful_tools_and_exposes_each_failed_server(
+    monkeypatch,
+):
+    monkeypatch.setenv("XAGENT_USER_ID", "7")
+    healthy_tool = _unavailable_tool(server_name="Healthy result", server_id=99)
+
+    async def loader(connections, **kwargs):
+        return MCPLoadResult(
+            tools=(healthy_tool,),
+            loaded_servers=("healthy",),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="broken",
+                    phase=MCPFailurePhase.INITIALIZE,
+                    error_type="RuntimeError",
+                    attempts=3,
+                ),
+                MCPServerLoadFailure(
+                    server_name="partial",
+                    phase=MCPFailurePhase.ADAPTER_CONSTRUCTION,
+                    error_type="ValidationError",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        loader,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "id": 11,
+                "name": "healthy",
+                "transport": "stdio",
+                "config": {"command": "echo"},
+                "allow_users": ["7"],
+            },
+            {
+                "id": 12,
+                "name": "broken",
+                "transport": "stdio",
+                "config": {"command": "echo"},
+                "allow_users": ["7"],
+            },
+            {
+                "id": 13,
+                "name": "partial",
+                "transport": "stdio",
+                "config": {"command": "echo"},
+                "allow_users": ["7"],
+            },
+        ]
+    )
+
+    assert [tool.name for tool in tools] == [
+        "mcp_broken_12_unavailable",
+        "mcp_partial_13_unavailable",
+        "mcp_healthy_result_99_unavailable",
+    ]
+    broken = tools[0].run_json_sync({})
+    partial = tools[1].run_json_sync({})
+    assert broken["reason"] == "initialize"
+    assert broken["error"] == "MCP server initialization failed."
+    assert partial["reason"] == "adapter_construction"
+    assert partial["error"] == "Some MCP server tools could not be prepared."
+    public_result = repr(broken) + repr(partial)
+    assert "RuntimeError" not in public_result
+    assert "ValidationError" not in public_result
+
+
+@pytest.mark.asyncio
+async def test_factory_partial_failures_create_only_one_unavailable_tool_per_server(
+    monkeypatch,
+):
+    async def loader(connections, **kwargs):
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="partial",
+                    phase=MCPFailurePhase.ADAPTER_CONSTRUCTION,
+                    error_type="FirstError",
+                ),
+                MCPServerLoadFailure(
+                    server_name="partial",
+                    phase=MCPFailurePhase.SANDBOX_TOOL_WRAP,
+                    error_type="SecondError",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        loader,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "id": 13,
+                "name": "partial",
+                "transport": "stdio",
+                "config": {"command": "echo"},
+            }
+        ]
+    )
+
+    assert [tool.name for tool in tools] == ["mcp_partial_13_unavailable"]
+
+
+@pytest.mark.asyncio
+async def test_factory_exposes_server_returning_no_tools(monkeypatch):
+    async def loader(connections, **kwargs):
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="empty",
+                    phase=MCPFailurePhase.NO_TOOLS_RETURNED,
+                    error_type=None,
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        loader,
+    )
+
+    tools = await ToolFactory._create_mcp_tools_from_configs(
+        [
+            {
+                "id": 14,
+                "name": "empty",
+                "transport": "stdio",
+                "config": {"command": "echo"},
+            }
+        ]
+    )
+
+    assert [tool.name for tool in tools] == ["mcp_empty_14_unavailable"]
+    result = tools[0].run_json_sync({})
+    assert result["reason"] == "no_tools_returned"
+    assert result["error"] == "MCP server returned no available tools."
 
 
 @pytest.mark.asyncio
@@ -362,7 +568,10 @@ async def test_factory_malformed_normal_config_keeps_unavailable_tool(caplog):
         ]
     )
 
-    assert [tool.name for tool in tools] == ["mcp_google_drive_42_unavailable"]
+    assert [tool.name for tool in tools] == [
+        "mcp_google_drive_42_unavailable",
+        "mcp_normal_unavailable",
+    ]
     assert "MCP server config 'config' field for server 'normal'" in caplog.text
     assert "dictionary, got NoneType" in caplog.text
 
@@ -374,7 +583,7 @@ async def test_factory_does_not_pass_unavailable_config_to_normal_loader(monkeyp
     async def loader(connections, **kwargs):
         nonlocal seen_connections
         seen_connections = connections
-        return []
+        return MCPLoadResult(tools=(), loaded_servers=(), failures=())
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
@@ -404,7 +613,7 @@ async def test_factory_preserves_runtime_keys_for_normal_configs(monkeypatch):
     async def loader(connections, **kwargs):
         nonlocal seen_connections
         seen_connections = connections
-        return []
+        return MCPLoadResult(tools=(), loaded_servers=(), failures=())
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
@@ -464,7 +673,9 @@ async def test_factory_returns_unavailable_tools_before_normal_tools(monkeypatch
     normal_tool = _unavailable_tool(server_name="Normal", server_id=99)
 
     async def loader(connections, **kwargs):
-        return [normal_tool]
+        return MCPLoadResult(
+            tools=(normal_tool,), loaded_servers=("normal",), failures=()
+        )
 
     monkeypatch.setattr(
         "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
