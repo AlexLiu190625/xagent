@@ -33,11 +33,11 @@ from ...core.model.chat.basic.openai import OpenAILLM
 from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
-from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ...core.tools.adapters.vibe.config import (
     MCPFailurePolicy,
     RequiredMCPUnavailableError,
 )
+from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ...core.workspace import scoped_user_root
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store

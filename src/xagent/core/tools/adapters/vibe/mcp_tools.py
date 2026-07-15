@@ -3,8 +3,6 @@
 import logging
 from typing import TYPE_CHECKING, Any, List
 
-from .connector_runtime import ConnectorRuntimeError
-from .factory import register_tool
 from .config import (
     MCPConfigLoadError,
     MCPFailurePolicy,
@@ -12,6 +10,8 @@ from .config import (
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
 )
+from .connector_runtime import ConnectorRuntimeError
+from .factory import register_tool
 
 if TYPE_CHECKING:
     from .config import BaseToolConfig
@@ -120,11 +120,13 @@ def _build_mcp_load_summary(
     emitted_failure_keys: set[str] = set()
     for name in requested:
         key = normalize_mcp_server_name(name)
-        failure = failures_by_key.get(key)
-        if failure is None and key not in loaded_keys:
-            failure = MCPUnavailableSummary.from_values(name, "no_tools_returned")
-        if failure is not None and key not in emitted_failure_keys:
-            failures.append(failure)
+        requested_failure = failures_by_key.get(key)
+        if requested_failure is None and key not in loaded_keys:
+            requested_failure = MCPUnavailableSummary.from_values(
+                name, "no_tools_returned"
+            )
+        if requested_failure is not None and key not in emitted_failure_keys:
+            failures.append(requested_failure)
             emitted_failure_keys.add(key)
 
     for key, failure in failures_by_key.items():

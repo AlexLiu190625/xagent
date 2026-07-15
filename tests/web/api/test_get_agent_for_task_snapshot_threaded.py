@@ -32,8 +32,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
+from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_setup_snapshot import (

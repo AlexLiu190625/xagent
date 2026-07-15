@@ -12,7 +12,6 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-
 MIGRATION_PATH = (
     Path(__file__).parent.parent.parent
     / "src/xagent/migrations/versions/20260715_normalize_builtin_mcp_launch.py"

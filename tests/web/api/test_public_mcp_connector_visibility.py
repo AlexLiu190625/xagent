@@ -3,13 +3,18 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 import xagent.web.api.mcp as mcp_api
-from xagent.web.api.admin_mcp import admin_mcp_router
+from xagent.web.api.admin_mcp import (
+    _commit_public_mcp_app_write,
+    admin_mcp_router,
+)
 from xagent.web.api.auth import (
     AppNotOAuthError,
     _ensure_user_mcp_server,
@@ -73,6 +78,34 @@ def _login(username: str, password: str) -> dict[str, str]:
     )
     assert response.status_code == 200
     return {"Authorization": f"Bearer {response.json()['access_token']}"}
+
+
+def test_public_mcp_write_commit_rolls_back_and_preserves_failure() -> None:
+    db = Mock()
+    failure = RuntimeError("commit failed")
+    db.commit.side_effect = failure
+
+    with pytest.raises(RuntimeError) as caught:
+        _commit_public_mcp_app_write(db)
+
+    assert caught.value is failure
+    db.rollback.assert_called_once_with()
+
+
+def test_public_mcp_create_commit_maps_integrity_error_after_rollback() -> None:
+    db = Mock()
+    db.commit.side_effect = IntegrityError(
+        "INSERT INTO public_mcp_apps ...",
+        {},
+        RuntimeError("duplicate app_id"),
+    )
+
+    with pytest.raises(HTTPException) as caught:
+        _commit_public_mcp_app_write(db, integrity_error_detail="App already exists")
+
+    assert caught.value.status_code == 400
+    assert caught.value.detail == "App already exists"
+    db.rollback.assert_called_once_with()
 
 
 def _create_public_app(

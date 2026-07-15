@@ -170,6 +170,24 @@ def _record_public_mcp_app_audit(
     )
 
 
+def _commit_public_mcp_app_write(
+    db: Session,
+    *,
+    integrity_error_detail: str | None = None,
+) -> None:
+    """Commit one catalog write and always restore the session on failure."""
+    try:
+        db.commit()
+    except Exception as error:
+        db.rollback()
+        if integrity_error_detail is not None and isinstance(error, IntegrityError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=integrity_error_detail,
+            ) from None
+        raise
+
+
 def _public_mcp_app_response(app: PublicMCPApp) -> Dict[str, Any]:
     return {
         "id": app.id,
@@ -405,11 +423,7 @@ async def create_app(
         before_values=None,
         after_values=_public_mcp_app_values(db_app),
     )
-    try:
-        db.commit()
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(status_code=400, detail="App already exists") from None
+    _commit_public_mcp_app_write(db, integrity_error_detail="App already exists")
     db.refresh(db_app)
     return _public_mcp_app_response(db_app)
 
@@ -440,7 +454,7 @@ async def update_app(
             after_values=_public_mcp_app_values(db_app),
         )
 
-    db.commit()
+    _commit_public_mcp_app_write(db)
     db.refresh(db_app)
     return _public_mcp_app_response(db_app)
 
@@ -471,7 +485,7 @@ async def patch_app(
             after_values=_public_mcp_app_values(db_app),
         )
 
-    db.commit()
+    _commit_public_mcp_app_write(db)
     db.refresh(db_app)
     return _public_mcp_app_response(db_app)
 
@@ -502,5 +516,5 @@ async def delete_app(
         after_values=None,
     )
     db.delete(db_app)
-    db.commit()
+    _commit_public_mcp_app_write(db)
     return {"success": True}

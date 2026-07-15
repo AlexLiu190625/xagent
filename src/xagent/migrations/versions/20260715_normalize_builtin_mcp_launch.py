@@ -12,7 +12,6 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-
 revision: str = "20260715_normalize_builtin_mcp_launch"
 down_revision: Union[str, None] = "20260713_add_agent_visibility"
 branch_labels: Union[str, Sequence[str], None] = None

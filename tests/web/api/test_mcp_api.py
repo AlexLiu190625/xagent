@@ -25,8 +25,8 @@ from xagent.web.api.mcp import (
     _merge_masked_env,
     get_mcp_servers,
     get_supported_transports,
-    test_mcp_connection as run_mcp_connection_test,
 )
+from xagent.web.api.mcp import test_mcp_connection as run_mcp_connection_test
 from xagent.web.models.custom_api import CustomApi, UserCustomApi
 from xagent.web.models.mcp import MCPServer
 from xagent.web.models.user import User

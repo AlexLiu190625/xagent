@@ -2080,9 +2080,14 @@ class WebToolConfig(BaseToolConfig):
                         if runtime_build.diagnostic is not None:
                             self._mcp_oauth_diagnostics.append(runtime_build.diagnostic)
                         diagnostic = runtime_build.diagnostic
-                        reason = (
+                        diagnostic_code = (
                             diagnostic.get("code")
                             if isinstance(diagnostic, Mapping)
+                            else None
+                        )
+                        reason = (
+                            diagnostic_code
+                            if isinstance(diagnostic_code, str)
                             else "runtime_connection_failed"
                         )
                         return self._build_unavailable_mcp_config(

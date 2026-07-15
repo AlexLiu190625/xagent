@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent
 from xagent.web.models.task import (
@@ -16,7 +17,6 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
-from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 
 
 class TestAgentServiceManagerReconstruction:

@@ -9,7 +9,6 @@ import sqlalchemy as sa
 from alembic.migration import MigrationContext
 from alembic.operations import Operations
 
-
 MIGRATION_PATH = (
     Path(__file__).parent.parent.parent
     / "src/xagent/migrations/versions/20260715_add_public_mcp_app_audits.py"
@@ -137,6 +136,31 @@ def test_online_upgrade_is_idempotent_when_table_already_exists() -> None:
         inspector = sa.inspect(connection)
         assert TABLE in inspector.get_table_names()
         assert {index["name"] for index in inspector.get_indexes(TABLE)} == INDEXES
+
+
+def test_online_upgrade_skips_until_sqlalchemy_base_users_table_exists() -> None:
+    from xagent.web import models as _models  # noqa: F401
+    from xagent.web.models.database import Base
+
+    migration = _load_migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+
+    with engine.begin() as connection:
+        operations = _operations(connection)
+        with Operations.context(operations.get_context()):
+            migration.upgrade()
+
+        assert TABLE not in sa.inspect(connection).get_table_names()
+
+        Base.metadata.create_all(connection)
+        inspector = sa.inspect(connection)
+        assert TABLE in inspector.get_table_names()
+        foreign_keys = inspector.get_foreign_keys(TABLE)
+        assert len(foreign_keys) == 1
+        assert foreign_keys[0]["referred_table"] == "users"
+
+        with Operations.context(operations.get_context()):
+            migration.downgrade()
 
 
 @pytest.mark.parametrize("dialect_name", ["sqlite", "postgresql", "mysql"])

@@ -5,11 +5,11 @@ import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from xagent.core.tools.adapters.vibe.config import MCPConfigLoadError
 from xagent.core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
 )
-from xagent.core.tools.adapters.vibe.config import MCPConfigLoadError
 from xagent.web.tools.config import WebToolConfig
 
 

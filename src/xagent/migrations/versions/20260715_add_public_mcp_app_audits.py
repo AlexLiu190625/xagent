@@ -11,7 +11,6 @@ from typing import Sequence, Union
 import sqlalchemy as sa
 from alembic import op
 
-
 revision: str = "20260715_add_public_mcp_app_audits"
 down_revision: Union[str, None] = "20260715_normalize_builtin_mcp_launch"
 branch_labels: Union[str, Sequence[str], None] = None
@@ -31,7 +30,13 @@ INDEXES: tuple[tuple[str, str], ...] = (
 def upgrade() -> None:
     if not op.get_context().as_sql:
         inspector = sa.inspect(op.get_bind())
-        if TABLE in inspector.get_table_names():
+        tables = set(inspector.get_table_names())
+        if TABLE in tables:
+            return
+        # Core application tables are created by SQLAlchemy after Alembic on
+        # a fresh installation.  Skipping here lets Base.metadata.create_all()
+        # create this table together with users and retain the declared FK.
+        if "users" not in tables:
             return
 
     op.create_table(

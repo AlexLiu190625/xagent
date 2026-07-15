@@ -38,11 +38,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from xagent.web.api.chat import AgentServiceManager
 from xagent.core.tools.adapters.vibe.config import (
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
 )
+from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User

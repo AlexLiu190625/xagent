@@ -31,8 +31,8 @@ What these tests pin:
 
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError, asdict
 import re
+from dataclasses import FrozenInstanceError, asdict
 from pathlib import Path
 from typing import List
 from unittest.mock import AsyncMock, MagicMock
