@@ -4,10 +4,13 @@ This module provides a scalable structure for defining supported MCP application
 their OAuth configurations, and server launch configurations.
 """
 
+from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session
 
+from .builtin_mcp_registry import get_builtin_execution_fields
 from .models.public_mcp import PublicMCPApp
 
 
@@ -29,18 +32,30 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
 
 
 def _app_to_dict(app: PublicMCPApp) -> Dict[str, Any]:
+    execution_fields = get_builtin_execution_fields(app.app_id)
+    if execution_fields is None:
+        execution_fields = {
+            "name": app.name,
+            "transport": app.transport,
+            "provider_name": app.provider_name,
+            "oauth_scopes": deepcopy(app.oauth_scopes or []),
+            "launch_config": deepcopy(app.launch_config or {}),
+        }
+
+    transport = execution_fields["transport"]
+    launch_config = deepcopy(execution_fields["launch_config"])
     return {
         "id": app.app_id,
-        "name": app.name,
+        "name": execution_fields["name"],
         "description": app.description,
         "icon": app.icon,
-        "transport": app.transport,
-        "provider": app.provider_name,
+        "transport": transport,
+        "provider": execution_fields["provider_name"],
         "category": app.category,
-        "oauth_scopes": app.oauth_scopes or [],
+        "oauth_scopes": deepcopy(execution_fields["oauth_scopes"]),
         "is_visible_in_connector": bool(app.is_visible_in_connector),
-        "launch_config": app.launch_config or {},
-        "auth_type": classify_app_auth(app.transport, app.launch_config),
+        "launch_config": launch_config,
+        "auth_type": classify_app_auth(transport, launch_config),
     }
 
 
@@ -60,3 +75,20 @@ def get_app_by_name(db: Session, name: str) -> Dict[str, Any] | None:
     """Retrieve an MCP app configuration by its exact name."""
     app = db.query(PublicMCPApp).filter(PublicMCPApp.name == name).first()
     return _app_to_dict(app) if app else None
+
+
+def get_app_for_mcp_server(db: Session, server: Any) -> Dict[str, Any] | None:
+    """Resolve a server's catalog app by stable identity when it is available.
+
+    Older server rows predate ``auth.app_id`` and are still resolved by their
+    exact catalog name. Once a row carries ``app_id``, an invalid value must not
+    fall back to a same-named app because that could select another connector's
+    credentials or launch configuration.
+    """
+    auth = getattr(server, "auth", None)
+    if isinstance(auth, Mapping) and "app_id" in auth:
+        app_id = auth.get("app_id")
+        if not isinstance(app_id, str) or not app_id:
+            return None
+        return get_app_by_id(db, app_id)
+    return get_app_by_name(db, str(getattr(server, "name", "")))

@@ -1763,10 +1763,10 @@ class WebToolConfig(BaseToolConfig):
                 if server.transport == "oauth":
                     # Find corresponding OAuth account
                     # The provider might be linkedin, google, etc. based on the app config
-                    from ...web.mcp_apps import get_app_by_name
+                    from ...web.mcp_apps import get_app_for_mcp_server
                     from ...web.models.user_oauth import UserOAuth
 
-                    app_info = get_app_by_name(self.db, str(server.name))
+                    app_info = get_app_for_mcp_server(self.db, server)
                     provider_name = (
                         app_info.get("provider") if app_info else server.name.lower()
                     )
@@ -1914,7 +1914,7 @@ class WebToolConfig(BaseToolConfig):
                         transport_config["cwd"] = server.cwd
 
                 elif server.transport in ["sse", "websocket", "streamable_http"]:
-                    from ...web.mcp_apps import get_app_by_name
+                    from ...web.mcp_apps import get_app_for_mcp_server
                     from ...web.services.mcp_runtime import (
                         build_mcp_runtime_connection,
                         connection_to_transport_config,
@@ -1930,7 +1930,7 @@ class WebToolConfig(BaseToolConfig):
                     remote_configured_resource: str | None = None
                     remote_hook_token: _ResolvedHookToken | None = None
                     if resolver is not None:
-                        app_info = get_app_by_name(self.db, str(server.name))
+                        app_info = get_app_for_mcp_server(self.db, server)
                         remote_providers_to_resolve = (
                             _oauth_token_provider_candidates(app_info)
                             if app_info

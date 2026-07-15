@@ -103,7 +103,7 @@ def _add_oauth_server(
     user: User,
     *,
     name: str = "Google Drive",
-    app_id: str | None = "google-drive",
+    app_id: str | None = "resolver-google-drive",
     provider: str | None = "google",
     launch_config: object | None = None,
     register_app: bool = True,
@@ -266,6 +266,60 @@ def _assert_same_oauth_config_except_token(
 
 
 @pytest.mark.asyncio
+async def test_builtin_oauth_server_uses_stable_app_id_and_canonical_runtime_config(
+    db_session,
+):
+    db, user = db_session
+    server = _add_oauth_server(
+        db,
+        user,
+        name="Renamed Gmail Server",
+        app_id="custom-same-name",
+        provider="wrong-provider",
+        launch_config={
+            "command": "uv",
+            "args": ["run", "wrong-server.py"],
+            "env_mapping": {"WRONG_TOKEN": "access_token"},
+        },
+    )
+    server.auth = {"app_id": "gmail"}
+    db.add(
+        PublicMCPApp(
+            app_id="gmail",
+            name="Stale Gmail Catalog Name",
+            transport="oauth",
+            provider_name="wrong-provider",
+            oauth_scopes=["wrong-scope"],
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+                "env_mapping": {"WRONG_TOKEN": "access_token"},
+            },
+        )
+    )
+    db.commit()
+
+    async def resolver(request: TokenRequest) -> ResolvedToken | None:
+        return ResolvedToken(
+            access_token="hook-token",
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+
+    set_oauth_token_resolver_hook(resolver)
+
+    configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert configs[0]["transport"] == "stdio"
+    assert configs[0]["config"]["command"] == "python"
+    assert configs[0]["config"]["args"] == [
+        "-m",
+        "xagent.web.tools.mcp.gmail",
+    ]
+    assert configs[0]["config"]["env"]["GOOGLE_ACCESS_TOKEN"] == "hook-token"
+    assert "WRONG_TOKEN" not in configs[0]["config"]["env"]
+
+
+@pytest.mark.asyncio
 async def test_hook_receives_provider_candidates_in_order_and_first_hit_wins(
     db_session,
 ):
@@ -275,7 +329,7 @@ async def test_hook_receives_provider_candidates_in_order_and_first_hit_wins(
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
         seen.append(request.provider)
-        if request.provider == "google-drive":
+        if request.provider == "resolver-google-drive":
             return ResolvedToken(
                 access_token="hook-token",
                 expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
@@ -286,7 +340,7 @@ async def test_hook_receives_provider_candidates_in_order_and_first_hit_wins(
 
     configs = await _tool_config(db, user).get_mcp_server_configs()
 
-    assert seen == ["google", "google-drive"]
+    assert seen == ["google", "resolver-google-drive"]
     assert len(configs) == 1
     assert configs[0]["transport"] == "stdio"
     assert _access_token_env(configs[0]) == "hook-token"
@@ -346,7 +400,7 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
 
     async def resolver(request: TokenRequest) -> ResolvedToken | None:
         seen.append((request.provider, request.resource, request.scope))
-        if request.provider == "google-drive":
+        if request.provider == "resolver-google-drive":
             return ResolvedToken(
                 access_token="hook-token",
                 expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
@@ -361,7 +415,7 @@ async def test_hook_request_receives_provider_resource_and_scope_verbatim(db_ses
 
     assert seen == [
         ("google", resource, scope),
-        ("google-drive", resource, scope),
+        ("resolver-google-drive", resource, scope),
     ]
     assert _access_token_env(configs[0]) == "hook-token"
 
@@ -730,7 +784,7 @@ async def test_hook_failure_does_not_fallback_and_later_servers_still_build(
             "resource": None,
             "scope": "",
             "issuer": None,
-            "providers": ["google", "google-drive"],
+            "providers": ["google", "resolver-google-drive"],
             "exception_type": "RuntimeError",
         }
     ]
@@ -1264,7 +1318,9 @@ async def test_remote_without_hook_skips_resolver_candidate_work(
     def unexpected_resolver_work(*args, **kwargs):
         pytest.fail("resolver-specific work ran without a registered hook")
 
-    monkeypatch.setattr("xagent.web.mcp_apps.get_app_by_name", unexpected_resolver_work)
+    monkeypatch.setattr(
+        "xagent.web.mcp_apps.get_app_for_mcp_server", unexpected_resolver_work
+    )
     monkeypatch.setattr(
         "xagent.web.services.mcp_runtime.effective_mcp_oauth_resource",
         unexpected_resolver_work,

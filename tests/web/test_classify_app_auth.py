@@ -6,8 +6,12 @@ BOTH required_env and command, everything else is unconnectable.
 """
 
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session
 
-from xagent.web.mcp_apps import classify_app_auth
+from xagent.web import mcp_apps
+from xagent.web.mcp_apps import classify_app_auth, get_app_by_id
+from xagent.web.models.public_mcp import PublicMCPApp
 
 
 def test_oauth_transport_is_builtin_oauth():
@@ -52,3 +56,153 @@ def test_oauth_landing_rejects_non_oauth_app():
             "1",
             {"id": "google-maps", "name": "Google Maps", "auth_type": "api_key"},
         )
+
+
+@pytest.fixture()
+def catalog_db():
+    engine = create_engine("sqlite:///:memory:")
+    PublicMCPApp.__table__.create(engine)
+    with Session(engine) as db:
+        yield db
+    engine.dispose()
+
+
+def test_builtin_runtime_view_overlays_stale_execution_fields(catalog_db):
+    catalog_db.add(
+        PublicMCPApp(
+            app_id="gmail",
+            name="Stale Gmail Name",
+            description="Environment-specific description",
+            icon="https://example.com/gmail.png",
+            transport="oauth",
+            provider_name="wrong-provider",
+            category="Environment Category",
+            oauth_scopes=["wrong-scope"],
+            is_visible_in_connector=False,
+            launch_config={
+                "command": "uv",
+                "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+                "env_mapping": {"WRONG_TOKEN": "access_token"},
+            },
+        )
+    )
+    catalog_db.commit()
+
+    app = get_app_by_id(catalog_db, "gmail")
+
+    assert app is not None
+    assert app["name"] == "Gmail"
+    assert app["transport"] == "oauth"
+    assert app["provider"] == "google"
+    assert app["oauth_scopes"] == ["https://www.googleapis.com/auth/gmail.modify"]
+    assert app["launch_config"] == {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.gmail"],
+        "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+    }
+    assert app["description"] == "Environment-specific description"
+    assert app["icon"] == "https://example.com/gmail.png"
+    assert app["category"] == "Environment Category"
+    assert app["is_visible_in_connector"] is False
+
+
+def test_custom_runtime_view_preserves_database_execution_fields(catalog_db):
+    launch_config = {
+        "command": "uv",
+        "args": ["run", "custom_server.py"],
+        "required_env": ["CUSTOM_TOKEN"],
+    }
+    catalog_db.add(
+        PublicMCPApp(
+            app_id="custom-gmail",
+            name="Gmail",
+            transport="stdio",
+            launch_config=launch_config,
+        )
+    )
+    catalog_db.commit()
+
+    app = get_app_by_id(catalog_db, "custom-gmail")
+
+    assert app is not None
+    assert app["name"] == "Gmail"
+    assert app["transport"] == "stdio"
+    assert app["launch_config"] == launch_config
+    assert app["auth_type"] == "api_key"
+
+
+def test_mcp_server_catalog_lookup_prefers_stable_app_id(catalog_db):
+    from types import SimpleNamespace
+
+    catalog_db.add_all(
+        [
+            PublicMCPApp(
+                app_id="gmail",
+                name="Gmail",
+                transport="oauth",
+                provider_name="google",
+                launch_config={"command": "uv"},
+            ),
+            PublicMCPApp(
+                app_id="renamed-custom",
+                name="Renamed Server",
+                transport="stdio",
+                launch_config={
+                    "command": "uv",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            ),
+        ]
+    )
+    catalog_db.commit()
+    server = SimpleNamespace(name="Renamed Server", auth={"app_id": "gmail"})
+
+    app = mcp_apps.get_app_for_mcp_server(catalog_db, server)
+
+    assert app is not None
+    assert app["id"] == "gmail"
+    assert app["name"] == "Gmail"
+
+
+def test_mcp_server_catalog_lookup_falls_back_to_name_only_for_legacy_row(catalog_db):
+    from types import SimpleNamespace
+
+    catalog_db.add(
+        PublicMCPApp(
+            app_id="legacy-custom",
+            name="Legacy Server",
+            transport="stdio",
+            launch_config={"command": "uv", "required_env": ["TOKEN"]},
+        )
+    )
+    catalog_db.commit()
+
+    app = mcp_apps.get_app_for_mcp_server(
+        catalog_db, SimpleNamespace(name="Legacy Server", auth=None)
+    )
+
+    assert app is not None
+    assert app["id"] == "legacy-custom"
+
+
+def test_invalid_stable_app_id_does_not_fall_back_to_name(catalog_db):
+    from types import SimpleNamespace
+
+    catalog_db.add(
+        PublicMCPApp(
+            app_id="legacy-custom",
+            name="Legacy Server",
+            transport="stdio",
+            launch_config={"command": "uv", "required_env": ["TOKEN"]},
+        )
+    )
+    catalog_db.commit()
+
+    app = mcp_apps.get_app_for_mcp_server(
+        catalog_db,
+        SimpleNamespace(
+            name="Legacy Server", auth={"app_id": "missing-stable-identity"}
+        ),
+    )
+
+    assert app is None
