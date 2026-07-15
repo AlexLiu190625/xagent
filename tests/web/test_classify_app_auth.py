@@ -185,7 +185,14 @@ def test_mcp_server_catalog_lookup_falls_back_to_name_only_for_legacy_row(catalo
     assert app["id"] == "legacy-custom"
 
 
-def test_invalid_stable_app_id_does_not_fall_back_to_name(catalog_db):
+@pytest.mark.parametrize(
+    "invalid_app_id",
+    ["missing-stable-identity", "", 123],
+    ids=["unknown-string", "empty-string", "non-string"],
+)
+def test_invalid_stable_app_id_does_not_fall_back_to_name(
+    catalog_db, invalid_app_id: object
+):
     from types import SimpleNamespace
 
     catalog_db.add(
@@ -200,9 +207,7 @@ def test_invalid_stable_app_id_does_not_fall_back_to_name(catalog_db):
 
     app = mcp_apps.get_app_for_mcp_server(
         catalog_db,
-        SimpleNamespace(
-            name="Legacy Server", auth={"app_id": "missing-stable-identity"}
-        ),
+        SimpleNamespace(name="Legacy Server", auth={"app_id": invalid_app_id}),
     )
 
     assert app is None

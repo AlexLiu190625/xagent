@@ -43,7 +43,7 @@ class PublicMCPApp(Base):  # type: ignore[no-any-unimported]
 
 
 class PublicMCPAppAudit(Base):  # type: ignore[no-any-unimported]
-    """Immutable admin write history for custom public MCP catalog apps."""
+    """Immutable admin write history for public MCP catalog apps."""
 
     __tablename__ = "public_mcp_app_audits"
 

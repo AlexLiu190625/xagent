@@ -54,6 +54,49 @@ async def test_connection_test_reports_successful_structured_load(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_connection_test_keeps_partial_tools_and_reports_safe_failures(
+    monkeypatch,
+):
+    tool = MagicMock()
+
+    async def load_tools(*args, **kwargs):
+        return MCPLoadResult(
+            tools=(tool,),
+            loaded_servers=("test",),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="test",
+                    phase=MCPFailurePhase.ADAPTER_CONSTRUCTION,
+                    error_type="BearerSecretError",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        load_tools,
+    )
+
+    response = await run_mcp_connection_test(
+        MCPConnectionTest(name="mail", transport="stdio", config={"command": "python"}),
+        MagicMock(),
+    )
+
+    assert response.success is True
+    assert response.details == {
+        "tool_count": 1,
+        "failures": [
+            {
+                "server_name": "test",
+                "phase": "adapter_construction",
+                "attempts": 1,
+            }
+        ],
+    }
+    assert "BearerSecretError" not in repr(response)
+
+
+@pytest.mark.asyncio
 async def test_connection_test_reports_structured_load_failure_without_exception_text(
     monkeypatch,
 ):

@@ -5,6 +5,7 @@ import { Plus, Trash2, Edit2, Search } from "lucide-react"
 import { useAuth } from "@/contexts/auth-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import { deepEqual } from "@/lib/mcp-utils"
 import { toast } from "@/components/ui/sonner"
 
 import { useI18n } from "@/contexts/i18n-context"
@@ -97,32 +98,6 @@ const BUILTIN_PRESENTATION_FIELDS = new Set<keyof PublicMCPAppMutation>([
 
 function cloneApp(app: PublicMCPApp): PublicMCPApp {
   return JSON.parse(JSON.stringify(app)) as PublicMCPApp
-}
-
-function deepEqual(left: unknown, right: unknown): boolean {
-  if (Object.is(left, right)) return true
-  if (Array.isArray(left) || Array.isArray(right)) {
-    return Array.isArray(left)
-      && Array.isArray(right)
-      && left.length === right.length
-      && left.every((item, index) => deepEqual(item, right[index]))
-  }
-  if (
-    left === null
-    || right === null
-    || typeof left !== "object"
-    || typeof right !== "object"
-  ) return false
-
-  const leftRecord = left as Record<string, unknown>
-  const rightRecord = right as Record<string, unknown>
-  const leftKeys = Object.keys(leftRecord)
-  const rightKeys = Object.keys(rightRecord)
-  return leftKeys.length === rightKeys.length
-    && leftKeys.every((key) => (
-      Object.prototype.hasOwnProperty.call(rightRecord, key)
-      && deepEqual(leftRecord[key], rightRecord[key])
-    ))
 }
 
 function buildAppUpdateDelta(

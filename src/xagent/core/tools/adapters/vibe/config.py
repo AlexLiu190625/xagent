@@ -132,6 +132,16 @@ class RequiredMCPUnavailableError(RuntimeError):
         super().__init__("Required MCP servers are unavailable.")
 
 
+def enforce_mcp_failure_policy(
+    policy: MCPFailurePolicy,
+    summaries: Iterable[MCPUnavailableSummary],
+) -> None:
+    """Apply the caller-owned MCP setup policy at every loading boundary."""
+    failures = tuple(summaries)
+    if policy is MCPFailurePolicy.STRICT and failures:
+        raise RequiredMCPUnavailableError(failures)
+
+
 def normalize_tool_allowlist(value: Any) -> Optional[List[str]]:
     """Coerce a tool-allowlist hook result into a list of tool-name strings.
 

@@ -5,10 +5,9 @@ from typing import TYPE_CHECKING, Any, List
 
 from .config import (
     MCPConfigLoadError,
-    MCPFailurePolicy,
     MCPToolLoadSummary,
     MCPUnavailableSummary,
-    RequiredMCPUnavailableError,
+    enforce_mcp_failure_policy,
 )
 from .connector_runtime import ConnectorRuntimeError
 from .factory import register_tool
@@ -164,8 +163,7 @@ async def _finish_mcp_setup(
 ) -> List[Any]:
     """Emit once before enforcing the caller-owned setup policy."""
     await _emit_mcp_load_summary(config, summary)
-    if config.get_mcp_failure_policy() is MCPFailurePolicy.STRICT and summary.failures:
-        raise RequiredMCPUnavailableError(summary.failures)
+    enforce_mcp_failure_policy(config.get_mcp_failure_policy(), summary.failures)
     return tools
 
 

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from xagent.core.tools.adapters.vibe.config import MCPConfigLoadError
 from xagent.core.tools.adapters.vibe.connector_runtime import (
@@ -107,6 +107,23 @@ def test_live_db_path_unchanged():
     cfg = WebToolConfig(db=sentinel, request=None)
     assert cfg.get_db() is sentinel
     cfg.close()  # must not raise; caller owns the request session
+
+
+def test_legacy_oauth_session_uses_engine_when_caller_is_connection_bound():
+    engine = create_engine("sqlite://")
+    connection = engine.connect()
+    caller_db = Session(bind=connection)
+    cfg = WebToolConfig(db=caller_db, request=None, user_id=1)
+
+    oauth_db = cfg._new_legacy_oauth_session()
+    try:
+        assert caller_db.get_bind() is connection
+        assert oauth_db.get_bind() is engine
+    finally:
+        oauth_db.close()
+        caller_db.close()
+        connection.close()
+        engine.dispose()
 
 
 def test_custom_api_loader_uses_factory_session():

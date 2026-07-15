@@ -3,12 +3,13 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
 
 import xagent.web.api.mcp as mcp_api
 from xagent.web.api.admin_mcp import (
@@ -1360,6 +1361,53 @@ def test_admin_patch_rejects_builtin_execution_field_changes(
                 for column in PublicMCPApp.__table__.columns
             }
             assert after == before
+            assert db.query(PublicMCPAppAudit).count() == 0
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_put_rejects_changed_builtin_execution_field_without_audit() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            app_pk = app.id
+            persisted_name = app.name
+        finally:
+            db.close()
+
+        canonical = get_builtin_public_mcp_app("gmail")
+        assert canonical is not None
+        canonical["name"] = "Renamed Gmail"
+
+        response = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json=canonical,
+        )
+
+        assert response.status_code == 409
+        assert response.json()["detail"] == (
+            "Built-in MCP app field 'name' is managed by code"
+        )
+        db = next(get_db())
+        try:
+            app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_pk).one()
+            assert app.name == persisted_name
+            assert db.query(PublicMCPAppAudit).count() == 0
         finally:
             db.close()
     finally:
@@ -1382,12 +1430,14 @@ def test_admin_patch_allows_builtin_presentation_fields() -> None:
             app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
             app_pk = app.id
             original_launch_config = app.launch_config
+            original_description = app.description
+            admin_user_id = db.query(User.id).filter(User.username == "admin").scalar()
         finally:
             db.close()
 
         response = client.patch(
             f"/api/admin/mcp/apps/{app_pk}",
-            headers=admin_headers,
+            headers={**admin_headers, "X-Request-ID": "builtin-patch"},
             json={
                 "description": "Managed Gmail description",
                 "icon": "https://example.com/managed-gmail.png",
@@ -1404,6 +1454,19 @@ def test_admin_patch_allows_builtin_presentation_fields() -> None:
         assert body["category"] == "Managed Communication"
         assert body["is_visible_in_connector"] is False
         assert body["launch_config"] == original_launch_config
+
+        db = next(get_db())
+        try:
+            audit = db.query(PublicMCPAppAudit).one()
+            assert audit.action == "update"
+            assert audit.app_id == "gmail"
+            assert audit.actor_user_id == admin_user_id
+            assert audit.request_id == "builtin-patch"
+            assert audit.before_values["description"] == original_description
+            assert audit.after_values["description"] == "Managed Gmail description"
+            assert audit.after_values["launch_config"] == original_launch_config
+        finally:
+            db.close()
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -1436,13 +1499,27 @@ def test_admin_legacy_put_accepts_canonical_builtin_execution_fields() -> None:
 
         response = client.put(
             f"/api/admin/mcp/apps/{app_pk}",
-            headers=admin_headers,
+            headers={**admin_headers, "X-Request-ID": "builtin-put"},
             json=canonical,
         )
 
         assert response.status_code == 200
         assert response.json()["is_builtin"] is True
         assert response.json()["description"] == "Legacy client presentation update"
+        db = next(get_db())
+        try:
+            audit = db.query(PublicMCPAppAudit).one()
+            assert audit.action == "update"
+            assert audit.app_id == "gmail"
+            assert audit.request_id == "builtin-put"
+            assert (
+                audit.before_values["description"] != audit.after_values["description"]
+            )
+            assert (
+                audit.after_values["description"] == "Legacy client presentation update"
+            )
+        finally:
+            db.close()
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:
@@ -1590,6 +1667,58 @@ def test_admin_delete_rejects_builtin_catalog_app() -> None:
             pass
 
 
+def test_admin_failed_custom_create_rolls_back_staged_audit() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        def fail_commit_after_flush(session: Session) -> None:
+            session.flush()
+            raise RuntimeError("commit failed after flush")
+
+        with patch.object(Session, "commit", fail_commit_after_flush):
+            with pytest.raises(RuntimeError, match="commit failed after flush"):
+                client.post(
+                    "/api/admin/mcp/apps",
+                    headers=admin_headers,
+                    json={
+                        "app_id": "custom-failed-audit",
+                        "name": "Custom Failed Audit",
+                        "transport": "stdio",
+                        "launch_config": {
+                            "command": "custom-command",
+                            "required_env": ["CUSTOM_TOKEN"],
+                        },
+                    },
+                )
+
+        db = next(get_db())
+        try:
+            assert (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "custom-failed-audit")
+                .first()
+                is None
+            )
+            assert (
+                db.query(PublicMCPAppAudit)
+                .filter(PublicMCPAppAudit.app_id == "custom-failed-audit")
+                .count()
+                == 0
+            )
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_admin_custom_catalog_writes_record_before_after_audits() -> None:
     temp_dir = _setup_test_db()
     try:
@@ -1616,6 +1745,21 @@ def test_admin_custom_catalog_writes_record_before_after_audits() -> None:
         )
         assert created.status_code == 200
         app_pk = created.json()["id"]
+
+        replaced = client.put(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "catalog-put"},
+            json={
+                "app_id": "custom-audited",
+                "name": "Custom Audited Put",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "put-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert replaced.status_code == 200
 
         updated = client.patch(
             f"/api/admin/mcp/apps/{app_pk}",
@@ -1646,10 +1790,12 @@ def test_admin_custom_catalog_writes_record_before_after_audits() -> None:
             assert [audit.action for audit in audits] == [
                 "create",
                 "update",
+                "update",
                 "delete",
             ]
             assert [audit.request_id for audit in audits] == [
                 "catalog-create",
+                "catalog-put",
                 "catalog-update",
                 "catalog-delete",
             ]
@@ -1657,9 +1803,11 @@ def test_admin_custom_catalog_writes_record_before_after_audits() -> None:
             assert audits[0].before_values is None
             assert audits[0].after_values["launch_config"]["command"] == "old-command"
             assert audits[1].before_values["launch_config"]["command"] == "old-command"
-            assert audits[1].after_values["launch_config"]["command"] == "new-command"
-            assert audits[2].before_values["launch_config"]["command"] == "new-command"
-            assert audits[2].after_values is None
+            assert audits[1].after_values["launch_config"]["command"] == "put-command"
+            assert audits[2].before_values["launch_config"]["command"] == "put-command"
+            assert audits[2].after_values["launch_config"]["command"] == "new-command"
+            assert audits[3].before_values["launch_config"]["command"] == "new-command"
+            assert audits[3].after_values is None
         finally:
             db.close()
     finally:

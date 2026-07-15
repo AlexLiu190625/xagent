@@ -10,6 +10,10 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.agent.service import AgentService
+from xagent.core.tools.adapters.vibe.config import (
+    MCPFailurePolicy,
+    RequiredMCPUnavailableError,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
     MCPFailurePhase,
@@ -567,6 +571,60 @@ class TestToolFactoryMCPIntegration:
         assert result["reason"] == "session_start"
         assert result["error"] == "MCP server could not be started."
         assert "BearerSecretError" not in repr(result)
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_enforces_strict_failure_policy(
+        self, mock_load_mcp, test_db, sample_stdio_config
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        mock_load_mcp.return_value = MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=sample_stdio_config["name"],
+                    phase=MCPFailurePhase.SESSION_START,
+                    error_type="BearerSecretError",
+                ),
+            ),
+        )
+
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await ToolFactory.create_mcp_tools(
+                test_db,
+                mcp_failure_policy=MCPFailurePolicy.STRICT,
+            )
+
+        assert exc_info.value.summaries[0].server_name == sample_stdio_config["name"]
+        assert exc_info.value.summaries[0].reason == "session_start"
+        assert "BearerSecretError" not in str(exc_info.value)
+
+    @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
+    async def test_create_mcp_tools_scopes_loader_failure_to_requested_user(
+        self, mock_load_mcp, test_db, sample_stdio_config, monkeypatch
+    ):
+        manager = DatabaseMCPServerManager(test_db)
+        manager.add_server(manager.create_config(**sample_stdio_config))
+        server = (
+            test_db.query(MCPServer).filter_by(name=sample_stdio_config["name"]).one()
+        )
+        test_db.add(
+            UserMCPServer(
+                user_id=1,
+                mcpserver_id=server.id,
+                is_owner=True,
+                is_active=True,
+            )
+        )
+        test_db.commit()
+        mock_load_mcp.side_effect = RuntimeError("loader failed")
+
+        tools = await ToolFactory.create_mcp_tools(test_db, user_id=1)
+
+        monkeypatch.setenv("XAGENT_USER_ID", "2")
+        result = tools[0].run_json_sync({})
+        assert "Access denied" in result["content"][0]["text"]
 
     @patch("xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools")
     async def test_create_mcp_tools_no_connections(self, mock_load_mcp, test_db):

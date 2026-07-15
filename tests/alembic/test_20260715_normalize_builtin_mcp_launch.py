@@ -1,4 +1,4 @@
-"""Tests for normalizing built-in Python MCP launch configurations."""
+"""Tests for normalizing built-in MCP execution fields."""
 
 import importlib.util
 import json
@@ -17,63 +17,158 @@ MIGRATION_PATH = (
     / "src/xagent/migrations/versions/20260715_normalize_builtin_mcp_launch.py"
 )
 
-EXPECTED_LAUNCH_CONFIGS = {
+EXECUTION_FIELD_NAMES = (
+    "name",
+    "transport",
+    "provider_name",
+    "oauth_scopes",
+    "launch_config",
+)
+
+EXPECTED_EXECUTION_FIELDS = {
     "linkedin": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.linkedin"],
-        "env_mapping": {"LINKEDIN_ACCESS_TOKEN": "access_token"},
+        "name": "LinkedIn",
+        "transport": "oauth",
+        "provider_name": "linkedin",
+        "oauth_scopes": ["openid", "profile", "email", "w_member_social"],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.linkedin"],
+            "env_mapping": {"LINKEDIN_ACCESS_TOKEN": "access_token"},
+        },
     },
     "gmail": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.gmail"],
-        "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        "name": "Gmail",
+        "transport": "oauth",
+        "provider_name": "google",
+        "oauth_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.gmail"],
+            "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        },
     },
     "google-drive": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.google_drive"],
-        "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        "name": "Google Drive",
+        "transport": "oauth",
+        "provider_name": "google",
+        "oauth_scopes": ["https://www.googleapis.com/auth/drive"],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.google_drive"],
+            "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        },
     },
     "google-calendar": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.calendar"],
-        "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        "name": "Google Calendar",
+        "transport": "oauth",
+        "provider_name": "google",
+        "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.calendar"],
+            "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        },
     },
     "teams": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.teams"],
-        "env_mapping": {"AUTH_TOKEN": "access_token"},
+        "name": "Teams",
+        "transport": "oauth",
+        "provider_name": "microsoft",
+        "oauth_scopes": [
+            "Team.ReadBasic.All",
+            "Channel.ReadBasic.All",
+            "TeamMember.Read.All",
+            "ChannelMessage.Read.All",
+            "ChannelMessage.Send",
+            "Chat.ReadWrite",
+        ],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.teams"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        },
     },
     "outlook": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.outlook"],
-        "env_mapping": {"AUTH_TOKEN": "access_token"},
+        "name": "Outlook",
+        "transport": "oauth",
+        "provider_name": "microsoft",
+        "oauth_scopes": [
+            "Mail.Read",
+            "Mail.Send",
+            "Calendars.ReadWrite",
+            "Contacts.Read",
+        ],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.outlook"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        },
     },
     "onedrive": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.onedrive"],
-        "env_mapping": {"AUTH_TOKEN": "access_token"},
+        "name": "OneDrive",
+        "transport": "oauth",
+        "provider_name": "microsoft",
+        "oauth_scopes": ["Files.ReadWrite"],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.onedrive"],
+            "env_mapping": {"AUTH_TOKEN": "access_token"},
+        },
     },
     "facebook": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.facebook"],
-        "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        "name": "Facebook Pages",
+        "transport": "oauth",
+        "provider_name": "meta",
+        "oauth_scopes": [
+            "pages_show_list",
+            "pages_read_engagement",
+            "pages_manage_posts",
+        ],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.facebook"],
+            "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        },
     },
     "instagram": {
-        "command": "python",
-        "args": ["-m", "xagent.web.tools.mcp.instagram"],
-        "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        "name": "Instagram",
+        "transport": "oauth",
+        "provider_name": "meta",
+        "oauth_scopes": [
+            "pages_show_list",
+            "pages_read_engagement",
+            "instagram_basic",
+            "instagram_content_publish",
+        ],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.instagram"],
+            "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+        },
+    },
+    "google-maps": {
+        "name": "Google Maps",
+        "transport": "stdio",
+        "provider_name": None,
+        "oauth_scopes": None,
+        "launch_config": {
+            "command": "npx",
+            "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
+            "required_env": ["GOOGLE_MAPS_API_KEY"],
+        },
     },
 }
 
-GOOGLE_MAPS_CONFIG = {
-    "command": "npx",
-    "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
-    "required_env": ["GOOGLE_MAPS_API_KEY"],
-}
-CUSTOM_UV_CONFIG = {
-    "command": "uv",
-    "args": ["run", "custom_server.py"],
-    "env": {"CUSTOM_SETTING": "preserve-me"},
+CUSTOM_EXECUTION_FIELDS = {
+    "name": "Custom uv MCP",
+    "transport": "stdio",
+    "provider_name": "custom-provider",
+    "oauth_scopes": ["custom-scope"],
+    "launch_config": {
+        "command": "uv",
+        "args": ["run", "custom_server.py"],
+        "env": {"CUSTOM_SETTING": "preserve-me"},
+    },
 }
 
 
@@ -98,6 +193,9 @@ def _public_mcp_apps(metadata: sa.MetaData) -> sa.Table:
         sa.Column("id", sa.Integer, primary_key=True),
         sa.Column("app_id", sa.String(100), nullable=False, unique=True),
         sa.Column("name", sa.String(200), nullable=False),
+        sa.Column("transport", sa.String(50), nullable=False),
+        sa.Column("provider_name", sa.String(50)),
+        sa.Column("oauth_scopes", sa.JSON),
         sa.Column("launch_config", sa.JSON),
     )
 
@@ -110,64 +208,67 @@ def _uv_config(canonical: dict[str, object]) -> dict[str, object]:
     }
 
 
+def _drifted_execution_fields(
+    canonical: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "name": f"Stale {canonical['name']}",
+        "transport": "stdio" if canonical["transport"] == "oauth" else "oauth",
+        "provider_name": "stale-provider",
+        "oauth_scopes": ["stale-scope"],
+        "launch_config": _uv_config(canonical["launch_config"]),
+    }
+
+
 def _seed_environment(
     connection,
     table: sa.Table,
     *,
-    uv_app_ids: set[str],
+    drifted_app_ids: set[str],
     missing_app_ids: set[str] | None = None,
 ) -> None:
     missing_app_ids = missing_app_ids or set()
     rows = [
         {
             "app_id": app_id,
-            "name": app_id,
-            "launch_config": (_uv_config(config) if app_id in uv_app_ids else config),
+            **(
+                _drifted_execution_fields(execution_fields)
+                if app_id in drifted_app_ids
+                else execution_fields
+            ),
         }
-        for app_id, config in EXPECTED_LAUNCH_CONFIGS.items()
+        for app_id, execution_fields in EXPECTED_EXECUTION_FIELDS.items()
         if app_id not in missing_app_ids
     ]
-    rows.extend(
-        [
-            {
-                "app_id": "google-maps",
-                "name": "Google Maps",
-                "launch_config": GOOGLE_MAPS_CONFIG,
-            },
-            {
-                "app_id": "custom-uv",
-                "name": "Custom uv MCP",
-                "launch_config": CUSTOM_UV_CONFIG,
-            },
-        ]
-    )
+    rows.append({"app_id": "custom-uv", **CUSTOM_EXECUTION_FIELDS})
     connection.execute(sa.insert(table), rows)
 
 
-def _configs_by_app_id(connection, table: sa.Table) -> dict[str, object]:
-    return dict(
-        connection.execute(
-            sa.select(table.c.app_id, table.c.launch_config).order_by(table.c.app_id)
-        ).all()
+def _execution_fields_by_app_id(
+    connection, table: sa.Table
+) -> dict[str, dict[str, object]]:
+    rows = connection.execute(
+        sa.select(
+            table.c.app_id,
+            *(table.c[field] for field in EXECUTION_FIELD_NAMES),
+        ).order_by(table.c.app_id)
     )
+    return {
+        row.app_id: {field: getattr(row, field) for field in EXECUTION_FIELD_NAMES}
+        for row in rows
+    }
 
 
 @pytest.mark.parametrize(
-    "uv_app_ids",
+    "drifted_app_ids",
     [
-        {
-            "linkedin",
-            "gmail",
-            "google-drive",
-            "google-calendar",
-            "instagram",
-        },
-        {"instagram"},
+        set(EXPECTED_EXECUTION_FIELDS),
+        {"instagram", "google-maps"},
     ],
     ids=["au-shaped-data", "sg-shaped-data"],
 )
 def test_upgrade_converges_environment_data_without_touching_other_apps(
-    tmp_path, uv_app_ids
+    tmp_path, drifted_app_ids
 ) -> None:
     migration = _load_migration_module()
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
@@ -176,17 +277,16 @@ def test_upgrade_converges_environment_data_without_touching_other_apps(
     metadata.create_all(engine)
 
     with engine.begin() as connection:
-        _seed_environment(connection, table, uv_app_ids=uv_app_ids)
+        _seed_environment(connection, table, drifted_app_ids=drifted_app_ids)
 
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
 
-        configs = _configs_by_app_id(connection, table)
+        execution_fields = _execution_fields_by_app_id(connection, table)
 
-    for app_id, expected_config in EXPECTED_LAUNCH_CONFIGS.items():
-        assert configs[app_id] == expected_config
-    assert configs["google-maps"] == GOOGLE_MAPS_CONFIG
-    assert configs["custom-uv"] == CUSTOM_UV_CONFIG
+    for app_id, expected_fields in EXPECTED_EXECUTION_FIELDS.items():
+        assert execution_fields[app_id] == expected_fields
+    assert execution_fields["custom-uv"] == CUSTOM_EXECUTION_FIELDS
 
 
 def test_upgrade_is_update_only_and_idempotent(tmp_path) -> None:
@@ -200,23 +300,23 @@ def test_upgrade_is_update_only_and_idempotent(tmp_path) -> None:
         _seed_environment(
             connection,
             table,
-            uv_app_ids=set(EXPECTED_LAUNCH_CONFIGS),
+            drifted_app_ids=set(EXPECTED_EXECUTION_FIELDS),
             missing_app_ids={"facebook"},
         )
 
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
-            first_upgrade = _configs_by_app_id(connection, table)
+            first_upgrade = _execution_fields_by_app_id(connection, table)
             migration.upgrade()
-            second_upgrade = _configs_by_app_id(connection, table)
+            second_upgrade = _execution_fields_by_app_id(connection, table)
 
     assert "facebook" not in first_upgrade
     assert first_upgrade == second_upgrade
-    assert first_upgrade["google-maps"] == GOOGLE_MAPS_CONFIG
-    assert first_upgrade["custom-uv"] == CUSTOM_UV_CONFIG
+    assert first_upgrade["google-maps"] == EXPECTED_EXECUTION_FIELDS["google-maps"]
+    assert first_upgrade["custom-uv"] == CUSTOM_EXECUTION_FIELDS
 
 
-def test_downgrade_does_not_restore_invalid_launch_configs(tmp_path) -> None:
+def test_downgrade_does_not_restore_invalid_execution_fields(tmp_path) -> None:
     migration = _load_migration_module()
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'test.db'}")
     metadata = sa.MetaData()
@@ -224,16 +324,20 @@ def test_downgrade_does_not_restore_invalid_launch_configs(tmp_path) -> None:
     metadata.create_all(engine)
 
     with engine.begin() as connection:
-        _seed_environment(connection, table, uv_app_ids=set(EXPECTED_LAUNCH_CONFIGS))
+        _seed_environment(
+            connection,
+            table,
+            drifted_app_ids=set(EXPECTED_EXECUTION_FIELDS),
+        )
 
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
             migration.downgrade()
 
-        configs = _configs_by_app_id(connection, table)
+        execution_fields = _execution_fields_by_app_id(connection, table)
 
-    for app_id, expected_config in EXPECTED_LAUNCH_CONFIGS.items():
-        assert configs[app_id] == expected_config
+    for app_id, expected_fields in EXPECTED_EXECUTION_FIELDS.items():
+        assert execution_fields[app_id] == expected_fields
 
 
 def test_upgrade_skips_when_catalog_table_is_absent() -> None:
@@ -243,6 +347,41 @@ def test_upgrade_skips_when_catalog_table_is_absent() -> None:
     with engine.begin() as connection:
         with patch.object(migration, "op", _operations(connection)):
             migration.upgrade()
+
+
+def test_upgrade_skips_when_required_catalog_columns_are_absent() -> None:
+    migration = _load_migration_module()
+    engine = sa.create_engine("sqlite:///:memory:")
+    metadata = sa.MetaData()
+    table = sa.Table(
+        "public_mcp_apps",
+        metadata,
+        sa.Column("app_id", sa.String(100), primary_key=True),
+        sa.Column("name", sa.String(200), nullable=False),
+        sa.Column("launch_config", sa.JSON),
+    )
+    metadata.create_all(engine)
+    stale_launch_config = _uv_config(
+        EXPECTED_EXECUTION_FIELDS["gmail"]["launch_config"]
+    )
+
+    with engine.begin() as connection:
+        connection.execute(
+            sa.insert(table),
+            {
+                "app_id": "gmail",
+                "name": "Stale Gmail",
+                "launch_config": stale_launch_config,
+            },
+        )
+
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+
+        stored = connection.execute(sa.select(table)).mappings().one()
+
+    assert stored["name"] == "Stale Gmail"
+    assert stored["launch_config"] == stale_launch_config
 
 
 def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
@@ -257,16 +396,20 @@ def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
         migration.upgrade()
 
     sql = output.getvalue()
-    assert sql.count("UPDATE public_mcp_apps SET launch_config=") == len(
-        EXPECTED_LAUNCH_CONFIGS
-    )
+    assert sql.count("UPDATE public_mcp_apps SET") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("SET name=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("transport=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("provider_name=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("oauth_scopes=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("launch_config=") == len(EXPECTED_EXECUTION_FIELDS)
     assert "INSERT INTO public_mcp_apps" not in sql
     assert "DELETE FROM public_mcp_apps" not in sql
     assert "%(" not in sql
     assert '"command": "python"' in sql
-    for app_id, config in EXPECTED_LAUNCH_CONFIGS.items():
+    for app_id, expected_fields in EXPECTED_EXECUTION_FIELDS.items():
         assert f"public_mcp_apps.app_id = '{app_id}'" in sql
-        assert config["args"][1] in sql
+        assert expected_fields["name"] in sql
+        assert expected_fields["launch_config"]["args"][1] in sql
 
 
 def test_offline_sqlite_upgrade_round_trips_json_catalog_values() -> None:
@@ -282,20 +425,40 @@ def test_offline_sqlite_upgrade_round_trips_json_catalog_values() -> None:
 
     connection = sqlite3.connect(":memory:")
     connection.execute(
-        "CREATE TABLE public_mcp_apps (app_id TEXT PRIMARY KEY, launch_config JSON)"
+        "CREATE TABLE public_mcp_apps ("
+        "app_id TEXT PRIMARY KEY, name TEXT NOT NULL, transport TEXT NOT NULL, "
+        "provider_name TEXT, oauth_scopes JSON, launch_config JSON)"
     )
+    drifted = _drifted_execution_fields(EXPECTED_EXECUTION_FIELDS["gmail"])
     connection.execute(
-        "INSERT INTO public_mcp_apps (app_id, launch_config) VALUES (?, ?)",
-        ("gmail", json.dumps(_uv_config(EXPECTED_LAUNCH_CONFIGS["gmail"]))),
+        "INSERT INTO public_mcp_apps "
+        "(app_id, name, transport, provider_name, oauth_scopes, launch_config) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "gmail",
+            drifted["name"],
+            drifted["transport"],
+            drifted["provider_name"],
+            json.dumps(drifted["oauth_scopes"]),
+            json.dumps(drifted["launch_config"]),
+        ),
     )
     connection.executescript(output.getvalue())
 
-    stored_config = connection.execute(
-        "SELECT launch_config FROM public_mcp_apps WHERE app_id = 'gmail'"
+    stored = connection.execute(
+        "SELECT name, transport, provider_name, oauth_scopes, launch_config "
+        "FROM public_mcp_apps WHERE app_id = 'gmail'"
     ).fetchone()
 
-    assert stored_config is not None
-    assert json.loads(stored_config[0]) == EXPECTED_LAUNCH_CONFIGS["gmail"]
+    assert stored is not None
+    expected = EXPECTED_EXECUTION_FIELDS["gmail"]
+    assert stored[:3] == (
+        expected["name"],
+        expected["transport"],
+        expected["provider_name"],
+    )
+    assert json.loads(stored[3]) == expected["oauth_scopes"]
+    assert json.loads(stored[4]) == expected["launch_config"]
 
 
 def test_offline_mysql_upgrade_emits_json_text_literals_without_bind_parameters() -> (
@@ -312,13 +475,21 @@ def test_offline_mysql_upgrade_emits_json_text_literals_without_bind_parameters(
         migration.upgrade()
 
     sql = output.getvalue()
-    assert sql.count("UPDATE public_mcp_apps") == len(EXPECTED_LAUNCH_CONFIGS)
+    assert sql.count("UPDATE public_mcp_apps") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("SET name=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("transport=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("provider_name=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("oauth_scopes=") == len(EXPECTED_EXECUTION_FIELDS)
+    assert sql.count("launch_config=") == len(EXPECTED_EXECUTION_FIELDS)
     assert "CAST(" not in sql
     assert ":app_id" not in sql
-    assert ":launch_config" not in sql
-    for app_id, config in EXPECTED_LAUNCH_CONFIGS.items():
+    for field in EXECUTION_FIELD_NAMES:
+        assert f":{field}" not in sql
+    for app_id, expected_fields in EXPECTED_EXECUTION_FIELDS.items():
         assert f"app_id = '{app_id}'" in sql
-        assert json.dumps(config, sort_keys=True) in sql
+        assert expected_fields["name"] in sql
+        assert json.dumps(expected_fields["oauth_scopes"], sort_keys=True) in sql
+        assert json.dumps(expected_fields["launch_config"], sort_keys=True) in sql
 
 
 def test_offline_postgresql_downgrade_emits_no_sql() -> None:

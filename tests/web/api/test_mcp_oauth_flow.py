@@ -316,6 +316,68 @@ async def test_get_mcp_server_tools_injects_runtime_oauth_grant(
 
 
 @pytest.mark.asyncio
+async def test_get_mcp_server_tools_keeps_partial_tools_and_reports_safe_failures(
+    db_session,
+    monkeypatch,
+):
+    db, user, _ = db_session
+    server = _add_mcp_oauth_server(db, user)
+    client = _add_oauth_client(db, server, client_id="client-123")
+    db.add(
+        MCPOAuthGrant(
+            mcp_server_id=server.id,
+            user_id=user.id,
+            mcp_oauth_client_id=client.id,
+            resource_owner_key=f"xagent:user:{user.id}",
+            issuer="https://auth.example.com",
+            resource="https://mcp.example.com/mcp",
+            scope="records.read",
+            access_token=encrypt_value("runtime-token"),
+            status="active",
+        )
+    )
+    db.commit()
+
+    async def partially_failed_load(*args, **kwargs):
+        return MCPLoadResult(
+            tools=(
+                SimpleNamespace(name="search_records", description="Search records"),
+            ),
+            loaded_servers=("records",),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name="records",
+                    phase=MCPFailurePhase.ADAPTER_CONSTRUCTION,
+                    error_type="BearerSecretError",
+                ),
+            ),
+        )
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.mcp_adapter.load_mcp_tools_as_agent_tools",
+        partially_failed_load,
+    )
+
+    response = await get_mcp_server_tools(server.id, user, db)
+
+    assert response == {
+        "server_name": "records",
+        "tool_count": 1,
+        "tools": [
+            {"name": "search_records", "description": "Search records"},
+        ],
+        "failures": [
+            {
+                "server_name": "records",
+                "phase": "adapter_construction",
+                "attempts": 1,
+            }
+        ],
+    }
+    assert "BearerSecretError" not in repr(response)
+
+
+@pytest.mark.asyncio
 async def test_get_mcp_server_tools_reports_structured_runtime_failure(
     db_session,
     monkeypatch,

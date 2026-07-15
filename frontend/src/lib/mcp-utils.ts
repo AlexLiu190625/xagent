@@ -336,7 +336,7 @@ function envEntriesToObject(
   return env
 }
 
-function deepEqual(left: unknown, right: unknown): boolean {
+export function deepEqual(left: unknown, right: unknown): boolean {
   if (Object.is(left, right)) return true
   if (Array.isArray(left) || Array.isArray(right)) {
     return Array.isArray(left)

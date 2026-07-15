@@ -8,7 +8,17 @@ and configuration management.
 # mypy: ignore-errors
 
 import logging
-from typing import TYPE_CHECKING, Any, Callable, Dict, FrozenSet, List, Optional, Tuple
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Dict,
+    FrozenSet,
+    Iterable,
+    List,
+    Optional,
+    Tuple,
+)
 
 from sqlalchemy.orm import Session
 
@@ -17,7 +27,10 @@ from .....core.workspace import TaskWorkspace
 from .base import AbstractBaseTool, Tool
 from .config import (
     BaseToolConfig,
+    MCPFailurePolicy,
+    MCPUnavailableSummary,
     RequiredMCPUnavailableError,
+    enforce_mcp_failure_policy,
     normalize_tool_allowlist,
 )
 from .connector_runtime import ConnectorRuntimeError
@@ -586,6 +599,22 @@ class ToolFactory:
         return tools
 
     @staticmethod
+    def _mcp_unavailable_summaries(
+        tools: Iterable[Tool],
+    ) -> tuple[MCPUnavailableSummary, ...]:
+        """Project unavailable tools into the shared strict-policy contract."""
+        from .mcp_adapter import UnavailableMCPTool
+
+        return tuple(
+            MCPUnavailableSummary.from_values(
+                tool.server_name,
+                tool.unavailability_reason,
+            )
+            for tool in tools
+            if isinstance(tool, UnavailableMCPTool)
+        )
+
+    @staticmethod
     async def _create_mcp_tools_from_configs(
         mcp_configs: List[Dict[str, Any]],
         sandbox: Optional["Sandbox"] = None,
@@ -744,12 +773,19 @@ class ToolFactory:
             return []
 
     @classmethod
-    async def create_mcp_tools(cls, db: Session, user_id: int | None = None):
+    async def create_mcp_tools(
+        cls,
+        db: Session,
+        user_id: int | None = None,
+        *,
+        mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
+    ):
         """Create MCP tools from database configuration.
 
         Args:
             db: Database session
             user_id: User ID for filtering MCP servers
+            mcp_failure_policy: Caller-owned handling for unavailable servers
 
         Returns:
             List of MCP tools
@@ -833,6 +869,10 @@ class ToolFactory:
                 )
 
             if not connections:
+                enforce_mcp_failure_policy(
+                    mcp_failure_policy,
+                    cls._mcp_unavailable_summaries(unavailable_tools),
+                )
                 return unavailable_tools
 
             # Load MCP tools
@@ -848,10 +888,15 @@ class ToolFactory:
                     cls._create_unavailable_mcp_tool(
                         server_name=server_name,
                         server_id=config.get("id"),
+                        allow_users=config.get("allow_users"),
                         reason="loader_failed",
                         message="MCP server tools could not be loaded.",
                     )
                     for server_name, config in configs_by_name.items()
+                )
+                enforce_mcp_failure_policy(
+                    mcp_failure_policy,
+                    cls._mcp_unavailable_summaries(unavailable_tools),
                 )
                 return unavailable_tools
 
@@ -861,17 +906,33 @@ class ToolFactory:
                     configs_by_name,
                 )
             )
+            enforce_mcp_failure_policy(
+                mcp_failure_policy,
+                cls._mcp_unavailable_summaries(unavailable_tools),
+            )
             return unavailable_tools + list(load_result.tools)
         except ConnectorRuntimeError:
+            raise
+        except RequiredMCPUnavailableError:
             raise
         except Exception as e:
             logger.warning(
                 "Failed to create MCP tools from database (%s)", type(e).__name__
             )
+            enforce_mcp_failure_policy(
+                mcp_failure_policy,
+                [MCPUnavailableSummary.from_values(None, "config_load_failed")],
+            )
             return []
 
     @classmethod
-    def _create_mcp_tools(cls, db, user_id: int):
+    def _create_mcp_tools(
+        cls,
+        db,
+        user_id: int,
+        *,
+        mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
+    ):
         """Synchronous wrapper for create_mcp_tools.
 
         Args:
@@ -898,7 +959,11 @@ class ToolFactory:
                         new_loop = asyncio.new_event_loop()
                         asyncio.set_event_loop(new_loop)
                         result = new_loop.run_until_complete(
-                            cls.create_mcp_tools(db, user_id)
+                            cls.create_mcp_tools(
+                                db,
+                                user_id,
+                                mcp_failure_policy=mcp_failure_policy,
+                            )
                         )
                         result_queue.put(result)
                     except Exception as e:
@@ -916,7 +981,15 @@ class ToolFactory:
                 return result
             else:
                 # If no event loop is running, use the current one
-                return loop.run_until_complete(cls.create_mcp_tools(db, user_id))
+                return loop.run_until_complete(
+                    cls.create_mcp_tools(
+                        db,
+                        user_id,
+                        mcp_failure_policy=mcp_failure_policy,
+                    )
+                )
+        except RequiredMCPUnavailableError:
+            raise
         except Exception as e:
             logger.warning(f"Failed to create MCP tools (sync wrapper): {e}")
             return []

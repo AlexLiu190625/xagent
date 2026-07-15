@@ -6,7 +6,12 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
+from fastapi.testclient import TestClient
 
+from xagent.core.tools.adapters.vibe.config import (
+    MCPUnavailableSummary,
+    RequiredMCPUnavailableError,
+)
 from xagent.core.utils.encryption import decrypt_value
 from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
@@ -30,7 +35,13 @@ from xagent.web.services.connector_runtime import (
     load_connector_runtime_view,
     set_connector_runtime_resolver_for_testing,
 )
-from xagent.web.services.task_orchestrator import TurnStarted, finish_turn
+from xagent.web.services.task_orchestrator import (
+    TurnStarted,
+)
+from xagent.web.services.task_orchestrator import _schedule_bg as _real_schedule_bg
+from xagent.web.services.task_orchestrator import (
+    finish_turn,
+)
 from xagent.web.services.trigger_providers import sign_webhook_payload
 from xagent.web.services.triggers import (
     _compute_next_run_at,
@@ -43,6 +54,7 @@ from .conftest import (
     _admin_headers,
     _direct_db_session,
     _register_second_user,
+    app_for_tests,
     client,
 )
 
@@ -302,6 +314,86 @@ def test_trigger_test_run_creates_hidden_agent_task(mock_bg_scheduler) -> None:
         assert "hello" in (task.description or "")
     finally:
         db.close()
+
+
+def test_trigger_test_run_mcp_setup_failure_marks_run_failed() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+    created = client.post(
+        f"/api/agents/{agent_id}/triggers",
+        headers=headers,
+        json={"type": "webhook", "name": "Required MCP failure"},
+    )
+    assert created.status_code == 200, created.text
+    trigger_id = int(created.json()["id"])
+
+    private_detail = "connector-token-must-not-leak"
+    setup_error = RequiredMCPUnavailableError(
+        [
+            MCPUnavailableSummary.from_values(
+                private_detail,
+                "oauth_token_required",
+            )
+        ]
+    )
+    setup_calls = 0
+
+    async def fail_required_mcp_setup(_manager, *_args, **_kwargs):
+        nonlocal setup_calls
+        setup_calls += 1
+        raise setup_error
+
+    final_state: tuple[str, str | None, str, str | None, datetime | None] | None = None
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator._schedule_bg",
+            new=_real_schedule_bg,
+        ),
+        patch(
+            "xagent.web.api.chat.AgentServiceManager.get_agent_for_task",
+            new=fail_required_mcp_setup,
+        ),
+        TestClient(app_for_tests, raise_server_exceptions=False) as live_client,
+    ):
+        fired = live_client.post(
+            f"/api/agents/{agent_id}/triggers/{trigger_id}/test",
+            headers=headers,
+            json={"payload": {"subject": "exercise MCP setup"}},
+        )
+        assert fired.status_code == 200, fired.text
+        run_id = int(fired.json()["trigger_run"]["id"])
+
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            db = _direct_db_session()
+            try:
+                run = db.query(TriggerRun).filter(TriggerRun.id == run_id).one()
+                task = db.query(Task).filter(Task.id == run.task_id).one()
+                final_state = (
+                    str(run.status),
+                    run.error_message,
+                    task.status.value,
+                    task.error_message,
+                    run.finished_at,
+                )
+            finally:
+                db.close()
+            if final_state[0] == TriggerRunStatus.FAILED.value:
+                break
+            time.sleep(0.01)
+        else:
+            pytest.fail(f"trigger run did not reach FAILED: {final_state}")
+
+    safe_error = "Required MCP servers are unavailable."
+    assert final_state is not None
+    run_status, run_error, task_status, task_error, run_finished_at = final_state
+    assert setup_calls == 1
+    assert run_status == TriggerRunStatus.FAILED.value
+    assert run_error == safe_error
+    assert task_status == TaskStatus.FAILED.value
+    assert task_error == safe_error
+    assert run_finished_at is not None
+    assert private_detail not in str(final_state)
 
 
 def _signed_webhook_headers(

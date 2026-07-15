@@ -53,6 +53,10 @@ OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
 UNAVAILABLE_MCP_MESSAGE = "MCP server is unavailable."
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+# This web-runtime allowlist is intentionally narrower than the adapter-layer
+# public summary allowlist. It accepts only credential/config resolution reasons
+# produced at this boundary; adapter/list-tools phases are sanitized separately
+# after loading and must not be admitted here by sharing one broad constant.
 MCP_UNAVAILABLE_REASONS = frozenset(
     {
         "authorization_required",
@@ -1801,7 +1805,7 @@ class WebToolConfig(BaseToolConfig):
         if self._live_db is not None:
             from sqlalchemy.orm import Session
 
-            return Session(bind=self._live_db.get_bind(), autoflush=False)
+            return Session(bind=self._live_db.get_bind().engine, autoflush=False)
         return self.get_session_factory()()
 
     async def _resolve_legacy_oauth_access_token(

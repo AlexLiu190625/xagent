@@ -158,7 +158,7 @@ def _record_public_mcp_app_audit(
     before_values: Dict[str, Any] | None,
     after_values: Dict[str, Any] | None,
 ) -> None:
-    """Add one custom catalog audit row to the caller's write transaction."""
+    """Add one catalog audit row to the caller's write transaction."""
     db.add(
         PublicMCPAppAudit(
             actor_user_id=int(actor.id),
@@ -222,21 +222,17 @@ def _apply_public_mcp_app_update(db_app: PublicMCPApp, changes: Dict[str, Any]) 
                     status_code=status.HTTP_409_CONFLICT,
                     detail=f"Built-in MCP app field '{field}' is managed by code",
                 )
-        merged = {
-            **persisted,
-            **{
-                field: value
-                for field, value in changes.items()
-                if field not in _BUILTIN_PROTECTED_FIELDS
-            },
-            **{field: canonical[field] for field in _BUILTIN_PROTECTED_FIELDS},
-        }
-        _validate_public_mcp_app_values(merged)
         writable_changes = {
             field: value
             for field, value in changes.items()
             if field not in _BUILTIN_PROTECTED_FIELDS
         }
+        merged = {
+            **persisted,
+            **writable_changes,
+            **{field: canonical[field] for field in _BUILTIN_PROTECTED_FIELDS},
+        }
+        _validate_public_mcp_app_values(merged)
     else:
         if "app_id" in changes and changes["app_id"] != db_app.app_id:
             raise HTTPException(
@@ -445,19 +441,17 @@ async def update_app(
     if not db_app:
         raise HTTPException(status_code=404, detail="App not found")
 
-    is_builtin = is_builtin_public_mcp_app(db_app.app_id)
     before_values = _public_mcp_app_values(db_app)
     _apply_public_mcp_app_update(db_app, app.model_dump())
-    if not is_builtin:
-        _record_public_mcp_app_audit(
-            db,
-            actor=actor,
-            request=request,
-            action="update",
-            app_id=db_app.app_id,
-            before_values=before_values,
-            after_values=_public_mcp_app_values(db_app),
-        )
+    _record_public_mcp_app_audit(
+        db,
+        actor=actor,
+        request=request,
+        action="update",
+        app_id=db_app.app_id,
+        before_values=before_values,
+        after_values=_public_mcp_app_values(db_app),
+    )
 
     _commit_public_mcp_app_write(db)
     db.refresh(db_app)
@@ -476,19 +470,17 @@ async def patch_app(
     if not db_app:
         raise HTTPException(status_code=404, detail="App not found")
 
-    is_builtin = is_builtin_public_mcp_app(db_app.app_id)
     before_values = _public_mcp_app_values(db_app)
     _apply_public_mcp_app_update(db_app, app.model_dump(exclude_unset=True))
-    if not is_builtin:
-        _record_public_mcp_app_audit(
-            db,
-            actor=actor,
-            request=request,
-            action="update",
-            app_id=db_app.app_id,
-            before_values=before_values,
-            after_values=_public_mcp_app_values(db_app),
-        )
+    _record_public_mcp_app_audit(
+        db,
+        actor=actor,
+        request=request,
+        action="update",
+        app_id=db_app.app_id,
+        before_values=before_values,
+        after_values=_public_mcp_app_values(db_app),
+    )
 
     _commit_public_mcp_app_write(db)
     db.refresh(db_app)
