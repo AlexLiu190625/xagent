@@ -3939,6 +3939,8 @@ Build when you need.`,
         visibleInConnectorDescription: "When disabled, this public app is completely hidden from the connector dialog for all users.",
         oauthScopes: "OAuth Scopes (comma separated)",
         launchConfig: "Launch Config (JSON)",
+        launchConfigGuidance: "Provide a JSON object with the runtime command, arguments, and optional environment mappings.",
+        managedFieldsDescription: "Identity, transport, OAuth scopes, and launch configuration are managed by the application. Presentation fields remain editable.",
         invalidJson: "Invalid JSON in launch_config"
       }
     },

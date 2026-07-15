@@ -47,7 +47,98 @@ interface PublicMCPApp {
   category: string | null
   oauth_scopes: string[] | null
   is_visible_in_connector: boolean
-  launch_config: any | null
+  launch_config: Record<string, unknown> | null
+  is_builtin: boolean
+}
+
+type PublicMCPAppForm = Omit<
+  Partial<PublicMCPApp>,
+  "oauth_scopes" | "launch_config"
+> & {
+  oauth_scopes?: string[] | string | null
+  launch_config?: Record<string, unknown> | string | null
+}
+
+type PublicMCPAppMutation = Pick<
+  PublicMCPApp,
+  | "app_id"
+  | "name"
+  | "description"
+  | "icon"
+  | "transport"
+  | "provider_name"
+  | "category"
+  | "oauth_scopes"
+  | "is_visible_in_connector"
+  | "launch_config"
+>
+
+const APP_MUTATION_FIELDS: (keyof PublicMCPAppMutation)[] = [
+  "app_id",
+  "name",
+  "description",
+  "icon",
+  "transport",
+  "provider_name",
+  "category",
+  "oauth_scopes",
+  "is_visible_in_connector",
+  "launch_config",
+]
+
+const APP_EDIT_FIELDS = APP_MUTATION_FIELDS.filter((field) => field !== "app_id")
+
+const BUILTIN_PRESENTATION_FIELDS = new Set<keyof PublicMCPAppMutation>([
+  "description",
+  "icon",
+  "category",
+  "is_visible_in_connector",
+])
+
+function cloneApp(app: PublicMCPApp): PublicMCPApp {
+  return JSON.parse(JSON.stringify(app)) as PublicMCPApp
+}
+
+function deepEqual(left: unknown, right: unknown): boolean {
+  if (Object.is(left, right)) return true
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return Array.isArray(left)
+      && Array.isArray(right)
+      && left.length === right.length
+      && left.every((item, index) => deepEqual(item, right[index]))
+  }
+  if (
+    left === null
+    || right === null
+    || typeof left !== "object"
+    || typeof right !== "object"
+  ) return false
+
+  const leftRecord = left as Record<string, unknown>
+  const rightRecord = right as Record<string, unknown>
+  const leftKeys = Object.keys(leftRecord)
+  const rightKeys = Object.keys(rightRecord)
+  return leftKeys.length === rightKeys.length
+    && leftKeys.every((key) => (
+      Object.prototype.hasOwnProperty.call(rightRecord, key)
+      && deepEqual(leftRecord[key], rightRecord[key])
+    ))
+}
+
+function buildAppUpdateDelta(
+  current: PublicMCPAppMutation,
+  baseline: PublicMCPApp,
+): Partial<PublicMCPAppMutation> {
+  const fields = baseline.is_builtin
+    ? APP_EDIT_FIELDS.filter((field) => BUILTIN_PRESENTATION_FIELDS.has(field))
+    : APP_EDIT_FIELDS
+
+  return fields.reduce<Partial<PublicMCPAppMutation>>((delta, field) => {
+    if (!deepEqual(current[field], baseline[field])) {
+      Object.assign(delta, { [field]: current[field] })
+    }
+    return delta
+  }, {})
 }
 
 export default function AdminMcpPage() {
@@ -70,6 +161,7 @@ export default function AdminMcpPage() {
 
   const [editingProviderId, setEditingProviderId] = useState<number | null>(null)
   const [editingAppId, setEditingAppId] = useState<number | null>(null)
+  const [editingAppBaseline, setEditingAppBaseline] = useState<PublicMCPApp | null>(null)
 
   // New Provider Form
   const [newProvider, setNewProvider] = useState<Partial<OAuthProvider>>({
@@ -78,7 +170,7 @@ export default function AdminMcpPage() {
   })
 
   // New App Form
-  const [newApp, setNewApp] = useState<Partial<PublicMCPApp>>({
+  const [newApp, setNewApp] = useState<PublicMCPAppForm>({
     app_id: "", name: "", description: "", icon: "", transport: "oauth",
     category: "Communication", oauth_scopes: [], is_visible_in_connector: true, launch_config: "{}"
   })
@@ -135,13 +227,15 @@ export default function AdminMcpPage() {
   }
 
   const handleEditApp = (a: PublicMCPApp) => {
+    const baseline = cloneApp(a)
     setEditingAppId(a.id)
     setNewApp({
-      ...a,
-      oauth_scopes: a.oauth_scopes ? a.oauth_scopes.join(", ") : "" as any,
-      launch_config: typeof a.launch_config === 'string' ? a.launch_config : JSON.stringify(a.launch_config, null, 2)
+      ...baseline,
+      oauth_scopes: baseline.oauth_scopes ? baseline.oauth_scopes.join(", ") : "" as any,
+      launch_config: typeof baseline.launch_config === 'string' ? baseline.launch_config : JSON.stringify(baseline.launch_config, null, 2)
     })
-    setSelectedProviderName(a.provider_name || "none")
+    setEditingAppBaseline(baseline)
+    setSelectedProviderName(baseline.provider_name || "none")
     setIsAddModalOpen(true)
     setStep(2)
     setIsStandaloneProvider(false)
@@ -180,23 +274,18 @@ export default function AdminMcpPage() {
   const handleToggleAppVisibility = async (app: PublicMCPApp, checked: boolean) => {
     setTogglingAppId(app.id)
     try {
-      const payload = {
-        ...app,
-        is_visible_in_connector: checked,
-        launch_config: app.launch_config || {},
-        oauth_scopes: app.oauth_scopes || [],
-      }
       const res = await apiRequest(`${getApiUrl()}/api/admin/mcp/apps/${app.id}`, {
-        method: 'PUT',
+        method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
+        body: JSON.stringify({ is_visible_in_connector: checked })
       })
 
       if (res.ok) {
+        const saved = cloneApp(await res.json())
         setApps((prev) =>
           prev.map((item) =>
             item.id === app.id
-              ? { ...item, is_visible_in_connector: checked }
+              ? saved
               : item
           )
         )
@@ -271,43 +360,60 @@ export default function AdminMcpPage() {
 
   const handleNextStep2 = async () => {
     try {
-      let parsedConfig = {}
+      let parsedConfig: Record<string, unknown> = {}
       try {
         if (typeof newApp.launch_config === 'string') {
           const raw = newApp.launch_config.trim()
           parsedConfig = raw === "" ? {} : JSON.parse(raw)
         } else {
-          parsedConfig = newApp.launch_config
+          parsedConfig = newApp.launch_config ?? {}
         }
       } catch (e) {
         toast.error(t("adminMcp.apps.form.invalidJson"))
         return
       }
 
-      const appData = {
-        ...newApp,
+      const appData: PublicMCPAppMutation = {
+        app_id: newApp.app_id || "",
+        name: newApp.name || "",
+        description: newApp.description ?? null,
+        icon: newApp.icon ?? null,
+        transport: newApp.transport || "oauth",
         provider_name: selectedProviderName === "none" ? null : selectedProviderName,
+        category: newApp.category ?? null,
         launch_config: parsedConfig,
         oauth_scopes: typeof newApp.oauth_scopes === 'string'
           ? (newApp.oauth_scopes as string).split(',').map(s => s.trim()).filter(Boolean)
-          : newApp.oauth_scopes
+          : newApp.oauth_scopes ?? null,
+        is_visible_in_connector: newApp.is_visible_in_connector ?? true,
       }
 
       const isEdit = editingAppId !== null
+      if (isEdit && !editingAppBaseline) {
+        toast.error(t("adminMcp.apps.saveFailed"))
+        return
+      }
       const url = isEdit
         ? `${getApiUrl()}/api/admin/mcp/apps/${editingAppId}`
         : `${getApiUrl()}/api/admin/mcp/apps`
-      const method = isEdit ? 'PUT' : 'POST'
+      const method = isEdit ? 'PATCH' : 'POST'
+      const payload = isEdit
+        ? buildAppUpdateDelta(appData, editingAppBaseline as PublicMCPApp)
+        : appData
 
       const res = await apiRequest(url, {
         method,
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(appData)
+        body: JSON.stringify(payload)
       })
 
       if (res.ok) {
+        const saved = cloneApp(await res.json())
         toast.success(isEdit ? (t("adminMcp.apps.saveSuccess")) : (t("adminMcp.apps.saveSuccess")))
-        fetchData()
+        setApps((prev) => isEdit
+          ? prev.map((item) => item.id === saved.id ? saved : item)
+          : [...prev, saved]
+        )
         setIsAddModalOpen(false)
       } else {
         toast.error(isEdit ? (t("adminMcp.apps.saveFailed")) : (t("adminMcp.apps.saveFailed")))
@@ -324,6 +430,7 @@ export default function AdminMcpPage() {
         setStep(1)
         setEditingProviderId(null)
         setEditingAppId(null)
+        setEditingAppBaseline(null)
         setIsCreatingProvider(false)
         setNewProvider({ provider_name: "", name: "", client_id: "", client_secret: "", auth_url: "", token_url: "", redirect_uri: "", userinfo_url: "", user_id_path: "id", email_path: "email", default_scopes: [] })
         setNewApp({ app_id: "", name: "", description: "", icon: "", transport: "oauth", category: "Communication", oauth_scopes: [], is_visible_in_connector: true, launch_config: "{}" })
@@ -607,7 +714,11 @@ export default function AdminMcpPage() {
                         <div className="space-y-4">
                           <div className="space-y-2">
                             <Label>{t("adminMcp.providers.form.selectLabel")}</Label>
-                            <Select value={selectedProviderName} onValueChange={setSelectedProviderName}>
+                            <Select
+                              value={selectedProviderName}
+                              onValueChange={setSelectedProviderName}
+                              disabled={editingAppBaseline?.is_builtin}
+                            >
                               <SelectTrigger>
                                 <SelectValue placeholder={t("adminMcp.providers.form.selectPlaceholder")} />
                               </SelectTrigger>
@@ -621,7 +732,11 @@ export default function AdminMcpPage() {
                           </div>
                           <div className="pt-4 border-t flex flex-col items-center">
                             <span className="text-sm text-muted-foreground mb-4">{t("adminMcp.providers.form.orCreateNew")}</span>
-                            <Button variant="outline" onClick={() => setIsCreatingProvider(true)}>
+                            <Button
+                              variant="outline"
+                              disabled={editingAppBaseline?.is_builtin}
+                              onClick={() => setIsCreatingProvider(true)}
+                            >
                               <Plus className="w-4 h-4 mr-2" /> {t("adminMcp.providers.form.addNew")}
                             </Button>
                           </div>
@@ -692,14 +807,19 @@ export default function AdminMcpPage() {
                   label: t("adminMcp.modal.step2"),
                   content: (
                     <div className="grid gap-4 py-4">
+                      {editingAppBaseline?.is_builtin && (
+                        <p className="rounded-md border bg-muted/50 px-3 py-2 text-xs text-muted-foreground">
+                          {t("adminMcp.apps.form.managedFieldsDescription")}
+                        </p>
+                      )}
                       <div className="grid grid-cols-2 gap-4">
                         <div className="space-y-2">
                           <Label>{t("adminMcp.apps.form.appId")}</Label>
-                          <Input value={newApp.app_id} onChange={e => setNewApp({ ...newApp, app_id: e.target.value })} />
+                          <Input disabled={editingAppId !== null} value={newApp.app_id} onChange={e => setNewApp({ ...newApp, app_id: e.target.value })} />
                         </div>
                         <div className="space-y-2">
                           <Label>{t("adminMcp.apps.form.displayName")}</Label>
-                          <Input value={newApp.name} onChange={e => setNewApp({ ...newApp, name: e.target.value })} />
+                          <Input disabled={editingAppBaseline?.is_builtin} value={newApp.name} onChange={e => setNewApp({ ...newApp, name: e.target.value })} />
                         </div>
                       </div>
                       <div className="space-y-2">
@@ -732,7 +852,11 @@ export default function AdminMcpPage() {
                       </div>
                       <div className="space-y-2">
                         <Label>{t("adminMcp.apps.form.transport")}</Label>
-                        <Select value={newApp.transport} onValueChange={v => setNewApp({ ...newApp, transport: v })}>
+                        <Select
+                          value={newApp.transport}
+                          onValueChange={v => setNewApp({ ...newApp, transport: v })}
+                          disabled={editingAppBaseline?.is_builtin}
+                        >
                           <SelectTrigger>
                             <SelectValue />
                           </SelectTrigger>
@@ -758,13 +882,22 @@ export default function AdminMcpPage() {
                       {newApp.transport === "oauth" && (
                         <div className="space-y-2">
                           <Label>{t("adminMcp.apps.form.oauthScopes")}</Label>
-                          <Input value={(newApp.oauth_scopes as any) || ""} onChange={e => setNewApp({ ...newApp, oauth_scopes: e.target.value as any })} />
+                          <Input
+                            disabled={editingAppBaseline?.is_builtin}
+                            value={Array.isArray(newApp.oauth_scopes) ? newApp.oauth_scopes.join(", ") : newApp.oauth_scopes || ""}
+                            onChange={e => setNewApp({ ...newApp, oauth_scopes: e.target.value })}
+                          />
                         </div>
                       )}
                       <div className="space-y-2">
                         <Label>{t("adminMcp.apps.form.launchConfig")}</Label>
-                        <p className="text-xs text-muted-foreground">Example: {`{"command": "uv", "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"], "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"}}`}</p>
+                        {!editingAppBaseline?.is_builtin && (
+                          <p className="text-xs text-muted-foreground">
+                            {t("adminMcp.apps.form.launchConfigGuidance")}
+                          </p>
+                        )}
                         <Textarea
+                          disabled={editingAppBaseline?.is_builtin}
                           value={typeof newApp.launch_config === 'string' ? newApp.launch_config : JSON.stringify(newApp.launch_config, null, 2)}
                           onChange={e => setNewApp({ ...newApp, launch_config: e.target.value })}
                           className="font-mono text-xs"
