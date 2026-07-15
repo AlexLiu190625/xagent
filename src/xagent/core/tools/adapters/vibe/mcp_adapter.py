@@ -10,6 +10,8 @@ import logging
 import os
 import re
 from collections.abc import Iterator
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Type, Union, cast
 
 import httpx
@@ -35,6 +37,37 @@ from .sandboxed_tool.sandboxed_mcp_tool_helper import (
     load_sandboxed_mcp_tools,
     should_sandbox_mcp_connection,
 )
+
+
+class MCPFailurePhase(str, Enum):
+    """Public-safe phase where an MCP server failed to load."""
+
+    SESSION_START = "session_start"
+    INITIALIZE = "initialize"
+    LIST_TOOLS = "list_tools"
+    ADAPTER_CONSTRUCTION = "adapter_construction"
+    SANDBOX_LIST_TOOLS = "sandbox_list_tools"
+    SANDBOX_TOOL_WRAP = "sandbox_tool_wrap"
+    NO_TOOLS_RETURNED = "no_tools_returned"
+
+
+@dataclass(frozen=True)
+class MCPServerLoadFailure:
+    """Safe MCP load failure data that excludes raw exception details."""
+
+    server_name: str
+    phase: MCPFailurePhase
+    error_type: str | None
+    attempts: int = 1
+
+
+@dataclass(frozen=True)
+class MCPLoadResult:
+    """Structured outcome for loading one or more MCP servers."""
+
+    tools: tuple[AbstractBaseTool, ...]
+    loaded_servers: tuple[str, ...]
+    failures: tuple[MCPServerLoadFailure, ...]
 
 
 class EmptyArgsModel(BaseModel):
@@ -1046,33 +1079,68 @@ async def _load_direct_mcp_tools(
     name_prefix: str,
     visibility: Optional[ToolVisibility],
     allow_users: Optional[List[str]],
-) -> list[AbstractBaseTool]:
+) -> MCPLoadResult:
     """Load MCP tools directly on the host."""
     agent_tools: list[AbstractBaseTool] = []
     mcp_tools: list[MCPTool] = []
-    last_error: Exception = RuntimeError(f"Failed to load tools from {server_name}")
     transport = connection.get("transport", "")
     non_retryable = {"oauth", "unknown"}
     max_attempts = 1 if transport in non_retryable else 3
     concurrency_safe, concurrent_tools = _connection_concurrency_config(connection)
+    failure_phase = MCPFailurePhase.SESSION_START
+    error_type: str | None = None
 
     for attempt in range(max_attempts):
+        current_phase = MCPFailurePhase.SESSION_START
         try:
             async with create_session(connection) as session:
+                current_phase = MCPFailurePhase.INITIALIZE
                 await session.initialize()
                 # Use the shared loader to keep pagination behavior consistent.
+                current_phase = MCPFailurePhase.LIST_TOOLS
                 mcp_tools = await load_mcp_tools(session)
             break
         except Exception as e:
-            last_error = e
+            failure_phase = current_phase
+            error_type = type(e).__name__
             if attempt < max_attempts - 1:
                 logger.warning(
-                    f"Attempt {attempt + 1} failed to load tools from MCP server {server_name}: {e}, retrying..."
+                    "Attempt %d failed to load tools from MCP server %s during "
+                    "%s (%s); retrying",
+                    attempt + 1,
+                    server_name,
+                    current_phase.value,
+                    error_type,
                 )
                 await asyncio.sleep(1)
     else:
-        raise last_error
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=server_name,
+                    phase=failure_phase,
+                    error_type=error_type,
+                    attempts=max_attempts,
+                ),
+            ),
+        )
 
+    if not mcp_tools:
+        return MCPLoadResult(
+            tools=(),
+            loaded_servers=(),
+            failures=(
+                MCPServerLoadFailure(
+                    server_name=server_name,
+                    phase=MCPFailurePhase.NO_TOOLS_RETURNED,
+                    error_type=None,
+                ),
+            ),
+        )
+
+    adapter_error_type: str | None = None
     for mcp_tool in mcp_tools:
         try:
             adapter = _build_mcp_tool_adapter(
@@ -1090,10 +1158,30 @@ async def _load_direct_mcp_tools(
             logger.debug(f"Created adapter for tool: {adapter.name}")
 
         except Exception as e:
-            logger.error(f"Failed to create adapter for tool {mcp_tool.name}: {e}")
+            adapter_error_type = adapter_error_type or type(e).__name__
+            logger.error(
+                "Failed to create adapter for MCP tool %s from server %s (%s)",
+                mcp_tool.name,
+                server_name,
+                type(e).__name__,
+            )
             continue
 
-    return agent_tools
+    failures: tuple[MCPServerLoadFailure, ...] = ()
+    if adapter_error_type is not None:
+        failures = (
+            MCPServerLoadFailure(
+                server_name=server_name,
+                phase=MCPFailurePhase.ADAPTER_CONSTRUCTION,
+                error_type=adapter_error_type,
+            ),
+        )
+
+    return MCPLoadResult(
+        tools=tuple(agent_tools),
+        loaded_servers=(server_name,) if agent_tools else (),
+        failures=failures,
+    )
 
 
 async def load_mcp_tools_as_agent_tools(
@@ -1103,7 +1191,7 @@ async def load_mcp_tools_as_agent_tools(
     visibility: Optional[ToolVisibility] = None,
     allow_users: Optional[List[str]] = None,
     sandbox: Sandbox | None = None,
-) -> List[AbstractBaseTool]:
+) -> MCPLoadResult:
     """Load MCP tools from multiple servers and convert to Agent tools.
 
     Args:
@@ -1115,13 +1203,15 @@ async def load_mcp_tools_as_agent_tools(
             using npx/uvx will be routed through the sandbox for isolation.
 
     Returns:
-        List of MCP-backed agent tools, including sandboxed wrappers when needed
+        Structured MCP tools, loaded server names, and public-safe failures.
 
     Notes:
-        Failures loading tools from individual MCP servers are logged and skipped.
-        The function continues processing remaining servers instead of raising.
+        Failures loading tools from individual MCP servers are preserved while
+        the function continues processing remaining servers.
     """
-    agent_tools: List[AbstractBaseTool] = []
+    agent_tools: list[AbstractBaseTool] = []
+    loaded_servers: list[str] = []
+    failures: list[MCPServerLoadFailure] = []
 
     for server_name, connection in connection_map.items():
         try:
@@ -1149,27 +1239,93 @@ async def load_mcp_tools_as_agent_tools(
                         concurrent_tools=_concurrent_tools,
                     )
 
-                server_tools = await load_sandboxed_mcp_tools(
-                    connection,
-                    sandbox,
-                    tool_builder,
-                )
+                try:
+                    sandbox_result = await load_sandboxed_mcp_tools(
+                        connection,
+                        sandbox,
+                        tool_builder,
+                    )
+                except Exception as e:
+                    error_type = type(e).__name__
+                    logger.error(
+                        "Failed to list sandboxed MCP tools from server %s (%s)",
+                        server_name,
+                        error_type,
+                    )
+                    failures.append(
+                        MCPServerLoadFailure(
+                            server_name=server_name,
+                            phase=MCPFailurePhase.SANDBOX_LIST_TOOLS,
+                            error_type=error_type,
+                        )
+                    )
+                    continue
+
+                server_tools = sandbox_result.tools
+                if sandbox_result.adapter_error_types:
+                    failures.append(
+                        MCPServerLoadFailure(
+                            server_name=server_name,
+                            phase=MCPFailurePhase.ADAPTER_CONSTRUCTION,
+                            error_type=sandbox_result.adapter_error_types[0],
+                        )
+                    )
+                elif sandbox_result.wrap_error_types:
+                    failures.append(
+                        MCPServerLoadFailure(
+                            server_name=server_name,
+                            phase=MCPFailurePhase.SANDBOX_TOOL_WRAP,
+                            error_type=sandbox_result.wrap_error_types[0],
+                        )
+                    )
+                elif not server_tools:
+                    failures.append(
+                        MCPServerLoadFailure(
+                            server_name=server_name,
+                            phase=MCPFailurePhase.NO_TOOLS_RETURNED,
+                            error_type=None,
+                        )
+                    )
             else:
-                server_tools = await _load_direct_mcp_tools(
+                direct_result = await _load_direct_mcp_tools(
                     server_name,
                     connection,
                     name_prefix=name_prefix,
                     visibility=visibility,
                     allow_users=allow_users,
                 )
+                server_tools = direct_result.tools
+                failures.extend(direct_result.failures)
 
             agent_tools.extend(server_tools)
+            if server_tools:
+                loaded_servers.append(server_name)
             logger.info(f"Found {len(server_tools)} tools from server {server_name}")
 
         except Exception as e:
-            logger.error(f"Failed to load tools from MCP server {server_name}: {e}")
-            # Continue with other servers rather than failing completely
+            error_type = type(e).__name__
+            logger.error(
+                "Unexpected failure loading tools from MCP server %s (%s)",
+                server_name,
+                error_type,
+            )
+            failures.append(
+                MCPServerLoadFailure(
+                    server_name=server_name,
+                    phase=MCPFailurePhase.SESSION_START,
+                    error_type=error_type,
+                )
+            )
             continue
 
-    logger.info(f"Successfully loaded {len(agent_tools)} MCP tools as Agent tools")
-    return agent_tools
+    logger.info(
+        "Loaded %d MCP tools from %d servers with %d server failures",
+        len(agent_tools),
+        len(loaded_servers),
+        len(failures),
+    )
+    return MCPLoadResult(
+        tools=tuple(agent_tools),
+        loaded_servers=tuple(loaded_servers),
+        failures=tuple(failures),
+    )

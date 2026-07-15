@@ -9,6 +9,7 @@ import logging
 import posixpath
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 
 from mcp.types import Tool as MCPTool
 
@@ -40,6 +41,15 @@ _MCP_SANDBOX_CONFIG = SandboxConfig(
 )
 
 _SANDBOX_MCP_DEPENDENCIES = SANDBOX_BASE_DEPENDENCIES + _MCP_SANDBOX_EXTRA_PACKAGES
+
+
+@dataclass(frozen=True)
+class SandboxedMCPLoadResult:
+    """Internal sandbox load outcome with public-safe failure metadata."""
+
+    tools: tuple[AbstractBaseTool, ...]
+    adapter_error_types: tuple[str, ...]
+    wrap_error_types: tuple[str, ...]
 
 
 def should_sandbox_mcp_connection(connection: Connection) -> bool:
@@ -116,9 +126,9 @@ async def list_tools_in_sandbox(
             tool_data = json.loads(output)
         except json.JSONDecodeError as e:
             logger.error(
-                "Failed to parse MCP list_tools output from %s. Raw output:\n%s",
+                "Failed to parse MCP list_tools output from %s (%s)",
                 result_file,
-                output,
+                type(e).__name__,
             )
             raise RuntimeError(f"Failed to parse MCP list_tools output: {e}") from e
 
@@ -134,22 +144,39 @@ async def load_sandboxed_mcp_tools(
     connection: Connection,
     sandbox: Sandbox,
     tool_builder: Callable[[MCPTool], AbstractBaseTool],
-) -> list[AbstractBaseTool]:
+) -> SandboxedMCPLoadResult:
     """Load MCP tool metadata in sandbox and wrap built tools for sandboxed calls."""
     mcp_tools = await list_tools_in_sandbox(sandbox, connection)
     wrapped_tools: list[AbstractBaseTool] = []
+    adapter_error_types: list[str] = []
+    wrap_error_types: list[str] = []
 
     for mcp_tool in mcp_tools:
         try:
             tool = tool_builder(mcp_tool)
+        except Exception as e:
+            logger.warning(
+                "Failed to build sandboxed MCP tool '%s' (%s)",
+                mcp_tool.name,
+                type(e).__name__,
+            )
+            adapter_error_types.append(type(e).__name__)
+            continue
+
+        try:
             set_instance_sandbox_config(tool, _MCP_SANDBOX_CONFIG)
             wrapped_tools.append(await create_sandboxed_tool(tool, sandbox))
         except Exception as e:
             logger.warning(
-                "Failed to wrap sandboxed MCP tool '%s': %s",
+                "Failed to wrap sandboxed MCP tool '%s' (%s)",
                 mcp_tool.name,
-                e,
+                type(e).__name__,
             )
+            wrap_error_types.append(type(e).__name__)
             continue
 
-    return wrapped_tools
+    return SandboxedMCPLoadResult(
+        tools=tuple(wrapped_tools),
+        adapter_error_types=tuple(adapter_error_types),
+        wrap_error_types=tuple(wrap_error_types),
+    )

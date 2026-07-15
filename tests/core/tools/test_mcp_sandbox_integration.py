@@ -5,7 +5,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from mcp.types import Tool as MCPTool
 
-from xagent.core.tools.adapters.vibe.mcp_adapter import load_mcp_tools_as_agent_tools
+from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPLoadResult,
+    load_mcp_tools_as_agent_tools,
+)
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper import (
     list_tools_in_sandbox,
     should_sandbox_mcp_connection,
@@ -90,12 +94,14 @@ class TestLoadMcpToolsAsAgentTools:
                 new=AsyncMock(),
             ) as mock_direct,
         ):
-            tools = await load_mcp_tools_as_agent_tools(
+            result = await load_mcp_tools_as_agent_tools(
                 {"demo": connection},
                 sandbox=sandbox,
             )
 
-        assert tools == [wrapped_tool]
+        assert result.tools == (wrapped_tool,)
+        assert result.loaded_servers == ("demo",)
+        assert result.failures == ()
         mock_list.assert_awaited_once_with(sandbox, connection)
         mock_wrap.assert_awaited_once()
         mock_direct.assert_not_awaited()
@@ -112,18 +118,154 @@ class TestLoadMcpToolsAsAgentTools:
         with (
             patch(
                 "xagent.core.tools.adapters.vibe.mcp_adapter._load_direct_mcp_tools",
-                new=AsyncMock(return_value=[direct_tool]),
+                new=AsyncMock(
+                    return_value=MCPLoadResult(
+                        tools=(direct_tool,), loaded_servers=("demo",), failures=()
+                    )
+                ),
             ) as mock_direct,
             patch(
                 "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.load_sandboxed_mcp_tools",
                 new=AsyncMock(),
             ) as mock_sandboxed,
         ):
-            tools = await load_mcp_tools_as_agent_tools(
+            result = await load_mcp_tools_as_agent_tools(
                 {"demo": connection},
                 sandbox=MagicMock(),
             )
 
-        assert tools == [direct_tool]
+        assert result.tools == (direct_tool,)
+        assert result.loaded_servers == ("demo",)
+        assert result.failures == ()
         mock_direct.assert_awaited_once()
         mock_sandboxed.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sandbox_list_failure_is_preserved_without_secret(self, caplog):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+            new=AsyncMock(
+                side_effect=RuntimeError("Bearer planted-sandbox-list-secret")
+            ),
+        ):
+            result = await load_mcp_tools_as_agent_tools(
+                {"demo": connection}, sandbox=MagicMock()
+            )
+
+        assert result.tools == ()
+        assert result.loaded_servers == ()
+        assert len(result.failures) == 1
+        assert result.failures[0].phase is MCPFailurePhase.SANDBOX_LIST_TOOLS
+        assert result.failures[0].error_type == "RuntimeError"
+        assert "planted-sandbox-list-secret" not in repr(result)
+        assert "planted-sandbox-list-secret" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_sandbox_wrap_failure_preserves_other_wrapped_tools(self):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+        sandbox = MagicMock(name="sandbox")
+        mcp_tools = [
+            MCPTool(
+                name="healthy",
+                description="Healthy",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            MCPTool(
+                name="broken",
+                description="Broken",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+        ]
+        wrapped_tool = MagicMock()
+
+        with (
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+                new=AsyncMock(return_value=mcp_tools),
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.create_sandboxed_tool",
+                new=AsyncMock(
+                    side_effect=[
+                        wrapped_tool,
+                        RuntimeError("Bearer planted-sandbox-wrap-secret"),
+                    ]
+                ),
+            ),
+        ):
+            result = await load_mcp_tools_as_agent_tools(
+                {"demo": connection}, sandbox=sandbox
+            )
+
+        assert result.tools == (wrapped_tool,)
+        assert result.loaded_servers == ("demo",)
+        assert len(result.failures) == 1
+        assert result.failures[0].phase is MCPFailurePhase.SANDBOX_TOOL_WRAP
+        assert result.failures[0].error_type == "RuntimeError"
+        assert "planted-sandbox-wrap-secret" not in repr(result)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_adapter_failure_is_preserved(self):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+        mcp_tool = MCPTool(
+            name="broken",
+            description="Broken",
+            inputSchema={"type": "object", "properties": {}},
+        )
+
+        with (
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+                new=AsyncMock(return_value=[mcp_tool]),
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.mcp_adapter._build_mcp_tool_adapter",
+                side_effect=ValueError("Bearer planted-builder-secret"),
+            ),
+        ):
+            result = await load_mcp_tools_as_agent_tools(
+                {"demo": connection}, sandbox=MagicMock()
+            )
+
+        assert result.tools == ()
+        assert result.loaded_servers == ()
+        assert len(result.failures) == 1
+        assert result.failures[0].phase is MCPFailurePhase.ADAPTER_CONSTRUCTION
+        assert result.failures[0].error_type == "ValueError"
+        assert "planted-builder-secret" not in repr(result)
+
+    @pytest.mark.asyncio
+    async def test_sandbox_server_with_no_tools_is_reported(self):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+
+        with patch(
+            "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+            new=AsyncMock(return_value=[]),
+        ):
+            result = await load_mcp_tools_as_agent_tools(
+                {"demo": connection}, sandbox=MagicMock()
+            )
+
+        assert result.tools == ()
+        assert result.loaded_servers == ()
+        assert len(result.failures) == 1
+        assert result.failures[0].phase is MCPFailurePhase.NO_TOOLS_RETURNED
+        assert result.failures[0].error_type is None

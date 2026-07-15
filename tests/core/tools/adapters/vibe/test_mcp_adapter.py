@@ -1,16 +1,21 @@
 import json
 from contextlib import asynccontextmanager
+from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
 
 from xagent.core.tools.adapters.vibe import mcp_adapter as mcp_adapter_module
 from xagent.core.tools.adapters.vibe.mcp_adapter import (
+    MCPFailurePhase,
+    MCPServerLoadFailure,
     MCPToolAdapter,
     _build_mcp_tool_adapter,
     _exception_indicates_http_401,
     _mcp_return_value_as_string,
+    load_mcp_tools_as_agent_tools,
 )
 
 
@@ -25,6 +30,205 @@ def _http_status_error(
         request=request,
         response=response,
     )
+
+
+def _mcp_tool(name: str = "echo") -> SimpleNamespace:
+    return SimpleNamespace(
+        name=name,
+        description=f"{name} tool",
+        inputSchema={"type": "object", "properties": {}},
+    )
+
+
+def test_mcp_server_load_failure_is_immutable():
+    failure = MCPServerLoadFailure(
+        server_name="mail",
+        phase=MCPFailurePhase.INITIALIZE,
+        error_type="RuntimeError",
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        failure.attempts = 2
+
+
+@pytest.mark.asyncio
+async def test_mcp_loader_returns_structured_success(monkeypatch):
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "load_mcp_tools",
+        AsyncMock(return_value=[_mcp_tool()]),
+    )
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"mail": {"transport": "stdio", "command": "python", "args": []}}
+    )
+
+    assert len(result.tools) == 1
+    assert result.loaded_servers == ("mail",)
+    assert result.failures == ()
+
+
+@pytest.mark.asyncio
+async def test_mcp_loader_preserves_partial_server_progress(monkeypatch):
+    class FakeSession:
+        def __init__(self, should_fail: bool):
+            self.should_fail = should_fail
+
+        async def initialize(self):
+            if self.should_fail:
+                raise ConnectionError("Bearer planted-initialize-secret")
+
+    @asynccontextmanager
+    async def fake_create_session(connection):
+        yield FakeSession(connection["command"] == "fail")
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "load_mcp_tools",
+        AsyncMock(return_value=[_mcp_tool()]),
+    )
+    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", AsyncMock())
+
+    result = await load_mcp_tools_as_agent_tools(
+        {
+            "healthy": {
+                "transport": "stdio",
+                "command": "python",
+                "args": [],
+            },
+            "broken": {"transport": "stdio", "command": "fail", "args": []},
+        }
+    )
+
+    assert len(result.tools) == 1
+    assert result.loaded_servers == ("healthy",)
+    assert len(result.failures) == 1
+    failure = result.failures[0]
+    assert failure.server_name == "broken"
+    assert failure.phase is MCPFailurePhase.INITIALIZE
+    assert failure.error_type == "ConnectionError"
+    assert failure.attempts == 3
+    assert "planted-initialize-secret" not in repr(result)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failing_stage", "expected_phase"),
+    [
+        ("session", MCPFailurePhase.SESSION_START),
+        ("initialize", MCPFailurePhase.INITIALIZE),
+        ("list_tools", MCPFailurePhase.LIST_TOOLS),
+    ],
+)
+async def test_mcp_loader_classifies_direct_failure_phase(
+    monkeypatch, caplog, failing_stage, expected_phase
+):
+    class FakeSession:
+        async def initialize(self):
+            if failing_stage == "initialize":
+                raise ValueError("Bearer planted-phase-secret")
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        if failing_stage == "session":
+            raise ValueError("Bearer planted-phase-secret")
+        yield FakeSession()
+
+    async def fake_load_tools(_session):
+        if failing_stage == "list_tools":
+            raise ValueError("Bearer planted-phase-secret")
+        return [_mcp_tool()]
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(mcp_adapter_module, "load_mcp_tools", fake_load_tools)
+    monkeypatch.setattr(mcp_adapter_module.asyncio, "sleep", AsyncMock())
+    caplog.set_level("WARNING")
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"broken": {"transport": "stdio", "command": "python", "args": []}}
+    )
+
+    assert result.tools == ()
+    assert result.loaded_servers == ()
+    assert len(result.failures) == 1
+    assert result.failures[0].phase is expected_phase
+    assert result.failures[0].error_type == "ValueError"
+    assert result.failures[0].attempts == 3
+    assert "planted-phase-secret" not in repr(result)
+    assert "planted-phase-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_mcp_loader_reports_no_tools(monkeypatch):
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(
+        mcp_adapter_module, "load_mcp_tools", AsyncMock(return_value=[])
+    )
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"empty": {"transport": "stdio", "command": "python", "args": []}}
+    )
+
+    assert result.tools == ()
+    assert result.loaded_servers == ()
+    assert len(result.failures) == 1
+    assert result.failures[0].phase is MCPFailurePhase.NO_TOOLS_RETURNED
+    assert result.failures[0].error_type is None
+
+
+@pytest.mark.asyncio
+async def test_mcp_loader_preserves_tools_when_one_adapter_fails(monkeypatch):
+    class FakeSession:
+        async def initialize(self):
+            return None
+
+    @asynccontextmanager
+    async def fake_create_session(_connection):
+        yield FakeSession()
+
+    original_builder = mcp_adapter_module._build_mcp_tool_adapter
+
+    def fake_builder(server_name, connection, mcp_tool, **kwargs):
+        if mcp_tool.name == "broken":
+            raise TypeError("adapter planted-secret")
+        return original_builder(server_name, connection, mcp_tool, **kwargs)
+
+    monkeypatch.setattr(mcp_adapter_module, "create_session", fake_create_session)
+    monkeypatch.setattr(
+        mcp_adapter_module,
+        "load_mcp_tools",
+        AsyncMock(return_value=[_mcp_tool("healthy"), _mcp_tool("broken")]),
+    )
+    monkeypatch.setattr(mcp_adapter_module, "_build_mcp_tool_adapter", fake_builder)
+
+    result = await load_mcp_tools_as_agent_tools(
+        {"partial": {"transport": "stdio", "command": "python", "args": []}}
+    )
+
+    assert len(result.tools) == 1
+    assert result.loaded_servers == ("partial",)
+    assert len(result.failures) == 1
+    assert result.failures[0].phase is MCPFailurePhase.ADAPTER_CONSTRUCTION
+    assert result.failures[0].error_type == "TypeError"
+    assert "planted-secret" not in repr(result)
 
 
 def test_build_mcp_tool_adapter_stamps_normalized_source_server():
