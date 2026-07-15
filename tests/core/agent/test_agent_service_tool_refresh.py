@@ -6,6 +6,7 @@ import pytest
 
 from xagent.core.agent.service import AgentService
 from xagent.core.tools.adapters.vibe.config import (
+    MCPToolLoadSummary,
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
 )
@@ -117,6 +118,44 @@ async def test_agent_service_refreshes_initialized_tools_when_policy_changes(
     await service._ensure_tools_initialized()
     assert {tool.name for tool in service.tools} == {"allowed"}
     assert tool_config.refresh_count == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_service_rebuild_reuses_mcp_summary_observer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class SummaryObservingConfig(RefreshingToolConfig):
+        def __init__(self) -> None:
+            super().__init__()
+            self.summaries: list[MCPToolLoadSummary] = []
+
+        async def emit_mcp_load_summary(self, summary: MCPToolLoadSummary) -> None:
+            self.summaries.append(summary)
+
+    tool_config = SummaryObservingConfig()
+    observed_config_ids: list[int] = []
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        observed_config_ids.append(id(config))
+        await config.emit_mcp_load_summary(MCPToolLoadSummary())
+        return [NamedTool("allowed")]
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="mcp-summary-observer-refresh-test",
+        id="mcp-summary-observer-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+    await service._ensure_tools_initialized()
+
+    assert observed_config_ids == [id(tool_config), id(tool_config)]
+    assert tool_config.summaries == [MCPToolLoadSummary(), MCPToolLoadSummary()]
 
 
 @pytest.mark.asyncio

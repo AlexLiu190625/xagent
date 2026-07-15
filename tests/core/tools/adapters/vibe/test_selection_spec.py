@@ -31,6 +31,7 @@ What these tests pin:
 
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError, asdict
 import re
 from pathlib import Path
 from typing import List
@@ -41,6 +42,7 @@ import pytest
 from xagent.core.tools.adapters.vibe.config import (
     BaseToolConfig,
     MCPFailurePolicy,
+    MCPToolLoadSummary,
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
 )
@@ -303,10 +305,13 @@ class _MCPConfig:
         servers: List[dict],
         selection_spec: ToolSelectionSpec | None = None,
         failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
+        observer_error: Exception | None = None,
     ):
         self._servers = servers
         self._tool_selection_spec = selection_spec
         self._failure_policy = failure_policy
+        self._observer_error = observer_error
+        self.load_summaries: list[MCPToolLoadSummary] = []
 
     def get_tool_selection_spec(self):
         return self._tool_selection_spec
@@ -320,11 +325,35 @@ class _MCPConfig:
     def get_mcp_failure_policy(self):
         return self._failure_policy
 
+    async def emit_mcp_load_summary(self, summary: MCPToolLoadSummary) -> None:
+        self.load_summaries.append(summary)
+        if self._observer_error is not None:
+            raise self._observer_error
+
 
 def test_mcp_failure_policy_defaults_to_best_effort() -> None:
     assert (
         BaseToolConfig.get_mcp_failure_policy(object()) is MCPFailurePolicy.BEST_EFFORT
     )
+
+
+def test_mcp_load_summary_is_immutable_and_has_only_safe_fields() -> None:
+    summary = MCPToolLoadSummary(
+        requested_servers=("Gmail",),
+        loaded_servers=("Gmail",),
+        failures=(),
+        successful_tool_count=1,
+    )
+
+    with pytest.raises(FrozenInstanceError):
+        summary.successful_tool_count = 2  # type: ignore[misc]
+
+    assert set(asdict(summary)) == {
+        "requested_servers",
+        "loaded_servers",
+        "failures",
+        "successful_tool_count",
+    }
 
 
 def test_required_mcp_error_message_does_not_expose_summary_values() -> None:
@@ -389,6 +418,175 @@ async def test_mcp_best_effort_keeps_unavailable_tool(monkeypatch):
     tools = await mcp_tools.create_mcp_tools(_MCPConfig([{"name": "Gmail"}]))
 
     assert tools == [unavailable]
+
+
+async def test_mcp_summary_reports_partial_success_and_same_server_failure(
+    monkeypatch,
+):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    class _LoadedTool:
+        source_server = "gmail"
+
+    gmail_failure = UnavailableMCPTool(
+        server_name="Gmail",
+        server_id=1,
+        reason="adapter_construction",
+    )
+    slack_failure = UnavailableMCPTool(
+        server_name="Slack",
+        server_id=2,
+        reason="initialize",
+    )
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        return [_LoadedTool(), gmail_failure, gmail_failure, slack_failure]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+    config = _MCPConfig([{"name": "Gmail"}, {"name": "Slack"}])
+
+    tools = await mcp_tools.create_mcp_tools(config)
+
+    assert len(tools) == 4
+    assert config.load_summaries == [
+        MCPToolLoadSummary(
+            requested_servers=("Gmail", "Slack"),
+            loaded_servers=("Gmail",),
+            failures=(
+                MCPUnavailableSummary("Gmail", "adapter_construction"),
+                MCPUnavailableSummary("Slack", "initialize"),
+            ),
+            successful_tool_count=1,
+        )
+    ]
+
+
+async def test_mcp_summary_marks_each_requested_server_without_tools(monkeypatch):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+    config = _MCPConfig([{"name": "Gmail"}, {"name": "Slack"}])
+
+    assert await mcp_tools.create_mcp_tools(config) == []
+    assert config.load_summaries[0].failures == (
+        MCPUnavailableSummary("Gmail", "no_tools_returned"),
+        MCPUnavailableSummary("Slack", "no_tools_returned"),
+    )
+
+
+async def test_mcp_scoped_selection_with_no_configs_emits_before_strict_failure():
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    config = _MCPConfig(
+        [],
+        selection_spec=ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"]),
+        failure_policy=MCPFailurePolicy.STRICT,
+    )
+
+    with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+        await mcp_tools.create_mcp_tools(config)
+
+    expected_failure = MCPUnavailableSummary("gmail", "no_tools_returned")
+    assert exc_info.value.summaries == (expected_failure,)
+    assert config.load_summaries == [
+        MCPToolLoadSummary(
+            requested_servers=("gmail",),
+            loaded_servers=(),
+            failures=(expected_failure,),
+            successful_tool_count=0,
+        )
+    ]
+
+
+async def test_mcp_plain_selection_with_no_configs_emits_zero_summary():
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    config = _MCPConfig(
+        [],
+        selection_spec=ToolSelectionSpec.from_raw(tool_categories=["mcp"]),
+    )
+
+    assert await mcp_tools.create_mcp_tools(config) == []
+    assert config.load_summaries == [MCPToolLoadSummary()]
+
+
+@pytest.mark.parametrize("policy", list(MCPFailurePolicy))
+async def test_mcp_observer_failure_never_changes_policy_outcome(
+    monkeypatch,
+    caplog,
+    policy: MCPFailurePolicy,
+):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    unavailable = UnavailableMCPTool(
+        server_name="Gmail",
+        server_id=1,
+        reason="oauth_token_required",
+    )
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        return [unavailable]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+    config = _MCPConfig(
+        [{"name": "Gmail", "config": {"token": "never-log-this"}}],
+        failure_policy=policy,
+        observer_error=RuntimeError("authorization=never-log-this"),
+    )
+
+    if policy is MCPFailurePolicy.STRICT:
+        with pytest.raises(RequiredMCPUnavailableError):
+            await mcp_tools.create_mcp_tools(config)
+    else:
+        assert await mcp_tools.create_mcp_tools(config) == [unavailable]
+
+    assert len(config.load_summaries) == 1
+    serialized = repr(asdict(config.load_summaries[0]))
+    assert "never-log-this" not in serialized
+    assert "authorization" not in serialized
+    assert "never-log-this" not in caplog.text
+    assert "RuntimeError" in caplog.text
+
+
+async def test_mcp_observer_descriptor_failure_is_best_effort(
+    monkeypatch,
+    caplog,
+):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    class _DescriptorFailureConfig(_MCPConfig):
+        @property
+        def emit_mcp_load_summary(self):
+            raise RuntimeError("descriptor-secret")
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+    config = _DescriptorFailureConfig([{"name": "Gmail"}])
+
+    assert await mcp_tools.create_mcp_tools(config) == []
+    assert "descriptor-secret" not in caplog.text
+    assert "RuntimeError" in caplog.text
 
 
 async def test_mcp_strict_policy_applies_after_server_selection(monkeypatch):

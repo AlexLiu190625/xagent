@@ -7,6 +7,7 @@ from .connector_runtime import ConnectorRuntimeError
 from .factory import register_tool
 from .config import (
     MCPFailurePolicy,
+    MCPToolLoadSummary,
     MCPUnavailableSummary,
     RequiredMCPUnavailableError,
 )
@@ -15,6 +16,125 @@ if TYPE_CHECKING:
     from .config import BaseToolConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _stable_server_names(values: Any) -> tuple[str, ...]:
+    """Return exact-string server identities once, preserving input order."""
+    from .selection_spec import normalize_mcp_server_name
+
+    names: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = value if type(value) is str else "MCP server"
+        key = normalize_mcp_server_name(name)
+        if key not in seen:
+            names.append(name)
+            seen.add(key)
+    return tuple(names)
+
+
+def _build_mcp_load_summary(
+    mcp_configs: List[dict[str, Any]],
+    tools: List[Any],
+    *,
+    requested_servers: tuple[str, ...] | None = None,
+    forced_failure_reason: str | None = None,
+) -> MCPToolLoadSummary:
+    """Build the single safe summary owned by the selected MCP boundary."""
+    from .mcp_adapter import UnavailableMCPTool
+    from .selection_spec import normalize_mcp_server_name
+
+    requested = (
+        requested_servers
+        if requested_servers is not None
+        else _stable_server_names(config.get("name") for config in mcp_configs)
+    )
+    display_by_normalized = {
+        normalize_mcp_server_name(name): name for name in requested
+    }
+
+    loaded: list[str] = []
+    loaded_keys: set[str] = set()
+    failures_by_key: dict[str, MCPUnavailableSummary] = {}
+    successful_tool_count = 0
+
+    for tool in tools:
+        if isinstance(tool, UnavailableMCPTool):
+            failure = MCPUnavailableSummary.from_values(
+                tool.server_name,
+                tool.unavailability_reason,
+            )
+            key = normalize_mcp_server_name(failure.server_name)
+            failures_by_key.setdefault(key, failure)
+            continue
+
+        successful_tool_count += 1
+        source_server = getattr(tool, "source_server", None)
+        if type(source_server) is not str:
+            continue
+        key = normalize_mcp_server_name(source_server)
+        name = display_by_normalized.get(key)
+        if name is not None and key not in loaded_keys:
+            loaded.append(name)
+            loaded_keys.add(key)
+
+    if forced_failure_reason is not None:
+        for name in requested:
+            key = normalize_mcp_server_name(name)
+            failures_by_key.setdefault(
+                key,
+                MCPUnavailableSummary.from_values(name, forced_failure_reason),
+            )
+
+    failures: list[MCPUnavailableSummary] = []
+    emitted_failure_keys: set[str] = set()
+    for name in requested:
+        key = normalize_mcp_server_name(name)
+        failure = failures_by_key.get(key)
+        if failure is None and key not in loaded_keys:
+            failure = MCPUnavailableSummary.from_values(name, "no_tools_returned")
+        if failure is not None and key not in emitted_failure_keys:
+            failures.append(failure)
+            emitted_failure_keys.add(key)
+
+    for key, failure in failures_by_key.items():
+        if key not in emitted_failure_keys:
+            failures.append(failure)
+            emitted_failure_keys.add(key)
+
+    return MCPToolLoadSummary(
+        requested_servers=requested,
+        loaded_servers=tuple(loaded),
+        failures=tuple(failures),
+        successful_tool_count=successful_tool_count,
+    )
+
+
+async def _emit_mcp_load_summary(
+    config: "BaseToolConfig", summary: MCPToolLoadSummary
+) -> None:
+    try:
+        emitter = getattr(config, "emit_mcp_load_summary", None)
+        if not callable(emitter):
+            return
+        await emitter(summary)
+    except Exception as exc:
+        logger.warning(
+            "Failed to emit MCP load summary (%s)",
+            type(exc).__name__,
+        )
+
+
+async def _finish_mcp_setup(
+    config: "BaseToolConfig",
+    summary: MCPToolLoadSummary,
+    tools: List[Any],
+) -> List[Any]:
+    """Emit once before enforcing the caller-owned setup policy."""
+    await _emit_mcp_load_summary(config, summary)
+    if config.get_mcp_failure_policy() is MCPFailurePolicy.STRICT and summary.failures:
+        raise RequiredMCPUnavailableError(summary.failures)
+    return tools
 
 
 @register_tool(categories={"mcp"}, selection_gate="mcp")
@@ -43,8 +163,16 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     if spec is not None and not spec.includes_mcp():
         return []
     mcp_configs = await config.get_mcp_server_configs()
+    requested_without_configs: tuple[str, ...] = ()
+    if not mcp_configs and spec is not None:
+        scoped = spec.scoped_mcp_servers()
+        if scoped:
+            requested_without_configs = _stable_server_names(sorted(scoped))
     if not mcp_configs:
-        return []
+        summary = _build_mcp_load_summary(
+            [], [], requested_servers=requested_without_configs
+        )
+        return await _finish_mcp_setup(config, summary, [])
 
     # Pre-build per-server restriction comes from the single policy method
     # ``spec.scoped_mcp_servers()`` so it stays consistent with the parent/
@@ -69,40 +197,36 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
                 if normalize_mcp_server_name(cfg.get("name", "")) in scoped
             ]
             if not mcp_configs:
-                return []
+                requested_servers = _stable_server_names(sorted(scoped))
+                summary = _build_mcp_load_summary(
+                    [], [], requested_servers=requested_servers
+                )
+                return await _finish_mcp_setup(config, summary, [])
 
     try:
         from .factory import ToolFactory
-        from .mcp_adapter import UnavailableMCPTool
 
         tools = await ToolFactory._create_mcp_tools_from_configs(
             mcp_configs,
             sandbox=config.get_sandbox(),
         )
-        policy = config.get_mcp_failure_policy()
-        if policy is MCPFailurePolicy.STRICT:
-            unavailable = [
-                MCPUnavailableSummary.from_values(
-                    tool.server_name,
-                    tool.unavailability_reason,
-                )
-                for tool in tools
-                if isinstance(tool, UnavailableMCPTool)
-            ]
-            if unavailable:
-                raise RequiredMCPUnavailableError(unavailable)
-            if not tools:
-                raise RequiredMCPUnavailableError(
-                    MCPUnavailableSummary.from_values(
-                        mcp_config.get("name"), "no_tools_returned"
-                    )
-                    for mcp_config in mcp_configs
-                )
-        return tools
     except ConnectorRuntimeError:
-        raise
-    except RequiredMCPUnavailableError:
+        summary = _build_mcp_load_summary(
+            mcp_configs,
+            [],
+            forced_failure_reason="runtime_connection_failed",
+        )
+        await _emit_mcp_load_summary(config, summary)
         raise
     except Exception as e:
         logger.warning("Failed to create MCP tools (%s)", type(e).__name__)
-        return []
+        tools = []
+        summary = _build_mcp_load_summary(
+            mcp_configs,
+            tools,
+            forced_failure_reason="loader_failed",
+        )
+    else:
+        summary = _build_mcp_load_summary(mcp_configs, tools)
+
+    return await _finish_mcp_setup(config, summary, tools)

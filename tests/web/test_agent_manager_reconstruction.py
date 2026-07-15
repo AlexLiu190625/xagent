@@ -384,6 +384,7 @@ class TestAgentServiceManagerReconstruction:
             create_all_tools,
         )
 
+        task_tracer = object()
         with patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None):
             _tools, tool_config = await agent_manager._build_tools_for_task(
                 task_id=sample_task.id,
@@ -397,9 +398,12 @@ class TestAgentServiceManagerReconstruction:
                 },
                 task_llm=None,
                 task_vision_llm=None,
+                parent_tracer=task_tracer,
             )
 
         assert tool_config.get_mcp_failure_policy() is expected_policy
+        assert tool_config._mcp_load_summary_tracer is task_tracer
+        assert tool_config._mcp_load_summary_trace_task_id == str(sample_task.id)
 
     @pytest.mark.asyncio
     async def test_get_agent_for_task_existing_task_with_reconstruction(

@@ -516,6 +516,8 @@ async def create_default_tools(
     scope: Optional[ExecutionScope] = None,
     connector_runtime_turn_id: Optional[str] = None,
     mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
+    mcp_load_summary_tracer: Optional[Any] = None,
+    mcp_load_summary_trace_task_id: Optional[str] = None,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -581,6 +583,8 @@ async def create_default_tools(
         agent_call_stack=agent_call_stack,
         connector_runtime_turn_id=connector_runtime_turn_id,
         mcp_failure_policy=mcp_failure_policy,
+        mcp_load_summary_tracer=mcp_load_summary_tracer,
+        mcp_load_summary_trace_task_id=mcp_load_summary_trace_task_id,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -1371,6 +1375,8 @@ class AgentServiceManager:
             else None,
             connector_runtime_turn_id=None,
             mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
+            mcp_load_summary_tracer=parent_tracer,
+            mcp_load_summary_trace_task_id=str(task_id),
         )
 
     async def get_agent_for_task(
@@ -1949,6 +1955,8 @@ class AgentServiceManager:
                     mcp_failure_policy=_mcp_failure_policy_for_task_source(
                         task.source if task is not None else None
                     ),
+                    mcp_load_summary_tracer=tracer,
+                    mcp_load_summary_trace_task_id=str(task_id),
                 )
 
                 with UserContext(runtime_user_id):

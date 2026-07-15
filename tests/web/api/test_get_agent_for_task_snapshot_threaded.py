@@ -306,6 +306,7 @@ async def test_snapshot_source_controls_mcp_failure_policy(
     db.query.return_value.filter.return_value.first.return_value = task_row
     create_tools = AsyncMock(return_value=([], MagicMock()))
 
+    tracer = MagicMock()
     with (
         patch(
             "xagent.web.api.chat.load_task_setup_snapshot_sync",
@@ -313,7 +314,7 @@ async def test_snapshot_source_controls_mcp_failure_policy(
         ),
         patch.object(manager, "_load_persisted_conversation_history"),
         patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
-        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=tracer),
         patch("xagent.web.api.chat.create_default_tools", new=create_tools),
         patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
         patch("xagent.web.api.chat.AgentService"),
@@ -321,6 +322,8 @@ async def test_snapshot_source_controls_mcp_failure_policy(
         await manager.get_agent_for_task(task_id=42, db=db, user=user)
 
     assert create_tools.await_args.kwargs["mcp_failure_policy"] is expected_policy
+    assert create_tools.await_args.kwargs["mcp_load_summary_tracer"] is tracer
+    assert create_tools.await_args.kwargs["mcp_load_summary_trace_task_id"] == "42"
 
 
 @pytest.mark.asyncio

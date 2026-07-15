@@ -22,6 +22,7 @@ from ...core.agent.result import ClassifiedToolFailure, normalize_tool_failure_c
 from ...core.tools.adapters.vibe.config import (
     BaseToolConfig,
     MCPFailurePolicy,
+    MCPToolLoadSummary,
     normalize_tool_allowlist,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -468,6 +469,8 @@ class WebToolConfig(BaseToolConfig):
         execution_scope: Optional[Any] = None,
         connector_runtime_turn_id: Optional[str] = None,
         mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
+        mcp_load_summary_tracer: Optional[Any] = None,
+        mcp_load_summary_trace_task_id: Optional[str] = None,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -476,6 +479,8 @@ class WebToolConfig(BaseToolConfig):
         # to the ``_SpecAll`` ALL-mode (build every default tool).
         self._tool_selection_spec = tool_selection_spec
         self._mcp_failure_policy = mcp_failure_policy
+        self._mcp_load_summary_tracer = mcp_load_summary_tracer
+        self._mcp_load_summary_trace_task_id = mcp_load_summary_trace_task_id
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -987,6 +992,33 @@ class WebToolConfig(BaseToolConfig):
 
     def get_mcp_failure_policy(self) -> MCPFailurePolicy:
         return self._mcp_failure_policy
+
+    async def emit_mcp_load_summary(self, summary: MCPToolLoadSummary) -> None:
+        """Persist one fixed-schema MCP setup audit event when configured."""
+        if self._mcp_load_summary_tracer is None:
+            return
+
+        from ...core.agent.trace import SYSTEM_INFO
+
+        await self._mcp_load_summary_tracer.trace_event(
+            SYSTEM_INFO,
+            task_id=self._mcp_load_summary_trace_task_id,
+            data={
+                "__audit_only__": True,
+                "event_type": "mcp_load_summary",
+                "requested_servers": list(summary.requested_servers),
+                "loaded_servers": list(summary.loaded_servers),
+                "failures": [
+                    {
+                        "server_name": failure.server_name,
+                        "reason": failure.reason,
+                    }
+                    for failure in summary.failures
+                ],
+                "successful_tool_count": summary.successful_tool_count,
+            },
+            require_persisted=False,
+        )
 
     def get_allowed_agent_ids(self) -> Optional[List[int]]:
         """Get explicitly allowed published agent IDs. None means use defaults."""

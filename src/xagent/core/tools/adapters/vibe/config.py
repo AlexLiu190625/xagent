@@ -70,6 +70,16 @@ class MCPUnavailableSummary:
         return cls(server_name=safe_server_name, reason=safe_reason)
 
 
+@dataclass(frozen=True)
+class MCPToolLoadSummary:
+    """Immutable, public-safe outcome of one selected MCP setup attempt."""
+
+    requested_servers: tuple[str, ...] = ()
+    loaded_servers: tuple[str, ...] = ()
+    failures: tuple[MCPUnavailableSummary, ...] = ()
+    successful_tool_count: int = 0
+
+
 class RequiredMCPUnavailableError(RuntimeError):
     """A selected MCP dependency is unavailable under strict setup policy."""
 
@@ -168,6 +178,10 @@ class BaseToolConfig(ABC):
     def get_mcp_failure_policy(self) -> MCPFailurePolicy:
         """Return the MCP setup failure policy for this execution."""
         return MCPFailurePolicy.BEST_EFFORT
+
+    async def emit_mcp_load_summary(self, summary: MCPToolLoadSummary) -> None:
+        """Observe an MCP setup outcome without changing setup behavior."""
+        return None
 
     @abstractmethod
     def get_file_tools_enabled(self) -> bool:
