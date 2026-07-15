@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import os
 from typing import Any
 
@@ -109,8 +110,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["openid", "profile", "email", "w_member_social"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.linkedin"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.linkedin"],
                 "env_mapping": {"LINKEDIN_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -125,8 +126,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.gmail"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -141,13 +142,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["https://www.googleapis.com/auth/drive"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": [
-                    "run",
-                    "python",
-                    "-m",
-                    "xagent.web.tools.mcp.google_drive",
-                ],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.google_drive"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -162,8 +158,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["https://www.googleapis.com/auth/calendar"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.calendar"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.calendar"],
                 "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -185,8 +181,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.teams"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.teams"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -206,8 +202,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.outlook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.outlook"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -222,8 +218,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             "oauth_scopes": ["Files.ReadWrite"],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.onedrive"],
                 "env_mapping": {"AUTH_TOKEN": "access_token"},
             },
         },
@@ -242,8 +238,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.facebook"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -263,8 +259,8 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             ],
             "is_visible_in_connector": True,
             "launch_config": {
-                "command": "uv",
-                "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.instagram"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
             },
         },
@@ -287,6 +283,35 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
             },
         },
     ]
+
+
+_BUILTIN_EXECUTION_FIELD_NAMES = (
+    "name",
+    "transport",
+    "provider_name",
+    "oauth_scopes",
+    "launch_config",
+)
+
+
+def get_builtin_public_mcp_app(app_id: str) -> dict[str, Any] | None:
+    for row in get_builtin_public_mcp_app_rows():
+        if row["app_id"] == app_id:
+            return deepcopy(row)
+    return None
+
+
+def is_builtin_public_mcp_app(app_id: str) -> bool:
+    return any(row["app_id"] == app_id for row in get_builtin_public_mcp_app_rows())
+
+
+def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
+    row = get_builtin_public_mcp_app(app_id)
+    if row is None:
+        return None
+    return deepcopy(
+        {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
+    )
 
 
 def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any]:

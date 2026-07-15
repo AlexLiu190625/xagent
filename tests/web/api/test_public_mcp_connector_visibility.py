@@ -561,8 +561,8 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "Chat.ReadWrite",
         ]
         assert teams_app.launch_config == {
-            "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.mcp.teams"],
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.teams"],
             "env_mapping": {"AUTH_TOKEN": "access_token"},
         }
 
@@ -575,8 +575,8 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "Contacts.Read",
         ]
         assert outlook_app.launch_config == {
-            "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.mcp.outlook"],
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.outlook"],
             "env_mapping": {"AUTH_TOKEN": "access_token"},
         }
 
@@ -584,8 +584,8 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
         assert onedrive_app.provider_name == "microsoft"
         assert onedrive_app.oauth_scopes == ["Files.ReadWrite"]
         assert onedrive_app.launch_config == {
-            "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.mcp.onedrive"],
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.onedrive"],
             "env_mapping": {"AUTH_TOKEN": "access_token"},
         }
 
@@ -598,8 +598,8 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "pages_manage_posts",
         ]
         assert facebook_app.launch_config == {
-            "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.mcp.facebook"],
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.facebook"],
             "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
         }
 
@@ -613,8 +613,8 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             "instagram_content_publish",
         ]
         assert instagram_app.launch_config == {
-            "command": "uv",
-            "args": ["run", "python", "-m", "xagent.web.tools.mcp.instagram"],
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.instagram"],
             "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
         }
     finally:
@@ -626,6 +626,110 @@ def test_init_db_seeds_builtin_oauth_and_microsoft_graph_public_apps() -> None:
             shutil.rmtree(temp_dir)
         except OSError:
             pass
+
+
+def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+
+    expected_python_apps = {
+        "linkedin": (
+            "xagent.web.tools.mcp.linkedin",
+            {"LINKEDIN_ACCESS_TOKEN": "access_token"},
+        ),
+        "gmail": (
+            "xagent.web.tools.mcp.gmail",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-drive": (
+            "xagent.web.tools.mcp.google_drive",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "google-calendar": (
+            "xagent.web.tools.mcp.calendar",
+            {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        ),
+        "teams": (
+            "xagent.web.tools.mcp.teams",
+            {"AUTH_TOKEN": "access_token"},
+        ),
+        "outlook": (
+            "xagent.web.tools.mcp.outlook",
+            {"AUTH_TOKEN": "access_token"},
+        ),
+        "onedrive": (
+            "xagent.web.tools.mcp.onedrive",
+            {"AUTH_TOKEN": "access_token"},
+        ),
+        "facebook": (
+            "xagent.web.tools.mcp.facebook",
+            {"META_ACCESS_TOKEN": "access_token"},
+        ),
+        "instagram": (
+            "xagent.web.tools.mcp.instagram",
+            {"META_ACCESS_TOKEN": "access_token"},
+        ),
+    }
+    rows_by_app_id = {row["app_id"]: row for row in get_builtin_public_mcp_app_rows()}
+
+    for app_id, (module_name, env_mapping) in expected_python_apps.items():
+        assert rows_by_app_id[app_id]["launch_config"] == {
+            "command": "python",
+            "args": ["-m", module_name],
+            "env_mapping": env_mapping,
+        }
+
+    assert rows_by_app_id["google-maps"]["launch_config"] == {
+        "command": "npx",
+        "args": ["-y", "@cablate/mcp-google-map", "--stdio"],
+        "required_env": ["GOOGLE_MAPS_API_KEY"],
+    }
+
+
+def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() -> None:
+    from xagent.web.builtin_mcp_registry import (
+        get_builtin_execution_fields,
+        get_builtin_public_mcp_app,
+        is_builtin_public_mcp_app,
+    )
+
+    expected_execution_fields = {
+        "name": "Gmail",
+        "transport": "oauth",
+        "provider_name": "google",
+        "oauth_scopes": ["https://www.googleapis.com/auth/gmail.modify"],
+        "launch_config": {
+            "command": "python",
+            "args": ["-m", "xagent.web.tools.mcp.gmail"],
+            "env_mapping": {"GOOGLE_ACCESS_TOKEN": "access_token"},
+        },
+    }
+
+    app = get_builtin_public_mcp_app("gmail")
+    execution_fields = get_builtin_execution_fields("gmail")
+
+    assert app is not None
+    assert app["app_id"] == "gmail"
+    assert execution_fields == expected_execution_fields
+    assert is_builtin_public_mcp_app("gmail") is True
+    assert get_builtin_public_mcp_app("Gmail") is None
+    assert get_builtin_public_mcp_app("gmail ") is None
+    assert get_builtin_public_mcp_app("unknown-app") is None
+    assert get_builtin_execution_fields("unknown-app") is None
+    assert is_builtin_public_mcp_app("unknown-app") is False
+
+    app["name"] = "Mutated Gmail"
+    app["oauth_scopes"].append("mutated-scope")
+    app["launch_config"]["args"].append("mutated-arg")
+    assert execution_fields is not None
+    execution_fields["oauth_scopes"].append("another-mutated-scope")
+    execution_fields["launch_config"]["env_mapping"]["MUTATED"] = "token"
+
+    fresh_app = get_builtin_public_mcp_app("gmail")
+    assert fresh_app is not None
+    assert fresh_app["name"] == "Gmail"
+    assert fresh_app["oauth_scopes"] == expected_execution_fields["oauth_scopes"]
+    assert fresh_app["launch_config"] == expected_execution_fields["launch_config"]
+    assert get_builtin_execution_fields("gmail") == expected_execution_fields
 
 
 def test_init_db_does_not_reseed_deleted_builtin_app_on_existing_database() -> None:
