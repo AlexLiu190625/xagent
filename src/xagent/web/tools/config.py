@@ -48,7 +48,21 @@ OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
 OAUTH_TOKEN_GENERATION_MAX_LENGTH = 1024
 OAUTH_TOKEN_RESOLVER_FAILURE_CODE = "oauth_token_resolver_failed"
 OAUTH_TOKEN_RESOLVER_FAILURE_MESSAGE = "OAuth token resolver failed"
+UNAVAILABLE_MCP_MESSAGE = "MCP server is unavailable."
 UNAVAILABLE_MCP_CREDENTIAL_MESSAGE = "MCP server credentials are unavailable."
+MCP_UNAVAILABLE_REASONS = frozenset(
+    {
+        "authorization_required",
+        "catalog_app_not_found",
+        "insufficient_scope",
+        "invalid_launch_config",
+        "oauth_token_refresh_failed",
+        "oauth_token_required",
+        OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+        "runtime_connection_failed",
+        "token_refresh_failed",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -355,7 +369,9 @@ async def refresh_oauth_token_if_needed(
                     return True
             else:
                 logger.error(
-                    f"Failed to refresh {provider_name} token: {response.text}"
+                    "Failed to refresh %s token (status %s)",
+                    provider_name,
+                    response.status_code,
                 )
             return False
 
@@ -397,11 +413,17 @@ async def refresh_oauth_token_if_needed(
                 )
                 return True
         else:
-            logger.error(f"Failed to refresh {provider_name} token: {response.text}")
+            logger.error(
+                "Failed to refresh %s token (status %s)",
+                provider_name,
+                response.status_code,
+            )
 
     except Exception as e:
         logger.error(
-            f"Exception refreshing token for {provider_name}: {e}", exc_info=True
+            "Exception refreshing token for %s with %s",
+            provider_name,
+            type(e).__name__,
         )
 
     return False
@@ -1611,32 +1633,43 @@ class WebToolConfig(BaseToolConfig):
             getattr(server, "name", "<unknown>"),
             error.exception_type,
         )
-        return self._build_unavailable_oauth_mcp_config(
+        return self._build_unavailable_mcp_config(
             server=server,
+            reason=OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
+            message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
             diagnostic=diagnostic,
             failure_code=error.failure_code,
         )
 
-    def _build_unavailable_oauth_mcp_config(
+    def _build_unavailable_mcp_config(
         self,
         *,
         server: Any,
-        diagnostic: Dict[str, Any],
-        failure_code: str | None,
+        reason: str,
+        message: str = UNAVAILABLE_MCP_MESSAGE,
+        diagnostic: Mapping[str, Any] | None = None,
+        failure_code: object = None,
     ) -> Dict[str, Any]:
+        safe_reason = (
+            reason
+            if type(reason) is str and reason in MCP_UNAVAILABLE_REASONS
+            else "runtime_connection_failed"
+        )
         inner_config: Dict[str, Any] = {
             "unavailable": True,
-            "reason": OAUTH_TOKEN_RESOLVER_FAILURE_CODE,
-            "message": UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+            "reason": safe_reason,
+            "message": message,
             "server_id": getattr(server, "id", None),
-            "diagnostic": diagnostic,
         }
-        if failure_code is not None:
-            inner_config["failure_code"] = failure_code
+        if diagnostic is not None:
+            inner_config["diagnostic"] = dict(diagnostic)
+        normalized_failure_code = normalize_tool_failure_code(failure_code)
+        if normalized_failure_code is not None:
+            inner_config["failure_code"] = normalized_failure_code
         return {
-            "name": server.name,
+            "name": getattr(server, "name", ""),
             "transport": "unavailable",
-            "description": server.description,
+            "description": getattr(server, "description", None),
             "config": inner_config,
             "user_id": str(self._user_id),
             "allow_users": [str(self._user_id)],
@@ -1767,6 +1800,18 @@ class WebToolConfig(BaseToolConfig):
                     from ...web.models.user_oauth import UserOAuth
 
                     app_info = get_app_for_mcp_server(self.db, server)
+                    if app_info is None:
+                        logger.warning(
+                            "OAuth MCP server '%s' has no matching catalog app",
+                            getattr(server, "name", "<unknown>"),
+                        )
+                        configs.append(
+                            self._build_unavailable_mcp_config(
+                                server=server,
+                                reason="catalog_app_not_found",
+                            )
+                        )
+                        continue
                     provider_name = (
                         app_info.get("provider") if app_info else server.name.lower()
                     )
@@ -1810,6 +1855,12 @@ class WebToolConfig(BaseToolConfig):
                                 "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
                                 getattr(server, "name", "<unknown>"),
                                 error.field,
+                            )
+                            configs.append(
+                                self._build_unavailable_mcp_config(
+                                    server=server,
+                                    reason="invalid_launch_config",
+                                )
                             )
                             continue
                         config["transport"] = "stdio"
@@ -1864,6 +1915,14 @@ class WebToolConfig(BaseToolConfig):
                                 # Delete the invalid oauth record so UI shows it as disconnected
                                 self.db.delete(oauth_account)
                                 self.db.commit()
+                                configs.append(
+                                    self._build_unavailable_mcp_config(
+                                        server=server,
+                                        reason="oauth_token_refresh_failed",
+                                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                                        failure_code="oauth_token_required",
+                                    )
+                                )
                                 continue
 
                             if is_valid and app_info:
@@ -1885,6 +1944,12 @@ class WebToolConfig(BaseToolConfig):
                                         getattr(server, "name", "<unknown>"),
                                         error.field,
                                     )
+                                    configs.append(
+                                        self._build_unavailable_mcp_config(
+                                            server=server,
+                                            reason="invalid_launch_config",
+                                        )
+                                    )
                                     continue
                                 config["transport"] = "stdio"
 
@@ -1892,6 +1957,15 @@ class WebToolConfig(BaseToolConfig):
                             logger.info(
                                 f"OAUTH CONFIG: No valid token found for '{provider_name}'."
                             )
+                            configs.append(
+                                self._build_unavailable_mcp_config(
+                                    server=server,
+                                    reason="oauth_token_required",
+                                    message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                                    failure_code="oauth_token_required",
+                                )
+                            )
+                            continue
 
                 if server.transport == "stdio":
                     if server.command:
@@ -1997,17 +2071,48 @@ class WebToolConfig(BaseToolConfig):
                                 connection_to_transport_config(delegated_connection)
                             )
                         else:
-                            runtime_build = await build_mcp_runtime_connection(
-                                self.db,
-                                server,
-                                user_id=self._user_id,
-                                mcp_auth_context=auth_context,
-                            )
+                            try:
+                                runtime_build = await build_mcp_runtime_connection(
+                                    self.db,
+                                    server,
+                                    user_id=self._user_id,
+                                    mcp_auth_context=auth_context,
+                                )
+                            except ConnectorRuntimeError:
+                                raise
+                            except Exception as error:
+                                logger.warning(
+                                    "MCP runtime connection failed for server '%s' with %s",
+                                    getattr(server, "name", "<unknown>"),
+                                    type(error).__name__,
+                                )
+                                configs.append(
+                                    self._build_unavailable_mcp_config(
+                                        server=server,
+                                        reason="runtime_connection_failed",
+                                    )
+                                )
+                                continue
                             if runtime_build.connection is None:
                                 if runtime_build.diagnostic is not None:
                                     self._mcp_oauth_diagnostics.append(
                                         runtime_build.diagnostic
                                     )
+                                diagnostic = runtime_build.diagnostic
+                                reason = (
+                                    diagnostic.get("code")
+                                    if isinstance(diagnostic, Mapping)
+                                    else "runtime_connection_failed"
+                                )
+                                configs.append(
+                                    self._build_unavailable_mcp_config(
+                                        server=server,
+                                        reason=reason,
+                                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                                        diagnostic=diagnostic,
+                                        failure_code="oauth_token_required",
+                                    )
+                                )
                                 continue
                             transport_config.update(
                                 connection_to_transport_config(runtime_build.connection)
@@ -2060,7 +2165,10 @@ class WebToolConfig(BaseToolConfig):
             # Preserve the legacy partial-return behavior for unrelated load
             # errors. Resolver and OAuth launch-config failures are handled
             # per server above so later servers can still load.
-            logger.warning(f"Failed to load MCP server configs: {e}", exc_info=True)
+            logger.warning(
+                "Failed to load MCP server configs with %s",
+                type(e).__name__,
+            )
 
         logger.info(f"Loaded {len(configs)} MCP server configurations")
         return configs

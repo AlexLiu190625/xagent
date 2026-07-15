@@ -153,6 +153,27 @@ async def _load_configs(db, user: User, **kwargs):
     return await cfg.get_mcp_server_configs(), cfg
 
 
+def _assert_unavailable_runtime_config(
+    config: dict,
+    server: MCPServer,
+    diagnostic: dict,
+) -> None:
+    assert config["name"] == server.name
+    assert config["transport"] == "unavailable"
+    assert config["description"] == server.description
+    assert config["config"]["unavailable"] is True
+    assert config["config"]["reason"] == diagnostic["code"]
+    assert config["config"]["server_id"] == server.id
+    assert config["config"]["diagnostic"] == diagnostic
+    assert config["config"]["failure_code"] == "oauth_token_required"
+    assert config["user_id"] == str(server.user_mcpservers[0].user_id)
+    assert config["allow_users"] == [str(server.user_mcpservers[0].user_id)]
+    assert "runtime_input_schema" not in config
+    assert "runtime_bindings" not in config
+    assert "allow_delegated_authorization" not in config
+    assert "connector_runtime" not in config
+
+
 def test_effective_mcp_oauth_resource_prefers_selector_verbatim(db_session):
     db, user, _ = db_session
     server = _add_mcp_oauth_server(db, user)
@@ -268,7 +289,6 @@ async def test_mcp_oauth_missing_grant_does_not_fall_back_to_static_headers(
 
     configs, cfg = await _load_configs(db, user)
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics == [
         {
@@ -282,6 +302,8 @@ async def test_mcp_oauth_missing_grant_does_not_fall_back_to_static_headers(
             "issuer": "https://auth.example.com",
         }
     ]
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
 
 
 @pytest.mark.asyncio
@@ -440,10 +462,11 @@ async def test_mcp_oauth_runtime_reports_insufficient_scope_without_static_fallb
         mcp_auth_context={str(server.id): {"scope": "records.write"}},
     )
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "insufficient_scope"
     assert diagnostics[0]["scope"] == "records.write"
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
 
 
 @pytest.mark.asyncio
@@ -463,9 +486,10 @@ async def test_mcp_oauth_runtime_ignores_revoked_grant_without_static_fallback(
 
     configs, cfg = await _load_configs(db, user)
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "authorization_required"
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
 
 
 @pytest.mark.asyncio
@@ -517,10 +541,11 @@ async def test_mcp_oauth_runtime_expired_grant_without_refresh_requires_reauth(
 
     configs, cfg = await _load_configs(db, user)
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "authorization_required"
     assert "reauthorization" in diagnostics[0]["message"]
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
 
 
 @pytest.mark.asyncio
@@ -541,8 +566,10 @@ async def test_mcp_oauth_runtime_does_not_use_other_users_grant(db_session):
         mcp_auth_context={str(server.id): {"resource_owner_key": "resource-owner-b"}},
     )
 
-    assert configs == []
-    assert cfg.get_mcp_oauth_diagnostics()[0]["code"] == "authorization_required"
+    diagnostic = cfg.get_mcp_oauth_diagnostics()[0]
+    assert diagnostic["code"] == "authorization_required"
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostic)
 
 
 @pytest.mark.asyncio
@@ -759,7 +786,7 @@ async def test_mcp_oauth_runtime_refresh_without_expires_in_clears_stale_expiry(
 
 
 @pytest.mark.asyncio
-async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fallback(
+async def test_mcp_oauth_runtime_refresh_failure_retains_unavailable_without_static_fallback(
     db_session,
     monkeypatch,
 ):
@@ -800,12 +827,15 @@ async def test_mcp_oauth_runtime_refresh_failure_skips_server_without_static_fal
 
     configs, cfg = await _load_configs(db, user)
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "token_refresh_failed"
     assert diagnostics[0]["message"] == "refresh token is invalid"
     assert "leaked-access-token" not in str(diagnostics[0])
     assert "leaked-refresh-token" not in str(diagnostics[0])
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
+    assert "leaked-access-token" not in str(configs[0])
+    assert "leaked-refresh-token" not in str(configs[0])
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "expired-access-token"
 
@@ -842,11 +872,13 @@ async def test_mcp_oauth_runtime_refresh_sanitizes_transport_exception(
 
     configs, cfg = await _load_configs(db, user)
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "token_refresh_failed"
     assert diagnostics[0]["message"] == "OAuth request failed"
     assert "secret-token" not in str(diagnostics[0])
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
+    assert "secret-token" not in str(configs[0])
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "expired-access-token"
 
@@ -897,9 +929,10 @@ async def test_mcp_oauth_runtime_refresh_rejects_narrowed_scope_without_commit(
         mcp_auth_context={str(server.id): {"scope": "records.write"}},
     )
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "insufficient_scope"
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "expired-access-token"
     assert grant.scope == "records.read records.write"
@@ -948,10 +981,11 @@ async def test_mcp_oauth_runtime_refresh_rejects_oversized_scope_without_commit(
 
     configs, cfg = await _load_configs(db, user)
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "token_refresh_failed"
     assert "at most" in diagnostics[0]["message"]
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "expired-access-token"
     assert grant.scope == "records.read"
@@ -1002,10 +1036,11 @@ async def test_mcp_oauth_runtime_refresh_rejects_oversized_token_type_without_co
 
     configs, cfg = await _load_configs(db, user)
 
-    assert configs == []
     diagnostics = cfg.get_mcp_oauth_diagnostics()
     assert diagnostics[0]["code"] == "token_refresh_failed"
     assert "token_type" in diagnostics[0]["message"]
+    assert len(configs) == 1
+    _assert_unavailable_runtime_config(configs[0], server, diagnostics[0])
     db.refresh(grant)
     assert decrypt_value(grant.access_token) == "expired-access-token"
     assert grant.scope == "records.read"
