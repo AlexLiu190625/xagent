@@ -25,9 +25,16 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 
 from xagent.core.tools.adapters.vibe.connector_runtime import ConnectorRef
+from xagent.web.models.agent import Agent
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.trigger import (
+    AgentTrigger,
+    TriggerRun,
+    TriggerRunStatus,
+    TriggerType,
+)
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
@@ -864,6 +871,44 @@ def test_finish_turn_running_flips_failed_when_we_own_lease(db_session) -> None:
 
     db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
+
+
+def test_finish_turn_mirrors_failed_task_to_trigger_run(db_session) -> None:
+    """The existing terminal-state owner mirrors setup failures to TriggerRun."""
+    user = _create_user(db_session)
+    agent = Agent(user_id=user.id, name="trigger agent")
+    db_session.add(agent)
+    db_session.flush()
+    trigger = AgentTrigger(
+        user_id=user.id,
+        agent_id=agent.id,
+        type=TriggerType.SCHEDULED.value,
+        name="scheduled test",
+        config={},
+    )
+    db_session.add(trigger)
+    db_session.flush()
+    task = _create_task(
+        db_session,
+        user.id,
+        status=TaskStatus.FAILED,
+        error_message="Required MCP servers are unavailable.",
+    )
+    task.source = "trigger"
+    run = TriggerRun(
+        trigger_id=trigger.id,
+        task_id=task.id,
+        status=TriggerRunStatus.RUNNING.value,
+        idempotency_key="strict-mcp-setup-failure",
+    )
+    db_session.add_all([task, run])
+    db_session.commit()
+
+    finish_turn(db_session, int(task.id))
+
+    db_session.refresh(run)
+    assert run.status == TriggerRunStatus.FAILED.value
+    assert run.error_message == "Required MCP servers are unavailable."
 
 
 # ---------------------------------------------------------------------------

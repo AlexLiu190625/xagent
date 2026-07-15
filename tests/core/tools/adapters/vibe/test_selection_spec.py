@@ -38,7 +38,14 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.config import (
+    BaseToolConfig,
+    MCPFailurePolicy,
+    MCPUnavailableSummary,
+    RequiredMCPUnavailableError,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
+from xagent.core.tools.adapters.vibe.mcp_adapter import UnavailableMCPTool
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
 # ----- Spec helper semantics ---------------------------------------------
@@ -295,9 +302,11 @@ class _MCPConfig:
         self,
         servers: List[dict],
         selection_spec: ToolSelectionSpec | None = None,
+        failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
     ):
         self._servers = servers
         self._tool_selection_spec = selection_spec
+        self._failure_policy = failure_policy
 
     def get_tool_selection_spec(self):
         return self._tool_selection_spec
@@ -307,6 +316,133 @@ class _MCPConfig:
 
     def get_sandbox(self):
         return None
+
+    def get_mcp_failure_policy(self):
+        return self._failure_policy
+
+
+def test_mcp_failure_policy_defaults_to_best_effort() -> None:
+    assert (
+        BaseToolConfig.get_mcp_failure_policy(object()) is MCPFailurePolicy.BEST_EFFORT
+    )
+
+
+def test_required_mcp_error_message_does_not_expose_summary_values() -> None:
+    class _StringSubclass(str):
+        pass
+
+    error = RequiredMCPUnavailableError(
+        [
+            # Exact built-in strings are retained only in structured data.
+            # Subclasses are rejected at this boundary.
+            MCPUnavailableSummary.from_values(
+                "secret-like-server-name", "not_an_allowlisted_reason"
+            ),
+            MCPUnavailableSummary.from_values(
+                _StringSubclass("hidden"), _StringSubclass("initialize")
+            ),
+        ]
+    )
+
+    assert str(error) == "Required MCP servers are unavailable."
+    assert "secret-like-server-name" not in str(error)
+    assert error.summaries[0].reason == "mcp_server_unavailable"
+    assert error.summaries[1].server_name == "MCP server"
+    assert error.summaries[1].reason == "mcp_server_unavailable"
+
+
+async def test_registry_preserves_required_mcp_errors(isolated_registry):
+    error = RequiredMCPUnavailableError(
+        [MCPUnavailableSummary.from_values("Gmail", "oauth_token_required")]
+    )
+
+    async def fail_creator(config):
+        raise error
+
+    fail_creator.__name__ = "fail_creator"
+    isolated_registry.register(fail_creator)
+
+    with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+        await isolated_registry.create_registered_tools(_FakeConfig(None))
+
+    assert exc_info.value is error
+
+
+async def test_mcp_best_effort_keeps_unavailable_tool(monkeypatch):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    unavailable = UnavailableMCPTool(
+        server_name="Gmail",
+        server_id=1,
+        reason="oauth_token_required",
+    )
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        return [unavailable]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+
+    tools = await mcp_tools.create_mcp_tools(_MCPConfig([{"name": "Gmail"}]))
+
+    assert tools == [unavailable]
+
+
+async def test_mcp_strict_policy_applies_after_server_selection(monkeypatch):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    unavailable = UnavailableMCPTool(
+        server_name="Gmail",
+        server_id=1,
+        reason="oauth_token_required",
+    )
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        assert [config["name"] for config in mcp_configs] == ["Gmail"]
+        return [unavailable]
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+    config = _MCPConfig(
+        [{"name": "Gmail"}, {"name": "Slack"}],
+        selection_spec=ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"]),
+        failure_policy=MCPFailurePolicy.STRICT,
+    )
+
+    with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+        await mcp_tools.create_mcp_tools(config)
+
+    assert [(item.server_name, item.reason) for item in exc_info.value.summaries] == [
+        ("Gmail", "oauth_token_required")
+    ]
+    assert "Slack" not in str(exc_info.value)
+
+
+async def test_mcp_strict_policy_rejects_empty_result_for_selected_configs(
+    monkeypatch,
+):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    async def _fake_create(mcp_configs, sandbox=None):
+        return []
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "_create_mcp_tools_from_configs",
+        staticmethod(_fake_create),
+    )
+    config = _MCPConfig([{"name": "Gmail"}], failure_policy=MCPFailurePolicy.STRICT)
+
+    with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+        await mcp_tools.create_mcp_tools(config)
+
+    assert exc_info.value.summaries[0].reason == "no_tools_returned"
 
 
 async def test_mcp_per_server_filter_skips_non_matching_configs(monkeypatch):

@@ -5,6 +5,11 @@ from typing import TYPE_CHECKING, Any, List
 
 from .connector_runtime import ConnectorRuntimeError
 from .factory import register_tool
+from .config import (
+    MCPFailurePolicy,
+    MCPUnavailableSummary,
+    RequiredMCPUnavailableError,
+)
 
 if TYPE_CHECKING:
     from .config import BaseToolConfig
@@ -68,12 +73,35 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
 
     try:
         from .factory import ToolFactory
+        from .mcp_adapter import UnavailableMCPTool
 
-        return await ToolFactory._create_mcp_tools_from_configs(
+        tools = await ToolFactory._create_mcp_tools_from_configs(
             mcp_configs,
             sandbox=config.get_sandbox(),
         )
+        policy = config.get_mcp_failure_policy()
+        if policy is MCPFailurePolicy.STRICT:
+            unavailable = [
+                MCPUnavailableSummary.from_values(
+                    tool.server_name,
+                    tool.unavailability_reason,
+                )
+                for tool in tools
+                if isinstance(tool, UnavailableMCPTool)
+            ]
+            if unavailable:
+                raise RequiredMCPUnavailableError(unavailable)
+            if not tools:
+                raise RequiredMCPUnavailableError(
+                    MCPUnavailableSummary.from_values(
+                        mcp_config.get("name"), "no_tools_returned"
+                    )
+                    for mcp_config in mcp_configs
+                )
+        return tools
     except ConnectorRuntimeError:
+        raise
+    except RequiredMCPUnavailableError:
         raise
     except Exception as e:
         logger.warning("Failed to create MCP tools (%s)", type(e).__name__)

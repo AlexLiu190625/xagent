@@ -15,7 +15,11 @@ from sqlalchemy.orm import Session
 from .....config import get_uploads_dir
 from .....core.workspace import TaskWorkspace
 from .base import AbstractBaseTool, Tool
-from .config import BaseToolConfig, normalize_tool_allowlist
+from .config import (
+    BaseToolConfig,
+    RequiredMCPUnavailableError,
+    normalize_tool_allowlist,
+)
 from .connector_runtime import ConnectorRuntimeError
 from .output_filter_wrapper import OutputFilteredToolWrapper
 from .selection_spec import ToolSelectionSpec
@@ -190,6 +194,8 @@ class ToolRegistry:
                 created_tools = await creator(config)
                 tools.extend(created_tools)
             except ConnectorRuntimeError:
+                raise
+            except RequiredMCPUnavailableError:
                 raise
             except Exception as e:
                 logger.warning(f"Tool creator {creator.__name__} failed: {e}")

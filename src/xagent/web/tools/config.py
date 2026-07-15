@@ -21,6 +21,7 @@ from ...config import get_uploads_dir
 from ...core.agent.result import ClassifiedToolFailure, normalize_tool_failure_code
 from ...core.tools.adapters.vibe.config import (
     BaseToolConfig,
+    MCPFailurePolicy,
     normalize_tool_allowlist,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -466,6 +467,7 @@ class WebToolConfig(BaseToolConfig):
         mcp_auth_context: Optional[Dict[str, Any]] = None,
         execution_scope: Optional[Any] = None,
         connector_runtime_turn_id: Optional[str] = None,
+        mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
     ):
         # ``tool_selection_spec`` accepts :class:`ToolSelectionSpec` from
         # the tools adapter package; typed as ``Any`` here to avoid an
@@ -473,6 +475,7 @@ class WebToolConfig(BaseToolConfig):
         # reads ``config.get_tool_selection_spec()``. ``None`` defaults
         # to the ``_SpecAll`` ALL-mode (build every default tool).
         self._tool_selection_spec = tool_selection_spec
+        self._mcp_failure_policy = mcp_failure_policy
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -981,6 +984,9 @@ class WebToolConfig(BaseToolConfig):
         backward-compat).
         """
         return self._tool_selection_spec
+
+    def get_mcp_failure_policy(self) -> MCPFailurePolicy:
+        return self._mcp_failure_policy
 
     def get_allowed_agent_ids(self) -> Optional[List[int]]:
         """Get explicitly allowed published agent IDs. None means use defaults."""

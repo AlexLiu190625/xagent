@@ -8,9 +8,95 @@ to the ToolFactory in a unified way.
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from ..... import config as _root_config
+
+
+class MCPFailurePolicy(str, Enum):
+    """Caller-owned behavior when a selected MCP server is unavailable."""
+
+    BEST_EFFORT = "best_effort"
+    STRICT = "strict"
+
+
+_PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
+    {
+        "adapter_construction",
+        "authorization_required",
+        "catalog_app_not_found",
+        "initialize",
+        "insufficient_scope",
+        "invalid_config",
+        "invalid_launch_config",
+        "list_tools",
+        "loader_failed",
+        "no_tools_returned",
+        "oauth_token_refresh_failed",
+        "oauth_token_required",
+        "oauth_token_resolver_failed",
+        "runtime_connection_failed",
+        "sandbox_list_tools",
+        "sandbox_tool_wrap",
+        "session_start",
+        "token_refresh_failed",
+    }
+)
+_DEFAULT_MCP_UNAVAILABLE_REASON = "mcp_server_unavailable"
+_DEFAULT_MCP_SERVER_NAME = "MCP server"
+
+
+@dataclass(frozen=True)
+class MCPUnavailableSummary:
+    """Public-safe identity and classification for one unavailable server."""
+
+    server_name: str
+    reason: str
+
+    @classmethod
+    def from_values(
+        cls, server_name: object, reason: object
+    ) -> "MCPUnavailableSummary":
+        safe_server_name = (
+            server_name if type(server_name) is str else _DEFAULT_MCP_SERVER_NAME
+        )
+        safe_reason = (
+            reason
+            if type(reason) is str and reason in _PUBLIC_MCP_UNAVAILABLE_REASONS
+            else _DEFAULT_MCP_UNAVAILABLE_REASON
+        )
+        return cls(server_name=safe_server_name, reason=safe_reason)
+
+
+class RequiredMCPUnavailableError(RuntimeError):
+    """A selected MCP dependency is unavailable under strict setup policy."""
+
+    def __init__(self, summaries: Iterable[MCPUnavailableSummary]) -> None:
+        normalized: list[MCPUnavailableSummary] = []
+        seen: set[tuple[str, str]] = set()
+        for summary in summaries:
+            if type(summary) is MCPUnavailableSummary:
+                safe_summary = MCPUnavailableSummary.from_values(
+                    summary.server_name,
+                    summary.reason,
+                )
+            else:
+                safe_summary = MCPUnavailableSummary.from_values(None, None)
+            key = (safe_summary.server_name, safe_summary.reason)
+            if key not in seen:
+                normalized.append(safe_summary)
+                seen.add(key)
+        if not normalized:
+            normalized.append(
+                MCPUnavailableSummary(
+                    server_name=_DEFAULT_MCP_SERVER_NAME,
+                    reason=_DEFAULT_MCP_UNAVAILABLE_REASON,
+                )
+            )
+        self.summaries = tuple(normalized)
+        super().__init__("Required MCP servers are unavailable.")
 
 
 def normalize_tool_allowlist(value: Any) -> Optional[List[str]]:
@@ -78,6 +164,10 @@ class BaseToolConfig(ABC):
     async def get_mcp_server_configs(self) -> List[Dict[str, Any]]:
         """Get MCP server configurations."""
         pass
+
+    def get_mcp_failure_policy(self) -> MCPFailurePolicy:
+        """Return the MCP setup failure policy for this execution."""
+        return MCPFailurePolicy.BEST_EFFORT
 
     @abstractmethod
     def get_file_tools_enabled(self) -> bool:

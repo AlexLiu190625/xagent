@@ -16,6 +16,7 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
+from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 
 
 class TestAgentServiceManagerReconstruction:
@@ -353,6 +354,52 @@ class TestAgentServiceManagerReconstruction:
             "BY_CATEGORIES mode expected for non-empty tool_categories"
         )
         assert "browser" in spec.categories
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("source", "expected_policy"),
+        [
+            ("trigger", MCPFailurePolicy.STRICT),
+            ("sdk", MCPFailurePolicy.BEST_EFFORT),
+            (None, MCPFailurePolicy.BEST_EFFORT),
+        ],
+    )
+    async def test_build_tools_maps_task_source_to_mcp_failure_policy(
+        self,
+        source,
+        expected_policy,
+        agent_manager,
+        mock_db,
+        sample_task,
+        mock_user,
+        monkeypatch,
+    ):
+        sample_task.source = source
+
+        async def create_all_tools(config, apply_user_override_filter=True):
+            return []
+
+        monkeypatch.setattr(
+            "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+            create_all_tools,
+        )
+
+        with patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None):
+            _tools, tool_config = await agent_manager._build_tools_for_task(
+                task_id=sample_task.id,
+                task=sample_task,
+                db=mock_db,
+                user=mock_user,
+                agent_config={
+                    "tool_categories": ["mcp:Gmail"],
+                    "knowledge_bases": [],
+                    "skills": [],
+                },
+                task_llm=None,
+                task_vision_llm=None,
+            )
+
+        assert tool_config.get_mcp_failure_policy() is expected_policy
 
     @pytest.mark.asyncio
     async def test_get_agent_for_task_existing_task_with_reconstruction(

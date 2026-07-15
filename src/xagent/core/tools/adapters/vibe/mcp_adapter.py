@@ -1012,6 +1012,16 @@ class UnavailableMCPTool(AbstractBaseTool):
         return self._name
 
     @property
+    def server_name(self) -> str:
+        """Public server identity used by strict setup diagnostics."""
+        return self._server_name
+
+    @property
+    def unavailability_reason(self) -> str | None:
+        """Public-safe reason code used by strict setup diagnostics."""
+        return self._reason
+
+    @property
     def description(self) -> str:
         return self._message
 

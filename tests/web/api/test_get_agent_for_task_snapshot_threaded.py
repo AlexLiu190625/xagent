@@ -33,6 +33,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.web.api.chat import AgentServiceManager
+from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_setup_snapshot import (
@@ -282,6 +283,44 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
     # before reaching this point.
     assert constructed.get("pattern") == "single_call"
     assert constructed.get("task_id") == "42"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("source", "expected_policy"),
+    [
+        ("trigger", MCPFailurePolicy.STRICT),
+        ("internal", MCPFailurePolicy.BEST_EFFORT),
+        (None, MCPFailurePolicy.BEST_EFFORT),
+    ],
+)
+async def test_snapshot_source_controls_mcp_failure_policy(
+    source: str | None,
+    expected_policy: MCPFailurePolicy,
+) -> None:
+    snapshot = _build_snapshot(source=source)
+    manager = AgentServiceManager()
+    user = _make_user()
+    db = MagicMock()
+    task_row = MagicMock(status=TaskStatus.PENDING)
+    db.query.return_value.filter.return_value.first.return_value = task_row
+    create_tools = AsyncMock(return_value=([], MagicMock()))
+
+    with (
+        patch(
+            "xagent.web.api.chat.load_task_setup_snapshot_sync",
+            return_value=snapshot,
+        ),
+        patch.object(manager, "_load_persisted_conversation_history"),
+        patch.object(manager, "_load_persisted_execution_context", new=AsyncMock()),
+        patch("xagent.web.api.chat.create_task_tracer", return_value=MagicMock()),
+        patch("xagent.web.api.chat.create_default_tools", new=create_tools),
+        patch("xagent.web.sandbox_manager.get_sandbox_manager", return_value=None),
+        patch("xagent.web.api.chat.AgentService"),
+    ):
+        await manager.get_agent_for_task(task_id=42, db=db, user=user)
+
+    assert create_tools.await_args.kwargs["mcp_failure_policy"] is expected_policy
 
 
 @pytest.mark.asyncio

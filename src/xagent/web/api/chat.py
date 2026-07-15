@@ -34,6 +34,10 @@ from ...core.model.chat.basic.zhipu import ZhipuLLM
 from ...core.model.chat.token_context import aggregate_token_usage_by_model
 from ...core.model.providers import is_placeholder_api_key
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
+from ...core.tools.adapters.vibe.config import (
+    MCPFailurePolicy,
+    RequiredMCPUnavailableError,
+)
 from ...core.workspace import scoped_user_root
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
@@ -420,6 +424,13 @@ def _build_tool_selection_spec_for_task(
     return spec
 
 
+def _mcp_failure_policy_for_task_source(source: object) -> MCPFailurePolicy:
+    """Map the persisted task source to its MCP setup contract."""
+    if type(source) is str and source == "trigger":
+        return MCPFailurePolicy.STRICT
+    return MCPFailurePolicy.BEST_EFFORT
+
+
 def _build_allowed_external_dirs(
     user_id: Optional[int],
     *,
@@ -504,6 +515,7 @@ async def create_default_tools(
     agent_call_stack: Optional[List[int]] = None,
     scope: Optional[ExecutionScope] = None,
     connector_runtime_turn_id: Optional[str] = None,
+    mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
 ) -> tuple[list[Any], Any]:
     """Create default tools and tool_config for AgentService using ToolFactory.
 
@@ -568,6 +580,7 @@ async def create_default_tools(
         parent_tracer=parent_tracer,
         agent_call_stack=agent_call_stack,
         connector_runtime_turn_id=connector_runtime_turn_id,
+        mcp_failure_policy=mcp_failure_policy,
     )
 
     # Store excluded_agent_id in tool_config for agent tool filtering
@@ -1357,6 +1370,7 @@ class AgentServiceManager:
             if workforce_runtime
             else None,
             connector_runtime_turn_id=None,
+            mcp_failure_policy=_mcp_failure_policy_for_task_source(task.source),
         )
 
     async def get_agent_for_task(
@@ -1611,6 +1625,12 @@ class AgentServiceManager:
                         )
                         return self._agents[task_id]
                     except HTTPException:
+                        raise
+                    except RequiredMCPUnavailableError:
+                        self._agents.pop(task_id, None)
+                        self._agent_owner_ids.pop(task_id, None)
+                        self._agent_sandbox_keys.pop(task_id, None)
+                        self._agent_scope_fingerprints.pop(task_id, None)
                         raise
                     except Exception as e:
                         logger.warning(
@@ -1926,6 +1946,9 @@ class AgentServiceManager:
                     if workforce_runtime
                     else None,
                     connector_runtime_turn_id=connector_runtime_turn_id,
+                    mcp_failure_policy=_mcp_failure_policy_for_task_source(
+                        task.source if task is not None else None
+                    ),
                 )
 
                 with UserContext(runtime_user_id):

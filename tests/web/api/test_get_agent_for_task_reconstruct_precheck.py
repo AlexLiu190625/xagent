@@ -39,6 +39,10 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from xagent.web.api.chat import AgentServiceManager
+from xagent.core.tools.adapters.vibe.config import (
+    MCPUnavailableSummary,
+    RequiredMCPUnavailableError,
+)
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import DAGExecution, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
@@ -232,6 +236,41 @@ async def test_running_with_prior_trace_event_runs_reconstruct() -> None:
                 pass
 
     reconstruct.assert_awaited_once_with(42, db, scope=None)
+
+
+@pytest.mark.asyncio
+async def test_required_mcp_failure_does_not_fall_back_after_reconstruct() -> None:
+    manager = AgentServiceManager()
+    user = _make_user()
+    task = _make_task(TaskStatus.RUNNING, agent_id=7)
+    db = _build_db(
+        task,
+        trace_event=_Fake(),
+        agent=_make_agent(),
+        user=user,
+    )
+    error = RequiredMCPUnavailableError(
+        [MCPUnavailableSummary.from_values("Gmail", "oauth_token_required")]
+    )
+
+    async def fail_reconstruct(*args, **kwargs):
+        manager._agents[42] = MagicMock()
+        manager._agent_owner_ids[42] = 1
+        raise error
+
+    with (
+        patch.object(
+            manager, "_reconstruct_agent_from_history", side_effect=fail_reconstruct
+        ),
+        patch("xagent.web.api.chat.load_task_setup_snapshot_sync") as snapshot_loader,
+    ):
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await manager.get_agent_for_task(task_id=42, db=db, user=user)
+
+    assert exc_info.value is error
+    snapshot_loader.assert_not_called()
+    assert 42 not in manager._agents
+    assert 42 not in manager._agent_owner_ids
 
 
 @pytest.mark.asyncio

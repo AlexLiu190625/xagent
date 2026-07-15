@@ -12,7 +12,10 @@ from ..memory import MemoryStore
 from ..memory.in_memory import InMemoryMemoryStore
 from ..model.chat.basic.base import BaseLLM
 from ..tools.adapters.vibe import Tool
-from ..tools.adapters.vibe.config import normalize_tool_allowlist
+from ..tools.adapters.vibe.config import (
+    RequiredMCPUnavailableError,
+    normalize_tool_allowlist,
+)
 from ..tools.adapters.vibe.connector_runtime import ConnectorRuntimeError
 from ..workspace import TaskWorkspace, create_workspace
 from .trace import Tracer
@@ -664,6 +667,8 @@ class AgentService:
                 self._tool_policy_signature = policy_signature
             except ConnectorRuntimeError:
                 raise
+            except RequiredMCPUnavailableError:
+                raise
             except Exception as exc:
                 logger.error("Failed to initialize tools from configuration: %s", exc)
                 raise RuntimeError(
@@ -753,6 +758,8 @@ class AgentService:
 
         agent_call_stack = _get_conf("get_agent_call_stack", [])
         agent_call_stack_items = tuple(str(agent_id) for agent_id in agent_call_stack)
+        mcp_failure_policy = _get_conf("get_mcp_failure_policy")
+        mcp_failure_policy_value = getattr(mcp_failure_policy, "value", None)
 
         return (
             override_items,
@@ -765,6 +772,7 @@ class AgentService:
             None if parent_task_id is None else str(parent_task_id),
             parent_tracer_identity,
             agent_call_stack_items,
+            mcp_failure_policy_value,
         )
 
     def _execution_type(self) -> str:
