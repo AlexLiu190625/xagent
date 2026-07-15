@@ -1903,17 +1903,9 @@ def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
 def test_append_message_uses_persisted_task_owner_for_files_after_owner_changes(
     mock_start_task,
 ):
-    """Task-owned files remain attachable after the agent owner changes."""
+    """Task-aware uploads use the persisted owner after agent-owner drift."""
     agent_id, full_key = _create_agent_with_key()
     task_id = _create_task(full_key, agent_id, content="first turn")
-    upload_response = client.post(
-        "/v1/chat/files",
-        headers=_bearer(full_key),
-        files=[("files", ("owner-file.txt", b"owner data", "text/plain"))],
-    )
-    assert upload_response.status_code == 200, upload_response.text
-    file_id = upload_response.json()["files"][0]["file_id"]
-
     persisted_task_owner_id, _current_agent_owner_id = (
         _change_agent_owner_for_existing_task(
             task_id=task_id,
@@ -1922,6 +1914,29 @@ def test_append_message_uses_persisted_task_owner_for_files_after_owner_changes(
         )
     )
     mock_start_task.reset_mock()
+
+    upload_response = client.post(
+        f"/v1/chat/files?task_id={task_id}",
+        headers=_bearer(full_key),
+        files=[("files", ("owner-file.txt", b"owner data", "text/plain"))],
+    )
+    assert upload_response.status_code == 200, upload_response.text
+    file_id = upload_response.json()["files"][0]["file_id"]
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        uploaded_file = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert uploaded_file.user_id == persisted_task_owner_id
+        assert uploaded_file.task_id is None
+        assert str(uploaded_file.storage_key).startswith(
+            f"users/{persisted_task_owner_id}/uploads/"
+        )
+    finally:
+        db.close()
 
     response = client.post(
         f"/v1/chat/tasks/{task_id}/messages",
@@ -1938,8 +1953,6 @@ def test_append_message_uses_persisted_task_owner_for_files_after_owner_changes(
 
     assert response.status_code == 202, response.text
 
-    from xagent.web.models.uploaded_file import UploadedFile
-
     db = _direct_db_session()
     try:
         uploaded_file = (
@@ -1947,6 +1960,39 @@ def test_append_message_uses_persisted_task_owner_for_files_after_owner_changes(
         )
         assert uploaded_file.user_id == persisted_task_owner_id
         assert uploaded_file.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_task_aware_upload_rejects_other_agents_task_without_writing_file(
+    mock_start_task,
+):
+    """A key cannot select another agent's task runtime owner for upload."""
+    owner_agent_id, owner_key = _create_agent_with_key()
+    owner_task_id = _create_task(owner_key, owner_agent_id)
+    mock_start_task.reset_mock()
+
+    other_headers = _register_second_user(username="sdk-task-upload-other")
+    _other_agent_id, other_key = _create_agent_with_key_for(other_headers)
+    response = client.post(
+        f"/v1/chat/files?task_id={owner_task_id}",
+        headers=_bearer(other_key),
+        files=[("files", ("forbidden-owner.txt", b"private", "text/plain"))],
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "task_not_found"
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        assert (
+            db.query(UploadedFile)
+            .filter(UploadedFile.filename == "forbidden-owner.txt")
+            .count()
+            == 0
+        )
     finally:
         db.close()
 

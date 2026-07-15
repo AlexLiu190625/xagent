@@ -17,7 +17,7 @@ by the WebSocket UI path so both transports share one state machine.
 import logging
 from typing import Any, NoReturn, Optional, Tuple, cast
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -87,21 +87,40 @@ _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
 @router.post("/chat/files", response_model=UploadFilesResponse)
 async def upload_task_files(
     files: list[UploadFile] = File(...),
+    task_id: Optional[int] = Query(
+        default=None,
+        gt=0,
+        description=(
+            "Existing SDK task whose persisted runtime owner should own "
+            "the uploaded files."
+        ),
+    ),
     authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
     db: Session = Depends(get_db),
 ) -> UploadFilesResponse:
     """Store files for later attachment to a task turn.
 
     API-key-gated counterpart to the JWT-only ``POST /api/files/upload``.
-    Files are stored unbound (``task_id`` NULL) and owned by the agent's
-    user; the returned ``file_id`` values are passed back in
-    ``message.files`` on ``POST /v1/chat/tasks`` (or ``.../messages``),
-    where they get bound to the task and exposed to the agent.
+    Files are stored unbound (``UploadedFile.task_id`` NULL); the returned
+    ``file_id`` values are passed back in ``message.files`` on
+    ``POST /v1/chat/tasks`` (or ``.../messages``), where they get bound to
+    the task and exposed to the agent.
+
+    When ``task_id`` is omitted, the upload is owned by the agent's current
+    user for a future create request. When ``task_id`` is provided, the task
+    is authorized through the key-bound agent and its persisted ``Task.user_id``
+    owns the upload. This keeps historical tasks usable after agent ownership
+    changes without transferring file ownership during append.
     """
     from ..files import store_uploaded_files
 
     agent, _key = authed
-    owner = db.query(User).filter(User.id == agent.user_id).first()
+    upload_owner_user_id = int(agent.user_id)
+    if task_id is not None:
+        task = _resolve_task_or_404(task_id, agent, db)
+        upload_owner_user_id = int(task.user_id)
+
+    owner = db.query(User).filter(User.id == upload_owner_user_id).first()
     if owner is None:
         raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
 
