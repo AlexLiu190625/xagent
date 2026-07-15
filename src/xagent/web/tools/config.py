@@ -114,6 +114,12 @@ class ResolvedToken:
     generation: str | None = field(default=None, repr=False)
 
 
+@dataclass(frozen=True)
+class _LegacyOAuthTokenResolution:
+    access_token: str | None
+    refresh_failed: bool = False
+
+
 TokenResolverResult = ResolvedToken | Awaitable[ResolvedToken | None] | None
 TokenResolver = Callable[[TokenRequest], TokenResolverResult]
 
@@ -366,7 +372,7 @@ async def refresh_oauth_token_if_needed(
                         oauth_account.expires_at = datetime.now(
                             timezone.utc
                         ) + timedelta(seconds=int(data["expires_in"]))
-                    db.commit()
+                    db.flush([oauth_account])
                     logger.info(
                         f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                     )
@@ -411,7 +417,7 @@ async def refresh_oauth_token_if_needed(
                     oauth_account.expires_at = datetime.now(timezone.utc) + timedelta(
                         seconds=data["expires_in"]
                     )
-                db.commit()
+                db.flush([oauth_account])
                 logger.info(
                     f"Successfully refreshed {provider_name} token for user {oauth_account.user_id}"
                 )
@@ -1772,6 +1778,101 @@ class WebToolConfig(BaseToolConfig):
             },
         }
 
+    def _new_legacy_oauth_session(self) -> Any:
+        """Open the transaction owner for legacy OAuth token maintenance."""
+        if self._db_factory is not None:
+            return self._db_factory()
+        if self._live_db is not None:
+            from sqlalchemy.orm import Session
+
+            return Session(bind=self._live_db.get_bind(), autoflush=False)
+        return self.get_session_factory()()
+
+    async def _resolve_legacy_oauth_access_token(
+        self,
+        *,
+        provider_name: object,
+        app_id: object,
+    ) -> _LegacyOAuthTokenResolution:
+        """Resolve and persist one legacy OAuth account in an isolated transaction."""
+        from ...web.models.user_oauth import UserOAuth
+
+        oauth_db = self._new_legacy_oauth_session()
+        try:
+            if app_id:
+                providers_to_check = [provider_name, app_id]
+                oauth_account = (
+                    oauth_db.query(UserOAuth)
+                    .filter(
+                        UserOAuth.user_id == self._user_id,
+                        UserOAuth.provider.in_(providers_to_check),
+                    )
+                    .first()
+                )
+                logger.info(
+                    "OAUTH CONFIG: Checked providers %s for user %s. Found: %s",
+                    providers_to_check,
+                    self._user_id,
+                    oauth_account is not None,
+                )
+            else:
+                oauth_account = (
+                    oauth_db.query(UserOAuth)
+                    .filter(
+                        UserOAuth.user_id == self._user_id,
+                        UserOAuth.provider == provider_name,
+                    )
+                    .first()
+                )
+                logger.info(
+                    "OAUTH CONFIG: Checked provider '%s' for user %s. Found: %s",
+                    provider_name,
+                    self._user_id,
+                    oauth_account is not None,
+                )
+
+            if not oauth_account or not oauth_account.access_token:
+                return _LegacyOAuthTokenResolution(access_token=None)
+
+            logger.info(
+                "OAUTH CONFIG: Token found for '%s'. Refresh token present: %s, Expires: %s",
+                provider_name,
+                oauth_account.refresh_token is not None,
+                oauth_account.expires_at,
+            )
+            account_id = int(oauth_account.id)
+            is_valid = await refresh_oauth_token_if_needed(
+                oauth_db,
+                oauth_account,
+                str(provider_name) if provider_name else "",
+            )
+            if not is_valid:
+                logger.warning(
+                    "OAUTH CONFIG: Token for '%s' is invalid and could not be refreshed. "
+                    "Deleting OAuth record to prompt user for reconnection.",
+                    provider_name,
+                )
+                # A failed flush leaves the transaction unusable. Roll it back,
+                # reload the account, then persist the disconnection atomically.
+                oauth_db.rollback()
+                oauth_account = oauth_db.get(UserOAuth, account_id)
+                if oauth_account is not None:
+                    oauth_db.delete(oauth_account)
+                    oauth_db.commit()
+                return _LegacyOAuthTokenResolution(
+                    access_token=None,
+                    refresh_failed=True,
+                )
+
+            access_token = str(oauth_account.access_token)
+            oauth_db.commit()
+            return _LegacyOAuthTokenResolution(access_token=access_token)
+        except Exception:
+            oauth_db.rollback()
+            raise
+        finally:
+            oauth_db.close()
+
     async def _build_mcp_server_config(
         self,
         *,
@@ -1812,7 +1913,6 @@ class WebToolConfig(BaseToolConfig):
             # Find corresponding OAuth account
             # The provider might be linkedin, google, etc. based on the app config
             from ...web.mcp_apps import get_app_for_mcp_server
-            from ...web.models.user_oauth import UserOAuth
 
             app_info = get_app_for_mcp_server(self.db, server)
             if app_info is None:
@@ -1872,84 +1972,18 @@ class WebToolConfig(BaseToolConfig):
                     hook_token.provider,
                 )
             else:
-                if app_id:
-                    providers_to_check = [provider_name, app_id]
-                    oauth_account = (
-                        self.db.query(UserOAuth)
-                        .filter(
-                            UserOAuth.user_id == self._user_id,
-                            UserOAuth.provider.in_(providers_to_check),
-                        )
-                        .first()
+                legacy_token = await self._resolve_legacy_oauth_access_token(
+                    provider_name=provider_name,
+                    app_id=app_id,
+                )
+                if legacy_token.refresh_failed:
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="oauth_token_refresh_failed",
+                        message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
+                        failure_code="oauth_token_required",
                     )
-                    logger.info(
-                        f"OAUTH CONFIG: Checked providers {providers_to_check} for user {self._user_id}. Found: {oauth_account is not None}"
-                    )
-                else:
-                    oauth_account = (
-                        self.db.query(UserOAuth)
-                        .filter(
-                            UserOAuth.user_id == self._user_id,
-                            UserOAuth.provider == provider_name,
-                        )
-                        .first()
-                    )
-                    logger.info(
-                        f"OAUTH CONFIG: Checked provider '{provider_name}' for user {self._user_id}. Found: {oauth_account is not None}"
-                    )
-
-                if oauth_account and oauth_account.access_token:
-                    logger.info(
-                        f"OAUTH CONFIG: Token found for '{provider_name}'. Refresh token present: {oauth_account.refresh_token is not None}, Expires: {oauth_account.expires_at}"
-                    )
-                    # Check and refresh token if needed before using it
-                    is_valid = await refresh_oauth_token_if_needed(
-                        self.db,
-                        oauth_account,
-                        str(provider_name) if provider_name else "",
-                    )
-
-                    if not is_valid:
-                        logger.warning(
-                            f"OAUTH CONFIG: Token for '{provider_name}' is invalid and could not be refreshed. "
-                            "Deleting OAuth record to prompt user for reconnection."
-                        )
-                        # Delete the invalid oauth record so UI shows it as disconnected
-                        self.db.delete(oauth_account)
-                        self.db.commit()
-                        return self._build_unavailable_mcp_config(
-                            server=server,
-                            reason="oauth_token_refresh_failed",
-                            message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
-                            failure_code="oauth_token_required",
-                        )
-
-                    if is_valid and app_info:
-                        app_id = app_info.get("id")
-                        logger.info(
-                            f"OAUTH CONFIG: Mapping '{app_id}' to executable proxy"
-                        )
-                        try:
-                            transport_config = (
-                                self._build_oauth_mcp_stdio_transport_config(
-                                    server=server,
-                                    app_info=app_info,
-                                    access_token=oauth_account.access_token,
-                                )
-                            )
-                        except _OAuthLaunchConfigInvalid as error:
-                            logger.warning(
-                                "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
-                                getattr(server, "name", "<unknown>"),
-                                error.field,
-                            )
-                            return self._build_unavailable_mcp_config(
-                                server=server,
-                                reason="invalid_launch_config",
-                            )
-                        config["transport"] = "stdio"
-
-                else:
+                if legacy_token.access_token is None:
                     logger.info(
                         f"OAUTH CONFIG: No valid token found for '{provider_name}'."
                     )
@@ -1959,6 +1993,24 @@ class WebToolConfig(BaseToolConfig):
                         message=UNAVAILABLE_MCP_CREDENTIAL_MESSAGE,
                         failure_code="oauth_token_required",
                     )
+                logger.info("OAUTH CONFIG: Mapping '%s' to executable proxy", app_id)
+                try:
+                    transport_config = self._build_oauth_mcp_stdio_transport_config(
+                        server=server,
+                        app_info=app_info,
+                        access_token=legacy_token.access_token,
+                    )
+                except _OAuthLaunchConfigInvalid as error:
+                    logger.warning(
+                        "Skipping OAuth MCP server '%s' because launch_config.%s is invalid",
+                        getattr(server, "name", "<unknown>"),
+                        error.field,
+                    )
+                    return self._build_unavailable_mcp_config(
+                        server=server,
+                        reason="invalid_launch_config",
+                    )
+                config["transport"] = "stdio"
 
         if server.transport == "stdio":
             if server.command:

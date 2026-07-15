@@ -858,13 +858,24 @@ async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invali
     )
     account_id = oauth_account.id
     _add_stdio_server(db, user, name="after")
+    pending_app = PublicMCPApp(
+        app_id="pending-unrelated-app",
+        name="Pending unrelated app",
+        transport="stdio",
+    )
+    db.add(pending_app)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
 
     async def fail_refresh(*args, **kwargs):
         return False
 
     monkeypatch.setattr(web_tools_config, "refresh_oauth_token_if_needed", fail_refresh)
 
-    configs = await _tool_config(db, user).get_mcp_server_configs()
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
 
     assert [config["name"] for config in configs] == ["Google Drive", "after"]
     _assert_unavailable_mcp_config(
@@ -874,7 +885,91 @@ async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invali
         oauth_token_required=True,
     )
     assert "expired-secret-token" not in repr(configs[0])
-    assert db.get(UserOAuth, account_id) is None
+    assert pending_app in db.new
+    with isolated_session_factory() as verification_db:
+        assert verification_db.get(UserOAuth, account_id) is None
+        assert (
+            verification_db.query(PublicMCPApp)
+            .filter(PublicMCPApp.app_id == pending_app.app_id)
+            .first()
+            is None
+        )
+
+
+@pytest.mark.asyncio
+async def test_user_oauth_refresh_does_not_commit_unrelated_caller_changes(
+    db_session,
+    monkeypatch,
+):
+    db, user = db_session
+    db.add(
+        OAuthProvider(
+            provider_name="meta",
+            name="Meta",
+            client_id=encrypt_value("client-id-secret"),
+            client_secret=encrypt_value("client-secret-value"),
+            auth_url="https://auth.example/authorize",
+            token_url="https://auth.example/token",
+        )
+    )
+    _add_oauth_server(
+        db,
+        user,
+        name="Meta Connector",
+        provider="meta",
+        launch_config=_launch_config(env_key="META_ACCESS_TOKEN"),
+    )
+    oauth_account = _add_user_oauth(
+        db, user, provider="meta", access_token="expired-access-secret"
+    )
+    account_id = oauth_account.id
+    oauth_account.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+    pending_app = PublicMCPApp(
+        app_id="pending-refresh-app",
+        name="Pending refresh app",
+        transport="stdio",
+    )
+    db.add(pending_app)
+    isolated_session_factory = sessionmaker(
+        bind=db.get_bind(), autoflush=False, autocommit=False
+    )
+
+    class SuccessfulAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+        async def get(self, *args, **kwargs):
+            return httpx.Response(
+                200,
+                json={"access_token": "refreshed-token", "expires_in": 3600},
+            )
+
+    monkeypatch.setattr(
+        web_tools_config.httpx,
+        "AsyncClient",
+        SuccessfulAsyncClient,
+    )
+
+    configs = await _tool_config(
+        db, user, db_factory=isolated_session_factory
+    ).get_mcp_server_configs()
+
+    assert _access_token_env(configs[0], "META_ACCESS_TOKEN") == "refreshed-token"
+    assert pending_app in db.new
+    with isolated_session_factory() as verification_db:
+        refreshed_account = verification_db.get(UserOAuth, account_id)
+        assert refreshed_account is not None
+        assert refreshed_account.access_token == "refreshed-token"
+        assert (
+            verification_db.query(PublicMCPApp)
+            .filter(PublicMCPApp.app_id == pending_app.app_id)
+            .first()
+            is None
+        )
 
 
 @pytest.mark.asyncio
