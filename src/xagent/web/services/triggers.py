@@ -30,6 +30,7 @@ from ..models.user_oauth import UserOAuth
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .background_jobs import create_background_job, enqueue_background_job
 from .connector_runtime import (
+    bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
     prepare_create_connector_runtime,
     reject_ephemeral_connector_runtime_payload,
@@ -783,21 +784,25 @@ def _attach_task_to_trigger_run(
         if str(trigger.type) == TriggerType.SCHEDULED.value
         else ERROR_RUNTIME_SECRET_UNAVAILABLE
     )
+    task_source = "trigger"
+    task_owner_user_id = int(trigger.user_id)
     runtime_plan = prepare_create_connector_runtime(
         db=db,
         agent=agent,
+        task_source=task_source,
+        connector_user_id=task_owner_user_id,
         payload_items=_trigger_connector_runtime_payload(trigger.config),
         allow_ephemeral=False,
         missing_ephemeral_error_code=missing_secret_error_code,
     )
     task = Task(
-        user_id=int(trigger.user_id),
+        user_id=task_owner_user_id,
         title=_trigger_task_title(trigger, prompt),
         description=prompt,
         status=TaskStatus.PENDING,
         agent_id=int(trigger.agent_id),
         execution_mode=getattr(agent, "execution_mode", None) or "balanced",
-        source="trigger",
+        source=task_source,
         is_visible=False,
         input=prompt,
         agent_config=_trigger_execution_context(
@@ -805,10 +810,8 @@ def _attach_task_to_trigger_run(
             run=run,
             test=test,
         ),
-        connector_runtime_selected_refs=[
-            ref.to_wire() for ref in runtime_plan.selected_refs
-        ],
     )
+    bind_create_connector_runtime_plan(task=task, plan=runtime_plan)
     db.add(task)
     db.flush()
     persist_create_connector_runtime_context(

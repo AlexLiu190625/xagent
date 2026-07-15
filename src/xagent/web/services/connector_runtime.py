@@ -8,7 +8,7 @@ consume the resolved runtime view later in the execution path.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from threading import RLock
 from typing import Any, Iterable, cast
@@ -19,6 +19,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     CONNECTOR_TYPE_CUSTOM_API,
     CONNECTOR_TYPE_MCP,
     ERROR_CONNECTOR_NOT_FOUND,
+    ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ERROR_INVALID_RUNTIME_CONTEXT,
     ERROR_MISSING_RUNTIME_CONTEXT,
     ERROR_RUNTIME_CONTEXT_IMMUTABLE,
@@ -55,6 +56,8 @@ class ConnectorRuntimePayload:
 
 @dataclass(frozen=True)
 class ConnectorRuntimeCreatePlan:
+    task_source: str | None
+    connector_user_id: int
     selected_refs: tuple[ConnectorRef, ...]
     context_by_ref: dict[ConnectorRef, dict[str, Any]]
     ephemeral_by_ref: dict[ConnectorRef, dict[str, dict[str, Any]]]
@@ -86,11 +89,18 @@ class ConnectorRuntimeRequest:
     user_id: int | None
     connector_ref: ConnectorRef
     values: ConnectorRuntimeValues
+    task_source: str | None = None
 
 
 ConnectorRuntimeResolver = Callable[
     [ConnectorRuntimeRequest], ConnectorRuntimeValues | None
 ]
+
+
+@dataclass(frozen=True)
+class _ConnectorRuntimeResolverRegistration:
+    resolver: ConnectorRuntimeResolver
+    task_sources: frozenset[str] | None
 
 
 # The default OSS store is process-local and single-turn: it is only reliable
@@ -100,22 +110,69 @@ ConnectorRuntimeResolver = Callable[
 _EPHEMERAL_RUNTIME_VALUES: dict[str, dict[str, Any]] = {}
 _EPHEMERAL_RUNTIME_MANIFESTS: dict[str, dict[str, dict[str, set[str]]]] = {}
 _EPHEMERAL_RUNTIME_VALUES_LOCK = RLock()
-_RUNTIME_RESOLVER: ConnectorRuntimeResolver | None = None
+_RUNTIME_RESOLVER_REGISTRATION: _ConnectorRuntimeResolverRegistration | None = None
 
 
 def set_connector_runtime_resolver(
     resolver: ConnectorRuntimeResolver | None,
+    *,
+    task_sources: Collection[str] | None = None,
 ) -> None:
-    """Install the server-side hook that can supply runtime values."""
+    """Install the server-side hook that can supply runtime values.
 
-    global _RUNTIME_RESOLVER
-    _RUNTIME_RESOLVER = resolver
+    ``task_sources=None`` preserves the legacy global behavior. A supplied
+    non-empty collection limits the hook to exact ``Task.source`` matches.
+    """
+
+    global _RUNTIME_RESOLVER_REGISTRATION
+    if resolver is None:
+        if task_sources is not None:
+            raise ValueError("task_sources requires a resolver")
+        _RUNTIME_RESOLVER_REGISTRATION = None
+        return
+    _RUNTIME_RESOLVER_REGISTRATION = _ConnectorRuntimeResolverRegistration(
+        resolver=resolver,
+        task_sources=_normalize_resolver_task_sources(task_sources),
+    )
 
 
 def set_connector_runtime_resolver_for_testing(
     resolver: ConnectorRuntimeResolver | None,
+    *,
+    task_sources: Collection[str] | None = None,
 ) -> None:
-    set_connector_runtime_resolver(resolver)
+    set_connector_runtime_resolver(resolver, task_sources=task_sources)
+
+
+def _normalize_resolver_task_sources(
+    task_sources: Collection[str] | None,
+) -> frozenset[str] | None:
+    if task_sources is None:
+        return None
+    if isinstance(task_sources, (str, bytes)):
+        raise TypeError("task_sources must be a collection of strings")
+    normalized = frozenset(task_sources)
+    if not normalized:
+        raise ValueError("task_sources must contain at least one source")
+    if any(not isinstance(source, str) or not source for source in normalized):
+        raise ValueError("task_sources must contain non-empty strings")
+    if any(source != source.strip() for source in normalized):
+        raise ValueError("task_sources must not contain surrounding whitespace")
+    return normalized
+
+
+def _runtime_resolver_for_task_source(
+    task_source: str | None,
+) -> ConnectorRuntimeResolver | None:
+    registration = _RUNTIME_RESOLVER_REGISTRATION
+    if registration is None:
+        return None
+    if (
+        registration.task_sources is not None
+        and task_source not in registration.task_sources
+    ):
+        return None
+    return registration.resolver
 
 
 def store_ephemeral_runtime_values(
@@ -193,6 +250,8 @@ def load_connector_runtime_view(
     task = db.query(Task).filter(Task.id == task_id).first()
     if task is None:
         return {}
+    task_owner_user_id = _require_task_runtime_owner(task, expected_user_id=user_id)
+    task_source = _task_source(task)
 
     selected_refs = _load_task_selected_refs(task)
     if not selected_refs:
@@ -205,11 +264,7 @@ def load_connector_runtime_view(
     ephemeral_manifest = (
         get_ephemeral_runtime_manifest(turn_id) if isinstance(turn_id, str) else None
     )
-    visible = (
-        _load_visible_runtime_connectors(db, user_id=user_id)
-        if user_id is not None
-        else {}
-    )
+    visible = _load_visible_runtime_connectors(db, user_id=task_owner_user_id)
 
     runtime_view: dict[str, dict[str, Any]] = {}
     for ref in selected_refs:
@@ -240,7 +295,8 @@ def load_connector_runtime_view(
         values = _resolve_runtime_values(
             task_id=task_id,
             turn_id=turn_id,
-            user_id=user_id,
+            task_source=task_source,
+            user_id=task_owner_user_id,
             ref=ref,
             values=values,
         )
@@ -261,15 +317,19 @@ def prepare_create_connector_runtime(
     *,
     db: Session,
     agent: Agent,
+    task_source: str | None,
+    connector_user_id: int,
     payload_items: Iterable[Any] | None,
     allow_ephemeral: bool = True,
     missing_ephemeral_error_code: str = ERROR_RUNTIME_SECRET_UNAVAILABLE,
 ) -> ConnectorRuntimeCreatePlan:
-    # This create-plan helper is for entrypoints where the task runtime owner is
-    # the agent owner (currently /v1 SDK tasks and triggers). Entrypoints where a
-    # published/shared agent runs under a different task owner must use
-    # prepare_connector_runtime_selection_snapshot(..., connector_user_id=...).
-    visible = _load_visible_runtime_connectors(db, user_id=int(agent.user_id))
+    """Prepare runtime values for a task identity chosen by the caller.
+
+    ``agent`` supplies tool-selection policy. ``connector_user_id`` supplies
+    connector visibility and must be the same owner later persisted on Task.
+    """
+
+    visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
     selected_refs = _plan_selected_refs(agent, visible)
     payload_by_ref = _parse_payload_items(payload_items)
     if not allow_ephemeral:
@@ -287,7 +347,7 @@ def prepare_create_connector_runtime(
         auth_selector = dict(payload.auth_selector) if payload is not None else {}
         _validate_values_against_schema(ref, connector, context, secrets, auth_selector)
         _require_context_values(ref, connector, context)
-        if _RUNTIME_RESOLVER is None:
+        if _runtime_resolver_for_task_source(task_source) is None:
             _require_ephemeral_values(
                 ref,
                 connector,
@@ -304,6 +364,8 @@ def prepare_create_connector_runtime(
             }
 
     return ConnectorRuntimeCreatePlan(
+        task_source=task_source,
+        connector_user_id=int(connector_user_id),
         selected_refs=_sort_connector_refs(selected_refs),
         context_by_ref=context_by_ref,
         ephemeral_by_ref=ephemeral_by_ref,
@@ -343,6 +405,28 @@ def bind_connector_runtime_selection_snapshot(
     ]
 
 
+def bind_create_connector_runtime_plan(
+    *, task: Task, plan: ConnectorRuntimeCreatePlan
+) -> None:
+    """Validate and bind a create plan before the Task is persisted."""
+
+    # Keep this service-boundary assertion even when a caller derives the Task
+    # and plan from the same owner/source values.
+    if (
+        int(task.user_id) != plan.connector_user_id
+        or _task_source(task) != plan.task_source
+    ):
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector runtime context is unavailable.",
+            details={"reason": "runtime_task_identity_mismatch"},
+            status_code=503,
+        )
+    bind_connector_runtime_selection_snapshot(
+        task=task, selected_refs=plan.selected_refs
+    )
+
+
 def reject_ephemeral_connector_runtime_payload(
     payload_items: Iterable[Any] | None,
 ) -> None:
@@ -370,11 +454,16 @@ def prepare_append_connector_runtime(
     db: Session,
     agent: Agent,
     task: Task,
+    connector_user_id: int,
     payload_items: Iterable[Any] | None,
 ) -> ConnectorRuntimeAppendPlan:
+    task_owner_user_id = _require_task_runtime_owner(
+        task, expected_user_id=connector_user_id
+    )
+    task_source = _task_source(task)
     selected_refs = _load_task_selected_refs(task)
     payload_by_ref = _parse_payload_items(payload_items)
-    visible = _load_visible_runtime_connectors(db, user_id=int(agent.user_id))
+    visible = _load_visible_runtime_connectors(db, user_id=task_owner_user_id)
     _validate_payload_refs(payload_by_ref, visible=visible, selected_refs=selected_refs)
 
     persisted_context = _load_task_context_rows(db, task_id=int(task.id))
@@ -392,7 +481,7 @@ def prepare_append_connector_runtime(
         secrets = dict(payload.secrets) if payload is not None else {}
         auth_selector = dict(payload.auth_selector) if payload is not None else {}
         _validate_values_against_schema(ref, connector, context, secrets, auth_selector)
-        if _RUNTIME_RESOLVER is None:
+        if _runtime_resolver_for_task_source(task_source) is None:
             _require_ephemeral_values(ref, connector, secrets, auth_selector)
         stored = persisted_context.get(ref, {})
         _require_context_values(ref, connector, stored)
@@ -726,23 +815,45 @@ def _binding_missing_ephemeral_error_code(task: Task) -> str:
     return ERROR_RUNTIME_SECRET_UNAVAILABLE
 
 
+def _require_task_runtime_owner(task: Task, *, expected_user_id: int | None) -> int:
+    task_owner_user_id = int(task.user_id)
+    # ``Task.user_id`` remains the owner SSOT; the optional expected value is a
+    # defensive assertion for service callers that carry an independent owner.
+    if expected_user_id is not None and int(expected_user_id) != task_owner_user_id:
+        raise ConnectorRuntimeError(
+            ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
+            "Connector runtime context is unavailable.",
+            details={"reason": "runtime_owner_mismatch"},
+            status_code=503,
+        )
+    return task_owner_user_id
+
+
+def _task_source(task: Task) -> str | None:
+    source = task.source
+    return source if isinstance(source, str) else None
+
+
 def _resolve_runtime_values(
     *,
     task_id: int,
     turn_id: str | None,
-    user_id: int | None,
+    task_source: str | None,
+    user_id: int,
     ref: ConnectorRef,
     values: ConnectorRuntimeValues,
 ) -> ConnectorRuntimeValues:
-    if _RUNTIME_RESOLVER is None:
+    resolver = _runtime_resolver_for_task_source(task_source)
+    if resolver is None:
         return values
-    resolved = _RUNTIME_RESOLVER(
+    resolved = resolver(
         ConnectorRuntimeRequest(
             task_id=task_id,
             turn_id=turn_id,
             user_id=user_id,
             connector_ref=ref,
             values=values,
+            task_source=task_source,
         )
     )
     return resolved if resolved is not None else values

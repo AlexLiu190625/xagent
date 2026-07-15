@@ -17,7 +17,7 @@ by the WebSocket UI path so both transports share one state machine.
 import logging
 from typing import Any, NoReturn, Optional, Tuple, cast
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from sqlalchemy import func
 from sqlalchemy.orm import Session
 
@@ -40,6 +40,7 @@ from ...schemas.v1 import (
     UploadFilesResponse,
 )
 from ...services.connector_runtime import (
+    bind_create_connector_runtime_plan,
     persist_create_connector_runtime_context,
     pop_ephemeral_runtime_values,
     prepare_append_connector_runtime,
@@ -86,21 +87,40 @@ _CONNECTOR_RUNTIME_SETUP_FAILED_MESSAGE = "Connector runtime setup failed."
 @router.post("/chat/files", response_model=UploadFilesResponse)
 async def upload_task_files(
     files: list[UploadFile] = File(...),
+    task_id: Optional[int] = Query(
+        default=None,
+        gt=0,
+        description=(
+            "Existing SDK task whose persisted runtime owner should own "
+            "the uploaded files."
+        ),
+    ),
     authed: Tuple[Agent, AgentApiKey] = Depends(get_agent_from_api_key),
     db: Session = Depends(get_db),
 ) -> UploadFilesResponse:
     """Store files for later attachment to a task turn.
 
     API-key-gated counterpart to the JWT-only ``POST /api/files/upload``.
-    Files are stored unbound (``task_id`` NULL) and owned by the agent's
-    user; the returned ``file_id`` values are passed back in
-    ``message.files`` on ``POST /v1/chat/tasks`` (or ``.../messages``),
-    where they get bound to the task and exposed to the agent.
+    Files are stored unbound (``UploadedFile.task_id`` NULL); the returned
+    ``file_id`` values are passed back in ``message.files`` on
+    ``POST /v1/chat/tasks`` (or ``.../messages``), where they get bound to
+    the task and exposed to the agent.
+
+    When ``task_id`` is omitted, the upload is owned by the agent's current
+    user for a future create request. When ``task_id`` is provided, the task
+    is authorized through the key-bound agent and its persisted ``Task.user_id``
+    owns the upload. This keeps historical tasks usable after agent ownership
+    changes without transferring file ownership during append.
     """
     from ..files import store_uploaded_files
 
     agent, _key = authed
-    owner = db.query(User).filter(User.id == agent.user_id).first()
+    upload_owner_user_id = int(agent.user_id)
+    if task_id is not None:
+        task = _resolve_task_or_404(task_id, agent, db)
+        upload_owner_user_id = int(task.user_id)
+
+    owner = db.query(User).filter(User.id == upload_owner_user_id).first()
     if owner is None:
         raise V1ApiError(V1ErrorCode.INTERNAL_ERROR, 500)
 
@@ -343,6 +363,9 @@ async def create_chat_task(
             exception message stays out of the response.
     """
     agent, _key = authed
+    task_source = "sdk"
+    task_owner_user_id = int(agent.user_id)
+    actor_user_id = int(agent.user_id)
 
     # Server-side agent_id consistency check. The key already binds an
     # agent; ``body.agent_id`` is required by the SDK contract for
@@ -358,19 +381,10 @@ async def create_chat_task(
     # happens after the turn is claimed (below).
     file_infos = _resolve_turn_files_or_400(
         file_ids=request.message.files or [],
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
         task_id=None,
     )
-
-    try:
-        runtime_plan = prepare_create_connector_runtime(
-            db=db,
-            agent=agent,
-            payload_items=request.connector_runtime_context,
-        )
-    except ConnectorRuntimeError as exc:
-        _raise_v1_connector_runtime_error(exc)
 
     # title is what the web UI shows in its task list. Truncate to
     # 50 chars (matches the WS handler convention) so very long
@@ -387,18 +401,27 @@ async def create_chat_task(
     # user message so GET endpoint can return it without going through
     # task_chat_messages.
     task = Task(
-        user_id=agent.user_id,
+        user_id=task_owner_user_id,
         title=title,
         description=request.message.content,
         status=TaskStatus.PENDING,
         agent_id=agent.id,
         input=request.message.content,
-        source="sdk",
+        source=task_source,
         is_visible=False,
-        connector_runtime_selected_refs=[
-            ref.to_wire() for ref in runtime_plan.selected_refs
-        ],
     )
+    try:
+        runtime_plan = prepare_create_connector_runtime(
+            db=db,
+            agent=agent,
+            task_source=task_source,
+            connector_user_id=task_owner_user_id,
+            payload_items=request.connector_runtime_context,
+        )
+        bind_create_connector_runtime_plan(task=task, plan=runtime_plan)
+    except ConnectorRuntimeError as exc:
+        _raise_v1_connector_runtime_error(exc)
+
     db.add(task)
     db.flush()
     persist_create_connector_runtime_context(
@@ -423,9 +446,9 @@ async def create_chat_task(
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
-            task_owner_user_id=int(agent.user_id),
+            task_owner_user_id=task_owner_user_id,
             # SDK key resolves to the agent owner; actor == owner here.
-            actor_user_id=int(agent.user_id),
+            actor_user_id=actor_user_id,
             payload=payload,
             kind=TurnKind.CREATE,
             force_fresh=False,
@@ -449,7 +472,7 @@ async def create_chat_task(
     bind_turn_files(
         file_ids=[info["file_id"] for info in file_infos],
         task_id=int(task.id),
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
     )
 
@@ -585,6 +608,8 @@ async def append_message_to_task(
     # Resolve task first so cross-agent leak protection (404 instead
     # of 403 for "not yours") fires before any body-level checks.
     task = _resolve_task_or_404(task_id, agent, db)
+    task_owner_user_id = int(task.user_id)
+    actor_user_id = int(agent.user_id)
 
     # body.agent_id mismatch is also a 404 -- but agent_not_found,
     # not task_not_found, because that's the field the caller got
@@ -598,6 +623,7 @@ async def append_message_to_task(
             db=db,
             agent=agent,
             task=task,
+            connector_user_id=task_owner_user_id,
             payload_items=request.connector_runtime_context,
         )
     except ConnectorRuntimeError as exc:
@@ -609,7 +635,7 @@ async def append_message_to_task(
     # bound to this task re-resolve idempotently. Binding runs after the claim.
     file_infos = _resolve_turn_files_or_400(
         file_ids=request.message.files or [],
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
         task_id=int(task.id),
     )
@@ -629,9 +655,10 @@ async def append_message_to_task(
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
-            task_owner_user_id=int(agent.user_id),
-            # SDK key resolves to the agent owner; actor == owner here.
-            actor_user_id=int(agent.user_id),
+            task_owner_user_id=task_owner_user_id,
+            # The key-bound agent authorizes access; the persisted task owner
+            # remains the runtime identity when those identities have drifted.
+            actor_user_id=actor_user_id,
             payload=payload,
             kind=TurnKind.APPEND,
             force_fresh=False,
@@ -653,7 +680,7 @@ async def append_message_to_task(
     bind_turn_files(
         file_ids=[info["file_id"] for info in file_infos],
         task_id=int(task.id),
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
     )
 

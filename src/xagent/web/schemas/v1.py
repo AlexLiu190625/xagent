@@ -56,6 +56,9 @@ class MessageBody(BaseModel):
         default=None,
         description=(
             "file_id values previously returned by ``POST /v1/chat/files``. "
+            "For an existing task, pass its id to that endpoint as the "
+            "``task_id`` query parameter so the upload uses the persisted "
+            "task runtime owner. "
             "The referenced files are attached to this turn and exposed to "
             "the agent via file references."
         ),
@@ -128,7 +131,8 @@ class UploadFilesResponse(BaseModel):
 
     Pass the returned ``file_id`` values in a subsequent
     ``POST /v1/chat/tasks`` (or ``.../messages``) under ``message.files``
-    to attach them to a turn.
+    to attach them to a turn. For an existing task, supply ``task_id`` to
+    the upload endpoint so the file is stored under that task's runtime owner.
     """
 
     files: List[UploadedFileInfo]

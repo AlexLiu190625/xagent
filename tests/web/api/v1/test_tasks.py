@@ -14,6 +14,7 @@ real :class:`TraceEvent` rows inserted directly into the test DB to
 drive the mapping.
 """
 
+from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,6 +33,7 @@ from xagent.web.models.task import (
     TaskStatus,
     TraceEvent,
 )
+from xagent.web.models.user import User
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -86,6 +88,13 @@ def _create_agent_with_key_for(headers: dict[str, str]) -> tuple[int, str]:
 # note in test_agent_api_keys.py for why we use ``usefixtures`` with a
 # string name rather than importing the fixture.
 pytestmark = pytest.mark.usefixtures("_test_db")
+
+
+@pytest.fixture(autouse=True)
+def reset_connector_runtime_resolver():
+    set_connector_runtime_resolver_for_testing(None)
+    yield
+    set_connector_runtime_resolver_for_testing(None)
 
 
 # ===== helpers =====
@@ -863,6 +872,82 @@ def test_create_task_rejects_missing_required_secret_without_resolver(mock_start
     assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
     assert resp.json()["error"]["details"]["reason"] == "not_provided"
     assert mock_start_task.call_count == 0
+
+
+def test_external_scoped_resolver_does_not_defer_sdk_required_secret(
+    mock_start_task,
+):
+    agent_id, full_key = _create_agent_with_key()
+    _install_runtime_mcp_connector(agent_id, required=False, secret_required=True)
+    resolver_calls = 0
+
+    def _resolver(request):
+        nonlocal resolver_calls
+        resolver_calls += 1
+        return request.values
+
+    set_connector_runtime_resolver_for_testing(_resolver, task_sources={"external"})
+    try:
+        resp = client.post(
+            "/v1/chat/tasks",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "first user message"},
+            },
+        )
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+
+    assert resp.status_code == 400
+    assert resp.json()["error"]["code"] == "runtime_secret_unavailable"
+    assert resp.json()["error"]["details"]["reason"] == "not_provided"
+    assert mock_start_task.call_count == 0
+    assert resolver_calls == 0
+
+
+def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
+    monkeypatch: pytest.MonkeyPatch,
+    mock_start_task,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    prepare_runtime_plan = v1_tasks.prepare_create_connector_runtime
+
+    def prepare_mismatched_identity(**kwargs):
+        plan = prepare_runtime_plan(**kwargs)
+        return replace(
+            plan,
+            connector_user_id=plan.connector_user_id + 1,
+        )
+
+    monkeypatch.setattr(
+        v1_tasks,
+        "prepare_create_connector_runtime",
+        prepare_mismatched_identity,
+    )
+
+    response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "identity mismatch"},
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"] == {
+        "code": "connector_runtime_unavailable",
+        "message": "Connector runtime context is unavailable.",
+        "details": {"reason": "runtime_task_identity_mismatch"},
+    }
+    assert mock_start_task.call_count == 0
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Task).filter(Task.agent_id == agent_id).count() == 0
+    finally:
+        db.close()
 
 
 def test_connector_runtime_view_loads_task_context(mock_start_task):
@@ -1684,6 +1769,29 @@ def _force_task_status(task_id: int, status: TaskStatus) -> None:
         db.close()
 
 
+def _change_agent_owner_for_existing_task(
+    *, task_id: int, agent_id: int, username: str
+) -> tuple[int, int]:
+    """Change the agent owner while preserving the task's persisted owner."""
+    _register_second_user(username=username)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        persisted_task_owner_id = int(task.user_id)
+        current_agent_owner_id = int(
+            db.query(User.id).filter(User.username == username).one()[0]
+        )
+        assert current_agent_owner_id != persisted_task_owner_id
+
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.user_id = current_agent_owner_id
+        task.status = TaskStatus.COMPLETED
+        db.commit()
+        return persisted_task_owner_id, current_agent_owner_id
+    finally:
+        db.close()
+
+
 def test_append_message_happy_path(mock_start_task):
     """Returns 202 + accepted_at, persists new user message, kicks off bg."""
     agent_id, full_key = _create_agent_with_key()
@@ -1732,6 +1840,275 @@ def test_append_message_happy_path(mock_start_task):
         db.close()
 
     assert mock_start_task.call_count == 1
+
+
+def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
+    mock_start_task,
+):
+    """A key-bound agent may append while the task keeps its runtime owner."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+
+    persisted_task_owner_id, current_agent_owner_id = (
+        _change_agent_owner_for_existing_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            username="sdk-owner-drift",
+        )
+    )
+    mock_start_task.reset_mock()
+
+    with patch.object(
+        v1_tasks.TaskTurnOrchestrator,
+        "begin_turn",
+        wraps=v1_tasks.TaskTurnOrchestrator.begin_turn,
+    ) as begin_turn:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    assert begin_turn.await_count == 1
+    assert begin_turn.await_args.kwargs["task_owner_user_id"] == (
+        persisted_task_owner_id
+    )
+    assert begin_turn.await_args.kwargs["actor_user_id"] == current_agent_owner_id
+
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        messages = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert [message.user_id for message in messages] == [
+            persisted_task_owner_id,
+            persisted_task_owner_id,
+        ]
+    finally:
+        db.close()
+
+
+def test_append_message_uses_persisted_task_owner_for_files_after_owner_changes(
+    mock_start_task,
+):
+    """Task-aware uploads use the persisted owner after agent-owner drift."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+    persisted_task_owner_id, _current_agent_owner_id = (
+        _change_agent_owner_for_existing_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            username="sdk-file-owner-drift",
+        )
+    )
+    mock_start_task.reset_mock()
+
+    upload_response = client.post(
+        f"/v1/chat/files?task_id={task_id}",
+        headers=_bearer(full_key),
+        files=[("files", ("owner-file.txt", b"owner data", "text/plain"))],
+    )
+    assert upload_response.status_code == 200, upload_response.text
+    file_id = upload_response.json()["files"][0]["file_id"]
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        uploaded_file = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert uploaded_file.user_id == persisted_task_owner_id
+        assert uploaded_file.task_id is None
+        assert str(uploaded_file.storage_key).startswith(
+            f"users/{persisted_task_owner_id}/uploads/"
+        )
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "use the existing file",
+                "files": [file_id],
+            },
+        },
+    )
+
+    assert response.status_code == 202, response.text
+
+    db = _direct_db_session()
+    try:
+        uploaded_file = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert uploaded_file.user_id == persisted_task_owner_id
+        assert uploaded_file.task_id == task_id
+    finally:
+        db.close()
+
+
+def test_task_aware_upload_rejects_other_agents_task_without_writing_file(
+    mock_start_task,
+):
+    """A key cannot select another agent's task runtime owner for upload."""
+    owner_agent_id, owner_key = _create_agent_with_key()
+    owner_task_id = _create_task(owner_key, owner_agent_id)
+    mock_start_task.reset_mock()
+
+    other_headers = _register_second_user(username="sdk-task-upload-other")
+    _other_agent_id, other_key = _create_agent_with_key_for(other_headers)
+    response = client.post(
+        f"/v1/chat/files?task_id={owner_task_id}",
+        headers=_bearer(other_key),
+        files=[("files", ("forbidden-owner.txt", b"private", "text/plain"))],
+    )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["error"]["code"] == "task_not_found"
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        assert (
+            db.query(UploadedFile)
+            .filter(UploadedFile.filename == "forbidden-owner.txt")
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    ("task_sources", "expected_status"),
+    [
+        (None, 202),
+        ({"sdk"}, 202),
+        ({"external"}, 400),
+    ],
+    ids=["legacy-global", "matching-sdk", "non-matching-external"],
+)
+def test_append_message_resolver_scope_follows_persisted_sdk_source(
+    mock_start_task,
+    task_sources: set[str] | None,
+    expected_status: int,
+) -> None:
+    agent_id, full_key = _create_agent_with_key()
+    server_id = _install_runtime_mcp_connector(
+        agent_id,
+        required=False,
+        secret_required=True,
+    )
+    create_response = client.post(
+        "/v1/chat/tasks",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {"role": "user", "content": "first turn"},
+            "connector_runtime_context": [
+                {
+                    "connector_ref": {
+                        "connector_type": "mcp",
+                        "connector_id": server_id,
+                    },
+                    "secrets": {"authorization": "Bearer initial-token"},
+                }
+            ],
+        },
+    )
+    assert create_response.status_code == 202, create_response.text
+    task_id = create_response.json()["task_id"]
+    initial_turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+    _force_task_status(task_id, TaskStatus.COMPLETED)
+    mock_start_task.reset_mock()
+
+    db = _direct_db_session()
+    try:
+        task_owner_user_id = int(
+            db.query(Task.user_id).filter(Task.id == task_id).one()[0]
+        )
+    finally:
+        db.close()
+
+    resolver_requests = []
+
+    def resolver(request):
+        resolver_requests.append(request)
+        return ConnectorRuntimeValues(
+            context=request.values.context,
+            secrets={"authorization": "Bearer resolver-token"},
+            auth_selector=request.values.auth_selector,
+        )
+
+    append_turn_id: str | None = None
+    set_connector_runtime_resolver_for_testing(
+        resolver,
+        task_sources=task_sources,
+    )
+    try:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+            },
+        )
+        assert response.status_code == expected_status, response.text
+
+        if expected_status == 202:
+            assert mock_start_task.call_count == 1
+            append_turn_id = mock_start_task.call_args.kwargs["payload"].turn_id
+            runtime_turn_id = append_turn_id
+        else:
+            assert response.json()["error"]["code"] == "runtime_secret_unavailable"
+            assert response.json()["error"]["details"]["reason"] == "not_provided"
+            assert mock_start_task.call_count == 0
+            runtime_turn_id = initial_turn_id
+
+        db = _direct_db_session()
+        try:
+            view = load_connector_runtime_view(
+                db=db,
+                task_id=task_id,
+                turn_id=runtime_turn_id,
+                user_id=task_owner_user_id,
+            )
+        finally:
+            db.close()
+    finally:
+        set_connector_runtime_resolver_for_testing(None)
+        pop_ephemeral_runtime_values(initial_turn_id)
+        if append_turn_id is not None:
+            pop_ephemeral_runtime_values(append_turn_id)
+
+    if expected_status == 202:
+        assert view[f"mcp:{server_id}"]["secrets"] == {
+            "authorization": "Bearer resolver-token"
+        }
+        assert len(resolver_requests) == 1
+        assert resolver_requests[0].task_source == "sdk"
+        assert resolver_requests[0].user_id == task_owner_user_id
+    else:
+        assert view[f"mcp:{server_id}"]["secrets"] == {
+            "authorization": "Bearer initial-token"
+        }
+        assert resolver_requests == []
 
 
 def test_append_message_rejects_changed_connector_runtime_context(mock_start_task):
