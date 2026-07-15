@@ -85,14 +85,19 @@ def _update_statement(app_id: str, launch_config: object) -> sa.sql.dml.Update:
 
 
 def _upgrade_offline() -> None:
+    dialect_name = op.get_context().dialect.name
     for app_id, launch_config in CANONICAL_LAUNCH_CONFIGS.items():
         serialized_config = json.dumps(launch_config, sort_keys=True)
+        serialized_literal = op.inline_literal(serialized_config)
+        launch_config_value = (
+            sa.cast(serialized_literal, sa.JSON())
+            if dialect_name == "postgresql"
+            else serialized_literal
+        )
         statement = (
             sa.update(PUBLIC_MCP_APPS_TABLE)
             .where(PUBLIC_MCP_APPS_TABLE.c.app_id == op.inline_literal(app_id))
-            .values(
-                launch_config=sa.cast(op.inline_literal(serialized_config), sa.JSON())
-            )
+            .values(launch_config=launch_config_value)
         )
         op.execute(statement)
 

@@ -1,4 +1,17 @@
-from sqlalchemy import JSON, Boolean, Column, Integer, String, Text, true
+from typing import Any
+
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    DateTime,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    true,
+)
+from sqlalchemy.sql import func
 
 from .database import Base
 
@@ -26,3 +39,28 @@ class PublicMCPApp(Base):  # type: ignore[no-any-unimported]
     launch_config = Column(
         JSON, nullable=True
     )  # Dict e.g., {"command": "npx", "args": ["..."]}
+
+
+class PublicMCPAppAudit(Base):  # type: ignore[no-any-unimported]
+    """Immutable admin write history for custom public MCP catalog apps."""
+
+    __tablename__ = "public_mcp_app_audits"
+
+    id = Column(Integer, primary_key=True)
+    actor_user_id = Column(
+        Integer,
+        ForeignKey("users.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    action = Column(String(16), nullable=False, index=True)
+    app_id = Column(String(100), nullable=False, index=True)
+    before_values: Any = Column(JSON, nullable=True)
+    after_values: Any = Column(JSON, nullable=True)
+    request_id = Column(String(128), nullable=True, index=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
+        index=True,
+    )

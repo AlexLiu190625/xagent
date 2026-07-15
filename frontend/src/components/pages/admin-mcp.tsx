@@ -570,9 +570,17 @@ export default function AdminMcpPage() {
                           <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => handleEditApp(a)}>
                             <Edit2 className="w-4 h-4 text-muted-foreground hover:text-blue-500" />
                           </Button>
-                          <Button variant="ghost" size="icon" className="h-8 w-8" onClick={() => handleDeleteApp(a.id)}>
-                            <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive" />
-                          </Button>
+                          {!a.is_builtin && (
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8"
+                              aria-label={t("adminMcp.apps.deleteAction")}
+                              onClick={() => handleDeleteApp(a.id)}
+                            >
+                              <Trash2 className="w-4 h-4 text-muted-foreground hover:text-destructive" />
+                            </Button>
+                          )}
                         </div>
                       </TableCell>
                     </TableRow>

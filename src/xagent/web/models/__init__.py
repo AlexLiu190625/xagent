@@ -11,7 +11,7 @@ from .mcp_oauth import MCPOAuthClient, MCPOAuthFlowState, MCPOAuthGrant
 from .model import Model
 from .oauth_provider import OAuthProvider
 from .oidc_consumed_token import OidcConsumedToken
-from .public_mcp import PublicMCPApp
+from .public_mcp import PublicMCPApp, PublicMCPAppAudit
 from .sandbox import SandboxInfo, SandboxSnapshot
 from .skill import UserSkill, UserSkillFile
 from .system_setting import SystemSetting
@@ -88,6 +88,7 @@ __all__ = [
     "OAuthProvider",
     "OidcConsumedToken",
     "PublicMCPApp",
+    "PublicMCPAppAudit",
     "Workforce",
     "WorkforceAgent",
     "WorkforceRun",

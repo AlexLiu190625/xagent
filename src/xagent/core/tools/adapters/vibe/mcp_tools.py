@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, List
 from .connector_runtime import ConnectorRuntimeError
 from .factory import register_tool
 from .config import (
+    MCPConfigLoadError,
     MCPFailurePolicy,
     MCPToolLoadSummary,
     MCPUnavailableSummary,
@@ -31,6 +32,35 @@ def _stable_server_names(values: Any) -> tuple[str, ...]:
             names.append(name)
             seen.add(key)
     return tuple(names)
+
+
+def _select_config_load_failures(
+    error: MCPConfigLoadError,
+    spec: Any,
+) -> tuple[MCPUnavailableSummary, ...]:
+    """Apply MCP server selection before enforcing config-load failures."""
+    if spec is None:
+        return error.summaries
+
+    scoped = spec.scoped_mcp_servers()
+    if scoped == frozenset():
+        return ()
+    if scoped is None:
+        return error.summaries
+
+    from .selection_spec import normalize_mcp_server_name
+
+    by_name = {
+        normalize_mcp_server_name(summary.server_name): summary
+        for summary in error.summaries
+    }
+    return tuple(
+        by_name.get(
+            name,
+            MCPUnavailableSummary.from_values(name, "config_load_failed"),
+        )
+        for name in sorted(scoped)
+    )
 
 
 def _build_mcp_load_summary(
@@ -162,7 +192,29 @@ async def create_mcp_tools(config: "BaseToolConfig") -> List[Any]:
     )
     if spec is not None and not spec.includes_mcp():
         return []
-    mcp_configs = await config.get_mcp_server_configs()
+    try:
+        mcp_configs = await config.get_mcp_server_configs()
+    except MCPConfigLoadError as error:
+        failures = _select_config_load_failures(error, spec)
+        if not failures:
+            return []
+
+        from .factory import ToolFactory
+
+        tools = [
+            ToolFactory._create_unavailable_mcp_tool(
+                server_name=failure.server_name,
+                reason=failure.reason,
+                message="MCP server configuration is unavailable.",
+            )
+            for failure in failures
+        ]
+        summary = MCPToolLoadSummary(
+            requested_servers=tuple(failure.server_name for failure in failures),
+            failures=failures,
+            successful_tool_count=0,
+        )
+        return await _finish_mcp_setup(config, summary, tools)
     requested_without_configs: tuple[str, ...] = ()
     if not mcp_configs and spec is not None:
         scoped = spec.scoped_mcp_servers()

@@ -206,6 +206,17 @@ describe("AdminMcpPage app updates", () => {
     expect((screen.getByText("select:none").closest("button") as HTMLButtonElement).disabled).toBe(false)
   })
 
+  it("offers delete only for custom catalog apps", async () => {
+    renderPage([builtinApp, customApp])
+
+    const builtinRow = (await screen.findByText("gmail")).closest("tr")
+    const customRow = (await screen.findByText("custom-mail")).closest("tr")
+    if (!builtinRow || !customRow) throw new Error("Missing app rows")
+
+    expect(within(builtinRow).queryByRole("button", { name: "adminMcp.apps.deleteAction" })).toBeNull()
+    expect(within(customRow).getByRole("button", { name: "adminMcp.apps.deleteAction" })).not.toBeNull()
+  })
+
   it("sends only presentation deltas when editing a built-in app", async () => {
     const authoritative = { ...builtinApp, description: "Updated description" }
     renderPage([builtinApp])

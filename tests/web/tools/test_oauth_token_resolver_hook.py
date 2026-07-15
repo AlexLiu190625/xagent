@@ -809,6 +809,44 @@ async def test_missing_user_oauth_token_retains_unavailable_server_and_later_ser
 
 
 @pytest.mark.asyncio
+async def test_unexpected_server_config_failure_retains_failure_and_later_server(
+    db_session,
+    monkeypatch,
+    caplog,
+):
+    db, user = db_session
+    failed_server = _add_stdio_server(db, user, name="before")
+    failed_server.env = {"FAIL": "encrypted-secret"}
+    _add_stdio_server(db, user, name="after")
+    db.commit()
+
+    def fail_first_server(env):
+        if env == {"FAIL": "encrypted-secret"}:
+            raise RuntimeError("decrypt-secret")
+        return {}
+
+    monkeypatch.setattr(
+        "xagent.core.utils.encryption.decrypt_env_dict",
+        fail_first_server,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        configs = await _tool_config(db, user).get_mcp_server_configs()
+
+    assert [config["name"] for config in configs] == ["before", "after"]
+    _assert_unavailable_mcp_config(
+        configs[0],
+        failed_server,
+        reason="config_load_failed",
+    )
+    assert configs[1]["config"]["command"] == "echo"
+    public_output = repr(configs[0]) + caplog.text
+    assert "encrypted-secret" not in public_output
+    assert "decrypt-secret" not in public_output
+    assert "RuntimeError" in caplog.text
+
+
+@pytest.mark.asyncio
 async def test_user_oauth_refresh_failure_retains_unavailable_and_deletes_invalid_record(
     db_session,
     monkeypatch,

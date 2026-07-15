@@ -1,6 +1,8 @@
+from copy import deepcopy
 from typing import Any, Dict, List, Optional
+from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, ValidationError, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -13,7 +15,7 @@ from ..builtin_mcp_registry import (
 )
 from ..models.database import get_db
 from ..models.oauth_provider import OAuthProvider
-from ..models.public_mcp import PublicMCPApp
+from ..models.public_mcp import PublicMCPApp, PublicMCPAppAudit
 from ..models.user import User
 
 admin_mcp_router = APIRouter(prefix="/api/admin/mcp", tags=["Admin MCP"])
@@ -131,10 +133,41 @@ _BUILTIN_PROTECTED_FIELDS = frozenset(
         "launch_config",
     }
 )
+_PUBLIC_MCP_AUDIT_REQUEST_ID_MAX_LENGTH = 128
 
 
 def _public_mcp_app_values(app: PublicMCPApp) -> Dict[str, Any]:
-    return {field: getattr(app, field) for field in _PUBLIC_MCP_APP_FIELDS}
+    return deepcopy({field: getattr(app, field) for field in _PUBLIC_MCP_APP_FIELDS})
+
+
+def _public_mcp_audit_request_id(request: Request) -> str:
+    request_id = request.headers.get("x-request-id")
+    if request_id:
+        return request_id[:_PUBLIC_MCP_AUDIT_REQUEST_ID_MAX_LENGTH]
+    return uuid4().hex
+
+
+def _record_public_mcp_app_audit(
+    db: Session,
+    *,
+    actor: User,
+    request: Request,
+    action: str,
+    app_id: str,
+    before_values: Dict[str, Any] | None,
+    after_values: Dict[str, Any] | None,
+) -> None:
+    """Add one custom catalog audit row to the caller's write transaction."""
+    db.add(
+        PublicMCPAppAudit(
+            actor_user_id=int(actor.id),
+            action=action,
+            app_id=app_id,
+            before_values=before_values,
+            after_values=after_values,
+            request_id=_public_mcp_audit_request_id(request),
+        )
+    )
 
 
 def _public_mcp_app_response(app: PublicMCPApp) -> Dict[str, Any]:
@@ -347,8 +380,9 @@ async def list_apps(
 @admin_mcp_router.post("/apps", response_model=PublicMCPAppResponse)
 async def create_app(
     app: PublicMCPAppCreate,
+    request: Request,
     db: Session = Depends(get_db),
-    _: User = Depends(verify_admin),
+    actor: User = Depends(verify_admin),
 ) -> Any:
     if is_builtin_public_mcp_app(app.app_id):
         raise HTTPException(
@@ -362,6 +396,15 @@ async def create_app(
         raise HTTPException(status_code=400, detail="App already exists")
     db_app = PublicMCPApp(**app.model_dump())
     db.add(db_app)
+    _record_public_mcp_app_audit(
+        db,
+        actor=actor,
+        request=request,
+        action="create",
+        app_id=db_app.app_id,
+        before_values=None,
+        after_values=_public_mcp_app_values(db_app),
+    )
     try:
         db.commit()
     except IntegrityError:
@@ -375,14 +418,27 @@ async def create_app(
 async def update_app(
     app_id: int,
     app: PublicMCPAppCreate,
+    request: Request,
     db: Session = Depends(get_db),
-    _: User = Depends(verify_admin),
+    actor: User = Depends(verify_admin),
 ) -> Any:
     db_app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_id).first()
     if not db_app:
         raise HTTPException(status_code=404, detail="App not found")
 
+    is_builtin = is_builtin_public_mcp_app(db_app.app_id)
+    before_values = _public_mcp_app_values(db_app)
     _apply_public_mcp_app_update(db_app, app.model_dump())
+    if not is_builtin:
+        _record_public_mcp_app_audit(
+            db,
+            actor=actor,
+            request=request,
+            action="update",
+            app_id=db_app.app_id,
+            before_values=before_values,
+            after_values=_public_mcp_app_values(db_app),
+        )
 
     db.commit()
     db.refresh(db_app)
@@ -393,14 +449,27 @@ async def update_app(
 async def patch_app(
     app_id: int,
     app: PublicMCPAppUpdate,
+    request: Request,
     db: Session = Depends(get_db),
-    _: User = Depends(verify_admin),
+    actor: User = Depends(verify_admin),
 ) -> Any:
     db_app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_id).first()
     if not db_app:
         raise HTTPException(status_code=404, detail="App not found")
 
+    is_builtin = is_builtin_public_mcp_app(db_app.app_id)
+    before_values = _public_mcp_app_values(db_app)
     _apply_public_mcp_app_update(db_app, app.model_dump(exclude_unset=True))
+    if not is_builtin:
+        _record_public_mcp_app_audit(
+            db,
+            actor=actor,
+            request=request,
+            action="update",
+            app_id=db_app.app_id,
+            before_values=before_values,
+            after_values=_public_mcp_app_values(db_app),
+        )
 
     db.commit()
     db.refresh(db_app)
@@ -409,11 +478,29 @@ async def patch_app(
 
 @admin_mcp_router.delete("/apps/{app_id}")
 async def delete_app(
-    app_id: int, db: Session = Depends(get_db), _: User = Depends(verify_admin)
+    app_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    actor: User = Depends(verify_admin),
 ) -> dict:
     db_app = db.query(PublicMCPApp).filter(PublicMCPApp.id == app_id).first()
     if not db_app:
         raise HTTPException(status_code=404, detail="App not found")
+    if is_builtin_public_mcp_app(db_app.app_id):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Built-in MCP apps are managed by code",
+        )
+    before_values = _public_mcp_app_values(db_app)
+    _record_public_mcp_app_audit(
+        db,
+        actor=actor,
+        request=request,
+        action="delete",
+        app_id=db_app.app_id,
+        before_values=before_values,
+        after_values=None,
+    )
     db.delete(db_app)
     db.commit()
     return {"success": True}

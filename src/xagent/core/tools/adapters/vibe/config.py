@@ -27,6 +27,7 @@ _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
         "adapter_construction",
         "authorization_required",
         "catalog_app_not_found",
+        "config_load_failed",
         "initialize",
         "insufficient_scope",
         "invalid_config",
@@ -80,32 +81,54 @@ class MCPToolLoadSummary:
     successful_tool_count: int = 0
 
 
+def _normalize_mcp_unavailable_summaries(
+    summaries: Iterable[MCPUnavailableSummary],
+    *,
+    default_reason: str = _DEFAULT_MCP_UNAVAILABLE_REASON,
+) -> tuple[MCPUnavailableSummary, ...]:
+    normalized: list[MCPUnavailableSummary] = []
+    seen: set[tuple[str, str]] = set()
+    for summary in summaries:
+        if type(summary) is MCPUnavailableSummary:
+            safe_summary = MCPUnavailableSummary.from_values(
+                summary.server_name,
+                summary.reason,
+            )
+        else:
+            safe_summary = MCPUnavailableSummary.from_values(None, None)
+        key = (safe_summary.server_name, safe_summary.reason)
+        if key not in seen:
+            normalized.append(safe_summary)
+            seen.add(key)
+    if not normalized:
+        normalized.append(
+            MCPUnavailableSummary(
+                server_name=_DEFAULT_MCP_SERVER_NAME,
+                reason=default_reason,
+            )
+        )
+    return tuple(normalized)
+
+
+class MCPConfigLoadError(RuntimeError):
+    """A public-safe failure to scan or prefetch selected MCP configs."""
+
+    def __init__(self, server_names: Iterable[object] = ()) -> None:
+        self.summaries = _normalize_mcp_unavailable_summaries(
+            (
+                MCPUnavailableSummary.from_values(name, "config_load_failed")
+                for name in server_names
+            ),
+            default_reason="config_load_failed",
+        )
+        super().__init__("MCP server configurations could not be loaded.")
+
+
 class RequiredMCPUnavailableError(RuntimeError):
     """A selected MCP dependency is unavailable under strict setup policy."""
 
     def __init__(self, summaries: Iterable[MCPUnavailableSummary]) -> None:
-        normalized: list[MCPUnavailableSummary] = []
-        seen: set[tuple[str, str]] = set()
-        for summary in summaries:
-            if type(summary) is MCPUnavailableSummary:
-                safe_summary = MCPUnavailableSummary.from_values(
-                    summary.server_name,
-                    summary.reason,
-                )
-            else:
-                safe_summary = MCPUnavailableSummary.from_values(None, None)
-            key = (safe_summary.server_name, safe_summary.reason)
-            if key not in seen:
-                normalized.append(safe_summary)
-                seen.add(key)
-        if not normalized:
-            normalized.append(
-                MCPUnavailableSummary(
-                    server_name=_DEFAULT_MCP_SERVER_NAME,
-                    reason=_DEFAULT_MCP_UNAVAILABLE_REASON,
-                )
-            )
-        self.summaries = tuple(normalized)
+        self.summaries = _normalize_mcp_unavailable_summaries(summaries)
         super().__init__("Required MCP servers are unavailable.")
 
 

@@ -1307,7 +1307,7 @@ async def load_mcp_tools_as_agent_tools(
                             error_type=sandbox_result.adapter_error_types[0],
                         )
                     )
-                elif sandbox_result.wrap_error_types:
+                if sandbox_result.wrap_error_types:
                     failures.append(
                         MCPServerLoadFailure(
                             server_name=server_name,
@@ -1315,7 +1315,11 @@ async def load_mcp_tools_as_agent_tools(
                             error_type=sandbox_result.wrap_error_types[0],
                         )
                     )
-                elif not server_tools:
+                if (
+                    not server_tools
+                    and not sandbox_result.adapter_error_types
+                    and not sandbox_result.wrap_error_types
+                ):
                     failures.append(
                         MCPServerLoadFailure(
                             server_name=server_name,

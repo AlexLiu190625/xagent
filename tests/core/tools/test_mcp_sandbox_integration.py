@@ -249,6 +249,63 @@ class TestLoadMcpToolsAsAgentTools:
         assert "planted-builder-secret" not in repr(result)
 
     @pytest.mark.asyncio
+    async def test_sandbox_adapter_and_wrap_failures_are_both_preserved(self):
+        connection: Connection = {
+            "transport": "stdio",
+            "command": "npx",
+            "args": ["demo"],
+        }
+        mcp_tools = [
+            MCPTool(
+                name="broken-adapter",
+                description="Broken adapter",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+            MCPTool(
+                name="broken-wrap",
+                description="Broken wrap",
+                inputSchema={"type": "object", "properties": {}},
+            ),
+        ]
+        adapter = MagicMock()
+
+        with (
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.list_tools_in_sandbox",
+                new=AsyncMock(return_value=mcp_tools),
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.mcp_adapter._build_mcp_tool_adapter",
+                side_effect=[
+                    ValueError("Bearer planted-combined-adapter-secret"),
+                    adapter,
+                ],
+            ),
+            patch(
+                "xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_mcp_tool_helper.create_sandboxed_tool",
+                new=AsyncMock(
+                    side_effect=RuntimeError("Bearer planted-combined-wrap-secret")
+                ),
+            ),
+        ):
+            result = await load_mcp_tools_as_agent_tools(
+                {"demo": connection}, sandbox=MagicMock()
+            )
+
+        assert result.tools == ()
+        assert result.loaded_servers == ()
+        assert [failure.phase for failure in result.failures] == [
+            MCPFailurePhase.ADAPTER_CONSTRUCTION,
+            MCPFailurePhase.SANDBOX_TOOL_WRAP,
+        ]
+        assert [failure.error_type for failure in result.failures] == [
+            "ValueError",
+            "RuntimeError",
+        ]
+        assert "planted-combined-adapter-secret" not in repr(result)
+        assert "planted-combined-wrap-secret" not in repr(result)
+
+    @pytest.mark.asyncio
     async def test_sandbox_server_with_no_tools_is_reported(self):
         connection: Connection = {
             "transport": "stdio",

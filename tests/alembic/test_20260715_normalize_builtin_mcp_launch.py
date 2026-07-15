@@ -1,6 +1,8 @@
 """Tests for normalizing built-in Python MCP launch configurations."""
 
 import importlib.util
+import json
+import sqlite3
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -266,6 +268,58 @@ def test_offline_postgresql_upgrade_emits_literal_update_only_sql() -> None:
     for app_id, config in EXPECTED_LAUNCH_CONFIGS.items():
         assert f"public_mcp_apps.app_id = '{app_id}'" in sql
         assert config["args"][1] in sql
+
+
+def test_offline_sqlite_upgrade_round_trips_json_catalog_values() -> None:
+    migration = _load_migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="sqlite",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+
+    with Operations.context(context):
+        migration.upgrade()
+
+    connection = sqlite3.connect(":memory:")
+    connection.execute(
+        "CREATE TABLE public_mcp_apps (app_id TEXT PRIMARY KEY, launch_config JSON)"
+    )
+    connection.execute(
+        "INSERT INTO public_mcp_apps (app_id, launch_config) VALUES (?, ?)",
+        ("gmail", json.dumps(_uv_config(EXPECTED_LAUNCH_CONFIGS["gmail"]))),
+    )
+    connection.executescript(output.getvalue())
+
+    stored_config = connection.execute(
+        "SELECT launch_config FROM public_mcp_apps WHERE app_id = 'gmail'"
+    ).fetchone()
+
+    assert stored_config is not None
+    assert json.loads(stored_config[0]) == EXPECTED_LAUNCH_CONFIGS["gmail"]
+
+
+def test_offline_mysql_upgrade_emits_json_text_literals_without_bind_parameters() -> (
+    None
+):
+    migration = _load_migration_module()
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="mysql",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+
+    with Operations.context(context):
+        migration.upgrade()
+
+    sql = output.getvalue()
+    assert sql.count("UPDATE public_mcp_apps") == len(EXPECTED_LAUNCH_CONFIGS)
+    assert "CAST(" not in sql
+    assert ":app_id" not in sql
+    assert ":launch_config" not in sql
+    for app_id, config in EXPECTED_LAUNCH_CONFIGS.items():
+        assert f"app_id = '{app_id}'" in sql
+        assert json.dumps(config, sort_keys=True) in sql
 
 
 def test_offline_postgresql_downgrade_emits_no_sql() -> None:

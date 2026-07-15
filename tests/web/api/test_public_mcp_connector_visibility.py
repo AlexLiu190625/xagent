@@ -19,7 +19,7 @@ from xagent.web.api.mcp import mcp_router
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.oauth_provider import OAuthProvider
-from xagent.web.models.public_mcp import PublicMCPApp
+from xagent.web.models.public_mcp import PublicMCPApp, PublicMCPAppAudit
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 
@@ -1452,6 +1452,125 @@ def test_admin_create_rejects_reserved_builtin_id_after_deletion() -> None:
                 db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").first()
                 is None
             )
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_delete_rejects_builtin_catalog_app() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp.id)
+                .filter(PublicMCPApp.app_id == "gmail")
+                .scalar()
+            )
+        finally:
+            db.close()
+
+        response = client.delete(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+        )
+
+        assert response.status_code == 409
+        db = next(get_db())
+        try:
+            assert db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            assert db.query(PublicMCPAppAudit).count() == 0
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_custom_catalog_writes_record_before_after_audits() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        db = next(get_db())
+        try:
+            admin_user_id = db.query(User.id).filter(User.username == "admin").scalar()
+        finally:
+            db.close()
+
+        created = client.post(
+            "/api/admin/mcp/apps",
+            headers={**admin_headers, "X-Request-ID": "catalog-create"},
+            json={
+                "app_id": "custom-audited",
+                "name": "Custom Audited",
+                "transport": "stdio",
+                "launch_config": {
+                    "command": "old-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                },
+            },
+        )
+        assert created.status_code == 200
+        app_pk = created.json()["id"]
+
+        updated = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "catalog-update"},
+            json={
+                "launch_config": {
+                    "command": "new-command",
+                    "required_env": ["CUSTOM_TOKEN"],
+                }
+            },
+        )
+        assert updated.status_code == 200
+
+        deleted = client.delete(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers={**admin_headers, "X-Request-ID": "catalog-delete"},
+        )
+        assert deleted.status_code == 200
+
+        db = next(get_db())
+        try:
+            audits = (
+                db.query(PublicMCPAppAudit)
+                .filter(PublicMCPAppAudit.app_id == "custom-audited")
+                .order_by(PublicMCPAppAudit.id)
+                .all()
+            )
+            assert [audit.action for audit in audits] == [
+                "create",
+                "update",
+                "delete",
+            ]
+            assert [audit.request_id for audit in audits] == [
+                "catalog-create",
+                "catalog-update",
+                "catalog-delete",
+            ]
+            assert {audit.actor_user_id for audit in audits} == {admin_user_id}
+            assert audits[0].before_values is None
+            assert audits[0].after_values["launch_config"]["command"] == "old-command"
+            assert audits[1].before_values["launch_config"]["command"] == "old-command"
+            assert audits[1].after_values["launch_config"]["command"] == "new-command"
+            assert audits[2].before_values["launch_config"]["command"] == "new-command"
+            assert audits[2].after_values is None
         finally:
             db.close()
     finally:

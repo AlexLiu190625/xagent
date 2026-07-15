@@ -329,8 +329,9 @@ def _safe_configuration_hash(values: dict[str, Any]) -> str:
 def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
     """Return safe summaries for persisted built-in catalog drift.
 
-    Missing built-in rows are intentionally ignored because catalog deletion is
-    supported. Only rows selected by exact built-in ``app_id`` are compared, so
+    Missing rows are intentionally outside this drift-only check; supported
+    admin writes cannot delete built-ins, and this validator never recreates
+    data. Only rows selected by exact built-in ``app_id`` are compared, so
     custom applications remain database-owned.
     """
 

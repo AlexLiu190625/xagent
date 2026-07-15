@@ -41,6 +41,7 @@ import pytest
 
 from xagent.core.tools.adapters.vibe.config import (
     BaseToolConfig,
+    MCPConfigLoadError,
     MCPFailurePolicy,
     MCPToolLoadSummary,
     MCPUnavailableSummary,
@@ -306,17 +307,21 @@ class _MCPConfig:
         selection_spec: ToolSelectionSpec | None = None,
         failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
         observer_error: Exception | None = None,
+        load_error: MCPConfigLoadError | None = None,
     ):
         self._servers = servers
         self._tool_selection_spec = selection_spec
         self._failure_policy = failure_policy
         self._observer_error = observer_error
+        self._load_error = load_error
         self.load_summaries: list[MCPToolLoadSummary] = []
 
     def get_tool_selection_spec(self):
         return self._tool_selection_spec
 
     async def get_mcp_server_configs(self):
+        if self._load_error is not None:
+            raise self._load_error
         return self._servers
 
     def get_sandbox(self):
@@ -519,6 +524,60 @@ async def test_mcp_plain_selection_with_no_configs_emits_zero_summary():
 
     assert await mcp_tools.create_mcp_tools(config) == []
     assert config.load_summaries == [MCPToolLoadSummary()]
+
+
+@pytest.mark.parametrize("policy", list(MCPFailurePolicy))
+async def test_mcp_config_scan_failure_uses_shared_failure_policy(
+    policy: MCPFailurePolicy,
+):
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    config = _MCPConfig(
+        [],
+        selection_spec=ToolSelectionSpec.from_raw(tool_categories=["mcp"]),
+        failure_policy=policy,
+        load_error=MCPConfigLoadError(),
+    )
+
+    if policy is MCPFailurePolicy.STRICT:
+        with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+            await mcp_tools.create_mcp_tools(config)
+        failures = exc_info.value.summaries
+    else:
+        tools = await mcp_tools.create_mcp_tools(config)
+        assert len(tools) == 1
+        assert isinstance(tools[0], UnavailableMCPTool)
+        failures = config.load_summaries[0].failures
+
+    expected_failure = MCPUnavailableSummary("MCP server", "config_load_failed")
+    assert failures == (expected_failure,)
+    assert config.load_summaries == [
+        MCPToolLoadSummary(
+            requested_servers=("MCP server",),
+            loaded_servers=(),
+            failures=(expected_failure,),
+            successful_tool_count=0,
+        )
+    ]
+
+
+async def test_scoped_mcp_config_load_failure_applies_selection_before_strict_policy():
+    from xagent.core.tools.adapters.vibe import mcp_tools
+
+    config = _MCPConfig(
+        [],
+        selection_spec=ToolSelectionSpec.from_raw(tool_categories=["mcp:Gmail"]),
+        failure_policy=MCPFailurePolicy.STRICT,
+        load_error=MCPConfigLoadError(["Gmail", "Slack"]),
+    )
+
+    with pytest.raises(RequiredMCPUnavailableError) as exc_info:
+        await mcp_tools.create_mcp_tools(config)
+
+    expected_failure = MCPUnavailableSummary("Gmail", "config_load_failed")
+    assert exc_info.value.summaries == (expected_failure,)
+    assert config.load_summaries[0].requested_servers == ("Gmail",)
+    assert config.load_summaries[0].failures == (expected_failure,)
 
 
 @pytest.mark.parametrize("policy", list(MCPFailurePolicy))
