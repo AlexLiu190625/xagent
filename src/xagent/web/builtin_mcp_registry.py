@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from copy import deepcopy
+import hashlib
+import json
 import os
+from copy import deepcopy
 from typing import Any
 
 import sqlalchemy as sa
@@ -312,6 +314,69 @@ def get_builtin_execution_fields(app_id: str) -> dict[str, Any] | None:
     return deepcopy(
         {field_name: row[field_name] for field_name in _BUILTIN_EXECUTION_FIELD_NAMES}
     )
+
+
+def _safe_configuration_hash(values: dict[str, Any]) -> str:
+    serialized = json.dumps(
+        values,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(serialized).hexdigest()}"
+
+
+def validate_builtin_public_mcp_apps(bind: Connection) -> list[dict[str, Any]]:
+    """Return safe summaries for persisted built-in catalog drift.
+
+    Missing built-in rows are intentionally ignored because catalog deletion is
+    supported. Only rows selected by exact built-in ``app_id`` are compared, so
+    custom applications remain database-owned.
+    """
+
+    canonical_rows = get_builtin_public_mcp_app_rows()
+    canonical_by_app_id = {row["app_id"]: row for row in canonical_rows}
+    selected_columns = [
+        PUBLIC_MCP_APPS_TABLE.c.app_id,
+        *(PUBLIC_MCP_APPS_TABLE.c[field] for field in _BUILTIN_EXECUTION_FIELD_NAMES),
+    ]
+    persisted_rows = bind.execute(
+        sa.select(*selected_columns).where(
+            PUBLIC_MCP_APPS_TABLE.c.app_id.in_(tuple(canonical_by_app_id))
+        )
+    ).mappings()
+    persisted_by_app_id = {row["app_id"]: row for row in persisted_rows}
+
+    mismatches: list[dict[str, Any]] = []
+    for app_id, canonical_row in canonical_by_app_id.items():
+        persisted_row = persisted_by_app_id.get(app_id)
+        if persisted_row is None:
+            continue
+
+        mismatched_fields = [
+            field_name
+            for field_name in _BUILTIN_EXECUTION_FIELD_NAMES
+            if persisted_row[field_name] != canonical_row[field_name]
+        ]
+        if not mismatched_fields:
+            continue
+
+        canonical_values = {
+            field_name: canonical_row[field_name] for field_name in mismatched_fields
+        }
+        persisted_values = {
+            field_name: persisted_row[field_name] for field_name in mismatched_fields
+        }
+        mismatches.append(
+            {
+                "app_id": app_id,
+                "mismatched_fields": mismatched_fields,
+                "canonical_hash": _safe_configuration_hash(canonical_values),
+                "persisted_hash": _safe_configuration_hash(persisted_values),
+            }
+        )
+
+    return mismatches
 
 
 def _filter_row(row: dict[str, Any], allowed_columns: set[str]) -> dict[str, Any]:

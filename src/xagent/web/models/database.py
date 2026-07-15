@@ -12,6 +12,7 @@ from ...db.sqlite import apply_sqlite_concurrency_pragmas
 _SessionLocal: sessionmaker[Session] | None = None
 
 _engine: Engine | None = None
+logger = logging.getLogger(__name__)
 
 # Create base model class
 # Mypy workaround: explicitly type Base as Any to avoid "variable not valid as type" error
@@ -124,11 +125,24 @@ def init_db(db_url: str | None = None) -> None:
     # Create all tables
     Base.metadata.create_all(bind=_engine)
 
-    if should_seed_builtin_mcp_registry:
-        from ..builtin_mcp_registry import seed_builtin_oauth_and_public_mcp_apps
+    from ..builtin_mcp_registry import (
+        seed_builtin_oauth_and_public_mcp_apps,
+        validate_builtin_public_mcp_apps,
+    )
 
-        with _engine.begin() as conn:
+    with _engine.begin() as conn:
+        if should_seed_builtin_mcp_registry:
             seed_builtin_oauth_and_public_mcp_apps(conn)
+        builtin_mcp_mismatches = validate_builtin_public_mcp_apps(conn)
 
-    logger = logging.getLogger(__name__)
+    for mismatch in builtin_mcp_mismatches:
+        logger.warning(
+            "Built-in MCP catalog drift detected: app_id=%s "
+            "mismatched_fields=%s canonical_hash=%s persisted_hash=%s",
+            mismatch["app_id"],
+            ",".join(mismatch["mismatched_fields"]),
+            mismatch["canonical_hash"],
+            mismatch["persisted_hash"],
+        )
+
     logger.info("Database initialized. Waiting for first admin setup.")

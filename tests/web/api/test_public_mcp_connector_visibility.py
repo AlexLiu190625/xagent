@@ -1,4 +1,5 @@
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -730,6 +731,173 @@ def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() ->
     assert fresh_app["oauth_scopes"] == expected_execution_fields["oauth_scopes"]
     assert fresh_app["launch_config"] == expected_execution_fields["launch_config"]
     assert get_builtin_execution_fields("gmail") == expected_execution_fields
+
+
+def test_builtin_registry_drift_validation_reports_safe_read_only_summaries() -> None:
+    from xagent.web.builtin_mcp_registry import validate_builtin_public_mcp_apps
+
+    secret_marker = "secret-value-must-not-appear"
+    temp_dir = _setup_test_db()
+    db = next(get_db())
+    try:
+        gmail_app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        gmail_app.name = "Stale Gmail"
+        gmail_app.launch_config = {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+        deleted_builtin_app = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "google-drive").one()
+        )
+        db.delete(deleted_builtin_app)
+        custom_app = PublicMCPApp(
+            app_id="Gmail",
+            name="Custom Gmail Lookalike",
+            transport="stdio",
+            launch_config={"command": "custom-command"},
+        )
+        db.add(custom_app)
+        db.commit()
+
+        with get_engine().begin() as connection:
+            mismatches = validate_builtin_public_mcp_apps(connection)
+
+        assert len(mismatches) == 1
+        mismatch = mismatches[0]
+        assert mismatch["app_id"] == "gmail"
+        assert mismatch["mismatched_fields"] == ["name", "launch_config"]
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", mismatch["canonical_hash"])
+        assert re.fullmatch(r"sha256:[0-9a-f]{64}", mismatch["persisted_hash"])
+        assert mismatch["canonical_hash"] != mismatch["persisted_hash"]
+        assert secret_marker not in repr(mismatches)
+        assert "Gmail" not in repr(mismatches)
+        assert "google-drive" not in repr(mismatches)
+
+        db.expire_all()
+        persisted_gmail = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        )
+        persisted_custom = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "Gmail").one()
+        )
+        assert persisted_gmail.name == "Stale Gmail"
+        assert persisted_gmail.launch_config == {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+        assert persisted_custom.launch_config == {"command": "custom-command"}
+        assert (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "google-drive").first()
+            is None
+        )
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_builtin_registry_drift_validation_accepts_canonical_rows() -> None:
+    from xagent.web.builtin_mcp_registry import validate_builtin_public_mcp_apps
+
+    temp_dir = _setup_test_db()
+    try:
+        with get_engine().begin() as connection:
+            assert validate_builtin_public_mcp_apps(connection) == []
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_init_db_logs_safe_builtin_registry_drift_without_repairing(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    from xagent.web.models.database import init_db
+
+    secret_marker = "secret-value-must-not-be-logged"
+    temp_dir = tempfile.mkdtemp()
+    temp_db_path = os.path.join(temp_dir, "test.db")
+    db_url = f"sqlite:///{temp_db_path}"
+    init_db(db_url=db_url)
+
+    db = next(get_db())
+    try:
+        gmail_app = db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        gmail_app.launch_config = {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+        db.commit()
+    finally:
+        db.close()
+
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="xagent.web.models.database"):
+        init_db(db_url=db_url)
+
+    drift_records = [
+        record
+        for record in caplog.records
+        if record.name == "xagent.web.models.database"
+        and "Built-in MCP catalog drift detected" in record.getMessage()
+    ]
+    assert len(drift_records) == 1
+    drift_message = drift_records[0].getMessage()
+    assert "app_id=gmail" in drift_message
+    assert "mismatched_fields=launch_config" in drift_message
+    assert "canonical_hash=sha256:" in drift_message
+    assert "persisted_hash=sha256:" in drift_message
+    assert secret_marker not in drift_message
+
+    db = next(get_db())
+    try:
+        persisted_gmail = (
+            db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+        )
+        assert persisted_gmail.launch_config == {
+            "command": secret_marker,
+            "args": ["--token", secret_marker],
+        }
+    finally:
+        db.close()
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_init_db_does_not_warn_when_builtin_registry_is_canonical(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="xagent.web.models.database"):
+        temp_dir = _setup_test_db()
+    try:
+        assert not any(
+            record.name == "xagent.web.models.database"
+            and "Built-in MCP catalog drift detected" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
 
 
 def test_init_db_does_not_reseed_deleted_builtin_app_on_existing_database() -> None:
