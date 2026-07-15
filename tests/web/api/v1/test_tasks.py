@@ -36,6 +36,7 @@ from xagent.web.models.task import (
     TaskStatus,
     TraceEvent,
 )
+from xagent.web.models.user import User
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -1771,6 +1772,29 @@ def _force_task_status(task_id: int, status: TaskStatus) -> None:
         db.close()
 
 
+def _change_agent_owner_for_existing_task(
+    *, task_id: int, agent_id: int, username: str
+) -> tuple[int, int]:
+    """Change the agent owner while preserving the task's persisted owner."""
+    _register_second_user(username=username)
+    db = _direct_db_session()
+    try:
+        task = db.query(Task).filter(Task.id == task_id).one()
+        persisted_task_owner_id = int(task.user_id)
+        current_agent_owner_id = int(
+            db.query(User.id).filter(User.username == username).one()[0]
+        )
+        assert current_agent_owner_id != persisted_task_owner_id
+
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.user_id = current_agent_owner_id
+        task.status = TaskStatus.COMPLETED
+        db.commit()
+        return persisted_task_owner_id, current_agent_owner_id
+    finally:
+        db.close()
+
+
 def test_append_message_happy_path(mock_start_task):
     """Returns 202 + accepted_at, persists new user message, kicks off bg."""
     agent_id, full_key = _create_agent_with_key()
@@ -1819,6 +1843,112 @@ def test_append_message_happy_path(mock_start_task):
         db.close()
 
     assert mock_start_task.call_count == 1
+
+
+def test_append_message_uses_persisted_task_owner_after_agent_owner_changes(
+    mock_start_task,
+):
+    """A key-bound agent may append while the task keeps its runtime owner."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+
+    persisted_task_owner_id, current_agent_owner_id = (
+        _change_agent_owner_for_existing_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            username="sdk-owner-drift",
+        )
+    )
+    mock_start_task.reset_mock()
+
+    with patch.object(
+        v1_tasks.TaskTurnOrchestrator,
+        "begin_turn",
+        wraps=v1_tasks.TaskTurnOrchestrator.begin_turn,
+    ) as begin_turn:
+        response = client.post(
+            f"/v1/chat/tasks/{task_id}/messages",
+            headers=_bearer(full_key),
+            json={
+                "agent_id": agent_id,
+                "message": {"role": "user", "content": "second turn"},
+            },
+        )
+
+    assert response.status_code == 202, response.text
+    assert begin_turn.await_count == 1
+    assert begin_turn.await_args.kwargs["task_owner_user_id"] == (
+        persisted_task_owner_id
+    )
+    assert begin_turn.await_args.kwargs["actor_user_id"] == current_agent_owner_id
+
+    from xagent.web.models.chat_message import TaskChatMessage
+
+    db = _direct_db_session()
+    try:
+        messages = (
+            db.query(TaskChatMessage)
+            .filter(TaskChatMessage.task_id == task_id)
+            .order_by(TaskChatMessage.id)
+            .all()
+        )
+        assert [message.user_id for message in messages] == [
+            persisted_task_owner_id,
+            persisted_task_owner_id,
+        ]
+    finally:
+        db.close()
+
+
+def test_append_message_uses_persisted_task_owner_for_files_after_owner_changes(
+    mock_start_task,
+):
+    """Task-owned files remain attachable after the agent owner changes."""
+    agent_id, full_key = _create_agent_with_key()
+    task_id = _create_task(full_key, agent_id, content="first turn")
+    upload_response = client.post(
+        "/v1/chat/files",
+        headers=_bearer(full_key),
+        files=[("files", ("owner-file.txt", b"owner data", "text/plain"))],
+    )
+    assert upload_response.status_code == 200, upload_response.text
+    file_id = upload_response.json()["files"][0]["file_id"]
+
+    persisted_task_owner_id, _current_agent_owner_id = (
+        _change_agent_owner_for_existing_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            username="sdk-file-owner-drift",
+        )
+    )
+    mock_start_task.reset_mock()
+
+    response = client.post(
+        f"/v1/chat/tasks/{task_id}/messages",
+        headers=_bearer(full_key),
+        json={
+            "agent_id": agent_id,
+            "message": {
+                "role": "user",
+                "content": "use the existing file",
+                "files": [file_id],
+            },
+        },
+    )
+
+    assert response.status_code == 202, response.text
+
+    from xagent.web.models.uploaded_file import UploadedFile
+
+    db = _direct_db_session()
+    try:
+        uploaded_file = (
+            db.query(UploadedFile).filter(UploadedFile.file_id == file_id).one()
+        )
+        assert uploaded_file.user_id == persisted_task_owner_id
+        assert uploaded_file.task_id == task_id
+    finally:
+        db.close()
 
 
 @pytest.mark.parametrize(

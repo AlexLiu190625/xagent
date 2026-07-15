@@ -346,6 +346,7 @@ async def create_chat_task(
     agent, _key = authed
     task_source = "sdk"
     task_owner_user_id = int(agent.user_id)
+    actor_user_id = int(agent.user_id)
 
     # Server-side agent_id consistency check. The key already binds an
     # agent; ``body.agent_id`` is required by the SDK contract for
@@ -361,7 +362,7 @@ async def create_chat_task(
     # happens after the turn is claimed (below).
     file_infos = _resolve_turn_files_or_400(
         file_ids=request.message.files or [],
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
         task_id=None,
     )
@@ -426,9 +427,9 @@ async def create_chat_task(
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
-            task_owner_user_id=int(agent.user_id),
+            task_owner_user_id=task_owner_user_id,
             # SDK key resolves to the agent owner; actor == owner here.
-            actor_user_id=int(agent.user_id),
+            actor_user_id=actor_user_id,
             payload=payload,
             kind=TurnKind.CREATE,
             force_fresh=False,
@@ -452,7 +453,7 @@ async def create_chat_task(
     bind_turn_files(
         file_ids=[info["file_id"] for info in file_infos],
         task_id=int(task.id),
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
     )
 
@@ -588,6 +589,8 @@ async def append_message_to_task(
     # Resolve task first so cross-agent leak protection (404 instead
     # of 403 for "not yours") fires before any body-level checks.
     task = _resolve_task_or_404(task_id, agent, db)
+    task_owner_user_id = int(task.user_id)
+    actor_user_id = int(agent.user_id)
 
     # body.agent_id mismatch is also a 404 -- but agent_not_found,
     # not task_not_found, because that's the field the caller got
@@ -601,7 +604,7 @@ async def append_message_to_task(
             db=db,
             agent=agent,
             task=task,
-            connector_user_id=int(task.user_id),
+            connector_user_id=task_owner_user_id,
             payload_items=request.connector_runtime_context,
         )
     except ConnectorRuntimeError as exc:
@@ -613,7 +616,7 @@ async def append_message_to_task(
     # bound to this task re-resolve idempotently. Binding runs after the claim.
     file_infos = _resolve_turn_files_or_400(
         file_ids=request.message.files or [],
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
         task_id=int(task.id),
     )
@@ -633,9 +636,10 @@ async def append_message_to_task(
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=int(task.id),
-            task_owner_user_id=int(agent.user_id),
-            # SDK key resolves to the agent owner; actor == owner here.
-            actor_user_id=int(agent.user_id),
+            task_owner_user_id=task_owner_user_id,
+            # The key-bound agent authorizes access; the persisted task owner
+            # remains the runtime identity when those identities have drifted.
+            actor_user_id=actor_user_id,
             payload=payload,
             kind=TurnKind.APPEND,
             force_fresh=False,
@@ -657,7 +661,7 @@ async def append_message_to_task(
     bind_turn_files(
         file_ids=[info["file_id"] for info in file_infos],
         task_id=int(task.id),
-        owner_user_id=int(agent.user_id),
+        owner_user_id=task_owner_user_id,
         db=db,
     )
 
