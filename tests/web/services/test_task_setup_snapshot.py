@@ -146,6 +146,7 @@ def test_basic_task_no_agent_builder(db_session) -> None:
     assert snapshot.task.id == int(task.id)
     assert snapshot.task.user_id == int(user.id)
     assert snapshot.task.status == TaskStatus.PENDING
+    assert snapshot.task.source == "sdk"
     assert snapshot.task.agent_id is None
     assert snapshot.task.execution_mode == "flash"
 
@@ -156,6 +157,27 @@ def test_basic_task_no_agent_builder(db_session) -> None:
 
     # task_pattern derived from execution_mode
     assert snapshot.task_pattern == "single_call"  # "flash" -> single_call
+
+
+@pytest.mark.parametrize("source", ["sdk", "trigger", None])
+def test_task_source_is_preserved(db_session, source: str | None) -> None:
+    """The setup policy owner receives the persisted task origin unchanged."""
+    user = _create_user(db_session)
+    task = _create_task(
+        db_session,
+        user_id=int(user.id),
+        source=source if source is not None else "internal",
+    )
+    if source is None:
+        task.source = None
+        db_session.commit()
+
+    snapshot = load_task_setup_snapshot_sync(
+        task_id=int(task.id), task_owner_user_id=int(user.id)
+    )
+
+    assert snapshot is not None
+    assert snapshot.task.source == source
 
 
 def test_agent_builder_published_sets_excluded_agent_id(db_session) -> None:
@@ -271,6 +293,7 @@ def test_no_orm_leak_in_returned_fields(db_session) -> None:
     assert isinstance(snapshot.task.id, int)
     assert isinstance(snapshot.task.user_id, int)
     assert isinstance(snapshot.task.status, TaskStatus)
+    assert snapshot.task.source is None or isinstance(snapshot.task.source, str)
     assert snapshot.task.agent_id is None or isinstance(snapshot.task.agent_id, int)
     assert snapshot.task.execution_mode is None or isinstance(
         snapshot.task.execution_mode, str

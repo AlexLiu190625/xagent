@@ -45,12 +45,13 @@ def _make_user() -> User:
     return User(id=1, username="snap-int-user", password_hash="hash", is_admin=False)
 
 
-def _build_snapshot() -> TaskSetupSnapshot:
+def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
     return TaskSetupSnapshot(
         task=_TaskFields(
             id=42,
             user_id=1,
             status=TaskStatus.PENDING,
+            source=source,
             agent_id=None,
             agent_config=None,
             model_name=None,
@@ -78,9 +79,11 @@ async def test_snapshot_runs_off_loop_thread() -> None:
     loop_thread_id = threading.get_ident()
     loader_thread_id: dict[str, int] = {}
 
+    loaded_snapshot = _build_snapshot(source="trigger")
+
     def fake_loader(task_id: int, user_id: int | None) -> TaskSetupSnapshot:
         loader_thread_id["id"] = threading.get_ident()
-        return _build_snapshot()
+        return loaded_snapshot
 
     manager = AgentServiceManager()
     user = _make_user()
@@ -130,6 +133,7 @@ async def test_snapshot_runs_off_loop_thread() -> None:
         "fails when the ``to_thread`` wrapper is removed or the "
         "loader is being called inline."
     )
+    assert loaded_snapshot.task.source == "trigger"
 
 
 @pytest.mark.asyncio
@@ -310,6 +314,7 @@ async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -
             id=42,
             user_id=1,
             status=TaskStatus.PENDING,
+            source="trigger",
             agent_id=7,
             agent_config=None,
             model_name=None,

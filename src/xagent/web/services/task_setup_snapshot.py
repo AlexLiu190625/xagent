@@ -62,6 +62,7 @@ class _TaskFields:
     compact_model_name: Optional[str]
     execution_mode: Optional[str]
     agent_type: Optional[str]
+    source: str | None = None
 
 
 @dataclass(frozen=True)
@@ -161,6 +162,7 @@ def load_task_setup_snapshot_sync(
             id=int(task_row.id),
             user_id=int(task_row.user_id),
             status=task_row.status,
+            source=str(task_row.source) if task_row.source is not None else None,
             agent_id=int(task_row.agent_id) if task_row.agent_id is not None else None,
             agent_config=(
                 dict(task_row.agent_config)

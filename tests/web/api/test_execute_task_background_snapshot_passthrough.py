@@ -63,12 +63,13 @@ def _make_user_orm() -> User:
     return User(id=1, username="exec-bg-user", password_hash="hash", is_admin=False)
 
 
-def _make_snapshot() -> TaskSetupSnapshot:
+def _make_snapshot(*, source: str | None = "trigger") -> TaskSetupSnapshot:
     return TaskSetupSnapshot(
         task=_TaskFields(
             id=42,
             user_id=1,
             status=TaskStatus.RUNNING,
+            source=source,
             agent_id=7,
             agent_config=None,
             model_name=None,
@@ -235,6 +236,11 @@ async def test_snapshot_path_skips_task_query_keeps_user_query() -> None:
         f"User queried {counter.calls_by_model[User]} time(s) -- expected 1 "
         "(kept for get_user_tool_overrides hook compat)."
     )
+    forwarded_snapshot = agent_manager.get_agent_for_task.await_args.kwargs[
+        "task_setup_snapshot"
+    ]
+    assert forwarded_snapshot is snapshot
+    assert forwarded_snapshot.task.source == "trigger"
 
 
 @pytest.mark.asyncio
