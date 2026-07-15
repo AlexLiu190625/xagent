@@ -1253,6 +1253,62 @@ def test_admin_app_responses_derive_builtin_ownership() -> None:
             pass
 
 
+def test_admin_app_responses_overlay_builtin_execution_fields_without_persisting() -> (
+    None
+):
+    from xagent.web.builtin_mcp_registry import get_builtin_execution_fields
+
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+        stale_launch_config = {
+            "command": "uv",
+            "args": ["run", "python", "-m", "xagent.web.tools.mcp.gmail"],
+        }
+        db = next(get_db())
+        try:
+            gmail_app = (
+                db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            )
+            gmail_app.name = "Stale Gmail"
+            gmail_app.oauth_scopes = ["stale-scope"]
+            gmail_app.launch_config = stale_launch_config
+            db.commit()
+        finally:
+            db.close()
+
+        response = client.get("/api/admin/mcp/apps", headers=admin_headers)
+
+        assert response.status_code == 200
+        apps = {app["app_id"]: app for app in response.json()}
+        execution_fields = get_builtin_execution_fields("gmail")
+        assert execution_fields is not None
+        assert {
+            field: apps["gmail"][field] for field in execution_fields
+        } == execution_fields
+        assert apps["gmail"]["is_builtin"] is True
+
+        db = next(get_db())
+        try:
+            persisted_gmail = (
+                db.query(PublicMCPApp).filter(PublicMCPApp.app_id == "gmail").one()
+            )
+            assert persisted_gmail.name == "Stale Gmail"
+            assert persisted_gmail.oauth_scopes == ["stale-scope"]
+            assert persisted_gmail.launch_config == stale_launch_config
+        finally:
+            db.close()
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 @pytest.mark.parametrize(
     ("field", "replacement"),
     [

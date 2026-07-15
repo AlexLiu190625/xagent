@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from ...core.utils.encryption import encrypt_value
 from ..auth_dependencies import get_current_user
 from ..builtin_mcp_registry import (
+    get_builtin_execution_fields,
     get_builtin_public_mcp_app,
     is_builtin_public_mcp_app,
 )
@@ -189,10 +190,14 @@ def _commit_public_mcp_app_write(
 
 
 def _public_mcp_app_response(app: PublicMCPApp) -> Dict[str, Any]:
+    values = _public_mcp_app_values(app)
+    execution_fields = get_builtin_execution_fields(app.app_id)
+    if execution_fields is not None:
+        values.update(execution_fields)
     return {
         "id": app.id,
-        **_public_mcp_app_values(app),
-        "is_builtin": is_builtin_public_mcp_app(app.app_id),
+        **values,
+        "is_builtin": execution_fields is not None,
     }
 
 
