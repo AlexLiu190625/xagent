@@ -187,7 +187,7 @@ def test_non_zoom_provider_does_not_set_prompt_login(db_session):
     assert "prompt" not in qs
 
 
-def test_meta_login_uses_comma_separated_scopes_from_selected_app(
+def test_meta_login_uses_comma_separated_canonical_scopes_for_builtin_app(
     db_session, monkeypatch
 ):
     db, user = db_session
@@ -225,7 +225,9 @@ def test_meta_login_uses_comma_separated_scopes_from_selected_app(
     )
     qs = parse_qs(urlparse(_location(resp)).query)
 
-    assert qs["scope"] == ["public_profile,pages_manage_posts,pages_show_list"]
+    assert qs["scope"] == [
+        "public_profile,pages_manage_posts,pages_read_engagement,pages_show_list"
+    ]
 
 
 def test_meta_login_uses_config_id_without_scope_when_configured(
