@@ -461,6 +461,65 @@ def test_offline_sqlite_upgrade_round_trips_json_catalog_values() -> None:
     assert json.loads(stored[4]) == expected["launch_config"]
 
 
+def test_online_and_offline_upgrades_store_json_null_consistently(tmp_path) -> None:
+    migration = _load_migration_module()
+    online_engine = sa.create_engine(f"sqlite:///{tmp_path / 'online.db'}")
+    metadata = sa.MetaData()
+    table = _public_mcp_apps(metadata)
+    metadata.create_all(online_engine)
+
+    with online_engine.begin() as connection:
+        _seed_environment(
+            connection,
+            table,
+            drifted_app_ids={"google-maps"},
+            missing_app_ids=set(EXPECTED_EXECUTION_FIELDS) - {"google-maps"},
+        )
+        with patch.object(migration, "op", _operations(connection)):
+            migration.upgrade()
+        online_value = connection.exec_driver_sql(
+            "SELECT oauth_scopes, oauth_scopes IS NULL "
+            "FROM public_mcp_apps WHERE app_id = 'google-maps'"
+        ).one()
+
+    output = StringIO()
+    context = MigrationContext.configure(
+        dialect_name="sqlite",
+        opts={"as_sql": True, "output_buffer": output},
+    )
+    with Operations.context(context):
+        migration.upgrade()
+
+    offline_connection = sqlite3.connect(":memory:")
+    offline_connection.execute(
+        "CREATE TABLE public_mcp_apps ("
+        "app_id TEXT PRIMARY KEY, name TEXT NOT NULL, transport TEXT NOT NULL, "
+        "provider_name TEXT, oauth_scopes JSON, launch_config JSON)"
+    )
+    drifted = _drifted_execution_fields(EXPECTED_EXECUTION_FIELDS["google-maps"])
+    offline_connection.execute(
+        "INSERT INTO public_mcp_apps "
+        "(app_id, name, transport, provider_name, oauth_scopes, launch_config) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        (
+            "google-maps",
+            drifted["name"],
+            drifted["transport"],
+            drifted["provider_name"],
+            json.dumps(drifted["oauth_scopes"]),
+            json.dumps(drifted["launch_config"]),
+        ),
+    )
+    offline_connection.executescript(output.getvalue())
+    offline_value = offline_connection.execute(
+        "SELECT oauth_scopes, oauth_scopes IS NULL "
+        "FROM public_mcp_apps WHERE app_id = 'google-maps'"
+    ).fetchone()
+    offline_connection.close()
+
+    assert online_value == offline_value == ("null", 0)
+
+
 def test_offline_mysql_upgrade_emits_json_text_literals_without_bind_parameters() -> (
     None
 ):

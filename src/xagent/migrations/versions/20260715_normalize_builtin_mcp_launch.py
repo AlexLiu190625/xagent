@@ -188,6 +188,8 @@ def _offline_value(field_name: str, value: object, dialect_name: str) -> object:
     if field_name not in JSON_EXECUTION_FIELD_NAMES:
         return sa.null() if value is None else op.inline_literal(value)
 
+    # Match the online sa.JSON binding contract (none_as_null=False): Python None
+    # is stored as JSON ``null``, not SQL NULL, on every supported dialect.
     serialized_value = json.dumps(value, sort_keys=True)
     serialized_literal = op.inline_literal(serialized_value)
     if dialect_name == "postgresql":

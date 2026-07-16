@@ -13,6 +13,8 @@ from sqlalchemy.orm import Session
 
 import xagent.web.api.mcp as mcp_api
 from xagent.web.api.admin_mcp import (
+    PublicMCPAppCreate,
+    PublicMCPAppUpdate,
     _commit_public_mcp_app_write,
     admin_mcp_router,
 )
@@ -46,6 +48,26 @@ app_for_tests.include_router(mcp_router)
 app_for_tests.include_router(admin_mcp_router)
 app_for_tests.dependency_overrides[get_db] = override_get_db
 client = TestClient(app_for_tests)
+
+
+def test_admin_catalog_openapi_documents_launch_config_and_update_semantics() -> None:
+    create_launch_config = PublicMCPAppCreate.model_json_schema()["properties"][
+        "launch_config"
+    ]
+    update_launch_config = PublicMCPAppUpdate.model_json_schema()["properties"][
+        "launch_config"
+    ]
+
+    for field_schema in (create_launch_config, update_launch_config):
+        description = field_schema.get("description", "").lower()
+        assert "credentials or secret values" in description
+        assert "connector credential flow" in description
+
+    operations = app_for_tests.openapi()["paths"]["/api/admin/mcp/apps/{app_id}"]
+    assert "full replacement" in operations["put"]["description"].lower()
+    assert "use patch" in operations["put"]["description"].lower()
+    assert "partial update" in operations["patch"]["description"].lower()
+    assert "presentation fields" in operations["patch"]["description"].lower()
 
 
 def _setup_test_db() -> str:

@@ -84,6 +84,8 @@ vi.mock("@/components/ui/table", () => ({
 }))
 
 import AdminMcpPage from "./admin-mcp"
+import en from "../../i18n/locales/en"
+import zh from "../../i18n/locales/zh"
 
 type App = {
   id: number
@@ -157,6 +159,13 @@ describe("AdminMcpPage app updates", () => {
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
+  })
+
+  it("warns administrators not to store credentials in launch config", () => {
+    expect(en.adminMcp.apps.form.launchConfigGuidance).toContain("Do not include credential or secret values")
+    expect(en.adminMcp.apps.form.launchConfigGuidance).toContain("connector credential flow")
+    expect(zh.adminMcp.apps.form.launchConfigGuidance).toContain("不要填写凭证或密钥值")
+    expect(zh.adminMcp.apps.form.launchConfigGuidance).toContain("连接器凭证流程")
   })
 
   it("patches only visibility and applies the authoritative response", async () => {

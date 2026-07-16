@@ -3,7 +3,7 @@ from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
-from pydantic import BaseModel, ValidationError, model_validator
+from pydantic import BaseModel, Field, ValidationError, model_validator
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -20,6 +20,12 @@ from ..models.public_mcp import PublicMCPApp, PublicMCPAppAudit
 from ..models.user import User
 
 admin_mcp_router = APIRouter(prefix="/api/admin/mcp", tags=["Admin MCP"])
+
+_LAUNCH_CONFIG_DESCRIPTION = (
+    "Runtime launch metadata such as command, arguments, required environment "
+    "variable names, and mappings. Do not include credentials or secret values; "
+    "configure them through the connector credential flow."
+)
 
 
 def verify_admin(user: User = Depends(get_current_user)) -> User:
@@ -77,7 +83,10 @@ class PublicMCPAppBase(BaseModel):
     category: Optional[str] = None
     oauth_scopes: Optional[List[str]] = None
     is_visible_in_connector: bool = True
-    launch_config: Optional[Dict[str, Any]] = None
+    launch_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=_LAUNCH_CONFIG_DESCRIPTION,
+    )
 
 
 class PublicMCPAppCreate(PublicMCPAppBase):
@@ -120,7 +129,10 @@ class PublicMCPAppUpdate(BaseModel):
     category: Optional[str] = None
     oauth_scopes: Optional[List[str]] = None
     is_visible_in_connector: Optional[bool] = None
-    launch_config: Optional[Dict[str, Any]] = None
+    launch_config: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description=_LAUNCH_CONFIG_DESCRIPTION,
+    )
 
 
 _PUBLIC_MCP_APP_FIELDS = tuple(PublicMCPAppBase.model_fields)
@@ -429,7 +441,15 @@ async def create_app(
     return _public_mcp_app_response(db_app)
 
 
-@admin_mcp_router.put("/apps/{app_id}", response_model=PublicMCPAppResponse)
+@admin_mcp_router.put(
+    "/apps/{app_id}",
+    response_model=PublicMCPAppResponse,
+    description=(
+        "Full replacement of a public MCP app. Built-in identity and execution "
+        "fields must match their code-owned canonical values; use PATCH for "
+        "partial updates to editable presentation fields."
+    ),
+)
 async def update_app(
     app_id: int,
     app: PublicMCPAppCreate,
@@ -458,7 +478,15 @@ async def update_app(
     return _public_mcp_app_response(db_app)
 
 
-@admin_mcp_router.patch("/apps/{app_id}", response_model=PublicMCPAppResponse)
+@admin_mcp_router.patch(
+    "/apps/{app_id}",
+    response_model=PublicMCPAppResponse,
+    description=(
+        "Partial update of a public MCP app. For built-in apps, only editable "
+        "presentation fields such as description, icon, category, and visibility "
+        "may be changed."
+    ),
+)
 async def patch_app(
     app_id: int,
     app: PublicMCPAppUpdate,

@@ -3940,7 +3940,7 @@ Build when you need.`,
         visibleInConnectorDescription: "关闭后，该公共应用会从连接器弹窗中完全隐藏，任何用户都无法再看到它。",
         oauthScopes: "OAuth 权限范围 (逗号分隔)",
         launchConfig: "启动配置 (JSON)",
-        launchConfigGuidance: "请提供包含运行命令、参数和可选环境变量映射的 JSON 对象。",
+        launchConfigGuidance: "请仅提供运行命令、参数、所需环境变量名和映射等启动元数据。不要填写凭证或密钥值；请通过连接器凭证流程进行配置。",
         managedFieldsDescription: "应用标识、传输协议、OAuth 权限范围和启动配置由系统管理，展示信息仍可编辑。",
         invalidJson: "launch_config 中存在无效的 JSON"
       }
