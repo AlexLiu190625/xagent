@@ -223,6 +223,7 @@ class WorkspaceCommandPathGuard:
         if redirect_type in {"<<", "<<<"}:
             return
         output = getattr(node, "output", None)
+        # bashlex emits descriptor-duplication targets such as 2>&1 as integers.
         raw_path = self._literal_word(output)
         if raw_path is None:
             return

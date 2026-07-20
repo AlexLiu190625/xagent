@@ -488,6 +488,17 @@ class TestScopedCommandPathGuard:
         assert result["success"] is False
         assert result["return_code"] == 126
 
+    @pytest.mark.parametrize("redirect", ["2>&1", "1>&2", "3<&0"])
+    def test_descriptor_duplication_is_not_treated_as_path(
+        self, scoped_command_workspace, redirect
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"cd {shlex.quote(str(external_file.parent))} && printf ok {redirect}"
+        )
+
     @pytest.mark.parametrize(
         "command_template",
         [
