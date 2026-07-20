@@ -5,6 +5,8 @@ Tests for CommandExecutor tool
 import os
 import shlex
 import sys
+from collections.abc import Set as AbstractSet
+from typing import TypeVar
 from unittest.mock import Mock
 
 import pytest
@@ -14,6 +16,7 @@ from xagent.core.tools.adapters.vibe.command_executor import (
     CommandExecutorResult,
     CommandExecutorTool,
 )
+from xagent.core.tools.core import command_path_guard as command_path_guard_module
 from xagent.core.tools.core.command_executor import (
     CommandExecutorCore,
     execute_command,
@@ -24,6 +27,8 @@ from xagent.core.tools.core.command_path_guard import (
     WorkspaceCommandPathGuard,
 )
 from xagent.core.workspace import TaskWorkspace
+
+_SetValue = TypeVar("_SetValue")
 
 
 @pytest.fixture
@@ -529,6 +534,42 @@ class TestScopedCommandPathGuard:
         assert result["success"] is False
         assert result["return_code"] == 126
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    def test_read_path_option_union_is_computed_once(self, scoped_command_workspace):
+        class CountingSet(set[str]):
+            union_count = 0
+
+            def __or__(self, other: AbstractSet[_SetValue]) -> set[str | _SetValue]:
+                self.union_count += 1
+                return super().__or__(other)
+
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        short_options = CountingSet({"-f"})
+
+        remaining = guard._check_read_path_options(
+            ("first.txt", "second.txt"),
+            workspace.output_dir,
+            short_options=short_options,
+            long_options={"--files-from"},
+        )
+
+        assert remaining == ["first.txt", "second.txt"]
+        assert short_options.union_count == 1
+
+    def test_embedded_io_patterns_are_precompiled(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        monkeypatch.setattr(command_path_guard_module, "re", None)
+
+        guard._reject_embedded_io("awk", "BEGIN { print 1 }")
+        assert guard._sed_has_unsafe_io("s/a/b/") is False
+
+        with pytest.raises(CommandPathViolation):
+            guard._reject_embedded_io("awk", 'BEGIN { system("cat secret") }')
+        assert guard._sed_has_unsafe_io("w secret.txt") is True
 
     @pytest.mark.parametrize(
         ("script_name", "script_template", "invocation"),

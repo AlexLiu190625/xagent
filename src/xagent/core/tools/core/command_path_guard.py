@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 
 PathAccess = Literal["read", "write"]
 _MAX_INSPECTED_SCRIPT_BYTES = 1024 * 1024
+_AWK_UNSAFE_IO_PATTERN = re.compile(r"\bsystem\s*\(|\bgetline\b|>>?\s*[\"']|\|\s*[\"']")
+_SED_ADDRESS_PATTERN = r"(?:\d+|\$|/(?:\\.|[^/\n])*/)"
+_SED_FILE_OR_EXEC_COMMAND_PATTERN = re.compile(
+    rf"(?:^|[;\n])\s*(?:{_SED_ADDRESS_PATTERN}"
+    rf"(?:\s*,\s*{_SED_ADDRESS_PATTERN})?\s*)?[rRwWe](?:\s|$)"
+)
 
 _READ_COMMANDS = {
     "cat",
@@ -422,10 +428,11 @@ class WorkspaceCommandPathGuard:
         long_options: set[str],
     ) -> list[str]:
         remaining: list[str] = []
+        path_options = short_options | long_options
         index = 0
         while index < len(values):
             value = values[index]
-            if value in short_options | long_options:
+            if value in path_options:
                 if index + 1 < len(values):
                     self._check_path(values[index + 1], cwd, "read")
                 index += 2
@@ -668,12 +675,7 @@ class WorkspaceCommandPathGuard:
     @staticmethod
     def _reject_embedded_io(language: Literal["sed", "awk"], script: str) -> None:
         if language == "awk":
-            unsafe = bool(
-                re.search(r"\bsystem\s*\(", script)
-                or re.search(r"\bgetline\b", script)
-                or re.search(r">>?\s*[\"']", script)
-                or re.search(r"\|\s*[\"']", script)
-            )
+            unsafe = bool(_AWK_UNSAFE_IO_PATTERN.search(script))
         else:
             unsafe = WorkspaceCommandPathGuard._sed_has_unsafe_io(script)
         if unsafe:
@@ -684,12 +686,7 @@ class WorkspaceCommandPathGuard:
 
     @staticmethod
     def _sed_has_unsafe_io(script: str) -> bool:
-        address = r"(?:\d+|\$|/(?:\\.|[^/\n])*/)"
-        file_or_exec_command = re.compile(
-            rf"(?:^|[;\n])\s*(?:{address}(?:\s*,\s*{address})?\s*)?"
-            r"[rRwWe](?:\s|$)"
-        )
-        if file_or_exec_command.search(script):
+        if _SED_FILE_OR_EXEC_COMMAND_PATTERN.search(script):
             return True
 
         # Parse substitution flags sufficiently to catch GNU sed's ``e`` and
