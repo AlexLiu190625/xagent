@@ -65,7 +65,9 @@ class CommandExecutorTool(AbstractBaseTool):
         )
         boundary_line = (
             "Common shell file operations are checked against the current "
-            "workspace; external allowed directories are read-only."
+            "workspace; external allowed directories are read-only. This is a "
+            "cooperative, best-effort check, not an operating-system security "
+            "boundary; unknown commands remain outside its classification."
             if self._restrict_paths
             else ""
         )

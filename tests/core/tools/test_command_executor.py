@@ -24,6 +24,7 @@ from xagent.core.tools.core.command_executor import (
 )
 from xagent.core.tools.core.command_path_guard import (
     CommandPathViolation,
+    CommandPolicyViolation,
     WorkspaceCommandPathGuard,
 )
 from xagent.core.workspace import TaskWorkspace
@@ -87,6 +88,17 @@ class TestCommandExecutorTool:
         assert "Use concrete paths" in description
         assert "Only search for files when no usable path was provided" in description
         assert "Do not run broad recursive searches from `/`" in description
+
+    def test_restricted_description_states_guard_boundary(self, tmp_path):
+        workspace = Mock()
+        workspace.resolve_path.return_value = tmp_path
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        description = tool.description
+
+        assert "best-effort" in description
+        assert "not an operating-system security boundary" in description
+        assert "unknown commands" in description
 
     def test_simple_echo_command(self, command_executor):
         """Test simple echo command"""
@@ -527,27 +539,287 @@ class TestScopedCommandPathGuard:
             f"bash -c 'printf %s \"$1\"' ignored {shlex.quote(str(sibling_file))}"
         )
 
-    def test_malformed_top_level_shell_input_remains_cooperative(
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            'cat "$TARGET"',
+            'cat "$(printf %s {path})"',
+            "cat `printf %s {path}`",
+        ],
+    )
+    def test_rejects_unresolved_expansion_in_supported_path_operand(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+        command = command_template.format(path=shlex.quote(str(sibling_file)))
+        if "$TARGET" in command:
+            command = f"TARGET={shlex.quote(str(sibling_file))}; {command}"
+
+        result = tool.run_json_sync({"command": command})
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+
+    def test_rejects_unresolved_expansion_in_redirect_path(
         self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"TARGET={shlex.quote(str(sibling_file))}; "
+                    'printf changed > "$TARGET"'
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    def test_allows_unresolved_expansion_in_non_path_operand(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        own_file = workspace.output_dir / "own.txt"
+        own_file.write_text("needle", encoding="utf-8")
+        monkeypatch.setenv("PATTERN", "needle")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": 'grep "$PATTERN" own.txt'})
+
+        assert result["success"] is True
+        assert result["output"] == "needle\n"
+
+    def test_tilde_path_is_resolved_as_a_static_path(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        monkeypatch.setenv("HOME", str(workspace.output_dir))
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("cat ~/own.txt")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "echo '",
+            "for ((i=0;i<1;i++)); do cat sibling.txt; done",
+            "coproc cat sibling.txt",
+            "select x in a b; do cat sibling.txt; done",
+            "cat $'sibling.txt'",
+        ],
+    )
+    def test_unparsed_top_level_shell_input_fails_closed(
+        self, scoped_command_workspace, command
     ):
         workspace, _, _ = scoped_command_workspace
         tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
 
-        result = tool.run_json_sync({"command": "echo '"})
+        result = tool.run_json_sync({"command": command})
 
         assert result["success"] is False
-        assert result["return_code"] != 126
+        assert result["return_code"] == 126
 
-    def test_malformed_nested_shell_input_remains_cooperative(
-        self, scoped_command_workspace
-    ):
+    def test_unparsed_nested_shell_input_fails_closed(self, scoped_command_workspace):
         workspace, _, _ = scoped_command_workspace
         tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
 
         result = tool.run_json_sync({"command": 'sh -c "echo \'"'})
 
         assert result["success"] is False
-        assert result["return_code"] != 126
+        assert result["return_code"] == 126
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sh",
+            "sh -s",
+            "printf 'cat own.txt' | sh",
+            "sh < run.sh",
+        ],
+    )
+    def test_rejects_shell_input_that_cannot_be_inspected(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": command})
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+
+    @pytest.mark.parametrize(
+        "invocation", ["bash {script}", "sh {script}", ". {script}", "source {script}"]
+    )
+    def test_rejects_shell_script_that_accesses_sibling(
+        self, scoped_command_workspace, invocation
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = workspace.output_dir / "read-sibling.sh"
+        script.write_text(
+            f"cat {shlex.quote(str(sibling_file))}\n",
+            encoding="utf-8",
+        )
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": invocation.format(script=shlex.quote(str(script)))}
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+
+    def test_rejects_dynamically_created_shell_script_before_partial_execution(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = f"cat {shlex.quote(str(sibling_file))}"
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"printf '%s\\n' {shlex.quote(script)} > run.sh && bash run.sh"
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert not (workspace.output_dir / "run.sh").exists()
+
+    def test_shell_script_arguments_are_not_treated_as_paths(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = workspace.output_dir / "print-arg.sh"
+        script.write_text("printf '%s\\n' \"$1\"\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"bash {shlex.quote(str(script))} {shlex.quote(str(sibling_file))}"
+        )
+
+    def test_recursive_shell_script_inspection_is_bounded(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script = workspace.output_dir / "loop.sh"
+        script.write_text("source loop.sh\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="depth exceeded"):
+            guard.validate("bash loop.sh")
+
+    def test_rejects_unsafe_bash_initialization_file(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = workspace.output_dir / "unsafe.rc"
+        script.write_text(
+            f"cat {shlex.quote(str(sibling_file))}\n",
+            encoding="utf-8",
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(f"bash --rcfile {shlex.quote(str(script))} -i -c exit")
+
+    def test_directory_stack_keeps_relative_paths_bound_to_real_cwd(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        subdirectory = workspace.output_dir / "sub"
+        subdirectory.mkdir()
+        forbidden = workspace.base_dir / "forbidden" / "secret.txt"
+        forbidden.parent.mkdir()
+        forbidden.write_text("outside workspace", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate("pushd sub && popd && cat ../../forbidden/secret.txt")
+
+        guard.validate("pushd sub && popd && cat own.txt")
+
+    def test_cd_dash_uses_tracked_previous_directory(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "sub").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("cd sub && cd - && cat own.txt")
+
+    @pytest.mark.parametrize("operator", [";", "||", "&"])
+    def test_rejects_ambiguous_directory_state_across_shell_operator(
+        self, scoped_command_workspace, operator
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "sub").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(f"cd sub {operator} cat ../../forbidden/secret.txt")
+
+    def test_source_state_propagates_but_child_shell_state_does_not(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "sub").mkdir()
+        script = workspace.output_dir / "change-directory.sh"
+        script.write_text("cd sub\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f". {shlex.quote(str(script))} && cat ../../forbidden/secret.txt"
+        )
+        with pytest.raises(CommandPathViolation):
+            guard.validate(
+                f"bash {shlex.quote(str(script))} && cat ../../forbidden/secret.txt"
+            )
+
+    def test_guard_internal_error_returns_stable_rejection(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        executor = CommandExecutorCore(
+            str(workspace.resolve_path("")),
+            path_guard=guard,
+        )
+
+        def crash(_command):
+            raise RecursionError("secret parser detail")
+
+        monkeypatch.setattr(guard, "validate", crash)
+
+        result = executor.execute_command("printf should-not-run")
+
+        assert result == {
+            "success": False,
+            "output": "",
+            "error": "Command rejected by workspace path policy: command validation failed",
+            "return_code": 126,
+        }
+
+    def test_deeply_nested_shell_returns_stable_rejection(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+        command = "(" * 2000 + "true" + ")" * 2000
+
+        result = tool.run_json_sync({"command": command})
+
+        assert result == {
+            "success": False,
+            "output": "",
+            "error": "Command rejected by workspace path policy: command validation failed",
+            "return_code": 126,
+        }
 
     @pytest.mark.parametrize(
         "command_template",
@@ -573,6 +845,52 @@ class TestScopedCommandPathGuard:
         assert result["success"] is False
         assert result["return_code"] == 126
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    @pytest.mark.parametrize(
+        "program",
+        [
+            'BEGIN { print "changed" > target }',
+            'BEGIN { print "changed" > (target) }',
+        ],
+    )
+    def test_rejects_dynamic_awk_output_target(self, scoped_command_workspace, program):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"awk -v target={shlex.quote(str(sibling_file))} "
+                    f"{shlex.quote(program)}"
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    def test_allows_awk_comparison_without_file_io(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("awk 'BEGIN { print (2 > 1) }'")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'PROGRAM=\'BEGIN { system("cat own.txt") }\' awk "$PROGRAM"',
+            "PROGRAM='e cat own.txt' sed -e \"$PROGRAM\" own.txt",
+        ],
+    )
+    def test_rejects_dynamic_sed_and_awk_programs(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
 
     def test_read_path_option_union_is_computed_once(self, scoped_command_workspace):
         class CountingSet(set[str]):
@@ -816,6 +1134,270 @@ class TestScopedCommandPathGuard:
 
         assert result["success"] is True
         assert result["output"] == "allowed"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "tac {path}",
+            "base64 {path}",
+            "base64 -i {path}",
+            "tar -tf {path}",
+            "tar --list --file={path}",
+            "tar -cf archive.tar {path}",
+            "dd if={path} of=copy.bin",
+        ],
+    )
+    def test_rejects_added_command_reads_from_sibling(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": command_template.format(path=shlex.quote(str(sibling_file)))}
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "base64 -i own.txt -o {path}",
+            "tar -cf {path} own.txt",
+            "tar --create --file={path} own.txt",
+            "tar -xf own.tar -C {parent}",
+            "dd if=own.txt of={path}",
+        ],
+    )
+    def test_rejects_added_command_writes_to_sibling(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "own.tar").write_bytes(b"not-an-archive")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {
+                "command": command_template.format(
+                    path=shlex.quote(str(sibling_file)),
+                    parent=shlex.quote(str(sibling_file.parent)),
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tac own.txt",
+            "base64 own.txt",
+            "base64 -i own.txt -o encoded.txt",
+            "tar -cf archive.tar own.txt",
+            "tar -tf archive.tar",
+            "tar -xf archive.tar -C extracted",
+            "dd if=own.txt of=copy.bin",
+        ],
+    )
+    def test_added_command_paths_inside_workspace_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tac -s / own.txt",
+            "tac -s/ own.txt",
+            "tac --separator / own.txt",
+            "tac --separator=/ own.txt",
+            "base64 -w 20 own.txt",
+            "base64 --wrap=20 own.txt",
+        ],
+    )
+    def test_added_command_scalar_options_are_not_paths(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'SEPARATOR=:; tac -s"$SEPARATOR" own.txt',
+            'WIDTH=20; base64 -w"$WIDTH" own.txt',
+            'PAIR="if=own.txt of=copy.bin"; dd $PAIR',
+            'OPTION=farchive.tar; tar -c"$OPTION" own.txt',
+        ],
+    )
+    def test_rejects_dynamic_added_command_grammar(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "base64 -i{path}",
+            "base64 --input {path}",
+            "base64 --input={path}",
+            "base64 -di{path}",
+            "base64 -o{path}",
+            "base64 --output {path}",
+            "base64 --output={path}",
+            "base64 -do{path}",
+        ],
+    )
+    def test_rejects_base64_path_option_variants(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    def test_dd_flag_assignments_are_not_paths(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("dd iflag=fullblock oflag=sync")
+
+    @pytest.mark.parametrize(
+        "argv_template",
+        [
+            ["tac", "{path}"],
+            ["base64", "-i", "{path}"],
+            ["tar", "-tf", "{path}"],
+            ["dd", "if={path}", "of=copy.bin"],
+        ],
+    )
+    def test_added_command_argv_uses_same_path_policy(
+        self, scoped_command_workspace, argv_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        argv = [value.format(path=str(sibling_file)) for value in argv_template]
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate_argv(argv)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "tar -f{path} -t",
+            "tar --file {path} --list",
+            "tar tf {path}",
+            "tar cf archive.tar {path}",
+            "tar --add-file={path} -cf archive.tar",
+            "tar -cf archive.tar @{path}",
+        ],
+    )
+    def test_rejects_tar_read_path_variants(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    def test_tar_archive_path_remains_anchored_to_process_cwd(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "sub").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate("tar -c -C sub -f ../../escape.tar file")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -cf archive.tar -T file-list.txt",
+            "tar --create --files-from=file-list.txt -f archive.tar",
+            "tar -xPf archive.tar",
+            "tar -xf archive.tar --absolute-names",
+            "tar -cf archive.tar --checkpoint-action=exec=sh own.txt",
+            "tar -cf archive.tar --checkpoint-action exec=sh own.txt",
+            "tar -cf archive.tar --to-command=sh own.txt",
+            "tar -cf archive.tar -I sh own.txt",
+            "tar -cf archive.tar -F hook.sh own.txt",
+            "tar -tf host:archive.tar",
+        ],
+    )
+    def test_rejects_tar_indirect_or_executable_path_sources(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_tar_delete_and_compare_keep_distinct_archive_access(
+        self, scoped_command_workspace
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"tar -df {shlex.quote(str(external_file))}")
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"tar --delete -f {shlex.quote(str(external_file))} member")
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -tf own.tar ../../member",
+            "tar -xf own.tar ../../member -C extracted",
+        ],
+    )
+    def test_tar_member_selectors_are_not_local_paths(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "nested_command",
+        [
+            "base64 -o {} own.txt",
+            "tar -cf {} own.txt",
+            "dd if=own.txt of={}",
+        ],
+    )
+    def test_added_find_exec_writes_make_root_write_sensitive(
+        self, scoped_command_workspace, nested_command
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"find {shlex.quote(str(external_file.parent))} "
+                f"-type f -exec {nested_command} \\;"
+            )
+
+        assert exc_info.value.access == "write"
 
     def test_allows_supported_commands_inside_workspace(self, scoped_command_workspace):
         workspace, _, _ = scoped_command_workspace

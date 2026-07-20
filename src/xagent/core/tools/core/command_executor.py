@@ -12,7 +12,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
-from .command_path_guard import CommandPathViolation, WorkspaceCommandPathGuard
+from .command_path_guard import CommandPolicyViolation, WorkspaceCommandPathGuard
 
 logger = logging.getLogger(__name__)
 
@@ -200,8 +200,14 @@ class CommandExecutorCore:
                     argv = [command] if isinstance(command, str) else list(command)
                     self.path_guard.validate_argv(argv)
                     command = argv
-            except CommandPathViolation as exc:
+            except CommandPolicyViolation as exc:
                 return _command_rejected_result(exc)
+            except Exception as exc:
+                logger.error(
+                    "CommandExecutor: Command path validation failed (%s)",
+                    type(exc).__name__,
+                )
+                return _command_rejected_result("command validation failed")
 
         # Sanitize command for logging
         safe_command = _sanitize_command_for_logging(command)
