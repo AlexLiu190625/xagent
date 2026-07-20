@@ -119,6 +119,13 @@ class _ShellState:
     directory_stack: tuple[Path, ...] = ()
     previous_cwd: Path | None = None
     script_depth: int = 0
+    cwd_is_conditional: bool = False
+
+
+@dataclass(frozen=True)
+class _FindExecClause:
+    marker: Literal["-exec", "-execdir"]
+    command: tuple[str, ...]
 
 
 TarMode = Literal[
@@ -206,7 +213,10 @@ class WorkspaceCommandPathGuard:
                 part_kind = getattr(part, "kind", None)
                 if part_kind in {"operator", "pipe"}:
                     operator = getattr(part, "op", None)
-                    if state_changed and operator != "&&":
+                    if operator == "&&":
+                        if state_changed:
+                            current = replace(current, cwd_is_conditional=True)
+                    elif state_changed or current.cwd_is_conditional:
                         raise CommandPolicyViolation(
                             "cannot safely resolve directory state across shell operator"
                         )
@@ -1326,30 +1336,33 @@ class WorkspaceCommandPathGuard:
         if not roots:
             roots = ["."]
         expression = literals[expression_start:]
-        exec_commands = self._parse_find_exec_commands(expression)
+        exec_clauses = self._parse_find_exec_commands(expression)
         access: PathAccess = (
             "write"
             if "-delete" in expression
             or any(
-                self._find_exec_command_writes(command, cwd)
-                for command in exec_commands
+                self._find_exec_command_writes(clause, cwd) for clause in exec_clauses
             )
             else "read"
         )
         for root in roots:
             self._check_path(root, cwd, access)
 
-        for command in exec_commands:
-            self._validate_nested_command_words(command, _ShellState(cwd=cwd))
+        for clause in exec_clauses:
+            self._validate_nested_command_words(
+                clause.command,
+                _ShellState(cwd=cwd),
+            )
 
     @staticmethod
     def _parse_find_exec_commands(
         expression: Sequence[str],
-    ) -> list[tuple[str, ...]]:
-        commands: list[tuple[str, ...]] = []
+    ) -> list[_FindExecClause]:
+        clauses: list[_FindExecClause] = []
         index = 0
         while index < len(expression):
-            if expression[index] not in {"-exec", "-execdir"}:
+            marker = expression[index]
+            if marker not in {"-exec", "-execdir"}:
                 index += 1
                 continue
             nested: list[str] = []
@@ -1358,24 +1371,34 @@ class WorkspaceCommandPathGuard:
                 nested.append(expression[index])
                 index += 1
             if nested:
-                commands.append(tuple(nested))
+                clauses.append(
+                    _FindExecClause(
+                        marker=cast(Literal["-exec", "-execdir"], marker),
+                        command=tuple(nested),
+                    )
+                )
             index += 1
-        return commands
+        return clauses
 
     def _find_exec_command_writes(
         self,
-        command: Sequence[str],
+        clause: _FindExecClause,
         cwd: Path,
     ) -> bool:
+        command = clause.command
         if not command:
             return False
 
-        writes_placeholder = False
+        writes_from_find_root = False
 
         def observe_path(raw_path: str, access: PathAccess) -> None:
-            nonlocal writes_placeholder
-            if access == "write" and "{}" in raw_path:
-                writes_placeholder = True
+            nonlocal writes_from_find_root
+            if access != "write":
+                return
+            if "{}" in raw_path or (
+                clause.marker == "-execdir" and self._is_relative_file_operand(raw_path)
+            ):
+                writes_from_find_root = True
 
         probe = WorkspaceCommandPathGuard(
             self._workspace,
@@ -1387,7 +1410,11 @@ class WorkspaceCommandPathGuard:
             # The regular validation pass reports statically unsafe embedded
             # programs. This probe only classifies placeholder path access.
             pass
-        return writes_placeholder
+        return writes_from_find_root
+
+    @staticmethod
+    def _is_relative_file_operand(raw_path: str) -> bool:
+        return raw_path not in {"", "-", "{}"} and not Path(raw_path).is_absolute()
 
     def _check_nested_shell(
         self,
@@ -1553,6 +1580,8 @@ class WorkspaceCommandPathGuard:
     ) -> None:
         if not words:
             return
+        if isinstance(words[0], _CommandValue) and not words[0].is_static:
+            raise CommandPolicyViolation("cannot resolve dynamic command name")
         command_name = os.path.basename(words[0])
         self._validate_command_values(command_name, words[1:], state)
 

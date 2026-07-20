@@ -764,6 +764,17 @@ class TestScopedCommandPathGuard:
         with pytest.raises(CommandPolicyViolation):
             guard.validate(f"cd sub {operator} cat ../../forbidden/secret.txt")
 
+    def test_rejects_conditional_directory_state_at_unconditional_join(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("cd missing && true; touch ../outside.txt")
+
+        guard.validate("cd sub && printf reached-only-after-success")
+
     def test_source_state_propagates_but_child_shell_state_does_not(
         self, scoped_command_workspace
     ):
@@ -1252,6 +1263,24 @@ class TestScopedCommandPathGuard:
     @pytest.mark.parametrize(
         "command_template",
         [
+            'COMMAND=rm; find {root} -type f -exec "$COMMAND" {{}} \\;',
+            'COMMAND=rm; printf "%s\\n" own.txt | xargs "$COMMAND"',
+        ],
+    )
+    def test_rejects_dynamic_nested_command_names(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(
+                command_template.format(root=shlex.quote(str(external_file.parent)))
+            )
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
             "base64 -i{path}",
             "base64 --input {path}",
             "base64 --input={path}",
@@ -1395,6 +1424,20 @@ class TestScopedCommandPathGuard:
             guard.validate(
                 f"find {shlex.quote(str(external_file.parent))} "
                 f"-type f -exec {nested_command} \\;"
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_find_execdir_relative_write_makes_root_write_sensitive(
+        self, scoped_command_workspace
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"find {shlex.quote(str(external_file.parent))} "
+                "-type f -execdir sh -c 'printf changed > marker' \\;"
             )
 
         assert exc_info.value.access == "write"
