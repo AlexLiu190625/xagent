@@ -19,6 +19,7 @@ from xagent.core.tools.core.command_executor import (
     execute_command,
     execute_script,
 )
+from xagent.core.tools.core.command_path_guard import WorkspaceCommandPathGuard
 from xagent.core.workspace import TaskWorkspace
 
 
@@ -272,6 +273,60 @@ class TestCommandExecutorTool:
 
 class TestScopedCommandPathGuard:
     """Cooperative command path checks enabled only for scoped executions."""
+
+    def test_rejects_shell_false_argv_read_from_sibling(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        executor = CommandExecutorCore(
+            str(workspace.resolve_path("")),
+            path_guard=WorkspaceCommandPathGuard(workspace),
+        )
+
+        result = executor.execute_command(
+            ["cat", str(sibling_file)],
+            shell=False,
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "outside allowed read paths" in result["error"]
+        assert "sibling secret" not in result["output"]
+
+    def test_rejects_shell_true_list_when_path_guard_is_enabled(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        executor = CommandExecutorCore(
+            str(workspace.resolve_path("")),
+            path_guard=WorkspaceCommandPathGuard(workspace),
+        )
+
+        result = executor.execute_command(
+            [f"cat {shlex.quote(str(sibling_file))}"],
+            shell=True,
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "requires a string command" in result["error"]
+        assert "sibling secret" not in result["output"]
+
+    def test_allows_shell_false_argv_inside_workspace(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        own_file = workspace.output_dir / "own.txt"
+        own_file.write_text("own content", encoding="utf-8")
+        executor = CommandExecutorCore(
+            str(workspace.resolve_path("")),
+            path_guard=WorkspaceCommandPathGuard(workspace),
+        )
+
+        result = executor.execute_command(
+            ["cat", str(own_file)],
+            shell=False,
+        )
+
+        assert result["success"] is True
+        assert result["return_code"] == 0
+        assert result["output"] == "own content"
 
     def test_creator_behavior_remains_unrestricted(self, scoped_command_workspace):
         workspace, _, sibling_file = scoped_command_workspace

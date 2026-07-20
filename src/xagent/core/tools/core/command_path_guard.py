@@ -93,6 +93,13 @@ class WorkspaceCommandPathGuard:
         for node in nodes:
             cwd = self._validate_node(node, cwd)
 
+    def validate_argv(self, argv: Sequence[str]) -> None:
+        """Reject out-of-policy paths in an argument-vector command."""
+        if not argv:
+            return
+        command_name = os.path.basename(argv[0])
+        self._validate_command_values(command_name, argv[1:], self._initial_cwd)
+
     def _validate_node(self, node: Any, cwd: Path) -> Path:
         kind = getattr(node, "kind", None)
         if kind == "list":

@@ -27,6 +27,16 @@ TIMEOUT_EXIT_CODE = -999
 COMMAND_REJECTED_EXIT_CODE = 126
 
 
+def _command_rejected_result(reason: object) -> Dict[str, Any]:
+    logger.warning("CommandExecutor: Rejected command path: %s", reason)
+    return {
+        "success": False,
+        "output": "",
+        "error": f"Command rejected by workspace path policy: {reason}",
+        "return_code": COMMAND_REJECTED_EXIT_CODE,
+    }
+
+
 def _validate_timeout(timeout: Optional[int], default_timeout: int) -> int:
     """
     Validate and normalize timeout value.
@@ -152,7 +162,7 @@ class CommandExecutorCore:
 
     def execute_command(
         self,
-        command: str,
+        command: str | list[str],
         timeout: Optional[int] = None,
         capture_output: bool = True,
         shell: bool = True,
@@ -161,7 +171,7 @@ class CommandExecutorCore:
         Execute shell command and return result.
 
         Args:
-            command: Shell command to execute
+            command: Shell command text, or an argument vector when shell=False
             timeout: Execution timeout in seconds (default: 300)
             capture_output: Whether to capture stdout/stderr
             shell: Whether to use shell (allows pipes, redirects, etc.)
@@ -178,17 +188,20 @@ class CommandExecutorCore:
         timeout = _validate_timeout(timeout, self.timeout)
         _validate_working_directory(self.working_directory)
 
-        if self.path_guard is not None and shell and isinstance(command, str):
+        if self.path_guard is not None:
             try:
-                self.path_guard.validate(command)
+                if shell:
+                    if not isinstance(command, str):
+                        return _command_rejected_result(
+                            "shell=True requires a string command when path restrictions are enabled"
+                        )
+                    self.path_guard.validate(command)
+                else:
+                    argv = [command] if isinstance(command, str) else list(command)
+                    self.path_guard.validate_argv(argv)
+                    command = argv
             except CommandPathViolation as exc:
-                logger.warning("CommandExecutor: Rejected command path: %s", exc)
-                return {
-                    "success": False,
-                    "output": "",
-                    "error": f"Command rejected by workspace path policy: {exc}",
-                    "return_code": COMMAND_REJECTED_EXIT_CODE,
-                }
+                return _command_rejected_result(exc)
 
         # Sanitize command for logging
         safe_command = _sanitize_command_for_logging(command)
