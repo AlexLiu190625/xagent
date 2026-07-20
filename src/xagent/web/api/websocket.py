@@ -56,6 +56,10 @@ from ..services.chat_history_service import (
     mark_user_message_delivery,
     mark_user_message_delivery_sync,
 )
+from ..services.file_reference_output_service import (
+    load_assistant_file_reference_records,
+    reconcile_assistant_file_references,
+)
 from ..services.file_turn import (
     append_uploaded_files_context as _append_uploaded_files_context_to_message,
 )
@@ -613,6 +617,27 @@ def _agent_outbound_event_type(payload: Dict[str, Any]) -> str:
     return "agent_progress"
 
 
+def _reconcile_streamed_final_answer(task_id: int, content: str) -> str:
+    """Repair the completed stream payload using task-scoped durable FileRefs."""
+    db_gen = get_db()
+    db = next(db_gen)
+    try:
+        task = db.query(Task).filter(Task.id == int(task_id)).first()
+        task_user_id = _task_user_id(task) if task is not None else None
+        if task_user_id is None:
+            return content
+        return str(
+            reconcile_assistant_file_references(
+                db,
+                task_id=int(task_id),
+                user_id=task_user_id,
+                content=content,
+            )
+        )
+    finally:
+        db.close()
+
+
 def make_agent_outbound_handler(task_id: int) -> Any:
     """Create a web bridge for agent agent-to-user messages."""
 
@@ -624,6 +649,15 @@ def make_agent_outbound_handler(task_id: int) -> Any:
             "final_answer_end",
             "final_answer_error",
         }:
+            if payload_type == "final_answer_end" and isinstance(
+                payload.get("content"), str
+            ):
+                payload = dict(payload)
+                payload["content"] = await asyncio.to_thread(
+                    _reconcile_streamed_final_answer,
+                    task_id,
+                    str(payload["content"]),
+                )
             await manager.broadcast_to_task(
                 create_final_answer_stream_event(payload_type, task_id, dict(payload)),
                 task_id,
@@ -1483,6 +1517,15 @@ async def execute_task_background(
             ai_response,
             path_to_file_id,
         )
+        if effective_user_id is not None:
+            ai_response = reconcile_assistant_file_references(
+                db,
+                task_id=int(task_id),
+                user_id=int(effective_user_id),
+                content=ai_response,
+            )
+            if isinstance(chat_response, dict) and chat_response.get("message"):
+                chat_response = {**chat_response, "message": ai_response}
 
         # Task execution result is logged by ConsoleTraceHandler, no need for duplicate logs
 
@@ -1641,17 +1684,14 @@ async def execute_task_background(
                         db_new,
                         task_id=task_id,
                         user_id=int(effective_user_id),
-                        content=str(
-                            chat_response.get("message", ai_response)
-                            if isinstance(chat_response, dict)
-                            else ai_response
-                        ),
+                        content=str(ai_response),
                         message_type="chat_response"
                         if isinstance(chat_response, dict)
                         else "final_answer",
                         interactions=chat_response.get("interactions")
                         if isinstance(chat_response, dict)
                         else None,
+                        content_is_reconciled=True,
                     )
                     # Commit the pending terminal status. ``persist_assistant_message``
                     # commits internally when it writes a row, but it
@@ -2147,6 +2187,12 @@ async def execute_resume_background(
                     if normalized_outputs:
                         result["file_outputs"] = normalized_outputs
                         output = _rewrite_file_links_to_file_id(output, path_to_file_id)
+                    output = reconcile_assistant_file_references(
+                        db_normalize,
+                        task_id=int(task_id),
+                        user_id=int(task_owner_user_id),
+                        content=output,
+                    )
             finally:
                 db_normalize.close()
 
@@ -2201,6 +2247,7 @@ async def execute_resume_background(
                         content=output,
                         message_type="final_answer",
                         turn_id=_latest_result_user_turn_id(result),
+                        content_is_reconciled=True,
                     )
                     orm_task_updated = cast(Any, task_updated)
                     orm_task_updated.output = output
@@ -4388,6 +4435,12 @@ async def handle_execute_task(
                 result.get("output", ""),
                 path_to_file_id,
             )
+            result["output"] = reconcile_assistant_file_references(
+                db,
+                task_id=int(task_id),
+                user_id=int(task.user_id),
+                content=result["output"],
+            )
 
             # Send task completion event (don't duplicate result as trace system already sent)
             await manager.broadcast_to_task(
@@ -4730,9 +4783,22 @@ async def send_historical_data_as_stream(
                 .order_by(TaskChatMessage.created_at, TaskChatMessage.id)
                 .all()
             )
+            file_reference_records = load_assistant_file_reference_records(
+                db,
+                task_id=int(task_id),
+                user_id=int(task.user_id),
+            )
             for chat_message in chat_messages:
                 role = str(chat_message.role)
                 content = str(chat_message.content or "").strip()
+                if role == "assistant":
+                    content = reconcile_assistant_file_references(
+                        db,
+                        task_id=int(task_id),
+                        user_id=int(task.user_id),
+                        content=content,
+                        records=file_reference_records,
+                    )
                 # Read attachments off the row so file-only turns (empty
                 # content + non-empty attachments) survive replay and so the
                 # chip metadata reaches the synthesized user_message event.

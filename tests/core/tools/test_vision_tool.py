@@ -27,6 +27,7 @@ def mock_vision_model():
 
     # Mock has_ability method
     model.has_ability = Mock(return_value=True)
+    model.supports_native_video_input = False
 
     return model
 
@@ -429,7 +430,7 @@ class TestVisionToolUnderstandImages:
         )
 
         assert result.success is False
-        assert "No valid images could be processed" in result.error
+        assert "No valid images or video frames could be processed" in result.error
 
     @pytest.mark.asyncio
     async def test_understand_no_model_available(self):
@@ -461,6 +462,398 @@ class TestVisionToolUnderstandImages:
 
         assert result.success is False
         assert "Model error" in result.error
+
+
+class TestVisionToolUnderstandMedia:
+    """Tests for the public image/video understanding entrypoint."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("field_name", "invalid_value"),
+        [
+            ("start_time", float("nan")),
+            ("start_time", float("inf")),
+            ("end_time", float("nan")),
+            ("end_time", float("inf")),
+        ],
+    )
+    async def test_understand_video_rejects_non_finite_time_ranges(
+        self,
+        vision_tool_without_workspace,
+        mock_vision_model,
+        field_name,
+        invalid_value,
+    ):
+        result = await vision_tool_without_workspace.understand_media(
+            "clip.mp4",
+            "What happens?",
+            **{field_name: invalid_value},
+        )
+
+        assert result.success is False
+        assert (
+            f"{field_name} must be a finite number greater than or equal to 0"
+            in result.error
+        )
+        mock_vision_model.vision_chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(("start_time", "end_time"), [(4, 4), (10, 2)])
+    async def test_understand_video_rejects_non_increasing_time_range(
+        self,
+        vision_tool_without_workspace,
+        mock_vision_model,
+        start_time,
+        end_time,
+    ):
+        result = await vision_tool_without_workspace.understand_media(
+            "clip.mp4",
+            "What happens?",
+            start_time=start_time,
+            end_time=end_time,
+        )
+
+        assert result.success is False
+        assert "end_time must be greater than start_time" in result.error
+        mock_vision_model.vision_chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_understand_video_samples_timestamped_frames(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        frames = [
+            (0.0, "data:image/jpeg;base64,ZmFrZV9mcmFtZV8x"),
+            (2.5, "data:image/jpeg;base64,ZmFrZV9mcmFtZV8y"),
+        ]
+        with patch.object(
+            vision_tool_without_workspace.core,
+            "_extract_video_frames",
+            return_value=frames,
+        ) as extract_frames:
+            result = await vision_tool_without_workspace.understand_media(
+                "clip.mp4",
+                "What changes over time?",
+                start_time=0,
+                end_time=3,
+                max_frames=2,
+            )
+
+        assert result.success is True
+        assert result.media_processed == 1
+        assert result.images_processed == 0
+        assert result.videos_processed == 1
+        assert result.frames_extracted == 2
+        extract_frames.assert_called_once_with(
+            "clip.mp4", start_time=0.0, end_time=3.0, max_frames=2
+        )
+
+        content = mock_vision_model.vision_chat.call_args.kwargs["messages"][0][
+            "content"
+        ]
+        assert content[0] == {"type": "text", "text": "What changes over time?"}
+        assert content[1]["text"] == "Video clip.mp4, frame at 0.00 seconds:"
+        assert content[3]["text"] == "Video clip.mp4, frame at 2.50 seconds:"
+        image_items = [item for item in content if item["type"] == "image_url"]
+        assert [item["image_url"]["url"] for item in image_items] == [
+            frame_data for _, frame_data in frames
+        ]
+
+    @pytest.mark.asyncio
+    async def test_understand_video_uses_native_input_when_model_supports_it(
+        self, tmp_path, mock_vision_model
+    ):
+        video_path = tmp_path / "clip.mp4"
+        video_path.write_bytes(b"fake-video")
+        mock_vision_model.supports_native_video_input = True
+        mock_vision_model.supports_native_video_time_range = True
+        mock_vision_model.build_native_video_content = Mock(
+            return_value={
+                "type": "video_url",
+                "video_url": {"url": "provider-ready-video"},
+            }
+        )
+        tool = VisionTool(mock_vision_model)
+
+        with (
+            patch.object(
+                tool.core,
+                "_convert_video_to_base64",
+                return_value="data:video/mp4;base64,ZmFrZS12aWRlbw==",
+            ) as convert_video,
+            patch(
+                "xagent.core.tools.core.vision_tool.asyncio.to_thread",
+                new=AsyncMock(return_value="data:video/mp4;base64,ZmFrZS12aWRlbw=="),
+            ) as to_thread,
+            patch.object(tool.core, "_extract_video_frames") as extract_frames,
+        ):
+            result = await tool.understand_media(
+                str(video_path),
+                "What happens?",
+                start_time=1,
+                end_time=4,
+            )
+
+        assert result.success is True
+        assert result.videos_processed == 1
+        assert result.native_videos_processed == 1
+        assert result.frames_extracted == 0
+        extract_frames.assert_not_called()
+        to_thread.assert_awaited_once_with(convert_video, str(video_path))
+
+        video_data = mock_vision_model.build_native_video_content.call_args.args[0]
+        assert video_data.startswith("data:video/mp4;base64,")
+        assert mock_vision_model.build_native_video_content.call_args.kwargs == {
+            "start_time": 1.0,
+            "end_time": 4.0,
+        }
+        content = mock_vision_model.vision_chat.call_args.kwargs["messages"][0][
+            "content"
+        ]
+        assert content[1] == {
+            "type": "video_url",
+            "video_url": {"url": "provider-ready-video"},
+        }
+
+    @pytest.mark.asyncio
+    async def test_time_range_falls_back_when_native_protocol_has_no_offsets(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        mock_vision_model.supports_native_video_input = True
+        mock_vision_model.supports_native_video_time_range = False
+        with patch.object(
+            vision_tool_without_workspace.core,
+            "_extract_video_frames",
+            return_value=[(2.0, "data:image/jpeg;base64,ZmFrZQ==")],
+        ) as extract_frames:
+            result = await vision_tool_without_workspace.understand_media(
+                "clip.mp4",
+                "What happens between one and three seconds?",
+                start_time=1,
+                end_time=3,
+                max_frames=1,
+            )
+
+        assert result.success is True
+        assert result.native_videos_processed == 0
+        assert result.frames_extracted == 1
+        extract_frames.assert_called_once_with(
+            "clip.mp4", start_time=1.0, end_time=3.0, max_frames=1
+        )
+
+    @pytest.mark.asyncio
+    async def test_understand_mixed_media_uses_one_model_call(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        with patch.object(
+            vision_tool_without_workspace.core,
+            "_extract_video_frames",
+            return_value=[(1.0, "data:image/jpeg;base64,ZmFrZV9mcmFtZQ==")],
+        ):
+            result = await vision_tool_without_workspace.understand_media(
+                ["data:image/png;base64,ZmFrZV9pbWFnZQ==", "clip.mov"],
+                "Compare them",
+                max_frames=1,
+            )
+
+        assert result.success is True
+        assert result.media_processed == 2
+        assert result.images_processed == 1
+        assert result.videos_processed == 1
+        assert result.frames_extracted == 1
+        mock_vision_model.vision_chat.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_video_is_never_wrapped_directly_as_image_url(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        result = await vision_tool_without_workspace.understand_media(
+            "data:video/mp4;base64,ZmFrZV92aWRlbw==", "What happens?"
+        )
+
+        assert result.success is False
+        assert result.warnings
+        mock_vision_model.vision_chat.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_native_video_data_url_is_passed_without_frame_sampling(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        mock_vision_model.supports_native_video_input = True
+        mock_vision_model.build_native_video_content = Mock(
+            side_effect=lambda url, **_: {
+                "type": "video_url",
+                "video_url": {"url": url},
+            }
+        )
+
+        result = await vision_tool_without_workspace.understand_media(
+            "data:video/mp4;base64,ZmFrZV92aWRlbw==", "What happens?"
+        )
+
+        assert result.success is True
+        assert result.native_videos_processed == 1
+        assert result.frames_extracted == 0
+        content = mock_vision_model.vision_chat.call_args.kwargs["messages"][0][
+            "content"
+        ]
+        assert content[1]["type"] == "video_url"
+
+    @pytest.mark.asyncio
+    async def test_unsupported_native_video_url_does_not_fail_other_media(
+        self, vision_tool_without_workspace, mock_vision_model
+    ):
+        mock_vision_model.supports_native_video_input = True
+
+        def build_native_video_content(url, **_):
+            if url.startswith("https://"):
+                raise ValueError("unsupported remote video URL")
+            return {"type": "video_url", "video_url": {"url": url}}
+
+        mock_vision_model.build_native_video_content = Mock(
+            side_effect=build_native_video_content
+        )
+
+        result = await vision_tool_without_workspace.understand_media(
+            [
+                "data:video/mp4;base64,ZmFrZV92aWRlbw==",
+                "https://example.com/remote.mp4",
+            ],
+            "Summarize the available video",
+        )
+
+        assert result.success is True
+        assert result.videos_processed == 1
+        assert result.native_videos_processed == 1
+        assert any("unsupported remote video URL" in item for item in result.warnings)
+        assert any("upload the video" in item for item in result.warnings)
+        mock_vision_model.vision_chat.assert_awaited_once()
+
+    def test_frame_budget_reserves_one_frame_for_every_video(
+        self, vision_tool_without_workspace
+    ):
+        assert vision_tool_without_workspace.core._video_frame_budgets(
+            image_count=2,
+            native_video_count=0,
+            video_count=2,
+            max_frames=8,
+        ) == [4, 4]
+
+    @pytest.mark.asyncio
+    async def test_all_native_videos_skip_fallback_frame_budget(
+        self, mock_vision_model
+    ):
+        mock_vision_model.supports_native_video_input = True
+        mock_vision_model.build_native_video_content = Mock(
+            side_effect=lambda url, **_: {
+                "type": "video_url",
+                "video_url": {"url": url},
+            }
+        )
+        tool = VisionTool(mock_vision_model)
+        media = [f"clip-{index}.mp4" for index in range(10)]
+
+        with (
+            patch.object(
+                tool.core,
+                "_convert_video_to_base64",
+                return_value="data:video/mp4;base64,ZmFrZS12aWRlbw==",
+            ),
+            patch.object(tool.core, "_video_frame_budgets") as frame_budgets,
+        ):
+            result = await tool.understand_media(media, "Summarize all videos")
+
+        assert result.success is True
+        assert result.native_videos_processed == 10
+        assert result.frames_extracted == 0
+        frame_budgets.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_native_videos_consume_fallback_frame_budget(self, mock_vision_model):
+        mock_vision_model.supports_native_video_input = True
+        mock_vision_model.build_native_video_content = Mock(
+            return_value={
+                "type": "video_url",
+                "video_url": {"url": "provider-ready-video"},
+            }
+        )
+        tool = VisionTool(mock_vision_model)
+
+        with (
+            patch.object(
+                tool.core,
+                "_convert_video_to_base64",
+                side_effect=[
+                    "data:video/mp4;base64,ZmFrZS12aWRlbw==",
+                    "data:video/mp4;base64,ZmFrZS12aWRlbw==",
+                    ValueError("cannot inline"),
+                ],
+            ),
+            patch.object(
+                tool.core,
+                "_extract_video_frames",
+                return_value=[(1.0, "data:image/jpeg;base64,ZmFrZQ==")],
+            ) as extract_frames,
+        ):
+            result = await tool.understand_media(
+                ["native-1.mp4", "native-2.mp4", "fallback.mp4"],
+                "Compare the videos",
+                max_frames=10,
+            )
+
+        assert result.success is True
+        assert result.native_videos_processed == 2
+        assert result.frames_extracted == 1
+        extract_frames.assert_called_once_with(
+            "fallback.mp4",
+            start_time=None,
+            end_time=None,
+            max_frames=8,
+        )
+
+    def test_probe_video_duration_requires_ffprobe(self, vision_tool_without_workspace):
+        with patch(
+            "xagent.core.tools.core.vision_tool.shutil.which", return_value=None
+        ):
+            with pytest.raises(RuntimeError, match="requires ffprobe/ffmpeg"):
+                vision_tool_without_workspace.core._probe_video_duration("clip.mp4")
+
+    def test_extract_video_frames_skips_empty_frame_and_uses_bucket_midpoints(
+        self, vision_tool_without_workspace, tmp_path
+    ):
+        video_path = tmp_path / "clip.mp4"
+        video_path.write_bytes(b"fake-video")
+        completed_frames = [Mock(stdout=b""), Mock(stdout=b"jpeg-frame")]
+
+        with (
+            patch(
+                "xagent.core.tools.core.vision_tool.shutil.which",
+                return_value="/usr/bin/ffmpeg",
+            ),
+            patch.object(
+                vision_tool_without_workspace.core,
+                "_probe_video_duration",
+                return_value=8.0,
+            ),
+            patch(
+                "xagent.core.tools.core.vision_tool.subprocess.run",
+                side_effect=completed_frames,
+            ) as run,
+        ):
+            frames = vision_tool_without_workspace.core._extract_video_frames(
+                str(video_path),
+                start_time=0.0,
+                end_time=8.0,
+                max_frames=2,
+            )
+
+        assert frames == [
+            (
+                6.0,
+                "data:image/jpeg;base64,"
+                + base64.b64encode(b"jpeg-frame").decode("ascii"),
+            )
+        ]
+        assert [call.args[0][4] for call in run.call_args_list] == ["2.000", "6.000"]
 
 
 class TestVisionToolDescribeImages:
@@ -731,12 +1124,11 @@ class TestGetVisionTool:
         """Test get_vision_tool with model provided"""
         tools = get_vision_tool(vision_model=mock_vision_model)
 
-        assert len(tools) == 3
+        assert len(tools) == 2
 
         # Check tool names
         tool_names = [tool.metadata.name for tool in tools]
-        assert "understand_images" in tool_names
-        assert "describe_images" in tool_names
+        assert "understand_media" in tool_names
         assert "detect_objects" in tool_names
 
     def test_get_vision_tool_with_workspace(self, mock_vision_model, mock_workspace):
@@ -745,12 +1137,11 @@ class TestGetVisionTool:
             vision_model=mock_vision_model, workspace=mock_workspace
         )
 
-        assert len(tools) == 3
+        assert len(tools) == 2
 
         # Check that tools were created (workspace binding is internal to VisionTool)
         tool_names = [tool.metadata.name for tool in tools]
-        assert "understand_images" in tool_names
-        assert "describe_images" in tool_names
+        assert "understand_media" in tool_names
         assert "detect_objects" in tool_names
 
     def test_get_vision_tool_without_model(self):
@@ -759,20 +1150,19 @@ class TestGetVisionTool:
 
         # Test should handle both scenarios:
         # 1. No vision models available (returns empty list)
-        # 2. Vision models available in test environment (returns 3 tools)
+        # 2. Vision models available in test environment (returns 2 tools)
 
         if len(tools) == 0:
             # No vision models available scenario
             assert len(tools) == 0
-        elif len(tools) == 3:
+        elif len(tools) == 2:
             # Vision models available scenario
             tool_names = [tool.metadata.name for tool in tools]
-            assert "understand_images" in tool_names
-            assert "describe_images" in tool_names
+            assert "understand_media" in tool_names
             assert "detect_objects" in tool_names
         else:
             # Unexpected number of tools - this indicates a problem
-            pytest.fail(f"Expected 0 or 3 tools, got {len(tools)}")
+            pytest.fail(f"Expected 0 or 2 tools, got {len(tools)}")
 
 
 class TestGetDefaultVisionModel:
@@ -843,10 +1233,10 @@ class TestVisionToolIntegration:
             vision_model=mock_vision_model, workspace=mock_workspace
         )
 
-        # Find understand_images tool
+        # Find unified media understanding tool
         understand_tool = None
         for tool in tools:
-            if tool.metadata.name == "understand_images":
+            if tool.metadata.name == "understand_media":
                 understand_tool = tool
                 break
 
@@ -854,7 +1244,7 @@ class TestVisionToolIntegration:
 
         # Execute tool
         result = await understand_tool.run_json_async(
-            {"images": "existing_image.jpg", "question": "What is this image?"}
+            {"media": "existing_image.jpg", "question": "What is this image?"}
         )
 
         assert result["success"] is True
@@ -874,12 +1264,8 @@ class TestVisionToolIntegration:
         tools_dict = {tool.metadata.name: tool for tool in tools}
 
         # Execute all tools
-        understand_result = await tools_dict["understand_images"].run_json_async(
-            {"images": "existing_image.jpg", "question": "What is this?"}
-        )
-
-        describe_result = await tools_dict["describe_images"].run_json_async(
-            {"images": "existing_image.jpg", "question": "Describe this image"}
+        understand_result = await tools_dict["understand_media"].run_json_async(
+            {"media": "existing_image.jpg", "question": "What is this?"}
         )
 
         detect_result = await tools_dict["detect_objects"].run_json_async(
@@ -888,11 +1274,10 @@ class TestVisionToolIntegration:
 
         # All should succeed and use the same model
         assert understand_result["success"] is True
-        assert describe_result["success"] is True
         assert detect_result["success"] is True
 
         # Verify model was called for each tool
-        assert mock_vision_model.vision_chat.call_count == 3
+        assert mock_vision_model.vision_chat.call_count == 2
 
     def test_tool_metadata(self, mock_vision_model):
         """Test that tools have correct metadata"""
@@ -923,7 +1308,7 @@ class TestVisionToolErrorHandling:
         assert (
             result.success is False
             and result.error is not None
-            and "At least one image must be provided" in result.error
+            and "At least one image or video must be provided" in result.error
         )
 
     @pytest.mark.asyncio
@@ -934,7 +1319,7 @@ class TestVisionToolErrorHandling:
         assert (
             result.success is False
             and result.error is not None
-            and "At least one image must be provided" in result.error
+            and "At least one image or video must be provided" in result.error
         )
 
 

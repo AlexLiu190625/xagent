@@ -52,6 +52,7 @@ def parse_document(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     progress_callback: Optional[Any] = None,
+    source_path_override: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Parse a document using the specified method."""
     return _get_legacy_step_compatibility_facade().parse_document(
@@ -62,6 +63,7 @@ def parse_document(
         user_id=user_id,
         is_admin=is_admin,
         progress_callback=progress_callback,
+        source_path_override=source_path_override,
     )
 
 
@@ -73,6 +75,7 @@ def _parse_document_impl(
     user_id: Optional[int] = None,
     is_admin: bool = False,
     progress_callback: Optional[Any] = None,
+    source_path_override: Optional[str] = None,
     *,
     handle: "LanceDBCollectionHandle",
 ) -> Dict[str, Any]:
@@ -98,6 +101,7 @@ def _parse_document_impl(
         collection=collection,
         doc_id=doc_id,
         parse_method=parse_method,
+        source_path_override=source_path_override,
         params=params,
         user_id=user_id,
         is_admin=is_admin,
@@ -149,7 +153,7 @@ async def _parse_document_internal(
     if not document:
         raise DocumentNotFoundError(f"Document not found: {doc_id}")
 
-    source_path = document["source_path"]
+    source_path = request.source_path_override or document["source_path"]
     file_type = document["file_type"]
     logger.info("Found document: %s", source_path)
 
@@ -244,7 +248,10 @@ async def _parse_document_internal(
         # Start with parser metadata, then override with authoritative values
         enriched_metadata = {
             **paragraph.metadata,
-            "source": source_path,
+            # Persist the canonical path from the document row, not the physical
+            # path actually read (which for staged ingestion is a transient file
+            # removed after publish). Durable metadata must keep the canonical path.
+            "source": document["source_path"],
             "file_type": file_type,  # Use file_type from database (without dot)
             "parse_method": str(parse_method),
             "parser": f"local:{parse_method}@v1.0.0",

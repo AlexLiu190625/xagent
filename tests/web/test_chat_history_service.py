@@ -1,3 +1,5 @@
+from unittest.mock import patch
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
@@ -7,6 +9,7 @@ from xagent.core.agent.transcript import build_assistant_transcript_content
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
     DELIVERY_FAILED,
@@ -123,6 +126,62 @@ def test_persist_assistant_message_formats_interactions_into_transcript():
         assert stored_message.role == "assistant"
         assert "Please answer the following questions:" in stored_message.content
         assert "Repository path: Enter the repository path" in stored_message.content
+    finally:
+        db_session.close()
+
+
+def test_persist_assistant_message_repairs_invented_file_id():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+        db_session.add(
+            UploadedFile(
+                file_id="real-video-id",
+                user_id=int(task.user_id),
+                task_id=int(task.id),
+                filename="generated_video.mp4",
+                storage_path="/tmp/real-video-id/generated_video.mp4",
+                mime_type="video/mp4",
+                file_size=123,
+            )
+        )
+        db_session.commit()
+
+        message = persist_assistant_message(
+            db_session,
+            int(task.id),
+            int(task.user_id),
+            "[generated_video.mp4](file:invented-video-id)",
+            message_type="final_answer",
+        )
+
+        assert message is not None
+        assert message.content == "[generated_video.mp4](file:real-video-id)"
+    finally:
+        db_session.close()
+
+
+def test_persist_assistant_message_skips_duplicate_reconciliation():
+    db_session = _create_db_session()
+    try:
+        task = _create_task(db_session)
+
+        with patch(
+            "xagent.web.services.chat_history_service."
+            "reconcile_assistant_file_references",
+            side_effect=AssertionError("content was already reconciled"),
+        ):
+            message = persist_assistant_message(
+                db_session,
+                int(task.id),
+                int(task.user_id),
+                "Already canonical",
+                message_type="final_answer",
+                content_is_reconciled=True,
+            )
+
+        assert message is not None
+        assert message.content == "Already canonical"
     finally:
         db_session.close()
 

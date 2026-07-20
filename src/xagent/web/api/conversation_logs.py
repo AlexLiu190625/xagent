@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import math
 from datetime import timezone
-from typing import Any
+from typing import Any, Sequence
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import and_, case, func, or_
@@ -15,7 +15,12 @@ from ..models.chat_message import TaskChatMessage
 from ..models.database import get_db
 from ..models.task import Task, TraceEvent
 from ..models.trigger import AgentTrigger, TriggerRun
+from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services.file_reference_output_service import (
+    load_assistant_file_reference_records,
+    reconcile_assistant_file_references,
+)
 from ..utils.db_timezone import format_datetime_for_api
 
 logger = logging.getLogger(__name__)
@@ -223,7 +228,10 @@ def _serialize_log_summary(task: Task, ui_source: str) -> dict[str, Any]:
 
 
 def _serialize_transcript_with_events(
-    db: Session, task: Task, messages: list[TaskChatMessage]
+    db: Session,
+    task: Task,
+    messages: list[TaskChatMessage],
+    file_reference_records: Sequence[UploadedFile] | None = None,
 ) -> list[dict[str, Any]]:
     """Transcript with successful context-compaction notices interleaved.
 
@@ -232,10 +240,26 @@ def _serialize_transcript_with_events(
     surface the same "context compacted" notice the live chat shows.
     """
 
+    if file_reference_records is None:
+        file_reference_records = load_assistant_file_reference_records(
+            db,
+            task_id=int(task.id),
+            user_id=int(task.user_id),
+        )
+
     # (sort_epoch, kind, payload); on ties order user (0) -> compaction (1) ->
     # assistant (2), since compaction happens before the assistant reply.
     rows: list[tuple[float, int, dict[str, Any]]] = []
     for message in sorted(messages, key=_message_sort_key):
+        content = message.content
+        if message.role == "assistant":
+            content = reconcile_assistant_file_references(
+                db,
+                task_id=int(task.id),
+                user_id=int(task.user_id),
+                content=content,
+                records=file_reference_records,
+            )
         rows.append(
             (
                 _event_epoch(message.created_at) or 0.0,
@@ -243,7 +267,7 @@ def _serialize_transcript_with_events(
                 {
                     "id": int(message.id),
                     "role": message.role,
-                    "content": message.content,
+                    "content": content,
                     "message_type": message.message_type,
                     "interactions": message.interactions,
                     "turn_id": message.turn_id,
@@ -526,15 +550,31 @@ async def get_conversation_log_detail(
         raise HTTPException(status_code=404, detail="Conversation log not found")
 
     messages = list(task.chat_messages or [])
+    file_reference_records = load_assistant_file_reference_records(
+        db,
+        task_id=int(task.id),
+        user_id=int(task.user_id),
+    )
     return {
         "log": _serialize_log_summary(task, ui_source),
-        "transcript": _serialize_transcript_with_events(db, task, messages),
+        "transcript": _serialize_transcript_with_events(
+            db,
+            task,
+            messages,
+            file_reference_records,
+        ),
         "trace_events": _serialize_trace_events(db, int(task.id)),
         "metadata": {
             "task": {
                 "task_id": int(task.id),
                 "input": task.input,
-                "output": task.output,
+                "output": reconcile_assistant_file_references(
+                    db,
+                    task_id=int(task.id),
+                    user_id=int(task.user_id),
+                    content=task.output,
+                    records=file_reference_records,
+                ),
                 "error_message": task.error_message,
                 "description": task.description,
             },
