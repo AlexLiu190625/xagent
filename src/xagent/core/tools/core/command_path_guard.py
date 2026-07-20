@@ -57,6 +57,7 @@ _WRITE_COMMANDS = {
     "truncate",
 }
 _SHELL_COMMANDS = {"bash", "dash", "sh", "zsh"}
+_BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
 _SAFE_DEVICE_PATHS = {
     Path("/dev/null"),
     Path("/dev/stdin"),
@@ -209,7 +210,7 @@ class WorkspaceCommandPathGuard:
         elif command_name == "find":
             self._check_find(args, cwd)
         elif command_name in _SHELL_COMMANDS:
-            self._check_nested_shell(args, cwd)
+            self._check_nested_shell(command_name, args, cwd)
         elif command_name in {".", "source"}:
             self._check_operands(args, cwd, "read")
         elif command_name == "xargs":
@@ -829,12 +830,38 @@ class WorkspaceCommandPathGuard:
             pass
         return writes_placeholder
 
-    def _check_nested_shell(self, literals: Sequence[str], cwd: Path) -> None:
+    def _check_nested_shell(
+        self,
+        command_name: str,
+        literals: Sequence[str],
+        cwd: Path,
+    ) -> None:
+        command_option_index: int | None = None
         for index, value in enumerate(literals[:-1]):
-            if value.startswith("-") and "c" in value[1:]:
-                self._validate_shell_text(literals[index + 1], cwd)
-                return
-        self._check_operands(literals, cwd, "read")
+            if (
+                value.startswith("-")
+                and not value.startswith("--")
+                and "c" in value[1:]
+            ):
+                command_option_index = index
+                break
+
+        file_values = (
+            literals
+            if command_option_index is None
+            else literals[:command_option_index]
+        )
+        if command_name == "bash":
+            file_values = self._check_read_path_options(
+                file_values,
+                cwd,
+                short_options=set(),
+                long_options=_BASH_FILE_OPTIONS,
+            )
+        self._check_operands(file_values, cwd, "read")
+
+        if command_option_index is not None:
+            self._validate_shell_text(literals[command_option_index + 1], cwd)
 
     def _check_xargs(self, values: Sequence[str], cwd: Path) -> None:
         command_start = len(values)

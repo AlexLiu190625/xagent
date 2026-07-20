@@ -488,6 +488,34 @@ class TestScopedCommandPathGuard:
         assert result["success"] is False
         assert result["return_code"] == 126
 
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "bash --rcfile {path} -i",
+            "bash --rcfile={path} -i",
+            "bash --init-file {path} -i -c exit",
+            "bash --rcfile {path} -i -c exit",
+        ],
+    )
+    def test_rejects_bash_file_options_outside_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    def test_shell_c_positional_arguments_are_not_treated_as_file_paths(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"bash -c 'printf %s \"$1\"' ignored {shlex.quote(str(sibling_file))}"
+        )
+
     def test_malformed_top_level_shell_input_remains_cooperative(
         self, scoped_command_workspace
     ):
