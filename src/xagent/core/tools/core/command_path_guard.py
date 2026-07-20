@@ -11,7 +11,7 @@ import logging
 import os
 import re
 from pathlib import Path
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Sequence, cast
 
 import bashlex
 
@@ -73,6 +73,16 @@ class WorkspaceCommandPathGuard:
         self._workspace = workspace
         self._initial_cwd = workspace.resolve_path("").resolve()
 
+    @staticmethod
+    def _parse_shell(command: str) -> list[Any] | None:
+        try:
+            return cast(list[Any], bashlex.parse(command))
+        except (bashlex.errors.ParsingError, NotImplementedError, ValueError) as exc:
+            logger.debug(
+                "Skipping command path guard for unparsed shell input: %s", exc
+            )
+            return None
+
     def validate(self, command: str) -> None:
         """Reject statically identifiable out-of-scope paths in ``command``.
 
@@ -81,12 +91,8 @@ class WorkspaceCommandPathGuard:
         command behavior and keeps the contract honest: the guard reduces risk
         for supported commands but is not a complete sandbox.
         """
-        try:
-            nodes = bashlex.parse(command)
-        except (NotImplementedError, ValueError) as exc:
-            logger.debug(
-                "Skipping command path guard for unparsed shell input: %s", exc
-            )
+        nodes = self._parse_shell(command)
+        if nodes is None:
             return
 
         cwd = self._initial_cwd
@@ -625,6 +631,8 @@ class WorkspaceCommandPathGuard:
         try:
             script = script_path.read_text(encoding="utf-8")
         except OSError as exc:
+            # A missing script may be created earlier in the same shell string;
+            # skipping inspection would allow its embedded file I/O unchecked.
             raise CommandPathViolation(access="read", path=script_path) from exc
         self._reject_embedded_io(language, script)
 
@@ -874,9 +882,8 @@ class WorkspaceCommandPathGuard:
         return target_dir, operands
 
     def _validate_shell_text(self, command: str, cwd: Path) -> None:
-        try:
-            nodes = bashlex.parse(command)
-        except (NotImplementedError, ValueError):
+        nodes = self._parse_shell(command)
+        if nodes is None:
             return
         current = cwd
         for node in nodes:

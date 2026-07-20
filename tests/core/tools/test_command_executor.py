@@ -480,6 +480,28 @@ class TestScopedCommandPathGuard:
         assert result["success"] is False
         assert result["return_code"] == 126
 
+    def test_malformed_top_level_shell_input_remains_cooperative(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": "echo '"})
+
+        assert result["success"] is False
+        assert result["return_code"] != 126
+
+    def test_malformed_nested_shell_input_remains_cooperative(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": 'sh -c "echo \'"'})
+
+        assert result["success"] is False
+        assert result["return_code"] != 126
+
     @pytest.mark.parametrize(
         "command_template",
         [
@@ -503,6 +525,43 @@ class TestScopedCommandPathGuard:
 
         assert result["success"] is False
         assert result["return_code"] == 126
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    @pytest.mark.parametrize(
+        ("script_name", "script_template", "invocation"),
+        [
+            ("dynamic.sed", "w {path}", "sed -f dynamic.sed own.txt"),
+            (
+                "dynamic.awk",
+                'BEGIN {{print "changed" > "{path}"}}',
+                "awk -f dynamic.awk own.txt",
+            ),
+        ],
+    )
+    def test_rejects_dynamically_created_sed_awk_scripts_with_embedded_io(
+        self,
+        scoped_command_workspace,
+        script_name,
+        script_template,
+        invocation,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+        script = script_template.format(path=sibling_file)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"printf '%s\\n' {shlex.quote(script)} > {script_name} "
+                    f"&& {invocation}"
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert not (workspace.output_dir / script_name).exists()
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
 
     def test_rejects_bare_cd_before_relative_file_access(
