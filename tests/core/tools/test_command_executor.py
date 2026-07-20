@@ -484,6 +484,26 @@ class TestScopedCommandPathGuard:
         assert "outside allowed write paths" in result["error"]
         assert external_file.exists()
 
+    @pytest.mark.parametrize("marker", ["-exec", "-execdir"])
+    def test_find_later_exec_write_treats_read_only_root_as_write_target(
+        self, scoped_command_workspace, marker
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"find {shlex.quote(str(external_file.parent))} -type f "
+                    f"{marker} cat {{}} \\; {marker} rm {{}} \\;"
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert "outside allowed write paths" in result["error"]
+        assert external_file.exists()
+
     def test_find_exec_copy_rejects_out_of_scope_destination(
         self, scoped_command_workspace
     ):

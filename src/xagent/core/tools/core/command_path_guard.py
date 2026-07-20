@@ -13,7 +13,7 @@ import re
 from pathlib import Path
 from typing import Any, Literal, Sequence
 
-import bashlex  # type: ignore[import-not-found]
+import bashlex
 
 from ...workspace import TaskWorkspace
 
@@ -491,7 +491,7 @@ class WorkspaceCommandPathGuard:
     def _check_sed_values(self, values: Sequence[str], cwd: Path) -> None:
         positionals: list[str] = []
         explicit_script = False
-        in_place = False
+        in_place = self._sed_requests_in_place(values)
         index = 0
         while index < len(values):
             value = values[index]
@@ -531,7 +531,6 @@ class WorkspaceCommandPathGuard:
                 or value.startswith("-i")
                 or value.startswith("--in-place")
             ):
-                in_place = True
                 index += 1
                 continue
             if value.startswith("-") and value != "-":
@@ -545,6 +544,13 @@ class WorkspaceCommandPathGuard:
         file_operands = positionals if explicit_script else positionals[1:]
         for raw_path in file_operands:
             self._check_path(raw_path, cwd, "write" if in_place else "read")
+
+    @staticmethod
+    def _sed_requests_in_place(values: Sequence[str]) -> bool:
+        return any(
+            value == "-i" or value.startswith("-i") or value.startswith("--in-place")
+            for value in values
+        )
 
     def _check_awk_values(self, values: Sequence[str], cwd: Path) -> None:
         positionals: list[str] = []
@@ -697,6 +703,8 @@ class WorkspaceCommandPathGuard:
 
     def _check_move_or_link(self, values: Sequence[str], cwd: Path) -> None:
         target_dir, operands = self._parse_target_directory(values)
+        # A hard link inside the workspace aliases its source inode, so an
+        # external read-only source must remain write-protected here.
         for raw_path in operands:
             self._check_path(raw_path, cwd, "write")
         if target_dir is not None:
@@ -716,49 +724,51 @@ class WorkspaceCommandPathGuard:
 
         if not roots:
             roots = ["."]
+        expression = literals[expression_start:]
+        exec_commands = self._parse_find_exec_commands(expression)
         access: PathAccess = (
             "write"
-            if any(value in {"-delete", "-exec", "-execdir"} for value in literals)
-            and self._find_exec_writes(literals)
+            if "-delete" in expression
+            or any(self._find_exec_command_writes(command) for command in exec_commands)
             else "read"
         )
         for root in roots:
             self._check_path(root, cwd, access)
 
-        index = expression_start
-        while index < len(literals):
-            if literals[index] not in {"-exec", "-execdir"}:
+        for command in exec_commands:
+            self._validate_nested_command_words(command, cwd)
+
+    @staticmethod
+    def _parse_find_exec_commands(
+        expression: Sequence[str],
+    ) -> list[tuple[str, ...]]:
+        commands: list[tuple[str, ...]] = []
+        index = 0
+        while index < len(expression):
+            if expression[index] not in {"-exec", "-execdir"}:
                 index += 1
                 continue
             nested: list[str] = []
             index += 1
-            while index < len(literals) and literals[index] not in {";", "+"}:
-                nested.append(literals[index])
+            while index < len(expression) and expression[index] not in {";", "+"}:
+                nested.append(expression[index])
                 index += 1
             if nested:
-                self._validate_nested_command_words(nested, cwd)
+                commands.append(tuple(nested))
             index += 1
+        return commands
 
     @staticmethod
-    def _find_exec_writes(literals: Sequence[str | None]) -> bool:
-        if "-delete" in literals:
+    def _find_exec_command_writes(command: Sequence[str]) -> bool:
+        if not command:
+            return False
+        nested_name = os.path.basename(command[0])
+        if nested_name in _WRITE_COMMANDS | {"mv", "ln"}:
             return True
-        for marker in ("-exec", "-execdir"):
-            try:
-                index = literals.index(marker)
-            except ValueError:
-                continue
-            if index + 1 >= len(literals):
-                continue
-            nested_name = os.path.basename(literals[index + 1] or "")
-            if nested_name in _WRITE_COMMANDS | {"mv", "ln"}:
-                return True
-            if nested_name == "sed" and any(
-                value == "-i" or (value or "").startswith("--in-place")
-                for value in literals[index + 2 :]
-            ):
-                return True
-        return False
+        return (
+            nested_name == "sed"
+            and WorkspaceCommandPathGuard._sed_requests_in_place(command[1:])
+        )
 
     def _check_nested_shell(self, literals: Sequence[str], cwd: Path) -> None:
         for index, value in enumerate(literals[:-1]):
