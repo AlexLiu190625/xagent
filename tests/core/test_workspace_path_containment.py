@@ -252,6 +252,43 @@ def test_resolve_path_accepts_traversal_into_allowed_external_dir(tmp_path):
     assert resolved == target.resolve()
 
 
+def test_resolve_authorized_path_uses_explicit_base(workspace, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    target = workspace.output_dir / "report.txt"
+
+    resolved = workspace.resolve_authorized_path(
+        "report.txt",
+        base_dir=workspace.output_dir,
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_authorized_path_can_exclude_external_write_roots(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = TaskWorkspace(
+        "task7",
+        str(tmp_path / "workspace"),
+        allowed_external_dirs=[str(external)],
+    )
+
+    assert (
+        workspace.resolve_authorized_path(
+            external / "reference.txt",
+            base_dir=workspace.output_dir,
+            include_external_dirs=True,
+        )
+        == (external / "reference.txt").resolve()
+    )
+    with pytest.raises(ValueError):
+        workspace.resolve_authorized_path(
+            external / "reference.txt",
+            base_dir=workspace.output_dir,
+            include_external_dirs=False,
+        )
+
+
 # --------------------------------------------------------------------------
 # SITE 2 — WorkspaceFileOperations._resolve_path (separate implementation;
 # it ignores allowed_external_dirs and confines strictly to workspace_dir)

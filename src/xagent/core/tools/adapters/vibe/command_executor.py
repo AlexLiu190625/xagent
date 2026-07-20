@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 
 from ....workspace import TaskWorkspace
 from ...core.command_executor import CommandExecutorCore
+from ...core.command_path_guard import WorkspaceCommandPathGuard
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .function import FunctionTool
 from .sandboxed_tool.sandbox_config import sandbox_config
@@ -41,9 +42,14 @@ class CommandExecutorResult(BaseModel):
 class CommandExecutorTool(AbstractBaseTool):
     """Framework wrapper for the pure command executor tool"""
 
-    def __init__(self, workspace: Optional[TaskWorkspace] = None) -> None:
+    def __init__(
+        self,
+        workspace: Optional[TaskWorkspace] = None,
+        restrict_paths: bool = False,
+    ) -> None:
         self._visibility = ToolVisibility.PUBLIC
         self._workspace = workspace
+        self._restrict_paths = restrict_paths
 
     @property
     def name(self) -> str:
@@ -57,9 +63,16 @@ class CommandExecutorTool(AbstractBaseTool):
             if working_directory
             else "Commands run in the current process working directory."
         )
+        boundary_line = (
+            "Common shell file operations are checked against the current "
+            "workspace; external allowed directories are read-only."
+            if self._restrict_paths
+            else ""
+        )
         return f"""Execute shell commands and scripts.
 Supports any shell command including system commands, scripts, pipes, and redirects.
 {workspace_line}
+{boundary_line}
 Use concrete paths, URLs, or file identifiers already returned by previous tool results directly. If a tool returned an absolute path or a path relative to the command working directory, pass that path to the next command instead of rediscovering it.
 Only search for files when no usable path was provided, and keep searches scoped to the command working directory or another explicitly relevant directory. Do not run broad recursive searches from `/` or the user's home directory unless the user explicitly asks for that scope.
 Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt | grep error"""
@@ -81,7 +94,12 @@ Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt |
         working_directory = self._get_working_directory()
 
         # Create core executor instance
-        executor = CommandExecutorCore(working_directory)
+        path_guard = (
+            WorkspaceCommandPathGuard(self._workspace)
+            if self._restrict_paths and self._workspace is not None
+            else None
+        )
+        executor = CommandExecutorCore(working_directory, path_guard=path_guard)
 
         # Execute command
         result = executor.execute_command(exec_args.command, timeout=exec_args.timeout)
@@ -99,7 +117,7 @@ Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt |
         return None
 
 
-@sandbox_config()
+@sandbox_config(packages=("bashlex>=0.18",))
 class CommandExecutorToolForBasic(CommandExecutorTool):
     """Command executor tool with BASIC category."""
 

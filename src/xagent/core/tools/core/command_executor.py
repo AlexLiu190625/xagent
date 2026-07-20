@@ -12,6 +12,8 @@ import tempfile
 from pathlib import Path
 from typing import Any, Dict, Optional
 
+from .command_path_guard import CommandPathViolation, WorkspaceCommandPathGuard
+
 logger = logging.getLogger(__name__)
 
 # Constants
@@ -20,6 +22,9 @@ MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 
 # Timeout return code constant
 TIMEOUT_EXIT_CODE = -999
+
+# Conventional shell exit code for a command found but not permitted to run.
+COMMAND_REJECTED_EXIT_CODE = 126
 
 
 def _validate_timeout(timeout: Optional[int], default_timeout: int) -> int:
@@ -129,14 +134,20 @@ def _sanitize_interpreter_suffix(interpreter: str) -> str:
 class CommandExecutorCore:
     """Shell command executor with execution controls"""
 
-    def __init__(self, working_directory: Optional[str] = None):
+    def __init__(
+        self,
+        working_directory: Optional[str] = None,
+        path_guard: Optional[WorkspaceCommandPathGuard] = None,
+    ):
         """
         Initialize the command executor.
 
         Args:
             working_directory: Directory to use as working directory during execution
+            path_guard: Optional cooperative workspace path guard
         """
         self.working_directory = working_directory
+        self.path_guard = path_guard
         self.timeout = 300  # 5 minutes default
 
     def execute_command(
@@ -166,6 +177,18 @@ class CommandExecutorCore:
         """
         timeout = _validate_timeout(timeout, self.timeout)
         _validate_working_directory(self.working_directory)
+
+        if self.path_guard is not None and shell and isinstance(command, str):
+            try:
+                self.path_guard.validate(command)
+            except CommandPathViolation as exc:
+                logger.warning("CommandExecutor: Rejected command path: %s", exc)
+                return {
+                    "success": False,
+                    "output": "",
+                    "error": f"Command rejected by workspace path policy: {exc}",
+                    "return_code": COMMAND_REJECTED_EXIT_CODE,
+                }
 
         # Sanitize command for logging
         safe_command = _sanitize_command_for_logging(command)

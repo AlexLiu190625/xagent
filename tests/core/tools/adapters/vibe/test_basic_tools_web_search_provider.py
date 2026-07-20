@@ -1,6 +1,8 @@
 import pytest
 
+from xagent.core.execution_scope import ExecutionScope
 from xagent.core.tools.adapters.vibe.basic_tools import create_basic_tools
+from xagent.core.tools.adapters.vibe.command_executor import CommandExecutorToolForBasic
 from xagent.core.tools.adapters.vibe.config import ToolConfig
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
@@ -8,6 +10,31 @@ from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 
 def _tool_names(tools):
     return [tool.name for tool in tools if hasattr(tool, "name")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restricted", [False, True])
+async def test_command_path_policy_is_projected_from_execution_scope(
+    tmp_path, restricted
+):
+    config = ToolConfig(
+        {
+            "workspace": {
+                "task_id": "42",
+                "base_dir": str(tmp_path),
+            },
+            "tool_credentials": {},
+        }
+    )
+    scope = ExecutionScope(restrict_command_paths=restricted)
+    config.get_execution_scope = lambda: scope
+
+    tools = await create_basic_tools(config)
+
+    command_tool = next(
+        tool for tool in tools if isinstance(tool, CommandExecutorToolForBasic)
+    )
+    assert command_tool._restrict_paths is restricted
 
 
 @pytest.mark.asyncio

@@ -15,6 +15,9 @@ from tests.core.tools.adapters.sandboxed_tool.conftest import (
     FakeBaseTool,
 )
 from xagent.core.tools.adapters.vibe.base import AbstractBaseTool
+from xagent.core.tools.adapters.vibe.command_executor import (
+    CommandExecutorToolForBasic,
+)
 from xagent.core.tools.adapters.vibe.function import FunctionTool
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
     sandbox_config,
@@ -129,6 +132,29 @@ class TestExtractInitParams:
         tool = _FakeToolNoParams()
         params = _extract_init_params(tool)
         assert params == {}
+
+    def test_command_path_guard_configuration_survives_sandbox_serialization(
+        self, tmp_path
+    ):
+        """The sandboxed command tool must retain the External-task policy."""
+        workspace = TaskWorkspace(id="test-command", base_dir=str(tmp_path))
+        tool = CommandExecutorToolForBasic(
+            workspace=workspace,
+            restrict_paths=True,
+        )
+
+        params = _extract_init_params(tool)
+        assert params == {
+            "workspace": workspace,
+            "restrict_paths": True,
+        }
+
+        restored = cloudpickle.loads(base64.b64decode(_serialize_init_params(params)))
+        assert restored["workspace"].id == workspace.id
+        assert restored["restrict_paths"] is True
+
+        wrapper = SandboxedToolWrapper(tool, _make_sandbox())
+        assert "bashlex>=0.18" in wrapper._requirements
 
 
 class TestSerializeInitParams:

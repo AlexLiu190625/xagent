@@ -72,6 +72,7 @@ dependencies = [
   "filelock>=3.0.0",
   "fsspec>=2024.0.0",
   "cloudpickle>=3.0.0",
+  "bashlex>=0.18",
   "exa-py>=2.0.0",
   # Data science libraries (core for RAG and analysis)
   "pandas>=1.3.0",
