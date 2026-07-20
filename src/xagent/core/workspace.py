@@ -771,19 +771,26 @@ class TaskWorkspace:
         """
         path = Path(file_path).expanduser()
         candidate = path if path.is_absolute() else Path(base_dir) / path
-        abs_path = candidate.resolve()
-        workspace_abs = self.workspace_dir.resolve()
+        try:
+            abs_path = candidate.resolve()
+            workspace_abs = self.workspace_dir.resolve()
+            allowed_external_abs = (
+                [allowed_dir.resolve() for allowed_dir in self.allowed_external_dirs]
+                if include_external_dirs
+                else []
+            )
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"Failed to resolve path {file_path}") from exc
+
         if abs_path == workspace_abs or abs_path.is_relative_to(workspace_abs):
             return abs_path
 
-        if include_external_dirs:
-            for allowed_dir in self.allowed_external_dirs:
-                allowed_abs = allowed_dir.resolve()
-                if abs_path == allowed_abs or abs_path.is_relative_to(allowed_abs):
-                    logger.debug(
-                        f"Accessing external file via allowed directory: {abs_path}"
-                    )
-                    return abs_path
+        for allowed_abs in allowed_external_abs:
+            if abs_path == allowed_abs or abs_path.is_relative_to(allowed_abs):
+                logger.debug(
+                    f"Accessing external file via allowed directory: {abs_path}"
+                )
+                return abs_path
 
         allowed_dirs_str = ", ".join(
             [str(self.workspace_dir)]

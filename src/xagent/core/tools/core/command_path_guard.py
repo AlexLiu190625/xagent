@@ -10,8 +10,9 @@ from __future__ import annotations
 import logging
 import os
 import re
+import stat
 from pathlib import Path
-from typing import Any, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Sequence, cast
 
 import bashlex
 
@@ -20,6 +21,7 @@ from ...workspace import TaskWorkspace
 logger = logging.getLogger(__name__)
 
 PathAccess = Literal["read", "write"]
+_MAX_INSPECTED_SCRIPT_BYTES = 1024 * 1024
 
 _READ_COMMANDS = {
     "cat",
@@ -69,9 +71,15 @@ class CommandPathViolation(ValueError):
 class WorkspaceCommandPathGuard:
     """Validate common shell file operands against one task workspace."""
 
-    def __init__(self, workspace: TaskWorkspace) -> None:
+    def __init__(
+        self,
+        workspace: TaskWorkspace,
+        *,
+        _path_access_observer: Callable[[str, PathAccess], None] | None = None,
+    ) -> None:
         self._workspace = workspace
         self._initial_cwd = workspace.resolve_path("").resolve()
+        self._path_access_observer = _path_access_observer
 
     @staticmethod
     def _parse_shell(command: str) -> list[Any] | None:
@@ -628,12 +636,33 @@ class WorkspaceCommandPathGuard:
         cwd: Path,
     ) -> None:
         script_path = self._check_path(raw_path, cwd, "read")
+        if self._path_access_observer is not None:
+            return
+
+        descriptor: int | None = None
         try:
-            script = script_path.read_text(encoding="utf-8")
-        except OSError as exc:
+            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            descriptor = os.open(script_path, flags)
+            with os.fdopen(descriptor, "rb") as script_file:
+                descriptor = None
+                metadata = os.fstat(script_file.fileno())
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
+                ):
+                    raise CommandPathViolation(access="read", path=script_path)
+                raw_script = script_file.read(_MAX_INSPECTED_SCRIPT_BYTES + 1)
+            if len(raw_script) > _MAX_INSPECTED_SCRIPT_BYTES:
+                raise CommandPathViolation(access="read", path=script_path)
+            script = raw_script.decode("utf-8")
+        except (OSError, UnicodeError) as exc:
             # A missing script may be created earlier in the same shell string;
             # skipping inspection would allow its embedded file I/O unchecked.
             raise CommandPathViolation(access="read", path=script_path) from exc
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         self._reject_embedded_io(language, script)
 
     @staticmethod
@@ -744,7 +773,10 @@ class WorkspaceCommandPathGuard:
         access: PathAccess = (
             "write"
             if "-delete" in expression
-            or any(self._find_exec_command_writes(command) for command in exec_commands)
+            or any(
+                self._find_exec_command_writes(command, cwd)
+                for command in exec_commands
+            )
             else "read"
         )
         for root in roots:
@@ -773,17 +805,32 @@ class WorkspaceCommandPathGuard:
             index += 1
         return commands
 
-    @staticmethod
-    def _find_exec_command_writes(command: Sequence[str]) -> bool:
+    def _find_exec_command_writes(
+        self,
+        command: Sequence[str],
+        cwd: Path,
+    ) -> bool:
         if not command:
             return False
-        nested_name = os.path.basename(command[0])
-        if nested_name in _WRITE_COMMANDS | {"mv", "ln"}:
-            return True
-        return (
-            nested_name == "sed"
-            and WorkspaceCommandPathGuard._sed_requests_in_place(command[1:])
+
+        writes_placeholder = False
+
+        def observe_path(raw_path: str, access: PathAccess) -> None:
+            nonlocal writes_placeholder
+            if access == "write" and "{}" in raw_path:
+                writes_placeholder = True
+
+        probe = WorkspaceCommandPathGuard(
+            self._workspace,
+            _path_access_observer=observe_path,
         )
+        try:
+            probe._validate_nested_command_words(command, cwd)
+        except CommandPathViolation:
+            # The regular validation pass reports statically unsafe embedded
+            # programs. This probe only classifies placeholder path access.
+            pass
+        return writes_placeholder
 
     def _check_nested_shell(self, literals: Sequence[str], cwd: Path) -> None:
         for index, value in enumerate(literals[:-1]):
@@ -930,22 +977,25 @@ class WorkspaceCommandPathGuard:
         return operands
 
     def _check_path(self, raw_path: str, cwd: Path, access: PathAccess) -> Path:
+        if self._path_access_observer is not None:
+            self._path_access_observer(raw_path, access)
+            return cwd
+
         if raw_path in {"", "-", "{}"}:
             return cwd
 
         candidate = Path(raw_path).expanduser()
         if not candidate.is_absolute():
             candidate = cwd / candidate
-        resolved = candidate.resolve()
 
-        if resolved in _SAFE_DEVICE_PATHS:
-            return resolved
+        if candidate in _SAFE_DEVICE_PATHS:
+            return candidate
 
         try:
             return self._workspace.resolve_authorized_path(
-                resolved,
+                candidate,
                 base_dir=cwd,
                 include_external_dirs=access == "read",
             )
         except ValueError as exc:
-            raise CommandPathViolation(access=access, path=resolved) from exc
+            raise CommandPathViolation(access=access, path=candidate) from exc

@@ -19,7 +19,10 @@ from xagent.core.tools.core.command_executor import (
     execute_command,
     execute_script,
 )
-from xagent.core.tools.core.command_path_guard import WorkspaceCommandPathGuard
+from xagent.core.tools.core.command_path_guard import (
+    CommandPathViolation,
+    WorkspaceCommandPathGuard,
+)
 from xagent.core.workspace import TaskWorkspace
 
 
@@ -563,6 +566,94 @@ class TestScopedCommandPathGuard:
         assert result["return_code"] == 126
         assert not (workspace.output_dir / script_name).exists()
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    @pytest.mark.parametrize("kind", ["device", "fifo"])
+    def test_script_inspection_rejects_non_regular_files_without_reading(
+        self, scoped_command_workspace, monkeypatch, kind
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script_path = workspace.output_dir / "script.sed"
+        if kind == "device":
+            script_path = type(script_path)("/dev/null")
+            if not script_path.exists():
+                pytest.skip("/dev/null is unavailable")
+        else:
+            os.mkfifo(script_path)
+
+        read_paths = []
+
+        def record_read(path, *args, **kwargs):
+            read_paths.append(path)
+            return ""
+
+        monkeypatch.setattr(type(script_path), "read_text", record_read)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard._inspect_script_file("sed", str(script_path), workspace.output_dir)
+
+        assert read_paths == []
+
+    def test_script_inspection_rejects_oversized_regular_file(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script_path = workspace.output_dir / "large.sed"
+        script_path.write_bytes(b"#" * (1024 * 1024 + 1))
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard._inspect_script_file("sed", str(script_path), workspace.output_dir)
+
+    @pytest.mark.parametrize(
+        "nested_command",
+        [
+            "cp own.txt {}",
+            "cp --target-directory={} own.txt",
+            "sort -o {} own.txt",
+            "uniq own.txt {}",
+            "diff --output={} own.txt own.txt",
+            "sh -c 'printf changed > {}'",
+        ],
+    )
+    def test_find_exec_placeholder_write_requires_writable_root(
+        self, scoped_command_workspace, nested_command
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        command = (
+            f"find {shlex.quote(str(external_file.parent))} "
+            f"-type f -exec {nested_command} \\;"
+        )
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command)
+
+        assert exc_info.value.access == "write"
+
+    def test_find_exec_read_placeholder_keeps_read_only_root_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"find {shlex.quote(str(external_file.parent))} "
+            "-type f -exec cp {} copy.txt \\;"
+        )
+
+    def test_path_resolution_failure_returns_policy_rejection(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        loop = workspace.output_dir / "loop"
+        loop.symlink_to("loop")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": "cat loop"})
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
 
     def test_rejects_bare_cd_before_relative_file_access(
         self, scoped_command_workspace, monkeypatch

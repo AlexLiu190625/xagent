@@ -9,6 +9,8 @@ independent implementations (``TaskWorkspace`` and ``WorkspaceFileOperations``,
 which do not delegate to one another).
 """
 
+from pathlib import Path
+
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
@@ -286,6 +288,27 @@ def test_resolve_authorized_path_can_exclude_external_write_roots(tmp_path):
             external / "reference.txt",
             base_dir=workspace.output_dir,
             include_external_dirs=False,
+        )
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_resolve_authorized_path_normalizes_resolution_failures(
+    workspace, monkeypatch, error_type
+):
+    candidate = workspace.output_dir / "unresolvable"
+    original_resolve = Path.resolve
+
+    def fail_candidate(path, *args, **kwargs):
+        if path == candidate:
+            raise error_type("resolution failed")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_candidate)
+
+    with pytest.raises(ValueError, match="Failed to resolve path"):
+        workspace.resolve_authorized_path(
+            candidate,
+            base_dir=workspace.output_dir,
         )
 
 
