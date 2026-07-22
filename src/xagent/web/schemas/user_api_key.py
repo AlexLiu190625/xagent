@@ -1,7 +1,7 @@
 """Schemas for user personal SDK management keys."""
 
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -40,7 +40,11 @@ class PersonalAPIKeyOwner(BaseModel):
     email: Optional[str] = None
 
 
+PersonalAPIKeyStatus = Literal["active", "expired", "revoked"]
+
+
 class PersonalAPIKeyListItem(PersonalAPIKeyMetadata):
+    status: PersonalAPIKeyStatus
     owner: PersonalAPIKeyOwner
 
 

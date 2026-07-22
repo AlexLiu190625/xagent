@@ -1,6 +1,7 @@
 import React from "react"
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { PersonalApiKeyListResponse } from "@/lib/personal-api-keys-api"
 
 const createPersonalApiKeyMock = vi.hoisted(() => vi.fn())
 const listPersonalApiKeysMock = vi.hoisted(() => vi.fn())
@@ -13,7 +14,13 @@ const translateMock = vi.hoisted(() => vi.fn((key: string, vars?: Record<string,
     "personalApiKeys.actions.revoke": "Revoke",
     "personalApiKeys.actions.copy": "Copy personal API key",
     "personalApiKeys.columns.key": "Secret Key",
+    "personalApiKeys.columns.status": "Status",
+    "personalApiKeys.columns.expires": "Expiry",
     "personalApiKeys.columns.created": "Created",
+    "personalApiKeys.status.active": "Active",
+    "personalApiKeys.status.expired": "Expired",
+    "personalApiKeys.status.revoked": "Revoked",
+    "personalApiKeys.neverExpires": "Never",
     "personalApiKeys.reveal.title": "Personal API Key Created",
     "personalApiKeys.reveal.warning": "Copy this key now — it is shown only once.",
     "personalApiKeys.confirm.revokeTitle": "Revoke personal API key?",
@@ -77,12 +84,13 @@ function PersonalKeysTabsHarness() {
   )
 }
 
-function listResponse(canManageOthers: boolean) {
+function listResponse(canManageOthers: boolean): PersonalApiKeyListResponse {
   const items = [
     {
       id: 1,
       key_prefix: "self123",
       masked_key: "xag_personal_self123_••••••••",
+      status: "active" as const,
       revoked_at: null as string | null,
       expires_at: null,
       created_at: "2026-07-22T00:00:00Z",
@@ -95,6 +103,7 @@ function listResponse(canManageOthers: boolean) {
       id: 2,
       key_prefix: "other456",
       masked_key: "xag_personal_other456_••••••••",
+      status: "active" as const,
       revoked_at: null,
       expires_at: null,
       created_at: "2026-07-22T00:00:00Z",
@@ -186,6 +195,7 @@ describe("PersonalApiKeysPanel", () => {
       id: 3,
       key_prefix: "new789",
       masked_key: "xag_personal_new789_••••••••",
+      status: "active",
       revoked_at: null,
       expires_at: null,
       created_at: "2026-07-22T00:00:00Z",
@@ -222,6 +232,7 @@ describe("PersonalApiKeysPanel", () => {
       id: 4,
       key_prefix: "revoked",
       masked_key: "xag_personal_revoked_••••••••",
+      status: "revoked",
       revoked_at: "2026-07-22T00:00:00Z",
       expires_at: null,
       created_at: "2026-07-22T00:00:00Z",
@@ -233,6 +244,50 @@ describe("PersonalApiKeysPanel", () => {
 
     const revokedRow = (await screen.findByText("xag_personal_revoked_••••••••")).closest("tr")
     expect(revokedRow).not.toBeNull()
+    expect(within(revokedRow!).queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument()
+  })
+
+  it("renders lifecycle status and expiry and only offers Revoke for active keys", async () => {
+    const response = listResponse(false)
+    const expiry = "2030-01-02T03:04:05Z"
+    response.items[0].expires_at = expiry
+    response.items.push(
+      {
+        id: 6,
+        key_prefix: "expired",
+        masked_key: "xag_personal_expired_••••••••",
+        status: "expired",
+        revoked_at: null,
+        expires_at: "2020-01-02T03:04:05Z",
+        created_at: "2020-01-01T00:00:00Z",
+        owner: { id: 1, username: "alice", email: "alice@example.com" },
+      },
+      {
+        id: 7,
+        key_prefix: "revoked-expired",
+        masked_key: "xag_personal_revoked-expired_••••••••",
+        status: "revoked",
+        revoked_at: "2020-01-03T00:00:00Z",
+        expires_at: "2020-01-02T03:04:05Z",
+        created_at: "2020-01-01T00:00:00Z",
+        owner: { id: 1, username: "alice", email: "alice@example.com" },
+      },
+    )
+    listPersonalApiKeysMock.mockResolvedValue(response)
+
+    render(<PersonalApiKeysPanel />)
+
+    const activeRow = (await screen.findByText("xag_personal_self123_••••••••")).closest("tr")
+    const expiredRow = screen.getByText("xag_personal_expired_••••••••").closest("tr")
+    const revokedRow = screen.getByText("xag_personal_revoked-expired_••••••••").closest("tr")
+    expect(screen.getByText("Status")).toBeInTheDocument()
+    expect(screen.getByText("Expiry")).toBeInTheDocument()
+    expect(within(activeRow!).getByText("Active")).toBeInTheDocument()
+    expect(within(activeRow!).getByText(new Date(expiry).toLocaleDateString())).toBeInTheDocument()
+    expect(within(activeRow!).getByRole("button", { name: "Revoke" })).toBeInTheDocument()
+    expect(within(expiredRow!).getByText("Expired")).toBeInTheDocument()
+    expect(within(expiredRow!).queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument()
+    expect(within(revokedRow!).getByText("Revoked")).toBeInTheDocument()
     expect(within(revokedRow!).queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument()
   })
 

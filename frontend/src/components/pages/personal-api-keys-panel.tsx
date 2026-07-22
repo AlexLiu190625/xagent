@@ -25,6 +25,17 @@ import {
   revokePersonalApiKey,
 } from "@/lib/personal-api-keys-api"
 
+function statusPillClass(status: PersonalApiKeyListItem["status"]): string {
+  switch (status) {
+    case "active":
+      return "bg-green-100 text-green-700 dark:bg-green-900/20 dark:text-green-400"
+    case "expired":
+      return "bg-amber-100 text-amber-700 dark:bg-amber-900/20 dark:text-amber-400"
+    default:
+      return "bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-400"
+  }
+}
+
 export function PersonalApiKeysPanel() {
   const { t } = useI18n()
   const [keys, setKeys] = useState<PersonalApiKeyListItem[]>([])
@@ -138,6 +149,12 @@ export function PersonalApiKeysPanel() {
                   </TableHead>
                 )}
                 <TableHead className="text-xs font-semibold text-muted-foreground">
+                  {t("personalApiKeys.columns.status") || "Status"}
+                </TableHead>
+                <TableHead className="text-xs font-semibold text-muted-foreground">
+                  {t("personalApiKeys.columns.expires") || "Expiry"}
+                </TableHead>
+                <TableHead className="text-xs font-semibold text-muted-foreground">
                   {t("personalApiKeys.columns.created") || "Created"}
                 </TableHead>
                 <TableHead className="w-[100px]" />
@@ -145,14 +162,26 @@ export function PersonalApiKeysPanel() {
             </TableHeader>
             <TableBody>
               {keys.map((key) => (
-                <TableRow key={key.id} className={key.revoked_at ? "opacity-50" : ""}>
+                <TableRow key={key.id} className={key.status === "active" ? "" : "opacity-50"}>
                   <TableCell className="font-mono text-xs text-muted-foreground">
                     {key.masked_key}
                   </TableCell>
                   {canManageOthers && <TableCell className="text-sm">{key.owner.username}</TableCell>}
+                  <TableCell>
+                    <span
+                      className={`inline-flex text-[11px] px-2 py-0.5 rounded-full capitalize font-medium ${statusPillClass(key.status)}`}
+                    >
+                      {t(`personalApiKeys.status.${key.status}`) || key.status}
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-sm text-muted-foreground">
+                    {key.expires_at
+                      ? formatDate(key.expires_at)
+                      : t("personalApiKeys.neverExpires") || "Never"}
+                  </TableCell>
                   <TableCell className="text-sm text-muted-foreground">{formatDate(key.created_at)}</TableCell>
                   <TableCell className="text-right">
-                    {!key.revoked_at && <Button
+                    {key.status === "active" && <Button
                       variant="ghost"
                       size="icon"
                       className="h-8 w-8 text-destructive hover:text-destructive"
@@ -167,7 +196,7 @@ export function PersonalApiKeysPanel() {
               ))}
               {keys.length === 0 && !loading && (
                 <TableRow>
-                  <TableCell colSpan={canManageOthers ? 4 : 3} className="text-center text-muted-foreground h-32">
+                  <TableCell colSpan={canManageOthers ? 6 : 5} className="text-center text-muted-foreground h-32">
                     {t("personalApiKeys.noData") || "No personal API keys yet."}
                   </TableCell>
                 </TableRow>

@@ -3531,8 +3531,16 @@ Build when you need.`,
     columns: {
       key: "Secret Key",
       owner: "Owner",
+      status: "Status",
+      expires: "Expiry",
       created: "Created"
     },
+    status: {
+      active: "Active",
+      expired: "Expired",
+      revoked: "Revoked"
+    },
+    neverExpires: "Never",
     actions: {
       copy: "Copy personal API key",
       revoke: "Revoke"

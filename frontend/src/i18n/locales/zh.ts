@@ -3531,8 +3531,16 @@ const zh = {
     columns: {
       key: "密钥",
       owner: "所有者",
+      status: "状态",
+      expires: "过期时间",
       created: "创建时间"
     },
+    status: {
+      active: "有效",
+      expired: "已过期",
+      revoked: "已撤销"
+    },
+    neverExpires: "永不过期",
     actions: {
       copy: "复制个人 API 密钥",
       revoke: "撤销"

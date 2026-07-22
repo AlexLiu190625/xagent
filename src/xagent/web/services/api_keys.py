@@ -28,7 +28,9 @@ from ..schemas.user_api_key import (
     PersonalAPIKeyOwner,
     PersonalAPIKeyMetadata,
     PersonalAPIKeyRevokeResponse,
+    PersonalAPIKeyStatus,
 )
+from ..utils.db_timezone import normalize_datetime_from_db
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .personal_key_scope import PersonalKeyAccessScope
 
@@ -474,6 +476,17 @@ class PersonalApiKeyManagementService:
     def __init__(self, db: Session) -> None:
         self.db = db
 
+    @staticmethod
+    def _status(row: UserApiKey, now: datetime) -> PersonalAPIKeyStatus:
+        if row.revoked_at is not None:
+            return "revoked"
+        if (
+            row.expires_at is not None
+            and normalize_datetime_from_db(row.expires_at) <= now
+        ):
+            return "expired"
+        return "active"
+
     def list_keys(self, scope: PersonalKeyAccessScope) -> list[PersonalAPIKeyListItem]:
         rows = (
             self.db.query(UserApiKey, User)
@@ -482,6 +495,7 @@ class PersonalApiKeyManagementService:
             .order_by(UserApiKey.created_at.desc(), UserApiKey.id.desc())
             .all()
         )
+        now = datetime.now(timezone.utc)
         return [
             PersonalAPIKeyListItem(
                 id=int(row.id),
@@ -490,6 +504,7 @@ class PersonalApiKeyManagementService:
                 revoked_at=row.revoked_at,
                 expires_at=row.expires_at,
                 created_at=row.created_at,
+                status=self._status(row, now),
                 owner=PersonalAPIKeyOwner(
                     id=int(owner.id), username=owner.username, email=owner.email
                 ),

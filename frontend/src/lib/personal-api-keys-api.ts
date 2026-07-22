@@ -11,6 +11,7 @@ export interface PersonalApiKeyListItem {
   id: number
   key_prefix: string
   masked_key: string
+  status: "active" | "expired" | "revoked"
   revoked_at: string | null
   expires_at: string | null
   created_at: string
