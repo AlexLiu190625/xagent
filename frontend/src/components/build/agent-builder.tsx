@@ -8,7 +8,7 @@ import { Textarea } from "@/components/ui/textarea"
 import { Button } from "@/components/ui/button"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, isJsonRecord } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
 import { isBuiltinModel, hostnameFromUrl } from "@/lib/models"
 import { PlusCircle, MessageSquare, Upload, Settings2, Check, Zap, BookOpen, Gauge, Sparkles, Loader2, X, XCircle, Trash2, Bot, Brain, Webhook, CalendarClock, Mail, Eye, Workflow, AlertCircle, Copy } from "lucide-react"
@@ -1443,8 +1443,26 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
           // But for the dialog purpose, we have what we need.
         }
       } else {
-        const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.unknown"))
+        const error: unknown = await response.json().catch(() => null)
+        const fallback = t("builds.editor.error.unknown")
+        let message = fallback
+
+        if (isJsonRecord(error)) {
+          const detail = error.detail
+          if (typeof detail === "string" && detail.trim()) {
+            message = detail
+          } else if (
+            isJsonRecord(detail) &&
+            typeof detail.message === "string" &&
+            detail.message.trim()
+          ) {
+            message = detail.message
+          } else if (typeof error.message === "string" && error.message.trim()) {
+            message = error.message
+          }
+        }
+
+        toast.error(message)
       }
     } catch (error) {
       console.error("Failed to save agent:", error)
