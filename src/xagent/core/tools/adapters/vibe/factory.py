@@ -283,6 +283,26 @@ class ToolFactory:
     async def create_all_tools(
         config: BaseToolConfig, apply_user_override_filter: bool = True
     ) -> List[Tool]:
+        """Create tools within the config's optional prepared-runtime boundary."""
+        prepare_factory_runtime = getattr(type(config), "prepare_factory_runtime", None)
+        release_factory_runtime = getattr(
+            type(config), "release_prepared_factory_runtime", None
+        )
+        if callable(prepare_factory_runtime):
+            await prepare_factory_runtime(config)
+        try:
+            return await ToolFactory._create_all_tools_prepared(
+                config,
+                apply_user_override_filter=apply_user_override_filter,
+            )
+        finally:
+            if callable(release_factory_runtime):
+                release_factory_runtime(config)
+
+    @staticmethod
+    async def _create_all_tools_prepared(
+        config: BaseToolConfig, apply_user_override_filter: bool = True
+    ) -> List[Tool]:
         """
         Create all tools based on configuration.
 

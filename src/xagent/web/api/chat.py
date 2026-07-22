@@ -495,7 +495,7 @@ def _int_id_or_none(value: Any) -> Optional[int]:
 
 
 async def create_default_tools(
-    db: Session,
+    db: Optional[Session],
     request: Any = None,
     user: Optional[User] = None,
     task_id: Optional[str] = None,
@@ -536,6 +536,12 @@ async def create_default_tools(
     # Create a WebToolConfig to properly initialize tools
     from ..tools.config import WebToolConfig
 
+    db_factory = None
+    if db is None:
+        from ..models.database import get_session_local
+
+        db_factory = get_session_local()
+
     owner_id = (
         int(workspace_owner_id) if workspace_owner_id is not None else int(user.id)
     )
@@ -548,6 +554,7 @@ async def create_default_tools(
     tool_config = WebToolConfig(
         db=db,
         request=request,
+        db_factory=db_factory,
         user=user,
         llm=llm,
         user_id=int(user.id),
