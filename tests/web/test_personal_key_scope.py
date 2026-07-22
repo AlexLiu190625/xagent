@@ -48,3 +48,29 @@ def test_non_manager_hook_cannot_expose_other_owners():
     scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
 
     assert scope == PersonalKeyAccessScope(owner_user_ids=(17,), can_manage_others=False)
+
+
+@pytest.mark.parametrize(
+    ("owner_user_ids", "can_manage_others"),
+    [
+        ((29,), 1),
+        ((29,), "yes"),
+        ([29], True),
+        ((True,), True),
+        (("29",), True),
+        ((29.0,), True),
+        ((0,), True),
+        ((-29,), True),
+    ],
+)
+def test_malformed_hook_scope_fails_closed(owner_user_ids, can_manage_others):
+    set_personal_key_scope_hook(
+        lambda _db, _actor: PersonalKeyAccessScope(
+            owner_user_ids=owner_user_ids,
+            can_manage_others=can_manage_others,
+        )
+    )
+
+    scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
+
+    assert scope == PersonalKeyAccessScope(owner_user_ids=(17,), can_manage_others=False)

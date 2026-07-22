@@ -510,4 +510,7 @@ class PersonalApiKeyManagementService:
         )
         if row is None:
             return None
-        return UserApiKeyService(self.db).revoke_key(int(row.user_id), key_id)
+        result = UserApiKeyService(self.db).revoke_key(int(row.user_id), key_id)
+        if not result.revoked and result.revoked_at is None:
+            return None
+        return result

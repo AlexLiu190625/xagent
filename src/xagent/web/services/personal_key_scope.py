@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 
 @dataclass(frozen=True)
@@ -26,20 +26,28 @@ def set_personal_key_scope_hook(hook: Any) -> None:
 def get_personal_key_access_scope(db: Any, actor: Any) -> PersonalKeyAccessScope:
     """Resolve a fail-closed scope, always retaining the actor's own keys."""
     actor_id = int(actor.id)
+    self_scope = PersonalKeyAccessScope((actor_id,), False)
     if _personal_key_scope_hook is None:
-        return PersonalKeyAccessScope((actor_id,), False)
+        return self_scope
 
     try:
-        proposed = cast(PersonalKeyAccessScope, _personal_key_scope_hook(db, actor))
+        proposed = _personal_key_scope_hook(db, actor)
         if not isinstance(proposed, PersonalKeyAccessScope):
-            raise TypeError("Personal key scope hook returned an invalid value")
+            return self_scope
+        if type(proposed.can_manage_others) is not bool:
+            return self_scope
+        if type(proposed.owner_user_ids) is not tuple:
+            return self_scope
+        if any(
+            type(owner_id) is not int or owner_id <= 0
+            for owner_id in proposed.owner_user_ids
+        ):
+            return self_scope
         if not proposed.can_manage_others:
-            return PersonalKeyAccessScope((actor_id,), False)
+            return self_scope
         owner_ids = tuple(
-            dict.fromkeys(
-                (actor_id, *(int(owner_id) for owner_id in proposed.owner_user_ids))
-            )
+            dict.fromkeys((actor_id, *proposed.owner_user_ids))
         )
         return PersonalKeyAccessScope(owner_ids, True)
     except (AttributeError, TypeError, ValueError):
-        return PersonalKeyAccessScope((actor_id,), False)
+        return self_scope

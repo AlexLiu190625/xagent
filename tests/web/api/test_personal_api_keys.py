@@ -3,6 +3,8 @@
 import pytest
 
 from xagent.web.models.user import User
+from xagent.web.schemas.user_api_key import PersonalAPIKeyRevokeResponse
+from xagent.web.services.api_keys import UserApiKeyService
 from xagent.web.services.personal_key_scope import (
     PersonalKeyAccessScope,
     set_personal_key_scope_hook,
@@ -43,6 +45,8 @@ def _user_id(username: str) -> int:
 def test_list_returns_only_self_keys_without_disclosing_one_time_secrets():
     headers = _admin_headers()
     created = _create_personal_key(headers)
+    bob_headers = _register_second_user()
+    bobs_key = _create_personal_key(bob_headers)
 
     response = client.get("/api/personal-api-keys", headers=headers)
 
@@ -58,6 +62,7 @@ def test_list_returns_only_self_keys_without_disclosing_one_time_secrets():
     }
     assert created["full_key"] not in response.text
     assert "full_key" not in item
+    assert all(item["id"] != bobs_key["id"] for item in body["items"])
 
 
 def test_default_scope_returns_404_for_another_owners_key():
@@ -108,6 +113,23 @@ def test_authorized_scope_lists_and_revokes_other_owner_keys_idempotently():
         "revoked": False,
         "revoked_at": first_revoke.json()["revoked_at"],
     }
+
+
+def test_key_disappearing_after_scope_lookup_returns_404(monkeypatch):
+    headers = _admin_headers()
+    created = _create_personal_key(headers)
+
+    def _missing_lifecycle_row(_service, _user_id, _key_id):
+        return PersonalAPIKeyRevokeResponse(revoked=False, revoked_at=None)
+
+    monkeypatch.setattr(UserApiKeyService, "revoke_key", _missing_lifecycle_row)
+
+    response = client.delete(
+        f"/api/personal-api-keys/{created['id']}", headers=headers
+    )
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Personal API key not found"}
 
 
 def test_legacy_personal_key_creation_contract_is_unchanged():
