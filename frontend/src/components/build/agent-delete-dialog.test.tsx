@@ -110,6 +110,38 @@ describe("AgentDeleteDialog", () => {
     expect(onDiscardWorkforce).toHaveBeenCalledWith(conflict.references[0])
   })
 
+  it("survives translation extensions wrapping text nodes when the spinner toggles", () => {
+    const props = {
+      target: { id: 42, name: "Research Agent" },
+      conflict,
+      onOpenChange: vi.fn(),
+      onConfirmDelete: vi.fn(),
+      onDiscardWorkforce: vi.fn(),
+    }
+    const { rerender } = render(
+      <AgentDeleteDialog {...props} pendingAction={null} />,
+    )
+
+    // Browser translation extensions (Chrome auto-translate, immersive
+    // translate, ...) replace bare text nodes with <font> wrappers. React's
+    // insertBefore then fails if a conditional sibling (the Loader2 spinner)
+    // is anchored on a bare text node.
+    const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT)
+    const textNodes: Text[] = []
+    while (walker.nextNode()) textNodes.push(walker.currentNode as Text)
+    for (const textNode of textNodes) {
+      const font = document.createElement("font")
+      textNode.parentNode?.insertBefore(font, textNode)
+      font.appendChild(textNode)
+    }
+
+    expect(() =>
+      rerender(
+        <AgentDeleteDialog {...props} pendingAction={{ kind: "delete" }} />,
+      ),
+    ).not.toThrow()
+  })
+
   it("keeps explicit retry available after the visible blockers are cleared", () => {
     const onConfirmDelete = vi.fn()
     render(

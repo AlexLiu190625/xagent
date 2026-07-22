@@ -218,6 +218,11 @@ export default function BuildsPage() {
             ? { ...current, conflict: result.conflict }
             : current,
         )
+        toast.error(
+          t("builds.list.deleteDialog.blockedToast", {
+            name: session.target.name,
+          }),
+        )
         return
       }
 

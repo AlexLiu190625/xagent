@@ -2291,6 +2291,7 @@ const zh = {
         confirm: "删除 Agent",
         blockedTitle: "Agent 正被 Workforce 使用",
         blockedDescription: "删除“{name}”前，需要先移除所有 Workforce 引用。",
+        blockedToast: "无法删除“{name}”：仍有 Workforce 正在使用该 Agent。",
         referencesLabel: "正在使用此 Agent 的 Workforce",
         hiddenReferences: "还有其他无法显示的 Workforce 正在使用此 Agent。请联系工作区管理员移除这些引用。",
         readyToRetry: "可见的阻塞项已清除。请重试删除，以确认没有剩余引用。",

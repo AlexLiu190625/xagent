@@ -2,7 +2,14 @@
 
 import React, { useEffect, useState } from "react"
 import Link from "next/link"
-import { ExternalLink, Loader2 } from "lucide-react"
+import {
+  AlertTriangle,
+  CheckCircle2,
+  ExternalLink,
+  Info,
+  Loader2,
+  Trash2,
+} from "lucide-react"
 
 import { WorkforceStatusBadge } from "@/components/workforce"
 import {
@@ -18,6 +25,7 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { useI18n } from "@/contexts/i18n-context"
+import { cn } from "@/lib/utils"
 import type {
   AgentDeleteConflictDetail,
   AgentDeleteWorkforceReference,
@@ -67,14 +75,30 @@ export function AgentDeleteDialog({
   return (
     <AlertDialog open={target !== null} onOpenChange={handleOpenChange}>
       <AlertDialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-2xl">
-        <AlertDialogHeader>
-          <AlertDialogTitle>
-            {t(
-              conflict
-                ? "builds.list.deleteDialog.blockedTitle"
-                : "builds.list.deleteDialog.title",
-            )}
-          </AlertDialogTitle>
+        <AlertDialogHeader className="space-y-3">
+          <div className="flex flex-col items-center gap-3 sm:flex-row">
+            <div
+              className={cn(
+                "flex h-10 w-10 shrink-0 items-center justify-center rounded-full",
+                conflict
+                  ? "bg-amber-500/15 text-amber-600 dark:text-amber-400"
+                  : "bg-destructive/10 text-destructive",
+              )}
+            >
+              {conflict ? (
+                <AlertTriangle className="h-5 w-5" aria-hidden="true" />
+              ) : (
+                <Trash2 className="h-5 w-5" aria-hidden="true" />
+              )}
+            </div>
+            <AlertDialogTitle>
+              {t(
+                conflict
+                  ? "builds.list.deleteDialog.blockedTitle"
+                  : "builds.list.deleteDialog.title",
+              )}
+            </AlertDialogTitle>
+          </div>
           <AlertDialogDescription asChild>
             <div className="space-y-4 text-left">
               <p>
@@ -102,12 +126,21 @@ export function AgentDeleteDialog({
                         return (
                           <li
                             key={reference.workforce_id}
-                            className="space-y-3 rounded-md border p-3"
+                            className="overflow-hidden rounded-lg border shadow-sm"
                           >
-                            <div className="flex flex-wrap items-center gap-2">
-                              <span className="font-medium text-foreground">
+                            <div className="flex flex-wrap items-center gap-2 p-4">
+                              <Link
+                                href={`/workforces/${reference.workforce_id}`}
+                                target="_blank"
+                                rel="noreferrer"
+                                aria-label={t("builds.list.deleteDialog.openWorkforce", {
+                                  name: reference.name,
+                                })}
+                                className="inline-flex items-center gap-1 font-semibold text-primary hover:underline"
+                              >
                                 {reference.name}
-                              </span>
+                                <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                              </Link>
                               <WorkforceStatusBadge status={reference.status} />
                               {reference.roles.map((role) => (
                                 <Badge key={role} variant="outline">
@@ -121,21 +154,8 @@ export function AgentDeleteDialog({
                               ) : null}
                             </div>
 
-                            <div className="flex flex-wrap gap-2">
-                              <Button variant="outline" size="sm" asChild>
-                                <Link
-                                  href={`/workforces/${reference.workforce_id}`}
-                                  target="_blank"
-                                  rel="noreferrer"
-                                >
-                                  {t("builds.list.deleteDialog.openWorkforce", {
-                                    name: reference.name,
-                                  })}
-                                  <ExternalLink aria-hidden="true" />
-                                </Link>
-                              </Button>
-
-                              {reference.can_discard ? (
+                            {reference.can_discard ? (
+                              <div className="flex flex-wrap items-center gap-2 border-t bg-muted/40 px-4 py-2.5">
                                 <Button
                                   type="button"
                                   variant={isConfirmingDiscard ? "destructive" : "outline"}
@@ -152,15 +172,17 @@ export function AgentDeleteDialog({
                                   {isDiscardPending ? (
                                     <Loader2 className="animate-spin" aria-hidden="true" />
                                   ) : null}
-                                  {t(
-                                    isConfirmingDiscard
-                                      ? "builds.list.deleteDialog.confirmDiscardDraft"
-                                      : "builds.list.deleteDialog.discardDraft",
-                                    { name: reference.name },
-                                  )}
+                                  <span>
+                                    {t(
+                                      isConfirmingDiscard
+                                        ? "builds.list.deleteDialog.confirmDiscardDraft"
+                                        : "builds.list.deleteDialog.discardDraft",
+                                      { name: reference.name },
+                                    )}
+                                  </span>
                                 </Button>
-                              ) : null}
-                            </div>
+                              </div>
+                            ) : null}
                           </li>
                         )
                       })}
@@ -168,15 +190,23 @@ export function AgentDeleteDialog({
                   ) : null}
 
                   {conflict.has_hidden_references ? (
-                    <p className="rounded-md bg-muted p-3" role="note">
-                      {t("builds.list.deleteDialog.hiddenReferences")}
+                    <p
+                      className="flex items-start gap-2 rounded-lg border border-amber-500/30 bg-amber-500/10 p-3 text-amber-700 dark:text-amber-400"
+                      role="note"
+                    >
+                      <Info className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                      <span>{t("builds.list.deleteDialog.hiddenReferences")}</span>
                     </p>
                   ) : null}
 
                   {conflict.references.length === 0 &&
                   !conflict.has_hidden_references ? (
-                    <p className="rounded-md bg-muted p-3" aria-live="polite">
-                      {t("builds.list.deleteDialog.readyToRetry")}
+                    <p
+                      className="flex items-start gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3 text-emerald-700 dark:text-emerald-400"
+                      aria-live="polite"
+                    >
+                      <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
+                      <span>{t("builds.list.deleteDialog.readyToRetry")}</span>
                     </p>
                   ) : null}
                 </>
@@ -197,11 +227,13 @@ export function AgentDeleteDialog({
             {pendingAction?.kind === "delete" ? (
               <Loader2 className="animate-spin" aria-hidden="true" />
             ) : null}
-            {t(
-              conflict
-                ? "builds.list.deleteDialog.retryDelete"
-                : "builds.list.deleteDialog.confirm",
-            )}
+            <span>
+              {t(
+                conflict
+                  ? "builds.list.deleteDialog.retryDelete"
+                  : "builds.list.deleteDialog.confirm",
+              )}
+            </span>
           </AlertDialogAction>
         </AlertDialogFooter>
       </AlertDialogContent>
