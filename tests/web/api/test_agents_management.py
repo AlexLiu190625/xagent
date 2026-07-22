@@ -1,5 +1,6 @@
 """Integration tests for agent management endpoints."""
 
+import asyncio
 import io
 import secrets
 from datetime import datetime, timedelta, timezone
@@ -7,9 +8,11 @@ from typing import Any
 
 import pytest
 from jose import jwt as jose_jwt
+from sqlalchemy import event
 from sqlalchemy.exc import IntegrityError
 
 from xagent.config import get_uploads_dir
+from xagent.web.api import agents as agents_api
 from xagent.web.api.widget import (
     EMBED_TICKET_TYPE,
     WIDGET_CREDENTIAL_REQUIRED_DETAIL,
@@ -45,6 +48,16 @@ def _reset_workforce_policy() -> None:
     set_workforce_policy(WorkforcePolicy())
     yield
     set_workforce_policy(WorkforcePolicy())
+
+
+def test_delete_agent_uses_sync_route_boundary() -> None:
+    delete_route = next(
+        route
+        for route in agents_api.router.routes
+        if route.path == "/api/agents/{agent_id}" and "DELETE" in route.methods
+    )
+
+    assert not asyncio.iscoroutinefunction(delete_route.endpoint)
 
 
 def _create_agent(headers: dict[str, str], name: str = "Test Agent") -> int:
@@ -1607,6 +1620,84 @@ class TestDeleteAgent:
         finally:
             db.close()
 
+    def test_reference_snapshot_classifies_policy_visibility_in_one_statement(
+        self,
+    ) -> None:
+        _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Snapshot Target")
+
+        db = _direct_db_session()
+        try:
+            actor = db.query(User).filter(User.id == owner_id).one()
+            visible_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Policy Visible",
+                manager_agent_id=target_id,
+                status="draft",
+            )
+            hidden_workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Policy Hidden",
+                manager_agent_id=target_id,
+                status="draft",
+            )
+            db.add_all([visible_workforce, hidden_workforce])
+            db.commit()
+            visible_workforce_id = int(visible_workforce.id)
+            hidden_workforce_id = int(hidden_workforce.id)
+
+            class NameVisibilityPolicy(WorkforcePolicy):
+                filter_calls = 0
+
+                def filter_visible_workforces(
+                    self,
+                    db: Any,
+                    user: User,
+                    query: Any,
+                ) -> Any:
+                    del db, user
+                    self.filter_calls += 1
+                    return query.filter(Workforce.name == "Policy Visible")
+
+            policy = NameVisibilityPolicy()
+            set_workforce_policy(policy)
+            statements: list[str] = []
+            engine = db.get_bind()
+
+            def record_statement(
+                _connection: Any,
+                _cursor: Any,
+                statement: str,
+                _parameters: Any,
+                _context: Any,
+                _executemany: bool,
+            ) -> None:
+                statements.append(statement)
+
+            event.listen(engine, "before_cursor_execute", record_statement)
+            try:
+                snapshot = AgentManagementService(db)._workforce_reference_snapshot(
+                    actor=actor,
+                    agent_id=target_id,
+                )
+            finally:
+                event.remove(engine, "before_cursor_execute", record_statement)
+
+            snapshot_by_id = {
+                reference.workforce_id: reference for reference in snapshot
+            }
+            assert policy.filter_calls == 1
+            assert len(statements) == 1
+            assert snapshot_by_id[visible_workforce_id].is_visible is True
+            assert snapshot_by_id[hidden_workforce_id].is_visible is False
+        finally:
+            db.close()
+
     def test_workforce_conflict_requires_blocker_evidence(self) -> None:
         with pytest.raises(ValueError, match="blocker evidence"):
             AgentWorkforceConflictError((), has_hidden_references=False)
@@ -1694,10 +1785,10 @@ class TestDeleteAgent:
             }
         ]
 
-    def test_disappearing_worker_reference_never_emits_invalid_conflict(
+    def test_disappearing_worker_reference_is_gone_before_conflict_classification(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _admin_headers()
+        headers = _admin_headers()
         owner_id = _user_id("admin")
         target_id = _create_agent_row(user_id=owner_id, name="Racing Worker")
         manager_id = _create_agent_row(user_id=owner_id, name="Race Manager")
@@ -1729,47 +1820,42 @@ class TestDeleteAgent:
         finally:
             setup_db.close()
 
-        db = _direct_db_session()
-        try:
-            actor = db.query(User).filter(User.id == owner_id).one()
-            service = AgentManagementService(db)
-            original_snapshot = service._workforce_reference_snapshot
+        original_snapshot = AgentManagementService._workforce_reference_snapshot
 
-            def snapshot_then_discard(agent_id: int):
-                snapshot = original_snapshot(agent_id)
-                discard_db = _direct_db_session()
-                try:
-                    discard_actor = (
-                        discard_db.query(User).filter(User.id == owner_id).one()
-                    )
-                    discard_draft_workforce(
-                        discard_db,
-                        discard_actor,
-                        discard_db.get(Workforce, workforce_id),
-                    )
-                finally:
-                    discard_db.close()
-                return snapshot
+        def snapshot_then_discard(
+            service: AgentManagementService,
+            *,
+            actor: User,
+            agent_id: int,
+        ):
+            snapshot = original_snapshot(service, actor=actor, agent_id=agent_id)
+            discard_db = _direct_db_session()
+            try:
+                discard_actor = discard_db.query(User).filter(User.id == owner_id).one()
+                discard_draft_workforce(
+                    discard_db,
+                    discard_actor,
+                    discard_db.get(Workforce, workforce_id),
+                )
+            finally:
+                discard_db.close()
+            return snapshot
 
-            monkeypatch.setattr(
-                service,
-                "_workforce_reference_snapshot",
-                snapshot_then_discard,
-            )
+        monkeypatch.setattr(
+            AgentManagementService,
+            "_workforce_reference_snapshot",
+            snapshot_then_discard,
+        )
 
-            with pytest.raises(AgentWorkforceConflictError) as exc_info:
-                service.delete_agent(actor=actor, agent_id=target_id)
+        response = client.delete(f"/api/agents/{target_id}", headers=headers)
 
-            conflict = exc_info.value
-            assert conflict.references or conflict.has_hidden_references
-            assert all(reference.roles for reference in conflict.references)
-        finally:
-            db.close()
+        assert response.status_code == 200, response.text
+        assert response.json() == {"message": "Agent deleted successfully"}
 
         verify_db = _direct_db_session()
         try:
             assert verify_db.get(Workforce, workforce_id) is None
-            assert verify_db.get(Agent, target_id) is not None
+            assert verify_db.get(Agent, target_id) is None
         finally:
             verify_db.close()
 

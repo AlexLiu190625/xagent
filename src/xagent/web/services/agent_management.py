@@ -8,7 +8,7 @@ from typing import Any, Literal, cast
 
 from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...templates.manager import TemplateManager
@@ -59,6 +59,7 @@ class AgentWorkforceReference:
 class _AgentWorkforceReferenceSnapshot:
     workforce_id: int
     roles: tuple[Literal["manager", "worker"], ...]
+    is_visible: bool
 
 
 @dataclass(frozen=True)
@@ -99,30 +100,46 @@ class AgentManagementService:
         return self.store.list_agent_items(user_id)
 
     def _workforce_reference_snapshot(
-        self, agent_id: int
+        self,
+        *,
+        actor: User,
+        agent_id: int,
     ) -> tuple[_AgentWorkforceReferenceSnapshot, ...]:
-        manager_reference = Workforce.manager_agent_id == agent_id
+        """Capture blocker roles and policy-owned visibility in one statement."""
+        blocker_workforce = aliased(Workforce)
+        manager_reference = blocker_workforce.manager_agent_id == agent_id
         worker_reference = (
             select(WorkforceAgent.id)
             .where(
-                WorkforceAgent.workforce_id == Workforce.id,
+                WorkforceAgent.workforce_id == blocker_workforce.id,
                 WorkforceAgent.agent_id == agent_id,
             )
             .exists()
         )
+        visible_reference = (
+            filter_visible_workforces(
+                self.db,
+                actor,
+                self.db.query(Workforce),
+            )
+            .filter(Workforce.id == blocker_workforce.id)
+            .exists()
+            .correlate(blocker_workforce)
+        )
         rows = (
             self.db.query(
-                Workforce.id,
+                blocker_workforce.id,
                 manager_reference.label("is_manager_reference"),
                 worker_reference.label("is_worker_reference"),
+                visible_reference.label("is_visible"),
             )
             .filter(or_(manager_reference, worker_reference))
-            .order_by(Workforce.id)
+            .order_by(blocker_workforce.id)
             .all()
         )
 
         snapshot: list[_AgentWorkforceReferenceSnapshot] = []
-        for workforce_id, is_manager, is_worker in rows:
+        for workforce_id, is_manager, is_worker, is_visible in rows:
             roles: list[Literal["manager", "worker"]] = []
             if is_manager:
                 roles.append("manager")
@@ -132,6 +149,7 @@ class AgentManagementService:
                 _AgentWorkforceReferenceSnapshot(
                     workforce_id=int(workforce_id),
                     roles=tuple(roles),
+                    is_visible=bool(is_visible),
                 )
             )
         return tuple(snapshot)
@@ -142,13 +160,17 @@ class AgentManagementService:
         actor: User,
         snapshot: tuple[_AgentWorkforceReferenceSnapshot, ...],
     ) -> tuple[AgentWorkforceReference, ...]:
-        snapshot_by_id = {reference.workforce_id: reference for reference in snapshot}
+        snapshot_by_id = {
+            reference.workforce_id: reference
+            for reference in snapshot
+            if reference.is_visible
+        }
         snapshot_ids = tuple(snapshot_by_id)
-        visible_rows = filter_visible_workforces(
-            self.db,
-            actor,
-            self.db.query(Workforce).filter(Workforce.id.in_(snapshot_ids)),
-        ).all()
+        if not snapshot_ids:
+            return ()
+        visible_rows = (
+            self.db.query(Workforce).filter(Workforce.id.in_(snapshot_ids)).all()
+        )
         workforces_by_id = {int(workforce.id): workforce for workforce in visible_rows}
         workforce_ids = tuple(sorted(workforces_by_id))
         if not workforce_ids:
@@ -223,19 +245,19 @@ class AgentManagementService:
     def _workforce_conflict(
         self, *, actor: User, agent_id: int
     ) -> AgentWorkforceConflictError | None:
-        snapshot = self._workforce_reference_snapshot(agent_id)
+        snapshot = self._workforce_reference_snapshot(actor=actor, agent_id=agent_id)
         if not snapshot:
             return None
         references = self._visible_workforce_references(
             actor=actor,
             snapshot=snapshot,
         )
-        visible_ids = {reference.workforce_id for reference in references}
+        has_hidden_references = any(not reference.is_visible for reference in snapshot)
+        if not references and not has_hidden_references:
+            return None
         return AgentWorkforceConflictError(
             references,
-            has_hidden_references=any(
-                reference.workforce_id not in visible_ids for reference in snapshot
-            ),
+            has_hidden_references=has_hidden_references,
         )
 
     def delete_agent(

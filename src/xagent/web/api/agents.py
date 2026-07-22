@@ -827,7 +827,7 @@ async def demote_agent_to_personal(
 
 
 @router.delete("/{agent_id}")
-async def delete_agent(
+def delete_agent(
     agent_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
