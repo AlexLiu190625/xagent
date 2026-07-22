@@ -1,0 +1,50 @@
+"""Contract tests for the application-owned personal-key access seam."""
+
+from types import SimpleNamespace
+
+import pytest
+
+from xagent.web.services.personal_key_scope import (
+    PersonalKeyAccessScope,
+    get_personal_key_access_scope,
+    set_personal_key_scope_hook,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clear_scope_hook():
+    set_personal_key_scope_hook(None)
+    yield
+    set_personal_key_scope_hook(None)
+
+
+def test_default_scope_is_limited_to_the_actor():
+    scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
+
+    assert scope == PersonalKeyAccessScope(owner_user_ids=(17,), can_manage_others=False)
+
+
+def test_hook_scope_always_includes_the_actor():
+    set_personal_key_scope_hook(
+        lambda _db, _actor: PersonalKeyAccessScope(
+            owner_user_ids=(29,), can_manage_others=True
+        )
+    )
+
+    scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
+
+    assert scope == PersonalKeyAccessScope(
+        owner_user_ids=(17, 29), can_manage_others=True
+    )
+
+
+def test_non_manager_hook_cannot_expose_other_owners():
+    set_personal_key_scope_hook(
+        lambda _db, _actor: PersonalKeyAccessScope(
+            owner_user_ids=(17, 29), can_manage_others=False
+        )
+    )
+
+    scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
+
+    assert scope == PersonalKeyAccessScope(owner_user_ids=(17,), can_manage_others=False)

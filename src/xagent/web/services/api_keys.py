@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session, joinedload
 from ...core.utils.api_key import ApiKeyKind, generate_api_key
 from ..models.agent import Agent, AgentOrigin
 from ..models.agent_api_key import AgentApiKey
+from ..models.user import User
 from ..models.user_api_key import UserApiKey
 from ..schemas.agent_api_key import (
     AgentApiKeyListItem,
@@ -23,10 +24,13 @@ from ..schemas.agent_api_key import (
 )
 from ..schemas.user_api_key import (
     PersonalAPIKeyCreateResponse,
+    PersonalAPIKeyListItem,
+    PersonalAPIKeyOwner,
     PersonalAPIKeyMetadata,
     PersonalAPIKeyRevokeResponse,
 )
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
+from .personal_key_scope import PersonalKeyAccessScope
 
 logger = logging.getLogger(__name__)
 
@@ -462,3 +466,48 @@ class UserApiKeyService:
         self.db.refresh(row)
         logger.info("Revoked personal API key %s for user %s", key_id, user_id)
         return PersonalAPIKeyRevokeResponse(revoked=True, revoked_at=row.revoked_at)
+
+
+class PersonalApiKeyManagementService:
+    """Lists and revokes personal keys within an application-resolved scope."""
+
+    def __init__(self, db: Session) -> None:
+        self.db = db
+
+    def list_keys(self, scope: PersonalKeyAccessScope) -> list[PersonalAPIKeyListItem]:
+        rows = (
+            self.db.query(UserApiKey, User)
+            .join(User, User.id == UserApiKey.user_id)
+            .filter(UserApiKey.user_id.in_(scope.owner_user_ids))
+            .order_by(UserApiKey.created_at.desc(), UserApiKey.id.desc())
+            .all()
+        )
+        return [
+            PersonalAPIKeyListItem(
+                id=int(row.id),
+                key_prefix=row.key_prefix,
+                masked_key=f"xag_personal_{row.key_prefix}_••••••••",
+                revoked_at=row.revoked_at,
+                expires_at=row.expires_at,
+                created_at=row.created_at,
+                owner=PersonalAPIKeyOwner(
+                    id=int(owner.id), username=owner.username, email=owner.email
+                ),
+            )
+            for row, owner in rows
+        ]
+
+    def revoke_key(
+        self, scope: PersonalKeyAccessScope, key_id: int
+    ) -> PersonalAPIKeyRevokeResponse | None:
+        row = (
+            self.db.query(UserApiKey)
+            .filter(
+                UserApiKey.id == key_id,
+                UserApiKey.user_id.in_(scope.owner_user_ids),
+            )
+            .first()
+        )
+        if row is None:
+            return None
+        return UserApiKeyService(self.db).revoke_key(int(row.user_id), key_id)

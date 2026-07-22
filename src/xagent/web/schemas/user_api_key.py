@@ -32,3 +32,18 @@ class PersonalAPIKeyMetadata(BaseModel):
 class PersonalAPIKeyRevokeResponse(BaseModel):
     revoked: bool
     revoked_at: Optional[datetime] = None
+
+
+class PersonalAPIKeyOwner(BaseModel):
+    id: int
+    username: str
+    email: Optional[str] = None
+
+
+class PersonalAPIKeyListItem(PersonalAPIKeyMetadata):
+    owner: PersonalAPIKeyOwner
+
+
+class PersonalAPIKeyListResponse(BaseModel):
+    items: list[PersonalAPIKeyListItem]
+    can_manage_others: bool
