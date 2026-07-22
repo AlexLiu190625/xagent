@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useState } from "react"
+import React, { useCallback, useEffect, useState } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
 import {
   AlertTriangle,
@@ -38,6 +38,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "@/components/ui/sonner"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
@@ -54,6 +55,7 @@ import {
   regenerateAgentApiKey,
   resumeAgentApiKey,
 } from "@/lib/agent-api-keys-api"
+import { PersonalApiKeysPanel } from "./personal-api-keys-panel"
 
 interface AgentOption {
   id: number
@@ -103,6 +105,23 @@ export function ApiKeysPage() {
   const [confirmAction, setConfirmAction] = useState<ConfirmAction | null>(null)
   const [confirmBusy, setConfirmBusy] = useState(false)
 
+  const activeTab = searchParams.get("agent")
+    ? "agent"
+    : searchParams.get("tab") === "personal"
+      ? "personal"
+      : "agent"
+
+  const handleTabChange = (tab: string) => {
+    const params = new URLSearchParams(searchParams.toString())
+    if (tab === "personal") {
+      params.set("tab", "personal")
+    } else {
+      params.delete("tab")
+    }
+    const query = params.toString()
+    router.replace(query ? `/api-keys?${query}` : "/api-keys")
+  }
+
   const fetchAll = useCallback(async () => {
     setLoading(true)
     try {
@@ -133,9 +152,10 @@ export function ApiKeysPage() {
   }, [])
 
   useEffect(() => {
+    if (activeTab !== "agent") return
     fetchAll()
     fetchAgents()
-  }, [fetchAll, fetchAgents])
+  }, [activeTab, fetchAll, fetchAgents])
 
   // Jump-link from an agent card / deploy dialog: pre-filter to that agent
   // by id (exact), independent of whether the agents list has loaded yet.
@@ -254,12 +274,33 @@ export function ApiKeysPage() {
         title={t("apiKeysPage.title") || "API Keys"}
         description={t("apiKeysPage.subtitle") || "Manage API keys for programmatic access to your agents."}
         actions={
-          <Button onClick={openCreateDialog} className="shrink-0">
-            <Plus className="w-4 h-4 mr-1" />
-            {t("apiKeysPage.newKey") || "New API Key"}
-          </Button>
+          activeTab === "agent" ? (
+            <Button onClick={openCreateDialog} className="shrink-0">
+              <Plus className="w-4 h-4 mr-1" />
+              {t("apiKeysPage.newKey") || "New API Key"}
+            </Button>
+          ) : undefined
         }
       />
+
+      <Tabs value={activeTab} onValueChange={handleTabChange} className="px-6 md:px-8 mt-6">
+        <TabsList className="bg-transparent h-12 p-0 space-x-6 justify-start border-b w-full rounded-none">
+          <TabsTrigger
+            value="agent"
+            className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
+          >
+            {t("apiKeysPage.tabs.agent") || "Agent Keys"}
+          </TabsTrigger>
+          <TabsTrigger
+            value="personal"
+            className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
+          >
+            {t("apiKeysPage.tabs.personal") || "Personal Keys"}
+          </TabsTrigger>
+        </TabsList>
+      </Tabs>
+
+      {activeTab === "personal" ? <PersonalApiKeysPanel /> : <>
 
       <div className="grid gap-4 grid-cols-2 lg:grid-cols-4 px-6 md:px-8 mt-6">
         <Card>
@@ -544,6 +585,7 @@ export function ApiKeysPage() {
             : t("apiKeysPage.actions.delete") || "Delete"
         }
       />
+      </>}
     </div>
   )
 }

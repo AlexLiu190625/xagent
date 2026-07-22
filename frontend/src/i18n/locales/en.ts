@@ -3458,6 +3458,10 @@ Build when you need.`,
     never: "Never",
     filteredByAgent: "Filtered agent",
     clearFilter: "Clear filter",
+    tabs: {
+      agent: "Agent Keys",
+      personal: "Personal Keys"
+    },
     stats: {
       totalKeys: "Total Keys",
       totalKeysHint: "across all agents",
@@ -3514,6 +3518,39 @@ Build when you need.`,
       regenerated: "API key regenerated",
       deleted: "API key deleted",
       actionFailed: "Action failed",
+      copied: "Copied to clipboard",
+      copyFailed: "Failed to copy to clipboard"
+    }
+  },
+  personalApiKeys: {
+    title: "Personal Keys",
+    description: "Manage your personal SDK and REST API keys.",
+    create: "Create Personal Key",
+    createForMe: "Create Personal Key for Me",
+    noData: "No personal API keys yet.",
+    columns: {
+      key: "Secret Key",
+      owner: "Owner",
+      created: "Created"
+    },
+    actions: {
+      revoke: "Revoke"
+    },
+    reveal: {
+      title: "Personal API Key Created",
+      warning: "Copy this key now — it is shown only once."
+    },
+    confirm: {
+      revokeTitle: "Revoke personal API key?",
+      revokeOwnDescription: "Revoking immediately invalidates this key.",
+      revokeOtherDescription: "Revoke this personal key for {owner}?"
+    },
+    messages: {
+      loadFailed: "Failed to load personal API keys",
+      created: "Personal API key created",
+      createFailed: "Failed to create personal API key",
+      revoked: "Personal API key revoked",
+      revokeFailed: "Failed to revoke personal API key",
       copied: "Copied to clipboard",
       copyFailed: "Failed to copy to clipboard"
     }
