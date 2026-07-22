@@ -114,6 +114,7 @@ export function ApiKeysPage() {
   const handleTabChange = (tab: string) => {
     const params = new URLSearchParams(searchParams.toString())
     if (tab === "personal") {
+      setAgentFilterId(null)
       params.delete("agent")
       params.set("tab", "personal")
     } else {
@@ -164,6 +165,7 @@ export function ApiKeysPage() {
     const agentId = searchParams.get("agent")
     const parsed = agentId ? Number(agentId) : NaN
     if (!Number.isNaN(parsed)) setAgentFilterId(parsed)
+    else setAgentFilterId(null)
   }, [searchParams])
 
   const agentFilterName = agentFilterId
@@ -585,7 +587,7 @@ export function ApiKeysPage() {
         }
       />
         </TabsContent>
-        <TabsContent value="personal" className="mt-0">
+        <TabsContent value="personal" className="mt-0 data-[state=inactive]:hidden" forceMount>
           <PersonalApiKeysPanel />
         </TabsContent>
       </Tabs>

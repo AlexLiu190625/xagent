@@ -4,18 +4,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const navigation = vi.hoisted(() => ({
   search: "",
+  searchParams: new URLSearchParams(),
   replace: vi.fn(),
 }))
 const listAgentApiKeysMock = vi.hoisted(() => vi.fn())
 const getAgentApiKeyStatsMock = vi.hoisted(() => vi.fn())
+const translateMock = vi.hoisted(() => vi.fn((key: string) => key))
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ replace: navigation.replace }),
-  useSearchParams: () => new URLSearchParams(navigation.search),
+  useSearchParams: () => navigation.searchParams,
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
-  useI18n: () => ({ t: (key: string) => key }),
+  useI18n: () => ({ t: translateMock }),
 }))
 
 vi.mock("@/lib/agent-api-keys-api", () => ({
@@ -38,9 +40,14 @@ vi.mock("@/components/pages/personal-api-keys-panel", () => ({
 
 import { ApiKeysPage } from "./api-keys"
 
+function setSearch(search: string) {
+  navigation.search = search
+  navigation.searchParams = new URLSearchParams(search)
+}
+
 describe("ApiKeysPage tabs", () => {
   beforeEach(() => {
-    navigation.search = ""
+    setSearch("")
     navigation.replace.mockReset()
     listAgentApiKeysMock.mockReset()
     getAgentApiKeyStatsMock.mockReset()
@@ -56,7 +63,7 @@ describe("ApiKeysPage tabs", () => {
   afterEach(cleanup)
 
   it("selects Personal Keys from the tab query parameter", async () => {
-    navigation.search = "tab=personal"
+    setSearch("tab=personal")
 
     render(<ApiKeysPage />)
 
@@ -72,7 +79,7 @@ describe("ApiKeysPage tabs", () => {
   })
 
   it("keeps an agent deep link on Agent Keys even when the Personal tab is requested", async () => {
-    navigation.search = "agent=12&tab=personal"
+    setSearch("agent=12&tab=personal")
 
     render(<ApiKeysPage />)
 
@@ -80,15 +87,19 @@ describe("ApiKeysPage tabs", () => {
       "data-state",
       "active",
     )
-    expect(screen.queryByText("personal-api-keys-panel")).not.toBeInTheDocument()
-    expect(screen.getByRole("tabpanel")).toHaveAttribute(
+    const inactivePersonalPanel = screen.getByText("personal-api-keys-panel").closest('[role="tabpanel"]')
+    expect(inactivePersonalPanel).toHaveAttribute("data-state", "inactive")
+    const activePanel = screen.getAllByRole("tabpanel").find(
+      (panel) => panel.getAttribute("data-state") === "active",
+    )
+    expect(activePanel).toHaveAttribute(
       "aria-labelledby",
       screen.getByRole("tab", { name: "apiKeysPage.tabs.agent" }).id,
     )
   })
 
   it("switches an agent deep link to Personal Keys without retaining the agent filter", async () => {
-    navigation.search = "agent=12"
+    setSearch("agent=12")
 
     render(<ApiKeysPage />)
 
@@ -97,5 +108,25 @@ describe("ApiKeysPage tabs", () => {
     })
 
     expect(navigation.replace).toHaveBeenCalledWith("/api-keys?tab=personal")
+  })
+
+  it("clears the agent filter after a Personal Keys round trip", async () => {
+    setSearch("agent=12")
+    const { rerender } = render(<ApiKeysPage />)
+
+    expect(await screen.findByText("apiKeysPage.filteredByAgent")).toBeInTheDocument()
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "apiKeysPage.tabs.personal" }), { button: 0 })
+    expect(navigation.replace).toHaveBeenCalledWith("/api-keys?tab=personal")
+
+    setSearch("tab=personal")
+    rerender(<ApiKeysPage />)
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "apiKeysPage.tabs.agent" }), { button: 0 })
+    expect(navigation.replace).toHaveBeenLastCalledWith("/api-keys")
+
+    setSearch("")
+    rerender(<ApiKeysPage />)
+
+    expect(screen.queryByText("apiKeysPage.filteredByAgent")).not.toBeInTheDocument()
   })
 })

@@ -58,6 +58,24 @@ vi.mock("@/components/ui/sonner", () => ({
 }))
 
 import { PersonalApiKeysPanel } from "./personal-api-keys-panel"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
+
+function PersonalKeysTabsHarness() {
+  const [tab, setTab] = React.useState("personal")
+
+  return (
+    <Tabs value={tab} onValueChange={setTab}>
+      <TabsList>
+        <TabsTrigger value="agent">Agent Keys</TabsTrigger>
+        <TabsTrigger value="personal">Personal Keys</TabsTrigger>
+      </TabsList>
+      <TabsContent value="agent">agent-panel</TabsContent>
+      <TabsContent value="personal" forceMount>
+        <PersonalApiKeysPanel />
+      </TabsContent>
+    </Tabs>
+  )
+}
 
 function listResponse(canManageOthers: boolean) {
   const items = [
@@ -216,5 +234,44 @@ describe("PersonalApiKeysPanel", () => {
     const revokedRow = (await screen.findByText("xag_personal_revoked_••••••••")).closest("tr")
     expect(revokedRow).not.toBeNull()
     expect(within(revokedRow!).queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument()
+  })
+
+  it("keeps a deferred create reveal while the Agent tab is selected", async () => {
+    let resolveCreate: (value: {
+      id: number
+      full_key: string
+      key_prefix: string
+      created_at: string
+      expires_at: null
+    }) => void
+    const create = new Promise<{
+      id: number
+      full_key: string
+      key_prefix: string
+      created_at: string
+      expires_at: null
+    }>((resolve) => {
+      resolveCreate = resolve
+    })
+    listPersonalApiKeysMock.mockResolvedValue(listResponse(false))
+    createPersonalApiKeyMock.mockReturnValue(create)
+
+    render(<PersonalKeysTabsHarness />)
+
+    await screen.findByText("xag_personal_self123_••••••••")
+    fireEvent.click(screen.getByRole("button", { name: "Create Personal Key" }))
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Agent Keys" }), { button: 0 })
+    expect(screen.getByText("agent-panel")).toBeVisible()
+
+    await act(async () => resolveCreate!({
+      id: 5,
+      full_key: "xag_personal_deferred_secret",
+      key_prefix: "deferred",
+      created_at: "2026-07-22T00:00:00Z",
+      expires_at: null,
+    }))
+
+    fireEvent.mouseDown(screen.getByRole("tab", { name: "Personal Keys" }), { button: 0 })
+    expect(screen.getByText("xag_personal_deferred_secret")).toBeVisible()
   })
 })
