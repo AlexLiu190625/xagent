@@ -57,6 +57,54 @@ def _create_user(db: Session, username: str) -> User:
     return user
 
 
+def test_create_runtime_plan_accepts_detached_tool_categories(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "detached-create-owner")
+    server = _create_runtime_mcp(db_session, owner, "detached-create-runtime")
+
+    plan = prepare_create_connector_runtime(
+        db=db_session,
+        tool_categories=("mcp",),
+        task_source="sdk",
+        connector_user_id=int(owner.id),
+        payload_items=None,
+    )
+
+    assert [ref.connector_id for ref in plan.selected_refs] == [int(server.id)]
+
+
+def test_append_runtime_plan_does_not_require_agent_orm(
+    db_session: Session,
+) -> None:
+    owner = _create_user(db_session, "detached-append-owner")
+    agent = Agent(user_id=owner.id, name="detached append agent")
+    db_session.add(agent)
+    db_session.flush()
+    server = _create_runtime_mcp(db_session, owner, "detached-append-runtime")
+    task = Task(
+        user_id=owner.id,
+        agent_id=agent.id,
+        title="detached append task",
+        source="sdk",
+        status=TaskStatus.COMPLETED,
+        connector_runtime_selected_refs=[
+            {"connector_type": "mcp", "connector_id": int(server.id)}
+        ],
+    )
+    db_session.add(task)
+    db_session.flush()
+
+    plan = prepare_append_connector_runtime(
+        db=db_session,
+        task=task,
+        connector_user_id=int(owner.id),
+        payload_items=None,
+    )
+
+    assert plan.ephemeral_by_ref == {}
+
+
 def _create_runtime_mcp(
     db: Session,
     user: User,
@@ -284,7 +332,7 @@ def test_scoped_resolver_applies_consistently_to_create_and_binding(
     try:
         plan = prepare_create_connector_runtime(
             db=db_session,
-            agent=agent,
+            tool_categories=agent.tool_categories,
             task_source="external",
             connector_user_id=int(task_owner.id),
             payload_items=None,
@@ -342,7 +390,7 @@ def test_scoped_resolver_does_not_bypass_other_create_sources(
         with pytest.raises(ConnectorRuntimeError) as exc_info:
             prepare_create_connector_runtime(
                 db=db_session,
-                agent=agent,
+                tool_categories=agent.tool_categories,
                 task_source=task_source,
                 connector_user_id=int(owner.id),
                 payload_items=None,
@@ -376,7 +424,7 @@ def test_create_plan_rejects_task_identity_mismatch(
     _create_runtime_mcp(db_session, owner, "identity-runtime")
     plan = prepare_create_connector_runtime(
         db=db_session,
-        agent=agent,
+        tool_categories=agent.tool_categories,
         task_source="external",
         connector_user_id=int(owner.id),
         payload_items=None,
@@ -427,7 +475,6 @@ def test_append_uses_persisted_task_owner_connector_visibility(
 
     plan = prepare_append_connector_runtime(
         db=db_session,
-        agent=agent,
         task=task,
         connector_user_id=int(task_owner.id),
         payload_items=[
@@ -453,7 +500,6 @@ def test_append_uses_persisted_task_owner_connector_visibility(
     with pytest.raises(ConnectorRuntimeError) as exc_info:
         prepare_append_connector_runtime(
             db=db_session,
-            agent=agent,
             task=task,
             connector_user_id=int(agent_owner.id),
             payload_items=None,
@@ -649,7 +695,7 @@ def test_resolver_registration_copies_mutable_source_scope(
     with pytest.raises(ConnectorRuntimeError) as exc_info:
         prepare_create_connector_runtime(
             db=db_session,
-            agent=agent,
+            tool_categories=agent.tool_categories,
             task_source="sdk",
             connector_user_id=int(owner.id),
             payload_items=None,

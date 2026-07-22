@@ -38,6 +38,23 @@ class RefreshingToolConfig:
         return self.allowed_tools
 
 
+class AsyncRefreshingToolConfig(RefreshingToolConfig):
+    def __init__(self) -> None:
+        super().__init__()
+        self.async_refresh_count = 0
+        self.sync_refresh_count = 0
+
+    async def refresh_runtime_policy(self) -> None:
+        self.async_refresh_count += 1
+
+    def refresh_user_tool_overrides(self) -> None:
+        self.sync_refresh_count += 1
+        raise AssertionError("sync policy refresh ran on the event loop")
+
+    def get_user_tool_overrides(self) -> dict[str, dict[str, bool]]:
+        return {"disabled": {"enabled": self.async_refresh_count < 2}}
+
+
 class AllowedToolsConfig:
     _workspace_config = None
 
@@ -49,6 +66,20 @@ class AllowedToolsConfig:
 
     def get_allowed_tools(self) -> list[str] | None:
         return self.allowed_tools
+
+
+class SnapshotRefreshingToolConfig(AllowedToolsConfig):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshot_prepared = False
+        self.release_count = 0
+
+    async def refresh_runtime_policy(self) -> None:
+        self.snapshot_prepared = True
+
+    def release_prepared_factory_runtime(self) -> None:
+        self.snapshot_prepared = False
+        self.release_count += 1
 
 
 class DelegationRuntimeConfig:
@@ -118,6 +149,65 @@ async def test_agent_service_refreshes_initialized_tools_when_policy_changes(
     await service._ensure_tools_initialized()
     assert {tool.name for tool in service.tools} == {"allowed"}
     assert tool_config.refresh_count == 2
+
+
+@pytest.mark.asyncio
+async def test_agent_service_awaits_async_runtime_policy_refresh(monkeypatch) -> None:
+    tool_config = AsyncRefreshingToolConfig()
+    tool_sets: list[list[Any]] = [
+        [NamedTool("allowed"), NamedTool("disabled")],
+        [NamedTool("allowed")],
+    ]
+
+    async def create_all_tools(config: Any) -> list[Any]:
+        assert config is tool_config
+        return tool_sets.pop(0)
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        create_all_tools,
+    )
+    service = AgentService(
+        name="async-tool-refresh-test",
+        id="async-tool-refresh-test",
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+    await service._ensure_tools_initialized()
+
+    assert tool_config.async_refresh_count == 2
+    assert tool_config.sync_refresh_count == 0
+    assert {tool.name for tool in service.tools} == {"allowed"}
+
+
+@pytest.mark.asyncio
+async def test_unchanged_policy_releases_prepared_factory_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_config = SnapshotRefreshingToolConfig()
+
+    async def unexpected_rebuild(config: Any) -> list[Any]:
+        raise AssertionError(f"unexpected tool rebuild for {config!r}")
+
+    monkeypatch.setattr(
+        "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+        unexpected_rebuild,
+    )
+    service = AgentService(
+        name="unchanged-tool-policy-test",
+        id="unchanged-tool-policy-test",
+        tools=[NamedTool("existing")],
+        tool_config=tool_config,
+        enable_workspace=False,
+    )
+
+    await service._ensure_tools_initialized()
+
+    assert tool_config.release_count == 1
+    assert not tool_config.snapshot_prepared
+    assert [tool.name for tool in service.tools] == ["existing"]
 
 
 @pytest.mark.asyncio

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Dict, Optional, Tuple, cast
@@ -25,6 +26,7 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.file_storage import get_user_file_storage
+from ...core.file_storage.keys import build_upload_storage_key
 from ...core.tools.adapters.vibe.file_tool import read_file
 from ...core.tools.core.file_analysis import collect_pptx_slide_blocks
 from ...core.workspace import scoped_user_root
@@ -40,6 +42,11 @@ from ..models.database import get_db
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
+from ..services import uploaded_file_store as uploaded_file_store_service
+from ..services.db_runtime import (
+    await_task_settlement,
+    drain_async_task_cancellation_safe,
+)
 from ..services.kb_file_service import aggregate_uploaded_file_statuses
 from ..services.managed_file_ref import (
     FILE_INTEGRITY_REUPLOAD_MESSAGE,
@@ -49,7 +56,11 @@ from ..services.managed_file_ref import (
     ManagedFileRef,
     guess_media_type,
 )
-from ..services.uploaded_file_store import UploadedFileStore, delete_pptx_pdf_cache
+from ..services.uploaded_file_store import (
+    PreparedUploadedFile,
+    UploadedFileStore,
+    delete_pptx_pdf_cache,
+)
 from .legacy_file import (
     infer_user_id_from_legacy_path,
     is_valid_uuid,
@@ -178,15 +189,22 @@ def _accel_redirect_response(
     )
 
 
-async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path) -> int:
-    """Persist an uploaded file while enforcing the configured size limit."""
+def _delete_local_path_sync(target_path: Path) -> None:
+    try:
+        target_path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to clean up local upload: %s", target_path)
+
+
+def _copy_upload_to_local_path_sync(source: Any, target_path: Path) -> int:
+    """Copy an upload stream to local storage in one worker thread."""
     total_size = 0
     read_buffer_size = 1024 * 1024  # 1MB chunks keep memory bounded for large files.
 
     try:
         with open(target_path, "wb") as buffer:
             while True:
-                chunk = await uploaded.read(read_buffer_size)
+                chunk = source.read(read_buffer_size)
                 if not chunk:
                     break
                 total_size += len(chunk)
@@ -198,15 +216,274 @@ async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path)
                         ),
                     )
                 buffer.write(chunk)
-    except Exception:
-        try:
-            if target_path.exists():
-                target_path.unlink()
-        except OSError:
-            pass
+    except BaseException:
+        _delete_local_path_sync(target_path)
         raise
 
     return total_size
+
+
+async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path) -> int:
+    """Persist an upload off-loop while enforcing the configured size limit."""
+    copy_task = asyncio.create_task(
+        asyncio.to_thread(
+            _copy_upload_to_local_path_sync,
+            uploaded.file,
+            target_path,
+        )
+    )
+    file_size, cancellation = await await_task_settlement(copy_task)
+    if cancellation is not None:
+        cleanup_task = asyncio.create_task(
+            asyncio.to_thread(_delete_local_path_sync, target_path)
+        )
+        await await_task_settlement(cleanup_task)
+        raise cancellation
+    return file_size
+
+
+def _resolve_v1_upload_path_sync(
+    *,
+    filename: str,
+    folder: str | None,
+    owner_user_id: int,
+) -> Path:
+    """Resolve and reserve a unique local v1 upload path off the event loop."""
+    return _build_unique_file_path(
+        get_upload_path(
+            filename,
+            None,
+            folder,
+            owner_user_id,
+        )
+    )
+
+
+@dataclass(frozen=True)
+class _StagedV1Upload:
+    file_id: str
+    owner_user_id: int
+    filename: str
+    mime_type: str | None
+    local_path: Path
+    storage_key: str
+
+
+@dataclass(frozen=True)
+class _PreparedV1Upload:
+    file: PreparedUploadedFile
+    content_preview: str
+
+
+def _upload_content_preview(local_path: Path, filename: str) -> str:
+    file_extension = Path(filename).suffix.lower()
+    if file_extension == ".pptx":
+        try:
+            preview_content = _pptx_text_preview(local_path)
+        except Exception:
+            return ""
+    elif file_extension == ".ppt" or file_extension in BINARY_EXTENSIONS:
+        return ""
+    else:
+        try:
+            preview_content = read_file(str(local_path))
+        except Exception:
+            return ""
+
+    if isinstance(preview_content, str) and len(preview_content) > 500:
+        return preview_content[:500] + "..."
+    return preview_content if isinstance(preview_content, str) else ""
+
+
+def _prepare_v1_uploads_sync(
+    staged_files: tuple[_StagedV1Upload, ...],
+) -> tuple[_PreparedV1Upload, ...]:
+    prepared: list[_PreparedV1Upload] = []
+    try:
+        for staged in staged_files:
+            file_metadata = (
+                uploaded_file_store_service.prepare_uploaded_file_from_local_path(
+                    local_path=staged.local_path,
+                    user_id=staged.owner_user_id,
+                    filename=staged.filename,
+                    file_id=staged.file_id,
+                    task_id=None,
+                    mime_type=staged.mime_type,
+                    storage_key=staged.storage_key,
+                )
+            )
+            prepared.append(
+                _PreparedV1Upload(
+                    file=file_metadata,
+                    content_preview=_upload_content_preview(
+                        staged.local_path, staged.filename
+                    ),
+                )
+            )
+    except BaseException:
+        uploaded_file_store_service.delete_durable_upload_keys(
+            [(item.owner_user_id, item.storage_key) for item in staged_files]
+        )
+        raise
+    return tuple(prepared)
+
+
+def _delete_local_uploads(staged_files: tuple[_StagedV1Upload, ...]) -> None:
+    for item in staged_files:
+        _delete_local_path_sync(item.local_path)
+
+
+def _format_stored_uploads(
+    *,
+    prepared_files: tuple[_PreparedV1Upload, ...],
+    task_type: str,
+    single_file_mode: bool,
+) -> Dict[str, Any]:
+    uploaded_files = [
+        {
+            "file_id": item.file.file_id,
+            "filename": item.file.filename,
+            "file_size": item.file.file_size,
+            "mime_type": item.file.mime_type,
+            "content_preview": item.content_preview,
+        }
+        for item in prepared_files
+    ]
+    if single_file_mode:
+        first_file = uploaded_files[0]
+        return {
+            "success": True,
+            "file_id": first_file["file_id"],
+            "filename": first_file["filename"],
+            "file_size": first_file["file_size"],
+            "mime_type": first_file["mime_type"],
+            "task_type": task_type,
+            "content_preview": first_file["content_preview"],
+            "message": f"Successfully uploaded {first_file['filename']}",
+        }
+    return {
+        "success": True,
+        "files": uploaded_files,
+        "total_files": len(uploaded_files),
+        "task_type": task_type,
+        "message": f"Successfully uploaded {len(uploaded_files)} files",
+    }
+
+
+async def _store_v1_uploaded_files_workflow(
+    *,
+    upload_items: list[UploadFile],
+    task_type: str,
+    folder: str | None,
+    owner_user_id: int,
+    single_file_mode: bool,
+) -> Dict[str, Any]:
+    staged_files: list[_StagedV1Upload] = []
+    prepared_files: tuple[_PreparedV1Upload, ...] = ()
+    persisted = False
+    try:
+        for uploaded in upload_items:
+            if not uploaded.filename or not uploaded.filename.strip():
+                raise HTTPException(status_code=422, detail="No filename provided")
+            if not is_allowed_file(uploaded.filename, task_type):
+                raise HTTPException(
+                    status_code=500,
+                    detail=(
+                        f"File type {Path(uploaded.filename).suffix.lower()} "
+                        f"not supported for task type {task_type}"
+                    ),
+                )
+            try:
+                path_task = asyncio.create_task(
+                    asyncio.to_thread(
+                        _resolve_v1_upload_path_sync,
+                        filename=uploaded.filename,
+                        folder=folder,
+                        owner_user_id=owner_user_id,
+                    )
+                )
+                local_path, cancellation = await await_task_settlement(path_task)
+                if cancellation is not None:
+                    raise cancellation
+            except ValueError as exc:
+                logger.warning("Invalid folder name rejected: %r - %s", folder, exc)
+                raise HTTPException(
+                    status_code=422, detail=f"Invalid folder name: {exc}"
+                ) from exc
+
+            await _write_upload_with_size_limit(uploaded, local_path)
+            file_id = str(uuid4())
+            staged_files.append(
+                _StagedV1Upload(
+                    file_id=file_id,
+                    owner_user_id=owner_user_id,
+                    filename=Path(uploaded.filename).name,
+                    mime_type=uploaded.content_type,
+                    local_path=local_path,
+                    storage_key=build_upload_storage_key(
+                        owner_user_id, file_id, Path(uploaded.filename).name
+                    ),
+                )
+            )
+
+        staged_batch = tuple(staged_files)
+        preparation_task = asyncio.create_task(
+            asyncio.to_thread(_prepare_v1_uploads_sync, staged_batch)
+        )
+        prepared_files, cancellation = await await_task_settlement(preparation_task)
+        if cancellation is not None:
+            raise cancellation
+
+        metadata = tuple(item.file for item in prepared_files)
+        persistence_task = asyncio.create_task(
+            asyncio.to_thread(
+                uploaded_file_store_service.persist_prepared_uploaded_files,
+                metadata,
+            )
+        )
+        _, cancellation = await await_task_settlement(persistence_task)
+        persisted = True
+        if cancellation is not None:
+            raise cancellation
+
+        return _format_stored_uploads(
+            prepared_files=prepared_files,
+            task_type=task_type,
+            single_file_mode=single_file_mode,
+        )
+    except DurableStorageOperationError as exc:
+        logger.warning("Durable storage unavailable during upload: %s", exc)
+        raise _durable_storage_unavailable() from exc
+    finally:
+        if not persisted:
+            prepared_metadata = tuple(item.file for item in prepared_files)
+            if prepared_metadata:
+                await asyncio.to_thread(
+                    uploaded_file_store_service.delete_prepared_uploaded_files_durable,
+                    prepared_metadata,
+                )
+            await asyncio.to_thread(_delete_local_uploads, tuple(staged_files))
+
+
+async def store_v1_uploaded_files(
+    *,
+    upload_items: list[UploadFile],
+    task_type: str,
+    folder: str | None,
+    owner_user_id: int,
+    single_file_mode: bool,
+) -> Dict[str, Any]:
+    """Store unbound SDK uploads without carrying ORM state across async work."""
+    workflow = asyncio.create_task(
+        _store_v1_uploaded_files_workflow(
+            upload_items=upload_items,
+            task_type=task_type,
+            folder=folder,
+            owner_user_id=owner_user_id,
+            single_file_mode=single_file_mode,
+        )
+    )
+    return await drain_async_task_cancellation_safe(workflow)
 
 
 async def store_uploaded_files(
@@ -262,33 +539,9 @@ async def store_uploaded_files(
             setattr(file_record, "file_size", file_size)
             db.flush()
 
-            content_preview = ""
-            file_extension = Path(uploaded.filename).suffix.lower()
-            if file_extension == ".pptx":
-                try:
-                    preview_content = await asyncio.to_thread(
-                        _pptx_text_preview, target_path
-                    )
-                    content_preview = (
-                        preview_content[:500] + "..."
-                        if len(preview_content) > 500
-                        else preview_content
-                    )
-                except Exception:
-                    content_preview = ""
-            elif file_extension == ".ppt":
-                content_preview = ""
-            elif file_extension not in BINARY_EXTENSIONS:
-                try:
-                    preview_content = read_file(str(target_path))
-                    content_preview = (
-                        preview_content[:500] + "..."
-                        if isinstance(preview_content, str)
-                        and len(preview_content) > 500
-                        else preview_content
-                    )
-                except Exception:
-                    content_preview = ""
+            content_preview = await asyncio.to_thread(
+                _upload_content_preview, target_path, uploaded.filename
+            )
 
             uploaded_files.append(
                 {

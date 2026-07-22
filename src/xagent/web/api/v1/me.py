@@ -1,12 +1,9 @@
 """GET /v1/me -- personal management key identity probe."""
 
-from typing import Tuple
-
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, Field
 
-from ...models.user import User
-from ...models.user_api_key import UserApiKey
+from ...services.api_keys import PersonalApiIdentity
 from .deps import get_user_from_personal_key
 
 router = APIRouter()
@@ -32,14 +29,13 @@ class MeResponse(BaseModel):
 
 @router.get("/me", response_model=MeResponse)
 async def get_me(
-    authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
+    authed: PersonalApiIdentity = Depends(get_user_from_personal_key),
 ) -> MeResponse:
     """Probe the user identity bound to the caller's personal key."""
-    user, key = authed
     return MeResponse(
         principal_type="user",
-        user_id=int(user.id),
-        username=str(user.username),
-        email=str(user.email) if user.email is not None else None,
-        key_prefix=key.key_prefix,
+        user_id=authed.user_id,
+        username=authed.username,
+        email=authed.email,
+        key_prefix=authed.key_prefix,
     )

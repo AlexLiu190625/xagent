@@ -14,6 +14,8 @@ real :class:`TraceEvent` rows inserted directly into the test DB to
 drive the mapping.
 """
 
+import asyncio
+import time
 from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -21,10 +23,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from fastapi import HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.api.v1 import tasks as v1_tasks
+from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
+from xagent.web.models.database import Base
 from xagent.web.models.mcp import MCPServer, UserMCPServer
 from xagent.web.models.public_mcp import PublicMCPApp
 from xagent.web.models.task import (
@@ -34,6 +41,10 @@ from xagent.web.models.task import (
     TraceEvent,
 )
 from xagent.web.models.user import User
+from xagent.web.schemas.v1 import AppendMessageRequest, CreateTaskRequest
+from xagent.web.services import sdk_task_service
+from xagent.web.services import task_orchestrator as task_orchestrator_module
+from xagent.web.services.api_keys import AgentApiIdentity
 from xagent.web.services.connector_runtime import (
     ConnectorRuntimeValues,
     drop_ephemeral_runtime_values_for_testing,
@@ -646,7 +657,7 @@ def test_upload_oversized_maps_to_413(mock_start_task):
     _agent_id, full_key = _create_agent_with_key()
 
     with patch(
-        "xagent.web.api.files.store_uploaded_files",
+        "xagent.web.api.files.store_v1_uploaded_files",
         new=AsyncMock(side_effect=HTTPException(status_code=413, detail="too big")),
     ):
         resp = client.post(
@@ -665,7 +676,7 @@ def test_upload_storage_unavailable_maps_to_503(mock_start_task):
     _agent_id, full_key = _create_agent_with_key()
 
     with patch(
-        "xagent.web.api.files.store_uploaded_files",
+        "xagent.web.api.files.store_v1_uploaded_files",
         new=AsyncMock(side_effect=HTTPException(status_code=503, detail="down")),
     ):
         resp = client.post(
@@ -911,7 +922,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
     mock_start_task,
 ) -> None:
     agent_id, full_key = _create_agent_with_key()
-    prepare_runtime_plan = v1_tasks.prepare_create_connector_runtime
+    prepare_runtime_plan = sdk_task_service.prepare_create_connector_runtime
 
     def prepare_mismatched_identity(**kwargs):
         plan = prepare_runtime_plan(**kwargs)
@@ -921,7 +932,7 @@ def test_create_task_maps_runtime_plan_identity_mismatch_to_domain_error(
         )
 
     monkeypatch.setattr(
-        v1_tasks,
+        sdk_task_service,
         "prepare_create_connector_runtime",
         prepare_mismatched_identity,
     )
@@ -1250,26 +1261,35 @@ def test_create_task_marks_failed_when_runtime_secret_store_fails(mock_start_tas
         db.close()
 
 
-def test_runtime_setup_failed_mark_swallows_secondary_rollback_failure(caplog):
-    class RollbackFailingDB:
-        rollback_calls = 0
+def test_runtime_setup_failed_mark_swallows_secondary_db_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog,
+) -> None:
+    class QueryFailingDB:
+        def __enter__(self):
+            return self
 
-        def rollback(self):
-            self.rollback_calls += 1
-            if self.rollback_calls > 1:
-                raise RuntimeError("rollback failed")
+        def __exit__(self, *_args):
+            return None
 
         def query(self, _model):
             raise RuntimeError("query failed")
 
-    db = RollbackFailingDB()
+    monkeypatch.setattr(
+        sdk_task_service,
+        "get_session_local",
+        lambda: QueryFailingDB,
+    )
 
-    with caplog.at_level("WARNING", logger="xagent.web.api.v1.tasks"):
-        v1_tasks._mark_task_failed_after_runtime_setup_error(db, 123)
+    with caplog.at_level("WARNING", logger="xagent.web.services.sdk_task_service"):
+        sdk_task_service.mark_pending_sdk_task_failed_sync(
+            123,
+            "Connector runtime setup failed.",
+            expected_agent_id=456,
+            expected_owner_user_id=789,
+        )
 
-    assert db.rollback_calls == 2
-    assert "Failed to roll back task 123 session" in caplog.text
-    assert "Failed to mark task 123 failed" in caplog.text
+    assert "Failed to mark pending SDK task 123 as failed" in caplog.text
 
 
 def test_create_task_cleans_runtime_secret_when_schedule_fails(mock_start_task):
@@ -2683,6 +2703,9 @@ def test_append_message_bg_inflight_does_not_corrupt_task_state(mock_start_task)
             # affected.
             background_task_manager.running_tasks.pop(task_id, None)
             fake_inflight.cancel()
+            loop.run_until_complete(
+                asyncio.gather(fake_inflight, return_exceptions=True)
+            )
     finally:
         loop.close()
 
@@ -3346,3 +3369,205 @@ def test_append_message_clears_stale_output_for_sdk_caller(mock_start_task):
         assert task_after.error_message is None
     finally:
         db.close()
+
+
+# ===== Turn-start database boundary =====
+
+
+@pytest.fixture()
+def single_connection_turn_db(tmp_path, monkeypatch):
+    """Real one-slot pool shared by sequential worker-owned Sessions."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'v1-turn-boundary.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.15,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_local = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
+
+    with session_local() as db:
+        user = User(
+            username="v1-turn-boundary-owner",
+            password_hash="hash",
+            is_admin=False,
+        )
+        db.add(user)
+        db.flush()
+        agent = Agent(
+            user_id=int(user.id),
+            name="V1 turn boundary agent",
+            description="test",
+            instructions="test",
+            execution_mode="balanced",
+            models={},
+            knowledge_bases=[],
+            skills=[],
+            tool_categories=[],
+            suggested_prompts=[],
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        identity = _detached_agent_identity(agent)
+    try:
+        yield engine, session_local, identity
+    finally:
+        engine.dispose()
+
+
+async def _run_with_ticker(awaitable):
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await awaitable
+    finally:
+        ticker_stop.set()
+        await ticker_task
+    return result, ticks
+
+
+def _observe_turn_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    engine,
+) -> list[int]:
+    checked_out: list[int] = []
+    original = task_orchestrator_module._begin_turn_atomic_sync
+
+    def observed(*args, **kwargs):
+        checked_out.append(engine.pool.checkedout())
+        time.sleep(0.05)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_begin_turn_atomic_sync",
+        observed,
+    )
+    return checked_out
+
+
+def _observe_sdk_prepare_checkout(
+    monkeypatch: pytest.MonkeyPatch,
+    engine,
+    function_name: str,
+) -> list[int]:
+    """Delay one sync prepare unit and prove it runs off the event loop."""
+
+    checked_out: list[int] = []
+    original = getattr(v1_tasks, function_name)
+
+    def observed(*args, **kwargs):
+        checked_out.append(engine.pool.checkedout())
+        time.sleep(0.05)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(v1_tasks, function_name, observed)
+    return checked_out
+
+
+def _detached_agent_identity(agent: Agent) -> AgentApiIdentity:
+    raw_categories = agent.tool_categories
+    return AgentApiIdentity(
+        agent_id=int(agent.id),
+        user_id=int(agent.user_id),
+        execution_mode=str(agent.execution_mode),
+        tool_categories=(
+            tuple(raw_categories) if isinstance(raw_categories, list) else None
+        ),
+        status=str(getattr(agent.status, "value", agent.status)),
+        origin=str(agent.origin),
+        key_prefix="abc123",
+    )
+
+
+@pytest.mark.asyncio
+async def test_create_task_prepare_and_begin_turn_use_worker_owned_connection(
+    single_connection_turn_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, _session_local, identity = single_connection_turn_db
+    prepare_checked_out = _observe_sdk_prepare_checkout(
+        monkeypatch,
+        engine,
+        "prepare_create_sdk_task_sync",
+    )
+    turn_checked_out = _observe_turn_checkout(monkeypatch, engine)
+    monkeypatch.setattr(v1_tasks, "record_key_usage", AsyncMock())
+
+    response, ticks = await _run_with_ticker(
+        v1_tasks.create_chat_task(
+            CreateTaskRequest(
+                agent_id=identity.agent_id,
+                message={"role": "user", "content": "hello"},
+            ),
+            identity,
+        )
+    )
+
+    assert response.status == TaskStatus.RUNNING.value
+    assert prepare_checked_out == [0]
+    assert turn_checked_out == [0]
+    assert ticks >= 6, "task preparation or turn startup blocked the event loop"
+
+
+@pytest.mark.asyncio
+async def test_append_task_prepare_and_begin_turn_use_worker_owned_connection(
+    single_connection_turn_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, session_local, identity = single_connection_turn_db
+    with session_local() as db:
+        task = Task(
+            user_id=identity.user_id,
+            title="existing sdk task",
+            description="first",
+            status=TaskStatus.COMPLETED,
+            agent_id=identity.agent_id,
+            input="first",
+            source="sdk",
+            is_visible=False,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    prepare_checked_out = _observe_sdk_prepare_checkout(
+        monkeypatch,
+        engine,
+        "prepare_append_sdk_task_sync",
+    )
+    turn_checked_out = _observe_turn_checkout(monkeypatch, engine)
+    monkeypatch.setattr(v1_tasks, "record_key_usage", AsyncMock())
+
+    response, ticks = await _run_with_ticker(
+        v1_tasks.append_message_to_task(
+            task_id,
+            AppendMessageRequest(
+                agent_id=identity.agent_id,
+                message={"role": "user", "content": "second"},
+            ),
+            identity,
+        )
+    )
+
+    assert response.status == TaskStatus.RUNNING.value
+    assert prepare_checked_out == [0]
+    assert turn_checked_out == [0]
+    assert ticks >= 6, "task preparation or turn startup blocked the event loop"

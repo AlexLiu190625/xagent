@@ -264,7 +264,8 @@ def _usage_snapshot(prefix: str):
         db.close()
 
 
-def test_record_key_usage_skips_revoked_key():
+@pytest.mark.asyncio
+async def test_record_key_usage_skips_revoked_key():
     """Direct-call test for the defense-in-depth guard in ``record_key_usage``.
 
     Both real call sites (create task / append message) are gated by
@@ -287,11 +288,12 @@ def test_record_key_usage_skips_revoked_key():
         db.close()
 
     before = _usage_snapshot(prefix)
-    record_key_usage(prefix)
+    await record_key_usage(prefix)
     assert _usage_snapshot(prefix) == before
 
 
-def test_record_key_usage_skips_paused_key():
+@pytest.mark.asyncio
+async def test_record_key_usage_skips_paused_key():
     from xagent.web.api.v1.deps import record_key_usage
     from xagent.web.models.agent_api_key import AgentApiKey
 
@@ -306,17 +308,18 @@ def test_record_key_usage_skips_paused_key():
         db.close()
 
     before = _usage_snapshot(prefix)
-    record_key_usage(prefix)
+    await record_key_usage(prefix)
     assert _usage_snapshot(prefix) == before
 
 
-def test_record_key_usage_updates_active_key():
+@pytest.mark.asyncio
+async def test_record_key_usage_updates_active_key():
     """Sanity counterpart: the guard doesn't block a legitimately active key."""
     from xagent.web.api.v1.deps import record_key_usage
 
     _agent_id, _full_key, prefix = _create_agent_and_key()
 
-    record_key_usage(prefix)
+    await record_key_usage(prefix)
 
     last_used_at, usage_month, usage_month_calls = _usage_snapshot(prefix)
     assert last_used_at is not None
@@ -388,7 +391,7 @@ def test_internal_exception_returns_v1_envelope_not_fastapi_detail():
     """
     secret_internal_msg = "secret-internal-detail-do-not-leak"
     with patch(
-        "xagent.web.api.v1.deps.parse_api_key",
+        "xagent.web.services.api_keys.parse_api_key",
         side_effect=RuntimeError(secret_internal_msg),
     ):
         resp = client.get(

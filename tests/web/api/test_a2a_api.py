@@ -1,20 +1,37 @@
+import asyncio
 import json
+import threading
+import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from fastapi import Request
+from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.web.api import a2a as a2a_api
-from xagent.web.models.agent import Agent
+from xagent.web.models import database as database_module
+from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.agent_api_key import AgentApiKey
+from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.user import User
 from xagent.web.services.a2a_protocol import A2A_MAX_MESSAGE_TEXT_LENGTH
+from xagent.web.services.api_keys import AgentApiIdentity
 from xagent.web.services.task_command_transport import (
+    COMMAND_COMPLETED,
     COMMAND_FAILED,
     MAX_COMMAND_DEFERS,
     MAX_COMMAND_FAILURES,
+)
+from xagent.web.services.task_lease_service import (
+    TaskLease,
+    TaskLeaseHeartbeatOutcome,
 )
 from xagent.web.services.task_orchestrator import TaskTurnError
 
@@ -28,6 +45,99 @@ def _bearer(full_key: str) -> dict[str, str]:
         "Authorization": f"Bearer {full_key}",
         "A2A-Version": "1.0",
     }
+
+
+def _request_with_json(path: str, payload: dict[str, object]) -> Request:
+    body = json.dumps(payload).encode()
+    delivered = False
+
+    async def receive() -> dict[str, object]:
+        nonlocal delivered
+        if delivered:
+            return {"type": "http.disconnect"}
+        delivered = True
+        return {"type": "http.request", "body": body, "more_body": False}
+
+    return Request(
+        {
+            "type": "http",
+            "http_version": "1.1",
+            "method": "POST",
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode(),
+            "query_string": b"",
+            "headers": [],
+            "client": ("127.0.0.1", 1),
+            "server": ("testserver", 80),
+        },
+        receive,
+    )
+
+
+def _detached_identity(agent: Agent, key: AgentApiKey) -> AgentApiIdentity:
+    raw_categories = agent.tool_categories
+    return AgentApiIdentity(
+        agent_id=int(agent.id),
+        user_id=int(agent.user_id),
+        execution_mode=(
+            str(agent.execution_mode) if agent.execution_mode is not None else None
+        ),
+        tool_categories=(
+            tuple(raw_categories) if isinstance(raw_categories, list) else None
+        ),
+        status=str(getattr(agent.status, "value", agent.status)),
+        origin=str(agent.origin),
+        key_prefix=str(key.key_prefix),
+    )
+
+
+@pytest.fixture()
+def single_connection_a2a_db(tmp_path, monkeypatch: pytest.MonkeyPatch):
+    """Real one-slot pool shared by an A2A request and runtime workers."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'a2a-turn-boundary.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.15,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_local = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
+
+    db = session_local()
+    user = User(
+        username="a2a-turn-boundary-owner",
+        password_hash="hash",
+        is_admin=False,
+    )
+    db.add(user)
+    db.flush()
+    agent = Agent(
+        user_id=int(user.id),
+        name="A2A turn boundary agent",
+        description="test",
+        instructions="test",
+        execution_mode="balanced",
+        models={},
+        knowledge_bases=[],
+        skills=[],
+        tool_categories=[],
+        suggested_prompts=[],
+        status=AgentStatus.PUBLISHED,
+    )
+    db.add(agent)
+    db.commit()
+    db.refresh(agent)
+    key = SimpleNamespace(key_prefix="a2atest")
+    try:
+        yield engine, db, agent, key
+    finally:
+        db.close()
+        engine.dispose()
 
 
 def _create_agent(headers: dict[str, str], name: str = "A2A Test Agent") -> int:
@@ -187,6 +297,202 @@ def test_message_send_creates_hidden_a2a_task() -> None:
 
     assert schedule_bg.call_count == 1
     assert schedule_bg.call_args.kwargs["task_id"] == int(task["id"])
+
+
+@pytest.mark.asyncio
+async def test_message_send_releases_one_slot_request_pool_before_turn_start(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A2A startup must not pin the request checkout needed by the worker."""
+
+    engine, db, agent, key = single_connection_a2a_db
+    from xagent.web.services import task_orchestrator as orchestrator_module
+
+    observed_checked_out: list[int] = []
+    original_begin = a2a_api.TaskTurnOrchestrator.create_and_begin_turn
+    original_atomic = orchestrator_module._create_turn_atomic_sync
+
+    async def observed_begin(**kwargs: object) -> object:
+        observed_checked_out.append(engine.pool.checkedout())
+        return await original_begin(**kwargs)  # type: ignore[arg-type]
+
+    def slow_atomic(*args: object, **kwargs: object) -> object:
+        time.sleep(0.05)
+        return original_atomic(*args, **kwargs)  # type: ignore[arg-type]
+
+    ticks = 0
+    stop_ticker = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop_ticker.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    monkeypatch.setattr(
+        a2a_api.TaskTurnOrchestrator,
+        "create_and_begin_turn",
+        observed_begin,
+    )
+    monkeypatch.setattr(orchestrator_module, "_create_turn_atomic_sync", slow_atomic)
+    monkeypatch.setattr(a2a_api, "record_key_usage", AsyncMock())
+    identity = _detached_identity(agent, key)
+    db.close()
+
+    path = f"/api/a2a/agents/{int(agent.id)}/message:send"
+    request = _request_with_json(
+        path,
+        {
+            "message": {
+                "messageId": "msg-one-slot",
+                "role": "ROLE_USER",
+                "parts": [{"text": "keep the request pool free"}],
+            },
+            "configuration": {"returnImmediately": True},
+        },
+    )
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        with patch(
+            "xagent.web.services.task_orchestrator._schedule_bg",
+            new=MagicMock(),
+        ):
+            response = await a2a_api.send_message(
+                int(agent.id),
+                request,
+                identity,
+            )
+    finally:
+        stop_ticker.set()
+        await ticker_task
+
+    assert response.status_code == 200
+    assert observed_checked_out == [0]
+    assert ticks >= 3, "A2A turn startup blocked the asyncio event loop"
+
+
+@pytest.mark.asyncio
+async def test_create_cancellation_after_commit_drains_turn_start(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancellation drains scheduling after the atomic create commit."""
+
+    _engine, db, agent, _key = single_connection_a2a_db
+    from xagent.web.services import task_orchestrator as orchestrator_module
+
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    db.close()
+
+    committed = threading.Event()
+    allow_worker_return = threading.Event()
+    original_create = orchestrator_module._create_turn_atomic_sync
+
+    def create_then_block(*args: object, **kwargs: object):
+        created = original_create(*args, **kwargs)  # type: ignore[arg-type]
+        committed.set()
+        assert allow_worker_return.wait(timeout=1.0)
+        return created
+
+    monkeypatch.setattr(
+        orchestrator_module,
+        "_create_turn_atomic_sync",
+        create_then_block,
+    )
+
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ) as schedule_bg:
+        request_task = asyncio.create_task(
+            a2a_api._start_a2a_turn(
+                agent_id=agent_id,
+                task_owner_user_id=owner_id,
+                execution_mode="balanced",
+                text="cancel after commit",
+                message_id="msg-cancel-after-commit",
+                context_id="ctx-cancel-after-commit",
+                task_id=None,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(committed.wait, 1.0)
+            with database_module.get_session_local()() as verify_db:
+                started = verify_db.query(Task).filter(Task.source == "a2a").one()
+                assert started.status == TaskStatus.RUNNING
+
+            request_task.cancel()
+            await asyncio.sleep(0)
+            assert not request_task.done()
+        finally:
+            allow_worker_return.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await request_task
+
+    with database_module.get_session_local()() as verify_db:
+        pending = (
+            verify_db.query(Task)
+            .filter(Task.source == "a2a", Task.status == TaskStatus.PENDING)
+            .count()
+        )
+        assert pending == 0
+        started = verify_db.query(Task).filter(Task.source == "a2a").one()
+        assert started.status == TaskStatus.RUNNING
+
+    schedule_bg.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_wait_poll_checkout_does_not_block_the_event_loop(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A contended A2A status poll belongs on a worker, not the main loop."""
+
+    engine, db, agent, _key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    db.close()
+    held_connection = engine.connect()
+    task = Task(
+        id=999,
+        user_id=owner_id,
+        title="poll boundary",
+        status=TaskStatus.RUNNING,
+        agent_id=agent_id,
+        source="a2a",
+        agent_config={"a2a_context_id": "ctx-poll-boundary"},
+    )
+    monkeypatch.setattr(a2a_api, "A2A_BLOCKING_WAIT_TIMEOUT_SECONDS", 1.0)
+
+    tick_times: list[float] = []
+    stop_ticker = asyncio.Event()
+
+    async def ticker() -> None:
+        while not stop_ticker.is_set():
+            tick_times.append(time.monotonic())
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        with pytest.raises(Exception, match="QueuePool limit"):
+            await a2a_api._wait_for_task(agent_id, a2a_api._task_snapshot(task))
+        # Let the ticker record the gap across the failed checkout.
+        await asyncio.sleep(0.02)
+    finally:
+        stop_ticker.set()
+        await ticker_task
+        held_connection.close()
+
+    gaps = [right - left for left, right in zip(tick_times, tick_times[1:])]
+    assert len(tick_times) >= 10
+    assert max(gaps, default=0.0) < 0.08, (
+        "A2A polling performed the QueuePool wait on the asyncio event loop"
+    )
 
 
 def test_message_send_rejects_key_bound_to_different_agent() -> None:
@@ -351,21 +657,29 @@ def test_a2a_auth_error_includes_bearer_challenge() -> None:
 
 def test_message_send_blocks_by_default_until_task_finishes() -> None:
     agent_id, full_key = _create_published_agent_with_key()
+    original_create = a2a_api.TaskTurnOrchestrator.create_and_begin_turn
 
     async def _complete_turn(**kwargs: object) -> object:
+        started = await original_create(**kwargs)  # type: ignore[arg-type]
         db = _direct_db_session()
         try:
-            row = db.query(Task).filter(Task.id == int(kwargs["task_id"])).one()
+            row = db.query(Task).filter(Task.id == started.task_id).one()
             row.status = TaskStatus.COMPLETED
             row.output = "blocking response"
             db.commit()
         finally:
             db.close()
-        return object()
+        return started
 
-    with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
-        new=_complete_turn,
+    with (
+        patch(
+            "xagent.web.api.a2a.TaskTurnOrchestrator.create_and_begin_turn",
+            new=_complete_turn,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator._schedule_bg",
+            new=MagicMock(),
+        ),
     ):
         response = client.post(
             f"/api/a2a/agents/{agent_id}/message:send",
@@ -415,7 +729,7 @@ def test_failed_create_does_not_leave_pending_a2a_task() -> None:
     agent_id, full_key = _create_published_agent_with_key()
 
     with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        "xagent.web.api.a2a.TaskTurnOrchestrator.create_and_begin_turn",
         side_effect=TaskTurnError("busy"),
     ):
         response = client.post(
@@ -439,11 +753,78 @@ def test_failed_create_does_not_leave_pending_a2a_task() -> None:
         db.close()
 
 
+@pytest.mark.asyncio
+async def test_pool_timeout_during_atomic_turn_create_leaves_no_a2a_task(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed atomic create leaves no task and keeps the event loop live."""
+
+    engine, db, agent, key = single_connection_a2a_db
+    recovery = MagicMock()
+    monkeypatch.setattr(a2a_api, "_recover_failed_turn_start", recovery)
+    monkeypatch.setattr(a2a_api, "record_key_usage", AsyncMock())
+    identity = _detached_identity(agent, key)
+    db.close()
+    held_connection = engine.connect()
+
+    path = f"/api/a2a/agents/{int(agent.id)}/message:send"
+    request = _request_with_json(
+        path,
+        {
+            "message": {
+                "messageId": "msg-pool-timeout",
+                "role": "ROLE_USER",
+                "parts": [{"text": "do not retry the exhausted pool"}],
+            },
+            "configuration": {"returnImmediately": True},
+        },
+    )
+
+    ticks = 0
+    stop_ticker = asyncio.Event()
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop_ticker.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    with patch(
+        "xagent.web.services.task_orchestrator._schedule_bg",
+        new=MagicMock(),
+    ) as schedule_bg:
+        ticker_task = asyncio.create_task(ticker())
+        try:
+            with pytest.raises(SQLAlchemyTimeoutError):
+                await a2a_api.send_message(
+                    int(agent.id),
+                    request,
+                    identity,
+                )
+        finally:
+            held_connection.close()
+            stop_ticker.set()
+            await ticker_task
+
+    with database_module.get_session_local()() as verify_db:
+        pending = (
+            verify_db.query(Task)
+            .filter(Task.source == "a2a", Task.status == TaskStatus.PENDING)
+            .count()
+        )
+        assert pending == 0
+
+    assert ticks >= 5, "pool checkout blocked the asyncio event loop"
+    recovery.assert_not_called()
+    schedule_bg.assert_not_called()
+
+
 def test_unexpected_a2a_error_uses_internal_protocol_envelope() -> None:
     agent_id, full_key = _create_published_agent_with_key()
 
     with patch(
-        "xagent.web.api.a2a.TaskTurnOrchestrator.begin_turn",
+        "xagent.web.api.a2a.TaskTurnOrchestrator.create_and_begin_turn",
         side_effect=RuntimeError("sensitive implementation detail"),
     ):
         response = client.post(
@@ -589,7 +970,7 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
     assert response.json()["task"]["contextId"] == "ctx-follow-up"
     assert response.json()["task"]["status"]["state"] == "TASK_STATE_WORKING"
     agent_service.post_user_message.assert_awaited_once_with(
-        task_id,
+        str(task_id),
         execution_message="follow up",
         display_message="follow up",
         turn_id=f"a2a:{task_id}:msg-follow-up",
@@ -605,6 +986,545 @@ def test_follow_up_infers_context_for_input_required_task() -> None:
         assert resumed.input == "follow up"
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_waiting_resume_uses_one_offloop_scope_and_no_request_session(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Checkpoint resume passes one frozen setup/scope into the live runtime."""
+
+    _engine, db, agent, key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    waiting = Task(
+        user_id=owner_id,
+        title="waiting boundary",
+        status=TaskStatus.WAITING_FOR_USER,
+        agent_id=agent_id,
+        source="a2a",
+        is_visible=False,
+        agent_config={"a2a_context_id": "ctx-waiting-boundary"},
+    )
+    db.add(waiting)
+    db.commit()
+    db.refresh(waiting)
+    task_id = int(waiting.id)
+    identity = _detached_identity(agent, key)
+    db.close()
+
+    main_thread = threading.get_ident()
+    scope = object()
+    setup_snapshot = SimpleNamespace(runtime_user=SimpleNamespace(id=owner_id))
+    scope_threads: list[int] = []
+    snapshot_threads: list[int] = []
+
+    def resolve_scope(resolved_task_id: int) -> object:
+        assert resolved_task_id == task_id
+        scope_threads.append(threading.get_ident())
+        return scope
+
+    def load_snapshot(resolved_task_id: int, user_id: int):
+        assert (resolved_task_id, user_id) == (task_id, owner_id)
+        snapshot_threads.append(threading.get_ident())
+        return setup_snapshot
+
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    schedule_resume = MagicMock()
+
+    monkeypatch.setattr(
+        a2a_api,
+        "resolve_execution_scope",
+        resolve_scope,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        a2a_api,
+        "load_task_setup_snapshot_sync",
+        load_snapshot,
+        raising=False,
+    )
+    monkeypatch.setattr(a2a_api, "_schedule_waiting_a2a_resume", schedule_resume)
+    monkeypatch.setattr(a2a_api, "record_key_usage", AsyncMock())
+
+    path = f"/api/a2a/agents/{agent_id}/message:send"
+    request = _request_with_json(
+        path,
+        {
+            "message": {
+                "messageId": "msg-waiting-boundary",
+                "taskId": task_id,
+                "role": "ROLE_USER",
+                "parts": [{"text": "resume safely"}],
+            },
+            "configuration": {"returnImmediately": True},
+        },
+    )
+
+    with patch(
+        "xagent.web.api.chat.get_agent_manager",
+        return_value=agent_manager,
+    ):
+        response = await a2a_api.send_message(
+            agent_id,
+            request,
+            identity,
+        )
+
+    assert response.status_code == 200
+    assert scope_threads and all(thread != main_thread for thread in scope_threads)
+    assert snapshot_threads and all(
+        thread != main_thread for thread in snapshot_threads
+    )
+    assert len(scope_threads) == 1
+    assert len(snapshot_threads) == 1
+    manager_args = agent_manager.get_agent_for_task.await_args.args
+    manager_kwargs = agent_manager.get_agent_for_task.await_args.kwargs
+    assert manager_args[:2] == (task_id, None)
+    assert manager_kwargs["task_setup_snapshot"] is setup_snapshot
+    assert manager_kwargs["resolved_execution_scope"] is scope
+    assert schedule_resume.call_args.kwargs["resolved_execution_scope"] is scope
+
+
+@pytest.mark.asyncio
+async def test_waiting_resume_cancellation_drains_finalize_before_schedule(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A cancelled request cannot strand a committed resume claim."""
+
+    _engine, db, agent, _key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    waiting = Task(
+        user_id=owner_id,
+        title="waiting cancellation",
+        status=TaskStatus.WAITING_FOR_USER,
+        agent_id=agent_id,
+        source="a2a",
+        is_visible=False,
+        agent_config={"a2a_context_id": "ctx-waiting-cancel"},
+    )
+    db.add(waiting)
+    db.commit()
+    db.refresh(waiting)
+    task_id = int(waiting.id)
+    db.close()
+
+    setup_snapshot = SimpleNamespace(runtime_user=SimpleNamespace(id=owner_id))
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    finalize_started = threading.Event()
+    allow_finalize = threading.Event()
+    schedule_resume = MagicMock()
+    original_finalize = a2a_api._finalize_waiting_a2a_resume
+
+    def delayed_finalize(**kwargs):
+        finalize_started.set()
+        assert allow_finalize.wait(timeout=1.0)
+        return original_finalize(**kwargs)
+
+    monkeypatch.setattr(a2a_api, "resolve_execution_scope", lambda _task_id: None)
+    monkeypatch.setattr(
+        a2a_api,
+        "load_task_setup_snapshot_sync",
+        lambda _task_id, _owner_id: setup_snapshot,
+    )
+    monkeypatch.setattr(
+        a2a_api,
+        "_finalize_waiting_a2a_resume",
+        delayed_finalize,
+    )
+    monkeypatch.setattr(a2a_api, "_schedule_waiting_a2a_resume", schedule_resume)
+
+    with patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager):
+        resume = asyncio.create_task(
+            a2a_api._resume_waiting_a2a_task(
+                task_id=task_id,
+                agent_id=agent_id,
+                task_owner_user_id=owner_id,
+                text="resume after cancellation",
+                message_id="msg-waiting-cancel",
+            )
+        )
+        assert await asyncio.to_thread(finalize_started.wait, 1.0)
+        resume.cancel()
+        allow_finalize.set()
+        with pytest.raises(asyncio.CancelledError):
+            await resume
+
+    schedule_resume.assert_called_once()
+    with database_module.get_session_local()() as verify_db:
+        claimed = verify_db.query(Task).filter(Task.id == task_id).one()
+        assert claimed.status == TaskStatus.RUNNING
+        assert claimed.runner_id is not None
+        assert claimed.run_id is not None
+        assert claimed.lease_expires_at is not None
+        assert schedule_resume.call_args.kwargs["run_id"] == claimed.run_id
+
+
+@pytest.mark.asyncio
+async def test_waiting_resume_finalize_pool_timeout_retains_fenced_lease(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A pool timeout retains the exact claim for TTL without another checkout."""
+
+    _engine, db, agent, _key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    waiting = Task(
+        user_id=owner_id,
+        title="waiting pool timeout",
+        status=TaskStatus.WAITING_FOR_USER,
+        agent_id=agent_id,
+        source="a2a",
+        is_visible=False,
+        agent_config={"a2a_context_id": "ctx-waiting-pool-timeout"},
+    )
+    db.add(waiting)
+    db.commit()
+    db.refresh(waiting)
+    task_id = int(waiting.id)
+    db.close()
+
+    setup_snapshot = SimpleNamespace(runtime_user=SimpleNamespace(id=owner_id))
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    restore_claim = MagicMock()
+    schedule_resume = MagicMock()
+
+    monkeypatch.setattr(a2a_api, "resolve_execution_scope", lambda _task_id: None)
+    monkeypatch.setattr(
+        a2a_api,
+        "load_task_setup_snapshot_sync",
+        lambda _task_id, _owner_id: setup_snapshot,
+    )
+    monkeypatch.setattr(
+        a2a_api,
+        "_finalize_waiting_a2a_resume",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            SQLAlchemyTimeoutError("QueuePool limit reached")
+        ),
+    )
+    monkeypatch.setattr(a2a_api, "_restore_waiting_resume_claim", restore_claim)
+    monkeypatch.setattr(a2a_api, "_schedule_waiting_a2a_resume", schedule_resume)
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        pytest.raises(SQLAlchemyTimeoutError, match="QueuePool limit"),
+    ):
+        await a2a_api._resume_waiting_a2a_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            task_owner_user_id=owner_id,
+            text="resume during pool exhaustion",
+            message_id="msg-waiting-pool-timeout",
+        )
+
+    restore_claim.assert_not_called()
+    schedule_resume.assert_not_called()
+    with database_module.get_session_local()() as verify_db:
+        claimed = verify_db.query(Task).filter(Task.id == task_id).one()
+        assert claimed.status == TaskStatus.RUNNING
+        assert claimed.runner_id is not None
+        assert claimed.run_id is not None
+        assert claimed.lease_expires_at is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("heartbeat_outcome", "expected_exception", "expected_match"),
+    [
+        (
+            TaskLeaseHeartbeatOutcome(lease_lost=True),
+            RuntimeError,
+            "lease heartbeat lost",
+        ),
+        (
+            TaskLeaseHeartbeatOutcome(
+                pool_timeout=SQLAlchemyTimeoutError("heartbeat pool timeout")
+            ),
+            SQLAlchemyTimeoutError,
+            "heartbeat pool timeout",
+        ),
+    ],
+)
+async def test_waiting_resume_heartbeat_starts_before_post_and_unhealthy_lease_stops_work(
+    monkeypatch: pytest.MonkeyPatch,
+    heartbeat_outcome: TaskLeaseHeartbeatOutcome,
+    expected_exception: type[BaseException],
+    expected_match: str,
+) -> None:
+    """A slow checkpoint post must stay fenced until finalize and schedule."""
+
+    task_id = 701
+    agent_id = 702
+    owner_id = 703
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="a2a-resume-runner",
+        run_id="a2a-resume-run",
+    )
+    heartbeat_started = asyncio.Event()
+
+    async def lost_heartbeat(
+        heartbeat_lease: TaskLease,
+        stop_event: asyncio.Event,
+    ) -> TaskLeaseHeartbeatOutcome:
+        assert heartbeat_lease == lease
+        heartbeat_started.set()
+        await stop_event.wait()
+        return heartbeat_outcome
+
+    async def post_user_message(*_args, **_kwargs) -> bool:
+        assert heartbeat_started.is_set(), (
+            "lease heartbeat started after external await"
+        )
+        return True
+
+    setup_snapshot = SimpleNamespace(runtime_user=SimpleNamespace(id=owner_id))
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(side_effect=post_user_message)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    finalize = MagicMock()
+    restore = MagicMock()
+    schedule = MagicMock()
+
+    monkeypatch.setattr(a2a_api, "resolve_execution_scope", lambda _task_id: None)
+    monkeypatch.setattr(
+        a2a_api,
+        "load_task_setup_snapshot_sync",
+        lambda _task_id, _owner_id: setup_snapshot,
+    )
+    monkeypatch.setattr(
+        a2a_api,
+        "_claim_waiting_a2a_resume",
+        lambda _task_id, _agent_id: lease,
+    )
+    monkeypatch.setattr(
+        a2a_api, "run_task_lease_heartbeat", lost_heartbeat, raising=False
+    )
+    monkeypatch.setattr(a2a_api, "_finalize_waiting_a2a_resume", finalize)
+    monkeypatch.setattr(a2a_api, "_restore_waiting_resume_claim", restore)
+    monkeypatch.setattr(a2a_api, "_schedule_waiting_a2a_resume", schedule)
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        pytest.raises(expected_exception, match=expected_match),
+    ):
+        await a2a_api._resume_waiting_a2a_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            task_owner_user_id=owner_id,
+            text="slow checkpoint response",
+            message_id="message-with-live-lease",
+        )
+
+    finalize.assert_not_called()
+    restore.assert_not_called()
+    schedule.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_waiting_resume_schedule_failure_restores_exact_claim(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local scheduling failure releases only this resume's exact lease."""
+
+    _engine, db, agent, _key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    waiting = Task(
+        user_id=owner_id,
+        title="waiting schedule failure",
+        status=TaskStatus.WAITING_FOR_USER,
+        agent_id=agent_id,
+        source="a2a",
+        is_visible=False,
+        agent_config={"a2a_context_id": "ctx-waiting-schedule-failure"},
+    )
+    db.add(waiting)
+    db.commit()
+    db.refresh(waiting)
+    task_id = int(waiting.id)
+    db.close()
+
+    setup_snapshot = SimpleNamespace(runtime_user=SimpleNamespace(id=owner_id))
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+
+    monkeypatch.setattr(a2a_api, "resolve_execution_scope", lambda _task_id: None)
+    monkeypatch.setattr(
+        a2a_api,
+        "load_task_setup_snapshot_sync",
+        lambda _task_id, _owner_id: setup_snapshot,
+    )
+    monkeypatch.setattr(
+        a2a_api,
+        "_schedule_waiting_a2a_resume",
+        MagicMock(side_effect=RuntimeError("scheduler unavailable")),
+    )
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        pytest.raises(RuntimeError, match="scheduler unavailable"),
+    ):
+        await a2a_api._resume_waiting_a2a_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            task_owner_user_id=owner_id,
+            text="resume before scheduling",
+            message_id="msg-waiting-schedule-failure",
+        )
+
+    with database_module.get_session_local()() as verify_db:
+        restored = verify_db.query(Task).filter(Task.id == task_id).one()
+        assert restored.status == TaskStatus.WAITING_FOR_USER
+        assert restored.runner_id is None
+        assert restored.lease_expires_at is None
+
+
+@pytest.mark.asyncio
+async def test_waiting_resume_recovery_does_not_overwrite_replacement_owner(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Late recovery is fenced by both runner_id and run_id."""
+
+    _engine, db, agent, _key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    waiting = Task(
+        user_id=owner_id,
+        title="waiting replacement owner",
+        status=TaskStatus.WAITING_FOR_USER,
+        agent_id=agent_id,
+        source="a2a",
+        is_visible=False,
+        agent_config={"a2a_context_id": "ctx-waiting-replacement-owner"},
+    )
+    db.add(waiting)
+    db.commit()
+    db.refresh(waiting)
+    task_id = int(waiting.id)
+    db.close()
+
+    setup_snapshot = SimpleNamespace(runtime_user=SimpleNamespace(id=owner_id))
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=True)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+
+    def replace_owner_then_fail(**_kwargs) -> None:
+        with database_module.get_session_local()() as replacement_db:
+            replacement = replacement_db.query(Task).filter(Task.id == task_id).one()
+            replacement.runner_id = "replacement-runner"
+            replacement.run_id = "replacement-run"
+            replacement_db.commit()
+        raise RuntimeError("scheduler unavailable after replacement")
+
+    monkeypatch.setattr(a2a_api, "resolve_execution_scope", lambda _task_id: None)
+    monkeypatch.setattr(
+        a2a_api,
+        "load_task_setup_snapshot_sync",
+        lambda _task_id, _owner_id: setup_snapshot,
+    )
+    monkeypatch.setattr(
+        a2a_api,
+        "_schedule_waiting_a2a_resume",
+        replace_owner_then_fail,
+    )
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        pytest.raises(RuntimeError, match="scheduler unavailable after replacement"),
+    ):
+        await a2a_api._resume_waiting_a2a_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            task_owner_user_id=owner_id,
+            text="resume before ownership change",
+            message_id="msg-waiting-replacement-owner",
+        )
+
+    with database_module.get_session_local()() as verify_db:
+        replacement = verify_db.query(Task).filter(Task.id == task_id).one()
+        assert replacement.status == TaskStatus.RUNNING
+        assert replacement.runner_id == "replacement-runner"
+        assert replacement.run_id == "replacement-run"
+        assert replacement.lease_expires_at is not None
+
+
+@pytest.mark.asyncio
+async def test_waiting_resume_without_checkpoint_releases_lease_for_fallback(
+    single_connection_a2a_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """posted=False leaves a clean PAUSED row for the APPEND fallback."""
+
+    _engine, db, agent, _key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    waiting = Task(
+        user_id=owner_id,
+        title="waiting missing checkpoint",
+        status=TaskStatus.WAITING_FOR_USER,
+        agent_id=agent_id,
+        source="a2a",
+        is_visible=False,
+        agent_config={"a2a_context_id": "ctx-waiting-missing-checkpoint"},
+    )
+    db.add(waiting)
+    db.commit()
+    db.refresh(waiting)
+    task_id = int(waiting.id)
+    db.close()
+
+    setup_snapshot = SimpleNamespace(runtime_user=SimpleNamespace(id=owner_id))
+    agent_service = MagicMock()
+    agent_service.post_user_message = AsyncMock(return_value=False)
+    agent_manager = MagicMock()
+    agent_manager.get_agent_for_task = AsyncMock(return_value=agent_service)
+    schedule_resume = MagicMock()
+
+    monkeypatch.setattr(a2a_api, "resolve_execution_scope", lambda _task_id: None)
+    monkeypatch.setattr(
+        a2a_api,
+        "load_task_setup_snapshot_sync",
+        lambda _task_id, _owner_id: setup_snapshot,
+    )
+    monkeypatch.setattr(a2a_api, "_schedule_waiting_a2a_resume", schedule_resume)
+
+    with patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager):
+        posted, finalized = await a2a_api._resume_waiting_a2a_task(
+            task_id=task_id,
+            agent_id=agent_id,
+            task_owner_user_id=owner_id,
+            text="fallback to a fresh turn",
+            message_id="msg-waiting-missing-checkpoint",
+        )
+
+    assert posted is False
+    assert finalized.status == TaskStatus.PAUSED
+    schedule_resume.assert_not_called()
+    with database_module.get_session_local()() as verify_db:
+        fallback = verify_db.query(Task).filter(Task.id == task_id).one()
+        assert fallback.status == TaskStatus.PAUSED
+        assert fallback.runner_id is None
+        assert fallback.lease_expires_at is None
 
 
 def test_failed_follow_up_restores_input_required_status() -> None:
@@ -849,13 +1769,13 @@ async def test_stream_artifact_updates_are_incremental_and_finalize(
         return None
 
     monkeypatch.setattr(a2a_api.asyncio, "sleep", no_sleep)
-    monkeypatch.setattr(
-        a2a_api,
-        "_fetch_fresh_a2a_task",
-        lambda _agent_id, _task_id: next(fresh_tasks),
-    )
 
-    response = a2a_api._task_stream_response(SimpleNamespace(id=7), task)
+    async def fetch_fresh(_agent_id: int, _task_id: int):
+        return a2a_api._task_snapshot(next(fresh_tasks))
+
+    monkeypatch.setattr(a2a_api, "_fetch_fresh_a2a_task", fetch_fresh)
+
+    response = a2a_api._task_stream_response(7, a2a_api._task_snapshot(task))
     events = [
         json.loads(chunk.removeprefix("data: "))
         async for chunk in response.body_iterator
@@ -911,6 +1831,70 @@ def test_cancel_is_idempotent_and_subscribe_rejects_terminal_task() -> None:
     assert second.json()["status"]["state"] == "TASK_STATE_CANCELED"
     assert subscribed.status_code == 400
     assert subscribed.json()["error"]["details"][0]["reason"] == "UNSUPPORTED_OPERATION"
+
+
+@pytest.mark.asyncio
+async def test_cancel_existing_command_releases_request_session_before_poll(
+    single_connection_a2a_db,
+) -> None:
+    """An idempotent cancel must not pin the only connection while polling."""
+
+    engine, db, agent, key = single_connection_a2a_db
+    agent_id = int(agent.id)
+    owner_id = int(agent.user_id)
+    task = Task(
+        user_id=owner_id,
+        title="already canceled",
+        status=TaskStatus.FAILED,
+        agent_id=agent_id,
+        source="a2a",
+        is_visible=False,
+        state_version=7,
+        agent_config={
+            "a2a_context_id": "ctx-existing-cancel",
+            "a2a_state": "TASK_STATE_CANCELED",
+        },
+    )
+    db.add(task)
+    db.commit()
+    db.refresh(task)
+    task_id = int(task.id)
+    command_identity = f"cancel:{task_id}:7"
+    db.add(
+        TaskExecutionCommand(
+            task_id=task_id,
+            actor_user_id=owner_id,
+            command_id=command_identity,
+            kind="cancel",
+            payload={"agent_id": agent_id},
+            status=COMMAND_COMPLETED,
+        )
+    )
+    db.commit()
+    identity = _detached_identity(agent, key)
+    db.close()
+
+    checked_out_at_dispatch: list[int] = []
+
+    async def observe_dispatch(_executor, *, command_db_id=None):
+        checked_out_at_dispatch.append(engine.pool.checkedout())
+        return False
+
+    with patch.object(
+        a2a_api,
+        "dispatch_one_task_command",
+        new=observe_dispatch,
+    ):
+        response = await a2a_api.cancel_task(
+            agent_id,
+            task_id,
+            identity,
+        )
+
+    assert response.status_code == 200
+    assert checked_out_at_dispatch == [0]
+    assert response.body is not None
+    assert json.loads(response.body)["status"]["state"] == "TASK_STATE_CANCELED"
 
 
 def test_cancel_retries_a_previous_terminal_transport_failure() -> None:
@@ -1067,8 +2051,7 @@ async def test_cancel_does_not_overwrite_a_concurrent_completion() -> None:
         ):
             await a2a_api._cancel_task_unserialized(
                 task_id=task_id,
-                agent=agent,
-                db=db,
+                agent_id=agent_id,
             )
 
         db.expire_all()

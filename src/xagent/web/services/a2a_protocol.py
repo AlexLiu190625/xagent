@@ -310,9 +310,9 @@ def message_task_id(message: Mapping[str, Any], body: Mapping[str, Any]) -> int 
     )
 
 
-def task_context_id(task: Task) -> str:
-    agent_config: dict[str, Any] = (
-        task.agent_config if isinstance(task.agent_config, dict) else {}
+def task_context_id(task: Any) -> str:
+    agent_config: Mapping[str, Any] = (
+        task.agent_config if isinstance(task.agent_config, Mapping) else {}
     )
     context_id = agent_config.get("a2a_context_id")
     if isinstance(context_id, str) and context_id:
@@ -320,7 +320,7 @@ def task_context_id(task: Task) -> str:
     return str(task.id)
 
 
-def task_to_a2a(task: Task, *, include_artifacts: bool = True) -> dict[str, Any]:
+def task_to_a2a(task: Any, *, include_artifacts: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {
         "id": str(task.id),
         "contextId": task_context_id(task),
@@ -344,11 +344,11 @@ def task_to_a2a(task: Task, *, include_artifacts: bool = True) -> dict[str, Any]
 
 
 def task_state(task_or_status: Task | Any) -> str:
-    task = task_or_status if isinstance(task_or_status, Task) else None
+    task = task_or_status if hasattr(task_or_status, "status") else None
     status = task.status if task is not None else task_or_status
     if task is not None:
-        agent_config: dict[str, Any] = (
-            task.agent_config if isinstance(task.agent_config, dict) else {}
+        agent_config: Mapping[str, Any] = (
+            task.agent_config if isinstance(task.agent_config, Mapping) else {}
         )
         override = agent_config.get("a2a_state")
         if override in {
@@ -375,11 +375,11 @@ def task_state(task_or_status: Task | Any) -> str:
     return "TASK_STATE_UNSPECIFIED"
 
 
-def sse_task_snapshot(task: Task) -> str:
+def sse_task_snapshot(task: Any) -> str:
     return _sse_event({"task": task_to_a2a(task)})
 
 
-def sse_task_update(task: Task) -> str:
+def sse_task_update(task: Any) -> str:
     return _sse_event(
         {
             "statusUpdate": {
@@ -392,7 +392,7 @@ def sse_task_update(task: Task) -> str:
 
 
 def sse_task_artifacts(
-    task: Task,
+    task: Any,
     *,
     text: str | None = None,
     append: bool = False,
@@ -418,7 +418,7 @@ def sse_task_artifacts(
     )
 
 
-def _agent_message(content: str, task: Task) -> dict[str, Any]:
+def _agent_message(content: str, task: Any) -> dict[str, Any]:
     return {
         "messageId": f"task-{task.id}-status",
         "contextId": task_context_id(task),

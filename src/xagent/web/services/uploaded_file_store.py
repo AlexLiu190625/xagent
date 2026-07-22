@@ -2,17 +2,140 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
 from ...config import get_storage_root
+from ...core.file_storage import get_user_file_storage
+from ..models.database import get_session_local
 from ..models.uploaded_file import UploadedFile
 from .managed_file_ref import ManagedFileRef, guess_media_type
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PreparedUploadedFile:
+    """Detached durable-upload metadata ready for one database transaction."""
+
+    file_id: str
+    user_id: int
+    task_id: int | None
+    filename: str
+    storage_path: str
+    storage_backend: str | None
+    storage_key: str
+    storage_uri: str | None
+    checksum: str
+    etag: str | None
+    mime_type: str | None
+    file_size: int
+    storage_status: str
+
+
+def prepare_uploaded_file_from_local_path(
+    *,
+    local_path: Path,
+    user_id: int,
+    filename: str,
+    file_id: str,
+    task_id: int | None,
+    mime_type: str | None,
+    storage_key: str | None = None,
+) -> PreparedUploadedFile:
+    """Write one local upload to durable storage without opening a DB session."""
+    record = create_unbound_uploaded_file_from_local_path(
+        local_path=local_path,
+        user_id=user_id,
+        filename=filename,
+        file_id=file_id,
+        task_id=task_id,
+        mime_type=mime_type,
+        storage_key=storage_key,
+    )
+    storage_key = getattr(record, "storage_key", None)
+    checksum = getattr(record, "checksum", None)
+    if not storage_key or not checksum:
+        raise RuntimeError("Durable upload metadata is incomplete")
+    return PreparedUploadedFile(
+        file_id=str(record.file_id),
+        user_id=int(record.user_id),
+        task_id=(None if record.task_id is None else int(record.task_id)),
+        filename=str(record.filename),
+        storage_path=str(record.storage_path),
+        storage_backend=(
+            None
+            if getattr(record, "storage_backend", None) is None
+            else str(record.storage_backend)
+        ),
+        storage_key=str(storage_key),
+        storage_uri=(
+            None
+            if getattr(record, "storage_uri", None) is None
+            else str(record.storage_uri)
+        ),
+        checksum=str(checksum),
+        etag=(None if getattr(record, "etag", None) is None else str(record.etag)),
+        mime_type=(
+            None
+            if getattr(record, "mime_type", None) is None
+            else str(record.mime_type)
+        ),
+        file_size=int(record.file_size),
+        storage_status=str(record.storage_status),
+    )
+
+
+def persist_prepared_uploaded_files(
+    files: Sequence[PreparedUploadedFile],
+) -> tuple[PreparedUploadedFile, ...]:
+    """Persist a prepared batch using a short, worker-owned transaction."""
+    session_factory = get_session_local()
+    with session_factory() as db:
+        try:
+            for item in files:
+                db.add(
+                    UploadedFile(
+                        file_id=item.file_id,
+                        user_id=item.user_id,
+                        task_id=item.task_id,
+                        filename=item.filename,
+                        storage_path=item.storage_path,
+                        storage_backend=item.storage_backend,
+                        storage_key=item.storage_key,
+                        storage_uri=item.storage_uri,
+                        checksum=item.checksum,
+                        etag=item.etag,
+                        mime_type=item.mime_type,
+                        file_size=item.file_size,
+                        storage_status=item.storage_status,
+                    )
+                )
+            db.commit()
+        except BaseException:
+            db.rollback()
+            raise
+    return tuple(files)
+
+
+def delete_prepared_uploaded_files_durable(
+    files: Sequence[PreparedUploadedFile],
+) -> None:
+    """Compensate durable objects for a batch that was not persisted."""
+    delete_durable_upload_keys([(item.user_id, item.storage_key) for item in files])
+
+
+def delete_durable_upload_keys(keys: Sequence[tuple[int, str]]) -> None:
+    """Delete known durable upload keys during transaction compensation."""
+    for user_id, storage_key in keys:
+        try:
+            get_user_file_storage(user_id).delete(storage_key)
+        except Exception:
+            logger.warning("Failed to clean up durable upload: %s", storage_key)
 
 
 def delete_pptx_pdf_cache(file_id: str) -> None:

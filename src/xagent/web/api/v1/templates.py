@@ -1,12 +1,11 @@
 """SDK management endpoints for built-in templates."""
 
-from typing import Any, Tuple
+from typing import Any
 
 from fastapi import APIRouter, Depends, Request
 
-from ...models.user import User
-from ...models.user_api_key import UserApiKey
 from ...schemas.v1 import V1TemplateDetail, V1TemplateSummary
+from ...services.api_keys import PersonalApiIdentity
 from .deps import get_user_from_personal_key
 from .errors import V1ApiError, V1ErrorCode
 
@@ -49,7 +48,7 @@ def _template_summary(template: dict[str, Any]) -> V1TemplateSummary:
 @router.get("", response_model=list[V1TemplateSummary])
 async def list_templates(
     request: Request,
-    _authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
+    _authed: PersonalApiIdentity = Depends(get_user_from_personal_key),
 ) -> list[V1TemplateSummary]:
     template_manager = _get_template_manager(request)
     templates = await template_manager.list_templates()
@@ -60,7 +59,7 @@ async def list_templates(
 async def get_template(
     template_id: str,
     request: Request,
-    _authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
+    _authed: PersonalApiIdentity = Depends(get_user_from_personal_key),
 ) -> V1TemplateDetail:
     template_manager = _get_template_manager(request)
     template = await template_manager.get_template(template_id)

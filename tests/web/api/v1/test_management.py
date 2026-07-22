@@ -1,15 +1,26 @@
 """Integration tests for /v1 management endpoints."""
 
+import asyncio
+import inspect
+import threading
+import time
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+from sqlalchemy import create_engine
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.templates.manager import TemplateManager
+from xagent.web.api.v1 import agents as v1_agents
+from xagent.web.models import database as database_module
 from xagent.web.models.agent import Agent
+from xagent.web.models.agent_api_key import AgentApiKey
 from xagent.web.models.model import Model as DBModel
 from xagent.web.models.user import User, UserModel
+from xagent.web.services import agent_management
 
 from ..conftest import _admin_headers, _direct_db_session, app_for_tests, client
 
@@ -25,6 +36,36 @@ def _personal_key() -> str:
 
 def _bearer(full_key: str) -> dict[str, str]:
     return {"Authorization": f"Bearer {full_key}"}
+
+
+def _post_commit_pool_exhausting_session_factory():
+    """Return a real one-slot QueuePool occupied immediately after commit."""
+    engine = create_engine(
+        database_module.get_engine().url,
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+    )
+    held_connections = []
+
+    class PostCommitPoolExhaustingSession(Session):
+        def commit(self) -> None:
+            super().commit()
+            if not held_connections:
+                # ``super().commit()`` returned the transaction's connection.
+                # Occupy that sole slot so any post-commit ORM refresh or
+                # expired-attribute load exercises a real QueuePool timeout.
+                held_connections.append(engine.connect())
+
+    factory = sessionmaker(
+        bind=engine,
+        class_=PostCommitPoolExhaustingSession,
+        autocommit=False,
+        autoflush=False,
+    )
+    return factory, held_connections, engine
 
 
 def _write_template(root: Path) -> None:
@@ -72,6 +113,571 @@ agent_config:
 """.strip(),
         encoding="utf-8",
     )
+
+
+@pytest.mark.parametrize(
+    "handler",
+    [
+        v1_agents.list_agents,
+        v1_agents.create_agent,
+        v1_agents.create_agent_from_template,
+        v1_agents.rotate_agent_runtime_key,
+    ],
+)
+def test_v1_agent_routes_do_not_inject_request_db_session(handler):
+    """A /v1 agent request must not own a Session across async work."""
+    assert "db" not in inspect.signature(handler).parameters
+
+
+@pytest.mark.asyncio
+async def test_agent_list_worker_owns_session_and_does_not_block_event_loop(
+    monkeypatch,
+):
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+    finally:
+        db.close()
+    assert user_id is not None
+
+    operation = getattr(agent_management, "list_agents_for_user_worker_owned", None)
+    assert callable(operation), "missing worker-owned agent-list entry point"
+
+    loop_thread = threading.get_ident()
+    service_threads: list[int] = []
+    original = agent_management.AgentManagementService.list_agents_for_user
+
+    def slow_list(self, requested_user_id):
+        service_threads.append(threading.get_ident())
+        time.sleep(0.05)
+        return original(self, requested_user_id)
+
+    monkeypatch.setattr(
+        agent_management.AgentManagementService,
+        "list_agents_for_user",
+        slow_list,
+    )
+
+    ticks = 0
+    stop = False
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop:
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await operation(user_id=user_id)
+    finally:
+        stop = True
+        await ticker_task
+
+    assert isinstance(result, list)
+    assert service_threads and service_threads[0] != loop_thread
+    assert ticks >= 3
+
+
+@pytest.mark.asyncio
+async def test_agent_create_opens_worker_session_after_kb_await(monkeypatch):
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+    finally:
+        db.close()
+    assert user_id is not None
+
+    operation = getattr(agent_management, "create_agent_worker_owned", None)
+    assert callable(operation), "missing worker-owned agent-create entry point"
+
+    real_factory = database_module.get_session_local()
+    session_threads: list[int] = []
+
+    class TrackingSessionFactory:
+        def __call__(self):
+            session_threads.append(threading.get_ident())
+            return real_factory()
+
+    monkeypatch.setattr(
+        agent_management,
+        "get_session_local",
+        lambda: TrackingSessionFactory(),
+    )
+
+    async def visible_kbs(names, *, user_id, is_admin):
+        assert names == ["visible-kb"]
+        assert session_threads == []
+        await asyncio.sleep(0)
+        assert session_threads == []
+        return []
+
+    monkeypatch.setattr(agent_management, "find_missing_knowledge_bases", visible_kbs)
+
+    loop_thread = threading.get_ident()
+    result = await operation(
+        user_id=user_id,
+        is_admin=True,
+        name="worker-owned create",
+        description=None,
+        instructions="Be useful.",
+        knowledge_bases=["visible-kb"],
+        tool_categories=["knowledge"],
+        generate_runtime_key=False,
+    )
+
+    assert isinstance(result.agent, dict)
+    assert result.agent["name"] == "worker-owned create"
+    assert session_threads and all(tid != loop_thread for tid in session_threads)
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Agent).filter(Agent.name == "worker-owned create").count() == 1
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_template_resolution_finishes_before_worker_session_opens(monkeypatch):
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+    finally:
+        db.close()
+    assert user_id is not None
+
+    operation = getattr(
+        agent_management, "create_agent_from_template_worker_owned", None
+    )
+    assert callable(operation), "missing worker-owned template-create entry point"
+
+    real_factory = database_module.get_session_local()
+    session_threads: list[int] = []
+
+    class TrackingSessionFactory:
+        def __call__(self):
+            session_threads.append(threading.get_ident())
+            return real_factory()
+
+    monkeypatch.setattr(
+        agent_management,
+        "get_session_local",
+        lambda: TrackingSessionFactory(),
+    )
+
+    class FakeTemplateManager:
+        async def get_template(self, template_id):
+            assert template_id == "worker-template"
+            assert session_threads == []
+            await asyncio.sleep(0)
+            assert session_threads == []
+            return {
+                "name": "Worker template",
+                "descriptions": {"en": "Template description"},
+                "agent_config": {"instructions": "Template instructions"},
+            }
+
+    result = await operation(
+        template_manager=FakeTemplateManager(),
+        user_id=user_id,
+        is_admin=True,
+        template_id="worker-template",
+        generate_runtime_key=False,
+    )
+
+    assert isinstance(result.agent, dict)
+    assert result.agent["name"] == "Worker template"
+    assert session_threads
+
+
+@pytest.mark.asyncio
+async def test_runtime_key_rotation_runs_in_worker_owned_session(monkeypatch):
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+        assert user_id is not None
+        agent = Agent(
+            user_id=user_id,
+            name="worker rotation",
+            instructions="Be useful.",
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    operation = getattr(agent_management, "rotate_agent_runtime_key_worker_owned", None)
+    assert callable(operation), "missing worker-owned key-rotation entry point"
+
+    loop_thread = threading.get_ident()
+    service_threads: list[int] = []
+    original = agent_management.AgentManagementService.generate_agent_runtime_key
+
+    def tracked_rotation(self, *, user_id, agent_id):
+        service_threads.append(threading.get_ident())
+        return original(self, user_id=user_id, agent_id=agent_id)
+
+    monkeypatch.setattr(
+        agent_management.AgentManagementService,
+        "generate_agent_runtime_key",
+        tracked_rotation,
+    )
+
+    result = await operation(user_id=user_id, agent_id=agent_id)
+
+    assert result is not None
+    assert result.full_key.startswith("xag_")
+    assert service_threads and service_threads[0] != loop_thread
+
+
+@pytest.mark.asyncio
+async def test_agent_create_does_not_checkout_again_after_secret_commit(monkeypatch):
+    """A committed agent/key must not be stranded by post-commit pool pressure."""
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+    finally:
+        db.close()
+    assert user_id is not None
+
+    factory, held_connections, engine = _post_commit_pool_exhausting_session_factory()
+    monkeypatch.setattr(agent_management, "get_session_local", lambda: factory)
+    name = "create without post-commit checkout"
+    try:
+        result = await agent_management.create_agent_worker_owned(
+            user_id=user_id,
+            is_admin=True,
+            name=name,
+            description=None,
+            instructions="Be useful.",
+        )
+    finally:
+        for connection in held_connections:
+            connection.close()
+        engine.dispose()
+
+    assert result.api_key is not None
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.name == name).one()
+        active_prefixes = {
+            row.key_prefix
+            for row in db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent.id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .all()
+        }
+        assert active_prefixes == {result.api_key.key_prefix}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_key_rotation_does_not_checkout_again_after_commit(monkeypatch):
+    """A rotation succeeds even when no pool slot exists after its commit."""
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+        assert user_id is not None
+        agent = Agent(
+            user_id=user_id,
+            name="rotation without post-commit checkout",
+            instructions="Be useful.",
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    factory, held_connections, engine = _post_commit_pool_exhausting_session_factory()
+    monkeypatch.setattr(agent_management, "get_session_local", lambda: factory)
+    try:
+        result = await agent_management.rotate_agent_runtime_key_worker_owned(
+            user_id=user_id,
+            agent_id=agent_id,
+        )
+    finally:
+        for connection in held_connections:
+            connection.close()
+        engine.dispose()
+
+    assert result is not None
+    db = _direct_db_session()
+    try:
+        assert db.query(Agent).filter(Agent.id == agent_id).count() == 1
+        active_prefixes = {
+            row.key_prefix
+            for row in db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .all()
+        }
+        assert active_prefixes == {result.key_prefix}
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("from_template", [False, True])
+async def test_cancelled_agent_create_revokes_only_committed_undelivered_runtime_key(
+    monkeypatch,
+    from_template: bool,
+):
+    """Cancellation keeps the durable agent but revokes its undelivered key."""
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+    finally:
+        db.close()
+    assert user_id is not None
+
+    entered_after_commit = threading.Event()
+    release_worker = threading.Event()
+    initial_key_prefix: list[str] = []
+    original_create = (
+        agent_management.AgentManagementService.create_agent_with_optional_key
+    )
+
+    def create_then_block(self, **kwargs):
+        result = original_create(self, **kwargs)
+        assert result[1] is not None
+        initial_key_prefix.append(result[1].key_prefix)
+        entered_after_commit.set()
+        assert release_worker.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        agent_management.AgentManagementService,
+        "create_agent_with_optional_key",
+        create_then_block,
+    )
+
+    name = f"cancelled-{'template' if from_template else 'plain'}-create"
+    if from_template:
+
+        class TemplateManager:
+            async def get_template(self, template_id):
+                assert template_id == "cancelled-template"
+                return {
+                    "name": name,
+                    "descriptions": {"en": "test"},
+                    "agent_config": {"instructions": "Be useful."},
+                }
+
+        caller = asyncio.create_task(
+            agent_management.create_agent_from_template_worker_owned(
+                template_manager=TemplateManager(),
+                user_id=user_id,
+                is_admin=True,
+                template_id="cancelled-template",
+            )
+        )
+    else:
+        caller = asyncio.create_task(
+            agent_management.create_agent_worker_owned(
+                user_id=user_id,
+                is_admin=True,
+                name=name,
+                description=None,
+                instructions="Be useful.",
+            )
+        )
+
+    assert await asyncio.to_thread(entered_after_commit.wait, 5)
+    caller.cancel()
+    release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.name == name).one()
+        assert initial_key_prefix
+        assert (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent.id,
+                AgentApiKey.key_prefix == initial_key_prefix[0],
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_agent_create_preserves_concurrent_rotation(monkeypatch):
+    """Create compensation cannot delete a concurrently updated durable agent."""
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+    finally:
+        db.close()
+    assert user_id is not None
+
+    entered_after_commit = threading.Event()
+    release_worker = threading.Event()
+    initial_key_prefix: list[str] = []
+    original_create = (
+        agent_management.AgentManagementService.create_agent_with_optional_key
+    )
+
+    def create_then_block(self, **kwargs):
+        result = original_create(self, **kwargs)
+        assert result[1] is not None
+        initial_key_prefix.append(result[1].key_prefix)
+        entered_after_commit.set()
+        assert release_worker.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        agent_management.AgentManagementService,
+        "create_agent_with_optional_key",
+        create_then_block,
+    )
+
+    name = "cancelled create with concurrent rotation"
+    caller = asyncio.create_task(
+        agent_management.create_agent_worker_owned(
+            user_id=user_id,
+            is_admin=True,
+            name=name,
+            description=None,
+            instructions="Be useful.",
+        )
+    )
+    assert await asyncio.to_thread(entered_after_commit.wait, 5)
+
+    db = _direct_db_session()
+    try:
+        agent_id = int(db.query(Agent.id).filter(Agent.name == name).scalar())
+    finally:
+        db.close()
+    concurrent_key = await agent_management.rotate_agent_runtime_key_worker_owned(
+        user_id=user_id,
+        agent_id=agent_id,
+    )
+    assert concurrent_key is not None
+
+    caller.cancel()
+    release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    db = _direct_db_session()
+    try:
+        assert db.query(Agent).filter(Agent.id == agent_id).count() == 1
+        initial_key = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.key_prefix == initial_key_prefix[0],
+            )
+            .one()
+        )
+        assert initial_key.revoked_at is not None
+        concurrent_row = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.key_prefix == concurrent_key.key_prefix,
+            )
+            .one()
+        )
+        assert concurrent_row.revoked_at is None
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_runtime_key_rotation_revokes_the_undelivered_key(monkeypatch):
+    """A cancelled rotation must not leave its newly minted key active."""
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = db.query(User.id).filter(User.username == "admin").scalar()
+        assert user_id is not None
+        agent = Agent(
+            user_id=user_id,
+            name="cancelled runtime rotation",
+            instructions="Be useful.",
+        )
+        db.add(agent)
+        db.commit()
+        db.refresh(agent)
+        agent_id = int(agent.id)
+    finally:
+        db.close()
+
+    first_key = await agent_management.rotate_agent_runtime_key_worker_owned(
+        user_id=user_id, agent_id=agent_id
+    )
+    assert first_key is not None
+
+    entered_after_commit = threading.Event()
+    release_worker = threading.Event()
+    created_prefix: list[str] = []
+    original_rotate = agent_management.AgentManagementService.generate_agent_runtime_key
+
+    def rotate_then_block(self, *, user_id, agent_id):
+        result = original_rotate(self, user_id=user_id, agent_id=agent_id)
+        assert result is not None
+        created_prefix.append(result.key_prefix)
+        entered_after_commit.set()
+        assert release_worker.wait(timeout=5)
+        return result
+
+    monkeypatch.setattr(
+        agent_management.AgentManagementService,
+        "generate_agent_runtime_key",
+        rotate_then_block,
+    )
+
+    caller = asyncio.create_task(
+        agent_management.rotate_agent_runtime_key_worker_owned(
+            user_id=user_id,
+            agent_id=agent_id,
+        )
+    )
+    assert await asyncio.to_thread(entered_after_commit.wait, 5)
+    caller.cancel()
+    release_worker.set()
+    with pytest.raises(asyncio.CancelledError):
+        await caller
+
+    assert created_prefix
+    db = _direct_db_session()
+    try:
+        assert (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == agent_id,
+                AgentApiKey.key_prefix == created_prefix[0],
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .count()
+            == 0
+        )
+    finally:
+        db.close()
 
 
 @pytest.fixture

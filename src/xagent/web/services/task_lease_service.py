@@ -7,10 +7,10 @@ import logging
 import os
 import socket
 import uuid
-from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, cast
+from enum import Enum
+from typing import Any, Callable, cast
 
 from sqlalchemy import case, func, or_, update
 from sqlalchemy.orm import Session
@@ -20,8 +20,12 @@ from ...config import (
     get_task_lease_ttl_seconds,
 )
 from ...core.agent.checkpoint import READABLE_CHECKPOINT_TYPES
-from ..models.database import get_db
 from ..models.task import Task, TaskStatus, TraceEvent
+from .db_runtime import (
+    await_task_settlement,
+    is_database_pool_timeout,
+    run_db_io_cancellation_safe,
+)
 from .task_execution_controller import control_state_for_status
 
 logger = logging.getLogger(__name__)
@@ -38,6 +42,63 @@ class TaskLease:
     task_id: int
     runner_id: str
     run_id: str | None = None
+
+
+@dataclass(frozen=True)
+class TaskLeaseHeartbeatOutcome:
+    """Lease state observed when a heartbeat loop stops.
+
+    A pool timeout is retained only until a later successful refresh proves
+    that ownership is healthy again. Callers use an unresolved timeout (or a
+    definite ownership loss) to avoid an immediate settlement checkout.
+    """
+
+    lease_lost: bool = False
+    pool_timeout: BaseException | None = None
+
+    @property
+    def requires_ttl_recovery(self) -> bool:
+        return self.lease_lost or self.pool_timeout is not None
+
+
+class TaskLeaseRefreshState(str, Enum):
+    """Result of refreshing one exact task-run lease."""
+
+    REFRESHED = "refreshed"
+    SETTLEMENT_READY = "settlement_ready"
+    LOST = "lost"
+
+
+async def acquire_task_lease_cancellation_safe(
+    acquire: Callable[[], TaskLease | None],
+    cleanup: Callable[[TaskLease], Any],
+) -> TaskLease | None:
+    """Acquire a lease and clean up a late result before propagating cancel.
+
+    The acquisition callback and cleanup callback each execute in their own
+    worker thread. When cancellation arrives during acquisition, the acquire
+    worker is drained first; if it committed and returned a lease, cleanup is
+    then drained as well. Only after both operations settle is cancellation
+    delivered to the caller.
+    """
+    worker = asyncio.get_running_loop().create_task(asyncio.to_thread(acquire))
+    lease, cancellation = await await_task_settlement(worker)
+    if cancellation is None:
+        return lease
+
+    if lease is not None:
+        try:
+            await run_db_io_cancellation_safe(lambda: cleanup(lease))
+        except asyncio.CancelledError:
+            # A repeated caller cancellation was recorded and propagated only
+            # after cleanup settled. Preserve the original cancellation below.
+            pass
+        except Exception:
+            logger.exception(
+                "Failed to clean up task %s lease after cancelled acquisition",
+                lease.task_id,
+            )
+    raise cancellation
 
 
 def get_runner_id() -> str:
@@ -90,6 +151,38 @@ def acquire_task_lease(
     transports so another worker cannot rotate the run between a status check
     and lease acquisition.
     """
+    lease = acquire_task_lease_no_commit(
+        db,
+        task_id,
+        runner_id=runner_id,
+        expected_run_id=expected_run_id,
+        new_run=new_run,
+    )
+    db.commit()
+    if lease is None:
+        logger.info(
+            "Task %s lease acquisition denied for runner %s",
+            task_id,
+            runner_id or get_runner_id(),
+        )
+        return None
+    logger.info(
+        "Task %s lease acquired by runner %s",
+        task_id,
+        lease.runner_id,
+    )
+    return lease
+
+
+def acquire_task_lease_no_commit(
+    db: Session,
+    task_id: int,
+    *,
+    runner_id: str | None = None,
+    expected_run_id: str | None = None,
+    new_run: bool = False,
+) -> TaskLease | None:
+    """Stage one atomic lease claim; the caller owns commit/rollback."""
     runner = runner_id or get_runner_id()
     now = utc_now()
     expires_at = _expires_at(now)
@@ -138,18 +231,12 @@ def acquire_task_lease(
         stmt = stmt.where(Task.status != TaskStatus.RUNNING)
     if expected_run_id is not None:
         stmt = stmt.where(Task.run_id == expected_run_id)
-    result = db.execute(stmt.execution_options(synchronize_session=False))
-    db.commit()
-    if _rowcount(result) != 1:
-        logger.info("Task %s lease acquisition denied for runner %s", task_id, runner)
-        return None
-    stored_run_id = db.query(Task.run_id).filter(Task.id == task_id).scalar()
-    logger.info(
-        "Task %s lease acquired by runner %s until %s",
-        task_id,
-        runner,
-        expires_at.isoformat(),
+    result = db.execute(
+        stmt.returning(Task.run_id).execution_options(synchronize_session=False)
     )
+    stored_run_id = result.scalar_one_or_none()
+    if stored_run_id is None:
+        return None
     return TaskLease(
         task_id=task_id,
         runner_id=runner,
@@ -189,8 +276,14 @@ def acquire_task_lease_isolated(
         db.close()
 
 
-def refresh_task_lease(db: Session, lease: TaskLease) -> bool:
-    """Refresh a live task lease owned by this runner."""
+def refresh_task_lease(db: Session, lease: TaskLease) -> TaskLeaseRefreshState:
+    """Refresh one exact lease or classify why it no longer needs refresh.
+
+    A task finalizer commits its terminal status before post-result broadcasts
+    complete, while the scheduler still owns and later releases the lease.  A
+    heartbeat in that window must distinguish the same terminal run from a
+    lease that another runner or run actually replaced.
+    """
     now = utc_now()
     expires_at = _expires_at(now)
     stmt = (
@@ -203,8 +296,30 @@ def refresh_task_lease(db: Session, lease: TaskLease) -> bool:
     if lease.run_id is not None:
         stmt = stmt.where(Task.run_id == lease.run_id)
     result = db.execute(stmt.execution_options(synchronize_session=False))
+    if _rowcount(result) == 1:
+        db.commit()
+        return TaskLeaseRefreshState.REFRESHED
+
+    owned_query = db.query(Task.status).filter(
+        Task.id == lease.task_id,
+        Task.runner_id == lease.runner_id,
+    )
+    if lease.run_id is not None:
+        owned_query = owned_query.filter(Task.run_id == lease.run_id)
+    owned_status = owned_query.scalar()
     db.commit()
-    return _rowcount(result) == 1
+    if owned_status is not None and owned_status != TaskStatus.RUNNING:
+        return TaskLeaseRefreshState.SETTLEMENT_READY
+    return TaskLeaseRefreshState.LOST
+
+
+def refresh_task_lease_isolated(lease: TaskLease) -> TaskLeaseRefreshState:
+    """Refresh ``lease`` in a short-lived session owned by this thread."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return refresh_task_lease(db, lease)
 
 
 def release_task_lease(
@@ -214,6 +329,22 @@ def release_task_lease(
     status: TaskStatus,
 ) -> bool:
     """Release a task lease and set its final visible status."""
+    released = release_task_lease_no_commit(db, lease, status=status)
+    if lease is None:
+        return False
+    db.commit()
+    return released
+
+
+def release_task_lease_no_commit(
+    db: Session,
+    lease: TaskLease | None,
+    *,
+    status: TaskStatus,
+) -> bool:
+    """Stage release of one exact lease; the caller owns commit/rollback."""
+    if status == TaskStatus.RUNNING:
+        raise ValueError("Cannot release a task lease with RUNNING status")
     if lease is None:
         return False
     control_state = control_state_for_status(status).value
@@ -240,7 +371,44 @@ def release_task_lease(
     if lease.run_id is not None:
         stmt = stmt.where(Task.run_id == lease.run_id)
     result = db.execute(stmt.execution_options(synchronize_session=False))
-    db.commit()
+    return _rowcount(result) == 1
+
+
+def fail_and_release_task_lease_no_commit(
+    db: Session,
+    lease: TaskLease,
+    *,
+    error_message: str,
+) -> bool:
+    """Atomically fail and release the exact live lease without committing.
+
+    The caller owns the transaction so related lifecycle projections can be
+    synchronized before one final commit. A lease without a run id is not a
+    sufficient ownership fence and is therefore never allowed to mutate the
+    task row.
+    """
+    if lease.run_id is None:
+        return False
+
+    failed_control_state = control_state_for_status(TaskStatus.FAILED).value
+    stmt = (
+        update(Task)
+        .where(Task.id == lease.task_id)
+        .where(Task.runner_id == lease.runner_id)
+        .where(Task.run_id == lease.run_id)
+        .where(Task.status == TaskStatus.RUNNING)
+        .values(
+            status=TaskStatus.FAILED,
+            runner_id=None,
+            lease_expires_at=None,
+            last_heartbeat_at=utc_now(),
+            control_state=failed_control_state,
+            state_version=func.coalesce(Task.state_version, 0) + 1,
+            error_message=error_message,
+            output=None,
+        )
+    )
+    result = db.execute(stmt.execution_options(synchronize_session=False))
     return _rowcount(result) == 1
 
 
@@ -253,6 +421,8 @@ def release_current_runner_task_lease(
     expected_run_id: str | None = None,
 ) -> bool:
     """Release the current runner's lease for a task."""
+    if status == TaskStatus.RUNNING:
+        raise ValueError("Cannot release a task lease with RUNNING status")
     runner = runner_id or get_runner_id()
     control_state = control_state_for_status(status).value
     current_version = func.coalesce(Task.state_version, 0)
@@ -325,9 +495,10 @@ def mark_task_paused_if_stale(db: Session, task: Task) -> bool:
 async def run_task_lease_heartbeat(
     lease: TaskLease,
     stop_event: asyncio.Event,
-) -> None:
+) -> TaskLeaseHeartbeatOutcome:
     """Keep a task lease alive until the execution finishes."""
     interval = get_task_lease_heartbeat_seconds()
+    unresolved_pool_timeout: BaseException | None = None
     while not stop_event.is_set():
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
@@ -335,34 +506,59 @@ async def run_task_lease_heartbeat(
         except asyncio.TimeoutError:
             pass
 
-        db_gen = get_db()
-        db = next(db_gen)
         try:
-            if not refresh_task_lease(db, lease):
+            refresh_state = await run_db_io_cancellation_safe(
+                lambda: refresh_task_lease_isolated(lease)
+            )
+            if refresh_state == TaskLeaseRefreshState.SETTLEMENT_READY:
+                logger.debug(
+                    "Task %s lease heartbeat observed owned terminal state; "
+                    "handing lease to settlement",
+                    lease.task_id,
+                )
+                return TaskLeaseHeartbeatOutcome()
+            if refresh_state == TaskLeaseRefreshState.LOST:
                 logger.warning(
                     "Task %s lease heartbeat lost for runner %s",
                     lease.task_id,
                     lease.runner_id,
                 )
-                return
+                return TaskLeaseHeartbeatOutcome(lease_lost=True)
+            unresolved_pool_timeout = None
         except Exception as e:
+            if is_database_pool_timeout(e):
+                unresolved_pool_timeout = e
             logger.warning(
                 "Task %s lease heartbeat failed for runner %s: %s",
                 lease.task_id,
                 lease.runner_id,
                 e,
             )
-        finally:
-            db.close()
+    return TaskLeaseHeartbeatOutcome(pool_timeout=unresolved_pool_timeout)
 
 
 async def stop_task_lease_heartbeat(
     task: asyncio.Task[Any] | None,
     stop_event: asyncio.Event | None,
-) -> None:
+) -> TaskLeaseHeartbeatOutcome:
     if stop_event is not None:
         stop_event.set()
-    if task is not None:
-        task.cancel()
-        with suppress(asyncio.CancelledError):
-            await task
+    if task is None:
+        return TaskLeaseHeartbeatOutcome()
+
+    try:
+        outcome, cancellation = await await_task_settlement(task)
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() > 0:
+            raise
+        # The heartbeat task itself had already been cancelled. Its worker I/O
+        # is cancellation-safe, so there is nothing left to drain here.
+        return TaskLeaseHeartbeatOutcome()
+    if cancellation is not None:
+        raise cancellation
+    if isinstance(outcome, TaskLeaseHeartbeatOutcome):
+        return outcome
+    # Compatibility with externally supplied/mocked heartbeat tasks that
+    # predate the structured result.
+    return TaskLeaseHeartbeatOutcome()

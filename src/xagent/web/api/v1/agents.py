@@ -1,14 +1,9 @@
 """SDK management endpoints for user-owned agents."""
 
-from typing import Tuple
+from typing import Any
 
 from fastapi import APIRouter, Depends, Request
-from sqlalchemy.orm import Session
 
-from ...models.agent import Agent
-from ...models.database import get_db
-from ...models.user import User
-from ...models.user_api_key import UserApiKey
 from ...schemas.agent_api_key import APIKeyGenerateResponse
 from ...schemas.v1 import (
     RuntimeKeyResponse,
@@ -19,13 +14,16 @@ from ...schemas.v1 import (
     V1AgentTemplateCreateRequest,
 )
 from ...services.agent_management import (
-    AgentManagementService,
     DuplicateAgentNameError,
     InvalidAgentModelConfigError,
     InvalidKnowledgeBaseError,
     TemplateNotFoundError,
+    create_agent_from_template_worker_owned,
+    create_agent_worker_owned,
+    list_agents_for_user_worker_owned,
+    rotate_agent_runtime_key_worker_owned,
 )
-from ...services.api_keys import KeyRotationConflict
+from ...services.api_keys import KeyRotationConflict, PersonalApiIdentity
 from .deps import get_user_from_personal_key
 from .errors import V1ApiError, V1ErrorCode
 
@@ -40,37 +38,29 @@ def _runtime_key_response(api_key: APIKeyGenerateResponse) -> RuntimeKeyResponse
     )
 
 
-def _agent_response(service: AgentManagementService, agent: Agent) -> V1AgentResponse:
-    return V1AgentResponse.model_validate(service.store.agent_to_response_dict(agent))
+def _agent_response(agent: dict[str, Any]) -> V1AgentResponse:
+    return V1AgentResponse.model_validate(agent)
 
 
 @router.get("", response_model=list[V1AgentSummary])
 async def list_agents(
-    authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
-    db: Session = Depends(get_db),
+    authed: PersonalApiIdentity = Depends(get_user_from_personal_key),
 ) -> list[V1AgentSummary]:
-    user, _key = authed
-    service = AgentManagementService(db)
-    return [
-        V1AgentSummary.model_validate(item)
-        for item in service.list_agents_for_user(int(user.id))
-    ]
+    items = await list_agents_for_user_worker_owned(user_id=authed.user_id)
+    return [V1AgentSummary.model_validate(item) for item in items]
 
 
 @router.post("", response_model=V1AgentCreateResponse)
 async def create_agent(
     request: V1AgentCreateRequest,
-    authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
-    db: Session = Depends(get_db),
+    authed: PersonalApiIdentity = Depends(get_user_from_personal_key),
 ) -> V1AgentCreateResponse:
-    user, _key = authed
-    service = AgentManagementService(db)
     try:
         # Atomic: KB validation + agent row + optional first runtime key,
         # all behind the single async create entry point.
-        agent, api_key = await service.create_agent(
-            user_id=int(user.id),
-            is_admin=bool(user.is_admin),
+        result = await create_agent_worker_owned(
+            user_id=authed.user_id,
+            is_admin=authed.is_admin,
             name=request.name,
             description=request.description,
             instructions=request.instructions,
@@ -100,8 +90,8 @@ async def create_agent(
         )
 
     return V1AgentCreateResponse(
-        agent=_agent_response(service, agent),
-        api_key=_runtime_key_response(api_key) if api_key else None,
+        agent=_agent_response(result.agent),
+        api_key=_runtime_key_response(result.api_key) if result.api_key else None,
     )
 
 
@@ -109,18 +99,16 @@ async def create_agent(
 async def create_agent_from_template(
     request: V1AgentTemplateCreateRequest,
     fastapi_request: Request,
-    authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
-    db: Session = Depends(get_db),
+    authed: PersonalApiIdentity = Depends(get_user_from_personal_key),
 ) -> V1AgentCreateResponse:
-    user, _key = authed
     template_manager = getattr(fastapi_request.app.state, "template_manager", None)
-    service = AgentManagementService(db, template_manager=template_manager)
     try:
         # Atomic: template-derived agent + optional first runtime key
         # commit together, same boundary as the plain create path.
-        agent, api_key = await service.create_agent_from_template(
-            user_id=int(user.id),
-            is_admin=bool(user.is_admin),
+        result = await create_agent_from_template_worker_owned(
+            template_manager=template_manager,
+            user_id=authed.user_id,
+            is_admin=authed.is_admin,
             template_id=request.template_id,
             name=request.name,
             description=request.description,
@@ -153,22 +141,19 @@ async def create_agent_from_template(
         )
 
     return V1AgentCreateResponse(
-        agent=_agent_response(service, agent),
-        api_key=_runtime_key_response(api_key) if api_key else None,
+        agent=_agent_response(result.agent),
+        api_key=_runtime_key_response(result.api_key) if result.api_key else None,
     )
 
 
 @router.post("/{agent_id}/api-key", response_model=RuntimeKeyResponse)
 async def rotate_agent_runtime_key(
     agent_id: int,
-    authed: Tuple[User, UserApiKey] = Depends(get_user_from_personal_key),
-    db: Session = Depends(get_db),
+    authed: PersonalApiIdentity = Depends(get_user_from_personal_key),
 ) -> RuntimeKeyResponse:
-    user, _key = authed
-    service = AgentManagementService(db)
     try:
-        api_key = service.generate_agent_runtime_key(
-            user_id=int(user.id), agent_id=agent_id
+        api_key = await rotate_agent_runtime_key_worker_owned(
+            user_id=authed.user_id, agent_id=agent_id
         )
     except KeyRotationConflict:
         raise V1ApiError(

@@ -1,4 +1,5 @@
 import asyncio
+import time
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -6,7 +7,7 @@ import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy.pool import QueuePool, StaticPool
 
 from xagent.core.tools.adapters.vibe.factory import ToolFactory
 from xagent.web.api.chat import (
@@ -15,6 +16,7 @@ from xagent.web.api.chat import (
     create_default_tools,
 )
 from xagent.web.models import Agent, Base, Task, User, Workforce, WorkforceRun
+from xagent.web.models import database as database_module
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.task import TaskStatus
@@ -59,6 +61,33 @@ def db_session() -> Session:
         session.close()
         _db_module._SessionLocal = _prev_session_local
         Base.metadata.drop_all(bind=engine)
+        engine.dispose()
+
+
+@pytest.fixture()
+def single_connection_workforce_db(tmp_path, monkeypatch):
+    """Real one-slot pool shared by the caller and turn orchestrator."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'workforce-turn-boundary.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.15,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_local = sessionmaker(
+        autocommit=False,
+        autoflush=False,
+        bind=engine,
+    )
+    monkeypatch.setattr(database_module, "_SessionLocal", session_local)
+    db = session_local()
+    try:
+        yield engine, db
+    finally:
+        db.close()
         engine.dispose()
 
 
@@ -237,6 +266,62 @@ async def test_create_workforce_run_creates_task_run_and_starts_turn(
         .count()
         == 1
     )
+
+
+@pytest.mark.asyncio
+async def test_create_workforce_run_releases_connection_before_begin_turn(
+    single_connection_workforce_db,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    engine, db = single_connection_workforce_db
+    _patch_schedule_bg(monkeypatch)
+    user = _create_user(db, "single-pool-owner")
+    manager = _create_agent(db, user, "Manager")
+    worker_agent = _create_agent(db, user, "Analyst")
+    workforce = _create_workforce(db, user, manager)
+    _add_worker(db, user, workforce, worker_agent)
+    db.commit()
+
+    checked_out: list[int] = []
+    original = task_orchestrator_module._begin_turn_atomic_sync
+
+    def observed(*args: Any, **kwargs: Any):
+        checked_out.append(engine.pool.checkedout())
+        time.sleep(0.05)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(
+        task_orchestrator_module,
+        "_begin_turn_atomic_sync",
+        observed,
+    )
+
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        result = await create_workforce_run(
+            db,
+            user,
+            workforce,
+            message="Coordinate a launch brief",
+        )
+        await result.background_task
+    finally:
+        ticker_stop.set()
+        await ticker_task
+
+    assert result.task.status == TaskStatus.RUNNING
+    assert result.workforce_run.status == "running"
+    assert checked_out == [0]
+    assert ticks >= 3, "workforce turn startup blocked the asyncio event loop"
 
 
 @pytest.mark.asyncio

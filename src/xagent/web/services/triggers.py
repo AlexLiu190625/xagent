@@ -788,7 +788,9 @@ def _attach_task_to_trigger_run(
     task_owner_user_id = int(trigger.user_id)
     runtime_plan = prepare_create_connector_runtime(
         db=db,
-        agent=agent,
+        tool_categories=(
+            agent.tool_categories if isinstance(agent.tool_categories, list) else None
+        ),
         task_source=task_source,
         connector_user_id=task_owner_user_id,
         payload_items=_trigger_connector_runtime_payload(trigger.config),

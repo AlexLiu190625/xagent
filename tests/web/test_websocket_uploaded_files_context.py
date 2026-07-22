@@ -13,6 +13,7 @@ from xagent.web.api.websocket import (
     _build_uploaded_files_context,
     _display_file_refs_from_file_info,
     _display_message_for_user,
+    _finalize_task_execution_result_isolated,
     _normalize_attachments_for_persistence,
     _normalize_file_outputs,
     _normalize_task_file_outputs,
@@ -27,6 +28,7 @@ from xagent.web.models import database as database_models
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services.task_lease_service import TaskLease
 
 
 @pytest.fixture()
@@ -103,6 +105,49 @@ def _create_uploaded_file(
     return file_record
 
 
+def test_normalize_file_outputs_skips_scope_lookup_for_empty_outputs(
+    db_session, monkeypatch
+) -> None:
+    """An empty output list must not spend a database checkout on scope."""
+
+    def unexpected_lookup(_task_id):
+        raise AssertionError("scope resolver must not run for empty outputs")
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_scope_segments_for_task",
+        unexpected_lookup,
+    )
+
+    assert _normalize_file_outputs(db_session, 10, 1, []) == ([], {})
+
+
+def test_normalize_file_outputs_uses_the_turns_resolved_scope(
+    db_session, monkeypatch
+) -> None:
+    """Explicit scope primitives prevent a second resolver call in one turn."""
+
+    def unexpected_lookup(_task_id):
+        raise AssertionError("turn scope was already resolved")
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_scope_segments_for_task",
+        unexpected_lookup,
+    )
+
+    normalized, aliases = _normalize_file_outputs(
+        db_session,
+        10,
+        1,
+        [{"unexpected": "shape"}],
+        resolved_scope_segments=("tenant-a",),
+    )
+
+    assert normalized == []
+    assert aliases == {}
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "terminal_status",
@@ -159,10 +204,7 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
     def fake_get_db():
         yield db_session
 
-    def fake_release_current_runner_task_lease_with_workforce_sync(
-        db, task_id, *, status
-    ):
-        return True
+    test_sessionmaker = sessionmaker(bind=db_session.get_bind())
 
     monkeypatch.setattr(
         websocket_api,
@@ -170,23 +212,26 @@ async def test_execute_task_background_reuses_task_id_for_terminal_tasks(
         BackgroundTaskManager(),
     )
     monkeypatch.setattr(websocket_api, "manager", BroadcastManager())
-    monkeypatch.setattr(
-        websocket_api,
-        "release_current_runner_task_lease_with_workforce_sync",
-        fake_release_current_runner_task_lease_with_workforce_sync,
-    )
     monkeypatch.setattr(database_models, "get_db", fake_get_db)
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
     monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message",
+        "xagent.web.services.task_setup_snapshot.get_session_local",
+        lambda: test_sessionmaker,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         lambda *args, **kwargs: None,
     )
+
+    user_id = int(user.id)
+    db_session.commit()
 
     await execute_task_background(
         task_id=10,
         user_message="重试",
         context={},
         agent_manager=AgentManager(),
-        task_owner_user_id=int(user.id),
+        task_owner_user_id=user_id,
         llm_user_message="重试",
     )
 
@@ -225,31 +270,25 @@ def _wire_execute_task_background(monkeypatch, db_session, manager):
     def fake_get_db():
         yield db_session
 
-    def fake_release(db, task_id, *, status):
-        return True
-
     test_sessionmaker = sessionmaker(bind=db_session.get_bind())
 
     monkeypatch.setattr(
         websocket_api, "background_task_manager", _NoopBackgroundTaskManager()
     )
     monkeypatch.setattr(websocket_api, "manager", manager)
-    monkeypatch.setattr(
-        websocket_api,
-        "release_current_runner_task_lease_with_workforce_sync",
-        fake_release,
-    )
     monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
+    monkeypatch.setattr(
+        "xagent.web.services.task_setup_snapshot.get_session_local",
+        lambda: test_sessionmaker,
+    )
     monkeypatch.setattr(database_models, "get_db", fake_get_db)
 
     def fake_persist_assistant_message(db, *args, **kwargs):
-        # The real helper commits the session; mirror that so the pending
-        # terminal status set by execute_task_background is durably landed
-        # (the status commit now rides on the assistant-message write).
-        db.commit()
+        # Finalization owns the single commit after staging the message.
+        return None
 
     monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message",
+        "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         fake_persist_assistant_message,
     )
 
@@ -259,8 +298,8 @@ async def test_completion_broadcast_failure_keeps_task_completed(
     db_session, monkeypatch
 ):
     """A failure in the post-completion broadcast must not be treated as an
-    execution failure: the already-COMPLETED row is left untouched, no
-    task_error is emitted, and the terminal failure writer is not invoked."""
+    execution failure: the already-COMPLETED row is left untouched and no
+    task_error is emitted."""
     user = _create_user(db_session, 1, "owner")
     _create_task(db_session, task_id=10, user_id=1, status=TaskStatus.RUNNING)
     db_session.commit()
@@ -283,9 +322,16 @@ async def test_completion_broadcast_failure_keeps_task_completed(
             return {"success": True, "output": "ok", "file_outputs": []}
 
     def fake_payload(
-        task_id, message, *, event_type="agent_error", expected_run_id=None
+        task_id,
+        message,
+        *,
+        event_type="agent_error",
+        expected_run_id=None,
+        only_if_running=False,
     ):
-        payload_calls.append((task_id, message, event_type))
+        payload_calls.append((task_id, message, event_type, only_if_running))
+        if only_if_running:
+            return None
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
@@ -306,7 +352,7 @@ async def test_completion_broadcast_failure_keeps_task_completed(
     assert task.error_message is None
     assert "task_completed" in sent_events
     assert "task_error" not in sent_events
-    assert payload_calls == []
+    assert payload_calls == [(10, "websocket client disconnected", "task_error", True)]
 
 
 @pytest.mark.asyncio
@@ -356,6 +402,65 @@ async def test_late_execution_result_does_not_resurrect_canceled_a2a_task(
     assert task.error_message == "Task canceled by A2A client."
 
 
+def test_result_finalization_rejects_replacement_run_with_same_runner(
+    db_session, monkeypatch
+) -> None:
+    """A process-global runner id is insufficient fencing after a new turn.
+
+    The old coroutine must be rejected by ``run_id`` before it can normalize
+    files, append a transcript row, or rewrite the replacement run's state.
+    """
+    _create_user(db_session, 1, "owner")
+    task = _create_task(
+        db_session,
+        task_id=15,
+        user_id=1,
+        status=TaskStatus.RUNNING,
+    )
+    task.runner_id = "shared-process-runner"
+    task.run_id = "replacement-run"
+    task.output = "replacement output"
+    db_session.commit()
+
+    test_sessionmaker = sessionmaker(bind=db_session.get_bind())
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: test_sessionmaker)
+
+    def unexpected_file_normalization(*_args, **_kwargs):
+        raise AssertionError("late result reached file persistence")
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_normalize_task_file_outputs",
+        unexpected_file_normalization,
+    )
+
+    finalized = _finalize_task_execution_result_isolated(
+        task_id=15,
+        task_user_id=1,
+        pre_run_status=TaskStatus.RUNNING,
+        result={
+            "success": True,
+            "output": "stale output",
+            "file_outputs": [{"file_id": "stale-file"}],
+        },
+        expected_run_id="old-run",
+        task_lease=TaskLease(
+            task_id=15,
+            runner_id="shared-process-runner",
+            run_id="old-run",
+        ),
+        resolved_scope_segments=(),
+    )
+
+    db_session.expire_all()
+    current = db_session.query(Task).filter(Task.id == 15).one()
+    assert finalized.late_result is True
+    assert current.status == TaskStatus.RUNNING
+    assert current.runner_id == "shared-process-runner"
+    assert current.run_id == "replacement-run"
+    assert current.output == "replacement output"
+
+
 @pytest.mark.asyncio
 async def test_execution_failure_routes_real_error_to_terminal_payload(
     db_session, monkeypatch
@@ -382,9 +487,14 @@ async def test_execution_failure_routes_real_error_to_terminal_payload(
             raise RuntimeError("agent boom xyz")
 
     def fake_payload(
-        task_id, message, *, event_type="agent_error", expected_run_id=None
+        task_id,
+        message,
+        *,
+        event_type="agent_error",
+        expected_run_id=None,
+        only_if_running=False,
     ):
-        payload_calls.append((task_id, message, event_type))
+        payload_calls.append((task_id, message, event_type, only_if_running))
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
@@ -399,7 +509,7 @@ async def test_execution_failure_routes_real_error_to_terminal_payload(
         llm_user_message="hi",
     )
 
-    assert payload_calls == [(11, "agent boom xyz", "task_error")]
+    assert payload_calls == [(11, "agent boom xyz", "task_error", True)]
     assert "task_error" in sent_events
 
 
@@ -433,15 +543,21 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
         raise RuntimeError("durable persist failed")
 
     def fake_payload(
-        task_id, message, *, event_type="agent_error", expected_run_id=None
+        task_id,
+        message,
+        *,
+        event_type="agent_error",
+        expected_run_id=None,
+        only_if_running=False,
     ):
-        payload_calls.append((task_id, event_type))
+        payload_calls.append((task_id, event_type, only_if_running))
         return {"type": event_type, "task_id": task_id}
 
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
     # Override the no-op persist with one that fails (durable write error).
     monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message", boom
+        "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
+        boom,
     )
     monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)
 
@@ -457,7 +573,7 @@ async def test_assistant_persist_failure_surfaces_as_task_failure(
     # The COMPLETED status was never committed (pending until the message
     # write that failed), so the status probe still sees RUNNING and the
     # failure is routed to the terminal payload writer.
-    assert payload_calls == [(12, "task_error")]
+    assert payload_calls == [(12, "task_error", True)]
 
 
 @pytest.mark.asyncio
@@ -492,7 +608,7 @@ async def test_empty_reply_turn_still_completes(db_session, monkeypatch):
     _wire_execute_task_background(monkeypatch, db_session, BroadcastManager())
     # Empty-content path: persist early-returns None without committing.
     monkeypatch.setattr(
-        "xagent.web.services.chat_history_service.persist_assistant_message",
+        "xagent.web.services.chat_history_service.persist_assistant_message_no_commit",
         lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(websocket_api, "_terminal_task_error_payload", fake_payload)

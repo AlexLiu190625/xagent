@@ -661,19 +661,18 @@ class TestModelService:
         "get_default",
         [get_default_sound_effect_model, get_default_music_model],
     )
-    def test_audio_generation_default_closes_database_generator(self, get_default):
+    def test_audio_generation_default_closes_owned_session(self, get_default):
         mock_db = MagicMock()
         filter_query = (
             mock_db.query.return_value.join.return_value.join.return_value.filter
         )
         shared_query = filter_query.return_value
         shared_query.limit.return_value.all.return_value = []
-        db_gen = MagicMock()
-        db_gen.__next__.return_value = mock_db
+        session_factory = MagicMock(return_value=mock_db)
 
         with patch(
-            "xagent.web.models.database.get_db",
-            return_value=db_gen,
+            "xagent.web.models.database.get_session_local",
+            return_value=session_factory,
         ):
             result = get_default(user_id=None)
 
@@ -682,7 +681,8 @@ class TestModelService:
             getattr(getattr(condition, "right", None), "value", None) == '"generate"'
             for condition in filter_query.call_args.args
         )
-        db_gen.close.assert_called_once_with()
+        session_factory.assert_called_once_with()
+        mock_db.close.assert_called_once_with()
 
     def test_embedding_fallback_skips_invisible_returns_none(self, monkeypatch):
         """System fallback returns None when no visible embedding model exists."""

@@ -37,6 +37,7 @@ from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.task import TaskStatus
 from xagent.web.models.user import User
 from xagent.web.services.task_setup_snapshot import (
+    RuntimeUserFields,
     TaskSetupSnapshot,
     _TaskFields,
 )
@@ -60,6 +61,8 @@ def _build_snapshot(*, source: str | None = "internal") -> TaskSetupSnapshot:
             execution_mode="flash",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="single_call",
         task_llm=None,
         task_fast_llm=None,
@@ -247,6 +250,12 @@ async def test_loop_consumes_snapshot_after_session_close() -> None:
 
         def cleanup_workspace(self) -> None: ...
 
+        def set_conversation_history(self, _messages: Any) -> None: ...
+
+        def set_execution_context_messages(self, _messages: Any) -> None: ...
+
+        def set_recovered_skill_context(self, _context: Any) -> None: ...
+
     manager = AgentServiceManager()
     user = _make_user()
     db = MagicMock()
@@ -364,6 +373,8 @@ async def test_snapshot_fallback_raises_on_no_default_llm_with_agent_builder() -
             execution_mode="balanced",
             agent_type="standard",
         ),
+        runtime_user=RuntimeUserFields(id=1, is_admin=False),
+        has_reconstructable_history=False,
         task_pattern="react",
         task_llm=None,
         task_fast_llm=None,

@@ -1,5 +1,6 @@
 """Core document search functionality for RAG pipelines."""
 
+import asyncio
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
@@ -37,8 +38,11 @@ async def _list_visible_collections(
     collections_by_name = {
         collection.name: collection for collection in result.collections
     }
+    team_refs = await asyncio.to_thread(
+        visible_team_knowledge_bases, None, int(user_id)
+    )
     refs_by_owner: dict[int, list] = {}
-    for ref in visible_team_knowledge_bases(None, int(user_id)):
+    for ref in team_refs:
         refs_by_owner.setdefault(ref.storage_user_id, []).append(ref)
     for storage_user_id, refs in refs_by_owner.items():
         owner_result = await list_collections(user_id=storage_user_id, is_admin=False)

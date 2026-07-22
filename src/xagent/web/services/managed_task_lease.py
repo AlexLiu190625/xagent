@@ -9,8 +9,10 @@ from dataclasses import dataclass, field
 from sqlalchemy.orm import Session
 
 from ..models.task import Task, TaskStatus
+from .db_runtime import run_db_io_cancellation_safe
 from .task_lease_service import (
     TaskLease,
+    TaskLeaseHeartbeatOutcome,
     acquire_task_lease,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
@@ -44,16 +46,30 @@ class ManagedTaskLease:
 
     lease: TaskLease
     stop_event: asyncio.Event
-    heartbeat_task: asyncio.Task[None]
+    heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome]
     _closed: bool = field(default=False, init=False)
 
     async def close(self) -> bool:
         if self._closed:
             return False
         self._closed = True
-        await stop_task_lease_heartbeat(self.heartbeat_task, self.stop_event)
+        heartbeat_outcome = await stop_task_lease_heartbeat(
+            self.heartbeat_task, self.stop_event
+        )
+        if heartbeat_outcome.requires_ttl_recovery:
+            logger.error(
+                "Task %s managed lease heartbeat unhealthy at shutdown; "
+                "retaining run %s for TTL recovery (lost=%s, pool_timeout=%s)",
+                self.lease.task_id,
+                self.lease.run_id,
+                heartbeat_outcome.lease_lost,
+                heartbeat_outcome.pool_timeout is not None,
+            )
+            return False
         try:
-            return await asyncio.to_thread(_release_managed_task_lease_sync, self.lease)
+            return await run_db_io_cancellation_safe(
+                lambda: _release_managed_task_lease_sync(self.lease)
+            )
         except Exception:
             logger.error(
                 "Failed to release managed task lease for task %s run %s",

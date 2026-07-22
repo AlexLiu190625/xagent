@@ -3,16 +3,25 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, NoReturn, cast
 
-from sqlalchemy import func
+from sqlalchemy import case, func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
-from ...core.utils.api_key import ApiKeyKind, generate_api_key
+from ...core.utils.api_key import (
+    ApiKeyKind,
+    generate_api_key,
+    parse_api_key,
+    verify_api_key,
+    verify_dummy,
+)
 from ..models.agent import Agent, AgentOrigin
 from ..models.agent_api_key import AgentApiKey
+from ..models.database import get_session_local
+from ..models.user import User
 from ..models.user_api_key import UserApiKey
 from ..schemas.agent_api_key import (
     AgentApiKeyListItem,
@@ -26,9 +35,280 @@ from ..schemas.user_api_key import (
     PersonalAPIKeyMetadata,
     PersonalAPIKeyRevokeResponse,
 )
+from ..utils.db_timezone import normalize_datetime_from_db
 from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AgentApiIdentity:
+    """Detached identity authorized by an agent runtime API key."""
+
+    agent_id: int
+    user_id: int
+    execution_mode: str | None
+    tool_categories: tuple[str, ...] | None
+    status: str
+    origin: str
+    key_prefix: str
+
+
+@dataclass(frozen=True)
+class PersonalApiIdentity:
+    """Detached identity authorized by a personal management API key."""
+
+    user_id: int
+    is_admin: bool
+    username: str
+    email: str | None
+    key_prefix: str
+
+
+class InvalidApiKeyError(RuntimeError):
+    """Raised for every expected API-key authentication failure."""
+
+
+@dataclass(frozen=True)
+class _AgentAuthCandidate:
+    key_hash: str
+    key_prefix: str
+    agent_id: int | None
+    user_id: int | None
+    execution_mode: str | None
+    tool_categories: tuple[str, ...] | None
+    status: str | None
+    origin: str | None
+
+
+@dataclass(frozen=True)
+class _PersonalAuthCandidate:
+    key_hash: str
+    key_prefix: str
+    expires_at: datetime | None
+    user_id: int | None
+    is_admin: bool | None
+    username: str | None
+    email: str | None
+
+
+def _invalid_api_key() -> NoReturn:
+    raise InvalidApiKeyError("invalid_api_key")
+
+
+def authenticate_agent_api_key(raw: str | None) -> AgentApiIdentity:
+    """Authenticate one agent key inside a worker-owned Session boundary.
+
+    The database candidate is copied to primitives and the Session is closed
+    before either real or dummy bcrypt work begins. No ORM state leaves this
+    function.
+    """
+
+    if raw is None:
+        verify_dummy()
+        _invalid_api_key()
+
+    parsed = parse_api_key(raw)
+    if parsed is None or parsed.kind != ApiKeyKind.AGENT:
+        verify_dummy()
+        _invalid_api_key()
+
+    session_local = get_session_local()
+    with session_local() as db:
+        row = (
+            db.query(
+                AgentApiKey.key_hash,
+                AgentApiKey.key_prefix,
+                Agent.id.label("agent_id"),
+                Agent.user_id.label("user_id"),
+                Agent.execution_mode,
+                Agent.tool_categories,
+                cast(Any, Agent.status),
+                Agent.origin,
+            )
+            .outerjoin(Agent, Agent.id == AgentApiKey.agent_id)
+            .filter(
+                AgentApiKey.key_prefix == parsed.prefix,
+                AgentApiKey.revoked_at.is_(None),
+                AgentApiKey.paused_at.is_(None),
+            )
+            .first()
+        )
+        candidate = None
+        if row is not None:
+            raw_categories = row.tool_categories
+            status = getattr(row.status, "value", row.status)
+            origin = getattr(row.origin, "value", row.origin)
+            candidate = _AgentAuthCandidate(
+                key_hash=str(row.key_hash),
+                key_prefix=str(row.key_prefix),
+                agent_id=(int(row.agent_id) if row.agent_id is not None else None),
+                user_id=(int(row.user_id) if row.user_id is not None else None),
+                execution_mode=(
+                    str(row.execution_mode) if row.execution_mode is not None else None
+                ),
+                tool_categories=(
+                    tuple(cast(list[str], raw_categories))
+                    if isinstance(raw_categories, list)
+                    else None
+                ),
+                status=str(status) if status is not None else None,
+                origin=str(origin) if origin is not None else None,
+            )
+
+    if candidate is None:
+        verify_dummy()
+        _invalid_api_key()
+
+    if not verify_api_key(raw, candidate.key_hash):
+        _invalid_api_key()
+
+    if (
+        candidate.agent_id is None
+        or candidate.user_id is None
+        or candidate.status is None
+        or candidate.origin is None
+        or candidate.origin == AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+    ):
+        _invalid_api_key()
+
+    return AgentApiIdentity(
+        agent_id=candidate.agent_id,
+        user_id=candidate.user_id,
+        execution_mode=candidate.execution_mode,
+        tool_categories=candidate.tool_categories,
+        status=candidate.status,
+        origin=candidate.origin,
+        key_prefix=candidate.key_prefix,
+    )
+
+
+def authenticate_personal_api_key(raw: str | None) -> PersonalApiIdentity:
+    """Authenticate one personal key without leaking a Session or ORM row."""
+
+    if raw is None:
+        verify_dummy()
+        _invalid_api_key()
+
+    parsed = parse_api_key(raw)
+    if parsed is None or parsed.kind != ApiKeyKind.PERSONAL:
+        verify_dummy()
+        _invalid_api_key()
+
+    session_local = get_session_local()
+    with session_local() as db:
+        row = (
+            db.query(
+                UserApiKey.key_hash,
+                UserApiKey.key_prefix,
+                UserApiKey.expires_at,
+                User.id.label("user_id"),
+                User.is_admin,
+                User.username,
+                User.email,
+            )
+            .outerjoin(User, User.id == UserApiKey.user_id)
+            .filter(
+                cast(Any, UserApiKey.key_prefix) == parsed.prefix,
+                UserApiKey.revoked_at.is_(None),
+            )
+            .first()
+        )
+        candidate = None
+        if row is not None:
+            candidate = _PersonalAuthCandidate(
+                key_hash=str(row.key_hash),
+                key_prefix=str(row.key_prefix),
+                expires_at=row.expires_at,
+                user_id=(int(row.user_id) if row.user_id is not None else None),
+                is_admin=(bool(row.is_admin) if row.is_admin is not None else None),
+                username=(str(row.username) if row.username is not None else None),
+                email=str(row.email) if row.email is not None else None,
+            )
+
+    if candidate is None:
+        verify_dummy()
+        _invalid_api_key()
+
+    expires_at = candidate.expires_at
+    if expires_at is not None and normalize_datetime_from_db(
+        expires_at
+    ) <= datetime.now(timezone.utc):
+        verify_dummy()
+        _invalid_api_key()
+
+    if not verify_api_key(raw, candidate.key_hash):
+        _invalid_api_key()
+
+    if (
+        candidate.user_id is None
+        or candidate.is_admin is None
+        or candidate.username is None
+    ):
+        _invalid_api_key()
+
+    return PersonalApiIdentity(
+        user_id=candidate.user_id,
+        is_admin=candidate.is_admin,
+        username=candidate.username,
+        email=candidate.email,
+        key_prefix=candidate.key_prefix,
+    )
+
+
+def record_agent_api_key_usage(key_prefix: str) -> None:
+    """Best-effort atomic usage tracking in a worker-owned Session."""
+
+    now = datetime.now(timezone.utc)
+    current_month = now.strftime("%Y-%m")
+    session_local = get_session_local()
+    db: Session | None = None
+    try:
+        db = session_local()
+        db.query(AgentApiKey).filter(
+            AgentApiKey.key_prefix == key_prefix,
+            AgentApiKey.revoked_at.is_(None),
+            AgentApiKey.paused_at.is_(None),
+        ).update(
+            {
+                AgentApiKey.last_used_at: now,
+                AgentApiKey.usage_month: current_month,
+                AgentApiKey.usage_month_calls: case(
+                    (
+                        AgentApiKey.usage_month == current_month,
+                        AgentApiKey.usage_month_calls + 1,
+                    ),
+                    else_=1,
+                ),
+            },
+            synchronize_session=False,
+        )
+        db.commit()
+    except Exception:
+        if db is not None:
+            try:
+                db.rollback()
+            except Exception:
+                logger.warning(
+                    "Failed to roll back API key usage for key_prefix=%s",
+                    key_prefix,
+                    exc_info=True,
+                )
+        logger.warning(
+            "Failed to record API key usage for key_prefix=%s",
+            key_prefix,
+            exc_info=True,
+        )
+    finally:
+        if db is not None:
+            try:
+                db.close()
+            except Exception:
+                logger.warning(
+                    "Failed to close API key usage session for key_prefix=%s",
+                    key_prefix,
+                    exc_info=True,
+                )
 
 
 class KeyRotationConflict(RuntimeError):
@@ -63,9 +343,11 @@ class AgentApiKeyService:
         (create-agent-with-key) stage this plus other writes and commit
         once at the outer boundary.
 
-        Returns the staged ORM row and the one-shot plaintext key. The
-        row's ``created_at`` is only populated after the caller commits
-        and refreshes.
+        Returns the staged ORM row and the one-shot plaintext key. Server
+        defaults needed by the response are refreshed before return, while
+        this transaction still owns its checked-out connection. Callers can
+        therefore build the detached one-shot response before committing and
+        must not refresh the expired row after commit.
         """
         now = datetime.now(timezone.utc)
         # Bulk-revoke rather than ``.filter(...).first()``: an agent can now
@@ -94,6 +376,10 @@ class AgentApiKeyService:
         )
         self.db.add(new_row)
         self.db.flush()
+        # ``created_at`` is database-owned. Load it while the transaction's
+        # connection is still checked out so a successful commit never needs
+        # a second pool checkout merely to construct the one-shot response.
+        self.db.refresh(new_row)
         logger.info(
             "Staged runtime API key for agent %s (prefix=%s, revoked=%d)",
             agent_id,
@@ -119,17 +405,17 @@ class AgentApiKeyService:
         """
         try:
             new_row, full_key = self.stage_rotated_key(agent_id)
+            response = APIKeyGenerateResponse(
+                full_key=full_key,
+                key_prefix=new_row.key_prefix,
+                created_at=new_row.created_at,
+            )
             self.db.commit()
         except IntegrityError as exc:
             self.db.rollback()
             raise KeyRotationConflict(str(exc)) from exc
 
-        self.db.refresh(new_row)
-        return APIKeyGenerateResponse(
-            full_key=full_key,
-            key_prefix=new_row.key_prefix,
-            created_at=new_row.created_at,
-        )
+        return response
 
     def get_metadata(self, agent_id: int) -> APIKeyMetadataResponse | None:
         # An agent can now have more than one active key (via the

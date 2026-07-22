@@ -316,7 +316,7 @@ def load_connector_runtime_view(
 def prepare_create_connector_runtime(
     *,
     db: Session,
-    agent: Agent,
+    tool_categories: Collection[str] | None,
     task_source: str | None,
     connector_user_id: int,
     payload_items: Iterable[Any] | None,
@@ -325,12 +325,13 @@ def prepare_create_connector_runtime(
 ) -> ConnectorRuntimeCreatePlan:
     """Prepare runtime values for a task identity chosen by the caller.
 
-    ``agent`` supplies tool-selection policy. ``connector_user_id`` supplies
-    connector visibility and must be the same owner later persisted on Task.
+    ``tool_categories`` is the detached tool-selection policy copied from the
+    authenticated agent. ``connector_user_id`` supplies connector visibility
+    and must be the same owner later persisted on Task.
     """
 
     visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
-    selected_refs = _plan_selected_refs(agent, visible)
+    selected_refs = _plan_selected_refs(tool_categories, visible)
     payload_by_ref = _parse_payload_items(payload_items)
     if not allow_ephemeral:
         _reject_ephemeral_payload_values(payload_by_ref)
@@ -392,7 +393,9 @@ def prepare_connector_runtime_selection_snapshot(
     if agent is None or connector_user_id is None:
         return ()
     visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
-    return _plan_selected_refs(agent, visible)
+    raw_categories = agent.tool_categories
+    tool_categories = raw_categories if isinstance(raw_categories, list) else None
+    return _plan_selected_refs(tool_categories, visible)
 
 
 def bind_connector_runtime_selection_snapshot(
@@ -452,7 +455,6 @@ def persist_create_connector_runtime_context(
 def prepare_append_connector_runtime(
     *,
     db: Session,
-    agent: Agent,
     task: Task,
     connector_user_id: int,
     payload_items: Iterable[Any] | None,
@@ -599,12 +601,13 @@ def _load_visible_runtime_connectors(
 
 
 def _plan_selected_refs(
-    agent: Agent, visible: dict[ConnectorRef, Any]
+    tool_categories: Collection[str] | None,
+    visible: dict[ConnectorRef, Any],
 ) -> tuple[ConnectorRef, ...]:
-    tool_categories = (
-        list(agent.tool_categories) if isinstance(agent.tool_categories, list) else None
+    normalized_categories = (
+        list(tool_categories) if tool_categories is not None else None
     )
-    spec = ToolSelectionSpec.from_raw(tool_categories=tool_categories)
+    spec = ToolSelectionSpec.from_raw(tool_categories=normalized_categories)
     selected: list[ConnectorRef] = []
     scoped_mcp_servers = spec.scoped_mcp_servers()
     for ref, connector in visible.items():

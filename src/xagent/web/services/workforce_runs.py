@@ -8,6 +8,7 @@ from fastapi import HTTPException
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
+from xagent.web.models.database import release_db_connection_if_clean
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
@@ -176,13 +177,20 @@ async def create_workforce_run(
     db.refresh(task)
     db.refresh(workforce_run)
     task_id = int(task.id)
+    task_owner_user_id = int(user.id)
+
+    # ``begin_turn`` owns a separate worker-thread Session. End the clean
+    # post-refresh request transaction first so its checkout cannot starve the
+    # orchestrator's atomic claim when the pool has only one free slot.
+    if not release_db_connection_if_clean(db):
+        raise RuntimeError("request DB transaction is not clean at turn boundary")
 
     try:
         started = await TaskTurnOrchestrator.begin_turn(
             task_id=task_id,
-            task_owner_user_id=int(user.id),
+            task_owner_user_id=task_owner_user_id,
             # Workforce runs as the requesting user; actor == owner here.
-            actor_user_id=int(user.id),
+            actor_user_id=task_owner_user_id,
             payload=TaskTurnPayload(transcript_message=normalized_message),
             kind=TurnKind.CREATE,
             force_fresh=False,

@@ -24,6 +24,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,6 +37,30 @@ from ..models.uploaded_file import UploadedFile
 from .managed_file_ref import ensure_uploaded_file_local_path
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class TurnFileLocator:
+    """Detached fields required to materialize one uploaded file."""
+
+    file_id: str
+    user_id: int
+    task_id: Optional[int]
+    filename: str
+    file_size: int
+    mime_type: Optional[str]
+    storage_path: str
+    storage_key: Optional[str]
+    storage_status: str
+    checksum: Optional[str]
+
+
+@dataclass(frozen=True)
+class TurnFileLookup:
+    """One request-order lookup, including unresolved file ids."""
+
+    requested_id: str
+    locator: Optional[TurnFileLocator]
 
 
 def normalize_filename(filename: str) -> str:
@@ -109,6 +134,23 @@ def resolve_turn_file_infos(
         lists ids that did not resolve (bad id, wrong owner, bound to another
         task, or missing bytes) so callers can decide strict-vs-lenient.
     """
+    lookups = load_turn_file_lookups(
+        file_ids=file_ids,
+        owner_user_id=owner_user_id,
+        db=db,
+        task_id=task_id,
+    )
+    return materialize_turn_file_lookups(lookups)
+
+
+def load_turn_file_lookups(
+    *,
+    file_ids: List[str],
+    owner_user_id: int,
+    db: Session,
+    task_id: Optional[int] = None,
+) -> tuple[TurnFileLookup, ...]:
+    """Load request-order file locator snapshots without durable I/O."""
     if task_id is not None:
         bind_filter: Any = or_(
             UploadedFile.task_id == task_id, UploadedFile.task_id.is_(None)
@@ -116,13 +158,12 @@ def resolve_turn_file_infos(
     else:
         bind_filter = UploadedFile.task_id.is_(None)
 
-    file_infos: List[Dict[str, Any]] = []
-    missing: List[str] = []
+    lookups: list[TurnFileLookup] = []
     seen: set[str] = set()
     for raw_file_id in file_ids:
         file_id = str(raw_file_id or "").strip()
         if not file_id:
-            missing.append(str(raw_file_id))
+            lookups.append(TurnFileLookup(requested_id=str(raw_file_id), locator=None))
             continue
         # Dedup at the source so a repeated file_id doesn't produce duplicate
         # UPLOADED FILES lines / attachment chips downstream.
@@ -140,23 +181,67 @@ def resolve_turn_file_infos(
             .first()
         )
         if record is None:
-            missing.append(file_id)
+            lookups.append(TurnFileLookup(requested_id=file_id, locator=None))
             continue
 
-        source_path = ensure_uploaded_file_local_path(record)
+        lookups.append(
+            TurnFileLookup(
+                requested_id=file_id,
+                locator=TurnFileLocator(
+                    file_id=str(record.file_id),
+                    user_id=int(record.user_id),
+                    task_id=(
+                        int(record.task_id) if record.task_id is not None else None
+                    ),
+                    filename=str(record.filename),
+                    file_size=int(record.file_size),
+                    mime_type=(
+                        str(record.mime_type) if record.mime_type is not None else None
+                    ),
+                    storage_path=str(record.storage_path),
+                    storage_key=(
+                        str(record.storage_key)
+                        if record.storage_key is not None
+                        else None
+                    ),
+                    storage_status=str(record.storage_status),
+                    checksum=(
+                        str(record.checksum) if record.checksum is not None else None
+                    ),
+                ),
+            )
+        )
+    return tuple(lookups)
+
+
+def materialize_turn_file_lookups(
+    lookups: tuple[TurnFileLookup, ...],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Materialize detached locators after their query Session is closed."""
+    file_infos: List[Dict[str, Any]] = []
+    missing: List[str] = []
+    for lookup in lookups:
+        locator = lookup.locator
+        if locator is None:
+            missing.append(lookup.requested_id)
+            continue
+
+        source_path = ensure_uploaded_file_local_path(locator)
         if not source_path.exists():
-            logger.warning("Physical file not found for %s: %s", file_id, source_path)
-            missing.append(file_id)
+            logger.warning(
+                "Physical file not found for %s: %s", locator.file_id, source_path
+            )
+            missing.append(locator.file_id)
             continue
 
-        original_name = Path(record.filename).name
+        original_name = Path(locator.filename).name
         file_infos.append(
             {
-                "file_id": record.file_id,
+                "file_id": locator.file_id,
                 "name": normalize_filename(original_name),
                 "original_name": original_name,
-                "size": record.file_size,
-                "type": record.mime_type,
+                "size": locator.file_size,
+                "type": locator.mime_type,
                 "path": str(source_path),
                 "workspace_path": None,
             }

@@ -103,3 +103,31 @@ async def test_unregistered_resume_coordinator_cannot_promote_itself() -> None:
         manager.promote_resume_task(7, current)
 
     assert 7 not in manager.running_tasks
+
+
+@pytest.mark.asyncio
+async def test_cancelling_waiter_does_not_cancel_previous_execution() -> None:
+    manager = BackgroundTaskManager()
+    previous_started = asyncio.Event()
+    allow_previous_to_finish = asyncio.Event()
+
+    async def previous_execution() -> None:
+        previous_started.set()
+        await allow_previous_to_finish.wait()
+
+    previous = asyncio.create_task(previous_execution())
+    manager.register_task(7, previous)
+    await previous_started.wait()
+
+    waiter = asyncio.create_task(manager.wait_for_previous(7))
+    await asyncio.sleep(0)
+    waiter.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert not previous.done()
+    assert not previous.cancelled()
+
+    allow_previous_to_finish.set()
+    await previous
