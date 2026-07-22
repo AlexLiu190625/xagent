@@ -140,6 +140,37 @@ interface TemplateRequirements {
 // instead (issue #802), and `other` is an internal fallback bucket.
 const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
 
+function readNonEmptyString(value: unknown): string | null {
+  return typeof value === "string" && value.trim() ? value : null
+}
+
+function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
+  if (!isJsonRecord(error)) return fallback
+
+  const detail = error.detail
+  const detailMessage = readNonEmptyString(detail)
+  if (detailMessage) return detailMessage
+
+  if (isJsonRecord(detail)) {
+    const message = readNonEmptyString(detail.message)
+    if (message) return message
+  }
+
+  if (Array.isArray(detail)) {
+    const messages = detail
+      .map((item) => {
+        const itemMessage = readNonEmptyString(item)
+        if (itemMessage) return itemMessage
+        if (!isJsonRecord(item)) return null
+        return readNonEmptyString(item.msg) ?? readNonEmptyString(item.message)
+      })
+      .filter((message): message is string => message !== null)
+    if (messages.length > 0) return messages.join("; ")
+  }
+
+  return readNonEmptyString(error.message) ?? fallback
+}
+
 // One-time reveal of auto-generated webhook secrets. Rendered both inside the
 // creation success dialog and inline in the config form (retry path / while
 // the dialog is closed); only the inline instance is dismissible.
@@ -1444,25 +1475,9 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
       } else {
         const error: unknown = await response.json().catch(() => null)
-        const fallback = t("builds.editor.error.unknown")
-        let message = fallback
-
-        if (isJsonRecord(error)) {
-          const detail = error.detail
-          if (typeof detail === "string" && detail.trim()) {
-            message = detail
-          } else if (
-            isJsonRecord(detail) &&
-            typeof detail.message === "string" &&
-            detail.message.trim()
-          ) {
-            message = detail.message
-          } else if (typeof error.message === "string" && error.message.trim()) {
-            message = error.message
-          }
-        }
-
-        toast.error(message)
+        toast.error(
+          getAgentUpdateErrorMessage(error, t("builds.editor.error.unknown"))
+        )
       }
     } catch (error) {
       console.error("Failed to save agent:", error)

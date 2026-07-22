@@ -290,4 +290,37 @@ describe("AgentBuilder update error handling (issue #956)", () => {
     })
     expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
   })
+
+  it("renders FastAPI validation detail messages without unmounting the builder", async () => {
+    installApi(
+      ["basic"],
+      () =>
+        new Response(
+          JSON.stringify({
+            detail: [
+              { msg: "Name must be 200 characters or fewer" },
+              "Invalid model selection",
+              { message: "Unsupported execution mode" },
+              { msg: " " },
+            ],
+          }),
+          { status: 422, headers: { "Content-Type": "application/json" } }
+        )
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    const nameInput = await screen.findByPlaceholderText(
+      "builds.configForm.name.placeholder"
+    )
+    fireEvent.change(nameInput, { target: { value: "Updated Agent" } })
+    fireEvent.click(screen.getByText("builds.editor.header.update"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalled()
+      expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe(
+        "Name must be 200 characters or fewer; Invalid model selection; Unsupported execution mode"
+      )
+    })
+    expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
+  })
 })
