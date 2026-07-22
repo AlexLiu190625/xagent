@@ -108,6 +108,14 @@ describe("AgentDeleteDialog", () => {
       name: "builds.list.deleteDialog.confirmDiscardDraft:Editable Draft",
     }))
     expect(onDiscardWorkforce).toHaveBeenCalledWith(conflict.references[0])
+
+    expect(screen.getByRole("button", {
+      name: "builds.list.deleteDialog.discardDraft:Editable Draft",
+    })).toBeInTheDocument()
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.deleteDialog.discardDraft:Editable Draft",
+    }))
+    expect(onDiscardWorkforce).toHaveBeenCalledTimes(1)
   })
 
   it("survives translation extensions wrapping text nodes when the spinner toggles", () => {

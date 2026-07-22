@@ -166,6 +166,7 @@ export function AgentDeleteDialog({
                                       setConfirmDiscardId(reference.workforce_id)
                                       return
                                     }
+                                    setConfirmDiscardId(null)
                                     onDiscardWorkforce(reference)
                                   }}
                                 >

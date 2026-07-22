@@ -192,7 +192,10 @@ describe("BuildsPage Agent deletion", () => {
       expect(listRequests).toBe(2)
       expect(screen.queryByText("Research Agent")).not.toBeInTheDocument()
     })
-    expect(toastErrorMock).not.toHaveBeenCalled()
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "builds.list.deleteDialog.blockedToast:Research Agent",
+    )
   })
 
   it("keeps a committed deletion removed when the background refresh fails", async () => {
@@ -353,13 +356,17 @@ describe("BuildsPage Agent deletion", () => {
       await Promise.resolve()
     })
 
-    expect(toastErrorMock).not.toHaveBeenCalled()
+    expect(toastErrorMock).toHaveBeenCalledTimes(1)
+    expect(toastErrorMock).toHaveBeenCalledWith(
+      "builds.list.deleteDialog.blockedToast:Research Agent",
+    )
   })
 
   it.each([
     ["workforce_not_discardable", "builds.list.deleteDialog.discardNotAllowed"],
     ["workforce_has_runs", "builds.list.deleteDialog.discardHasRuns"],
   ])("localizes stable Workforce discard error %s", async (code, translationKey) => {
+    let discardRequests = 0
     apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
       if (url === "http://api.local/api/agents" && !options?.method) {
         return Promise.resolve(jsonResponse([agent]))
@@ -368,6 +375,7 @@ describe("BuildsPage Agent deletion", () => {
         return Promise.resolve(jsonResponse(conflictPayload, { status: 409 }))
       }
       if (url === "http://api.local/api/workforces/7/discard" && options?.method === "POST") {
+        discardRequests += 1
         return Promise.resolve(jsonResponse({
           detail: { code, message: "Backend English" },
         }, { status: 409 }))
@@ -392,5 +400,15 @@ describe("BuildsPage Agent deletion", () => {
         `${translationKey}:Draft Workforce`,
       )
     })
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.deleteDialog.discardDraft:Draft Workforce",
+    }))
+    expect(discardRequests).toBe(1)
+
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.deleteDialog.confirmDiscardDraft:Draft Workforce",
+    }))
+    await waitFor(() => expect(discardRequests).toBe(2))
   })
 })

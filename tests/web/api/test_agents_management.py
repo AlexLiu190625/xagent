@@ -25,8 +25,10 @@ from xagent.web.models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from xagent.web.services.agent_management import (
     AgentManagementService,
     AgentWorkforceConflictError,
+    AgentWorkforceReference,
 )
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
+from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 
 from .conftest import (
     _admin_headers,
@@ -1588,6 +1590,43 @@ class TestDeleteAgent:
         finally:
             db.close()
 
+    def test_empty_workforce_reference_state_has_no_conflict(self) -> None:
+        _admin_headers()
+        owner_id = _user_id("admin")
+
+        db = _direct_db_session()
+        try:
+            actor = db.query(User).filter(User.id == owner_id).one()
+
+            conflict = AgentManagementService(db)._workforce_conflict(
+                actor=actor,
+                agent_id=999_999,
+            )
+
+            assert conflict is None
+        finally:
+            db.close()
+
+    def test_workforce_conflict_requires_blocker_evidence(self) -> None:
+        with pytest.raises(ValueError, match="blocker evidence"):
+            AgentWorkforceConflictError((), has_hidden_references=False)
+
+    def test_visible_workforce_conflict_requires_at_least_one_role(self) -> None:
+        with pytest.raises(ValueError, match="at least one role"):
+            AgentWorkforceConflictError(
+                (
+                    AgentWorkforceReference(
+                        workforce_id=7,
+                        name="Invalid reference",
+                        status="draft",
+                        roles=(),
+                        can_edit=True,
+                        can_discard=False,
+                    ),
+                ),
+                has_hidden_references=False,
+            )
+
     def test_reference_marks_draft_undiscardable_when_generated_manager_is_shared(
         self,
     ) -> None:
@@ -1655,6 +1694,85 @@ class TestDeleteAgent:
             }
         ]
 
+    def test_disappearing_worker_reference_never_emits_invalid_conflict(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _admin_headers()
+        owner_id = _user_id("admin")
+        target_id = _create_agent_row(user_id=owner_id, name="Racing Worker")
+        manager_id = _create_agent_row(user_id=owner_id, name="Race Manager")
+
+        setup_db = _direct_db_session()
+        try:
+            workforce = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Disappearing Worker Reference",
+                manager_agent_id=manager_id,
+                status="draft",
+            )
+            setup_db.add(workforce)
+            setup_db.flush()
+            setup_db.add(
+                WorkforceAgent(
+                    workforce_id=int(workforce.id),
+                    agent_id=target_id,
+                    assignment_instructions="Race with Agent deletion.",
+                    source_type="existing",
+                    enabled=True,
+                    sort_order=0,
+                )
+            )
+            setup_db.commit()
+            workforce_id = int(workforce.id)
+        finally:
+            setup_db.close()
+
+        db = _direct_db_session()
+        try:
+            actor = db.query(User).filter(User.id == owner_id).one()
+            service = AgentManagementService(db)
+            original_snapshot = service._workforce_reference_snapshot
+
+            def snapshot_then_discard(agent_id: int):
+                snapshot = original_snapshot(agent_id)
+                discard_db = _direct_db_session()
+                try:
+                    discard_actor = (
+                        discard_db.query(User).filter(User.id == owner_id).one()
+                    )
+                    discard_draft_workforce(
+                        discard_db,
+                        discard_actor,
+                        discard_db.get(Workforce, workforce_id),
+                    )
+                finally:
+                    discard_db.close()
+                return snapshot
+
+            monkeypatch.setattr(
+                service,
+                "_workforce_reference_snapshot",
+                snapshot_then_discard,
+            )
+
+            with pytest.raises(AgentWorkforceConflictError) as exc_info:
+                service.delete_agent(actor=actor, agent_id=target_id)
+
+            conflict = exc_info.value
+            assert conflict.references or conflict.has_hidden_references
+            assert all(reference.roles for reference in conflict.references)
+        finally:
+            db.close()
+
+        verify_db = _direct_db_session()
+        try:
+            assert verify_db.get(Workforce, workforce_id) is None
+            assert verify_db.get(Agent, target_id) is not None
+        finally:
+            verify_db.close()
+
     def test_maps_commit_time_fk_race_after_rollback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1666,18 +1784,19 @@ class TestDeleteAgent:
         try:
             actor = db.query(User).filter(User.id == owner_id).one()
             service = AgentManagementService(db)
-            reference_checks = iter([False, True])
-            monkeypatch.setattr(
-                service,
-                "_has_workforce_references",
-                lambda _agent_id: next(reference_checks),
-                raising=False,
+            conflicts = iter(
+                [
+                    None,
+                    AgentWorkforceConflictError(
+                        (),
+                        has_hidden_references=True,
+                    ),
+                ]
             )
             monkeypatch.setattr(
                 service,
-                "_visible_workforce_references",
-                lambda **_kwargs: (),
-                raising=False,
+                "_workforce_conflict",
+                lambda **_kwargs: next(conflicts),
             )
             monkeypatch.setattr(
                 db,
@@ -1712,9 +1831,8 @@ class TestDeleteAgent:
             service = AgentManagementService(db)
             monkeypatch.setattr(
                 service,
-                "_has_workforce_references",
-                lambda _agent_id: False,
-                raising=False,
+                "_workforce_conflict",
+                lambda **_kwargs: None,
             )
             raw_error = IntegrityError(
                 "DELETE FROM agents WHERE id = ?",

@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -1173,6 +1174,7 @@ def test_discard_requires_edit_access_without_mutation() -> None:
 
 def test_discard_rolls_back_when_generated_manager_cleanup_fails(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     headers = _admin_headers()
     workforce = _create_workforce(headers, name="Rollback Discard Workforce")
@@ -1196,6 +1198,7 @@ def test_discard_rolls_back_when_generated_manager_cleanup_fails(
         fail_cleanup,
         raising=False,
     )
+    caplog.set_level(logging.ERROR, logger="xagent.web.api.workforces")
 
     response = client.post(
         f"/api/workforces/{workforce_id}/discard",
@@ -1203,6 +1206,19 @@ def test_discard_rolls_back_when_generated_manager_cleanup_fails(
     )
 
     assert response.status_code == 500
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_discard_failed",
+            "message": "Failed to discard workforce",
+        }
+    }
+    assert "cleanup failed" not in response.text
+    assert any(
+        record.name == "xagent.web.api.workforces"
+        and record.getMessage() == f"Failed to discard workforce {workforce_id}"
+        and record.exc_info is not None
+        for record in caplog.records
+    )
     db = _direct_db_session()
     try:
         assert db.get(Workforce, workforce_id) is not None

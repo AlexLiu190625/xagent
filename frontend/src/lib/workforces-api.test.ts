@@ -214,6 +214,31 @@ describe("workforces-api", () => {
     )
   })
 
+  it("keeps unexpected structured discard failures localized", async () => {
+    apiRequestMock.mockResolvedValueOnce(
+      jsonResponse(
+        {
+          detail: {
+            code: "workforce_discard_failed",
+            message: "Backend English",
+          },
+        },
+        { status: 500 },
+      ),
+    )
+
+    let caught: unknown
+    try {
+      await discardWorkforce(5, "Localized fallback")
+    } catch (error) {
+      caught = error
+    }
+
+    expect(caught).toBeInstanceOf(Error)
+    expect((caught as Error).message).toBe("Localized fallback")
+    expect((caught as Error).message).not.toContain("Backend English")
+  })
+
   it("uses the localized fallback when discard cannot reach the API", async () => {
     apiRequestMock.mockRejectedValueOnce(new Error("Network connection failed"))
 

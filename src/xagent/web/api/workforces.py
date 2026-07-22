@@ -1,3 +1,4 @@
+import logging
 from datetime import timezone
 from typing import Any, cast
 
@@ -51,6 +52,7 @@ from .public_trace_events import (
 )
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
+logger = logging.getLogger(__name__)
 
 
 class WorkforceWorkerInput(BaseModel):
@@ -759,7 +761,20 @@ def discard_workforce(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ) -> Response:
-    discard_draft_workforce(db, user, _load_workforce(db, workforce_id))
+    try:
+        discard_draft_workforce(db, user, _load_workforce(db, workforce_id))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to discard workforce %s", workforce_id)
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "workforce_discard_failed",
+                "message": "Failed to discard workforce",
+            },
+        ) from None
     return Response(status_code=204)
 
 
