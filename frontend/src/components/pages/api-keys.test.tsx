@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const navigation = vi.hoisted(() => ({
@@ -65,6 +65,10 @@ describe("ApiKeysPage tabs", () => {
       "data-state",
       "active",
     )
+    const personalTab = screen.getByRole("tab", { name: "apiKeysPage.tabs.personal" })
+    const personalPanel = screen.getByRole("tabpanel")
+    expect(personalPanel).toHaveAttribute("aria-labelledby", personalTab.id)
+    expect(personalTab).toHaveAttribute("aria-controls", personalPanel.id)
   })
 
   it("keeps an agent deep link on Agent Keys even when the Personal tab is requested", async () => {
@@ -77,5 +81,21 @@ describe("ApiKeysPage tabs", () => {
       "active",
     )
     expect(screen.queryByText("personal-api-keys-panel")).not.toBeInTheDocument()
+    expect(screen.getByRole("tabpanel")).toHaveAttribute(
+      "aria-labelledby",
+      screen.getByRole("tab", { name: "apiKeysPage.tabs.agent" }).id,
+    )
+  })
+
+  it("switches an agent deep link to Personal Keys without retaining the agent filter", async () => {
+    navigation.search = "agent=12"
+
+    render(<ApiKeysPage />)
+
+    fireEvent.mouseDown(await screen.findByRole("tab", { name: "apiKeysPage.tabs.personal" }), {
+      button: 0,
+    })
+
+    expect(navigation.replace).toHaveBeenCalledWith("/api-keys?tab=personal")
   })
 })

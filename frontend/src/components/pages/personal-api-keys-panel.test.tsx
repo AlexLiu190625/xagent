@@ -1,10 +1,27 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const createPersonalApiKeyMock = vi.hoisted(() => vi.fn())
 const listPersonalApiKeysMock = vi.hoisted(() => vi.fn())
 const revokePersonalApiKeyMock = vi.hoisted(() => vi.fn())
+const translateMock = vi.hoisted(() => vi.fn((key: string, vars?: Record<string, string>) => {
+  const translations: Record<string, string> = {
+    "personalApiKeys.create": "Create Personal Key",
+    "personalApiKeys.createForMe": "Create Personal Key for Me",
+    "personalApiKeys.columns.owner": "Owner",
+    "personalApiKeys.actions.revoke": "Revoke",
+    "personalApiKeys.actions.copy": "Copy personal API key",
+    "personalApiKeys.columns.key": "Secret Key",
+    "personalApiKeys.columns.created": "Created",
+    "personalApiKeys.reveal.title": "Personal API Key Created",
+    "personalApiKeys.reveal.warning": "Copy this key now — it is shown only once.",
+    "personalApiKeys.confirm.revokeTitle": "Revoke personal API key?",
+    "personalApiKeys.confirm.revokeOwnDescription": "Revoking immediately invalidates this key.",
+    "personalApiKeys.confirm.revokeOtherDescription": "Revoke this personal key for {owner}?",
+  }
+  return (translations[key] ?? key).replace("{owner}", vars?.owner ?? "")
+}))
 
 vi.mock("@/lib/personal-api-keys-api", () => ({
   createPersonalApiKey: createPersonalApiKeyMock,
@@ -14,22 +31,7 @@ vi.mock("@/lib/personal-api-keys-api", () => ({
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({
-    t: (key: string, vars?: Record<string, string>) => {
-      const translations: Record<string, string> = {
-        "personalApiKeys.create": "Create Personal Key",
-        "personalApiKeys.createForMe": "Create Personal Key for Me",
-        "personalApiKeys.columns.owner": "Owner",
-        "personalApiKeys.actions.revoke": "Revoke",
-        "personalApiKeys.columns.key": "Secret Key",
-        "personalApiKeys.columns.created": "Created",
-        "personalApiKeys.reveal.title": "Personal API Key Created",
-        "personalApiKeys.reveal.warning": "Copy this key now — it is shown only once.",
-        "personalApiKeys.confirm.revokeTitle": "Revoke personal API key?",
-        "personalApiKeys.confirm.revokeOwnDescription": "Revoking immediately invalidates this key.",
-        "personalApiKeys.confirm.revokeOtherDescription": "Revoke this personal key for {owner}?",
-      }
-      return (translations[key] ?? key).replace("{owner}", vars?.owner ?? "")
-    },
+    t: translateMock,
   }),
 }))
 
@@ -38,6 +40,7 @@ vi.mock("@/components/ui/dialog", () => ({
   DialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DialogDescription: ({ children }: { children: React.ReactNode }) => <p>{children}</p>,
   DialogTitle: ({ children }: { children: React.ReactNode }) => <h2>{children}</h2>,
 }))
 
@@ -62,7 +65,7 @@ function listResponse(canManageOthers: boolean) {
       id: 1,
       key_prefix: "self123",
       masked_key: "xag_personal_self123_••••••••",
-      revoked_at: null,
+      revoked_at: null as string | null,
       expires_at: null,
       created_at: "2026-07-22T00:00:00Z",
       owner: { id: 1, username: "alice", email: "alice@example.com" },
@@ -137,6 +140,8 @@ describe("PersonalApiKeysPanel", () => {
 
     expect(await screen.findByText("xag_personal_created_secret")).toBeInTheDocument()
     expect(createPersonalApiKeyMock).toHaveBeenCalledOnce()
+    expect(screen.getByText("Copy this key now — it is shown only once.")).toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "Copy personal API key" })).toBeInTheDocument()
   })
 
   it("names another owner in the revoke confirmation", async () => {
@@ -151,5 +156,65 @@ describe("PersonalApiKeysPanel", () => {
 
     fireEvent.click(screen.getAllByRole("button", { name: "Revoke" })[2])
     await waitFor(() => expect(revokePersonalApiKeyMock).toHaveBeenCalledWith(2))
+  })
+
+  it("keeps a mutation-success refresh when an earlier list request resolves late", async () => {
+    let resolveInitial: (value: ReturnType<typeof listResponse>) => void
+    const initial = new Promise<ReturnType<typeof listResponse>>((resolve) => {
+      resolveInitial = resolve
+    })
+    const refreshed = listResponse(false)
+    refreshed.items.push({
+      id: 3,
+      key_prefix: "new789",
+      masked_key: "xag_personal_new789_••••••••",
+      revoked_at: null,
+      expires_at: null,
+      created_at: "2026-07-22T00:00:00Z",
+      owner: { id: 1, username: "alice", email: "alice@example.com" },
+    })
+    const stale = listResponse(false)
+    stale.items[0].masked_key = "xag_personal_stale000_••••••••"
+
+    listPersonalApiKeysMock
+      .mockReturnValueOnce(initial)
+      .mockResolvedValueOnce(refreshed)
+    createPersonalApiKeyMock.mockResolvedValue({
+      id: 3,
+      full_key: "xag_personal_new789_secret",
+      key_prefix: "new789",
+      created_at: "2026-07-22T00:00:00Z",
+      expires_at: null,
+    })
+
+    render(<PersonalApiKeysPanel />)
+
+    fireEvent.click(screen.getByRole("button", { name: "Create Personal Key" }))
+    expect(await screen.findByText("xag_personal_new789_••••••••")).toBeInTheDocument()
+
+    await act(async () => resolveInitial!(stale))
+
+    expect(screen.queryByText("xag_personal_stale000_••••••••")).not.toBeInTheDocument()
+    expect(screen.getByText("xag_personal_new789_••••••••")).toBeInTheDocument()
+  })
+
+  it("does not offer Revoke for a revoked personal key", async () => {
+    const response = listResponse(false)
+    response.items.push({
+      id: 4,
+      key_prefix: "revoked",
+      masked_key: "xag_personal_revoked_••••••••",
+      revoked_at: "2026-07-22T00:00:00Z",
+      expires_at: null,
+      created_at: "2026-07-22T00:00:00Z",
+      owner: { id: 1, username: "alice", email: "alice@example.com" },
+    })
+    listPersonalApiKeysMock.mockResolvedValue(response)
+
+    render(<PersonalApiKeysPanel />)
+
+    const revokedRow = (await screen.findByText("xag_personal_revoked_••••••••")).closest("tr")
+    expect(revokedRow).not.toBeNull()
+    expect(within(revokedRow!).queryByRole("button", { name: "Revoke" })).not.toBeInTheDocument()
   })
 })

@@ -38,7 +38,7 @@ import {
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import { toast } from "@/components/ui/sonner"
-import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { useI18n } from "@/contexts/i18n-context"
 import { apiRequest } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
@@ -114,6 +114,7 @@ export function ApiKeysPage() {
   const handleTabChange = (tab: string) => {
     const params = new URLSearchParams(searchParams.toString())
     if (tab === "personal") {
+      params.delete("agent")
       params.set("tab", "personal")
     } else {
       params.delete("tab")
@@ -283,8 +284,8 @@ export function ApiKeysPage() {
         }
       />
 
-      <Tabs value={activeTab} onValueChange={handleTabChange} className="px-6 md:px-8 mt-6">
-        <TabsList className="bg-transparent h-12 p-0 space-x-6 justify-start border-b w-full rounded-none">
+      <Tabs value={activeTab} onValueChange={handleTabChange} className="mt-6">
+        <TabsList className="bg-transparent h-12 p-0 space-x-6 justify-start border-b w-full rounded-none px-6 md:px-8">
           <TabsTrigger
             value="agent"
             className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
@@ -298,9 +299,7 @@ export function ApiKeysPage() {
             {t("apiKeysPage.tabs.personal") || "Personal Keys"}
           </TabsTrigger>
         </TabsList>
-      </Tabs>
-
-      {activeTab === "personal" ? <PersonalApiKeysPanel /> : <>
+        <TabsContent value="agent" className="mt-0">
 
       <div className="grid gap-4 grid-cols-2 lg:grid-cols-4 px-6 md:px-8 mt-6">
         <Card>
@@ -585,7 +584,11 @@ export function ApiKeysPage() {
             : t("apiKeysPage.actions.delete") || "Delete"
         }
       />
-      </>}
+        </TabsContent>
+        <TabsContent value="personal" className="mt-0">
+          <PersonalApiKeysPanel />
+        </TabsContent>
+      </Tabs>
     </div>
   )
 }

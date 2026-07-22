@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useCallback, useEffect, useState } from "react"
+import React, { useCallback, useEffect, useRef, useState } from "react"
 import { AlertTriangle, Check, Copy, KeyRound, Plus, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
@@ -8,6 +8,7 @@ import { ConfirmDialog } from "@/components/ui/confirm-dialog"
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogFooter,
   DialogHeader,
   DialogTitle,
@@ -34,18 +35,22 @@ export function PersonalApiKeysPanel() {
   const [copied, setCopied] = useState(false)
   const [confirmKey, setConfirmKey] = useState<PersonalApiKeyListItem | null>(null)
   const [revoking, setRevoking] = useState(false)
+  const listGeneration = useRef(0)
 
   const loadKeys = useCallback(async () => {
+    const generation = ++listGeneration.current
     setLoading(true)
     try {
       const response = await listPersonalApiKeys()
+      if (generation !== listGeneration.current) return
       setKeys(response.items)
       setCanManageOthers(response.can_manage_others)
     } catch (error) {
+      if (generation !== listGeneration.current) return
       console.error(error)
       toast.error(t("personalApiKeys.messages.loadFailed") || "Failed to load personal API keys")
     } finally {
-      setLoading(false)
+      if (generation === listGeneration.current) setLoading(false)
     }
   }, [t])
 
@@ -147,7 +152,7 @@ export function PersonalApiKeysPanel() {
                   {canManageOthers && <TableCell className="text-sm">{key.owner.username}</TableCell>}
                   <TableCell className="text-sm text-muted-foreground">{formatDate(key.created_at)}</TableCell>
                   <TableCell className="text-right">
-                    <Button
+                    {!key.revoked_at && <Button
                       variant="ghost"
                       size="icon"
                       className="h-8 w-8 text-destructive hover:text-destructive"
@@ -156,7 +161,7 @@ export function PersonalApiKeysPanel() {
                       aria-label={t("personalApiKeys.actions.revoke") || "Revoke"}
                     >
                       <Trash2 className="w-4 h-4" />
-                    </Button>
+                    </Button>}
                   </TableCell>
                 </TableRow>
               ))}
@@ -181,13 +186,19 @@ export function PersonalApiKeysPanel() {
             </DialogTitle>
           </DialogHeader>
           <div className="space-y-2 rounded-md border border-amber-300 bg-amber-50 dark:bg-amber-950/30 p-3">
-            <div className="flex items-center gap-2 text-sm font-medium text-amber-700 dark:text-amber-400">
+            <DialogDescription className="flex items-center gap-2 text-sm font-medium text-amber-700 dark:text-amber-400">
               <AlertTriangle className="h-4 w-4" />
               {t("personalApiKeys.reveal.warning") || "Copy this key now — it is shown only once."}
-            </div>
+            </DialogDescription>
             <div className="flex items-center gap-2">
               <code className="flex-1 break-all rounded bg-muted px-2 py-1.5 text-xs font-mono">{reveal?.full_key}</code>
-              <Button size="icon" variant="secondary" onClick={handleCopyReveal}>
+              <Button
+                size="icon"
+                variant="secondary"
+                onClick={handleCopyReveal}
+                title={t("personalApiKeys.actions.copy") || "Copy personal API key"}
+                aria-label={t("personalApiKeys.actions.copy") || "Copy personal API key"}
+              >
                 {copied ? <Check className="h-4 w-4 text-green-500" /> : <Copy className="h-4 w-4" />}
               </Button>
             </div>

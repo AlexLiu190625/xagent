@@ -3534,6 +3534,7 @@ const zh = {
       created: "创建时间"
     },
     actions: {
+      copy: "复制个人 API 密钥",
       revoke: "撤销"
     },
     reveal: {

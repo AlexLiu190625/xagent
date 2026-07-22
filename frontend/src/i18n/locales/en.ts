@@ -3534,6 +3534,7 @@ Build when you need.`,
       created: "Created"
     },
     actions: {
+      copy: "Copy personal API key",
       revoke: "Revoke"
     },
     reveal: {
