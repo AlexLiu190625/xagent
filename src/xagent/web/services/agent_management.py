@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+import logging
+from dataclasses import dataclass
+from typing import Any, Literal, cast
 
+from sqlalchemy import func, or_, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Query, Session
 
 from ...core.tools.core.document_search import find_missing_knowledge_bases
 from ...templates.manager import TemplateManager
 from ..models.agent import Agent
 from ..models.model import Model as DBModel
+from ..models.user import User
+from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from ..schemas.agent_api_key import APIKeyGenerateResponse
 from ..services.agent_store import AgentStore, invalidate_agent_cache
 from .api_keys import AgentApiKeyService, KeyRotationConflict
+from .workforce_access import can_edit_workforce, filter_visible_workforces
+from .workforce_lifecycle import is_workforce_manager_discard_safe
+
+logger = logging.getLogger(__name__)
 
 # Agent-builder tool category that gates knowledge-base access. A KB
 # selection is only valid when this category is also enabled.
@@ -36,6 +45,35 @@ class InvalidKnowledgeBaseError(ValueError):
     """Raised when KB selection fails the knowledge-tool or visibility rule."""
 
 
+@dataclass(frozen=True)
+class AgentWorkforceReference:
+    workforce_id: int
+    name: str
+    status: str
+    roles: tuple[Literal["manager", "worker"], ...]
+    can_edit: bool
+    can_discard: bool
+
+
+@dataclass(frozen=True)
+class AgentDeleteResult:
+    logo_url: str | None
+
+
+class AgentWorkforceConflictError(RuntimeError):
+    """Raised when a Workforce FK prevents deletion of an Agent."""
+
+    def __init__(
+        self,
+        references: tuple[AgentWorkforceReference, ...],
+        *,
+        has_hidden_references: bool,
+    ) -> None:
+        super().__init__("Agent is used by one or more workforces.")
+        self.references = references
+        self.has_hidden_references = has_hidden_references
+
+
 class AgentManagementService:
     """High-level user-owned agent management workflow boundary."""
 
@@ -49,6 +87,193 @@ class AgentManagementService:
 
     def list_agents_for_user(self, user_id: int) -> list[dict[str, Any]]:
         return self.store.list_agent_items(user_id)
+
+    def _workforce_reference_query(self, agent_id: int) -> Query[Workforce]:
+        worker_workforce_ids = select(WorkforceAgent.workforce_id).where(
+            WorkforceAgent.agent_id == agent_id
+        )
+        return self.db.query(Workforce).filter(
+            or_(
+                Workforce.manager_agent_id == agent_id,
+                Workforce.id.in_(worker_workforce_ids),
+            )
+        )
+
+    def _has_workforce_references(self, agent_id: int) -> bool:
+        return (
+            self._workforce_reference_query(agent_id)
+            .with_entities(Workforce.id)
+            .first()
+            is not None
+        )
+
+    def _has_hidden_workforce_references(
+        self, agent_id: int, visible_workforce_ids: tuple[int, ...]
+    ) -> bool:
+        query = self._workforce_reference_query(agent_id)
+        if visible_workforce_ids:
+            query = query.filter(Workforce.id.notin_(visible_workforce_ids))
+        return query.with_entities(Workforce.id).first() is not None
+
+    def _visible_workforce_references(
+        self,
+        *,
+        actor: User,
+        agent_id: int,
+    ) -> tuple[AgentWorkforceReference, ...]:
+        visible_rows = filter_visible_workforces(
+            self.db,
+            actor,
+            self._workforce_reference_query(agent_id),
+        ).all()
+        workforces_by_id = {int(workforce.id): workforce for workforce in visible_rows}
+        workforce_ids = tuple(sorted(workforces_by_id))
+        if not workforce_ids:
+            return ()
+
+        worker_workforce_ids = {
+            int(workforce_id)
+            for (workforce_id,) in (
+                self.db.query(WorkforceAgent.workforce_id)
+                .filter(
+                    WorkforceAgent.agent_id == agent_id,
+                    WorkforceAgent.workforce_id.in_(workforce_ids),
+                )
+                .all()
+            )
+        }
+        run_counts = {
+            int(workforce_id): int(count)
+            for workforce_id, count in (
+                self.db.query(WorkforceRun.workforce_id, func.count(WorkforceRun.id))
+                .filter(WorkforceRun.workforce_id.in_(workforce_ids))
+                .group_by(WorkforceRun.workforce_id)
+                .all()
+            )
+        }
+        manager_ids = tuple(
+            {int(workforce.manager_agent_id) for workforce in visible_rows}
+        )
+        managers_by_id = {
+            int(manager.id): manager
+            for manager in self.db.query(Agent).filter(Agent.id.in_(manager_ids)).all()
+        }
+        manager_reference_counts = {
+            int(manager_id): int(count)
+            for manager_id, count in (
+                self.db.query(Workforce.manager_agent_id, func.count(Workforce.id))
+                .filter(Workforce.manager_agent_id.in_(manager_ids))
+                .group_by(Workforce.manager_agent_id)
+                .all()
+            )
+        }
+        managers_used_as_workers = {
+            int(manager_id)
+            for (manager_id,) in (
+                self.db.query(WorkforceAgent.agent_id)
+                .filter(WorkforceAgent.agent_id.in_(manager_ids))
+                .distinct()
+                .all()
+            )
+        }
+
+        references: list[AgentWorkforceReference] = []
+        for workforce_id in workforce_ids:
+            workforce = workforces_by_id[workforce_id]
+            roles: list[Literal["manager", "worker"]] = []
+            if int(workforce.manager_agent_id) == agent_id:
+                roles.append("manager")
+            if workforce_id in worker_workforce_ids:
+                roles.append("worker")
+            status = str(workforce.status)
+            can_edit = bool(
+                status != "archived" and can_edit_workforce(self.db, actor, workforce)
+            )
+            manager_id = int(workforce.manager_agent_id)
+            manager_discard_safe = is_workforce_manager_discard_safe(
+                workforce,
+                managers_by_id.get(manager_id),
+                used_as_other_manager=manager_reference_counts.get(manager_id, 0) > 1,
+                used_as_worker=manager_id in managers_used_as_workers,
+            )
+            references.append(
+                AgentWorkforceReference(
+                    workforce_id=workforce_id,
+                    name=str(workforce.name),
+                    status=status,
+                    roles=tuple(roles),
+                    can_edit=can_edit,
+                    can_discard=bool(
+                        can_edit
+                        and status == "draft"
+                        and run_counts.get(workforce_id, 0) == 0
+                        and manager_discard_safe
+                    ),
+                )
+            )
+        return tuple(references)
+
+    def _workforce_conflict(
+        self, *, actor: User, agent_id: int
+    ) -> AgentWorkforceConflictError:
+        references = self._visible_workforce_references(
+            actor=actor,
+            agent_id=agent_id,
+        )
+        visible_ids = tuple(reference.workforce_id for reference in references)
+        return AgentWorkforceConflictError(
+            references,
+            has_hidden_references=self._has_hidden_workforce_references(
+                agent_id, visible_ids
+            ),
+        )
+
+    def delete_agent(
+        self,
+        *,
+        actor: User,
+        agent_id: int,
+    ) -> AgentDeleteResult | None:
+        """Delete an owned Agent unless any Workforce still references it."""
+        actor_user_id = int(actor.id)
+        agent = self.store.get_owned_agent(
+            actor_user_id,
+            agent_id,
+            for_update=True,
+        )
+        if agent is None:
+            return None
+        if self._has_workforce_references(agent_id):
+            raise self._workforce_conflict(actor=actor, agent_id=agent_id)
+
+        logo_url = cast("str | None", agent.logo_url)
+        agent_owner_user_id = int(agent.user_id)
+        agent_team_id = cast("int | None", agent.team_id)
+        try:
+            self.store.stage_delete_agent(agent)
+            self.db.commit()
+        except IntegrityError:
+            self.db.rollback()
+            if self._has_workforce_references(agent_id):
+                raise self._workforce_conflict(actor=actor, agent_id=agent_id) from None
+            raise
+        except Exception:
+            self.db.rollback()
+            raise
+
+        try:
+            invalidate_agent_cache(
+                agent_owner_user_id,
+                agent_id,
+                agent_team_id,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to invalidate cache after deleting agent %s",
+                agent_id,
+                exc_info=True,
+            )
+        return AgentDeleteResult(logo_url=logo_url)
 
     async def validate_knowledge_bases(
         self,

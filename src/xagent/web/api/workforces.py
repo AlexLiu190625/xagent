@@ -1,7 +1,7 @@
 from datetime import timezone
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
@@ -35,6 +35,7 @@ from ..services.workforce_access import (
     resolve_create_scope,
 )
 from ..services.workforce_creator import create_workforce_from_prompt
+from ..services.workforce_lifecycle import discard_draft_workforce
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
 from ..services.workforce_snapshot import (
@@ -750,6 +751,16 @@ async def archive_workforce(
     cast(Any, workforce).status = "archived"
     db.commit()
     return {"id": workforce.id, "status": workforce.status}
+
+
+@router.post("/{workforce_id}/discard", status_code=204)
+def discard_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    discard_draft_workforce(db, user, _load_workforce(db, workforce_id))
+    return Response(status_code=204)
 
 
 @router.post("/{workforce_id}/publish")
