@@ -298,9 +298,9 @@ describe("AgentBuilder update error handling (issue #956)", () => {
         new Response(
           JSON.stringify({
             detail: [
-              { msg: "Name must be 200 characters or fewer" },
-              "Invalid model selection",
-              { message: "Unsupported execution mode" },
+              { msg: " Name must be 200 characters or fewer " },
+              " Invalid model selection ",
+              { message: " Unsupported execution mode " },
               { msg: " " },
             ],
           }),

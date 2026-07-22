@@ -141,7 +141,7 @@ interface TemplateRequirements {
 const isAssignableToolCategory = (c: string) => c !== 'agent' && c !== 'other'
 
 function readNonEmptyString(value: unknown): string | null {
-  return typeof value === "string" && value.trim() ? value : null
+  return typeof value === "string" && value.trim() ? value.trim() : null
 }
 
 function getAgentUpdateErrorMessage(error: unknown, fallback: string): string {
