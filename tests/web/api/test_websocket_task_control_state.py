@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 from anyio import BrokenResourceError, ClosedResourceError
 
+from xagent.web.api import public_chat_access
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     ConnectionManager,
@@ -229,6 +231,83 @@ async def test_websocket_endpoint_disconnects_moved_connection_when_cancelled(
         await endpoint
 
     assert connection_manager.active_connections == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_kind", ["public", "share"])
+async def test_public_websocket_endpoint_disconnects_reassigned_connection_when_cancelled(
+    monkeypatch,
+    endpoint_kind: str,
+) -> None:
+    initial_task_id = 42
+    moved_task_id = 99
+    websocket = _BlockingWebSocket()
+    connection_manager = ConnectionManager()
+    access_context = SimpleNamespace(user=SimpleNamespace(id=7))
+
+    async def reassign_during_initial_status(*args) -> None:
+        connection_manager.register_connection(websocket, moved_task_id)
+
+    monkeypatch.setattr(public_chat_access, "manager", connection_manager)
+    monkeypatch.setattr(
+        public_chat_access,
+        "db_session_context",
+        lambda: nullcontext(object()),
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "get_public_chat_user",
+        lambda *args, **kwargs: access_context,
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "get_share_chat_user",
+        lambda *args, **kwargs: access_context,
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "get_task_for_public_context",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "get_task_for_share_context",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        public_chat_access,
+        "handle_status_request",
+        AsyncMock(side_effect=reassign_during_initial_status),
+    )
+
+    if endpoint_kind == "public":
+        endpoint = asyncio.create_task(
+            public_chat_access.public_chat_websocket_endpoint(
+                websocket=websocket,
+                task_id=initial_task_id,
+                token="token",
+                expected_auth_mode="widget",
+            )
+        )
+    else:
+        endpoint = asyncio.create_task(
+            public_chat_access.share_chat_websocket_endpoint(
+                websocket=websocket,
+                task_id=initial_task_id,
+                token="token",
+            )
+        )
+
+    await websocket.receive_started.wait()
+
+    assert connection_manager.active_connections == {moved_task_id: [websocket]}
+
+    endpoint.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await endpoint
+
+    assert connection_manager.active_connections == {}
+    assert connection_manager._connection_task_ids == {}
 
 
 @pytest.mark.asyncio
