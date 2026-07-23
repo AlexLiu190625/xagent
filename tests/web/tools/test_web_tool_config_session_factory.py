@@ -102,6 +102,34 @@ class _FailingQuerySession:
         raise RuntimeError("database-secret")
 
 
+class _PostgresAbortSession:
+    """Models Postgres' abort-until-transaction-reset behavior."""
+
+    def __init__(self, checkout_error: Exception | None = None):
+        self.aborted = False
+        self.closed = False
+        self.checkout_error = checkout_error
+
+    def connection(self):
+        if self.checkout_error is not None:
+            raise self.checkout_error
+        return object()
+
+    def query(self, *_args, **_kwargs):
+        self.assert_usable()
+        return _ListChain([SimpleNamespace(id=1)])
+
+    def close(self):
+        self.closed = True
+
+    def swallow_statement_failure(self) -> None:
+        self.aborted = True
+
+    def assert_usable(self) -> None:
+        if self.aborted:
+            raise RuntimeError("current transaction is aborted")
+
+
 def test_get_session_factory_prefers_injected_factory():
     factory = _factory()
     cfg = WebToolConfig(db=None, request=None, db_factory=factory)
@@ -596,6 +624,253 @@ async def test_factory_prepare_snapshots_selected_sync_factory_inputs(
 
 
 @pytest.mark.asyncio
+async def test_factory_prefetch_isolates_later_read_from_swallowed_sql_failure(
+    monkeypatch,
+):
+    """One optional loader must not poison a later independent DB read."""
+    sessions: list[_PostgresAbortSession] = []
+    loader_sessions: dict[str, _PostgresAbortSession] = {}
+    video_model = object()
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession()
+        sessions.append(session)
+        return session
+
+    def load_broken_images(db: _PostgresAbortSession, _user_id):
+        # ``get_image_models`` currently catches SQL errors internally. Model
+        # the resulting Postgres transaction state without leaking the error to
+        # the snapshot loader that would otherwise know to recover it.
+        loader_sessions["image"] = db
+        db.swallow_statement_failure()
+        return {}
+
+    def load_videos(db: _PostgresAbortSession, _user_id):
+        loader_sessions["video"] = db
+        db.assert_usable()
+        return {"video": video_model}
+
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_image_models",
+        load_broken_images,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_video_models",
+        load_videos,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_default_video_model",
+        lambda *_args, **_kwargs: None,
+    )
+
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=session_factory,
+        user_id=1,
+        task_id="_mock_",
+        workspace_config={"task_id": "_mock_"},
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(
+            tool_categories=["image", "video"]
+        ),
+    )
+
+    try:
+        await cfg.prepare_factory_runtime()
+
+        assert cfg.get_image_models() == {}
+        assert cfg.get_video_models() == {"video": video_model}
+        assert loader_sessions["image"] is not loader_sessions["video"]
+        assert all(session.closed for session in sessions)
+    finally:
+        cfg.release_prepared_factory_runtime()
+        cfg.close()
+
+
+@pytest.mark.asyncio
+async def test_factory_prefetch_recovers_before_later_read_after_required_failure(
+    monkeypatch,
+):
+    """A required input failure must not mark an unrelated input unavailable."""
+    sessions: list[_PostgresAbortSession] = []
+    loader_sessions: dict[str, _PostgresAbortSession] = {}
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession()
+        sessions.append(session)
+        return session
+
+    def load_broken_credential(db: _PostgresAbortSession, *_args):
+        loader_sessions["basic"] = db
+        raise RuntimeError("credential query failed")
+
+    def load_sql_connections(db: _PostgresAbortSession, _user_id):
+        loader_sessions["database"] = db
+        db.assert_usable()
+        return {"WAREHOUSE": "sqlite:///warehouse.db"}
+
+    monkeypatch.setattr(
+        "xagent.web.tools.config.resolve_tool_credential",
+        load_broken_credential,
+    )
+    monkeypatch.setattr(
+        "xagent.web.tools.config.get_sql_connection_map",
+        load_sql_connections,
+    )
+
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=session_factory,
+        user_id=1,
+        task_id="_mock_",
+        workspace_config={"task_id": "_mock_"},
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(
+            tool_categories=["basic", "database"]
+        ),
+    )
+
+    try:
+        await cfg.prepare_factory_runtime()
+
+        with pytest.raises(RuntimeError, match="credential snapshot is unavailable"):
+            cfg.get_tool_credential("web_search", "api_key")
+        assert cfg.get_sql_connections() == {"WAREHOUSE": "sqlite:///warehouse.db"}
+        assert loader_sessions["basic"] is not loader_sessions["database"]
+        assert all(session.closed for session in sessions)
+    finally:
+        cfg.release_prepared_factory_runtime()
+        cfg.close()
+
+
+@pytest.mark.asyncio
+async def test_factory_prefetch_propagates_later_input_checkout_timeout(monkeypatch):
+    """A later input's checkout timeout must not degrade to an empty model set."""
+    sessions: list[_PostgresAbortSession] = []
+    checkout_timeout = SQLAlchemyTimeoutError("later checkout timed out")
+    video_loader_called = False
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession(
+            checkout_error=checkout_timeout if sessions else None
+        )
+        sessions.append(session)
+        return session
+
+    def load_video_models(*_args):
+        nonlocal video_loader_called
+        video_loader_called = True
+        return {}
+
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_image_models",
+        lambda *_args: {},
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_video_models",
+        load_video_models,
+    )
+
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=session_factory,
+        user_id=1,
+        task_id="_mock_",
+        workspace_config={"task_id": "_mock_"},
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(
+            tool_categories=["image", "video"]
+        ),
+    )
+
+    try:
+        with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
+            await cfg.prepare_factory_runtime()
+
+        assert exc_info.value is checkout_timeout
+        assert video_loader_called is False
+        assert len(sessions) == 2
+        assert all(session.closed for session in sessions)
+    finally:
+        cfg.release_prepared_factory_runtime()
+        cfg.close()
+
+
+def test_runtime_policy_isolates_override_read_before_allowlist():
+    """A swallowed override failure must not erase the independent allowlist."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_PostgresAbortSession] = []
+    hook_sessions: dict[str, _PostgresAbortSession] = {}
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession()
+        sessions.append(session)
+        return session
+
+    def load_overrides(db: _PostgresAbortSession, _user):
+        hook_sessions["overrides"] = db
+        db.swallow_statement_failure()
+        return {}
+
+    def load_allowlist(db: _PostgresAbortSession, _user):
+        hook_sessions["allowlist"] = db
+        db.assert_usable()
+        return ["file"]
+
+    set_user_tool_overrides_hook(load_overrides)
+    set_user_tool_allowlist_hook(load_allowlist)
+    try:
+        snapshot = _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert snapshot.tool_overrides == {}
+        assert snapshot.tool_allowlist == ["file"]
+        assert hook_sessions["overrides"] is not hook_sessions["allowlist"]
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+def test_runtime_policy_propagates_later_input_checkout_timeout():
+    """The allowlist checkout must not hide a pool timeout as no policy."""
+    from xagent.web.tools.config import _load_tool_runtime_policy_snapshot
+
+    sessions: list[_PostgresAbortSession] = []
+    checkout_timeout = SQLAlchemyTimeoutError("allowlist checkout timed out")
+    allowlist_hook_called = False
+
+    def session_factory() -> _PostgresAbortSession:
+        session = _PostgresAbortSession(
+            checkout_error=checkout_timeout if sessions else None
+        )
+        sessions.append(session)
+        return session
+
+    def load_allowlist(_db, _user):
+        nonlocal allowlist_hook_called
+        allowlist_hook_called = True
+        return ["file"]
+
+    set_user_tool_overrides_hook(lambda _db, _user: {})
+    set_user_tool_allowlist_hook(load_allowlist)
+    try:
+        with pytest.raises(SQLAlchemyTimeoutError) as exc_info:
+            _load_tool_runtime_policy_snapshot(session_factory, 1)
+
+        assert exc_info.value is checkout_timeout
+        assert allowlist_hook_called is False
+        assert len(sessions) == 2
+        assert all(session.closed for session in sessions)
+    finally:
+        set_user_tool_overrides_hook(None)
+        set_user_tool_allowlist_hook(None)
+
+
+@pytest.mark.asyncio
 async def test_default_model_prefetch_returns_every_pool_checkout(
     monkeypatch,
     tmp_path,
@@ -607,7 +882,7 @@ async def test_default_model_prefetch_returns_every_pool_checkout(
     engine = create_engine(
         f"sqlite:///{tmp_path / 'default-models.db'}",
         poolclass=QueuePool,
-        pool_size=1,
+        pool_size=2,
         max_overflow=0,
         pool_timeout=0.1,
         connect_args={"check_same_thread": False},
@@ -618,10 +893,12 @@ async def test_default_model_prefetch_returns_every_pool_checkout(
 
     checkouts = 0
     checkins = 0
+    max_checked_out = 0
 
     def record_checkout(*_args) -> None:
-        nonlocal checkouts
+        nonlocal checkouts, max_checked_out
         checkouts += 1
+        max_checked_out = max(max_checked_out, engine.pool.checkedout())
 
     def record_checkin(*_args) -> None:
         nonlocal checkins
@@ -685,7 +962,8 @@ async def test_default_model_prefetch_returns_every_pool_checkout(
         await cfg.prepare_factory_runtime()
 
         assert default_calls == list(default_getters)
-        assert checkouts == checkins == 1
+        assert checkouts == checkins == len(collection_getters) + len(default_getters)
+        assert max_checked_out == 1
         assert engine.pool.checkedout() == 0
     finally:
         cfg.close()

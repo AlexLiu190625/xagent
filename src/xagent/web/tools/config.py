@@ -662,205 +662,209 @@ def _load_tool_factory_runtime_snapshot(
     music_model: Any | None = None
     published_agent_records: list[Any] = []
 
-    def load_optional_input(
+    def load_snapshot_input(
         input_name: str,
-        loader: Callable[[], Any],
+        loader: Callable[[Any], Any],
         default: Any,
+        *,
+        unavailable_input: str | None = None,
+        propagated_exceptions: tuple[type[Exception], ...] = (),
+        log_level: int = logging.WARNING,
+        log_message: str | None = None,
     ) -> Any:
-        try:
-            return loader()
-        except Exception as exc:
-            if is_database_pool_timeout(exc):
-                raise
-            logger.warning(
-                "Failed to prefetch %s tool input",
-                input_name,
-                exc_info=True,
-            )
-            return default
+        """Load one logical input through an isolated Session boundary.
 
-    requires_direct_db = plan.requires_direct_db_without_policy or (
-        plan.load_policy and policy_snapshot is None
-    )
-    db = None
-    if requires_direct_db:
+        Required creator inputs are marked unavailable so their synchronous
+        snapshot getters raise. Optional creator inputs retain their legacy
+        soft-fail behavior and return the supplied default.
+        """
         db = session_factory()
         try:
-            # Fail before creator-level broad exception handling can turn a
-            # saturated QueuePool into an empty/partial tool set.
+            # Fail before a legacy loader's broad exception handling can turn a
+            # saturated QueuePool into an empty or partial tool input.
             db.connection()
-
-            if plan.load_policy and policy_snapshot is None:
-                runtime_policy = _load_tool_runtime_policy(db, plan.user_id)
-
-            if plan.load_basic:
-                try:
-                    for tool_name, field_specs in TOOL_CREDENTIAL_SPECS.items():
-                        for field_name in field_specs:
-                            tool_credentials[(tool_name, field_name)] = (
-                                resolve_tool_credential(db, tool_name, field_name)
-                            )
-                except Exception as exc:
-                    if is_database_pool_timeout(exc):
-                        raise
-                    failed_inputs.add("basic")
-                    logger.warning(
-                        "Failed to prefetch tool credentials",
-                        exc_info=True,
-                    )
-
-            if plan.load_sql:
-                try:
-                    sql_connections = get_sql_connection_map(db, plan.user_id)
-                except Exception as exc:
-                    if is_database_pool_timeout(exc):
-                        raise
-                    failed_inputs.add("database")
-                    logger.warning(
-                        "Failed to prefetch SQL connections",
-                        exc_info=True,
-                    )
-
-            if plan.load_custom_api:
-                try:
-                    custom_api_configs = _load_custom_api_factory_inputs(
-                        db,
-                        user_id=plan.user_id,
-                        task_id=plan.task_id,
-                        connector_runtime_turn_id=plan.connector_runtime_turn_id,
-                    )
-                except ConnectorRuntimeError:
+            try:
+                return loader(db)
+            except Exception as exc:
+                if isinstance(exc, propagated_exceptions):
                     raise
-                except Exception as exc:
-                    if is_database_pool_timeout(exc):
-                        raise
-                    logger.error(
-                        "Failed to get Custom API configs from database: %s",
-                        exc,
+                if is_database_pool_timeout(exc):
+                    raise
+                if unavailable_input is not None:
+                    failed_inputs.add(unavailable_input)
+                if log_message is None:
+                    logger.log(
+                        log_level,
+                        "Failed to prefetch %s tool input",
+                        input_name,
                         exc_info=True,
                     )
-
-            if (
-                plan.published_agent_policy is not None
-                and plan.published_agent_policy.query_required
-                and plan.user_id is not None
-            ):
-                try:
-                    from ...core.tools.adapters.vibe.agent_tool import (
-                        load_published_agent_tool_records,
-                    )
-
-                    published_agent_records = load_published_agent_tool_records(
-                        db,
-                        user_id=plan.user_id,
-                        policy=plan.published_agent_policy,
-                    )
-                except Exception as exc:
-                    if is_database_pool_timeout(exc):
-                        raise
-                    logger.warning(
-                        "Failed to prefetch published-agent tools",
-                        exc_info=True,
-                    )
-
-            from ..services import model_service
-
-            if plan.load_image:
-                image_models = load_optional_input(
-                    "image",
-                    lambda: model_service.get_image_models(db, plan.user_id),
-                    {},
-                )
-            if plan.load_video:
-                video_models = load_optional_input(
-                    "video",
-                    lambda: model_service.get_video_models(db, plan.user_id),
-                    {},
-                )
-            if plan.load_audio:
-                asr_models = load_optional_input(
-                    "audio",
-                    lambda: model_service.get_asr_models(db, plan.user_id),
-                    {},
-                )
-                tts_models = load_optional_input(
-                    "audio",
-                    lambda: model_service.get_tts_models(db, plan.user_id),
-                    {},
-                )
-                sound_effect_models = load_optional_input(
-                    "audio",
-                    lambda: model_service.get_sound_effect_models(db, plan.user_id),
-                    {},
-                )
-                music_models = load_optional_input(
-                    "audio",
-                    lambda: model_service.get_music_models(db, plan.user_id),
-                    {},
-                )
-
-            if plan.load_vision:
-                vision_model = load_optional_input(
-                    "vision",
-                    lambda: model_service.get_default_vision_model(plan.user_id, db=db),
-                    None,
-                )
-            if plan.load_image and image_models:
-                image_generate_model = load_optional_input(
-                    "image",
-                    lambda: model_service.get_default_image_generate_model(
-                        plan.user_id, db=db
-                    ),
-                    None,
-                )
-                image_edit_model = load_optional_input(
-                    "image",
-                    lambda: model_service.get_default_image_edit_model(
-                        plan.user_id, db=db
-                    ),
-                    None,
-                )
-            if plan.load_video and video_models:
-                video_model = load_optional_input(
-                    "video",
-                    lambda: model_service.get_default_video_model(plan.user_id, db=db),
-                    None,
-                )
-            if plan.load_audio:
-                if asr_models or tts_models:
-                    asr_model = load_optional_input(
-                        "audio",
-                        lambda: model_service.get_default_asr_model(
-                            plan.user_id, db=db
-                        ),
-                        None,
-                    )
-                    tts_model = load_optional_input(
-                        "audio",
-                        lambda: model_service.get_default_tts_model(
-                            plan.user_id, db=db
-                        ),
-                        None,
-                    )
-                if sound_effect_models:
-                    sound_effect_model = load_optional_input(
-                        "audio",
-                        lambda: model_service.get_default_sound_effect_model(
-                            plan.user_id, db=db
-                        ),
-                        None,
-                    )
-                if music_models:
-                    music_model = load_optional_input(
-                        "audio",
-                        lambda: model_service.get_default_music_model(
-                            plan.user_id, db=db
-                        ),
-                        None,
-                    )
+                else:
+                    logger.log(log_level, log_message, exc_info=True)
+                return default
         finally:
-            if db is not None:
-                db.close()
+            # The next input receives a new Session even when this loader caught
+            # its own SQL error or changed the transaction state internally.
+            db.close()
+
+    if plan.load_policy and policy_snapshot is None:
+        runtime_policy = _load_tool_runtime_policy_snapshot(
+            session_factory,
+            plan.user_id,
+        )
+
+    if plan.load_basic:
+
+        def load_tool_credentials(db: Any) -> dict[tuple[str, str], str | None]:
+            loaded_credentials: dict[tuple[str, str], str | None] = {}
+            for tool_name, field_specs in TOOL_CREDENTIAL_SPECS.items():
+                for field_name in field_specs:
+                    loaded_credentials[(tool_name, field_name)] = (
+                        resolve_tool_credential(db, tool_name, field_name)
+                    )
+            return loaded_credentials
+
+        tool_credentials = load_snapshot_input(
+            "tool credentials",
+            load_tool_credentials,
+            {},
+            unavailable_input="basic",
+            log_message="Failed to prefetch tool credentials",
+        )
+
+    if plan.load_sql:
+        sql_connections = load_snapshot_input(
+            "SQL connections",
+            lambda db: get_sql_connection_map(db, plan.user_id),
+            {},
+            unavailable_input="database",
+            log_message="Failed to prefetch SQL connections",
+        )
+
+    if plan.load_custom_api:
+        custom_api_configs = load_snapshot_input(
+            "Custom API configs",
+            lambda db: _load_custom_api_factory_inputs(
+                db,
+                user_id=plan.user_id,
+                task_id=plan.task_id,
+                connector_runtime_turn_id=plan.connector_runtime_turn_id,
+            ),
+            [],
+            propagated_exceptions=(ConnectorRuntimeError,),
+            log_level=logging.ERROR,
+            log_message="Failed to get Custom API configs from database",
+        )
+
+    if (
+        plan.published_agent_policy is not None
+        and plan.published_agent_policy.query_required
+        and plan.user_id is not None
+    ):
+        from ...core.tools.adapters.vibe.agent_tool import (
+            load_published_agent_tool_records,
+        )
+
+        published_agent_user_id = plan.user_id
+        published_agent_policy = plan.published_agent_policy
+        published_agent_records = load_snapshot_input(
+            "published-agent tools",
+            lambda db: load_published_agent_tool_records(
+                db,
+                user_id=published_agent_user_id,
+                policy=published_agent_policy,
+            ),
+            [],
+            log_message="Failed to prefetch published-agent tools",
+        )
+
+    from ..services import model_service
+
+    if plan.load_image:
+        image_models = load_snapshot_input(
+            "image",
+            lambda db: model_service.get_image_models(db, plan.user_id),
+            {},
+        )
+    if plan.load_video:
+        video_models = load_snapshot_input(
+            "video",
+            lambda db: model_service.get_video_models(db, plan.user_id),
+            {},
+        )
+    if plan.load_audio:
+        asr_models = load_snapshot_input(
+            "audio",
+            lambda db: model_service.get_asr_models(db, plan.user_id),
+            {},
+        )
+        tts_models = load_snapshot_input(
+            "audio",
+            lambda db: model_service.get_tts_models(db, plan.user_id),
+            {},
+        )
+        sound_effect_models = load_snapshot_input(
+            "audio",
+            lambda db: model_service.get_sound_effect_models(db, plan.user_id),
+            {},
+        )
+        music_models = load_snapshot_input(
+            "audio",
+            lambda db: model_service.get_music_models(db, plan.user_id),
+            {},
+        )
+
+    if plan.load_vision:
+        vision_model = load_snapshot_input(
+            "vision",
+            lambda db: model_service.get_default_vision_model(plan.user_id, db=db),
+            None,
+        )
+    if plan.load_image and image_models:
+        image_generate_model = load_snapshot_input(
+            "image",
+            lambda db: model_service.get_default_image_generate_model(
+                plan.user_id, db=db
+            ),
+            None,
+        )
+        image_edit_model = load_snapshot_input(
+            "image",
+            lambda db: model_service.get_default_image_edit_model(plan.user_id, db=db),
+            None,
+        )
+    if plan.load_video and video_models:
+        video_model = load_snapshot_input(
+            "video",
+            lambda db: model_service.get_default_video_model(plan.user_id, db=db),
+            None,
+        )
+    if plan.load_audio:
+        if asr_models or tts_models:
+            asr_model = load_snapshot_input(
+                "audio",
+                lambda db: model_service.get_default_asr_model(plan.user_id, db=db),
+                None,
+            )
+            tts_model = load_snapshot_input(
+                "audio",
+                lambda db: model_service.get_default_tts_model(plan.user_id, db=db),
+                None,
+            )
+        if sound_effect_models:
+            sound_effect_model = load_snapshot_input(
+                "audio",
+                lambda db: model_service.get_default_sound_effect_model(
+                    plan.user_id, db=db
+                ),
+                None,
+            )
+        if music_models:
+            music_model = load_snapshot_input(
+                "audio",
+                lambda db: model_service.get_default_music_model(plan.user_id, db=db),
+                None,
+            )
 
     return _ToolFactoryRuntimeSnapshot(
         plan=plan,
@@ -888,11 +892,11 @@ def _load_tool_factory_runtime_snapshot(
     )
 
 
-def _load_tool_runtime_policy(
-    db: Any,
+def _load_tool_runtime_policy_snapshot(
+    session_factory: Any,
     user_id: int | None,
 ) -> _ToolRuntimePolicySnapshot:
-    """Load policy hooks with the same defaults and timeout semantics everywhere."""
+    """Load each detached policy input through its own worker-owned Session."""
     from ..services.db_runtime import is_database_pool_timeout
 
     if user_id is None:
@@ -900,43 +904,46 @@ def _load_tool_runtime_policy(
 
     from ..models.user import User
 
-    user = db.query(User).filter(User.id == user_id).first()
-    if user is None:
-        return _ToolRuntimePolicySnapshot()
+    def load_policy_input(
+        input_name: str,
+        loader: Callable[[Any, Any], Any],
+        default: Any,
+    ) -> Any:
+        db = session_factory()
+        try:
+            # Keep checkout outside the policy fallback because a saturated pool
+            # must reach the task owner rather than look like an absent policy.
+            db.connection()
+            try:
+                user = db.query(User).filter(User.id == user_id).first()
+                if user is None:
+                    return default
+                return loader(db, user)
+            except Exception as exc:
+                if is_database_pool_timeout(exc):
+                    raise
+                logger.exception("Failed to get user tool %s", input_name)
+                return default
+        finally:
+            # Hooks are application extension points and do not promise neutral
+            # transaction state, so the next hook always gets a fresh Session.
+            db.close()
 
-    tool_overrides: dict[str, Any] = {}
-    tool_allowlist: list[str] | None = None
-    try:
-        overrides = get_user_tool_overrides(db, user)
-        if isinstance(overrides, dict):
-            tool_overrides = dict(overrides)
-    except Exception as exc:
-        if is_database_pool_timeout(exc):
-            raise
-        logger.exception("Failed to get user tool overrides")
-    try:
-        tool_allowlist = normalize_tool_allowlist(get_user_tool_allowlist(db, user))
-    except Exception as exc:
-        if is_database_pool_timeout(exc):
-            raise
-        logger.exception("Failed to get user tool allowlist")
+    overrides = load_policy_input(
+        "overrides",
+        lambda db, user: get_user_tool_overrides(db, user),
+        {},
+    )
+    tool_overrides = dict(overrides) if isinstance(overrides, dict) else {}
+    tool_allowlist = load_policy_input(
+        "allowlist",
+        lambda db, user: normalize_tool_allowlist(get_user_tool_allowlist(db, user)),
+        None,
+    )
     return _ToolRuntimePolicySnapshot(
         tool_overrides=tool_overrides,
         tool_allowlist=tool_allowlist,
     )
-
-
-def _load_tool_runtime_policy_snapshot(
-    session_factory: Any,
-    user_id: int | None,
-) -> _ToolRuntimePolicySnapshot:
-    """Load detached policy using one short, worker-owned Session."""
-    db = session_factory()
-    try:
-        db.connection()
-        return _load_tool_runtime_policy(db, user_id)
-    finally:
-        db.close()
 
 
 class WebToolConfig(BaseToolConfig):
