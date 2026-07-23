@@ -1,7 +1,7 @@
 "use client"
 
-import React, { useCallback, useEffect, useRef, useState } from "react"
-import { AlertTriangle, Check, Copy, KeyRound, Plus, Trash2 } from "lucide-react"
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { AlertTriangle, Check, Copy, KeyRound, Plus, Search, Trash2 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardHeader } from "@/components/ui/card"
 import { ConfirmDialog } from "@/components/ui/confirm-dialog"
@@ -13,6 +13,7 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { toast } from "@/components/ui/sonner"
 import { useI18n } from "@/contexts/i18n-context"
@@ -46,6 +47,7 @@ export function PersonalApiKeysPanel() {
   const [copied, setCopied] = useState(false)
   const [confirmKey, setConfirmKey] = useState<PersonalApiKeyListItem | null>(null)
   const [revoking, setRevoking] = useState(false)
+  const [searchQuery, setSearchQuery] = useState("")
   const listGeneration = useRef(0)
 
   const loadKeys = useCallback(async () => {
@@ -111,6 +113,22 @@ export function PersonalApiKeysPanel() {
     }
   }
 
+  const normalizedQuery = searchQuery.trim().toLowerCase()
+  const filteredKeys = useMemo(
+    () =>
+      keys.filter(
+        (k) =>
+          !normalizedQuery ||
+          [k.masked_key, k.key_prefix, k.owner.username, k.owner.email ?? ""]
+            .join(" ")
+            .toLowerCase()
+            .includes(normalizedQuery)
+      ),
+    [keys, normalizedQuery]
+  )
+
+  const activeCount = useMemo(() => keys.filter((k) => k.status === "active").length, [keys])
+
   const formatDate = (value: string) => new Date(value).toLocaleDateString()
   const revokeDescription = confirmKey
     ? canManageOthers
@@ -121,20 +139,56 @@ export function PersonalApiKeysPanel() {
 
   return (
     <div className="px-6 md:px-8 pb-8 mt-6">
+      <div className="grid gap-4 grid-cols-2 lg:grid-cols-4 mb-6">
+        <Card>
+          <CardContent>
+            <p className="text-xs text-muted-foreground">
+              {t("personalApiKeys.stats.totalKeys") || "Total Keys"}
+            </p>
+            <p className="text-2xl font-bold mt-1">{loading ? "—" : keys.length}</p>
+            <p className="text-xs text-muted-foreground mt-1">
+              {t("personalApiKeys.stats.totalKeysHint") || "personal keys"}
+            </p>
+          </CardContent>
+        </Card>
+        <Card>
+          <CardContent>
+            <p className="text-xs text-muted-foreground">
+              {t("personalApiKeys.stats.activeKeys") || "Active Keys"}
+            </p>
+            <p className="text-2xl font-bold mt-1">{loading ? "—" : activeCount}</p>
+            <p className="text-xs text-muted-foreground mt-1">
+              {t("personalApiKeys.stats.activeKeysHint") || "accepting requests"}
+            </p>
+          </CardContent>
+        </Card>
+      </div>
+
       <Card className="shadow-sm">
-        <CardHeader className="pb-3 border-b flex flex-row items-center justify-between gap-4 space-y-0">
+        <CardHeader className="pb-3 border-b flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 space-y-0">
           <div>
             <h2 className="text-lg font-semibold">{t("personalApiKeys.title") || "Personal Keys"}</h2>
             <p className="text-sm text-muted-foreground mt-1">
               {t("personalApiKeys.description") || "Manage your personal SDK and REST API keys."}
             </p>
           </div>
-          <Button onClick={handleCreate} disabled={creating} className="shrink-0">
-            <Plus className="w-4 h-4 mr-1" />
-            {canManageOthers
-              ? t("personalApiKeys.createForMe") || "Create Personal Key for Me"
-              : t("personalApiKeys.create") || "Create Personal Key"}
-          </Button>
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            <div className="relative w-full sm:w-64">
+              <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-muted-foreground" />
+              <Input
+                placeholder={t("personalApiKeys.searchPlaceholder") || "Search keys or owners..."}
+                className="pl-9 h-9"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </div>
+            <Button onClick={handleCreate} disabled={creating} className="shrink-0">
+              <Plus className="w-4 h-4 mr-1" />
+              {canManageOthers
+                ? t("personalApiKeys.createForMe") || "Create Personal Key for Me"
+                : t("personalApiKeys.create") || "Create Personal Key"}
+            </Button>
+          </div>
         </CardHeader>
         <CardContent className="p-0">
           <Table>
@@ -161,10 +215,13 @@ export function PersonalApiKeysPanel() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {keys.map((key) => (
+              {filteredKeys.map((key) => (
                 <TableRow key={key.id} className={key.status === "active" ? "" : "opacity-50"}>
-                  <TableCell className="font-mono text-xs text-muted-foreground">
-                    {key.masked_key}
+                  <TableCell>
+                    <span className="inline-flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+                      <KeyRound className="w-3.5 h-3.5 shrink-0" />
+                      {key.masked_key}
+                    </span>
                   </TableCell>
                   {canManageOthers && <TableCell className="text-sm">{key.owner.username}</TableCell>}
                   <TableCell>
@@ -194,10 +251,12 @@ export function PersonalApiKeysPanel() {
                   </TableCell>
                 </TableRow>
               ))}
-              {keys.length === 0 && !loading && (
+              {filteredKeys.length === 0 && !loading && (
                 <TableRow>
                   <TableCell colSpan={canManageOthers ? 6 : 5} className="text-center text-muted-foreground h-32">
-                    {t("personalApiKeys.noData") || "No personal API keys yet."}
+                    {keys.length === 0
+                      ? t("personalApiKeys.noData") || "No personal API keys yet."
+                      : t("personalApiKeys.noResults") || "No keys match your search."}
                   </TableCell>
                 </TableRow>
               )}

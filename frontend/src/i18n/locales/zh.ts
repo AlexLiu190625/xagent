@@ -3550,6 +3550,14 @@ const zh = {
     create: "创建个人密钥",
     createForMe: "为我创建个人密钥",
     noData: "暂无个人 API 密钥。",
+    noResults: "没有匹配的密钥。",
+    searchPlaceholder: "搜索密钥或所有者...",
+    stats: {
+      totalKeys: "密钥总数",
+      totalKeysHint: "个人密钥",
+      activeKeys: "有效密钥",
+      activeKeysHint: "可正常调用"
+    },
     columns: {
       key: "密钥",
       owner: "所有者",

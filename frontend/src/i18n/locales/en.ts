@@ -3550,6 +3550,14 @@ Build when you need.`,
     create: "Create Personal Key",
     createForMe: "Create Personal Key for Me",
     noData: "No personal API keys yet.",
+    noResults: "No keys match your search.",
+    searchPlaceholder: "Search keys or owners...",
+    stats: {
+      totalKeys: "Total Keys",
+      totalKeysHint: "personal keys",
+      activeKeys: "Active Keys",
+      activeKeysHint: "accepting requests"
+    },
     columns: {
       key: "Secret Key",
       owner: "Owner",

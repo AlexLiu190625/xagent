@@ -276,32 +276,24 @@ export function ApiKeysPage() {
       <PageHeader
         title={t("apiKeysPage.title") || "API Keys"}
         description={t("apiKeysPage.subtitle") || "Manage API keys for programmatic access to your agents."}
-        actions={
-          activeTab === "agent" ? (
-            <Button onClick={openCreateDialog} className="shrink-0">
-              <Plus className="w-4 h-4 mr-1" />
-              {t("apiKeysPage.newKey") || "New API Key"}
-            </Button>
-          ) : undefined
-        }
       />
 
       <Tabs value={activeTab} onValueChange={handleTabChange} className="mt-6">
-        <TabsList className="bg-transparent h-12 p-0 space-x-6 justify-start border-b w-full rounded-none px-6 md:px-8">
+        <TabsList className="!flex bg-transparent h-auto p-0 gap-6 justify-start border-b w-full rounded-none px-6 md:px-8">
           <TabsTrigger
             value="agent"
-            className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
+            className="!flex-none !w-auto rounded-none border-0 border-b-2 border-transparent px-1 py-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground shadow-none hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-primary data-[state=active]:shadow-none"
           >
             {t("apiKeysPage.tabs.agent") || "Agent Keys"}
           </TabsTrigger>
           <TabsTrigger
             value="personal"
-            className="data-[state=active]:border-primary data-[state=active]:text-primary data-[state=active]:bg-transparent border border-transparent rounded-md px-4 py-2 shadow-none data-[state=active]:shadow-none text-slate-700 font-normal"
+            className="!flex-none !w-auto rounded-none border-0 border-b-2 border-transparent px-1 py-3 text-xs font-semibold uppercase tracking-wide text-muted-foreground shadow-none hover:text-foreground data-[state=active]:border-primary data-[state=active]:bg-transparent data-[state=active]:text-primary data-[state=active]:shadow-none"
           >
             {t("apiKeysPage.tabs.personal") || "Personal Keys"}
           </TabsTrigger>
         </TabsList>
-        <TabsContent value="agent" className="mt-0">
+        <TabsContent value="agent" className="mt-0 flex-col">
 
       <div className="grid gap-4 grid-cols-2 lg:grid-cols-4 px-6 md:px-8 mt-6">
         <Card>
@@ -372,6 +364,10 @@ export function ApiKeysPage() {
                   onChange={(e) => setSearchQuery(e.target.value)}
                 />
               </div>
+              <Button onClick={openCreateDialog} className="shrink-0">
+                <Plus className="w-4 h-4 mr-1" />
+                {t("apiKeysPage.newKey") || "New API Key"}
+              </Button>
             </div>
           </CardHeader>
           <CardContent className="p-0">
@@ -587,7 +583,7 @@ export function ApiKeysPage() {
         }
       />
         </TabsContent>
-        <TabsContent value="personal" className="mt-0 data-[state=inactive]:hidden" forceMount>
+        <TabsContent value="personal" className="mt-0 flex-col data-[state=inactive]:hidden" forceMount>
           <PersonalApiKeysPanel />
         </TabsContent>
       </Tabs>
