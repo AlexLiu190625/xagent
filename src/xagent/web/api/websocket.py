@@ -163,6 +163,25 @@ def _task_status_uses_live_control(
     return status in {TaskStatus.WAITING_FOR_USER, TaskStatus.RUNNING}
 
 
+# User-facing messages for turn rejections that are NOT transient. The
+# default "busy" message tells the user to retry, which is actively
+# misleading for workforce rejections where retrying can never succeed.
+_TURN_REJECTION_MESSAGES = {
+    "workforce_archived": (
+        "This workforce has been archived; the conversation can no longer "
+        "accept new messages."
+    ),
+    "workforce_config_changed": (
+        "The workforce configuration has changed since this conversation "
+        "started; please start a new conversation."
+    ),
+    "workforce_run_not_found": (
+        "This workforce conversation is no longer available; please start "
+        "a new conversation."
+    ),
+}
+
+
 def _task_status_payload(db: Session, task_id: int) -> dict[str, Any] | None:
     task = db.query(Task).filter(Task.id == task_id).first()
     if task is None:
@@ -4187,27 +4206,24 @@ async def _handle_chat_message_unserialized(
                             f"Refused to schedule bg for task {task_id}: "
                             f"{busy_err.reason}"
                         )
+                        rejection_message = _TURN_REJECTION_MESSAGES.get(
+                            busy_err.reason,
+                            "Task is currently busy; please wait for the previous "
+                            "turn to finish before sending another message.",
+                        )
                         await manager.broadcast_to_task(
                             {
                                 **_task_error_payload(
                                     db,
                                     task_id,
-                                    (
-                                        "Task is currently busy; please wait for "
-                                        "the previous turn to finish before sending "
-                                        "another message."
-                                    ),
+                                    rejection_message,
                                     event_type="agent_error",
                                 ),
                                 "timestamp": datetime.now(timezone.utc).timestamp(),
                             },
                             task_id,
                         )
-                        await finish_delivery(
-                            False,
-                            "Task is currently busy; please wait for the previous "
-                            "turn to finish before sending another message.",
-                        )
+                        await finish_delivery(False, rejection_message)
 
             finally:
                 db.close()
