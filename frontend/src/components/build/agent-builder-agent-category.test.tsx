@@ -243,6 +243,53 @@ describe("AgentBuilder agent tool category (issue #802)", () => {
 })
 
 describe("AgentBuilder update error handling (issue #956)", () => {
+  it.each([
+    {
+      name: "a plain string detail",
+      payload: { detail: " Agent update failed with string detail " },
+      expected: "Agent update failed with string detail",
+    },
+    {
+      name: "a top-level message",
+      payload: { message: " Agent update failed with top-level message " },
+      expected: "Agent update failed with top-level message",
+    },
+    {
+      name: "a detail object without a readable message",
+      payload: { detail: { code: 123 } },
+      expected: "builds.editor.error.unknown",
+    },
+    {
+      name: "a detail array without readable entries",
+      payload: {
+        detail: [1, true, null, { msg: " " }, { message: " " }],
+      },
+      expected: "builds.editor.error.unknown",
+    },
+  ])("handles $name without unmounting the builder", async ({ payload, expected }) => {
+    installApi(
+      ["basic"],
+      () =>
+        new Response(JSON.stringify(payload), {
+          status: 422,
+          headers: { "Content-Type": "application/json" },
+        })
+    )
+    render(<AgentBuilder agentId={AGENT_ID} />)
+
+    const nameInput = await screen.findByPlaceholderText(
+      "builds.configForm.name.placeholder"
+    )
+    fireEvent.change(nameInput, { target: { value: "Updated Agent" } })
+    fireEvent.click(screen.getByText("builds.editor.header.update"))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalled()
+      expect(toastErrorMock.mock.calls.at(-1)?.[0]).toBe(expected)
+    })
+    expect(screen.getByDisplayValue("Updated Agent")).toBeInTheDocument()
+  })
+
   it("renders a structured detail message without unmounting the builder", async () => {
     installApi(
       ["basic"],
