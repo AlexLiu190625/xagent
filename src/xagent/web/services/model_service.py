@@ -958,103 +958,113 @@ def get_default_video_model(
     return None
 
 
-def get_default_embedding_model(user_id: Optional[int] = None) -> Optional[str]:
+def get_default_embedding_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[str]:
     """
     Get the default embedding model ID for a specific user.
 
     Args:
         user_id: User ID for multi-tenant model resolution. If None, uses admin defaults.
+        db: Optional caller-owned database session.
 
     Returns:
         The embedding model ID or None if not available
     """
-    from ..models.database import get_db
     from ..models.model import Model as DBModel
     from ..models.user import UserDefaultModel, UserModel
 
-    db = next(get_db())
-
-    # If user_id is provided, get user-specific default
-    if user_id:
-        embedding_default = (
-            db.query(UserDefaultModel)
-            .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-            .filter(
-                UserDefaultModel.user_id == user_id,
-                UserDefaultModel.config_type == "embedding",
-                DBModel.is_active,
+    with _default_model_session(db) as model_db:
+        # If user_id is provided, get user-specific default
+        if user_id:
+            embedding_default = (
+                model_db.query(UserDefaultModel)
+                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                .filter(
+                    UserDefaultModel.user_id == user_id,
+                    UserDefaultModel.config_type == "embedding",
+                    DBModel.is_active,
+                )
+                .first()
             )
-            .first()
+
+            if embedding_default and embedding_default.model:
+                if _is_model_visible_to_user(
+                    model_db, embedding_default.model.id, user_id
+                ):
+                    return str(embedding_default.model.model_id)
+
+        # Visible users' shared defaults
+        admin_embedding_defaults = (
+            model_db.query(UserDefaultModel)
+            .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+            .filter(
+                UserDefaultModel.config_type == "embedding",
+                UserModel.is_shared.is_(True),
+                UserDefaultModel.user_id.in_(_get_visible_user_ids(model_db, user_id)),
+            )
+            .limit(1)
+            .all()
         )
 
-        if embedding_default and embedding_default.model:
-            if _is_model_visible_to_user(db, embedding_default.model.id, user_id):
-                return str(embedding_default.model.model_id)
-
-    # Visible users' shared defaults
-    admin_embedding_defaults = (
-        db.query(UserDefaultModel)
-        .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-        .filter(
-            UserDefaultModel.config_type == "embedding",
-            UserModel.is_shared.is_(True),
-            UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
-        )
-        .limit(1)
-        .all()
-    )
-
-    if admin_embedding_defaults:
-        return str(admin_embedding_defaults[0].model.model_id)
+        if admin_embedding_defaults:
+            return str(admin_embedding_defaults[0].model.model_id)
 
     return None
 
 
-def get_default_rerank_model(user_id: Optional[int] = None) -> Optional[str]:
+def get_default_rerank_model(
+    user_id: Optional[int] = None,
+    *,
+    db: Session | None = None,
+) -> Optional[str]:
     """Get the default rerank model ID for a specific user.
 
     Mirrors :func:`get_default_embedding_model` for rerank models. Looks up
     the user's configured default rerank model from ``UserDefaultModel``
     and returns the underlying ``Model.model_id`` (string).
     """
-    from ..models.database import get_db
     from ..models.model import Model as DBModel
     from ..models.user import UserDefaultModel, UserModel
 
-    db = next(get_db())
-    try:
-        if user_id:
-            rerank_default = (
-                db.query(UserDefaultModel)
-                .join(DBModel, UserDefaultModel.model_id == DBModel.id)
-                .filter(
-                    UserDefaultModel.user_id == user_id,
-                    UserDefaultModel.config_type == "rerank",
-                    DBModel.is_active,
+    with _default_model_session(db) as model_db:
+        try:
+            if user_id:
+                rerank_default = (
+                    model_db.query(UserDefaultModel)
+                    .join(DBModel, UserDefaultModel.model_id == DBModel.id)
+                    .filter(
+                        UserDefaultModel.user_id == user_id,
+                        UserDefaultModel.config_type == "rerank",
+                        DBModel.is_active,
+                    )
+                    .first()
                 )
-                .first()
-            )
-            if rerank_default and rerank_default.model:
-                if _is_model_visible_to_user(db, rerank_default.model.id, user_id):
-                    return str(rerank_default.model.model_id)
+                if rerank_default and rerank_default.model:
+                    if _is_model_visible_to_user(
+                        model_db, rerank_default.model.id, user_id
+                    ):
+                        return str(rerank_default.model.model_id)
 
-        admin_rerank_defaults = (
-            db.query(UserDefaultModel)
-            .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
-            .filter(
-                UserDefaultModel.config_type == "rerank",
-                UserModel.is_shared.is_(True),
-                UserDefaultModel.user_id.in_(_get_visible_user_ids(db, user_id)),
+            admin_rerank_defaults = (
+                model_db.query(UserDefaultModel)
+                .join(UserModel, UserDefaultModel.model_id == UserModel.model_id)
+                .filter(
+                    UserDefaultModel.config_type == "rerank",
+                    UserModel.is_shared.is_(True),
+                    UserDefaultModel.user_id.in_(
+                        _get_visible_user_ids(model_db, user_id)
+                    ),
+                )
+                .limit(1)
+                .all()
             )
-            .limit(1)
-            .all()
-        )
-        if admin_rerank_defaults:
-            return str(admin_rerank_defaults[0].model.model_id)
-    except Exception:
-        logger.exception("get_default_rerank_model failed")
-    finally:
-        db.close()
+            if admin_rerank_defaults:
+                return str(admin_rerank_defaults[0].model.model_id)
+        except Exception:
+            logger.exception("get_default_rerank_model failed")
     return None
 
 

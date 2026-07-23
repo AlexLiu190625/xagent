@@ -13,7 +13,17 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from functools import partial
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Literal, Mapping, Optional
+from typing import (
+    Any,
+    Awaitable,
+    Callable,
+    Dict,
+    List,
+    Literal,
+    Mapping,
+    Optional,
+    TypeVar,
+)
 
 import httpx
 
@@ -37,6 +47,7 @@ from ...core.tools.adapters.vibe.connector_runtime import (
     binding_target,
     runtime_bindings_from_config,
 )
+from ...core.tools.adapters.vibe.db_session import tool_session_scope
 from ..services.tool_credentials import (
     TOOL_CREDENTIAL_SPECS,
     get_sql_connection_map,
@@ -629,6 +640,22 @@ def _custom_api_config_from_model(
     }
 
 
+_SessionResultT = TypeVar("_SessionResultT")
+_CreatorFailedInputKey = Literal["basic", "database"]
+
+
+def _run_with_checked_out_session(
+    session_factory: Any,
+    operation: Callable[[Any], _SessionResultT],
+) -> _SessionResultT:
+    """Run one operation through a newly checked-out, always-closed Session."""
+    with tool_session_scope(session_factory) as db:
+        # Eager checkout keeps pool exhaustion outside callers' fallback
+        # handlers, so it cannot be mistaken for an absent optional input.
+        db.connection()
+        return operation(db)
+
+
 def _load_tool_factory_runtime_snapshot(
     session_factory: Any,
     plan: _ToolFactoryRuntimeLoadPlan,
@@ -667,22 +694,22 @@ def _load_tool_factory_runtime_snapshot(
         loader: Callable[[Any], Any],
         default: Any,
         *,
-        unavailable_input: str | None = None,
+        failed_input_key: _CreatorFailedInputKey | None = None,
         propagated_exceptions: tuple[type[Exception], ...] = (),
         log_level: int = logging.WARNING,
         log_message: str | None = None,
     ) -> Any:
         """Load one logical input through an isolated Session boundary.
 
-        Required creator inputs are marked unavailable so their synchronous
-        snapshot getters raise. Optional creator inputs retain their legacy
-        soft-fail behavior and return the supplied default.
+        ``basic`` credentials and ``database`` connections are the only
+        creator-scoped fail-closed inputs: a plain loader failure records their
+        key so that the matching creator raises while unrelated creators can
+        continue. Custom API, published-agent, and model discovery retain their
+        legacy soft defaults. Pool timeouts always propagate, and callers can
+        name additional typed exceptions that must propagate.
         """
-        db = session_factory()
-        try:
-            # Fail before a legacy loader's broad exception handling can turn a
-            # saturated QueuePool into an empty or partial tool input.
-            db.connection()
+
+        def load(db: Any) -> Any:
             try:
                 return loader(db)
             except Exception as exc:
@@ -690,8 +717,8 @@ def _load_tool_factory_runtime_snapshot(
                     raise
                 if is_database_pool_timeout(exc):
                     raise
-                if unavailable_input is not None:
-                    failed_inputs.add(unavailable_input)
+                if failed_input_key is not None:
+                    failed_inputs.add(failed_input_key)
                 if log_message is None:
                     logger.log(
                         log_level,
@@ -702,10 +729,8 @@ def _load_tool_factory_runtime_snapshot(
                 else:
                     logger.log(log_level, log_message, exc_info=True)
                 return default
-        finally:
-            # The next input receives a new Session even when this loader caught
-            # its own SQL error or changed the transaction state internally.
-            db.close()
+
+        return _run_with_checked_out_session(session_factory, load)
 
     if plan.load_policy and policy_snapshot is None:
         runtime_policy = _load_tool_runtime_policy_snapshot(
@@ -728,7 +753,7 @@ def _load_tool_factory_runtime_snapshot(
             "tool credentials",
             load_tool_credentials,
             {},
-            unavailable_input="basic",
+            failed_input_key="basic",
             log_message="Failed to prefetch tool credentials",
         )
 
@@ -737,7 +762,7 @@ def _load_tool_factory_runtime_snapshot(
             "SQL connections",
             lambda db: get_sql_connection_map(db, plan.user_id),
             {},
-            unavailable_input="database",
+            failed_input_key="database",
             log_message="Failed to prefetch SQL connections",
         )
 
@@ -794,22 +819,22 @@ def _load_tool_factory_runtime_snapshot(
         )
     if plan.load_audio:
         asr_models = load_snapshot_input(
-            "audio",
+            "audio:asr-models",
             lambda db: model_service.get_asr_models(db, plan.user_id),
             {},
         )
         tts_models = load_snapshot_input(
-            "audio",
+            "audio:tts-models",
             lambda db: model_service.get_tts_models(db, plan.user_id),
             {},
         )
         sound_effect_models = load_snapshot_input(
-            "audio",
+            "audio:sound-effect-models",
             lambda db: model_service.get_sound_effect_models(db, plan.user_id),
             {},
         )
         music_models = load_snapshot_input(
-            "audio",
+            "audio:music-models",
             lambda db: model_service.get_music_models(db, plan.user_id),
             {},
         )
@@ -842,18 +867,18 @@ def _load_tool_factory_runtime_snapshot(
     if plan.load_audio:
         if asr_models or tts_models:
             asr_model = load_snapshot_input(
-                "audio",
+                "audio:default-asr",
                 lambda db: model_service.get_default_asr_model(plan.user_id, db=db),
                 None,
             )
             tts_model = load_snapshot_input(
-                "audio",
+                "audio:default-tts",
                 lambda db: model_service.get_default_tts_model(plan.user_id, db=db),
                 None,
             )
         if sound_effect_models:
             sound_effect_model = load_snapshot_input(
-                "audio",
+                "audio:default-sound-effect",
                 lambda db: model_service.get_default_sound_effect_model(
                     plan.user_id, db=db
                 ),
@@ -861,7 +886,7 @@ def _load_tool_factory_runtime_snapshot(
             )
         if music_models:
             music_model = load_snapshot_input(
-                "audio",
+                "audio:default-music",
                 lambda db: model_service.get_default_music_model(plan.user_id, db=db),
                 None,
             )
@@ -909,11 +934,7 @@ def _load_tool_runtime_policy_snapshot(
         loader: Callable[[Any, Any], Any],
         default: Any,
     ) -> Any:
-        db = session_factory()
-        try:
-            # Keep checkout outside the policy fallback because a saturated pool
-            # must reach the task owner rather than look like an absent policy.
-            db.connection()
+        def load(db: Any) -> Any:
             try:
                 user = db.query(User).filter(User.id == user_id).first()
                 if user is None:
@@ -924,10 +945,8 @@ def _load_tool_runtime_policy_snapshot(
                     raise
                 logger.exception("Failed to get user tool %s", input_name)
                 return default
-        finally:
-            # Hooks are application extension points and do not promise neutral
-            # transaction state, so the next hook always gets a fresh Session.
-            db.close()
+
+        return _run_with_checked_out_session(session_factory, load)
 
     overrides = load_policy_input(
         "overrides",

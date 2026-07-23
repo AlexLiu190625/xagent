@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import threading
 from types import SimpleNamespace
 
@@ -128,6 +129,69 @@ class _PostgresAbortSession:
     def assert_usable(self) -> None:
         if self.aborted:
             raise RuntimeError("current transaction is aborted")
+
+
+def test_checked_out_session_runner_owns_checkout_and_close():
+    from xagent.web.tools.config import _run_with_checked_out_session
+
+    events: list[str] = []
+
+    class Session:
+        def connection(self):
+            events.append("checkout")
+            return object()
+
+        def close(self):
+            events.append("close")
+
+    session = Session()
+
+    def operation(db):
+        assert db is session
+        events.append("operation")
+        return "loaded"
+
+    result = _run_with_checked_out_session(lambda: session, operation)
+
+    assert result == "loaded"
+    assert events == ["checkout", "operation", "close"]
+
+
+def test_checked_out_session_runner_closes_after_operation_failure():
+    from xagent.web.tools.config import _run_with_checked_out_session
+
+    class Session:
+        closed = False
+
+        def connection(self):
+            return object()
+
+        def close(self):
+            self.closed = True
+
+    session = Session()
+
+    def fail_operation(_db):
+        raise RuntimeError("loader failed")
+
+    with pytest.raises(RuntimeError, match="loader failed"):
+        _run_with_checked_out_session(lambda: session, fail_operation)
+
+    assert session.closed
+
+
+def test_checked_out_session_runner_propagates_close_failure():
+    class Session:
+        def connection(self):
+            return object()
+
+        def close(self):
+            raise RuntimeError("session close failed")
+
+    from xagent.web.tools.config import _run_with_checked_out_session
+
+    with pytest.raises(RuntimeError, match="session close failed"):
+        _run_with_checked_out_session(lambda: Session(), lambda _db: "loaded")
 
 
 def test_get_session_factory_prefers_injected_factory():
@@ -683,6 +747,79 @@ async def test_factory_prefetch_isolates_later_read_from_swallowed_sql_failure(
         assert cfg.get_video_models() == {"video": video_model}
         assert loader_sessions["image"] is not loader_sessions["video"]
         assert all(session.closed for session in sessions)
+    finally:
+        cfg.release_prepared_factory_runtime()
+        cfg.close()
+
+
+@pytest.mark.parametrize(
+    ("failing_getter", "expected_input_name"),
+    [
+        ("get_asr_models", "audio:asr-models"),
+        ("get_tts_models", "audio:tts-models"),
+        ("get_sound_effect_models", "audio:sound-effect-models"),
+        ("get_music_models", "audio:music-models"),
+        ("get_default_asr_model", "audio:default-asr"),
+        ("get_default_tts_model", "audio:default-tts"),
+        ("get_default_sound_effect_model", "audio:default-sound-effect"),
+        ("get_default_music_model", "audio:default-music"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_audio_prefetch_logs_the_specific_failed_input(
+    monkeypatch,
+    caplog,
+    failing_getter,
+    expected_input_name,
+):
+    from xagent.web.services import model_service
+
+    collection_getters = (
+        "get_asr_models",
+        "get_tts_models",
+        "get_sound_effect_models",
+        "get_music_models",
+    )
+    default_getters = (
+        "get_default_asr_model",
+        "get_default_tts_model",
+        "get_default_sound_effect_model",
+        "get_default_music_model",
+    )
+    for getter_name in collection_getters:
+        monkeypatch.setattr(
+            model_service,
+            getter_name,
+            lambda *_args, _getter_name=getter_name, **_kwargs: {
+                _getter_name: object()
+            },
+        )
+    for getter_name in default_getters:
+        monkeypatch.setattr(
+            model_service,
+            getter_name,
+            lambda *_args, **_kwargs: None,
+        )
+
+    def fail_loader(*_args, **_kwargs):
+        raise RuntimeError("audio loader failed")
+
+    monkeypatch.setattr(model_service, failing_getter, fail_loader)
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=_TrackingSession,
+        user_id=1,
+        task_id="_mock_",
+        workspace_config={"task_id": "_mock_"},
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["audio"]),
+    )
+    try:
+        with caplog.at_level(logging.WARNING, logger="xagent.web.tools.config"):
+            await cfg.prepare_factory_runtime()
+
+        assert f"Failed to prefetch {expected_input_name} tool input" in caplog.text
     finally:
         cfg.release_prepared_factory_runtime()
         cfg.close()
