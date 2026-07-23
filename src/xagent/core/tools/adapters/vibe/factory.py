@@ -283,7 +283,11 @@ class ToolFactory:
     async def create_all_tools(
         config: BaseToolConfig, apply_user_override_filter: bool = True
     ) -> List[Tool]:
-        """Create tools within the config's optional prepared-runtime boundary."""
+        """Create tools within the config's optional prepared-runtime boundary.
+
+        Release runs after partial preparation, while an active prepare/build
+        failure remains primary if ordinary cleanup also fails.
+        """
         prepare_factory_runtime = getattr(type(config), "prepare_factory_runtime", None)
         release_factory_runtime = getattr(
             type(config), "release_prepared_factory_runtime", None
