@@ -51,6 +51,59 @@ class TestReadChunksForEmbedding:
 
 
 class TestWriteVectorsToDb:
+    def test_concurrent_writes_same_collection_are_serialized(self) -> None:
+        """Regression (PR #915): concurrent page ingestions write to the same
+        LanceDB table on separate threads; write_vectors_to_db must serialize
+        them per collection so overlapping commits can't raise CommitConflict.
+        """
+        import threading
+        import time
+        from unittest.mock import MagicMock, patch
+
+        from xagent.core.tools.core.RAG_tools.management.collection_manager import (
+            reset_locks_for_testing,
+        )
+
+        reset_locks_for_testing()
+
+        state_lock = threading.Lock()
+        active = 0
+        max_active = 0
+
+        def _fake_write(**kwargs: object) -> EmbeddingWriteResponse:
+            nonlocal active, max_active
+            with state_lock:
+                active += 1
+                max_active = max(max_active, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+            return EmbeddingWriteResponse(
+                upsert_count=0, deleted_stale_count=0, index_status="skipped"
+            )
+
+        facade = MagicMock()
+        facade.write_vectors_to_db.side_effect = _fake_write
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.vector_storage.vector_manager"
+            "._get_vector_storage_compatibility_facade",
+            return_value=facade,
+        ):
+
+            def _writer() -> None:
+                write_vectors_to_db(collection="same", embeddings=[])
+
+            threads = [threading.Thread(target=_writer) for _ in range(4)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert facade.write_vectors_to_db.call_count == 4
+        # Serialized: never two writers inside the facade call at once.
+        assert max_active == 1
+
     def test_write_vectors_empty_list(self) -> None:
         result = write_vectors_to_db(
             collection="coll", embeddings=[], create_index=True

@@ -39,6 +39,31 @@ export interface WorkforceRunListItem {
   task_id: number | null
   status: string
   created_at: string | null
+  completed_at?: string | null
+  task?: {
+    title: string
+    description: string | null
+    status: string
+  } | null
+}
+
+export interface WorkforceRunHistoryItem {
+  id: number
+  task_id: number | null
+  status: string
+  is_preview: boolean
+  task_title: string | null
+  message: string | null
+  created_at: string | null
+  completed_at: string | null
+}
+
+export interface WorkforceRunHistoryResponse {
+  items: WorkforceRunHistoryItem[]
+  total: number
+  page: number
+  size: number
+  pages: number
 }
 
 export interface WorkforceListItem {
@@ -59,7 +84,6 @@ export interface WorkforceDetail {
   description: string | null
   status: WorkforceStatus
   manager: WorkforceAgentSummary
-  manager_instructions: string | null
   workers: WorkforceWorker[]
   canvas_layout: Record<string, unknown> | null
   scope_type: string
@@ -75,6 +99,26 @@ export interface WorkforceListResponse {
   page: number
   size: number
   pages: number
+}
+
+export interface WorkforceAgentExecutionTraceEvent {
+  event_id?: string
+  event_type?: string
+  step_id?: string | null
+  timestamp?: number | string | null
+  data?: Record<string, unknown>
+  parent_event_id?: string | null
+}
+
+export interface WorkforceAgentExecution {
+  task_id: number
+  worker_task_id: string
+  agent_id?: number
+  agent_name?: string
+  worker_member_id?: number
+  worker_alias?: string
+  status: string
+  trace_events: WorkforceAgentExecutionTraceEvent[]
 }
 
 export interface WorkforceAgentOption {
@@ -114,7 +158,6 @@ export interface WorkforceCreatePayload {
   name: string
   description?: string
   manager_agent_id: number
-  manager_instructions?: string
   canvas_layout?: Record<string, unknown> | null
   workers?: WorkforceWorkerPayload[]
 }
@@ -127,7 +170,6 @@ export interface WorkforceUpdatePayload {
   name?: string
   description?: string | null
   manager_agent_id?: number
-  manager_instructions?: string | null
   canvas_layout?: Record<string, unknown> | null
 }
 

@@ -85,10 +85,20 @@ def write_vectors_to_db(
     create_index: bool = True,
     user_id: Optional[int] = None,
 ) -> EmbeddingWriteResponse:
-    """Write embedding vectors to database with idempotency through the facade."""
-    return _get_vector_storage_compatibility_facade().write_vectors_to_db(
-        collection=collection,
-        embeddings=embeddings,
-        create_index=create_index,
-        user_id=user_id,
-    )
+    """Write embedding vectors to database with idempotency through the facade.
+
+    Serialized per collection: web ingestion runs up to page_ingest_concurrency
+    pages on separate threads, and concurrent commits to the same LanceDB table
+    (including the create_index build) can raise CommitConflict. The dominant
+    cost, embedding computation, already finished before this call, so the lock
+    only serializes the cheap write and barely dents throughput.
+    """
+    from ..management.collection_manager import _get_collection_thread_lock
+
+    with _get_collection_thread_lock(collection):
+        return _get_vector_storage_compatibility_facade().write_vectors_to_db(
+            collection=collection,
+            embeddings=embeddings,
+            create_index=create_index,
+            user_id=user_id,
+        )

@@ -16,7 +16,6 @@ interface ReviewStepProps {
   name: string
   description: string
   managerAgentId: string
-  managerInstructions: string
   workers: WorkforceWorkerDraft[]
   agents: WorkforceAgentOption[]
   getAgentHref?: (agentId: number) => string
@@ -26,7 +25,6 @@ export function ReviewStep({
   name,
   description,
   managerAgentId,
-  managerInstructions,
   workers,
   agents,
   getAgentHref = (agentId) => `/build/${agentId}`,
@@ -74,7 +72,6 @@ export function ReviewStep({
           <div className="h-72 rounded-xl overflow-hidden border">
             <WorkforceDraftCanvas
               managerAgent={manager}
-              managerInstructions={managerInstructions}
               workers={workers}
               agents={agents}
             />
@@ -131,17 +128,6 @@ export function ReviewStep({
               {t("workforces.actions.openAgentEditor")}
             </Link>
           ) : null}
-        </div>
-      </div>
-
-      <div className="space-y-2">
-        <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-          {t("workforces.fields.managerInstructions")}
-        </div>
-        <div className="rounded-lg border bg-card p-4 max-h-48 overflow-y-auto">
-          <div className="whitespace-pre-wrap text-sm text-muted-foreground">
-            {managerInstructions || t("workforces.review.noManagerInstructions")}
-          </div>
         </div>
       </div>
 

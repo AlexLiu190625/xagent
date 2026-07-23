@@ -13,6 +13,7 @@ from xagent.core.tools.core.RAG_tools.core.exceptions import (
     EmbeddingAdapterError,
 )
 from xagent.core.tools.core.RAG_tools.core.schemas import (
+    ChunkEmbeddingData,
     ChunkForEmbedding,
     ChunkStrategy,
     CollectionInfo,
@@ -1187,3 +1188,168 @@ def test_process_document_rejects_absolute_paths_outside_allowed_dir(
             or "permission" in message_lower
             or "denied" in message_lower
         ), f"Unexpected error message for {abs_path}: {result.message}"
+
+
+def _make_chunks(n: int) -> List[ChunkForEmbedding]:
+    """n chunks with distinct text lengths (1..n) so a batch's vectors can be
+    traced back to their chunks and cross-batch scrambling is detectable."""
+    return [
+        ChunkForEmbedding(
+            doc_id="doc-1",
+            chunk_id=f"chunk-{i}",
+            parse_hash="hash-1",
+            text="x" * (i + 1),
+            chunk_hash=f"chunk-hash-{i}",
+            index=i,
+        )
+        for i in range(n)
+    ]
+
+
+def _run_batch_embedding(
+    monkeypatch: pytest.MonkeyPatch, *, concurrent: int
+) -> tuple[IngestionResult, int, List[ChunkEmbeddingData]]:
+    """Drive the sync/batch embedding path with a latency-injecting adapter that
+    records peak concurrency. Returns (result, max_inflight, written_embeddings)."""
+    import threading
+
+    _patch_pipeline_dependencies(monkeypatch)
+
+    chunks = _make_chunks(6)
+    read_response = EmbeddingReadResponse(
+        chunks=chunks, total_count=6, pending_count=6
+    ).model_dump()
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: read_response
+    )
+
+    lock = threading.Lock()
+    state = {"inflight": 0, "max": 0}
+
+    class _ConcurrencyProbeAdapter(_StubEmbeddingAdapter):
+        def encode(  # type: ignore[override]
+            self, text, dimension=None, instruct=None
+        ):
+            with lock:
+                state["inflight"] += 1
+                state["max"] = max(state["max"], state["inflight"])
+            try:
+                # Event.wait (unlike time.sleep, which the autouse _no_sleep
+                # fixture stubs out) really blocks, forcing an overlap window.
+                threading.Event().wait(0.05)
+                # vector[0] == len(text) lets the caller verify batch alignment
+                return [[float(len(item)), 0.0] for item in text]
+            finally:
+                with lock:
+                    state["inflight"] -= 1
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _ConcurrencyProbeAdapter()),
+    )
+
+    written: List[ChunkEmbeddingData] = []
+
+    def _capture_write(**kwargs: object) -> dict:
+        written.extend(kwargs.get("embeddings", []))  # type: ignore[arg-type]
+        return EmbeddingWriteResponse(
+            upsert_count=len(kwargs.get("embeddings", [])),  # type: ignore[arg-type]
+            deleted_stale_count=0,
+            index_status="created" if kwargs.get("create_index") else "skipped",
+        ).model_dump()
+
+    monkeypatch.setattr(document_ingestion, "write_vectors_to_db", _capture_write)
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.md",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=2,
+            embedding_concurrent=concurrent,
+        ),
+    )
+    return result, state["max"], written
+
+
+def test_batch_embedding_runs_concurrently_and_preserves_order(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """6 chunks / batch_size=2 => 3 batches. With embedding_concurrent=3 the encode
+    round-trips overlap, and vectors must still line up with their chunks in order."""
+    result, max_inflight, written = _run_batch_embedding(monkeypatch, concurrent=3)
+
+    assert result.status == "success"
+    assert max_inflight >= 2, "batch encodes did not overlap"
+    # All 6 embedded, in order, each vector aligned to its own chunk (no scrambling).
+    assert [e.chunk_id for e in written] == [f"chunk-{i}" for i in range(6)]
+    assert [int(e.vector[0]) for e in written] == [len(e.text) for e in written]
+
+
+def test_batch_embedding_concurrency_one_stays_serial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """embedding_concurrent=1 must preserve the legacy fully-serial behavior."""
+    result, max_inflight, written = _run_batch_embedding(monkeypatch, concurrent=1)
+
+    assert result.status == "success"
+    assert max_inflight == 1
+    assert [e.chunk_id for e in written] == [f"chunk-{i}" for i in range(6)]
+
+
+def test_batch_embedding_retries_transient_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient encode() failure in the sync batch path must be retried
+    (parity with the async path) instead of failing the whole document."""
+    _patch_pipeline_dependencies(monkeypatch)
+
+    chunks = _make_chunks(2)  # one batch of 2 at batch_size=2
+    read_response = EmbeddingReadResponse(
+        chunks=chunks, total_count=2, pending_count=2
+    ).model_dump()
+    monkeypatch.setattr(
+        document_ingestion, "read_chunks_for_embedding", lambda **_: read_response
+    )
+
+    calls = {"n": 0}
+
+    class _FlakyAdapter(_StubEmbeddingAdapter):
+        def encode(self, text, dimension=None, instruct=None):  # type: ignore[override]
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("transient 429")
+            return super().encode(text, dimension, instruct)
+
+    stub_config = EmbeddingModelConfig(
+        id="embedding-default",
+        model_name="text-embedding-v3",
+        model_provider="dashscope",
+        dimension=2,
+    )
+    monkeypatch.setattr(
+        document_ingestion,
+        "_resolve_embedding_adapter",
+        lambda _cfg: (stub_config, _FlakyAdapter()),
+    )
+
+    result = document_ingestion.process_document(
+        collection="demo",
+        source_path="/tmp/doc.md",
+        config=IngestionConfig(
+            embedding_use_async=False,
+            embedding_batch_size=2,
+            embedding_concurrent=1,
+            max_retries=3,
+        ),
+    )
+
+    assert result.status == "success"
+    assert calls["n"] == 2  # first attempt raised, retry succeeded

@@ -15,9 +15,12 @@ flag never changes observable results, only latency:
 - I4 (control short-circuit): a control tool (final_answer / send_message /
   ask_user_question) owns its segment and ends the turn's tool execution; later
   tool calls in the same turn do not run.
-- I5 (interrupt / resume): an interrupt is honored at a segment boundary with
-  the remaining calls left pending; a crash mid-batch leaves the whole segment
-  pending so resume re-runs it (safe because batched tools are read-only).
+- I5 (interrupt / resume): an interrupt during a concurrent batch preserves
+  calls that already completed and leaves only interrupted calls pending. A
+  cancelled call may still have committed externally before cancellation was
+  observed, so ``concurrency_safe`` is an explicit idempotency contract as well
+  as a concurrency contract. A crash before backfill leaves the whole segment
+  pending for resume under the same contract.
 - I6 (trace pairing): tool trace spans pair START with END/ERROR by
   ``tool_call_id`` rather than tool name, so concurrent same-name calls do not
   cross-attribute (see ``tracing/langfuse/handler.py``).
@@ -38,6 +41,7 @@ from datetime import timezone
 from enum import Enum
 from typing import Any, cast
 
+from ....model.chat.exceptions import LLMToolProtocolError
 from ....model.chat.tool_protocol import get_tool_protocol_error
 from ...context.enrichment import (
     enrich_context_with_memory,
@@ -48,8 +52,10 @@ from ...context.skill_tool import build_load_skill_tool
 from ...language import final_answer_language_rule
 from ...result import tool_result_succeeded, unwrap_final_answer_content
 from ...runtime import (
+    ExecutionInterrupted,
     LLMCallInterrupted,
     PatternRuntime,
+    ToolCallInterrupted,
     prepare_llm_for_context,
     resolved_llm_metadata,
 )
@@ -296,11 +302,15 @@ class ReActPattern(AgentPattern):
                 compact_llm=compact_llm,
                 runtime=runtime,
             )
-        except LLMCallInterrupted:
+        except ExecutionInterrupted as exc:
             interrupted = await self._interrupt_if_requested(
                 runtime=runtime,
                 context=context,
-                label="during_enrichment",
+                label=(
+                    "during_tool"
+                    if isinstance(exc, ToolCallInterrupted)
+                    else "during_enrichment"
+                ),
             )
             if interrupted is None:
                 raise
@@ -442,6 +452,8 @@ class ReActPattern(AgentPattern):
                 metadata=llm_metadata,
             )
             answer_streamer: ReActFinalAnswerStreamer | None = None
+            protocol_retry_performed = False
+            response_already_traced = False
             try:
                 effective_tool_choice = (
                     "required"
@@ -475,31 +487,23 @@ class ReActPattern(AgentPattern):
                 if interrupted is not None:
                     return interrupted
                 raise
-            except Exception as exc:
+            except LLMToolProtocolError as exc:
+                unavailable_tool_call = exc.code == "unavailable_tool_call"
                 if answer_streamer is not None:
-                    await answer_streamer.fail(str(exc))
-                raise
-            self.repeated_tool_decision = None
-            self.last_response = response
-            normalized = self._normalize_llm_response(response)
-            requires_protocol_retry = self._response_requires_tool_protocol_retry(
-                normalized,
-                force_final_answer=force_final_answer_now,
-            )
-            end_metadata: dict[str, Any] = dict(llm_metadata)
-            if requires_protocol_retry:
-                end_metadata.update(
-                    success=False,
-                    phase="discarded_invalid_tool_protocol",
+                    await answer_streamer.fail(
+                        "unavailable tool call, restoring available tools"
+                        if unavailable_tool_call
+                        else f"invalid {exc.code} tool protocol, retrying"
+                    )
+                await runtime.on_llm_error(
+                    context=context,
+                    error=exc,
+                    metadata={
+                        **llm_metadata,
+                        "phase": exc.code,
+                        "protocol_code": exc.code,
+                    },
                 )
-            await runtime.on_llm_end(
-                context=context,
-                response=response,
-                metadata=end_metadata,
-            )
-            if requires_protocol_retry:
-                if answer_streamer is not None:
-                    await answer_streamer.fail("invalid tool protocol, retrying")
                 try:
                     (
                         response,
@@ -509,8 +513,11 @@ class ReActPattern(AgentPattern):
                         llm=call_llm,
                         runtime=runtime,
                         iteration=iteration,
-                        tool_schemas=tool_schemas,
-                        force_final_answer=force_final_answer_now,
+                        tool_schemas=base_tool_schemas,
+                        force_final_answer=(
+                            force_final_answer_now and not unavailable_tool_call
+                        ),
+                        recovery_reason=exc.code,
                     )
                 except LLMCallInterrupted:
                     interrupted = await self._interrupt_if_requested(
@@ -521,31 +528,93 @@ class ReActPattern(AgentPattern):
                     if interrupted is not None:
                         return interrupted
                     raise
+                if unavailable_tool_call:
+                    self.force_final_answer_next = False
+                    force_final_answer_now = False
+                protocol_retry_performed = True
+                response_already_traced = True
+            except Exception as exc:
+                if answer_streamer is not None:
+                    await answer_streamer.fail(str(exc))
+                raise
+            self.repeated_tool_decision = None
+            self.last_response = response
+            normalized = self._normalize_llm_response(response)
+            requires_protocol_retry = self._response_requires_tool_protocol_retry(
+                normalized,
+                force_final_answer=force_final_answer_now,
+                reject_mixed_control_calls=protocol_retry_performed,
+            )
+            end_metadata: dict[str, Any] = dict(llm_metadata)
+            if requires_protocol_retry:
+                end_metadata.update(
+                    success=False,
+                    phase="discarded_invalid_tool_protocol",
+                )
+            if not response_already_traced:
+                await runtime.on_llm_end(
+                    context=context,
+                    response=response,
+                    metadata=end_metadata,
+                )
+            if requires_protocol_retry:
+                if protocol_retry_performed:
+                    return await self._invalid_tool_protocol_result(
+                        runtime=runtime,
+                        context=context,
+                        iteration=iteration,
+                        answer_streamer=answer_streamer,
+                        stream_failure_message=("invalid tool protocol after recovery"),
+                    )
+                if answer_streamer is not None:
+                    await answer_streamer.fail("invalid tool protocol, retrying")
+                recover_full_tool_set = self._requires_full_tool_set_recovery(
+                    normalized,
+                    force_final_answer=force_final_answer_now,
+                )
+                try:
+                    (
+                        response,
+                        answer_streamer,
+                    ) = await self._retry_tool_protocol_response(
+                        context=context,
+                        llm=call_llm,
+                        runtime=runtime,
+                        iteration=iteration,
+                        tool_schemas=base_tool_schemas,
+                        force_final_answer=(
+                            force_final_answer_now and not recover_full_tool_set
+                        ),
+                        recovery_reason=(
+                            "unavailable_tool_call" if recover_full_tool_set else None
+                        ),
+                    )
+                except LLMCallInterrupted:
+                    interrupted = await self._interrupt_if_requested(
+                        runtime=runtime,
+                        context=context,
+                        label="during_llm",
+                    )
+                    if interrupted is not None:
+                        return interrupted
+                    raise
+                if recover_full_tool_set:
+                    self.force_final_answer_next = False
+                    force_final_answer_now = False
                 self.last_response = response
                 normalized = self._normalize_llm_response(response)
                 if self._response_requires_tool_protocol_retry(
                     normalized,
                     force_final_answer=force_final_answer_now,
+                    reject_mixed_control_calls=recover_full_tool_set,
                 ):
-                    if answer_streamer is not None:
-                        await answer_streamer.fail("invalid tool protocol after retry")
-                    await runtime.checkpoint(
-                        "invalid_tool_protocol",
+                    return await self._invalid_tool_protocol_result(
+                        runtime=runtime,
                         context=context,
-                        pattern=self,
-                        metadata={"iteration": iteration},
+                        iteration=iteration,
+                        answer_streamer=answer_streamer,
+                        stream_failure_message="invalid tool protocol after retry",
                     )
-                    return PatternResult(
-                        success=False,
-                        error=(
-                            "The model returned an invalid tool protocol response "
-                            "after one repair attempt."
-                        ),
-                        metadata={
-                            "iterations": iteration + 1,
-                            "status": "invalid_tool_protocol",
-                        },
-                    ).to_dict()
             if force_final_answer_now and not normalized.get("tool_calls"):
                 normalized["done"] = True
 
@@ -601,6 +670,35 @@ class ReActPattern(AgentPattern):
             success=False,
             error="ReActPattern reached max iterations without a final answer.",
             metadata={"iterations": self.max_iterations, "status": self.status},
+        ).to_dict()
+
+    async def _invalid_tool_protocol_result(
+        self,
+        *,
+        runtime: PatternRuntime,
+        context: Any,
+        iteration: int,
+        answer_streamer: ReActFinalAnswerStreamer | None,
+        stream_failure_message: str,
+    ) -> dict[str, Any]:
+        if answer_streamer is not None:
+            await answer_streamer.fail(stream_failure_message)
+        await runtime.checkpoint(
+            "invalid_tool_protocol",
+            context=context,
+            pattern=self,
+            metadata={"iteration": iteration},
+        )
+        return PatternResult(
+            success=False,
+            error=(
+                "The model returned an invalid tool protocol response "
+                "after one repair attempt."
+            ),
+            metadata={
+                "iterations": iteration + 1,
+                "status": "invalid_tool_protocol",
+            },
         ).to_dict()
 
     async def _finish_streamed_answer_if_final(
@@ -714,6 +812,7 @@ class ReActPattern(AgentPattern):
         iteration: int,
         tool_schemas: list[dict[str, Any]],
         force_final_answer: bool,
+        recovery_reason: str | None = None,
     ) -> tuple[Any, ReActFinalAnswerStreamer]:
         tools = (
             [self._final_answer_tool_schema()] if force_final_answer else tool_schemas
@@ -724,24 +823,48 @@ class ReActPattern(AgentPattern):
             force_final_answer=force_final_answer,
             tool_names=self._schema_tool_names(tools),
         )
-        retry_instruction = (
-            "The previous response used an invalid tool protocol. Retry the same "
-            "turn using native structured tool calls only. Never place one tool "
-            "invocation or its arguments inside another tool's arguments. If work "
-            "remains, call the appropriate available work tool directly; call "
-            "final_answer only when the task is actually complete."
-        )
+        if recovery_reason == "unavailable_tool_call":
+            retry_instruction = (
+                "The previous response called a tool that was unavailable in the "
+                "narrowed tool schema. Re-decide this turn using the complete "
+                "current tool set listed above. Call only a tool present in that "
+                "set. If the requested work or artifact has not been successfully "
+                "produced, call the appropriate work tool; call final_answer only "
+                "when the task is actually complete and its required results exist."
+            )
+            retry_phase = "unavailable_tool_call_recovery"
+        elif recovery_reason == "malformed_tool_arguments":
+            retry_instruction = (
+                "The previous response returned malformed JSON arguments for a "
+                "tool call. Retry this turn by calling exactly one available tool "
+                "with one complete JSON object that matches its schema. Do not "
+                "truncate, concatenate, manually serialize, or wrap the arguments "
+                "in prose. If final_answer is the only available tool, put the "
+                "complete user-facing response in its answer field."
+            )
+            retry_phase = "malformed_tool_arguments_recovery"
+        else:
+            retry_instruction = (
+                "The previous response used an invalid tool protocol. Retry the same "
+                "turn using native structured tool calls only. Never place one tool "
+                "invocation or its arguments inside another tool's arguments. If "
+                "work remains, call the appropriate available work tool directly; "
+                "call final_answer only when the task is actually complete."
+            )
+            retry_phase = "tool_protocol_retry"
         messages[0] = {
             **messages[0],
             "content": f"{messages[0].get('content', '')}\n\n{retry_instruction}",
         }
         metadata = {
             "iteration": iteration,
-            "phase": "tool_protocol_retry",
+            "phase": retry_phase,
             **resolved_llm_metadata(llm),
         }
+        if recovery_reason:
+            metadata["recovery_reason"] = recovery_reason
         await runtime.checkpoint(
-            "tool_protocol_retry",
+            retry_phase,
             context=context,
             pattern=self,
             metadata=metadata,
@@ -776,6 +899,7 @@ class ReActPattern(AgentPattern):
         retry_is_invalid = self._response_requires_tool_protocol_retry(
             normalized,
             force_final_answer=force_final_answer,
+            reject_mixed_control_calls=(recovery_reason == "unavailable_tool_call"),
         )
         end_metadata = dict(metadata)
         if retry_is_invalid:
@@ -795,15 +919,46 @@ class ReActPattern(AgentPattern):
         normalized: dict[str, Any],
         *,
         force_final_answer: bool,
+        reject_mixed_control_calls: bool = False,
     ) -> bool:
         if get_tool_protocol_error(normalized.get("raw")) is not None:
             return True
-        for tool_call in normalized.get("tool_calls") or []:
+        tool_calls = normalized.get("tool_calls") or []
+        if (
+            reject_mixed_control_calls
+            and len(tool_calls) > 1
+            and any(
+                isinstance(tool_call, dict)
+                and tool_call.get("name") in self._control_tool_names()
+                for tool_call in tool_calls
+            )
+        ):
+            return True
+        for tool_call in tool_calls:
             if not isinstance(tool_call, dict):
                 continue
             if force_final_answer and tool_call.get("name") != "final_answer":
                 return True
         return False
+
+    def _requires_full_tool_set_recovery(
+        self,
+        normalized: dict[str, Any],
+        *,
+        force_final_answer: bool,
+    ) -> bool:
+        protocol_error = get_tool_protocol_error(normalized.get("raw"))
+        if (
+            isinstance(protocol_error, dict)
+            and protocol_error.get("code") == "unavailable_tool_call"
+        ):
+            return True
+        if not force_final_answer:
+            return False
+        return any(
+            isinstance(tool_call, dict) and tool_call.get("name") != "final_answer"
+            for tool_call in normalized.get("tool_calls") or []
+        )
 
     def _final_answer_tool_schema(self) -> dict[str, Any]:
         for schema in self._builtin_tool_schemas():
@@ -1489,8 +1644,10 @@ class ReActPattern(AgentPattern):
     def _tool_is_concurrency_safe(self, name: str, tools: list[Any]) -> bool:
         """Whether ``name`` may run concurrently with other safe tools.
 
-        Conservative: unknown tools and tools without the metadata flag are
-        treated as not safe.
+        The metadata flag is also the tool author's idempotency declaration:
+        an interrupted call can be retried on resume when cancellation races
+        with an external side effect. Unknown tools and tools without the flag
+        are conservatively kept serial.
         """
         try:
             tool = self._find_tool(name, tools)
@@ -1589,16 +1746,49 @@ class ReActPattern(AgentPattern):
         )
 
         # Tool-level failures are already converted to error dicts inside
-        # _execute_tool_safely, so anything coming back as a real exception is an
-        # infra-callback failure (on_tool_start/on_tool_end) or an unexpected
-        # bug. The serial path lets those propagate and halt the turn; re-raise
-        # here so the concurrent path behaves identically instead of
-        # mis-reporting infrastructure breakage to the model as a tool failure.
-        # Re-raising before backfill leaves the whole (idempotent) segment
-        # pending, so resume re-runs it cleanly (I5).
-        for result in raw_results:
-            if isinstance(result, BaseException):
-                raise result
+        # _execute_tool_safely. Reconcile the successful calls before propagating
+        # any real exception so a mixed infra-failure/interrupt batch cannot
+        # replay work that already completed. Keep exceptional calls pending by
+        # their object identity in this batch: provider-supplied ids are not
+        # guaranteed unique, so id-based filtering could accidentally drop a
+        # different call.
+        infra_error = next(
+            (
+                result
+                for result in raw_results
+                if isinstance(result, BaseException)
+                and not isinstance(result, ToolCallInterrupted)
+            ),
+            None,
+        )
+        interrupted = next(
+            (
+                result
+                for result in raw_results
+                if isinstance(result, ToolCallInterrupted)
+            ),
+            None,
+        )
+        if infra_error is not None or interrupted is not None:
+            completed_call_objects: set[int] = set()
+            for tool_call, result in zip(batch, raw_results):
+                if isinstance(result, BaseException):
+                    continue
+                self._backfill_result(tool_call, result, context)
+                completed_call_objects.add(id(tool_call))
+            self._reorder_ledger_for_batch(batch)
+            self.pending_tool_calls = [
+                tool_call
+                for tool_call in self.pending_tool_calls
+                if id(tool_call) not in completed_call_objects
+            ]
+            # Preserve the serial path's infra-error priority while keeping the
+            # ledger, context, and pending queue consistent for diagnostics or
+            # an explicit retry.
+            if infra_error is not None:
+                raise infra_error
+            assert interrupted is not None
+            raise interrupted
 
         for tool_call, result in zip(batch, raw_results):
             self._backfill_result(tool_call, result, context)
@@ -1707,10 +1897,9 @@ class ReActPattern(AgentPattern):
                     pattern=self,
                     metadata={"tool_calls": segment},
                 )
-                # In-flight tools are not cancellable, so an interrupt that
-                # arrives during the batch is honored here, at the segment
-                # boundary. The completed (read-only, concurrency-safe) results
-                # are already recorded, which is correct for resume.
+                # Catch interrupts that arrive after the batch completed but
+                # before the next segment begins. Interrupts during the batch
+                # cancel its runtime-owned tool tasks immediately.
                 interrupted = await self._interrupt_if_requested(
                     runtime=runtime,
                     context=context,
@@ -2222,7 +2411,21 @@ class ReActPattern(AgentPattern):
         try:
             await runtime.on_tool_start(tool_call=tool_call)
             try:
-                result = await self._execute_tool(tool_call, tools)
+                result = await runtime.run_tool_call(
+                    lambda: self._execute_tool(tool_call, tools)
+                )
+            except ToolCallInterrupted as exc:
+                await runtime.on_tool_cancelled(
+                    tool_call=tool_call,
+                    reason=str(exc),
+                )
+                self._record_tool_call(
+                    tool_call,
+                    status="interrupted",
+                    error=str(exc),
+                )
+                recorded_terminal = True
+                raise
             except Exception as exc:  # noqa: BLE001
                 error_result = {
                     "success": False,
@@ -2496,6 +2699,13 @@ class ReActPattern(AgentPattern):
     def _find_tool(self, name: str, tools: list[Any]) -> Any:
         for tool in tools:
             if self._tool_name(tool) == name:
+                return tool
+        # Semantic Agent tool names may change when an Agent is renamed. Keep
+        # historical ``agent_<id>`` calls and prior semantic names executable
+        # without exposing duplicate aliases to the model's tool schema.
+        for tool in tools:
+            matches_name = getattr(tool, "matches_name", None)
+            if callable(matches_name) and matches_name(name):
                 return tool
         raise ValueError(f"Tool not found: {name}")
 

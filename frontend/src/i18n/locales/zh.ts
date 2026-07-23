@@ -2285,6 +2285,28 @@ const zh = {
         triggers: "Triggers",
         deleteConfirm: "确定要删除这个 Agent 吗？",
       },
+      deleteDialog: {
+        title: "删除 Agent？",
+        description: "要删除“{name}”吗？此操作无法撤销。",
+        confirm: "删除 Agent",
+        blockedTitle: "Agent 正被 Workforce 使用",
+        blockedDescription: "删除“{name}”前，需要先移除所有 Workforce 引用。",
+        blockedToast: "无法删除“{name}”：仍有 Workforce 正在使用该 Agent。",
+        referencesLabel: "正在使用此 Agent 的 Workforce",
+        hiddenReferences: "还有其他无法显示的 Workforce 正在使用此 Agent。请联系工作区管理员移除这些引用。",
+        readyToRetry: "可见的阻塞项已清除。请重试删除，以确认没有剩余引用。",
+        roles: {
+          manager: "Manager",
+          worker: "Worker",
+        },
+        openWorkforce: "打开“{name}”",
+        discardDraft: "丢弃草稿“{name}”",
+        confirmDiscardDraft: "确认丢弃“{name}”",
+        retryDelete: "重试删除",
+        discardFailed: "丢弃“{name}”失败",
+        discardNotAllowed: "“{name}”已无法丢弃。",
+        discardHasRuns: "“{name}”已有运行记录，无法丢弃。",
+      },
       createModal: {
         title: "你想如何创建 Agent？",
         describeTitle: "通过描述创建",
@@ -2502,7 +2524,6 @@ const zh = {
           ppt: "PowerPoint",
           office: "办公工具",
           specialImage: "图像工具",
-          agent: "Agent 调用",
           database: "数据库",
           skill: "技能工具",
         },
@@ -2520,7 +2541,6 @@ const zh = {
           ppt: "演示文稿制作，支持幻灯片的生成、编辑和格式化。",
           office: "办公文档处理，支持 Word、Excel 等常用格式的操作。",
           specialImage: "高级图像处理，提供更专业的图像分析和转换工具。",
-          agent: "多智能体协同，支持调用其他 Agent 完成复杂任务。",
           database: "数据库操作，支持 SQL 查询、数据导出和数据库管理。",
           skill: "技能文件访问，支持读取和列出技能目录中的文件。",
         },
@@ -3005,6 +3025,9 @@ const zh = {
           action_end_compact: "上下文压缩完成",
           skill_select_start: "技能选择开始",
           skill_select_end: "技能选择完成",
+          workforce_delegation_start: "代理委派开始",
+          workforce_delegation_end: "代理委派完成",
+          workforce_delegation_error: "代理委派失败",
         },
         messages: {
           planStart: "开始生成执行计划: {phase}",
@@ -3297,7 +3320,8 @@ const zh = {
     delegateToWorker: "委派给 {worker}",
     workerReturned: "Worker 已返回结果",
     workerFailed: "Worker 执行失败",
-    unknownWorker: "未知 Worker"
+    unknownWorker: "未知 Worker",
+    viewAgentExecution: "查看 Agent 详情"
   },
   deploy_agent: {
     title: "部署 Agent",
@@ -3545,10 +3569,14 @@ const zh = {
     builder: {
       title: "Triggers",
       description: "选择此 Agent 的自动触发入口。",
-      saveFirst: "保存 Agent 后即可配置 Triggers。",
       tooltip: "Triggers 会在外部事件或定时计划发生时自动启动此 Agent。",
       open: "Triggers",
       configure: "配置 Trigger"
+    },
+    staging: {
+      info: "此处配置的 Triggers 会随草稿一起保存，创建 Agent 时自动生效。",
+      webhookPending: "Webhook 地址和签名 secret 将在 Agent 创建后生成。",
+      failedTitle: "部分 Trigger 创建失败，配置已保留，可重试或丢弃。"
     },
     type: {
       webhook: "Webhook",
@@ -3604,7 +3632,10 @@ const zh = {
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
       test: "测试触发",
-      addAnother: "新增"
+      addAnother: "新增",
+      retry: "重试",
+      discard: "丢弃",
+      confirmDiscard: "确认丢弃"
     },
     secret: {
       title: "请立即复制此 secret，它只显示一次。"
@@ -3653,6 +3684,8 @@ const zh = {
       runsLoadFailed: "加载 Trigger 运行记录失败",
       created: "Trigger 已创建",
       updated: "Trigger 已更新",
+      staged: "Trigger 已暂存，创建 Agent 时自动生效。",
+      stagedCreateFailed: "Trigger「{name}」创建失败：{error}",
       enabled: "Trigger 已启用",
       disabled: "Trigger 已停用",
       deleted: "Trigger 已删除",
@@ -3682,6 +3715,10 @@ const zh = {
       completed: "已完成",
       running: "运行中",
       failed: "失败",
+      pending: "等待中",
+      paused: "已暂停",
+      waitingForUser: "等待输入",
+      interrupted: "已中断",
     },
     sourceTypes: {
       existing: "已有 Agent"
@@ -3718,7 +3755,6 @@ const zh = {
       name: "名称",
       description: "描述",
       manager: "Manager",
-      managerInstructions: "Manager 指令",
       workers: "Workers",
       publishedAgent: "已发布 Agent",
       alias: "别名",
@@ -3730,7 +3766,6 @@ const zh = {
       requireApproval: "运行前需要审批",
       requireApprovalHint: "Workforce 负责人在委派此 Agent 前会征求您的确认",
       workforceName: "Workforce 名称",
-      workforceInstructions: "Workforce 指令",
       agentManager: "Agent Manager",
     },
     list: {
@@ -3822,12 +3857,9 @@ const zh = {
       placeholders: {
         name: "营销发布 Workforce",
         description: "协调调研、内容和发布任务。",
-        managerInstructions: "协调 workers，处理冲突结果，并返回统一答案。"
       },
       fields: {
         workforceName: "Workforce 名称",
-        workforceInstructions: "Workforce 指令",
-        workforceInstructionsHint: "描述 Workforce Lead 应如何编排工作，以及成功的输出是什么样子的。",
         agentManager: "Agent Manager",
         agentManagerHint: "这是你的 Workforce 汇报的 Agent，它理解你的指令并协调所有子 Agent 完成工作。",
       },
@@ -3874,7 +3906,6 @@ const zh = {
     review: {
       potentialRisks: "潜在风险",
       untitled: "未命名 Workforce",
-      noManagerInstructions: "没有 manager 指令",
       canvasPreview: "画布预览",
       workforceLead: "Workforce Lead",
       subAgentsDelegation: "Sub-agents 与委派",
@@ -3891,12 +3922,45 @@ const zh = {
     run: {
       testTitle: "测试 Workforce",
       live: "在线",
+      historyTitle: "运行历史",
+      newRun: "新运行",
+      emptyHistory: "暂无历史运行",
+      untitledRun: "未命名运行",
+      loadMore: "加载更多",
+      closeHistory: "关闭运行历史",
+      loadingAgentExecution: "正在加载 Agent 执行详情...",
+      agentExecutionResult: "Agent 原始输出",
+      emptyAgentExecution: "暂无 Agent 执行详情。",
+      agentExecutionLoadError: "无法加载 Agent 执行详情。",
+      retryAgentExecution: "重试",
       placeholder: "告诉 {manager} 要做什么...",
       inputHint: "你的团队负责人将自动协调各子 Agent。",
       readyTitle: "随时准备就绪",
       readyDesc: "发送消息，{manager} 将协调团队完成你的请求。",
       inactiveDisabled: "请先发布这个 Workforce 再运行。",
       archivedDisabled: "已归档的 Workforce 不能运行。"
+    },
+    runs: {
+      title: "运行记录",
+      historyTitle: "历史运行",
+      historyHint: "这个 Workforce 的历史运行记录。点击某次运行可重新打开对应会话。",
+      loading: "正在加载运行记录...",
+      loadError: "加载运行记录失败",
+      retry: "重试",
+      refresh: "刷新",
+      empty: "还没有运行记录",
+      emptyHint: "向这个 Workforce 发送任务后，运行记录会显示在这里。",
+      untitled: "运行 #{id}",
+      previewBadge: "预览",
+      taskDeleted: "会话不可用",
+      status: {
+        pending: "等待中",
+        running: "运行中",
+        paused: "已暂停",
+        completed: "已完成",
+        failed: "失败",
+        waiting_for_user: "等待用户",
+      }
     },
     builder: {
       archivedReadOnly: "已归档的 Workforce 只能查看。"
@@ -3961,6 +4025,8 @@ const zh = {
       updateWorker: "更新 worker 失败",
       removeWorker: "移除 worker 失败",
       run: "运行 Workforce 失败",
+      loadHistory: "加载运行历史失败",
+      download: "下载文件失败",
       notFound: "没有找到 Workforce。",
       loadCanvas: "加载 Workforce 画布失败",
       canvasUnavailable: "画布不可用。",

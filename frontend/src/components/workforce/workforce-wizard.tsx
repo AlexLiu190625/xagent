@@ -40,7 +40,6 @@ export function WorkforceWizard({
   const [name, setName] = useState("")
   const [description, setDescription] = useState("")
   const [managerAgentId, setManagerAgentId] = useState("")
-  const [managerInstructions, setManagerInstructions] = useState("")
   const [workers, setWorkers] = useState<WorkforceWorkerDraft[]>([])
 
   const managerWorkerConflict = useMemo(() => {
@@ -105,7 +104,6 @@ export function WorkforceWizard({
         name: name.trim(),
         description: description.trim() || undefined,
         manager_agent_id: Number(managerAgentId),
-        manager_instructions: managerInstructions.trim() || undefined,
         workers: workers.map((worker) => ({
           source_type: worker.source_type,
           agent_id: worker.agent_id,
@@ -157,16 +155,6 @@ export function WorkforceWizard({
                       rows={3}
                     />
                   </div>
-                  <div className="space-y-2">
-                    <Label>{t("workforces.create.fields.workforceInstructions")} <span className="text-destructive">*</span></Label>
-                    <p className="text-xs text-muted-foreground">{t("workforces.create.fields.workforceInstructionsHint")}</p>
-                    <Textarea
-                      value={managerInstructions}
-                      onChange={(event) => setManagerInstructions(event.target.value)}
-                      placeholder={t("workforces.create.placeholders.managerInstructions")}
-                      rows={4}
-                    />
-                  </div>
                 </div>
                 <div className="space-y-2">
                   <Label>{t("workforces.create.fields.agentManager")} <span className="text-destructive">*</span></Label>
@@ -200,7 +188,6 @@ export function WorkforceWizard({
                 name={name}
                 description={description}
                 managerAgentId={managerAgentId}
-                managerInstructions={managerInstructions}
                 workers={workers}
                 agents={agents}
               />

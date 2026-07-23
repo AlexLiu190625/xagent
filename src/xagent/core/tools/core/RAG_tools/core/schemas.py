@@ -28,6 +28,7 @@ DEFAULT_EMBEDDING_MODEL_ID: str = "text-embedding-v4"
 DEFAULT_EMBEDDING_BATCH_SIZE: int = 10
 DEFAULT_EMBEDDING_CONCURRENT: int = 10
 DEFAULT_MAX_RETRIES: int = 3
+DEFAULT_PAGE_INGEST_CONCURRENCY: int = 4
 DEFAULT_RETRY_DELAY_SECONDS: float = 1.0
 
 # LanceDB NULL sentinel values
@@ -1161,9 +1162,12 @@ class IngestionConfig(BaseModel):
         DEFAULT_EMBEDDING_CONCURRENT,
         gt=0,
         description=(
-            "Maximum concurrent requests for embedding computation when using "
-            "async mode (for models that don't support batch processing, e.g., text-embedding-v4). "
-            "Must be positive. Adjust based on machine configuration and API rate limits."
+            "Maximum concurrent embedding requests within one document: async-mode "
+            "per-chunk encodes (models without batch support, e.g. text-embedding-v4) "
+            "and batch-mode per-batch encodes both honor it. Must be positive. Note "
+            "that during website import the effective provider concurrency is "
+            "page_ingest_concurrency * embedding_concurrent (defaults 4 * 10 = ~40); "
+            "keep that product under your provider's rate limit to avoid 429s."
         ),
     )
     embedding_use_async: bool = Field(
@@ -1177,7 +1181,23 @@ class IngestionConfig(BaseModel):
     max_retries: int = Field(
         DEFAULT_MAX_RETRIES,
         ge=0,
-        description="Maximum number of retries for embedding provider failures; must be non-negative",
+        description=(
+            "Maximum number of retries for embedding provider failures; must be "
+            "non-negative. Note the two ingestion paths differ at 0: the batch "
+            "path always makes at least one attempt, while the async path makes "
+            "zero (skips embedding). Keep >=1 for consistent behavior."
+        ),
+    )
+    page_ingest_concurrency: int = Field(
+        DEFAULT_PAGE_INGEST_CONCURRENCY,
+        gt=0,
+        description=(
+            "Maximum number of web pages ingested concurrently during website "
+            "import (Step 2). Pages are independent, so concurrency overlaps their "
+            "parse/chunk/embed cost. Set to 1 for the legacy fully-serial behavior. "
+            "Multiplies with embedding_concurrent for total provider concurrency "
+            "(see that field); lower either if the provider rate-limits (429)."
+        ),
     )
     retry_delay: float = Field(
         DEFAULT_RETRY_DELAY_SECONDS,

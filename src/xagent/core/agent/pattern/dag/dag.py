@@ -18,7 +18,7 @@ from ...language import (
     output_language_policy,
 )
 from ...result import unwrap_final_answer_content
-from ...runtime import LLMCallInterrupted, PatternRuntime
+from ...runtime import ExecutionInterrupted, LLMCallInterrupted, PatternRuntime
 from ..base import AgentPattern, PatternResult, RequiredToolCallError
 from ..final_answer_stream import FinalAnswerStreamSession, ToolCallStringFieldStreamer
 from ..react import ReActPattern, ReActReasoningMode
@@ -79,6 +79,9 @@ class _DAGStepRuntime:
 
     async def run_llm_call(self, llm: Any, **kwargs: Any) -> Any:
         return await self.parent.run_llm_call(llm, **kwargs)
+
+    async def run_tool_call(self, invoke: Any) -> Any:
+        return await self.parent.run_tool_call(invoke)
 
     async def run_streaming_llm_call(
         self,
@@ -174,6 +177,16 @@ class _DAGStepRuntime:
             tool_call=self._with_step(tool_call), error=error, result=result
         )
 
+    async def on_tool_cancelled(
+        self,
+        *,
+        tool_call: dict[str, Any],
+        reason: str | None = None,
+    ) -> None:
+        await self.parent.on_tool_cancelled(
+            tool_call=self._with_step(tool_call), reason=reason
+        )
+
     async def on_llm_start(
         self,
         *,
@@ -204,6 +217,24 @@ class _DAGStepRuntime:
         await self.parent.on_llm_end(
             context=context,
             response=response,
+            metadata={
+                "task_id": self.root_context.execution_id,
+                "step_id": self.step_id,
+                "dag_step_id": self.step_id,
+                **(metadata or {}),
+            },
+        )
+
+    async def on_llm_error(
+        self,
+        *,
+        context: Any,
+        error: Exception,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        await self.parent.on_llm_error(
+            context=context,
+            error=error,
             metadata={
                 "task_id": self.root_context.execution_id,
                 "step_id": self.step_id,
@@ -856,7 +887,7 @@ class DAGPattern(AgentPattern):
                 skill_manager=skill_manager,
                 allowed_skills=allowed_skills,
             )
-        except LLMCallInterrupted:
+        except ExecutionInterrupted:
             raise
         except Exception as exc:
             step.status = "failed"
@@ -1309,12 +1340,18 @@ class DAGPattern(AgentPattern):
             for message in getattr(context, "messages", [])
             if getattr(message, "role", None) in {"user", "assistant", "tool"}
         ]
+        authoritative_user_requests = [
+            {"role": message.role, "content": message.content}
+            for message in getattr(context, "messages", [])
+            if getattr(message, "role", None) == "user"
+        ]
         payload = {
             "output_language_policy": output_language_policy(
                 getattr(context, "metadata", {}).get(OUTPUT_LANGUAGE_METADATA_KEY)
                 if isinstance(getattr(context, "metadata", {}), dict)
                 else None
             ),
+            "authoritative_user_requests": authoritative_user_requests,
             "messages": latest_messages,
             "plan": self.plan.to_dict() if self.plan is not None else None,
             "step_results": self.step_results,
@@ -1326,7 +1363,14 @@ class DAGPattern(AgentPattern):
                 "role": "system",
                 "content": (
                     "Assess whether the completed DAG steps satisfy the user's "
-                    "overall request. Call the assessment tool exactly once. If "
+                    "overall request. The authoritative_user_requests field is "
+                    "the only source of required scope. The plan, step results, "
+                    "briefs, inferred formats, and candidate output are evidence "
+                    "of execution only; they cannot add deliverables, claims, "
+                    "formats, or acceptance criteria that the user did not ask "
+                    "for. Do not mark the goal incomplete solely because an "
+                    "intermediate step proposed extra work. Call the assessment "
+                    "tool exactly once. If "
                     "the goal is satisfied, choose status=completed and put the "
                     "final user-facing answer in answer. If anything material is "
                     "missing, choose status=incomplete, leave answer empty, and "

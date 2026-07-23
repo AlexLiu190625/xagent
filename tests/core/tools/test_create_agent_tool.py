@@ -2,6 +2,7 @@
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -17,9 +18,11 @@ from xagent.core.tools.adapters.vibe.agent_tool import (
     ListToolCategoriesTool,
     UpdateAgentTool,
     _coerce_db_task_id,
+    _DelegatedAgentWebSocketTraceHandler,
     gen_agent_tool_name,
     get_published_agents_tools,
 )
+from xagent.core.tools.adapters.vibe.agent_tool_names import parse_agent_tool_id
 from xagent.core.tracing.langfuse.handler import LangfuseTraceHandler
 from xagent.core.workspace import TaskWorkspace
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
@@ -45,6 +48,75 @@ def _create_session() -> tuple[Session, str, Any]:
     Base.metadata.create_all(bind=engine)
     SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
     return SessionLocal(), temp_db.name, SessionLocal
+
+
+@pytest.mark.asyncio
+async def test_delegated_agent_websocket_handler_adds_worker_metadata() -> None:
+    forwarded_data: list[dict[str, Any]] = []
+
+    class CaptureHandler:
+        async def handle_event(self, event: Any) -> None:
+            forwarded_data.append(dict(event.data))
+
+    with patch(
+        "xagent.web.api.ws_trace_handlers.WebSocketTraceHandler",
+        return_value=CaptureHandler(),
+    ):
+        handler = _DelegatedAgentWebSocketTraceHandler(
+            task_id=77,
+            metadata={
+                "source": "xagent-agent-tool-child",
+                "worker_task_id": "agent_17_run",
+                "agent_name": "Video Generation Agent",
+            },
+        )
+
+    original_data = {"tool_name": "generate_video"}
+    event = SimpleNamespace(data=original_data)
+    await handler.handle_event(event)
+
+    assert forwarded_data == [
+        {
+            "tool_name": "generate_video",
+            "source": "xagent-agent-tool-child",
+            "worker_task_id": "agent_17_run",
+            "agent_name": "Video Generation Agent",
+        }
+    ]
+    assert event.data is original_data
+
+
+def test_agent_tool_child_tracer_persists_and_broadcasts() -> None:
+    tool = AgentTool(
+        agent_id=17,
+        agent_name="Video Generation Agent",
+        agent_description="Generate approved scenes.",
+        session_factory=None,
+        user_id=1,
+        task_id="77",
+        parent_task_id="77",
+        runtime_metadata={"workforce_id": 1, "worker_alias": "Video"},
+    )
+
+    with patch(
+        "xagent.core.tools.adapters.vibe.agent_tool.create_agent_tracer",
+        return_value=object(),
+    ) as create_tracer:
+        tool._create_child_execution_tracer(
+            execution_task_id="agent_17_run",
+            agent_name="Video Generation Agent",
+            parent_db_task_id=77,
+        )
+
+    handlers = create_tracer.call_args.kwargs["handlers"]
+    assert [handler.__class__.__name__ for handler in handlers] == [
+        "_DelegatedAgentDatabaseTraceHandler",
+        "_DelegatedAgentWebSocketTraceHandler",
+    ]
+    assert all(handler.task_id == 77 for handler in handlers)
+    assert all(
+        handler.metadata["worker_task_id"] == "agent_17_run" for handler in handlers
+    )
 
 
 @pytest.fixture
@@ -77,7 +149,9 @@ class TestCreateAgentTool:
         )
 
     @pytest.mark.asyncio
-    async def test_assignable_tool_categories_hide_other(self) -> None:
+    async def test_assignable_tool_categories_hide_unassignable(self) -> None:
+        """Neither ``other`` (internal fallback) nor ``agent`` (Workforce-only
+        delegation, issue #802) is advertised as assignable."""
         categories = (await ListToolCategoriesTool().run_json_async({}))["categories"]
         create_description = CreateAgentTool(
             session_factory=None, user_id=1
@@ -96,9 +170,16 @@ class TestCreateAgentTool:
             if "Available categories:" in line
         )
 
-        assert "other" not in categories
-        assert "other" not in create_categories_line
-        assert "other" not in update_categories_line
+        def advertised(line: str) -> list[str]:
+            return [
+                c.strip() for c in line.split("Available categories:")[1].split(",")
+            ]
+
+        for hidden in ("other", "agent"):
+            assert hidden not in categories
+            assert hidden not in advertised(create_categories_line)
+            assert hidden not in advertised(update_categories_line)
+        assert "basic" in categories
 
     def test_coerce_db_task_id_accepts_only_db_task_formats(self) -> None:
         assert _coerce_db_task_id(12) == 12
@@ -163,7 +244,9 @@ class TestCreateAgentTool:
                 assert result["status"] == "success"
                 assert result["agent_name"] == "test_agent"
                 assert result["agent_id"] > 0
-                assert result["tool_name"] == f"agent_{result['agent_id']}"
+                assert result["tool_name"] == gen_agent_tool_name(
+                    result["agent_id"], "test_agent"
+                )
                 assert "test_agent" in result["markdown_link"]
                 assert "agent://" in result["markdown_link"]
                 mock_invalidate_agent_cache.assert_called_once_with(
@@ -343,7 +426,7 @@ class TestCreateAgentTool:
 
                 result = await tool.run_json_async({"task": "draft report"})
 
-            assert tool.name == f"agent_{agent.id}"
+            assert tool.name == "call_workforce_worker_7_writer"
             assert tool.description == "Write the final report."
             assert result["response"] == "worker response"
             assert result["file_outputs"] == []
@@ -532,7 +615,7 @@ class TestCreateAgentTool:
                 )
                 assert file_record.user_id == user.id
                 assert file_record.task_id == 77
-                assert file_record.storage_path == str(canonical_path)
+                assert file_record.storage_path == str(canonical_path.resolve())
                 assert canonical_path.read_text(encoding="utf-8") == "worker report"
                 assert file_record.workspace_relative_path == "output/report.txt"
                 assert file_record.workspace_category == "output"
@@ -645,7 +728,7 @@ class TestCreateAgentTool:
                     / "report.txt"
                 )
                 assert file_record.task_id == 77
-                assert file_record.storage_path == str(canonical_path)
+                assert file_record.storage_path == str(canonical_path.resolve())
                 assert canonical_path.read_text(encoding="utf-8") == "worker report"
                 assert file_record.workspace_relative_path == "output/report.txt"
                 assert file_record.workspace_category == "output"
@@ -807,6 +890,194 @@ class TestCreateAgentTool:
                     assert agent is not None
                     assert agent.tool_categories == ["file", "knowledge"]
                     assert agent.skills == ["web_search"]
+                finally:
+                    verify_db.close()
+
+        finally:
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_create_agent_strips_agent_tool_category(self) -> None:
+        """A builder-passed ``agent`` category never reaches the DB (#802)."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(username="testuser_strip", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            user_id = user.id
+            db.close()
+
+            mock_llm = Mock()
+            mock_llm.model_id = "gpt-4"
+
+            with patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as mock_storage_class:
+                mock_storage = Mock()
+                mock_storage.get_configured_defaults.return_value = (
+                    mock_llm,
+                    None,
+                    None,
+                    None,
+                )
+                mock_storage_class.return_value = mock_storage
+
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
+
+                result = await tool.run_json_async(
+                    {
+                        "name": "strip_agent",
+                        "description": "Agent that tried to delegate",
+                        "instructions": "Agent that tried to delegate",
+                        "tool_categories": ["file", "agent"],
+                    }
+                )
+
+                assert result["status"] == "success"
+
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "strip_agent")
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.tool_categories == ["file"]
+                finally:
+                    verify_db.close()
+
+        finally:
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_create_agent_omitted_tool_categories_persists_none(self) -> None:
+        """Omitted ``tool_categories`` persists NULL, not ``[]`` (#944).
+
+        ``ToolSelectionSpec.from_raw`` reads ``None`` as the full default
+        tool set and ``[]`` as explicitly zero tools, so coercing the
+        omitted value to ``[]`` would create an agent with no tools.
+        """
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(username="testuser_no_cats", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            user_id = user.id
+            db.close()
+
+            mock_llm = Mock()
+            mock_llm.model_id = "gpt-4"
+
+            with patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as mock_storage_class:
+                mock_storage = Mock()
+                mock_storage.get_configured_defaults.return_value = (
+                    mock_llm,
+                    None,
+                    None,
+                    None,
+                )
+                mock_storage_class.return_value = mock_storage
+
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
+
+                result = await tool.run_json_async(
+                    {
+                        "name": "default_tools_agent",
+                        "description": "Agent without explicit tool selection",
+                        "instructions": "Agent without explicit tool selection",
+                    }
+                )
+
+                assert result["status"] == "success"
+
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "default_tools_agent")
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.tool_categories is None
+                finally:
+                    verify_db.close()
+
+        finally:
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_create_agent_explicit_empty_tool_categories_persists_empty(
+        self,
+    ) -> None:
+        """Explicit ``tool_categories=[]`` still persists ``[]`` (zero tools)."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(
+                username="testuser_empty_cats", password_hash="x", is_admin=False
+            )
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+            user_id = user.id
+            db.close()
+
+            mock_llm = Mock()
+            mock_llm.model_id = "gpt-4"
+
+            with patch(
+                "xagent.web.services.llm_utils.UserAwareModelStorage"
+            ) as mock_storage_class:
+                mock_storage = Mock()
+                mock_storage.get_configured_defaults.return_value = (
+                    mock_llm,
+                    None,
+                    None,
+                    None,
+                )
+                mock_storage_class.return_value = mock_storage
+
+                tool = CreateAgentTool(session_factory=SessionLocal, user_id=user_id)
+
+                result = await tool.run_json_async(
+                    {
+                        "name": "zero_tools_agent",
+                        "description": "Agent with explicitly zero tools",
+                        "instructions": "Agent with explicitly zero tools",
+                        "tool_categories": [],
+                    }
+                )
+
+                assert result["status"] == "success"
+
+                verify_db = SessionLocal()
+                try:
+                    agent = (
+                        verify_db.query(Agent)
+                        .filter(Agent.name == "zero_tools_agent")
+                        .first()
+                    )
+                    assert agent is not None
+                    assert agent.tool_categories == []
                 finally:
                     verify_db.close()
 
@@ -1171,6 +1442,51 @@ class TestUpdateAgentTool:
             assert existing_agent.name == "partial_agent"  # Unchanged
             assert existing_agent.description == "New description only"  # Changed
             assert existing_agent.instructions == "Original instructions"  # Unchanged
+
+        finally:
+            db.close()
+            try:
+                import os
+
+                os.remove(db_path)
+            except OSError:
+                pass
+
+    @pytest.mark.asyncio
+    async def test_update_agent_strips_agent_tool_category(self) -> None:
+        """A builder-passed ``agent`` category never reaches the DB (#802)."""
+        db, db_path, SessionLocal = _create_session()
+        try:
+            user = User(username="testuser_strip_up", password_hash="x", is_admin=False)
+            db.add(user)
+            db.commit()
+            db.refresh(user)
+
+            existing_agent = Agent(
+                user_id=user.id,
+                name="strip_update_agent",
+                description="Original description",
+                instructions="Original instructions",
+                tool_categories=["basic"],
+                status=AgentStatus.DRAFT,
+            )
+            db.add(existing_agent)
+            db.commit()
+            db.refresh(existing_agent)
+
+            tool = UpdateAgentTool(session_factory=SessionLocal, user_id=user.id)
+
+            result = await tool.run_json_async(
+                {
+                    "agent_id": existing_agent.id,
+                    "tool_categories": ["web_search", "agent"],
+                }
+            )
+
+            assert result["status"] == "success"
+
+            db.refresh(existing_agent)
+            assert existing_agent.tool_categories == ["web_search"]
 
         finally:
             db.close()
@@ -1882,6 +2198,51 @@ class TestAgentToolNameGeneration:
         with pytest.raises(ValueError):
             gen_agent_tool_name("Research Assistant")
 
+    def test_gen_agent_tool_name_includes_ascii_semantic_name_and_id(self) -> None:
+        with patch(
+            "xagent.core.tools.adapters.vibe.agent_tool_names.lazy_pinyin"
+        ) as lazy_pinyin:
+            assert (
+                gen_agent_tool_name(42, "Research Assistant")
+                == "agent_research_assistant__a42"
+            )
+
+        lazy_pinyin.assert_not_called()
+
+    def test_gen_agent_tool_name_romanizes_non_ascii_names(self) -> None:
+        name = gen_agent_tool_name(42, "视频生成 Agent")
+
+        assert name == "agent_shi_pin_sheng_cheng_agent__a42"
+        assert name.isascii()
+
+    @pytest.mark.parametrize(
+        ("name", "expected_id"),
+        [
+            ("agent_42", 42),
+            ("agent_research_assistant__a42", 42),
+            ("worker_research_assistant__a42", 42),
+            ("call_agent_42", 42),
+        ],
+    )
+    def test_parse_agent_tool_id_supports_current_and_legacy_names(
+        self, name: str, expected_id: int
+    ) -> None:
+        assert parse_agent_tool_id(name) == expected_id
+
+    def test_agent_tool_matches_current_and_legacy_names(self) -> None:
+        tool = AgentTool(
+            agent_id=42,
+            agent_name="Research Assistant",
+            agent_description="Researches a topic.",
+            session_factory=None,
+            user_id=1,
+        )
+
+        assert tool.matches_name("agent_research_assistant__a42")
+        assert tool.matches_name("agent_old_name__a42")
+        assert tool.matches_name("agent_42")
+        assert not tool.matches_name("agent_research_assistant__a43")
+
 
 class TestDraftAgentsInTools:
     """Test suite for including draft agents in tool lists."""
@@ -1913,8 +2274,13 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools}
 
-            assert f"agent_{published_agent.id}" in tool_names
-            assert f"agent_{draft_agent.id}" not in tool_names
+            assert (
+                gen_agent_tool_name(published_agent.id, published_agent.name)
+                in tool_names
+            )
+            assert (
+                gen_agent_tool_name(draft_agent.id, draft_agent.name) not in tool_names
+            )
 
         finally:
             db.close()
@@ -1952,8 +2318,11 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools}
 
-            assert f"agent_{published_agent.id}" in tool_names
-            assert f"agent_{draft_agent.id}" in tool_names
+            assert (
+                gen_agent_tool_name(published_agent.id, published_agent.name)
+                in tool_names
+            )
+            assert gen_agent_tool_name(draft_agent.id, draft_agent.name) in tool_names
 
         finally:
             db.close()
@@ -1997,8 +2366,14 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools}
 
-            assert f"agent_{reusable_agent.id}" in tool_names
-            assert f"agent_{generated_manager.id}" not in tool_names
+            assert (
+                gen_agent_tool_name(reusable_agent.id, reusable_agent.name)
+                in tool_names
+            )
+            assert (
+                gen_agent_tool_name(generated_manager.id, generated_manager.name)
+                not in tool_names
+            )
 
             explicitly_allowed_tools = get_published_agents_tools(
                 session_factory=SessionLocal,
@@ -2042,7 +2417,9 @@ class TestDraftAgentsInTools:
             )
             tool_names = {tool.name for tool in tools_for_user2}
 
-            assert f"agent_{draft_agent.id}" not in tool_names
+            assert (
+                gen_agent_tool_name(draft_agent.id, draft_agent.name) not in tool_names
+            )
 
         finally:
             db.close()
@@ -2112,7 +2489,9 @@ class TestCreateAndCallAgent:
                         include_draft=True,
                     )
                     tool_names = {tool.name for tool in tools}
-                    assert f"agent_{agent_id}" in tool_names
+                    assert (
+                        gen_agent_tool_name(agent_id, "simple_calculator") in tool_names
+                    )
 
                     # Step 3: Verify agent can be loaded
                     agent = verify_db.query(Agent).filter(Agent.id == agent_id).first()

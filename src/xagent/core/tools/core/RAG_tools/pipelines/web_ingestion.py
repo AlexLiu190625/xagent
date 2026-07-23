@@ -532,12 +532,26 @@ async def _run_web_ingestion_impl(
         successful_page_ingestions = 0
         total_chunks = 0
         total_embeddings = 0
+        pages_started = 0
 
         loop = asyncio.get_event_loop()
+        page_semaphore = asyncio.Semaphore(max(1, ing_cfg.page_ingest_concurrency))
 
-        for i, crawl_result in enumerate(crawl_results):
-            if crawl_result.status != "success":
-                continue
+        async def _process_page(i: int, crawl_result: CrawlResult) -> None:
+            # Bound concurrency, then run the page. Split out so gather() can call
+            # this directly (each page becomes its own semaphore-limited Task).
+            async with page_semaphore:
+                await _ingest_page(i, crawl_result)
+
+        async def _ingest_page(i: int, crawl_result: CrawlResult) -> None:
+            # Pages are independent; each runs its blocking ingestion in a worker
+            # thread while sibling pages overlap (issue #912). The shared
+            # accumulators / warnings / failed_urls below are only mutated between
+            # awaits, so cooperative single-thread scheduling keeps them race-free
+            # without locks; the cross-thread DB write hazard is guarded inside
+            # collection_manager.
+            nonlocal documents_created, successful_page_ingestions
+            nonlocal total_chunks, total_embeddings, pages_started
 
             page_title = crawl_result.title or f"page_{i + 1}"
             with pipeline_facade.web_page_operation(
@@ -545,18 +559,23 @@ async def _run_web_ingestion_impl(
                 url=crawl_result.url,
                 title=page_title,
             ) as page_operation:
-                # Progress callback
+                # Progress callback. Pages complete out of order under concurrency,
+                # so report a monotonic started-counter rather than the page index.
+                # Safe without a lock: only mutated between awaits on the one loop.
                 if progress_callback:
+                    pages_started += 1
                     progress_callback(
-                        f"Ingesting page {i + 1}/{len(crawl_results)}: {crawl_result.url}",
-                        i + 1,
+                        f"Ingesting {pages_started}/{len(crawl_results)}: {crawl_result.url}",
+                        pages_started,
                         len(crawl_results),
                     )
 
                 try:
-                    # Save crawled content to temporary markdown file
+                    # Index-prefixed so concurrent same-titled pages don't collide
+                    # on one temp path (torn read + shared doc_id when file_handler
+                    # is None).
                     filename = sanitize_for_doc_id(page_title)
-                    temp_file = Path(temp_dir) / f"{filename}.md"
+                    temp_file = Path(temp_dir) / f"{i}_{filename}.md"
 
                     with open(temp_file, "w", encoding="utf-8") as f:
                         # Add metadata header
@@ -651,7 +670,7 @@ async def _run_web_ingestion_impl(
                                 status="error",
                                 message=failure_message,
                             )
-                            continue
+                            return
 
                     try:
                         # Ingest the file
@@ -789,6 +808,31 @@ async def _run_web_ingestion_impl(
                         status="error",
                         message=failure_message,
                     )
+
+        pending_pages = [
+            (i, crawl_result)
+            for i, crawl_result in enumerate(crawl_results)
+            if crawl_result.status == "success"
+        ]
+        # return_exceptions=True so one page's unexpected error can't abort the
+        # others; per-page failures are already recorded inside _process_page.
+        # gather() runs each page as its own Task, which is what gives per-page
+        # ContextVar isolation — don't collapse this into shared-context awaits.
+        page_outcomes = await asyncio.gather(
+            *(_process_page(i, crawl_result) for i, crawl_result in pending_pages),
+            return_exceptions=True,
+        )
+        for (_, crawl_result), outcome in zip(pending_pages, page_outcomes):
+            if isinstance(outcome, Exception):
+                logger.error(
+                    "Unexpected error ingesting %s: %s",
+                    crawl_result.url,
+                    outcome,
+                    exc_info=outcome,
+                )
+                failure_message = f"Failed to ingest {crawl_result.url}: {outcome}"
+                failed_urls[crawl_result.url] = failure_message
+                warnings.append(failure_message)
 
     # Step 3: Compile results
     elapsed_ms = int((datetime.now(timezone.utc) - start_time).total_seconds() * 1000)

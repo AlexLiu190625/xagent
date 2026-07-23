@@ -1,3 +1,4 @@
+import logging
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
@@ -8,8 +9,14 @@ from sqlalchemy import event
 from xagent.web.api import workforces as workforces_api
 from xagent.web.models.agent import Agent, AgentOrigin, AgentStatus
 from xagent.web.models.database import get_engine
+from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
-from xagent.web.models.workforce import Workforce, WorkforceRun
+from xagent.web.models.workforce import (
+    Workforce,
+    WorkforceAgent,
+    WorkforceBuilderMessage,
+    WorkforceRun,
+)
 from xagent.web.services.workforce_access import WorkforcePolicy, set_workforce_policy
 
 from .conftest import (
@@ -119,21 +126,86 @@ def _create_workforce_run(
     user_id: int,
     status: str,
     created_at: datetime,
+    is_preview: bool = False,
+    task_id: int | None = None,
+    completed_at: datetime | None = None,
 ) -> int:
     db = _direct_db_session()
     try:
         run = WorkforceRun(
             workforce_id=workforce_id,
-            task_id=None,
+            task_id=task_id,
             user_id=user_id,
             status=status,
+            is_preview=is_preview,
             snapshot={"workforce": {"id": workforce_id}},
             created_at=created_at,
+            completed_at=completed_at,
         )
         db.add(run)
         db.commit()
         db.refresh(run)
         return int(run.id)
+    finally:
+        db.close()
+
+
+def _create_task(user_id: int, *, title: str, description: str) -> int:
+    db = _direct_db_session()
+    try:
+        task = Task(
+            user_id=user_id,
+            title=title,
+            description=description,
+            status=TaskStatus.COMPLETED,
+            source="internal",
+            is_visible=False,
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        return int(task.id)
+    finally:
+        db.close()
+
+
+def _create_task_workforce_run(
+    *,
+    workforce_id: int,
+    user_id: int,
+    title: str,
+    description: str,
+    status: TaskStatus,
+    created_at: datetime,
+) -> tuple[int, int]:
+    db = _direct_db_session()
+    try:
+        task = Task(
+            user_id=user_id,
+            title=title,
+            description=description,
+            status=status,
+            created_at=created_at,
+        )
+        db.add(task)
+        db.flush()
+        run = WorkforceRun(
+            workforce_id=workforce_id,
+            task_id=int(task.id),
+            user_id=user_id,
+            status=status.value,
+            snapshot={"workforce": {"id": workforce_id}},
+            created_at=created_at,
+            completed_at=(
+                created_at + timedelta(minutes=1)
+                if status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+                else None
+            ),
+        )
+        db.add(run)
+        db.commit()
+        db.refresh(run)
+        return int(run.id), int(task.id)
     finally:
         db.close()
 
@@ -397,6 +469,7 @@ def test_create_list_get_and_cross_user_access_control() -> None:
     assert workforce["status"] == "draft"
     assert workforce["manager"]["name"] == "Support Workforce Manager"
     assert workforce["workers"][0]["agent"]["name"] == "Support Workforce Worker 1"
+    assert "manager_instructions" not in workforce
 
     list_response = client.get("/api/workforces", headers=headers)
     assert list_response.status_code == 200
@@ -424,6 +497,21 @@ def test_create_list_get_and_cross_user_access_control() -> None:
     other_list_payload = other_list_response.json()
     assert other_list_payload["total"] == 1
     assert other_list_payload["items"][0]["id"] == other_workforce["id"]
+
+
+def test_manager_instructions_is_ignored_on_create_and_update() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers)
+
+    update_response = client.patch(
+        f"/api/workforces/{workforce['id']}",
+        headers=headers,
+        json={"description": "Updated", "manager_instructions": "Legacy value"},
+    )
+    assert update_response.status_code == 200, update_response.text
+    payload = update_response.json()
+    assert payload["description"] == "Updated"
+    assert "manager_instructions" not in payload
 
 
 def test_list_workforces_paginates_visible_query_and_bulk_loads_last_runs() -> None:
@@ -483,6 +571,219 @@ def test_list_workforces_paginates_visible_query_and_bulk_loads_last_runs() -> N
     assert len(workforce_run_selects) == 1
     for item in payload["items"]:
         assert item["last_run"]["status"] == expected_latest_status[item["id"]]
+
+
+def test_get_workforce_agent_execution_returns_only_requested_worker_trace() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Agent Trace Workforce")
+    owner_id = _user_id()
+    now = datetime.now(timezone.utc)
+    _, task_id = _create_task_workforce_run(
+        workforce_id=int(workforce["id"]),
+        user_id=owner_id,
+        title="Agent trace run",
+        description="Delegate the work",
+        status=TaskStatus.COMPLETED,
+        created_at=now,
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add_all(
+            [
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-start",
+                    event_type="react_task_start",
+                    timestamp=now,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "agent_id": 17,
+                        "agent_name": "Editor Agent",
+                        "worker_alias": "Editor",
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-end",
+                    event_type="react_task_end",
+                    timestamp=now + timedelta(seconds=1),
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "agent_name": "Editor Agent",
+                        "result": {"success": True},
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    event_id="delegation-end",
+                    event_type="task_update_general",
+                    timestamp=now + timedelta(seconds=2),
+                    data={
+                        "event_type": "workforce_delegation_end",
+                        "worker_task_id": "agent_17_run",
+                        "agent_id": 17,
+                        "agent_name": "Editor Agent",
+                        "worker_alias": "Editor",
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_18_run",
+                    event_id="other-worker",
+                    event_type="react_task_start",
+                    timestamp=now,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_18_run",
+                    },
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/workforces/{workforce['id']}/runs/{task_id}/agent-executions/agent_17_run",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["worker_task_id"] == "agent_17_run"
+    assert payload["agent_name"] == "Editor Agent"
+    assert payload["worker_alias"] == "Editor"
+    assert payload["status"] == "completed"
+    assert [event["event_id"] for event in payload["trace_events"]] == [
+        "worker-start",
+        "worker-end",
+    ]
+
+
+def test_get_workforce_agent_execution_derives_completed_without_summary() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Derived Agent Trace Workforce")
+    owner_id = _user_id()
+    now = datetime.now(timezone.utc)
+    _, task_id = _create_task_workforce_run(
+        workforce_id=int(workforce["id"]),
+        user_id=owner_id,
+        title="Agent trace run",
+        description="Delegate the work",
+        status=TaskStatus.RUNNING,
+        created_at=now,
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add_all(
+            [
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-start",
+                    event_type="react_task_start",
+                    timestamp=now,
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "agent_name": "Editor Agent",
+                    },
+                ),
+                TraceEvent(
+                    task_id=task_id,
+                    build_id="agent_17_run",
+                    event_id="worker-end",
+                    event_type="react_task_end",
+                    timestamp=now + timedelta(seconds=1),
+                    data={
+                        "source": "xagent-agent-tool-child",
+                        "worker_task_id": "agent_17_run",
+                        "result": {"success": True},
+                    },
+                ),
+            ]
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/workforces/{workforce['id']}/runs/{task_id}/agent-executions/agent_17_run",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "completed"
+
+
+def test_get_workforce_agent_execution_marks_orphan_interrupted() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Orphan Agent Trace Workforce")
+    owner_id = _user_id()
+    now = datetime.now(timezone.utc)
+    _, task_id = _create_task_workforce_run(
+        workforce_id=int(workforce["id"]),
+        user_id=owner_id,
+        title="Agent trace run",
+        description="Delegate the work",
+        status=TaskStatus.COMPLETED,
+        created_at=now,
+    )
+
+    db = _direct_db_session()
+    try:
+        db.add(
+            TraceEvent(
+                task_id=task_id,
+                build_id="agent_17_run",
+                event_id="worker-start",
+                event_type="react_task_start",
+                timestamp=now,
+                data={
+                    "source": "xagent-agent-tool-child",
+                    "worker_task_id": "agent_17_run",
+                    "agent_name": "Editor Agent",
+                },
+            )
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.get(
+        f"/api/workforces/{workforce['id']}/runs/{task_id}/agent-executions/agent_17_run",
+        headers=headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "interrupted"
+
+
+@pytest.mark.parametrize(
+    ("event_type", "result", "expected"),
+    [
+        ("dag_execute_end", {"success": True}, "completed"),
+        ("dag_execute_end", {"success": False}, "failed"),
+        ("trace_error", {}, "failed"),
+    ],
+)
+def test_agent_execution_status_recognizes_dag_terminal_events(
+    event_type: str,
+    result: dict[str, Any],
+    expected: str,
+) -> None:
+    assert (
+        workforces_api._derive_agent_execution_status(
+            [{"event_type": event_type, "data": {"result": result}}]
+        )
+        == expected
+    )
 
 
 def test_publish_unpublish_and_active_validation() -> None:
@@ -632,6 +933,339 @@ def test_archived_workforce_rejects_all_edit_boundaries() -> None:
     assert remove_worker_response.status_code == 409
 
 
+def test_discard_draft_deletes_graph_and_exclusive_generated_manager() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Discard Generated Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+    worker_agent_ids = [int(worker["agent"]["id"]) for worker in workforce["workers"]]
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.add(
+            WorkforceBuilderMessage(
+                workforce_id=workforce_id,
+                user_id=owner_id,
+                role="assistant",
+                content="Draft plan",
+                status="message",
+            )
+        )
+        task = Task(
+            user_id=owner_id,
+            title="Generated manager task",
+            description="Unrelated task reference",
+            status=TaskStatus.COMPLETED,
+            agent_id=manager_id,
+            source="internal",
+            is_visible=False,
+        )
+        db.add(task)
+        db.commit()
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 204, response.text
+    assert response.content == b""
+
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert (
+            db.query(WorkforceAgent).filter_by(workforce_id=workforce_id).count() == 0
+        )
+        assert (
+            db.query(WorkforceBuilderMessage)
+            .filter_by(workforce_id=workforce_id)
+            .count()
+            == 0
+        )
+        assert db.get(Agent, manager_id) is None
+        assert all(
+            db.get(Agent, worker_id) is not None for worker_id in worker_agent_ids
+        )
+        assert db.get(Task, task_id).agent_id is None
+    finally:
+        db.close()
+
+
+def test_discard_draft_preserves_reusable_manager() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Discard Reusable Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 204, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(Agent, manager_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("status", ["active", "archived"])
+def test_discard_rejects_non_draft_with_structured_conflict(status: str) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name=f"Discard {status.title()} Workforce")
+    workforce_id = int(workforce["id"])
+
+    db = _direct_db_session()
+    try:
+        workforce_row = db.get(Workforce, workforce_id)
+        assert workforce_row is not None
+        workforce_row.status = status
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_not_discardable",
+            "message": "Only draft workforces can be discarded.",
+        }
+    }
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("is_preview", [False, True])
+def test_discard_rejects_all_run_history_with_structured_conflict(
+    is_preview: bool,
+) -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(
+        headers,
+        name=f"Discard {'Preview' if is_preview else 'Run'} History Workforce",
+    )
+    workforce_id = int(workforce["id"])
+    run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=datetime.now(timezone.utc),
+        is_preview=is_preview,
+    )
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_has_runs",
+            "message": "Workforces with run history cannot be discarded.",
+        }
+    }
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+        assert db.get(WorkforceRun, run_id) is not None
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize("unsafe_reason", ["shared_reference", "owner_mismatch"])
+def test_discard_rejects_unsafe_generated_manager_without_mutation(
+    unsafe_reason: str,
+) -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Discard Shared Manager Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+    other_id: int | None = None
+    other_owner_id: int | None = None
+    if unsafe_reason == "owner_mismatch":
+        _register_second_user("manager-owner", "managerpass1")
+        other_owner_id = _user_id("manager-owner")
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        if unsafe_reason == "shared_reference":
+            other = Workforce(
+                owner_user_id=owner_id,
+                scope_type="user",
+                scope_id=str(owner_id),
+                name="Other Manager Reference",
+                manager_agent_id=manager_id,
+                status="draft",
+            )
+            db.add(other)
+        else:
+            assert other_owner_id is not None
+            manager.user_id = other_owner_id
+        db.commit()
+        if unsafe_reason == "shared_reference":
+            other_id = int(other.id)
+    finally:
+        db.close()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_not_discardable",
+            "message": "The generated manager cannot be safely discarded.",
+        }
+    }
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+        if other_id is not None:
+            assert db.get(Workforce, other_id) is not None
+        assert db.get(Agent, manager_id) is not None
+    finally:
+        db.close()
+
+
+def test_discard_requires_edit_access_without_mutation() -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Private Discard Workforce")
+    workforce_id = int(workforce["id"])
+    other_headers = _register_second_user()
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=other_headers,
+    )
+
+    assert response.status_code == 403, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+    finally:
+        db.close()
+
+
+def test_discard_rolls_back_when_generated_manager_cleanup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Rollback Discard Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    def fail_cleanup(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("cleanup failed")
+
+    monkeypatch.setattr(
+        "xagent.web.services.agent_store.AgentStore.stage_delete_agent",
+        fail_cleanup,
+        raising=False,
+    )
+    caplog.set_level(logging.ERROR, logger="xagent.web.api.workforces")
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {
+        "detail": {
+            "code": "workforce_discard_failed",
+            "message": "Failed to discard workforce",
+        }
+    }
+    assert "cleanup failed" not in response.text
+    assert any(
+        record.name == "xagent.web.api.workforces"
+        and record.getMessage() == f"Failed to discard workforce {workforce_id}"
+        and record.exc_info is not None
+        for record in caplog.records
+    )
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is not None
+        assert db.get(Agent, manager_id) is not None
+        assert (
+            db.query(WorkforceAgent).filter_by(workforce_id=workforce_id).count() == 1
+        )
+    finally:
+        db.close()
+
+
+def test_discard_stays_successful_when_post_commit_cache_invalidation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    workforce = _create_workforce(headers, name="Cache Failure Discard Workforce")
+    workforce_id = int(workforce["id"])
+    manager_id = int(workforce["manager"]["id"])
+
+    db = _direct_db_session()
+    try:
+        manager = db.get(Agent, manager_id)
+        assert manager is not None
+        manager.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    monkeypatch.setattr(
+        "xagent.web.services.workforce_lifecycle.invalidate_agent_cache",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("cache unavailable")),
+    )
+
+    response = client.post(
+        f"/api/workforces/{workforce_id}/discard",
+        headers=headers,
+    )
+
+    assert response.status_code == 204, response.text
+    db = _direct_db_session()
+    try:
+        assert db.get(Workforce, workforce_id) is None
+        assert db.get(Agent, manager_id) is None
+    finally:
+        db.close()
+
+
 def test_from_prompt_creates_draft_workforce() -> None:
     headers = _admin_headers()
     _create_published_agent(_user_id(), "Research Worker")
@@ -646,6 +1280,15 @@ def test_from_prompt_creates_draft_workforce() -> None:
     assert payload["id"]
     assert payload["status"] == "draft"
     assert payload["manager"]["status"] == "published"
+    assert "manager_instructions" not in payload
+
+    db = _direct_db_session()
+    try:
+        manager_agent = db.get(Agent, payload["manager"]["id"])
+        assert manager_agent is not None
+        assert manager_agent.instructions
+    finally:
+        db.close()
 
 
 def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -707,6 +1350,154 @@ def test_run_endpoint_delegates_to_run_service(monkeypatch: pytest.MonkeyPatch) 
         "is_preview": False,
         "is_visible": True,
     }
+
+
+def test_list_workforce_runs_orders_paginates_and_excludes_previews() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Runs History Workforce")
+    workforce_id = int(workforce["id"])
+    now = datetime.now(timezone.utc)
+
+    task_id = _create_task(
+        owner_id,
+        title="Runs History Workforce: analyze",
+        description="analyze " + "x" * 300,
+    )
+    oldest_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=now,
+        task_id=task_id,
+        completed_at=now + timedelta(minutes=1),
+    )
+    preview_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=now + timedelta(minutes=5),
+        is_preview=True,
+    )
+    latest_run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="running",
+        created_at=now + timedelta(minutes=10),
+    )
+
+    response = client.get(f"/api/workforces/{workforce_id}/runs", headers=headers)
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["total"] == 2
+    assert payload["pages"] == 1
+    assert [item["id"] for item in payload["items"]] == [latest_run_id, oldest_run_id]
+
+    oldest_item = payload["items"][1]
+    assert oldest_item["task_id"] == task_id
+    assert oldest_item["status"] == "completed"
+    assert oldest_item["is_preview"] is False
+    assert oldest_item["task_title"] == "Runs History Workforce: analyze"
+    assert oldest_item["message"].endswith("...")
+    assert len(oldest_item["message"]) == 203
+    assert oldest_item["completed_at"] is not None
+
+    latest_item = payload["items"][0]
+    assert latest_item["task_id"] is None
+    assert latest_item["task_title"] is None
+    assert latest_item["message"] is None
+    assert latest_item["completed_at"] is None
+
+    with_previews = client.get(
+        f"/api/workforces/{workforce_id}/runs",
+        headers=headers,
+        params={"include_preview": "true"},
+    )
+    assert with_previews.status_code == 200
+    preview_payload = with_previews.json()
+    assert preview_payload["total"] == 3
+    assert [item["id"] for item in preview_payload["items"]] == [
+        latest_run_id,
+        preview_run_id,
+        oldest_run_id,
+    ]
+    assert preview_payload["items"][1]["is_preview"] is True
+
+    paged = client.get(
+        f"/api/workforces/{workforce_id}/runs",
+        headers=headers,
+        params={"page": 2, "size": 1},
+    )
+    assert paged.status_code == 200
+    paged_payload = paged.json()
+    assert paged_payload["total"] == 2
+    assert paged_payload["pages"] == 2
+    assert [item["id"] for item in paged_payload["items"]] == [oldest_run_id]
+
+    invalid = client.get(
+        f"/api/workforces/{workforce_id}/runs",
+        headers=headers,
+        params={"page": 0},
+    )
+    assert invalid.status_code == 400
+
+    # Preview runs are also excluded from the list endpoint's last_run.
+    list_response = client.get(
+        "/api/workforces",
+        headers=headers,
+        params={"search": "Runs History Workforce"},
+    )
+    assert list_response.status_code == 200
+    assert list_response.json()["items"][0]["last_run"]["id"] == latest_run_id
+
+
+def test_workforce_run_detail_and_access_control() -> None:
+    headers = _admin_headers()
+    owner_id = _user_id()
+    workforce = _create_workforce(headers, name="Run Detail Workforce")
+    workforce_id = int(workforce["id"])
+    now = datetime.now(timezone.utc)
+    run_id = _create_workforce_run(
+        workforce_id=workforce_id,
+        user_id=owner_id,
+        status="completed",
+        created_at=now,
+    )
+
+    detail = client.get(
+        f"/api/workforces/{workforce_id}/runs/{run_id}", headers=headers
+    )
+    assert detail.status_code == 200
+    detail_payload = detail.json()
+    assert detail_payload["id"] == run_id
+    assert detail_payload["snapshot"] == {"workforce": {"id": workforce_id}}
+
+    missing = client.get(
+        f"/api/workforces/{workforce_id}/runs/{run_id + 999}", headers=headers
+    )
+    assert missing.status_code == 404
+
+    other_headers = _register_second_user()
+    other_workforce = _create_workforce(
+        other_headers,
+        name="Other Runs Workforce",
+        username="bob",
+    )
+    denied_list = client.get(
+        f"/api/workforces/{workforce_id}/runs", headers=other_headers
+    )
+    assert denied_list.status_code == 403
+    denied_detail = client.get(
+        f"/api/workforces/{workforce_id}/runs/{run_id}", headers=other_headers
+    )
+    assert denied_detail.status_code == 403
+
+    # A run id from another workforce is not addressable through this one.
+    cross_lookup = client.get(
+        f"/api/workforces/{other_workforce['id']}/runs/{run_id}",
+        headers=other_headers,
+    )
+    assert cross_lookup.status_code == 404
 
 
 def test_canvas_read_returns_nodes_edges_and_layout() -> None:

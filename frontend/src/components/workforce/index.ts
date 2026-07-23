@@ -5,6 +5,7 @@ export { WorkforceConfigPanel, buildWorkerEditState, normalizeWorkerSortOrder, w
 export type { WorkerEditState } from "./workforce-config-panel"
 export { WorkforceCreateView } from "./workforce-create-view"
 export { WorkforcePromptCreator } from "./workforce-prompt-creator"
+export { WorkforceRunsList } from "./workforce-runs-list"
 export { WorkforceStatusBadge } from "./workforce-status-badge"
 export { WorkforceWizard } from "./workforce-wizard"
 export { WorkersStep } from "./workers-step"

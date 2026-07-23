@@ -69,7 +69,13 @@ from .pattern import (
 )
 from .registry import ExecutionHandle, ExecutionLifecycleStatus, ExecutionRegistry
 from .runner import AgentRunner
-from .runtime import LLMCallInterrupted, PatternRuntime, load_pattern_checkpoint
+from .runtime import (
+    ExecutionInterrupted,
+    LLMCallInterrupted,
+    PatternRuntime,
+    ToolCallInterrupted,
+    load_pattern_checkpoint,
+)
 from .service import AgentService
 from .tracing import TraceEventCallback
 
@@ -102,8 +108,10 @@ __all__ = [
     "ExecutionSnapshot",
     "ExecutionStatus",
     "ExecutionContext",
+    "ExecutionInterrupted",
     "GenericComponent",
     "LLMCallInterrupted",
+    "ToolCallInterrupted",
     "LLMCallRecord",
     "LLMPlanGenerator",
     "MemoryComponent",

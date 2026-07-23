@@ -76,14 +76,12 @@ const nodeTypes = {
 
 interface WorkforceDraftCanvasProps {
   managerAgent: WorkforceAgentOption | undefined
-  managerInstructions: string
   workers: WorkforceWorkerDraft[]
   agents: WorkforceAgentOption[]
 }
 
 export function WorkforceDraftCanvas({
   managerAgent,
-  managerInstructions,
   workers,
   agents,
 }: WorkforceDraftCanvasProps) {
@@ -101,7 +99,7 @@ export function WorkforceDraftCanvas({
       data: {
         name: managerAgent?.name || t("workforces.canvas.nodeTypes.manager"),
         avatar: managerAgent?.name ? managerAgent.name.charAt(0).toUpperCase() : "M",
-        description: managerInstructions || managerAgent?.description || "",
+        description: managerAgent?.description || "",
       },
     })
 
@@ -138,7 +136,7 @@ export function WorkforceDraftCanvas({
     })
 
     return { nodes: newNodes, edges: newEdges }
-  }, [managerAgent, managerInstructions, workers, agents, t])
+  }, [managerAgent, workers, agents, t])
 
   return (
     <div className="h-full w-full rounded-xl border bg-gray-50/50">
@@ -174,7 +172,7 @@ export function WorkforceCanvas({ workforce }: WorkforceCanvasProps) {
       data: {
         name: manager?.name || t("workforces.canvas.nodeTypes.manager"),
         avatar: manager?.name ? manager.name.charAt(0).toUpperCase() : "M",
-        description: workforce?.manager_instructions || manager?.description || "",
+        description: manager?.description || "",
       },
     })
 

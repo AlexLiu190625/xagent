@@ -350,6 +350,23 @@ def test_from_template_creates_agent(template_manager):
     assert body["api_key"]["full_key"].startswith("xag_")
 
 
+def test_from_template_strips_agent_tool_category(template_manager):
+    """A tool_categories override containing ``agent`` is silently
+    stripped, same as the plain create path (issue #802)."""
+    key = _personal_key()
+    resp = client.post(
+        "/v1/agents/from-template",
+        headers=_bearer(key),
+        json={
+            "template_id": "qa",
+            "name": "Template agent stripped",
+            "tool_categories": ["web_search", "agent"],
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["agent"]["tool_categories"] == ["web_search"]
+
+
 def test_from_template_allows_empty_list_overrides(template_manager):
     key = _personal_key()
     resp = client.post(

@@ -1,3 +1,5 @@
+import hashlib
+import json
 from typing import Any, Literal, cast, overload
 
 from fastapi import HTTPException
@@ -7,7 +9,9 @@ from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
     get_execution_scope,
 )
-from xagent.core.tools.adapters.vibe.agent_tool_names import gen_agent_tool_name
+from xagent.core.tools.adapters.vibe.agent_tool_names import (
+    gen_workforce_agent_tool_name,
+)
 from xagent.web.models.agent import Agent
 from xagent.web.models.user import User
 
@@ -58,7 +62,7 @@ def normalize_text(
 
 
 def build_worker_tool_name(agent_id: int, alias: str | None = None) -> str:
-    return gen_agent_tool_name(agent_id)
+    return gen_workforce_agent_tool_name(agent_id, alias)
 
 
 def _sorted_workers(workforce: Workforce) -> list[WorkforceAgent]:
@@ -124,17 +128,16 @@ def build_manager_system_prompt(snapshot: dict[str, Any]) -> str:
         "4. Consolidate Worker results into one final answer.",
         "5. If Worker outputs conflict, resolve the conflict or explain uncertainty.",
         "6. Do not expose internal tool names unless necessary.",
+        "7. Use the exact tool name shown for each Worker Agent. Never infer a "
+        "tool name from worker order or agent ids.",
         "",
         "Available Worker Agents:",
     ]
     for worker in workers:
         alias = worker.get("alias") or worker["name"]
-        lines.append(f"- {alias}: {worker['assignment_instructions']}")
-
-    manager_instructions = snapshot.get("manager", {}).get("workforce_instructions")
-    if manager_instructions:
-        lines.extend(
-            ["", "Workforce-specific manager instructions:", manager_instructions]
+        lines.append(
+            f"- {alias} (tool: {worker['tool_name']}): "
+            f"{worker['assignment_instructions']}"
         )
     return "\n".join(lines)
 
@@ -163,13 +166,16 @@ def build_agent_tool_overrides(
     overrides: dict[int, dict[str, Any]] = {}
     for worker in snapshot["workers"]:
         alias = worker.get("alias") or worker["name"]
+        tool_name = worker.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            tool_name = build_worker_tool_name(int(worker["agent_id"]), alias)
         description_parts = []
         if worker.get("description"):
             description_parts.append(worker["description"])
         description_parts.append(f"Workforce role: {alias}.")
         description_parts.append(f"Assignment: {worker['assignment_instructions']}")
         overrides[int(worker["agent_id"])] = {
-            "tool_name": build_worker_tool_name(int(worker["agent_id"])),
+            "tool_name": tool_name,
             "description": " ".join(description_parts),
             "extra_system_prompt": build_worker_system_prompt(
                 workforce_name, worker["assignment_instructions"]
@@ -183,6 +189,93 @@ def build_agent_tool_overrides(
             "worker_alias": alias,
         }
     return overrides
+
+
+# Version of the fingerprint ALGORITHM, stored alongside the pinned value in
+# the run snapshot. The turn-entry guard only compares pinned vs live when the
+# pinned version matches; a version bump therefore exempts runs pinned under an
+# older algorithm instead of spuriously rejecting them with
+# "workforce_config_changed" on deploy. Bump whenever the payload shape or
+# canonicalization below changes. History: 1 = unsorted list fields (never
+# released); 2 = list fields canonicalized via sort.
+WORKFORCE_CONFIG_FINGERPRINT_VERSION = 2
+
+
+def _fingerprint_agent_payload(agent: Agent) -> dict[str, Any]:
+    # knowledge_bases / skills / tool_categories are order-insensitive sets
+    # persisted verbatim from the frontend's multi-selects, which append in
+    # click order. Canonicalize (sort) them so re-saving the same set in a
+    # different array order doesn't change the fingerprint and force-reject
+    # in-flight sessions. json.dumps(sort_keys=True) sorts dict keys only,
+    # not list contents.
+    return {
+        "instructions": agent.instructions,
+        "execution_mode": agent.execution_mode,
+        "models": agent.models or {},
+        "knowledge_bases": sorted(agent.knowledge_bases or [], key=str),
+        "skills": sorted(agent.skills or [], key=str),
+        "tool_categories": sorted(agent.tool_categories or [], key=str),
+    }
+
+
+def compute_workforce_config_fingerprint(
+    workforce: Workforce,
+    manager_agent: Agent,
+    enabled_workers: list[WorkforceAgent],
+) -> str:
+    """Hash the live config that shapes a run's execution.
+
+    The run snapshot only freezes prompt-building data; worker execution
+    re-reads the live Agent per call (instructions, models, KBs, skills,
+    tool categories). A full deep-freeze is impossible — KB content, MCP
+    config and model keys are inherently live — so instead this fingerprint
+    is stored at run creation and re-checked at each new turn's entry:
+    a mismatch rejects the turn ("config changed, start a new session")
+    rather than silently executing with drifted config.
+    """
+    payload = {
+        "version": WORKFORCE_CONFIG_FINGERPRINT_VERSION,
+        "workforce": {"id": workforce.id, "name": workforce.name},
+        "manager": {
+            "agent_id": manager_agent.id,
+            **_fingerprint_agent_payload(manager_agent),
+        },
+        "workers": [
+            {
+                "member_id": worker.id,
+                "agent_id": worker.agent_id,
+                "alias": worker.alias,
+                "assignment_instructions": worker.assignment_instructions,
+                "agent": _fingerprint_agent_payload(worker.agent),
+            }
+            for worker in enabled_workers
+        ],
+    }
+    canonical = json.dumps(
+        payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def compute_live_workforce_config_fingerprint(workforce: Workforce) -> str | None:
+    """Recompute the fingerprint from the current DB state of a workforce.
+
+    Applies the same enabled-worker filter and ordering as
+    ``build_workforce_snapshot``. Returns ``None`` when the live state cannot
+    produce a comparable fingerprint (e.g. the manager relationship is gone),
+    which callers should treat as a mismatch.
+    """
+    manager_agent = workforce.manager_agent
+    if manager_agent is None:
+        return None
+    enabled_workers = [
+        worker
+        for worker in _sorted_workers(workforce)
+        if worker.enabled and worker.agent is not None
+    ]
+    return compute_workforce_config_fingerprint(
+        workforce, cast(Agent, manager_agent), enabled_workers
+    )
 
 
 def build_workforce_snapshot(
@@ -243,13 +336,16 @@ def build_workforce_snapshot(
             "name": manager_agent.name,
             "description": manager_agent.description,
             "instructions": manager_agent.instructions,
-            "workforce_instructions": workforce.manager_instructions,
             "execution_mode": manager_agent.execution_mode,
             "models": manager_agent.models or {},
         },
         "workers": snapshot_workers,
     }
     snapshot["manager"]["runtime_prompt"] = build_manager_system_prompt(snapshot)
+    snapshot["config_fingerprint"] = compute_workforce_config_fingerprint(
+        workforce, manager_agent, enabled_workers
+    )
+    snapshot["config_fingerprint_version"] = WORKFORCE_CONFIG_FINGERPRINT_VERSION
     return snapshot
 
 

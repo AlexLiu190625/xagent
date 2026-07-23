@@ -1,6 +1,8 @@
+import logging
+from datetime import timezone
 from typing import Any, cast
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, selectinload
@@ -8,6 +10,7 @@ from sqlalchemy.orm import Session, selectinload
 from ..auth_dependencies import get_current_user
 from ..models.agent import Agent, is_workforce_generated_manager_agent
 from ..models.database import get_db
+from ..models.task import TaskStatus, TraceEvent
 from ..models.user import User
 from ..models.workforce import (
     Workforce,
@@ -24,6 +27,7 @@ from ..services.agent_team_scope import (
     get_agent_team_scope,
     owns_agent,
 )
+from ..services.trace_message_storage import decode_trace_events_data
 from ..services.workforce_access import (
     can_create_workforce,
     ensure_agent_access,
@@ -32,16 +36,30 @@ from ..services.workforce_access import (
     resolve_create_scope,
 )
 from ..services.workforce_creator import create_workforce_from_prompt
+from ..services.workforce_lifecycle import (
+    acquire_workforce_lifecycle_fence,
+    discard_draft_workforce,
+)
 from ..services.workforce_names import workforce_name_exists
 from ..services.workforce_runs import create_workforce_run as start_workforce_run
+from ..services.workforce_runtime import (
+    cancel_active_workforce_runs,
+    pause_workforce_tasks_after_archive,
+)
 from ..services.workforce_snapshot import (
     normalize_text,
     normalize_workforce_status,
     validate_workforce_for_run,
 )
 from ..services.workforce_workers import create_workforce_worker
+from .public_trace_events import (
+    DELEGATED_AGENT_TRACE_SOURCE,
+    is_audit_only_trace_data,
+    normalize_public_trace_event,
+)
 
 router = APIRouter(prefix="/api/workforces", tags=["workforces"])
+logger = logging.getLogger(__name__)
 
 
 class WorkforceWorkerInput(BaseModel):
@@ -58,7 +76,6 @@ class WorkforceCreateRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=200)
     description: str | None = None
     manager_agent_id: int
-    manager_instructions: str | None = None
     canvas_layout: dict[str, Any] | None = None
     workers: list[WorkforceWorkerInput] = Field(default_factory=list)
 
@@ -71,7 +88,6 @@ class WorkforceUpdateRequest(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=200)
     description: str | None = None
     manager_agent_id: int | None = None
-    manager_instructions: str | None = None
     canvas_layout: dict[str, Any] | None = None
 
 
@@ -202,7 +218,6 @@ def _serialize_workforce_detail(
         "description": workforce.description,
         "status": workforce.status,
         "manager": _serialize_agent(workforce.manager_agent, user, scope),
-        "manager_instructions": workforce.manager_instructions,
         "workers": [
             _serialize_worker(worker, user, scope)
             for worker in _sorted_workers(workforce)
@@ -246,6 +261,121 @@ def _serialize_workforce_list_item(
     }
 
 
+def _trace_timestamp(value: Any) -> float | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return float(value.timestamp())
+
+
+_AGENT_EXECUTION_METADATA_FIELDS = (
+    "agent_id",
+    "agent_name",
+    "worker_member_id",
+    "worker_alias",
+)
+
+
+def _merge_agent_execution_metadata(
+    metadata: dict[str, Any], data: dict[str, Any]
+) -> None:
+    """Keep the first immutable delegation identity observed in trace order."""
+
+    for key in _AGENT_EXECUTION_METADATA_FIELDS:
+        if key in data and key not in metadata:
+            metadata[key] = data[key]
+
+
+def _derive_agent_execution_status(
+    trace_events: list[dict[str, Any]],
+) -> str | None:
+    """Infer a terminal worker status when its parent summary is missing."""
+
+    status_aliases = {
+        "completed": "completed",
+        "failed": "failed",
+        "interrupted": "interrupted",
+        "waiting_for_user": "waiting_for_user",
+    }
+    for event in reversed(trace_events):
+        event_type = str(event.get("event_type") or "")
+        if event_type == "trace_error":
+            return "failed"
+        if event_type not in {
+            "react_task_end",
+            "task_completion",
+            "dag_execute_end",
+        }:
+            continue
+        data = event.get("data")
+        if not isinstance(data, dict):
+            data = {}
+        result = data.get("result")
+        if not isinstance(result, dict):
+            result = {}
+        for candidate in (result.get("status"), data.get("status")):
+            if isinstance(candidate, str):
+                normalized = status_aliases.get(candidate.strip().lower())
+                if normalized is not None:
+                    return normalized
+        success = result.get("success", data.get("success"))
+        if success is False:
+            return "failed"
+        if success is True or event_type == "task_completion":
+            return "completed"
+    return None
+
+
+def _serialize_agent_execution_traces(
+    db: Session,
+    *,
+    task_id: int,
+    worker_task_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    events = (
+        db.query(TraceEvent)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id == worker_task_id,
+            TraceEvent.data["source"].as_string() == DELEGATED_AGENT_TRACE_SOURCE,
+            TraceEvent.event_type != "agent_checkpoint",
+        )
+        .order_by(TraceEvent.timestamp, TraceEvent.id)
+        .all()
+    )
+    if not events:
+        raise HTTPException(status_code=404, detail="Agent execution not found")
+
+    decoded = decode_trace_events_data(
+        db,
+        task_id=task_id,
+        data_items=[event.data for event in events],
+        strict=False,
+    )
+    public_events: list[dict[str, Any]] = []
+    metadata: dict[str, Any] = {"worker_task_id": worker_task_id}
+    for event, data in zip(events, decoded):
+        if is_audit_only_trace_data(data):
+            continue
+        if isinstance(data, dict):
+            _merge_agent_execution_metadata(metadata, data)
+        event_type, public_data = normalize_public_trace_event(
+            str(event.event_type), data
+        )
+        public_events.append(
+            {
+                "event_id": event.event_id,
+                "event_type": event_type,
+                "step_id": event.step_id,
+                "timestamp": _trace_timestamp(event.timestamp),
+                "data": public_data,
+                "parent_event_id": event.parent_event_id,
+            }
+        )
+    return public_events, metadata
+
+
 def _load_latest_runs_by_workforce(
     db: Session,
     workforce_ids: list[int],
@@ -263,7 +393,10 @@ def _load_latest_runs_by_workforce(
             )
             .label("rank"),
         )
-        .filter(WorkforceRun.workforce_id.in_(workforce_ids))
+        .filter(
+            WorkforceRun.workforce_id.in_(workforce_ids),
+            WorkforceRun.is_preview.is_(False),
+        )
         .subquery()
     )
     latest_runs = (
@@ -414,10 +547,6 @@ async def create_workforce(
             name=name,
             description=normalize_text(request.description, "description"),
             manager_agent_id=int(manager_agent.id),
-            manager_instructions=normalize_text(
-                request.manager_instructions,
-                "manager_instructions",
-            ),
             status="draft",
             canvas_layout=request.canvas_layout,
         )
@@ -493,6 +622,70 @@ async def get_workforce(
     )
 
 
+@router.get("/{workforce_id}/runs/{task_id}/agent-executions/{worker_task_id}")
+async def get_workforce_agent_execution(
+    workforce_id: int,
+    task_id: int,
+    worker_task_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    run_query = db.query(WorkforceRun).filter(
+        WorkforceRun.workforce_id == int(workforce.id),
+        WorkforceRun.task_id == task_id,
+    )
+    if not user.is_admin:
+        run_query = run_query.filter(WorkforceRun.user_id == int(user.id))
+    run = run_query.options(selectinload(WorkforceRun.task)).first()
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workforce run not found")
+
+    trace_events, metadata = _serialize_agent_execution_traces(
+        db,
+        task_id=task_id,
+        worker_task_id=worker_task_id,
+    )
+
+    status = _derive_agent_execution_status(trace_events) or "running"
+    if (
+        status == "running"
+        and run.task is not None
+        and run.task.status in {TaskStatus.COMPLETED, TaskStatus.FAILED}
+    ):
+        status = "interrupted"
+    summary_events = (
+        db.query(TraceEvent)
+        .filter(
+            TraceEvent.task_id == task_id,
+            TraceEvent.build_id.is_(None),
+            TraceEvent.data["worker_task_id"].as_string() == worker_task_id,
+        )
+        .order_by(TraceEvent.id)
+        .all()
+    )
+    for event in summary_events:
+        data: dict[str, Any] = event.data if isinstance(event.data, dict) else {}
+        summary_type = data.get("event_type")
+        _merge_agent_execution_metadata(metadata, data)
+        if summary_type == "workforce_delegation_end":
+            status = "completed"
+        elif summary_type == "workforce_delegation_error":
+            status = "failed"
+
+    return {
+        **metadata,
+        "task_id": task_id,
+        "status": status,
+        "trace_events": trace_events,
+    }
+
+
 @router.patch("/{workforce_id}")
 async def update_workforce(
     workforce_id: int,
@@ -518,11 +711,6 @@ async def update_workforce(
         )
     if _field_supplied(request, "description"):
         workforce_row.description = normalize_text(request.description, "description")
-    if _field_supplied(request, "manager_instructions"):
-        workforce_row.manager_instructions = normalize_text(
-            request.manager_instructions,
-            "manager_instructions",
-        )
     if _field_supplied(request, "canvas_layout"):
         workforce_row.canvas_layout = request.canvas_layout
     if _field_supplied(request, "manager_agent_id"):
@@ -569,9 +757,52 @@ async def archive_workforce(
         _load_workforce(db, workforce_id),
         action="edit",
     )
+    workforce_id_value = int(workforce.id)
+    # Serialize against create_workforce_run, which takes the same lifecycle
+    # fence: without this row lock, archive's cancellation sweep can run
+    # while a concurrent create's uncommitted run is invisible to it (the
+    # session is autoflush=False, so even the status flip below stays in
+    # memory), letting that run permanently evade cancellation. The fence's
+    # no-op UPDATE locks on SQLite too, where SELECT FOR UPDATE is ignored.
+    if acquire_workforce_lifecycle_fence(db, workforce_id_value) is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
     cast(Any, workforce).status = "archived"
+    # Archive must also stop what is already running: flipping the status
+    # alone leaves in-flight runs executing (turn resolution never re-checks
+    # live workforce state) and external sessions open. The status flip and
+    # every run cancellation commit atomically; PAUSE dispatch for still
+    # RUNNING tasks happens after the commit (best-effort, own sessions).
+    pause_targets = cancel_active_workforce_runs(db, workforce_id_value)
     db.commit()
+    await pause_workforce_tasks_after_archive(
+        pause_targets,
+        workforce_id=workforce_id_value,
+        actor_user_id=int(user.id),
+    )
     return {"id": workforce.id, "status": workforce.status}
+
+
+@router.post("/{workforce_id}/discard", status_code=204)
+def discard_workforce(
+    workforce_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> Response:
+    try:
+        discard_draft_workforce(db, user, _load_workforce(db, workforce_id))
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Failed to discard workforce %s", workforce_id)
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "workforce_discard_failed",
+                "message": "Failed to discard workforce",
+            },
+        ) from None
+    return Response(status_code=204)
 
 
 @router.post("/{workforce_id}/publish")
@@ -754,6 +985,98 @@ async def create_workforce_run(
         "task_id": result.task.id,
         "status": result.workforce_run.status,
         "redirect_url": f"/task/{result.task.id}",
+    }
+
+
+_RUN_MESSAGE_PREVIEW_LIMIT = 200
+
+
+def _serialize_run_list_item(run: WorkforceRun) -> dict[str, Any]:
+    task = run.task
+    message = cast(str | None, task.description) if task is not None else None
+    if message and len(message) > _RUN_MESSAGE_PREVIEW_LIMIT:
+        message = message[:_RUN_MESSAGE_PREVIEW_LIMIT] + "..."
+    return {
+        "id": run.id,
+        "task_id": run.task_id,
+        "status": run.status,
+        "is_preview": bool(run.is_preview),
+        "source": task.source if task is not None else None,
+        "task_title": task.title if task is not None else None,
+        "message": message,
+        "created_at": _serialize_datetime(run.created_at),
+        "completed_at": _serialize_datetime(run.completed_at),
+    }
+
+
+@router.get("/{workforce_id}/runs")
+async def list_workforce_runs(
+    workforce_id: int,
+    page: int = 1,
+    size: int = 20,
+    include_preview: bool = False,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    if page < 1 or size < 1 or size > 100:
+        raise HTTPException(status_code=400, detail="Invalid pagination parameters")
+
+    query = db.query(WorkforceRun).filter(
+        WorkforceRun.workforce_id == int(workforce.id)
+    )
+    if not include_preview:
+        query = query.filter(WorkforceRun.is_preview.is_(False))
+
+    total = query.count()
+    runs = (
+        query.options(selectinload(WorkforceRun.task))
+        .order_by(WorkforceRun.created_at.desc(), WorkforceRun.id.desc())
+        .offset((page - 1) * size)
+        .limit(size)
+        .all()
+    )
+    return {
+        "items": [_serialize_run_list_item(run) for run in runs],
+        "total": total,
+        "page": page,
+        "size": size,
+        "pages": (total + size - 1) // size,
+    }
+
+
+@router.get("/{workforce_id}/runs/{run_id}")
+async def get_workforce_run(
+    workforce_id: int,
+    run_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+) -> dict[str, Any]:
+    workforce = ensure_workforce_access(
+        db,
+        user,
+        _load_workforce(db, workforce_id),
+        action="view",
+    )
+    run = (
+        db.query(WorkforceRun)
+        .options(selectinload(WorkforceRun.task))
+        .filter(
+            WorkforceRun.id == run_id,
+            WorkforceRun.workforce_id == int(workforce.id),
+        )
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=404, detail="Workforce run not found")
+    return {
+        **_serialize_run_list_item(run),
+        "snapshot": run.snapshot,
     }
 
 

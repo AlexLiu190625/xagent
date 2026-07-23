@@ -35,6 +35,16 @@ class ToolCategory(str, Enum):
     OTHER = "other"
 
 
+# Tool categories that users may not assign to an agent configuration.
+# ``OTHER`` is an internal fallback bucket, never directly assignable.
+# ``AGENT`` grants delegation to every published agent in the account;
+# multi-agent orchestration is a Workforce concern, which injects its
+# worker tools by explicit agent id / tool name instead (issue #802).
+AGENT_CONFIG_UNASSIGNABLE_CATEGORIES: frozenset[str] = frozenset(
+    {ToolCategory.OTHER.value, ToolCategory.AGENT.value}
+)
+
+
 class ToolMetadata(BaseModel):
     name: str
     description: Optional[str] = None

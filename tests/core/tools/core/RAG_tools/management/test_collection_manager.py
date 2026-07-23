@@ -294,6 +294,31 @@ class TestSyncFunctions:
         assert saved.documents == saved_before.documents + 2
         assert saved.processed_documents == saved_before.processed_documents + 1
 
+    def test_update_collection_stats_sync_concurrent_no_lost_updates(self, manager):
+        """Concurrent web-page ingestion (#912) runs each page in its own executor
+        thread + event loop. The per-loop asyncio lock cannot serialize those, so
+        the cross-thread lock must prevent read-modify-write from losing stat
+        increments.
+        """
+        import concurrent.futures
+        import uuid
+
+        collection_name = f"concurrent_stats_{str(uuid.uuid4())[:8]}"
+        # Create the collection (auto-created on first stats update).
+        update_collection_stats_sync(collection_name, documents_delta=0)
+
+        n = 24
+
+        def _bump() -> None:
+            # Fresh event loop per thread mimics run_in_executor page ingestion.
+            update_collection_stats_sync(collection_name, documents_delta=1)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+            list(pool.map(lambda _: _bump(), range(n)))
+
+        final = get_collection_sync(collection_name)
+        assert final.documents == n
+
 
 class TestHubTagMapping:
     """Test collection-manager hub tag mapping collision handling."""

@@ -112,6 +112,45 @@ def test_spec_published_agent_empty_set_excludes():
     assert spec.includes_published_agent() is False
 
 
+# ----- from_raw drops the non-assignable "agent" category (issue #802) ----
+
+
+def test_from_raw_drops_agent_category_but_keeps_others():
+    """Legacy agents saved with ``agent`` lose only that entry: the rest
+    of their selection keeps working, and no delegation is dispatched."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "agent"])
+    assert spec.categories == frozenset({"basic"})
+    assert spec.includes_published_agent() is False
+
+
+def test_from_raw_agent_only_categories_resolve_to_none():
+    """An agent whose ONLY category was ``agent`` now selects zero tools."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=["agent"])
+    assert spec.is_none()
+
+
+def test_from_raw_unconfigured_all_mode_keeps_published_agent_dispatch():
+    """Default chat (no agent selected → ``tool_categories=None``) stays in
+    ALL mode and keeps its agent tools — issue #802 only narrows the
+    configured-agent BY_CATEGORIES path."""
+    spec = ToolSelectionSpec.from_raw(tool_categories=None)
+    assert spec.is_all()
+    assert spec.includes_published_agent() is True
+
+
+def test_from_raw_dropped_agent_category_keeps_workforce_injection():
+    """Workforce delegation is declared by ``published_agent_ids`` +
+    ``name_allowlist``, never by the ``agent`` category — dropping the
+    category must not disturb the injection."""
+    spec = ToolSelectionSpec.from_raw(
+        tool_categories=["agent"],
+        published_agent_ids=[42],
+        name_allowlist={"agent_42"},
+    )
+    assert spec.includes_published_agent() is True
+    assert spec.published_agent_ids == frozenset({42})
+
+
 # ----- ToolRegistry registry-level skip ----------------------------------
 
 
@@ -230,6 +269,36 @@ async def test_registry_runs_published_agent_creator_for_workforce_extras(
     assert published_agents.await_count == 1
     assert agent_management.await_count == 0
     assert [tool.name for tool in tools] == ["calc", "agent_42"]
+
+
+async def test_registry_skips_agent_creators_for_legacy_agent_category(
+    isolated_registry,
+):
+    """A legacy configured agent whose saved categories still contain
+    ``agent`` gets neither published-agent delegation tools nor agent
+    management tools at runtime (issue #802) — the creators are never
+    awaited, while the rest of its selection builds normally."""
+    basic = AsyncMock(return_value=[_mock_tool("calc", "basic")])
+    basic.__name__ = "basic_creator"
+    published_agents = AsyncMock(return_value=[_mock_tool("agent_42", "agent")])
+    published_agents.__name__ = "create_agent_tools"
+    agent_management = AsyncMock(return_value=[_mock_tool("create_agent", "agent")])
+    agent_management.__name__ = "create_create_agent_tool"
+    isolated_registry.register(basic, categories={"basic"})
+    isolated_registry.register(
+        published_agents,
+        categories={"agent"},
+        selection_gate="published_agent",
+    )
+    isolated_registry.register(agent_management, categories={"agent"})
+
+    spec = ToolSelectionSpec.from_raw(tool_categories=["basic", "agent"])
+    tools = await isolated_registry.create_registered_tools(_FakeConfig(spec))
+
+    assert basic.await_count == 1
+    assert published_agents.await_count == 0
+    assert agent_management.await_count == 0
+    assert [tool.name for tool in tools] == ["calc"]
 
 
 async def test_factory_worker_only_mode_keeps_only_injected_agent_tools(

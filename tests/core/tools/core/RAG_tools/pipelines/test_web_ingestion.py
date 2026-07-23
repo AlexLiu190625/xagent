@@ -938,6 +938,84 @@ class TestWebIngestionFileHandler:
                 assert "xagent_web_ingest" in call_kwargs["source_path"]
 
     @pytest.mark.asyncio
+    async def test_same_titled_pages_no_file_handler_get_distinct_temp_paths(
+        self, crawl_config
+    ):
+        """Regression (PR #915 M2): with page-level concurrency and no
+        file_handler, two pages sharing a title must not collide on the same
+        temp file — otherwise one page's content overwrites the other's (torn
+        read) and, since the doc_id derives from the temp path, both collapse to
+        a single document. The per-page index prefix keeps the paths distinct.
+        """
+        same_title = "Shared Title"
+        mock_crawl_results = [
+            MagicMock(
+                url="https://example.com/page1",
+                title=same_title,
+                content_markdown="# Shared Title\n\nContent A",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=30,
+            ),
+            MagicMock(
+                url="https://example.com/page2",
+                title=same_title,
+                content_markdown="# Shared Title\n\nContent B",
+                status="success",
+                depth=0,
+                timestamp=datetime(2025, 1, 1, 12, 0, 0),
+                content_length=30,
+            ),
+        ]
+
+        ingestion_config = IngestionConfig(
+            chunk_size=500,
+            chunk_overlap=100,
+            page_ingest_concurrency=2,
+        )
+
+        def _ingest_side_effect(**kwargs: Any) -> IngestionResult:
+            return IngestionResult(
+                status="success",
+                doc_id=kwargs["source_path"],
+                parse_hash="hash",
+                chunk_count=1,
+                embedding_count=1,
+                vector_count=1,
+                completed_steps=[],
+                failed_step=None,
+                message="Success",
+                warnings=[],
+            )
+
+        with patch(
+            "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.WebCrawler"
+        ) as mock_crawler_class:
+            mock_crawler = MagicMock()
+            mock_crawler.crawl = AsyncMock(return_value=mock_crawl_results)
+            mock_crawler.total_urls_found = 2
+            mock_crawler.failed_urls = {}
+            mock_crawler_class.return_value = mock_crawler
+
+            with patch(
+                "xagent.core.tools.core.RAG_tools.pipelines.web_ingestion.run_document_ingestion",
+                side_effect=_ingest_side_effect,
+            ) as mock_ingest:
+                result = await run_web_ingestion(
+                    collection="test_collection",
+                    crawl_config=crawl_config,
+                    ingestion_config=ingestion_config,
+                )
+
+        assert result.status == "success"
+        assert mock_ingest.call_count == 2
+        source_paths = [c.kwargs["source_path"] for c in mock_ingest.call_args_list]
+        # Two distinct temp files → two distinct documents, no clobber.
+        assert len(set(source_paths)) == 2
+        assert result.documents_created == 2
+
+    @pytest.mark.asyncio
     async def test_file_handler_rollback_runs_on_ingestion_error_result(
         self, crawl_config, ingestion_config
     ):

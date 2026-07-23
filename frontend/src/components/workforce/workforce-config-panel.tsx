@@ -36,7 +36,6 @@ interface WorkforceConfigPanelProps {
     name: string
     description: string
     managerAgentId: string
-    managerInstructions: string
   }) => Promise<void>
   onAddWorker: (agentId: number, instructions: string, alias?: string) => Promise<void>
   onSaveWorker: (worker: WorkforceWorker, edit: WorkerEditState) => Promise<void>
@@ -351,7 +350,6 @@ export function WorkforceConfigPanel({
   const [editingDetails, setEditingDetails] = useState(false)
   const [detailsName, setDetailsName] = useState(workforce.name)
   const [detailsDescription, setDetailsDescription] = useState(workforce.description || "")
-  const [detailsInstructions, setDetailsInstructions] = useState(workforce.manager_instructions || "")
 
   // Lead section
   const [changeLeadOpen, setChangeLeadOpen] = useState(false)
@@ -367,7 +365,6 @@ export function WorkforceConfigPanel({
   useEffect(() => {
     setDetailsName(workforce.name)
     setDetailsDescription(workforce.description || "")
-    setDetailsInstructions(workforce.manager_instructions || "")
   }, [workforce])
 
   const workerAgentIds = new Set(workforce.workers.map((w) => w.agent.id))
@@ -388,7 +385,6 @@ export function WorkforceConfigPanel({
       name: detailsName.trim(),
       description: detailsDescription.trim(),
       managerAgentId: String(workforce.manager.id),
-      managerInstructions: detailsInstructions.trim(),
     })
     setEditingDetails(false)
   }
@@ -398,7 +394,6 @@ export function WorkforceConfigPanel({
       name: workforce.name,
       description: workforce.description || "",
       managerAgentId: String(agentId),
-      managerInstructions: workforce.manager_instructions || "",
     })
     setChangeLeadOpen(false)
   }
@@ -481,17 +476,6 @@ export function WorkforceConfigPanel({
                 disabled={saving}
               />
             </div>
-            <div className="space-y-1.5">
-              <Label className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                {t("workforces.fields.workforceInstructions")} *
-              </Label>
-              <Textarea
-                value={detailsInstructions}
-                onChange={(e) => setDetailsInstructions(e.target.value)}
-                rows={4}
-                disabled={saving}
-              />
-            </div>
             <div className="flex gap-2">
               <Button size="sm" onClick={handleSaveDetails} disabled={saving || !detailsName.trim()}>
                 {saving ? t("workforces.loading.saving") : t("common.save")}
@@ -502,7 +486,6 @@ export function WorkforceConfigPanel({
                 onClick={() => {
                   setDetailsName(workforce.name)
                   setDetailsDescription(workforce.description || "")
-                  setDetailsInstructions(workforce.manager_instructions || "")
                   setEditingDetails(false)
                 }}
                 disabled={saving}
@@ -526,16 +509,6 @@ export function WorkforceConfigPanel({
               <div className="mt-1 text-sm text-muted-foreground whitespace-pre-wrap">
                 {workforce.description || (
                   <span className="italic">{t("workforces.detail.noDescription")}</span>
-                )}
-              </div>
-            </div>
-            <div className="rounded-xl border p-4">
-              <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                {t("workforces.fields.workforceInstructions")} *
-              </div>
-              <div className="mt-1 text-sm text-muted-foreground whitespace-pre-wrap">
-                {workforce.manager_instructions || (
-                  <span className="italic">{t("workforces.review.noManagerInstructions")}</span>
                 )}
               </div>
             </div>

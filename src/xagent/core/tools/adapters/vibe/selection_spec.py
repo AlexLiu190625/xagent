@@ -53,6 +53,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, List, Optional, Set
 
+from .base import AGENT_CONFIG_UNASSIGNABLE_CATEGORIES
+
 logger = logging.getLogger(__name__)
 
 
@@ -306,20 +308,27 @@ class ToolSelectionSpec(ABC):
             if isinstance(entry, str) and entry.startswith("mcp:"):
                 server_name = normalize_mcp_server_name(entry.split(":", 1)[1])
                 derived_mcp_servers.add(server_name)
-            elif entry == "other":
-                # Legacy-only entry, no longer assignable (see module
-                # docstring). No built-in tool carries this category, so
-                # dropping it just prunes stale data -- except a legacy
-                # agent persisted with exactly ["other"] (no mcp_servers),
-                # which loses its only tool access. Warn so this is
-                # visible in logs; from_raw() has no agent id, so
-                # per-agent traceability comes from the backfill
-                # migration's logging instead.
+            elif entry in AGENT_CONFIG_UNASSIGNABLE_CATEGORIES:
+                # Legacy-only entries, no longer assignable (the set is the
+                # SSOT shared with the write-path strip and the builder
+                # tools). Legacy agent rows may still carry them; dropping
+                # here prunes them at runtime without a data migration.
+                #   - "other": no built-in tool carries it -- except a
+                #     legacy agent persisted with exactly ["other"] (no
+                #     mcp_servers), which loses its previous (leaky)
+                #     Custom API access.
+                #   - "agent" (issue #802): multi-agent delegation is a
+                #     Workforce concern, injected via
+                #     ``published_agent_ids`` + ``name_allowlist`` rather
+                #     than this category; any ``published_agent_ids``
+                #     passed alongside is unaffected.
+                # Warn so this is visible in logs; from_raw() has no agent
+                # id, so per-agent traceability comes from request logs.
                 logger.warning(
-                    "Dropping non-assignable 'other' tool category from "
-                    "tool_categories=%r; if 'other' was the only entry, "
-                    "this agent now gets zero tools instead of its "
-                    "previous (leaky) Custom API access",
+                    "Dropping non-assignable %r tool category from "
+                    "tool_categories=%r; if it was the only entry, this "
+                    "agent now gets zero tools",
+                    entry,
                     tool_categories,
                 )
                 continue

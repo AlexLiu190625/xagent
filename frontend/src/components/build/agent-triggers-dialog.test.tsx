@@ -1,6 +1,6 @@
 /// <reference types="@testing-library/jest-dom/vitest" />
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -41,6 +41,7 @@ vi.mock("@/lib/clipboard", () => ({
 }))
 
 import { AgentTriggersDialog } from "./agent-triggers-dialog"
+import type { StagedTrigger } from "@/lib/agent-triggers-api"
 
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return new Response(JSON.stringify(body), {
@@ -263,5 +264,154 @@ describe("AgentTriggersDialog", () => {
     fireEvent.click(await screen.findByText("triggers.cards.gmail.title"))
 
     expect(await screen.findByText("triggers.gmail.accountMissing")).toBeInTheDocument()
+  })
+})
+
+describe("AgentTriggersDialog staging mode (agent not created yet)", () => {
+  function stagedWebhook(clientId: number, name: string): StagedTrigger {
+    return {
+      clientId,
+      type: "webhook",
+      name,
+      enabled: true,
+      config: {},
+      prompt_template: null,
+      secret: null,
+    }
+  }
+
+  function renderStaging(triggers: StagedTrigger[]) {
+    const onChange = vi.fn()
+    render(
+      <AgentTriggersDialog
+        agentId={null}
+        open
+        onOpenChange={vi.fn()}
+        staged={{ triggers, onChange }}
+        gmailConnection={{ isConnected: false, connectedAccount: null }}
+      />,
+    )
+    return onChange
+  }
+
+  beforeEach(() => {
+    apiRequestMock.mockReset()
+    apiRequestMock.mockResolvedValue(jsonResponse([]))
+  })
+
+  afterEach(() => {
+    cleanup()
+  })
+
+  it("stages a default trigger when a type is toggled on", async () => {
+    const onChange = renderStaging([])
+
+    expect(await screen.findByText("triggers.staging.info")).toBeInTheDocument()
+
+    const [webhookSwitch] = screen.getAllByRole("switch")
+    fireEvent.click(webhookSwitch)
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({
+          clientId: -1,
+          type: "webhook",
+          enabled: true,
+          name: "triggers.defaults.webhookName",
+        }),
+      ])
+    })
+  })
+
+  it("appends a new staged trigger via Add instead of overwriting the selected one", async () => {
+    const onChange = renderStaging([stagedWebhook(-1, "First hook")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("First hook")
+
+    fireEvent.click(screen.getByRole("button", { name: /triggers.actions.addAnother/ }))
+
+    // Creation state: empty form and the create label, no leaked delete action.
+    expect(screen.getByLabelText("triggers.form.name")).toHaveValue("")
+    expect(screen.getByRole("button", { name: "triggers.actions.enable" })).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "triggers.actions.delete" })).not.toBeInTheDocument()
+
+    fireEvent.change(screen.getByLabelText("triggers.form.name"), {
+      target: { value: "Second hook" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.enable" }))
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -1, name: "First hook" }),
+        expect.objectContaining({ clientId: -2, name: "Second hook", type: "webhook" }),
+      ])
+    })
+  })
+
+  it("lists staged triggers newest first and selects the primary one", async () => {
+    renderStaging([stagedWebhook(-1, "Old hook"), stagedWebhook(-2, "New hook")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+
+    // Newest staged trigger (-2) is the primary selection…
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("New hook")
+    // …and precedes the older one in the picker.
+    const newPill = screen.getByText("New hook")
+    const oldPill = screen.getByText("Old hook")
+    expect(
+      newPill.compareDocumentPosition(oldPill) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy()
+  })
+
+  it("removes a staged trigger after delete confirmation", async () => {
+    const onChange = renderStaging([stagedWebhook(-1, "Doomed hook")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+
+    fireEvent.click(await screen.findByRole("button", { name: "triggers.actions.delete" }))
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.confirmDelete" }))
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([])
+    })
+  })
+
+  it("updates the selected staged trigger in place on save", async () => {
+    const onChange = renderStaging([stagedWebhook(-1, "Old name")])
+
+    fireEvent.click(await screen.findByText("triggers.cards.webhook.title"))
+    expect(await screen.findByLabelText("triggers.form.name")).toHaveValue("Old name")
+
+    fireEvent.change(screen.getByLabelText("triggers.form.name"), {
+      target: { value: "New name" },
+    })
+    fireEvent.click(screen.getByRole("button", { name: "triggers.actions.save" }))
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -1, name: "New name", type: "webhook" }),
+      ])
+    })
+  })
+
+  it("disables every staged trigger of a type when its switch is toggled off", async () => {
+    const onChange = renderStaging([
+      stagedWebhook(-1, "Hook one"),
+      stagedWebhook(-2, "Hook two"),
+    ])
+
+    await screen.findByText("triggers.staging.info")
+    const [webhookSwitch] = screen.getAllByRole("switch")
+    expect(webhookSwitch).toHaveAttribute("aria-checked", "true")
+
+    fireEvent.click(webhookSwitch)
+
+    await waitFor(() => {
+      expect(onChange).toHaveBeenCalledWith([
+        expect.objectContaining({ clientId: -1, enabled: false }),
+        expect.objectContaining({ clientId: -2, enabled: false }),
+      ])
+    })
   })
 })

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import os
 import time
@@ -1065,9 +1066,9 @@ def _process_document_impl(
                     "batch_size": cfg.embedding_batch_size
                     if not cfg.embedding_use_async
                     else None,
-                    "concurrent": cfg.embedding_concurrent
-                    if cfg.embedding_use_async
-                    else None,
+                    # Both paths honor embedding_concurrent: the async path fans out
+                    # per-chunk encodes, the batch path fans out per-batch encodes.
+                    "concurrent": cfg.embedding_concurrent,
                 },
             )
             embedding_start = time.time()
@@ -1167,34 +1168,85 @@ def _process_document_impl(
 
             else:
                 processed_batches = 0
+                # Fan the independent (network-bound) batch encodes out over a
+                # bounded thread pool (honoring embedding_concurrent; =1 restores
+                # serial), then write in original order. This materializes all
+                # vectors before writing — peak memory scales with the whole doc,
+                # fine for web pages; stream if very large docs ever land here.
+                batch_slices = [
+                    chunks[start : start + cfg.embedding_batch_size]
+                    for start in range(0, len(chunks), cfg.embedding_batch_size)
+                ]
+
+                def _encode_batch(
+                    indexed: Tuple[int, List[ChunkForEmbedding]],
+                ) -> List[List[float]]:
+                    idx, batch_chunks = indexed
+                    batch_texts = [chunk.text for chunk in batch_chunks]
+                    _log_embedding_text_batch_stats(
+                        f"compute_embeddings(batch) doc_id={doc_id}",
+                        batch_texts,
+                        batch_index=idx,
+                    )
+                    # Retry transient provider failures with linear backoff. Runs
+                    # in a worker thread, so a blocking time.sleep between attempts
+                    # is fine. A size mismatch is deterministic and stays terminal.
+                    # On exhaustion this re-raises and fails the whole document
+                    # (unlike the async path, which drops the chunk and continues);
+                    # max_retries=0 still does one attempt here, vs zero on async.
+                    attempts = max(1, cfg.max_retries)
+                    raw_vectors = None
+                    for attempt in range(attempts):
+                        try:
+                            raw_vectors = embedding_adapter.encode(batch_texts)
+                            break
+                        except Exception as exc:  # noqa: BLE001
+                            if attempt >= attempts - 1:
+                                raise
+                            logger.warning(
+                                "[RAG][embedding] batch encode failed "
+                                "(batch_index=%s attempt=%s/%s): %s",
+                                idx,
+                                attempt + 1,
+                                attempts,
+                                exc,
+                            )
+                            time.sleep(cfg.retry_delay * (attempt + 1))
+                    vectors = normalize_raw_embedding_to_vectors(raw_vectors)
+                    if len(vectors) != len(batch_chunks):
+                        raise VectorValidationError(
+                            "Embedding provider returned mismatched batch size",
+                            details={
+                                "batch_index": idx,
+                                "expected": len(batch_chunks),
+                                "actual": len(vectors),
+                            },
+                        )
+                    return vectors
+
+                max_encode_workers = max(1, cfg.embedding_concurrent)
+                if len(batch_slices) > 1 and max_encode_workers > 1:
+                    with concurrent.futures.ThreadPoolExecutor(
+                        max_workers=min(max_encode_workers, len(batch_slices))
+                    ) as encode_pool:
+                        # map preserves input order, so vectors line up with batches.
+                        all_vectors = list(
+                            encode_pool.map(_encode_batch, enumerate(batch_slices))
+                        )
+                else:
+                    all_vectors = [
+                        _encode_batch((idx, bc)) for idx, bc in enumerate(batch_slices)
+                    ]
+
                 with progress_tracker.track_step(
                     "write_vectors_to_db",
                     total_count=len(chunks),
                     message="Writing vectors...",
                 ) as write_step_tracker:
-                    for batch_start in range(0, len(chunks), cfg.embedding_batch_size):
-                        batch_chunks = chunks[
-                            batch_start : batch_start + cfg.embedding_batch_size
-                        ]
-                        batch_texts = [chunk.text for chunk in batch_chunks]
-                        _log_embedding_text_batch_stats(
-                            f"compute_embeddings(batch) doc_id={doc_id}",
-                            batch_texts,
-                            batch_index=processed_batches,
-                        )
-                        raw_vectors = embedding_adapter.encode(batch_texts)
-                        vectors = normalize_raw_embedding_to_vectors(raw_vectors)
-
-                        if len(vectors) != len(batch_chunks):
-                            raise VectorValidationError(
-                                "Embedding provider returned mismatched batch size",
-                                details={
-                                    "batch_index": processed_batches,
-                                    "expected": len(batch_chunks),
-                                    "actual": len(vectors),
-                                },
-                            )
-
+                    for batch_index, (batch_chunks, vectors) in enumerate(
+                        zip(batch_slices, all_vectors)
+                    ):
+                        is_last_batch = batch_index == len(batch_slices) - 1
                         embeddings_batch: List[ChunkEmbeddingData] = [
                             ChunkEmbeddingData(
                                 doc_id=chunk.doc_id,
@@ -1223,10 +1275,7 @@ def _process_document_impl(
                             write_response = write_vectors_to_db(
                                 collection=collection,
                                 embeddings=embeddings_batch,
-                                create_index=(
-                                    batch_start + cfg.embedding_batch_size
-                                    >= len(chunks)
-                                ),
+                                create_index=is_last_batch,
                                 user_id=user_id,
                             )
                             last_write_response = (
@@ -1312,20 +1361,29 @@ def _process_document_impl(
                 },
             )
         )
+        final_index_status = (
+            last_write_response.index_status
+            if last_write_response is not None
+            else "skipped"
+        )
         logger.info(
             "Step write_vectors_to_db completed",
             extra={
                 "collection": collection,
                 "doc_id": doc_id,
                 "vector_count": vector_count,
-                "index_status": (
-                    last_write_response.index_status
-                    if last_write_response is not None
-                    else "skipped"
-                ),
+                "index_status": final_index_status,
                 "elapsed_ms": write_elapsed_ms,
             },
         )
+        # Index build is non-fatal (vectors are written; search falls back to
+        # brute force), but a corrupted/failed index shouldn't stay buried in a
+        # status field — surface it to the caller as a warning.
+        if final_index_status in ("index_corrupted", "failed"):
+            warnings.append(
+                f"Vector index not ready (status={final_index_status}); "
+                "search will be slower until it rebuilds."
+            )
 
         # Update collection statistics
         try:

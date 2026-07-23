@@ -11,8 +11,12 @@ vi.mock("@/lib/utils", () => ({
 }))
 
 import {
+  StagedTrigger,
   createAgentTrigger,
+  createStagedTriggers,
   listAgentTriggerRuns,
+  stagedToCreatePayload,
+  stagedToPseudoTrigger,
   updateAgentTrigger,
 } from "./agent-triggers-api"
 
@@ -118,5 +122,109 @@ describe("agent trigger API client", () => {
     )
     expect(runs).toHaveLength(1)
     expect(runs[0].task_id).toBe(99)
+  })
+})
+
+describe("staged triggers (agent creation flow)", () => {
+  const staged: StagedTrigger = {
+    clientId: -3,
+    type: "scheduled",
+    name: "Daily report",
+    enabled: true,
+    config: { interval_seconds: 3600 },
+    prompt_template: "Run {{payload}}",
+    secret: null,
+  }
+
+  it("maps a staged trigger to a pseudo AgentTrigger keyed by its negative clientId", () => {
+    const pseudo = stagedToPseudoTrigger(staged)
+
+    expect(pseudo.id).toBe(-3)
+    expect(pseudo.type).toBe("scheduled")
+    expect(pseudo.name).toBe("Daily report")
+    expect(pseudo.enabled).toBe(true)
+    expect(pseudo.config).toEqual({ interval_seconds: 3600 })
+    expect(pseudo.prompt_template).toBe("Run {{payload}}")
+    expect(pseudo.webhook_token).toBeNull()
+    expect(pseudo.callback_id).toBeNull()
+  })
+
+  it("builds a create payload without leaking the client-side id", () => {
+    const payload = stagedToCreatePayload(staged)
+
+    expect(payload).toEqual({
+      type: "scheduled",
+      name: "Daily report",
+      enabled: true,
+      config: { interval_seconds: 3600 },
+      prompt_template: "Run {{payload}}",
+      secret: null,
+    })
+    expect("clientId" in payload).toBe(false)
+  })
+
+  const webhookNoSecret: StagedTrigger = {
+    clientId: -1,
+    type: "webhook",
+    name: "Generated hook",
+    enabled: true,
+    config: {},
+    prompt_template: null,
+    secret: null,
+  }
+  const webhookCustomSecret: StagedTrigger = {
+    clientId: -2,
+    type: "webhook",
+    name: "Custom hook",
+    enabled: true,
+    config: {},
+    prompt_template: null,
+    secret: "user-supplied",
+  }
+
+  function createdTrigger(id: number, overrides: Record<string, unknown> = {}) {
+    return jsonResponse({
+      id,
+      user_id: 1,
+      agent_id: 42,
+      type: "webhook",
+      name: "created",
+      enabled: true,
+      config: {},
+      prompt_template: null,
+      webhook_token: null,
+      next_run_at: null,
+      last_run_at: null,
+      last_error: null,
+      created_at: null,
+      updated_at: null,
+      ...overrides,
+    })
+  }
+
+  it("keeps failed staged triggers (config intact) instead of dropping them", async () => {
+    apiRequestMock
+      .mockResolvedValueOnce(createdTrigger(11, { webhook_secret: "gen-secret" }))
+      .mockResolvedValueOnce(
+        jsonResponse({ detail: "Gmail account not found" }, { status: 404 }),
+      )
+
+    const outcome = await createStagedTriggers(42, [webhookNoSecret, staged])
+
+    expect(outcome.failed).toHaveLength(1)
+    expect(outcome.failed[0].staged).toBe(staged)
+    expect(outcome.failed[0].error).toBe("Gmail account not found")
+    expect(outcome.generatedSecrets).toEqual([
+      { name: "Generated hook", secret: "gen-secret" },
+    ])
+  })
+
+  it("does not report user-supplied webhook secrets as generated", async () => {
+    apiRequestMock.mockResolvedValue(createdTrigger(12, { webhook_secret: "echoed-back" }))
+
+    const outcome = await createStagedTriggers(42, [webhookCustomSecret])
+
+    expect(outcome.failed).toHaveLength(0)
+    expect(outcome.generatedSecrets).toEqual([])
   })
 })

@@ -120,7 +120,6 @@ def _clean_creation_plan(
             "description": manager_description,
             "instructions": manager_instructions,
         },
-        "manager_instructions": manager_instructions,
         "workers": clean_workers,
         "warnings": clean_warnings,
     }
@@ -199,7 +198,7 @@ async def generate_workforce_creation_plan(
             "Create a manager spec that can coordinate workers and synthesize results. "
             "Select workers only from available_published_agents. "
             "Do not create worker agents. If no worker fits, return no workers and add a warning. "
-            "Return JSON only with keys: name, description, manager, manager_instructions, workers, warnings. "
+            "Return JSON only with keys: name, description, manager, workers, warnings. "
             "manager has name, description, instructions. "
             "Each worker has agent_id, alias, assignment_instructions, enabled. "
             "Keep instructions concrete and task-oriented."
@@ -311,10 +310,6 @@ async def create_workforce_from_prompt(
                 "description",
             ),
             manager_agent_id=int(manager_agent.id),
-            manager_instructions=normalize_text(
-                cast(str | None, plan.get("manager_instructions")),
-                "manager_instructions",
-            ),
             status="draft",
         )
         db.add(workforce)

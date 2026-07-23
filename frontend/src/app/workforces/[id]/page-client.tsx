@@ -2,8 +2,8 @@
 
 import React, { useCallback, useEffect, useRef, useState } from "react"
 import Link from "next/link"
-import { useParams } from "next/navigation"
-import { ArrowLeft, LayoutDashboard, MessageSquare } from "lucide-react"
+import { useParams, useRouter } from "next/navigation"
+import { ArrowLeft, History, LayoutDashboard, MessageSquare } from "lucide-react"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import type { Task } from "@/contexts/app-context-chat"
@@ -30,6 +30,7 @@ import {
     normalizeWorkerSortOrder,
     WorkforceCanvas,
     WorkforceConfigPanel,
+    WorkforceRunsList,
     WorkforceStatusBadge,
     type WorkerEditState,
 } from "@/components/workforce"
@@ -38,7 +39,7 @@ import { ResizableSplitLayout } from "@/components/layout/resizable-split-layout
 import { Button } from "@/components/ui/button"
 import { toast } from "sonner"
 
-type ActiveView = "configure" | "canvas"
+type ActiveView = "configure" | "canvas" | "runs"
 
 interface LoadOptions {
     silent?: boolean
@@ -47,6 +48,7 @@ interface LoadOptions {
 export default function WorkforceDetailPage() {
     const { t } = useI18n()
     const params = useParams()
+    const router = useRouter()
     const { sendMessage, setTaskId, closeFilePreview, dispatch } = useApp()
     const id = Array.isArray(params.id) ? params.id[0] : params.id
 
@@ -112,7 +114,6 @@ export default function WorkforceDetailPage() {
         name: string
         description: string
         managerAgentId: string
-        managerInstructions: string
     }) => {
         if (!id) return
         try {
@@ -121,7 +122,6 @@ export default function WorkforceDetailPage() {
                 name: data.name,
                 description: data.description || null,
                 manager_agent_id: Number(data.managerAgentId),
-                manager_instructions: data.managerInstructions || null,
             })
             setWorkforce(next)
             toast.success(t("workforces.messages.updated"))
@@ -337,6 +337,17 @@ export default function WorkforceDetailPage() {
                         <LayoutDashboard className="h-3.5 w-3.5 rotate-90" />
                         {t("workforces.canvas.title")}
                     </button>
+                    <button
+                        onClick={() => setActiveView("runs")}
+                        className={`flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                            activeView === "runs"
+                                ? "bg-background text-foreground shadow-sm"
+                                : "text-muted-foreground hover:text-foreground"
+                        }`}
+                    >
+                        <History className="h-3.5 w-3.5" />
+                        {t("workforces.runs.title")}
+                    </button>
                 </div>
 
                 <div className="flex-1" />
@@ -381,9 +392,21 @@ export default function WorkforceDetailPage() {
                                     onRemoveWorker={handleRemoveWorker}
                                 />
                             </div>
-                        ) : (
+                        ) : activeView === "canvas" ? (
                             <div className="h-full">
                                 <WorkforceCanvas workforce={workforce} />
+                            </div>
+                        ) : (
+                            <div className="h-full overflow-y-auto p-4 sm:p-6">
+                                <div className="mx-auto max-w-3xl">
+                                    <h2 className="text-sm font-semibold">{t("workforces.runs.historyTitle")}</h2>
+                                    <p className="mt-1 text-xs text-muted-foreground">{t("workforces.runs.historyHint")}</p>
+                                    <WorkforceRunsList
+                                        className="mt-4"
+                                        workforceId={id ?? workforce.id}
+                                        onSelectRun={(run) => router.push(`/workforces/${id ?? workforce.id}/run?run=${run.id}`)}
+                                    />
+                                </div>
                             </div>
                         )
                     }
