@@ -180,13 +180,18 @@ export function ApiKeysPage() {
     router.replace("/api-keys")
   }
 
+  // A key binds to an agent or a workforce; surface whichever owner name
+  // is set (the other is null on the wire).
+  const ownerName = (k: AgentApiKeyListItem): string =>
+    (k.owner_type === "workforce" ? k.workforce_name : k.agent_name) ?? ""
+
   const normalizedQuery = searchQuery.trim().toLowerCase()
   const filteredKeys = keys
     .filter((k) => agentFilterId === null || k.agent_id === agentFilterId)
     .filter(
       (k) =>
         !normalizedQuery ||
-        [k.label ?? "", k.agent_name, k.key_prefix]
+        [k.label ?? "", ownerName(k), k.key_prefix]
           .join(" ")
           .toLowerCase()
           .includes(normalizedQuery)
@@ -403,8 +408,14 @@ export function ApiKeysPage() {
                     </TableCell>
                     <TableCell>
                       <span className="inline-flex items-center gap-1.5 text-sm">
-                        <span className="h-2 w-2 rounded-full bg-indigo-500" />
-                        {key.agent_name}
+                        <span
+                          className={`h-2 w-2 rounded-full ${
+                            key.owner_type === "workforce"
+                              ? "bg-emerald-500"
+                              : "bg-indigo-500"
+                          }`}
+                        />
+                        {ownerName(key)}
                       </span>
                     </TableCell>
                     <TableCell>

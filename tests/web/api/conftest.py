@@ -27,6 +27,7 @@ from typing import Iterator
 
 import pytest
 from fastapi import FastAPI, Request
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
@@ -150,8 +151,16 @@ async def _v1_validation_error_handler(request: Request, exc: RequestValidationE
             status_code=422,
             content={"error": {"code": "invalid_input", "message": msg}},
         )
-    # /api/* uses FastAPI's default shape
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
+    # /api/* uses FastAPI's default shape. Encode via jsonable_encoder with
+    # an Exception fallback: pydantic model_validator errors carry the raw
+    # ValueError in ctx, which json.dumps alone can't serialize (the prod
+    # handler in web/app.py sanitizes the same way).
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": jsonable_encoder(exc.errors(), custom_encoder={Exception: str})
+        },
+    )
 
 
 app_for_tests.dependency_overrides[get_db] = _override_get_db

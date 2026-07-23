@@ -18,14 +18,18 @@ from sqlalchemy.orm import Session
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
 from ..models.database import get_db
+from ..models.deployment import DeploymentOwnerType
 from ..models.task import Task, TaskStatus
 from ..models.user import User
 from ..models.user_channel import UserChannel
+from ..models.workforce import Workforce, WorkforceRun
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
+from ..services.deployments import get_deployment
+from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
 from .websocket import (
@@ -39,6 +43,12 @@ from .websocket import (
 logger = logging.getLogger(__name__)
 db_session_context = contextmanager(get_db)
 
+# Cap on files per task-less share upload request. This path predates any
+# task/owner association (workforce first-turn attachments), so it is the one
+# public-share write surface with no downstream owner scoping; the cap blocks
+# the worst single-request abuse. Broader quota + orphan GC tracked in #973.
+MAX_TASKLESS_SHARE_UPLOAD_FILES = 10
+
 
 class PublicChatAuthResponse(BaseModel):
     access_token: str
@@ -48,6 +58,8 @@ class PublicChatAuthResponse(BaseModel):
     agent_logo: str | None = None
     agent_description: str | None = None
     suggested_prompts: list[str] = []
+    # Set instead of ``agent_id`` when the share token exposes a workforce.
+    workforce_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -61,9 +73,14 @@ class PublicChatAccessContext:
 
 @dataclass(frozen=True)
 class ShareChatAccessContext:
+    """Validated share-guest identity: exactly one of ``agent`` /
+    ``workforce`` is set, depending on which kind of share token the guest
+    presented. ``user`` is always the owner the shared entity runs as."""
+
     user: User
-    agent: Agent
     share_token: str
+    agent: Agent | None = None
+    workforce: Workforce | None = None
 
 
 def create_public_chat_access_token(data: dict[str, Any]) -> str:
@@ -97,6 +114,38 @@ def ensure_share_agent_available(
     ):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     return agent
+
+
+def ensure_share_workforce_available(
+    db: Session,
+    share_workforce_id: int,
+    user_id: int,
+    *,
+    expected_share_token: str | None = None,
+) -> Workforce:
+    """Resolve a share-guest workforce id to a live, shareable workforce.
+
+    Mirrors :func:`ensure_share_agent_available`: the share credential lives
+    in the workforce's ``deployments`` row, and external access requires the
+    workforce to still be published (``status == "active"``) — archiving or
+    unpublishing revokes every outstanding guest token.
+    """
+    workforce = db.query(Workforce).filter(Workforce.id == share_workforce_id).first()
+    deployment = get_deployment(db, DeploymentOwnerType.WORKFORCE, share_workforce_id)
+    if (
+        not workforce
+        or int(workforce.owner_user_id) != user_id
+        or workforce.status != "active"
+        or deployment is None
+        or not deployment.share_enabled
+        or not deployment.share_token
+        or (
+            expected_share_token is not None
+            and deployment.share_token != expected_share_token
+        )
+    ):
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    return workforce
 
 
 def get_public_chat_user(
@@ -165,14 +214,13 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         user_id = payload.get("user_id")
         auth_mode = payload.get("auth_mode")
         share_agent_id = payload.get("share_agent_id")
+        share_workforce_id = payload.get("share_workforce_id")
         share_token = payload.get("share_token")
 
         if auth_mode != "share":
             raise ValueError("Invalid token payload")
         if not isinstance(user_id, int):
             raise ValueError("Invalid token payload")
-        if not isinstance(share_agent_id, int):
-            raise ValueError("Invalid share token payload")
         if not isinstance(share_token, str) or not share_token:
             raise ValueError("Invalid share token payload")
 
@@ -180,13 +228,27 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         if not user:
             raise ValueError("User not found")
 
+        if isinstance(share_workforce_id, int):
+            workforce = ensure_share_workforce_available(
+                db,
+                share_workforce_id,
+                user_id,
+                expected_share_token=share_token,
+            )
+            return ShareChatAccessContext(
+                user=user, share_token=share_token, workforce=workforce
+            )
+
+        if not isinstance(share_agent_id, int):
+            raise ValueError("Invalid share token payload")
+
         agent = ensure_share_agent_available(
             db,
             share_agent_id,
             user_id,
             expected_share_token=share_token,
         )
-        return ShareChatAccessContext(user=user, agent=agent, share_token=share_token)
+        return ShareChatAccessContext(user=user, share_token=share_token, agent=agent)
     except Exception as exc:
         logger.error("Share chat token validation error: %s", exc)
         if isinstance(exc, HTTPException):
@@ -250,15 +312,22 @@ def get_task_for_public_context(
     return task
 
 
-def get_task_for_share_context(
+def _get_task_for_workforce_share_context(
     db: Session, task_id: int, access_context: ShareChatAccessContext
 ) -> Task:
+    workforce = access_context.workforce
+    # Callers today only reach here behind an `if workforce is not None`
+    # guard, but raise explicitly rather than assert: `python -O` strips
+    # asserts, and this is an auth boundary — a future unguarded caller must
+    # fail closed, not fall through with workforce=None.
+    if workforce is None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    workforce_id = int(workforce.id)
     task = (
         db.query(Task)
         .filter(
             Task.id == task_id,
             Task.user_id == access_context.user.id,
-            Task.agent_id == int(access_context.agent.id),
         )
         .first()
     )
@@ -270,9 +339,51 @@ def get_task_for_share_context(
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     if task.agent_config.get("auth_mode") != "share":
         raise HTTPException(status_code=403, detail="Share link is unavailable")
-    if int(task.agent_config.get("share_agent_id") or 0) != int(
-        access_context.agent.id
-    ):
+    if int(task.agent_config.get("share_workforce_id") or 0) != workforce_id:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    workforce_run_id = task.agent_config.get("workforce_run_id")
+    if not isinstance(workforce_run_id, int):
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    run = (
+        db.query(WorkforceRun)
+        .filter(
+            WorkforceRun.id == workforce_run_id,
+            WorkforceRun.task_id == int(task.id),
+            WorkforceRun.workforce_id == workforce_id,
+        )
+        .first()
+    )
+    if run is None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    return task
+
+
+def get_task_for_share_context(
+    db: Session, task_id: int, access_context: ShareChatAccessContext
+) -> Task:
+    if access_context.workforce is not None:
+        return _get_task_for_workforce_share_context(db, task_id, access_context)
+    agent = access_context.agent
+    if agent is None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    task = (
+        db.query(Task)
+        .filter(
+            Task.id == task_id,
+            Task.user_id == access_context.user.id,
+            Task.agent_id == int(agent.id),
+        )
+        .first()
+    )
+    if not task:
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
+    if task.channel_id is not None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    if not isinstance(task.agent_config, dict):
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    if task.agent_config.get("auth_mode") != "share":
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    if int(task.agent_config.get("share_agent_id") or 0) != int(agent.id):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     return task
 
@@ -340,7 +451,36 @@ async def upload_share_chat_files(
         raise HTTPException(status_code=422, detail="No files provided")
 
     if not task_id:
-        raise HTTPException(status_code=400, detail="task_id is required")
+        # A workforce share session starts its first turn inside task
+        # creation, so its opening-message attachments must be uploaded
+        # BEFORE any task exists and then threaded in as selected_file_ids.
+        # Allow that task-less upload only for workforce guests; the agent
+        # path still requires an existing task (files ride the first WS
+        # message), preserving its task_id-required contract.
+        if access_context.workforce is None:
+            raise HTTPException(status_code=400, detail="task_id is required")
+        # This branch is reachable by anyone holding the public share link
+        # before any task (hence any owner association) exists, so cap the
+        # per-request file count to blunt the worst abuse case cheaply.
+        # Owner storage quota + GC of orphaned (task_id IS NULL) rows are
+        # tracked as hardening in #973.
+        if len(upload_items) > MAX_TASKLESS_SHARE_UPLOAD_FILES:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "Too many files in one request "
+                    f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
+                ),
+            )
+        return await store_uploaded_files(
+            upload_items=upload_items,
+            task_type=task_type,
+            task_id=None,
+            folder=folder,
+            user=access_context.user,
+            db=db,
+            single_file_mode=file is not None and (not files),
+        )
 
     try:
         parsed_task_id = int(task_id)
@@ -435,6 +575,57 @@ async def create_public_chat_task(
     )
 
 
+async def _create_workforce_share_chat_task(
+    *,
+    request: TaskCreateRequest,
+    access_context: ShareChatAccessContext,
+    db: Session,
+) -> TaskCreateResponse:
+    """Guest task creation for a shared workforce.
+
+    Unlike the agent share path (which creates a bare PENDING task and lets
+    the first WS chat message start the turn), a workforce session must enter
+    through ``create_workforce_run``: it pins the config snapshot, creates the
+    ``WorkforceRun`` record, and begins the first turn with the guest's
+    message — so ``request.description`` doubles as the opening message.
+
+    Opening-message attachments are uploaded task-lessly by the client first
+    (there is no task yet), then passed here as ``request.files`` so the run
+    binds them to its task and the first turn actually sees them.
+    """
+    workforce = access_context.workforce
+    # Auth boundary: fail closed rather than assert (stripped under -O).
+    if workforce is None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+    if request.agent_id is not None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+
+    result = await create_workforce_run(
+        db,
+        access_context.user,
+        workforce,
+        message=request.description or "",
+        selected_file_ids=request.files,
+        source="shared_link",
+        is_visible=False,
+        extra_agent_config={
+            "auth_mode": "share",
+            "share_workforce_id": int(workforce.id),
+        },
+    )
+    task = result.task
+    return TaskCreateResponse(
+        task_id=task.id,
+        title=task.title,
+        status=task.status.value,
+        created_at=format_datetime_for_api(task.created_at)
+        if task.created_at
+        else None,
+        channel_id=task.channel_id,
+        channel_name=task.channel_name,
+    )
+
+
 async def create_share_chat_task(
     *,
     request: TaskCreateRequest,
@@ -442,6 +633,13 @@ async def create_share_chat_task(
     db: Session,
     default_channel_name: str,
 ) -> TaskCreateResponse:
+    if access_context.workforce is not None:
+        return await _create_workforce_share_chat_task(
+            request=request, access_context=access_context, db=db
+        )
+    if access_context.agent is None:
+        raise HTTPException(status_code=403, detail="Share link is unavailable")
+
     task_description = request.description or ""
 
     agent_id = request.agent_id

@@ -20,6 +20,7 @@ import type {
   WorkforceRunHistoryResponse,
   WorkforceRunPayload,
   WorkforceRunResponse,
+  WorkforceShareLink,
   WorkforceUpdatePayload,
   WorkforceWorker,
   WorkforceWorkerPayload,
@@ -349,6 +350,52 @@ export async function listAgentOptions(): Promise<WorkforceAgentOption[]> {
   const response = await apiRequest(`${getApiUrl()}/api/workforces/agent-options`)
   if (!response.ok) {
     throw await parseApiError(response, "Failed to load agents")
+  }
+  return response.json()
+}
+
+export async function getWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce share link")
+  }
+  return response.json()
+}
+
+export async function enableWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to enable workforce share link")
+  }
+  return response.json()
+}
+
+export async function rotateWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link/rotate`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to rotate workforce share link")
+  }
+  return response.json()
+}
+
+export async function disableWorkforceShareLink(
+  workforceId: number | string,
+): Promise<WorkforceShareLink> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/share-link`, {
+    method: "DELETE",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to disable workforce share link")
   }
   return response.json()
 }
