@@ -26,6 +26,7 @@ from ...models.task import Task, TaskStatus
 from ...models.uploaded_file import UploadedFile
 from ...models.user import User
 from ...services.chat_history_service import persist_user_message
+from ...services.db_runtime import drain_async_task_cancellation_safe
 from ...services.execution_result_projection import project_execution_result_for_channel
 from ...services.file_turn import (
     append_uploaded_files_context,
@@ -862,6 +863,7 @@ class TelegramBotInstance:
                         db.commit()
                         return
 
+                    assert managed_lease is not None
                     with UserContext(int(user.id)):  # type: ignore
                         result = await self._await_execution_with_stop_monitor(
                             user_id,
@@ -873,6 +875,7 @@ class TelegramBotInstance:
                                 tracking_task_id=str(task.id),
                                 db_session=db,
                                 manage_task_lease=False,
+                                task_lease=managed_lease.lease,
                             ),
                             reason="Telegram stop requested",
                         )
@@ -1009,12 +1012,21 @@ class TelegramBotInstance:
                     "Sorry, an error occurred while processing your request."
                 )
         finally:
-            if voice_asr_model is not None:
-                await self._close_voice_asr_model(voice_asr_model)
-            if managed_lease is not None:
-                await managed_lease.close()
-            self.user_preparing_executions.discard(user_id)
-            self._clear_user_stop_request(user_id)
+
+            async def _cleanup_message_batch() -> None:
+                try:
+                    if managed_lease is not None:
+                        await managed_lease.close()
+                finally:
+                    try:
+                        if voice_asr_model is not None:
+                            await self._close_voice_asr_model(voice_asr_model)
+                    finally:
+                        self.user_preparing_executions.discard(user_id)
+                        self._clear_user_stop_request(user_id)
+
+            cleanup_task = asyncio.create_task(_cleanup_message_batch())
+            await drain_async_task_cancellation_safe(cleanup_task)
 
     async def _send_output_images(
         self,

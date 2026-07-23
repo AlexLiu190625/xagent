@@ -5,10 +5,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.memory.in_memory import InMemoryMemoryStore
+from xagent.web import dynamic_memory_store as dynamic_memory_store_module
+from xagent.web.api import chat as chat_api
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.chat import AgentServiceManager, resolve_agent_service_memory_policy
 from xagent.web.api.websocket import (
@@ -16,6 +20,7 @@ from xagent.web.api.websocket import (
     _normalize_file_outputs,
     handle_build_preview_execution,
 )
+from xagent.web.dynamic_memory_store import DynamicMemoryStoreManager
 from xagent.web.models.database import Base
 from xagent.web.models.task import Task
 from xagent.web.models.uploaded_file import UploadedFile
@@ -303,6 +308,59 @@ def test_inline_preview_agent_config_uses_in_memory_disabled_policy():
 
     assert isinstance(policy.memory, InMemoryMemoryStore)
     assert policy.memory_enabled is False
+
+
+@pytest.mark.asyncio
+async def test_memory_policy_pool_timeout_does_not_block_loop_or_fallback(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """A real QueuePool wait must run off-loop and remain a visible failure."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'memory-policy-timeout.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.05,
+    )
+    session_factory = sessionmaker(bind=engine)
+
+    def get_test_db():
+        db = session_factory()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    monkeypatch.setattr(dynamic_memory_store_module, "get_db", get_test_db)
+    memory_manager = DynamicMemoryStoreManager()
+    monkeypatch.setattr(chat_api, "get_memory_store", memory_manager.get_memory_store)
+
+    held_connection = engine.connect()
+    stop_ticker = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not stop_ticker.is_set():
+            ticks += 1
+            await asyncio.sleep(0.005)
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        with pytest.raises(SQLAlchemyTimeoutError):
+            await chat_api.resolve_agent_service_memory_policy_async(
+                agent_config={},
+            )
+    finally:
+        stop_ticker.set()
+        await ticker_task
+        held_connection.close()
+        engine.dispose()
+
+    assert ticks >= 3
 
 
 def test_normalize_file_outputs_rolls_back_when_durable_storage_fails(

@@ -10,6 +10,7 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
 from xagent.web.services.db_runtime import (
     await_task_settlement,
+    drain_async_task_cancellation_safe,
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
 )
@@ -112,6 +113,81 @@ async def test_await_task_settlement_returns_late_result_and_cancellation() -> N
 
     assert result == "settled"
     assert isinstance(cancellation, asyncio.CancelledError)
+
+
+@pytest.mark.asyncio
+async def test_drain_async_task_propagates_cancellation_after_child_settles() -> None:
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def operation() -> str:
+        await release.wait()
+        finished.set()
+        return "settled"
+
+    child = asyncio.create_task(operation())
+    waiter = asyncio.create_task(drain_async_task_cancellation_safe(child))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1)
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_drain_async_task_preserves_late_child_error_as_cancellation_cause() -> (
+    None
+):
+    release = asyncio.Event()
+    child_error = RuntimeError("cleanup failed after caller cancellation")
+
+    async def operation() -> None:
+        await release.wait()
+        raise child_error
+
+    child = asyncio.create_task(operation())
+    waiter = asyncio.create_task(drain_async_task_cancellation_safe(child))
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await asyncio.wait_for(waiter, timeout=1)
+
+    assert exc_info.value.__cause__ is child_error
+
+
+@pytest.mark.asyncio
+async def test_drain_async_task_drains_after_repeated_cancellation() -> None:
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def operation() -> None:
+        await release.wait()
+        finished.set()
+
+    child = asyncio.create_task(operation())
+    waiter = asyncio.create_task(drain_async_task_cancellation_safe(child))
+    await asyncio.sleep(0)
+
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    waiter.cancel()
+    await asyncio.sleep(0)
+    assert not waiter.done()
+
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(waiter, timeout=1)
+    assert finished.is_set()
 
 
 def test_pool_timeout_classifier_walks_exception_chain() -> None:

@@ -318,7 +318,11 @@ class FeishuBotInstance:
                         task.description = text  # type: ignore
                         if not task.title:
                             task.title = text if len(text) <= 50 else f"{text[:50]}..."  # type: ignore
-                        db.commit()
+                    # File registration stages UploadedFile writes on this
+                    # channel-owned Session. Settle them before handing the
+                    # Session to the worker-owned runtime boundary; execution
+                    # must never commit or roll back a transport's pending work.
+                    db.commit()
 
                     context["state"] = context.get("state", {})
                     context["state"]["file_info"] = uploaded_info
@@ -338,6 +342,7 @@ class FeishuBotInstance:
 
             actual_task_id = str(task.id)
 
+            assert managed_lease is not None
             with UserContext(int(user.id)):
                 result = await agent_manager.execute_task(
                     agent_service=agent_service,
@@ -347,6 +352,7 @@ class FeishuBotInstance:
                     tracking_task_id=str(task.id),
                     db_session=db,
                     manage_task_lease=False,
+                    task_lease=managed_lease.lease,
                 )
 
             projection = project_execution_result_for_channel(result)

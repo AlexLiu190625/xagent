@@ -25,13 +25,11 @@ _run_gate_hook: Callable[[Any, Any], str | Mapping[str, Any] | None] | None = No
 # calls (one billable action per tool invocation).
 #
 # TRANSACTION CONTRACT: the hook is invoked from TaskTracker.complete_tracking
-# BEFORE that method commits the token-usage row on the SAME `db` session, and
-# a later commit failure there rolls the session back. The hook therefore MUST
-# manage its own durability — either persist through an independent
-# session/transaction, or accumulate in a store that doesn't depend on this
-# session's commit. It must NOT leave writes pending on `db` expecting the
-# caller to commit them (they may be rolled back), and must NOT commit `db`
-# itself (that would prematurely persist the caller's unrelated pending state).
+# only after the run/runner-fenced token-usage update commits. The hook owns
+# separate durability — either persist through an independent
+# session/transaction, or accumulate in a store that doesn't depend on the
+# compatibility `db` session. It must NOT leave writes pending on `db`
+# expecting the caller to commit them, and must NOT commit `db` itself.
 _usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
 # (db, user_id, delta_details, delta_actions) -> reason str if counting this
 # in-flight run's live-so-far usage would push the team over a run-gated quota,

@@ -69,3 +69,11 @@ async def run_db_io_cancellation_safe(operation: Callable[[], _T]) -> _T:
     if cancellation is not None:
         raise cancellation
     return result
+
+
+async def drain_async_task_cancellation_safe(task: asyncio.Task[_T]) -> _T:
+    """Drain an owned asynchronous task before propagating cancellation."""
+    result, cancellation = await await_task_settlement(task)
+    if cancellation is not None:
+        raise cancellation
+    return result

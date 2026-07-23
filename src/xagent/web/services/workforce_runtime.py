@@ -465,6 +465,18 @@ def _sync_workforce_run_status_for_task_id(
     return changed
 
 
+def sync_workforce_run_status_for_task_id_isolated(
+    task_id: int,
+    status: TaskStatus,
+) -> bool:
+    """Project a task status using a worker-owned short Session."""
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        return _sync_workforce_run_status_for_task_id(db, task_id, status)
+
+
 def release_task_lease_with_workforce_sync(
     db: Session,
     lease: TaskLease | None,
