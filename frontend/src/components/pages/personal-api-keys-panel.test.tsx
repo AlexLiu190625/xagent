@@ -78,7 +78,7 @@ function PersonalKeysTabsHarness() {
       </TabsList>
       <TabsContent value="agent">agent-panel</TabsContent>
       <TabsContent value="personal" forceMount>
-        <PersonalApiKeysPanel />
+        <PersonalApiKeysPanel active={tab === "personal"} />
       </TabsContent>
     </Tabs>
   )
@@ -126,10 +126,25 @@ describe("PersonalApiKeysPanel", () => {
 
   afterEach(cleanup)
 
+  it("loads only after the Personal tab is first activated", async () => {
+    listPersonalApiKeysMock.mockResolvedValue(listResponse(false))
+
+    const { rerender } = render(<PersonalApiKeysPanel active={false} />)
+
+    expect(listPersonalApiKeysMock).not.toHaveBeenCalled()
+
+    rerender(<PersonalApiKeysPanel active />)
+    await waitFor(() => expect(listPersonalApiKeysMock).toHaveBeenCalledOnce())
+
+    rerender(<PersonalApiKeysPanel active={false} />)
+    rerender(<PersonalApiKeysPanel active />)
+    expect(listPersonalApiKeysMock).toHaveBeenCalledOnce()
+  })
+
   it("renders a self-only list without owner controls", async () => {
     listPersonalApiKeysMock.mockResolvedValue(listResponse(false))
 
-    render(<PersonalApiKeysPanel />)
+    render(<PersonalApiKeysPanel active />)
 
     expect(await screen.findByText("xag_personal_self123_••••••••")).toBeInTheDocument()
     expect(screen.queryByText("bob")).not.toBeInTheDocument()
@@ -141,7 +156,7 @@ describe("PersonalApiKeysPanel", () => {
   it("renders owner data and the self-only creation copy for managed scopes", async () => {
     listPersonalApiKeysMock.mockResolvedValue(listResponse(true))
 
-    render(<PersonalApiKeysPanel />)
+    render(<PersonalApiKeysPanel active />)
 
     expect(await screen.findByText("bob")).toBeInTheDocument()
     expect(screen.getByText("Owner")).toBeInTheDocument()
@@ -158,7 +173,7 @@ describe("PersonalApiKeysPanel", () => {
       expires_at: null,
     })
 
-    render(<PersonalApiKeysPanel />)
+    render(<PersonalApiKeysPanel active />)
 
     await screen.findByText("xag_personal_self123_••••••••")
     expect(screen.queryByText("xag_personal_created_secret")).not.toBeInTheDocument()
@@ -174,7 +189,7 @@ describe("PersonalApiKeysPanel", () => {
   it("names another owner in the revoke confirmation", async () => {
     listPersonalApiKeysMock.mockResolvedValue(listResponse(true))
 
-    render(<PersonalApiKeysPanel />)
+    render(<PersonalApiKeysPanel active />)
 
     await screen.findByText("bob")
     fireEvent.click(screen.getAllByRole("button", { name: "Revoke" })[1])
@@ -215,7 +230,7 @@ describe("PersonalApiKeysPanel", () => {
       expires_at: null,
     })
 
-    render(<PersonalApiKeysPanel />)
+    render(<PersonalApiKeysPanel active />)
 
     fireEvent.click(screen.getByRole("button", { name: "Create Personal Key" }))
     expect(await screen.findByText("xag_personal_new789_••••••••")).toBeInTheDocument()
@@ -240,7 +255,7 @@ describe("PersonalApiKeysPanel", () => {
     })
     listPersonalApiKeysMock.mockResolvedValue(response)
 
-    render(<PersonalApiKeysPanel />)
+    render(<PersonalApiKeysPanel active />)
 
     const revokedRow = (await screen.findByText("xag_personal_revoked_••••••••")).closest("tr")
     expect(revokedRow).not.toBeNull()
@@ -275,7 +290,7 @@ describe("PersonalApiKeysPanel", () => {
     )
     listPersonalApiKeysMock.mockResolvedValue(response)
 
-    render(<PersonalApiKeysPanel />)
+    render(<PersonalApiKeysPanel active />)
 
     const activeRow = (await screen.findByText("xag_personal_self123_••••••••")).closest("tr")
     const expiredRow = screen.getByText("xag_personal_expired_••••••••").closest("tr")

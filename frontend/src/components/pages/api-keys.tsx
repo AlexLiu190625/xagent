@@ -584,7 +584,7 @@ export function ApiKeysPage() {
       />
         </TabsContent>
         <TabsContent value="personal" className="mt-0 flex-col data-[state=inactive]:hidden" forceMount>
-          <PersonalApiKeysPanel />
+          <PersonalApiKeysPanel active={activeTab === "personal"} />
         </TabsContent>
       </Tabs>
     </div>

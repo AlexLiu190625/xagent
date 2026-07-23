@@ -95,9 +95,15 @@ def test_list_derives_active_expired_and_revoked_status_with_revocation_preceden
     assert items_by_id[active["id"]]["status"] == "active"
     assert items_by_id[expired["id"]]["status"] == "expired"
     assert items_by_id[revoked_and_expired["id"]]["status"] == "revoked"
+    assert datetime.fromisoformat(
+        items_by_id[active["id"]]["created_at"]
+    ).utcoffset() == (timedelta(0))
     assert datetime.fromisoformat(items_by_id[expired["id"]]["expires_at"]) == (
-        expired_at
+        expired_at.replace(tzinfo=timezone.utc)
     )
+    assert datetime.fromisoformat(
+        items_by_id[revoked_and_expired["id"]]["revoked_at"]
+    ) == (revoked_at.replace(tzinfo=timezone.utc))
 
 
 def test_default_scope_returns_404_for_another_owners_key():

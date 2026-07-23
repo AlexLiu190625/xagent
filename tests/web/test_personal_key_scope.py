@@ -80,3 +80,27 @@ def test_malformed_hook_scope_fails_closed(owner_user_ids, can_manage_others):
     assert scope == PersonalKeyAccessScope(
         owner_user_ids=(17,), can_manage_others=False
     )
+
+
+@pytest.mark.parametrize("error_type", [AttributeError, TypeError, ValueError])
+def test_hook_contract_errors_fail_closed_to_the_actor(error_type):
+    def _raise_contract_error(_db, _actor):
+        raise error_type("invalid scope contract")
+
+    set_personal_key_scope_hook(_raise_contract_error)
+
+    scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
+
+    assert scope == PersonalKeyAccessScope(
+        owner_user_ids=(17,), can_manage_others=False
+    )
+
+
+def test_unexpected_hook_errors_remain_explicit():
+    def _raise_policy_outage(_db, _actor):
+        raise RuntimeError("policy backend unavailable")
+
+    set_personal_key_scope_hook(_raise_policy_outage)
+
+    with pytest.raises(RuntimeError, match="policy backend unavailable"):
+        get_personal_key_access_scope(None, SimpleNamespace(id=17))

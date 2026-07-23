@@ -37,7 +37,11 @@ function statusPillClass(status: PersonalApiKeyListItem["status"]): string {
   }
 }
 
-export function PersonalApiKeysPanel() {
+export interface PersonalApiKeysPanelProps {
+  active: boolean
+}
+
+export function PersonalApiKeysPanel({ active }: PersonalApiKeysPanelProps) {
   const { t } = useI18n()
   const [keys, setKeys] = useState<PersonalApiKeyListItem[]>([])
   const [canManageOthers, setCanManageOthers] = useState(false)
@@ -49,6 +53,7 @@ export function PersonalApiKeysPanel() {
   const [revoking, setRevoking] = useState(false)
   const [searchQuery, setSearchQuery] = useState("")
   const listGeneration = useRef(0)
+  const hasActivated = useRef(false)
 
   const loadKeys = useCallback(async () => {
     const generation = ++listGeneration.current
@@ -68,8 +73,10 @@ export function PersonalApiKeysPanel() {
   }, [t])
 
   useEffect(() => {
+    if (!active || hasActivated.current) return
+    hasActivated.current = true
     loadKeys()
-  }, [loadKeys])
+  }, [active, loadKeys])
 
   const handleCreate = async () => {
     setCreating(true)

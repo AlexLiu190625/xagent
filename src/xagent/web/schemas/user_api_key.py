@@ -3,10 +3,26 @@
 from datetime import datetime
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from ..utils.db_timezone import normalize_datetime_from_db
 
 
-class PersonalAPIKeyCreateResponse(BaseModel):
+class _PersonalAPIKeyTimestampResponse(BaseModel):
+    @field_validator(
+        "created_at",
+        "expires_at",
+        "revoked_at",
+        check_fields=False,
+    )
+    @classmethod
+    def _normalize_api_timestamp(cls, value: Optional[datetime]) -> Optional[datetime]:
+        if value is None:
+            return None
+        return normalize_datetime_from_db(value)
+
+
+class PersonalAPIKeyCreateResponse(_PersonalAPIKeyTimestampResponse):
     id: int
     full_key: str = Field(
         ...,
@@ -20,7 +36,7 @@ class PersonalAPIKeyCreateResponse(BaseModel):
     expires_at: Optional[datetime] = None
 
 
-class PersonalAPIKeyMetadata(BaseModel):
+class PersonalAPIKeyMetadata(_PersonalAPIKeyTimestampResponse):
     id: int
     key_prefix: str
     masked_key: str
@@ -29,7 +45,7 @@ class PersonalAPIKeyMetadata(BaseModel):
     created_at: datetime
 
 
-class PersonalAPIKeyRevokeResponse(BaseModel):
+class PersonalAPIKeyRevokeResponse(_PersonalAPIKeyTimestampResponse):
     revoked: bool
     revoked_at: Optional[datetime] = None
 
