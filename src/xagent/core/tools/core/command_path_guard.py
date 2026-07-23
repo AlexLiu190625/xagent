@@ -220,6 +220,17 @@ class _ScriptCommandGrammar:
     expression_long_option: str
     value_options: frozenset[str] = frozenset()
     ignores_assignment_arguments: bool = False
+    short_flag_options: frozenset[str] = frozenset()
+    short_value_options: frozenset[str] = frozenset()
+    in_place_short_option: str | None = None
+    in_place_long_option: str | None = None
+
+
+@dataclass(frozen=True)
+class _ScriptShortOptionResult:
+    next_index: int
+    explicit_script: bool = False
+    requests_in_place: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,6 +249,11 @@ class _CommandWrapperGrammar:
 _SED_GRAMMAR = _ScriptCommandGrammar(
     language="sed",
     expression_long_option="--expression",
+    value_options=frozenset({"-l", "--line-length"}),
+    short_flag_options=frozenset({"E", "n", "r", "s", "u", "z"}),
+    short_value_options=frozenset({"l"}),
+    in_place_short_option="i",
+    in_place_long_option="--in-place",
 )
 _AWK_GRAMMAR = _ScriptCommandGrammar(
     language="awk",
@@ -482,16 +498,9 @@ class WorkspaceCommandPathGuard:
         elif command_name == "grep":
             self._check_grep(args, state.cwd)
         elif command_name == "sed":
-            self._check_script_command(
-                _SED_GRAMMAR,
-                args,
-                state.cwd,
-                file_access="write" if self._sed_requests_in_place(args) else "read",
-            )
+            self._check_script_command(_SED_GRAMMAR, args, state.cwd)
         elif command_name == "awk":
-            self._check_script_command(
-                _AWK_GRAMMAR, args, state.cwd, file_access="read"
-            )
+            self._check_script_command(_AWK_GRAMMAR, args, state.cwd)
         elif command_name == "base64":
             self._check_base64(args, state.cwd)
         elif command_name == "dd":
@@ -1017,11 +1026,10 @@ class WorkspaceCommandPathGuard:
         grammar: _ScriptCommandGrammar,
         values: Sequence[str],
         cwd: Path,
-        *,
-        file_access: PathAccess,
     ) -> None:
         positionals: list[str] = []
         explicit_script = False
+        file_access: PathAccess = "read"
         index = 0
         while index < len(values):
             value = values[index]
@@ -1062,6 +1070,30 @@ class WorkspaceCommandPathGuard:
                 self._reject_embedded_io(grammar.language, script)
                 index += 1
                 continue
+            if grammar.in_place_long_option is not None and (
+                value == grammar.in_place_long_option
+                or value.startswith(f"{grammar.in_place_long_option}=")
+            ):
+                file_access = "write"
+                index += 1
+                continue
+            if (
+                grammar.short_flag_options
+                and value.startswith("-")
+                and not value.startswith("--")
+                and value != "-"
+            ):
+                option_result = self._consume_script_short_options(
+                    grammar,
+                    values,
+                    index,
+                    cwd,
+                )
+                explicit_script = explicit_script or option_result.explicit_script
+                if option_result.requests_in_place:
+                    file_access = "write"
+                index = option_result.next_index
+                continue
             if value in grammar.value_options:
                 index += 2
                 continue
@@ -1078,12 +1110,59 @@ class WorkspaceCommandPathGuard:
         for raw_path in file_operands:
             self._check_path(raw_path, cwd, file_access)
 
-    @staticmethod
-    def _sed_requests_in_place(values: Sequence[str]) -> bool:
-        return any(
-            value == "-i" or value.startswith("-i") or value.startswith("--in-place")
-            for value in values
-        )
+    def _consume_script_short_options(
+        self,
+        grammar: _ScriptCommandGrammar,
+        values: Sequence[str],
+        index: int,
+        cwd: Path,
+    ) -> _ScriptShortOptionResult:
+        token = values[index]
+        if isinstance(token, _CommandValue) and not token.is_static:
+            raise CommandPolicyViolation(
+                f"cannot inspect dynamic {grammar.language} options"
+            )
+
+        cursor = 1
+        while cursor < len(token):
+            option = token[cursor]
+            if option in grammar.short_flag_options:
+                cursor += 1
+                continue
+            if option == grammar.in_place_short_option:
+                # GNU sed treats the remainder of this token as the optional
+                # backup suffix, so no later character is another option.
+                return _ScriptShortOptionResult(
+                    next_index=index + 1,
+                    requests_in_place=True,
+                )
+            if option in {"e", "f"} or option in grammar.short_value_options:
+                attached_argument = token[cursor + 1 :]
+                argument: str
+                if attached_argument:
+                    argument = self._derived_value(token, attached_argument)
+                    next_index = index + 1
+                elif index + 1 < len(values):
+                    argument = values[index + 1]
+                    next_index = index + 2
+                else:
+                    raise CommandPolicyViolation(
+                        f"missing {grammar.language} argument for -{option}"
+                    )
+
+                if option == "e":
+                    self._reject_embedded_io(grammar.language, argument)
+                elif option == "f":
+                    self._inspect_script_file(grammar.language, argument, cwd)
+                return _ScriptShortOptionResult(
+                    next_index=next_index,
+                    explicit_script=option in {"e", "f"},
+                )
+            raise CommandPolicyViolation(
+                f"cannot safely inspect {grammar.language} option -{option}"
+            )
+
+        return _ScriptShortOptionResult(next_index=index + 1)
 
     def _check_base64(self, values: Sequence[str], cwd: Path) -> None:
         self._reject_dynamic_values("base64 arguments", values)

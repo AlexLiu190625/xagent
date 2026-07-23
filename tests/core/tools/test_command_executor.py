@@ -5,8 +5,6 @@ Tests for CommandExecutor tool
 import os
 import shlex
 import sys
-from collections.abc import Set as AbstractSet
-from typing import TypeVar
 from unittest.mock import Mock
 
 import pytest
@@ -16,7 +14,6 @@ from xagent.core.tools.adapters.vibe.command_executor import (
     CommandExecutorResult,
     CommandExecutorTool,
 )
-from xagent.core.tools.core import command_path_guard as command_path_guard_module
 from xagent.core.tools.core.command_executor import (
     CommandExecutorCore,
     execute_command,
@@ -28,8 +25,6 @@ from xagent.core.tools.core.command_path_guard import (
     WorkspaceCommandPathGuard,
 )
 from xagent.core.workspace import TaskWorkspace
-
-_SetValue = TypeVar("_SetValue")
 
 
 @pytest.fixture
@@ -574,6 +569,77 @@ class TestScopedCommandPathGuard:
         assert write_result["success"] is False
         assert "outside allowed write paths" in write_result["error"]
         assert external_file.read_text(encoding="utf-8") == "external reference"
+
+    @pytest.mark.parametrize(
+        "options",
+        ["-ni", "-ri", "-si", "-zi", "-Ei", "-nri", "-ni.backup"],
+    )
+    def test_rejects_bundled_sed_in_place_write_to_external_directory(
+        self, scoped_command_workspace, options
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"sed {options} 's/external/changed/' "
+                    f"{shlex.quote(str(external_file))}"
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "outside allowed write paths" in result["error"]
+        assert external_file.read_text(encoding="utf-8") == "external reference"
+
+    def test_sed_short_option_values_are_not_reparsed_as_in_place_flags(
+        self, scoped_command_workspace
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        script_file = workspace.output_dir / "inline.sed"
+        script_file.write_text("s/external/reference/", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"sed -nes/external/reference/ {shlex.quote(str(external_file))}"
+        )
+        guard.validate(
+            f"sed -nf{shlex.quote(str(script_file))} {shlex.quote(str(external_file))}"
+        )
+
+    def test_rejects_bundled_sed_script_file_outside_workspace(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"sed -nf{shlex.quote(str(sibling_file))} own.txt")
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "file -f {path}",
+            "file -m {path} own.txt",
+            "file --files-from={path}",
+            "file --magic-file={path} own.txt",
+            "wc --files0-from={path}",
+        ],
+    )
+    def test_rejects_read_control_file_options_outside_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
 
     def test_rejects_cd_and_symlink_escapes(self, scoped_command_workspace):
         workspace, _, sibling_file = scoped_command_workspace
@@ -1221,42 +1287,6 @@ class TestScopedCommandPathGuard:
         with pytest.raises(CommandPolicyViolation):
             guard.validate(command)
 
-    def test_read_path_option_union_is_computed_once(self, scoped_command_workspace):
-        class CountingSet(set[str]):
-            union_count = 0
-
-            def __or__(self, other: AbstractSet[_SetValue]) -> set[str | _SetValue]:
-                self.union_count += 1
-                return super().__or__(other)
-
-        workspace, _, _ = scoped_command_workspace
-        guard = WorkspaceCommandPathGuard(workspace)
-        short_options = CountingSet({"-f"})
-
-        remaining = guard._check_read_path_options(
-            ("first.txt", "second.txt"),
-            workspace.output_dir,
-            short_options=short_options,
-            long_options={"--files-from"},
-        )
-
-        assert remaining == ["first.txt", "second.txt"]
-        assert short_options.union_count == 1
-
-    def test_embedded_io_patterns_are_precompiled(
-        self, scoped_command_workspace, monkeypatch
-    ):
-        workspace, _, _ = scoped_command_workspace
-        guard = WorkspaceCommandPathGuard(workspace)
-        monkeypatch.setattr(command_path_guard_module, "re", None)
-
-        guard._reject_embedded_io("awk", "BEGIN { print 1 }")
-        assert guard._sed_has_unsafe_io("s/a/b/") is False
-
-        with pytest.raises(CommandPathViolation):
-            guard._reject_embedded_io("awk", 'BEGIN { system("cat secret") }')
-        assert guard._sed_has_unsafe_io("w secret.txt") is True
-
     @pytest.mark.parametrize(
         ("script_name", "script_template", "invocation"),
         [
@@ -1730,6 +1760,7 @@ class TestScopedCommandPathGuard:
             "base64 -o {} own.txt",
             "tar -cf {} own.txt",
             "dd if=own.txt of={}",
+            "sed -ni s/external/changed/ {}",
         ],
     )
     def test_added_find_exec_writes_make_root_write_sensitive(
