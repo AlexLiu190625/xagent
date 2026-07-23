@@ -229,24 +229,6 @@ class _ToolFactoryRuntimeLoadPlan:
     load_audio: bool
     published_agent_policy: Any | None
 
-    @property
-    def requires_direct_db_without_policy(self) -> bool:
-        return any(
-            (
-                self.load_basic,
-                self.load_sql,
-                self.load_custom_api,
-                self.load_vision,
-                self.load_image,
-                self.load_video,
-                self.load_audio,
-                (
-                    self.published_agent_policy is not None
-                    and self.published_agent_policy.query_required
-                ),
-            )
-        )
-
 
 @dataclass(frozen=True)
 class _ToolRuntimePolicySnapshot:
