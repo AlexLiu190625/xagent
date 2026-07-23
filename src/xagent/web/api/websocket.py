@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union, cast
 from urllib.parse import unquote
 
+from anyio import BrokenResourceError, ClosedResourceError
 from fastapi import (
     APIRouter,
     Depends,
@@ -115,6 +116,7 @@ from ..services.task_lease_service import (
 )
 from ..services.uploaded_file_store import UploadedFileStore
 from ..services.workforce_runtime import (
+    is_workforce_task,
     mark_workforce_task_status,
     release_current_runner_task_lease_with_workforce_sync,
     release_task_lease_with_workforce_sync,
@@ -2839,6 +2841,8 @@ class ConnectionManager:
     def __init__(self) -> None:
         # task_id -> List[WebSocket]
         self.active_connections: Dict[int, List[WebSocket]] = {}
+        # WebSocket -> current task_id
+        self._connection_task_ids: Dict[WebSocket, int] = {}
 
     async def connect(self, websocket: WebSocket, task_id: int) -> None:
         await websocket.accept()
@@ -2846,12 +2850,16 @@ class ConnectionManager:
 
     def register_connection(self, websocket: WebSocket, task_id: int) -> None:
         """Register an already-accepted websocket for task broadcasts."""
+        current_task_id = self._connection_task_ids.get(websocket)
+        if current_task_id is not None and current_task_id != task_id:
+            self._remove_from_task(websocket, current_task_id)
         if task_id not in self.active_connections:
             self.active_connections[task_id] = []
         if websocket not in self.active_connections[task_id]:
             self.active_connections[task_id].append(websocket)
+        self._connection_task_ids[websocket] = task_id
 
-    def disconnect(self, websocket: WebSocket, task_id: int) -> None:
+    def _remove_from_task(self, websocket: WebSocket, task_id: int) -> None:
         if task_id in self.active_connections:
             try:
                 self.active_connections[task_id].remove(websocket)
@@ -2860,21 +2868,31 @@ class ConnectionManager:
             except ValueError:
                 pass
 
-    def move_connection(
-        self, websocket: WebSocket, old_task_id: int, new_task_id: int
-    ) -> None:
-        """Move a WebSocket connection from one task_id to another"""
-        if old_task_id in self.active_connections:
-            try:
-                self.active_connections[old_task_id].remove(websocket)
-                if not self.active_connections[old_task_id]:
-                    del self.active_connections[old_task_id]
-            except ValueError:
-                pass
+    def disconnect(self, websocket: WebSocket) -> None:
+        task_id = self._connection_task_ids.pop(websocket, None)
+        if task_id is not None:
+            self._remove_from_task(websocket, task_id)
 
-        if new_task_id not in self.active_connections:
-            self.active_connections[new_task_id] = []
-        self.active_connections[new_task_id].append(websocket)
+    def detach_task_connections(self, task_id: int) -> List[WebSocket]:
+        """Remove and return every connection currently owned by a task."""
+        connections = self.active_connections.pop(task_id, [])
+        for connection in connections:
+            if self._connection_task_ids.get(connection) == task_id:
+                del self._connection_task_ids[connection]
+        return connections
+
+    def connections_for_task(self, task_id: int) -> List[WebSocket]:
+        """Return a stable snapshot of a task's current connections."""
+        return self.active_connections.get(task_id, []).copy()
+
+    def is_connection_registered(self, websocket: WebSocket, task_id: int) -> bool:
+        """Return whether a connection is still owned by the given task."""
+        return self._connection_task_ids.get(websocket) == task_id
+
+    def move_connection(self, websocket: WebSocket, new_task_id: int) -> None:
+        """Move a WebSocket connection from one task_id to another"""
+        old_task_id = self._connection_task_ids.get(websocket)
+        self.register_connection(websocket, new_task_id)
         logger.info(
             f"Moved WebSocket connection from task {old_task_id} to {new_task_id}"
         )
@@ -2884,25 +2902,33 @@ class ConnectionManager:
         await websocket.send_text(json.dumps(versioned_message))
 
     async def broadcast_to_task(self, message: dict, task_id: int) -> None:
-        if task_id in self.active_connections:
+        if self.connections_for_task(task_id):
             versioned_message = await _with_current_task_control_state(
                 message,
                 fallback_task_id=task_id,
             )
-            for connection in self.active_connections[task_id].copy():
+            for connection in self.connections_for_task(task_id):
+                if not self.is_connection_registered(connection, task_id):
+                    continue
                 try:
                     await connection.send_text(json.dumps(versioned_message))
-                except (ConnectionError, WebSocketDisconnect, RuntimeError) as e:
+                except (
+                    BrokenResourceError,
+                    ClosedResourceError,
+                    ConnectionError,
+                    WebSocketDisconnect,
+                    RuntimeError,
+                ) as e:
                     # Network connection error, remove disconnected connection
                     logger.warning(f"Connection error for task {task_id}: {e}")
-                    self.disconnect(connection, task_id)
+                    self.disconnect(connection)
                 except Exception as e:
                     # Other errors should not be silently handled, log and re-raise
                     logger.error(
                         f"Unexpected error broadcasting to task {task_id}: {e}"
                     )
                     # Remove disconnected connection but preserve error propagation
-                    self.disconnect(connection, task_id)
+                    self.disconnect(connection)
                     raise
 
 
@@ -3423,7 +3449,7 @@ async def _handle_chat_message_unserialized(
                         )
 
                         # Move WebSocket connection to new task_id
-                        manager.move_connection(websocket, old_task_id, task_id)
+                        manager.move_connection(websocket, task_id)
 
                         # Send task ID update event to notify frontend
                         await manager.send_personal_message(
@@ -4173,6 +4199,30 @@ async def _handle_chat_message_unserialized(
                             context=context,
                         )
                         logger.info(f"Task {task_id} started in background")
+                        # ``begin_turn`` flips the Task to RUNNING but does
+                        # not project that onto the WorkforceRun; without an
+                        # explicit sync a multi-turn APPEND leaves the run
+                        # stuck on its previous terminal status in runs
+                        # history. This is a best-effort projection, not a
+                        # guaranteed-fresh read: begin_turn commits in its own
+                        # DB session, so this ``db.refresh`` may not observe
+                        # that commit yet and the sync can no-op on a stale
+                        # terminal status. That is acceptable — terminal
+                        # statuses re-sync on completion, so a stale/failed
+                        # projection here only delays the "running" flip and
+                        # is non-fatal.
+                        if is_workforce_task(task):
+                            try:
+                                db.refresh(task)
+                                if sync_workforce_run_status(db, task, task.status):
+                                    db.commit()
+                            except Exception:
+                                logger.warning(
+                                    "Failed to sync workforce run status after "
+                                    "WS turn for task %s",
+                                    task_id,
+                                    exc_info=True,
+                                )
                         await finish_delivery(True)
                     except TaskTurnNotFoundError:
                         # Task vanished or changed ownership between the
@@ -5155,16 +5205,16 @@ async def websocket_chat_endpoint(
                 )
 
     except WebSocketDisconnect:
-        manager.disconnect(websocket, task_id)
+        pass
     except (ConnectionError, RuntimeError) as e:
         # Connection error
         logger.error(f"Connection error in WebSocket: {e}")
-        manager.disconnect(websocket, task_id)
     except Exception as e:
         # Other errors, re-raise
         logger.error(f"Unexpected error in WebSocket: {e}")
-        manager.disconnect(websocket, task_id)
         raise
+    finally:
+        manager.disconnect(websocket)
 
 
 async def handle_intervention(
@@ -5649,7 +5699,7 @@ async def _execute_durable_task_command(
     still broadcast normally.
     """
 
-    connections = manager.active_connections.get(command.task_id, [])
+    connections = manager.connections_for_task(command.task_id)
     websocket: Any = connections[0] if connections else _DiscardingCommandWebSocket()
     message_data = dict(command.payload)
     message_data.update(
@@ -6343,12 +6393,7 @@ async def websocket_build_preview_endpoint(
                         )
                     )
             elif message_type == "clear_context":
-                preview_task_id = getattr(websocket.state, "preview_task_id", None)
-                if (
-                    isinstance(preview_task_id, (int, str))
-                    and str(preview_task_id).isdigit()
-                ):
-                    manager.disconnect(websocket, int(preview_task_id))
+                manager.disconnect(websocket)
                 websocket.state.preview_task_id = None
                 await websocket.send_text(
                     json.dumps(
@@ -6370,14 +6415,13 @@ async def websocket_build_preview_endpoint(
                 )
 
     except WebSocketDisconnect:
-        preview_task_id = getattr(websocket.state, "preview_task_id", None)
-        if isinstance(preview_task_id, (int, str)) and str(preview_task_id).isdigit():
-            manager.disconnect(websocket, int(preview_task_id))
         logger.info(f"Build preview WebSocket disconnected for user {user.id}")
     except (ConnectionError, RuntimeError) as e:
         logger.error(f"Connection error in build preview WebSocket: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in build preview WebSocket: {e}")
+    finally:
+        manager.disconnect(websocket)
 
 
 async def handle_build_preview_execution(

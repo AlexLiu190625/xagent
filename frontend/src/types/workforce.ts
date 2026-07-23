@@ -201,6 +201,13 @@ export interface WorkforceRunResponse {
   redirect_url: string
 }
 
+export interface WorkforceShareLink {
+  workforce_id: number
+  share_enabled: boolean
+  share_token: string | null
+  share_updated_at: string | null
+}
+
 export interface WorkforceBuilderOperation {
   op: string
   [key: string]: unknown
