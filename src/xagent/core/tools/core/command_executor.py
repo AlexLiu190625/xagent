@@ -197,6 +197,9 @@ class CommandExecutorCore:
                         )
                     self.path_guard.validate(command)
                 else:
+                    # The Vibe adapter currently sends shell strings, but argv
+                    # validation intentionally protects direct and future
+                    # non-shell CommandExecutorCore callers.
                     argv = [command] if isinstance(command, str) else list(command)
                     self.path_guard.validate_argv(argv)
                     command = argv

@@ -71,6 +71,75 @@ _SAFE_DEVICE_PATHS = {
 }
 
 
+def _has_active_brace_expansion(raw_word: str) -> bool:
+    """Return whether Bash may expand an unquoted brace expression."""
+    brace_has_expander: list[bool] = []
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+    index = 0
+
+    while index < len(raw_word):
+        character = raw_word[index]
+        if escaped:
+            escaped = False
+            index += 1
+            continue
+        if character == "\\" and not in_single_quote:
+            escaped = True
+            index += 1
+            continue
+        if character == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            index += 1
+            continue
+        if character == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            index += 1
+            continue
+        if in_single_quote or in_double_quote:
+            index += 1
+            continue
+
+        if character == "{":
+            brace_has_expander.append(False)
+        elif character == "," and brace_has_expander:
+            brace_has_expander[-1] = True
+        elif (
+            character == "."
+            and index + 1 < len(raw_word)
+            and raw_word[index + 1] == "."
+            and brace_has_expander
+        ):
+            brace_has_expander[-1] = True
+            index += 1
+        elif character == "}" and brace_has_expander:
+            if brace_has_expander.pop():
+                return True
+        index += 1
+
+    return False
+
+
+def _mark_unmodeled_expansions(nodes: Sequence[Any], source: str) -> None:
+    """Attach source-aware expansion metadata missing from the Bash AST."""
+    pending = list(nodes)
+    while pending:
+        node = pending.pop()
+        if getattr(node, "kind", None) == "word":
+            start, end = cast(tuple[int, int], node.pos)
+            node.xagent_has_unmodeled_expansion = _has_active_brace_expansion(
+                source[start:end]
+            )
+        for value in vars(node).values():
+            if getattr(value, "kind", None) is not None:
+                pending.append(value)
+            elif isinstance(value, (list, tuple)):
+                pending.extend(
+                    item for item in value if getattr(item, "kind", None) is not None
+                )
+
+
 class CommandPolicyViolation(ValueError):
     """The guard cannot safely authorize a command under the active policy."""
 
@@ -138,6 +207,26 @@ TarMode = Literal[
     "list",
     "compare",
 ]
+
+
+@dataclass(frozen=True)
+class _ScriptCommandGrammar:
+    language: Literal["sed", "awk"]
+    expression_long_option: str
+    value_options: frozenset[str] = frozenset()
+    ignores_assignment_arguments: bool = False
+
+
+_SED_GRAMMAR = _ScriptCommandGrammar(
+    language="sed",
+    expression_long_option="--expression",
+)
+_AWK_GRAMMAR = _ScriptCommandGrammar(
+    language="awk",
+    expression_long_option="--source",
+    value_options=frozenset({"-F", "-v"}),
+    ignores_assignment_arguments=True,
+)
 TarEventKind = Literal[
     "archive",
     "directory",
@@ -180,10 +269,12 @@ class WorkspaceCommandPathGuard:
     @staticmethod
     def _parse_shell(command: str) -> list[Any]:
         try:
-            return cast(list[Any], bashlex.parse(command))
+            nodes = cast(list[Any], bashlex.parse(command))
         except (bashlex.errors.ParsingError, NotImplementedError, ValueError) as exc:
             logger.debug("Command path guard rejected unparsed shell input")
             raise CommandPolicyViolation("cannot safely parse shell command") from exc
+        _mark_unmodeled_expansions(nodes, command)
+        return nodes
 
     def validate(self, command: str) -> None:
         """Reject unsupported syntax and unsafe paths in ``command``."""
@@ -194,7 +285,10 @@ class WorkspaceCommandPathGuard:
             state = self._validate_node(node, state)
 
     def validate_argv(self, argv: Sequence[str]) -> None:
-        """Reject out-of-policy paths in an argument-vector command."""
+        """Reject out-of-policy paths in literal, pre-tokenized arguments.
+
+        No shell interprets this form, so shell expansion syntax remains literal.
+        """
         if not argv:
             return
         command_name = os.path.basename(argv[0])
@@ -267,8 +361,8 @@ class WorkspaceCommandPathGuard:
         if not words:
             return state
 
-        command_word = self._literal_word(words[0])
-        if command_word is None:
+        command_word = self._command_value(words[0])
+        if not command_word.is_static:
             raise CommandPolicyViolation("cannot resolve dynamic command name")
         command_name = os.path.basename(command_word)
         args = self._command_values(words[1:])
@@ -291,9 +385,16 @@ class WorkspaceCommandPathGuard:
         elif command_name == "grep":
             self._check_grep(args, state.cwd)
         elif command_name == "sed":
-            self._check_sed_values(args, state.cwd)
+            self._check_script_command(
+                _SED_GRAMMAR,
+                args,
+                state.cwd,
+                file_access="write" if self._sed_requests_in_place(args) else "read",
+            )
         elif command_name == "awk":
-            self._check_awk_values(args, state.cwd)
+            self._check_script_command(
+                _AWK_GRAMMAR, args, state.cwd, file_access="read"
+            )
         elif command_name == "base64":
             self._check_base64(args, state.cwd)
         elif command_name == "dd":
@@ -695,10 +796,16 @@ class WorkspaceCommandPathGuard:
         for raw_path in file_operands:
             self._check_path(raw_path, cwd, "read")
 
-    def _check_sed_values(self, values: Sequence[str], cwd: Path) -> None:
+    def _check_script_command(
+        self,
+        grammar: _ScriptCommandGrammar,
+        values: Sequence[str],
+        cwd: Path,
+        *,
+        file_access: PathAccess,
+    ) -> None:
         positionals: list[str] = []
         explicit_script = False
-        in_place = self._sed_requests_in_place(values)
         index = 0
         while index < len(values):
             value = values[index]
@@ -708,49 +815,52 @@ class WorkspaceCommandPathGuard:
             if value in {"-f", "--file"}:
                 explicit_script = True
                 if index + 1 < len(values):
-                    self._inspect_script_file("sed", values[index + 1], cwd)
+                    self._inspect_script_file(grammar.language, values[index + 1], cwd)
                 index += 2
                 continue
             if value.startswith("--file="):
                 explicit_script = True
-                self._inspect_script_file("sed", value.split("=", 1)[1], cwd)
+                self._inspect_script_file(
+                    grammar.language,
+                    value.split("=", 1)[1],
+                    cwd,
+                )
                 index += 1
                 continue
             if value.startswith("-f") and len(value) > 2:
                 explicit_script = True
-                self._inspect_script_file("sed", value[2:], cwd)
+                self._inspect_script_file(grammar.language, value[2:], cwd)
                 index += 1
                 continue
-            if value in {"-e", "--expression"}:
+            if value in {"-e", grammar.expression_long_option}:
                 explicit_script = True
                 if index + 1 < len(values):
-                    self._reject_embedded_io("sed", values[index + 1])
+                    self._reject_embedded_io(grammar.language, values[index + 1])
                 index += 2
                 continue
-            if value.startswith("-e") or value.startswith("--expression="):
+            if value.startswith("-e") or value.startswith(
+                f"{grammar.expression_long_option}="
+            ):
                 explicit_script = True
                 script = value.split("=", 1)[1] if "=" in value else value[2:]
-                self._reject_embedded_io("sed", script)
+                self._reject_embedded_io(grammar.language, script)
                 index += 1
                 continue
-            if (
-                value == "-i"
-                or value.startswith("-i")
-                or value.startswith("--in-place")
-            ):
-                index += 1
+            if value in grammar.value_options:
+                index += 2
                 continue
             if value.startswith("-") and value != "-":
                 index += 1
                 continue
-            positionals.append(value)
+            if not grammar.ignores_assignment_arguments or "=" not in value:
+                positionals.append(value)
             index += 1
 
         if not explicit_script and positionals:
-            self._reject_embedded_io("sed", positionals[0])
+            self._reject_embedded_io(grammar.language, positionals[0])
         file_operands = positionals if explicit_script else positionals[1:]
         for raw_path in file_operands:
-            self._check_path(raw_path, cwd, "write" if in_place else "read")
+            self._check_path(raw_path, cwd, file_access)
 
     @staticmethod
     def _sed_requests_in_place(values: Sequence[str]) -> bool:
@@ -758,62 +868,6 @@ class WorkspaceCommandPathGuard:
             value == "-i" or value.startswith("-i") or value.startswith("--in-place")
             for value in values
         )
-
-    def _check_awk_values(self, values: Sequence[str], cwd: Path) -> None:
-        positionals: list[str] = []
-        explicit_program = False
-        index = 0
-        while index < len(values):
-            value = values[index]
-            if value == "--":
-                positionals.extend(values[index + 1 :])
-                break
-            if value in {"-f", "--file"}:
-                explicit_program = True
-                if index + 1 < len(values):
-                    self._inspect_script_file("awk", values[index + 1], cwd)
-                index += 2
-                continue
-            if value.startswith("--file="):
-                explicit_program = True
-                self._inspect_script_file("awk", value.split("=", 1)[1], cwd)
-                index += 1
-                continue
-            if value.startswith("-f") and len(value) > 2:
-                explicit_program = True
-                self._inspect_script_file("awk", value[2:], cwd)
-                index += 1
-                continue
-            if value in {"-e", "--source"}:
-                explicit_program = True
-                if index + 1 < len(values):
-                    self._reject_embedded_io("awk", values[index + 1])
-                index += 2
-                continue
-            if value.startswith("-e") or value.startswith("--source="):
-                explicit_program = True
-                program = value.split("=", 1)[1] if "=" in value else value[2:]
-                self._reject_embedded_io("awk", program)
-                index += 1
-                continue
-            if value in {"-F", "-v"}:
-                index += 2
-                continue
-            if value.startswith("-F") or value.startswith("-v"):
-                index += 1
-                continue
-            if value.startswith("-") and value != "-":
-                index += 1
-                continue
-            if "=" not in value:
-                positionals.append(value)
-            index += 1
-
-        if not explicit_program and positionals:
-            self._reject_embedded_io("awk", positionals[0])
-        file_operands = positionals if explicit_program else positionals[1:]
-        for raw_path in file_operands:
-            self._check_path(raw_path, cwd, "read")
 
     def _check_base64(self, values: Sequence[str], cwd: Path) -> None:
         self._reject_dynamic_values("base64 arguments", values)
@@ -1639,22 +1693,18 @@ class WorkspaceCommandPathGuard:
                 self._validate_node(child, state)
 
     @staticmethod
-    def _literal_word(word: Any) -> str | None:
-        if word is None or getattr(word, "kind", None) != "word":
-            return None
-        if getattr(word, "parts", None):
-            return None
-        return str(word.word)
-
-    @staticmethod
     def _command_value(word: Any) -> _CommandValue:
         parts = getattr(word, "parts", ())
         return _CommandValue(
             str(word.word),
             # Tilde expansion is deterministic at the policy boundary and is
-            # resolved by Path.expanduser(); other shell parts remain dynamic.
-            is_static=not parts
-            or all(getattr(part, "kind", None) == "tilde" for part in parts),
+            # resolved by Path.expanduser(); parser parts and source-marked
+            # expansions that cannot be resolved here remain dynamic.
+            is_static=not getattr(word, "xagent_has_unmodeled_expansion", False)
+            and (
+                not parts
+                or all(getattr(part, "kind", None) == "tilde" for part in parts)
+            ),
         )
 
     def _command_values(self, words: Sequence[Any]) -> list[_CommandValue]:

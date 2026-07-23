@@ -348,6 +348,21 @@ class TestScopedCommandPathGuard:
         assert result["return_code"] == 0
         assert result["output"] == "own content"
 
+    def test_shell_false_argv_treats_braces_as_literal(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        literal_file = workspace.output_dir / "{a,b}"
+        literal_file.write_text("literal content", encoding="utf-8")
+        executor = CommandExecutorCore(
+            str(workspace.resolve_path("")),
+            path_guard=WorkspaceCommandPathGuard(workspace),
+        )
+
+        result = executor.execute_command(["cat", "{a,b}"], shell=False)
+
+        assert result["success"] is True
+        assert result["return_code"] == 0
+        assert result["output"] == "literal content"
+
     def test_creator_behavior_remains_unrestricted(self, scoped_command_workspace):
         workspace, _, sibling_file = scoped_command_workspace
         tool = CommandExecutorTool(workspace=workspace)
@@ -430,6 +445,54 @@ class TestScopedCommandPathGuard:
         assert "outside allowed write paths" in result["error"]
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
         assert own_file.exists()
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "cat {{{path},missing}}",
+            "{{cat,printf}} {path}",
+            "rm -f {{{path},missing}}",
+            "tee {{{path},own.txt}} < /dev/null",
+            "printf changed > {{{path},own.txt}}",
+            "bash -c 'cat {{{path},missing}}'",
+        ],
+    )
+    def test_rejects_brace_expansion_before_read_write_or_nested_execution(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+        command = command_template.format(path=str(sibling_file))
+
+        result = tool.run_json_sync({"command": command})
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    @pytest.mark.parametrize("operand", ["{a,b}", "{1..3}", "{a..z..2}"])
+    def test_rejects_unmodeled_brace_expansion_forms(
+        self, scoped_command_workspace, operand
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="dynamic path operand"):
+            guard.validate(f"cat {operand}")
+
+    @pytest.mark.parametrize("operand", ["'{a,b}'", r"\{1..3\}"])
+    def test_allows_quoted_or_escaped_literal_braces(
+        self, scoped_command_workspace, operand
+    ):
+        workspace, _, _ = scoped_command_workspace
+        literal_name = operand.replace("'", "").replace("\\", "")
+        (workspace.output_dir / literal_name).write_text("literal", encoding="utf-8")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": f"cat {operand}"})
+
+        assert result["success"] is True
+        assert result["output"] == "literal"
 
     def test_external_directory_is_read_only(self, scoped_command_workspace):
         workspace, external_file, _ = scoped_command_workspace
