@@ -25,8 +25,8 @@ from ..schemas.agent_api_key import (
 from ..schemas.user_api_key import (
     PersonalAPIKeyCreateResponse,
     PersonalAPIKeyListItem,
-    PersonalAPIKeyOwner,
     PersonalAPIKeyMetadata,
+    PersonalAPIKeyOwner,
     PersonalAPIKeyRevokeResponse,
     PersonalAPIKeyStatus,
 )

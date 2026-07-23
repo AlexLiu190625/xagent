@@ -21,7 +21,9 @@ def _clear_scope_hook():
 def test_default_scope_is_limited_to_the_actor():
     scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
 
-    assert scope == PersonalKeyAccessScope(owner_user_ids=(17,), can_manage_others=False)
+    assert scope == PersonalKeyAccessScope(
+        owner_user_ids=(17,), can_manage_others=False
+    )
 
 
 def test_hook_scope_always_includes_the_actor():
@@ -47,7 +49,9 @@ def test_non_manager_hook_cannot_expose_other_owners():
 
     scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
 
-    assert scope == PersonalKeyAccessScope(owner_user_ids=(17,), can_manage_others=False)
+    assert scope == PersonalKeyAccessScope(
+        owner_user_ids=(17,), can_manage_others=False
+    )
 
 
 @pytest.mark.parametrize(
@@ -73,4 +77,6 @@ def test_malformed_hook_scope_fails_closed(owner_user_ids, can_manage_others):
 
     scope = get_personal_key_access_scope(None, SimpleNamespace(id=17))
 
-    assert scope == PersonalKeyAccessScope(owner_user_ids=(17,), can_manage_others=False)
+    assert scope == PersonalKeyAccessScope(
+        owner_user_ids=(17,), can_manage_others=False
+    )

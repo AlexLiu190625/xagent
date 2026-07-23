@@ -45,9 +45,7 @@ def get_personal_key_access_scope(db: Any, actor: Any) -> PersonalKeyAccessScope
             return self_scope
         if not proposed.can_manage_others:
             return self_scope
-        owner_ids = tuple(
-            dict.fromkeys((actor_id, *proposed.owner_user_ids))
-        )
+        owner_ids = tuple(dict.fromkeys((actor_id, *proposed.owner_user_ids)))
         return PersonalKeyAccessScope(owner_ids, True)
     except (AttributeError, TypeError, ValueError):
         return self_scope

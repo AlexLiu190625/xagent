@@ -13,7 +13,6 @@ from ..schemas.user_api_key import (
 from ..services.api_keys import PersonalApiKeyManagementService
 from ..services.personal_key_scope import get_personal_key_access_scope
 
-
 router = APIRouter(prefix="/api/personal-api-keys", tags=["personal-api-keys"])
 
 

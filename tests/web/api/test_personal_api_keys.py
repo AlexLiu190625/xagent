@@ -20,7 +20,6 @@ from .conftest import (
     client,
 )
 
-
 pytestmark = pytest.mark.usefixtures("_test_db")
 
 
