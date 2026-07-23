@@ -3715,7 +3715,7 @@ async def delete_task(
 
         from .websocket import background_task_manager, manager
 
-        connections = manager.active_connections.pop(task_id, [])
+        connections = manager.detach_task_connections(task_id)
 
         async def _cleanup_runtime_state() -> None:
             await background_task_manager.cancel_task(task_id, timeout_seconds=0.05)
