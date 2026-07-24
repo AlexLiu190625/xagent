@@ -75,7 +75,7 @@ describe("widget bootstrap", () => {
     runWidget({ "data-widget-key": "widget-secret" })
 
     const guestId = localStorage.getItem("xagent_guest_id")
-    expect(guestId).toEqual(expect.stringMatching(/^guest_[a-z0-9]+$/))
+    expect(guestId).toBe("guest_4fzyo82mvyqnk000qvgin")
     await vi.waitFor(() => {
       expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
         `https://chat.example/widget/chat/default?guest_id=${guestId}&agent_id=17&embed_ticket=ticket%2Fone`,
