@@ -2522,9 +2522,10 @@ class AgentServiceManager:
         _release_agent_runtime_caller_session(db_session)
 
         # Quota gate: refuse to start a run when the team is out of monthly
-        # quota. Fails open if the check itself errors, so quota infra problems
-        # never block execution. The hook may query the application database;
-        # keep that QueuePool wait off the asyncio event loop.
+        # quota. Non-pool hook errors fail open. A pool checkout timeout propagates
+        # before this method performs further DB-backed runtime work, preventing an
+        # immediate cascade into workforce/tracker checkouts. Run the hook in a DB
+        # worker because it may query the application database.
         if tracker_task_id:
             try:
                 gate_reason = await run_db_io_cancellation_safe(

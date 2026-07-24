@@ -37,12 +37,15 @@ _usage_record_hook: Callable[[Any, Any, list, int], None] | None = None
 # single long/expensive run is stopped mid-flight instead of only being metered
 # at completion.
 #
-# CONTRACT: invoked SYNCHRONOUSLY on the event loop once per step. It MUST NOT
-# block (no synchronous network/DB round-trips per call) — blocking work stalls
-# the loop every step. Resolve/cache anything expensive out of band (the stock
-# app layer caches the user->team lookup and checks quota off in-memory
-# counters). Read-only: it must not write or commit `db` (same contract spirit
-# as the metering hook).
+# CONTRACT: invoked as a synchronous callable in a database worker once per
+# step; it must not return an awaitable or depend on an asyncio event loop in
+# that thread. ``db`` is a worker-owned short Session valid only for this call.
+# The hook may make bounded read-only queries, but it must not write, commit,
+# rollback, close, or retain the Session, or return attached ORM state.
+# ``delta_details`` is a detached read-only snapshot. Return a non-empty string
+# to interrupt the run, or ``None``/an empty string to allow it to continue.
+# Different task executions may invoke the hook concurrently, so the embedding
+# application owns synchronization for any shared in-memory state.
 _run_progress_gate_hook: Callable[[Any, Any, list, int], str | None] | None = None
 # (db, user_id) -> reason str if the team is out of storage quota, else None
 _storage_gate_hook: Callable[[Any, Any], str | None] | None = None

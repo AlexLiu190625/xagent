@@ -200,12 +200,12 @@ def _write_task_usage_sync(
         db_session.close()
 
 
-def _check_quota_on_event_loop(
+def _check_run_progress_gate_sync(
     user_id: int | None,
     delta_details: list[dict[str, Any]],
     delta_actions: int,
 ) -> str | None:
-    """Invoke the legacy progress hook on its documented event-loop thread."""
+    """Invoke the progress hook with a worker-owned short Session."""
     from ..services.quota_hooks import check_run_progress_gate
 
     db_session = _new_short_session()
@@ -558,10 +558,14 @@ class TaskTracker:
             return None
         try:
             delta_details, delta_actions = self._turn_delta()
-            reason = _check_quota_on_event_loop(
-                self._user_id,
-                _copy_details(delta_details),
-                delta_actions,
+            user_id = self._user_id
+            copied_delta_details = _copy_details(delta_details)
+            reason = await run_db_io_cancellation_safe(
+                lambda: _check_run_progress_gate_sync(
+                    user_id,
+                    copied_delta_details,
+                    delta_actions,
+                )
             )
             if reason is not None:
                 self.quota_interrupt_reason = reason
