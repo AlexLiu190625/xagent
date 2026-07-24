@@ -25,6 +25,7 @@ from ..schemas.agent_api_key import (
     APIKeyMetadataResponse,
     APIKeyRevokeResponse,
 )
+from ..schemas.widget import WidgetAllowedDomain
 from ..services.agent_access import (
     AccessibleAgent,
     accessible_agent_permissions,
@@ -106,7 +107,7 @@ class AgentUpdateRequest(BaseModel):
     )
     logo_base64: Optional[str] = None
     widget_enabled: Optional[bool] = None
-    allowed_domains: Optional[List[str]] = None
+    allowed_domains: Optional[List[WidgetAllowedDomain]] = None
     visibility: Optional[Literal["team", "admins"]] = Field(
         None, description="Team visibility: 'team' or 'admins' (team admins only)"
     )

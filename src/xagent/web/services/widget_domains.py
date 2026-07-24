@@ -1,10 +1,25 @@
 """Widget embedding-origin normalization and allowlist enforcement."""
 
+import logging
+from typing import Literal
 from urllib.parse import urlparse
 
 from fastapi import HTTPException
 
-__all__ = ["domain_allowed", "origin_to_domain", "require_domain_allowed"]
+__all__ = [
+    "domain_allowed",
+    "normalize_widget_allowed_domain",
+    "origin_to_domain",
+    "require_domain_allowed",
+]
+
+logger = logging.getLogger(__name__)
+
+_MalformedPolicyReason = Literal[
+    "not_list",
+    "non_string_entry",
+    "blank_entry",
+]
 
 
 def origin_to_domain(origin: str) -> str:
@@ -15,22 +30,51 @@ def origin_to_domain(origin: str) -> str:
     return (parsed.netloc or parsed.path).lower()
 
 
-def _normalize_allowed_domains(allowed_domains: object) -> list[str] | None:
+def normalize_widget_allowed_domain(value: str) -> str:
+    """Return the canonical form used to detect blanks and match domains."""
+    return value.strip().lower()
+
+
+def _normalize_allowed_domains(
+    allowed_domains: object,
+) -> tuple[list[str] | None, _MalformedPolicyReason | None]:
     """Validate and normalize the complete persisted allowlist.
 
     JSON columns do not enforce their declared application-level shape. Treat
-    any non-list container or non-string element as an invalid policy rather
-    than coercing it into a potentially broader allowlist.
+    any non-list container, non-string element, or blank entry as an invalid
+    policy rather than coercing or skipping it and potentially broadening
+    access.
     """
     if not isinstance(allowed_domains, list):
-        return None
+        return None, "not_list"
 
     normalized_domains: list[str] = []
     for domain in allowed_domains:
         if type(domain) is not str:
-            return None
-        normalized_domains.append(domain.strip().lower())
-    return normalized_domains
+            return None, "non_string_entry"
+        normalized_domain = normalize_widget_allowed_domain(domain)
+        if not normalized_domain:
+            return None, "blank_entry"
+        normalized_domains.append(normalized_domain)
+    return normalized_domains, None
+
+
+def _evaluate_domain_policy(
+    origin_domain: str, allowed_domains: object
+) -> tuple[bool, _MalformedPolicyReason | None]:
+    normalized_domains, malformed_reason = _normalize_allowed_domains(allowed_domains)
+    if malformed_reason is not None:
+        return False, malformed_reason
+    assert normalized_domains is not None
+
+    for normalized_domain in normalized_domains:
+        if (
+            normalized_domain == "*"
+            or normalized_domain == origin_domain
+            or (origin_domain and origin_domain.endswith("." + normalized_domain))
+        ):
+            return True, None
+    return False, None
 
 
 def domain_allowed(origin_domain: str, allowed_domains: object) -> bool:
@@ -41,26 +85,31 @@ def domain_allowed(origin_domain: str, allowed_domains: object) -> bool:
     case-insensitive handling inside this matcher. A malformed persisted
     allowlist denies access in full.
     """
-    normalized_domains = _normalize_allowed_domains(allowed_domains)
-    if normalized_domains is None:
-        return False
-
-    for normalized_domain in normalized_domains:
-        if (
-            normalized_domain == "*"
-            or normalized_domain == origin_domain
-            or (origin_domain and origin_domain.endswith("." + normalized_domain))
-        ):
-            return True
-    return False
+    allowed, _malformed_reason = _evaluate_domain_policy(origin_domain, allowed_domains)
+    return allowed
 
 
-def require_domain_allowed(origin_domain: str, allowed_domains: object) -> None:
+def require_domain_allowed(
+    origin_domain: str,
+    allowed_domains: object,
+    *,
+    owner_type: str,
+    owner_id: int,
+) -> None:
     """Enforce a normalized origin against stored widget allowlist entries.
 
     ``origin_domain`` must be the result of :func:`origin_to_domain`.
     """
-    if not domain_allowed(origin_domain, allowed_domains):
+    allowed, malformed_reason = _evaluate_domain_policy(origin_domain, allowed_domains)
+    if malformed_reason is not None:
+        logger.warning(
+            "Rejected malformed widget allowed-domains policy: "
+            "owner_type=%s owner_id=%s reason=%s",
+            owner_type,
+            owner_id,
+            malformed_reason,
+        )
+    if not allowed:
         raise HTTPException(
             status_code=403, detail=f"Domain not allowed: {origin_domain}"
         )

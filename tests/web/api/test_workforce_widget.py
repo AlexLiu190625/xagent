@@ -251,6 +251,31 @@ def test_widget_allowed_domains_update_independent_of_enable() -> None:
     assert updated.json()["widget_enabled"] is True
 
 
+@pytest.mark.parametrize(
+    "blank_domain",
+    ["", "   ", "\u001c"],
+    ids=["empty", "spaces", "unicode-control-separator"],
+)
+def test_workforce_widget_update_rejects_blank_allowed_domain(
+    blank_domain: str,
+) -> None:
+    workforce_id = _create_workforce("Validated Domains Widget Workforce")
+    _enable_widget(workforce_id, allowed_domains=["existing.example"])
+
+    response = client.put(
+        f"/api/workforces/{workforce_id}/widget",
+        headers=_admin_headers(),
+        json={"allowed_domains": [blank_domain]},
+    )
+
+    assert response.status_code == 422, response.text
+    fetched = client.get(
+        f"/api/workforces/{workforce_id}/widget-key", headers=_admin_headers()
+    )
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["allowed_domains"] == ["existing.example"]
+
+
 def test_widget_requires_workforce_owner() -> None:
     workforce_id = _create_workforce("Owner Only Widget Workforce")
     other_headers = _register_second_user()
@@ -395,10 +420,15 @@ def test_widget_embed_ticket_enforces_allowed_domains() -> None:
     assert allowed.status_code == 200, allowed.text
 
 
-def test_widget_embed_ticket_rejects_malformed_workforce_allowlist() -> None:
+def test_widget_embed_ticket_rejects_malformed_workforce_allowlist(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
     workforce_id = _create_workforce("Malformed Domain Gate Widget Workforce")
     key = _enable_widget(workforce_id, allowed_domains=["example.com"])
-    _set_workforce_allowed_domains_raw(workforce_id, "*")
+    _set_workforce_allowed_domains_raw(
+        workforce_id, "do-not-log-this-policy-value.example"
+    )
 
     response = client.post(
         "/api/widget/embed-ticket",
@@ -408,11 +438,17 @@ def test_widget_embed_ticket_rejects_malformed_workforce_allowlist() -> None:
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Domain not allowed: example.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=workforce owner_id={workforce_id} reason=not_list"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
 
 
-def test_widget_auth_rejects_ticket_when_workforce_allowlist_becomes_malformed() -> (
-    None
-):
+def test_widget_auth_rejects_ticket_when_workforce_allowlist_becomes_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
     workforce_id = _create_workforce("Malformed Live Allowlist Widget Workforce")
     key = _enable_widget(workforce_id, allowed_domains=["example.com"])
     ticket_response = client.post(
@@ -422,7 +458,9 @@ def test_widget_auth_rejects_ticket_when_workforce_allowlist_becomes_malformed()
     )
     assert ticket_response.status_code == 200, ticket_response.text
 
-    _set_workforce_allowed_domains_raw(workforce_id, [None, "example.com"])
+    _set_workforce_allowed_domains_raw(
+        workforce_id, [None, "do-not-log-this-policy-value.example"]
+    )
 
     response = client.post(
         "/api/widget/auth",
@@ -434,6 +472,11 @@ def test_widget_auth_rejects_ticket_when_workforce_allowlist_becomes_malformed()
 
     assert response.status_code == 403
     assert response.json()["detail"] == "Domain not allowed: example.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=workforce owner_id={workforce_id} reason=non_string_entry"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
 
 
 def test_widget_auth_rejects_unknown_key() -> None:

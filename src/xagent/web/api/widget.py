@@ -211,7 +211,19 @@ async def issue_widget_embed_ticket(
 
     origin = req.headers.get("origin") or req.headers.get("referer", "")
     origin_domain = origin_to_domain(origin)
-    require_domain_allowed(origin_domain, owner.allowed_domains)
+    if owner.workforce is not None:
+        policy_owner_type = EMBED_TICKET_OWNER_WORKFORCE
+        policy_owner_id = int(owner.workforce.id)
+    else:
+        assert owner.agent is not None
+        policy_owner_type = EMBED_TICKET_OWNER_AGENT
+        policy_owner_id = int(owner.agent.id)
+    require_domain_allowed(
+        origin_domain,
+        owner.allowed_domains,
+        owner_type=policy_owner_type,
+        owner_id=policy_owner_id,
+    )
 
     # The ticket has no jti/nonce and is intentionally replayable within its
     # short TTL: it only re-certifies "this origin is allowed", which /auth
@@ -255,7 +267,12 @@ def _workforce_owner_from_ticket(
         raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
     allowed_domains = deployment.allowed_domains
     # Re-check so tickets die immediately if the allowlist shrinks.
-    require_domain_allowed(origin_domain, allowed_domains)
+    require_domain_allowed(
+        origin_domain,
+        allowed_domains,
+        owner_type=EMBED_TICKET_OWNER_WORKFORCE,
+        owner_id=workforce_id,
+    )
     return ResolvedWidgetOwner(
         allowed_domains=allowed_domains,
         widget_key=str(deployment.widget_key),
@@ -299,7 +316,12 @@ def _owner_from_embed_ticket(db: Session, embed_ticket: str) -> ResolvedWidgetOw
     agent = _get_widget_enabled_agent(db, ticket_agent_id)
     allowed_domains = agent.allowed_domains
     # Re-check so tickets die immediately if the allowlist shrinks.
-    require_domain_allowed(origin_domain, allowed_domains)
+    require_domain_allowed(
+        origin_domain,
+        allowed_domains,
+        owner_type=EMBED_TICKET_OWNER_AGENT,
+        owner_id=ticket_agent_id,
+    )
     return ResolvedWidgetOwner(
         allowed_domains=allowed_domains,
         widget_key=str(agent.widget_key or ""),
