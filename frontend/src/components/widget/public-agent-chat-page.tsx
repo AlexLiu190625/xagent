@@ -71,7 +71,10 @@ function PublicConversationContent({
   const [hasResolvedStoredTask, setHasResolvedStoredTask] = useState(false)
   const storageKey = authMode === "share"
     ? `${authMode}_task_${routeToken}_${agentId ?? "anonymous"}`
-    : `${authMode}_task_${agentId ?? "anonymous"}_${normalizedGuestId ?? "anonymous"}`
+    // Include the owner id so two different widgets embedded on the same site
+    // (which share a guest id) don't collide on one stored task. A workforce
+    // widget has no agentId, so fall back to its workforceId.
+    : `${authMode}_task_${agentId ?? (workforceId ? `wf${workforceId}` : "anonymous")}_${normalizedGuestId ?? "anonymous"}`
   const publicApiPrefix = authMode === "share" ? "/api/share" : "/api/widget"
 
   useEffect(() => {
