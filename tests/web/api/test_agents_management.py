@@ -1,9 +1,11 @@
 """Integration tests for agent management endpoints."""
 
 import asyncio
+import base64
 import io
 import secrets
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -13,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 
 from xagent.config import get_uploads_dir
 from xagent.web.api import agents as agents_api
+from xagent.web.api.public_chat_access import create_public_chat_access_token
 from xagent.web.api.widget import (
     EMBED_TICKET_TYPE,
     WIDGET_CREDENTIAL_REQUIRED_DETAIL,
@@ -974,6 +977,162 @@ def test_widget_task_create_persists_connector_runtime_selection_snapshot() -> N
         db.close()
 
 
+def _create_widget_task(guest_headers: dict[str, str], agent_id: int) -> Any:
+    return client.post(
+        "/api/widget/chat/task/create",
+        json={
+            "title": "hello",
+            "description": "hello",
+            "agent_id": agent_id,
+        },
+        headers=guest_headers,
+    )
+
+
+def test_disabled_widget_invalidates_existing_guest_tokens() -> None:
+    """Disabling an agent's widget must invalidate already-issued guest JWTs
+    on their next request (mirrors the workforce/share widget path)."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Disable Invalidate Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    # Sanity: the guest token works while the widget is enabled.
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    disabled = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"widget_enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_rotated_widget_key_invalidates_existing_guest_tokens() -> None:
+    """Rotating an agent's widget key must invalidate already-issued guest
+    JWTs on their next request."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Rotate Invalidate Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
+    assert rotate.status_code == 200, rotate.text
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def test_widget_guest_token_rejected_when_agent_becomes_generated_manager() -> None:
+    """``ensure_widget_agent_available`` must reject a live guest token once the
+    backing agent is a workforce-generated manager, tripping the check at the
+    task-create site (not just at ``/api/widget/auth``)."""
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Becomes Manager Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _authenticate_widget_guest(agent_id=agent_id)
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    # Flip the agent into a generated manager after the token was issued.
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        agent.origin = AgentOrigin.WORKFORCE_GENERATED_MANAGER.value
+        db.commit()
+    finally:
+        db.close()
+
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
+def _mint_legacy_widget_guest_token(
+    *,
+    user_id: int,
+    agent_id: int,
+    guest_id: str = "guest-legacy",
+) -> dict[str, str]:
+    """Mint a widget guest JWT the way it was minted before the ``widget_key``
+    claim shipped (issue #988): no key embedded. Exercises the backward-compat
+    branch in ``ensure_widget_agent_available``."""
+    db = _direct_db_session()
+    try:
+        user = db.query(User).filter(User.id == user_id).one()
+        username = str(user.username)
+    finally:
+        db.close()
+    token = create_public_chat_access_token(
+        {
+            "sub": username,
+            "user_id": user_id,
+            "channel_id": None,
+            "guest_id": guest_id,
+            "auth_mode": "widget",
+            "widget_agent_id": agent_id,
+        }
+    )
+    return {"Authorization": f"Bearer {token}"}
+
+
+def test_legacy_guest_token_without_widget_key_stays_gated_on_widget_enabled() -> None:
+    """Guest tokens minted before the ``widget_key`` claim shipped carry no key:
+    they still work while the widget is enabled, survive key rotation (no key to
+    compare), but are revoked when the widget is disabled. Locks in the
+    transitional contract documented on ``ensure_widget_agent_available``."""
+    headers = _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Legacy Token Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+    )
+    guest_headers = _mint_legacy_widget_guest_token(user_id=owner_id, agent_id=agent_id)
+
+    # (a) A keyless legacy token works while the widget is enabled.
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    # (c) Rotating the key does not revoke a keyless token: there is no key
+    # claim to compare, so it stays gated on widget_enabled only.
+    rotate = client.post(f"/api/agents/{agent_id}/widget-key/rotate", headers=headers)
+    assert rotate.status_code == 200, rotate.text
+    assert _create_widget_task(guest_headers, agent_id).status_code == 200
+
+    # (b) Disabling the widget still revokes it.
+    disabled = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"widget_enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    response = _create_widget_task(guest_headers, agent_id)
+    assert response.status_code == 403, response.text
+    assert response.json()["detail"] == "Widget is unavailable"
+
+
 def test_share_link_requires_published_agent() -> None:
     headers = _admin_headers()
     owner_id = _user_id("admin")
@@ -1416,6 +1575,106 @@ def test_share_public_file_download_requires_valid_share_token() -> None:
 
     download_without_token = client.get(f"/api/files/public/download/{file_id}")
     assert download_without_token.status_code == 403, download_without_token.text
+
+
+def _logo_data_url(payload: bytes = b"fake-logo-bytes") -> str:
+    return "data:image/png;base64," + base64.b64encode(payload).decode()
+
+
+@pytest.fixture
+def logo_uploads_dir(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
+    """Isolate agent logo reads/writes to a temp dir instead of the real uploads root."""
+    monkeypatch.setattr(agents_api, "get_uploads_dir", lambda: tmp_path)
+    return tmp_path
+
+
+def test_logo_reupload_gets_a_fresh_url_and_removes_the_old_file(
+    logo_uploads_dir: Path,
+) -> None:
+    """A re-uploaded logo must change logo_url (#975): the old fix saved every
+    logo under the same deterministic filename, so browsers kept serving the
+    stale cached image after an update even though the file on disk changed."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    first = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": _logo_data_url(b"first")},
+    )
+    assert first.status_code == 200, first.text
+    first_logo_url = first.json()["logo_url"]
+    assert first_logo_url
+    first_path = logo_uploads_dir / first_logo_url.removeprefix("/uploads/")
+    assert first_path.is_file()
+
+    second = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": _logo_data_url(b"second")},
+    )
+    assert second.status_code == 200, second.text
+    second_logo_url = second.json()["logo_url"]
+
+    assert second_logo_url and second_logo_url != first_logo_url
+    assert not first_path.exists(), "old logo file should be cleaned up"
+    assert (logo_uploads_dir / second_logo_url.removeprefix("/uploads/")).is_file()
+
+
+def test_clearing_logo_with_empty_string_nulls_url_and_deletes_file(
+    logo_uploads_dir: Path,
+) -> None:
+    """logo_base64="" (vs. omitted, meaning "no change") must clear an
+    existing logo end-to-end (#976)."""
+    headers = _admin_headers()
+    agent_id = _create_agent(headers)
+
+    uploaded = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": _logo_data_url()},
+    )
+    assert uploaded.status_code == 200, uploaded.text
+    logo_url = uploaded.json()["logo_url"]
+    logo_path = logo_uploads_dir / logo_url.removeprefix("/uploads/")
+    assert logo_path.is_file()
+
+    cleared = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"logo_base64": ""},
+    )
+    assert cleared.status_code == 200, cleared.text
+    assert cleared.json()["logo_url"] is None
+    assert not logo_path.exists()
+
+
+def test_delete_logo_removes_a_file_inside_the_uploads_root(
+    logo_uploads_dir: Path,
+) -> None:
+    logo_dir = logo_uploads_dir / "agent_logos"
+    logo_dir.mkdir(parents=True)
+    logo_file = logo_dir / "agent_1_abcd1234.png"
+    logo_file.write_bytes(b"fake")
+
+    agents_api._delete_logo("/uploads/agent_logos/agent_1_abcd1234.png")
+
+    assert not logo_file.exists()
+
+
+def test_delete_logo_refuses_a_path_traversal_attempt(
+    logo_uploads_dir: Path,
+) -> None:
+    """A logo_url escaping the uploads root (e.g. via "..") must be refused
+    rather than deleting whatever it resolves to outside that root."""
+    outside_file = logo_uploads_dir.parent / "outside-secret.txt"
+    outside_file.write_text("do not delete me")
+
+    try:
+        agents_api._delete_logo("/uploads/../" + outside_file.name)
+        assert outside_file.exists()
+    finally:
+        outside_file.unlink(missing_ok=True)
 
 
 class TestDeleteAgent:

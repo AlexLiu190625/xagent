@@ -3405,6 +3405,16 @@ const zh = {
       manage_key: "管理 API Key"
     }
   },
+  deploy_workforce: {
+    title: "通过 REST API / SDK 部署",
+    desc: "使用 Workforce API Key 创建运行，然后轮询 GET /v1/chat/tasks/{id} 获取结果。",
+    copy: "复制",
+    new_key: "请立即复制此 Key —— 它不会再次显示。",
+    keys_title: "API Keys",
+    label_placeholder: "标签（可选），如 CI 流水线",
+    create_key: "创建 Key",
+    no_keys: "还没有 API Key。"
+  },
   api_key: {
     title: "API Key",
     subtitle: "SDK / REST API 凭证",
@@ -3482,6 +3492,10 @@ const zh = {
     never: "从未使用",
     filteredByAgent: "已按 Agent 筛选",
     clearFilter: "清除筛选",
+    tabs: {
+      agent: "Agent 密钥",
+      personal: "个人密钥"
+    },
     stats: {
       totalKeys: "密钥总数",
       totalKeysHint: "覆盖所有 Agent",
@@ -3542,9 +3556,60 @@ const zh = {
       copyFailed: "复制到剪贴板失败"
     }
   },
+  personalApiKeys: {
+    title: "个人密钥",
+    description: "管理您的个人 SDK 和 REST API 密钥。",
+    create: "创建个人密钥",
+    createForMe: "为我创建个人密钥",
+    noData: "暂无个人 API 密钥。",
+    noResults: "没有匹配的密钥。",
+    searchPlaceholder: "搜索密钥或所有者...",
+    stats: {
+      totalKeys: "密钥总数",
+      totalKeysHint: "个人密钥",
+      activeKeys: "有效密钥",
+      activeKeysHint: "可正常调用"
+    },
+    columns: {
+      key: "密钥",
+      owner: "所有者",
+      status: "状态",
+      expires: "过期时间",
+      created: "创建时间"
+    },
+    status: {
+      active: "有效",
+      expired: "已过期",
+      revoked: "已撤销"
+    },
+    neverExpires: "永不过期",
+    actions: {
+      copy: "复制个人 API 密钥",
+      revoke: "撤销"
+    },
+    reveal: {
+      title: "个人 API 密钥已创建",
+      warning: "请立即复制此密钥 —— 它只显示一次。"
+    },
+    confirm: {
+      revokeTitle: "撤销个人 API 密钥？",
+      revokeOwnDescription: "撤销会立即使此密钥失效。",
+      revokeOtherDescription: "要撤销 {owner} 的个人密钥吗？"
+    },
+    messages: {
+      loadFailed: "加载个人 API 密钥失败",
+      created: "个人 API 密钥已创建",
+      createFailed: "创建个人 API 密钥失败",
+      revoked: "个人 API 密钥已撤销",
+      revokeFailed: "撤销个人 API 密钥失败",
+      copied: "已复制到剪贴板",
+      copyFailed: "复制到剪贴板失败"
+    }
+  },
   triggers: {
     title: "Triggers",
     subtitle: "选择此 Agent 的触发方式",
+    deleteConfirm: "确定删除该触发器？",
     defaults: {
       webhookName: "API / Webhook",
       scheduledName: "Schedule",
@@ -3627,9 +3692,6 @@ const zh = {
     },
     actions: {
       new: "新建",
-      create: "创建 Trigger",
-      enable: "启用 Trigger",
-      save: "保存修改",
       delete: "删除",
       confirmDelete: "确认删除",
       rotateSecret: "轮换 secret",
@@ -3640,7 +3702,8 @@ const zh = {
       confirmDiscard: "确认丢弃"
     },
     secret: {
-      title: "请立即复制此 secret，它只显示一次。"
+      title: "请立即复制此 secret，它只显示一次。",
+      dismiss: "我已保存该 secret"
     },
     webhook: {
       title: "Webhook 地址",
@@ -3749,9 +3812,57 @@ const zh = {
       publish: "发布",
       unpublish: "取消发布",
       archive: "归档",
+      deploy: "部署",
+      triggers: "触发器",
+      share: "分享",
+      embed: "嵌入",
       createTeam: "创建团队",
       change: "更换",
       addAgent: "添加 Agent",
+    },
+    share_link: {
+      title: "分享 Workforce",
+      section_title: "公开分享链接",
+      desc: "生成一个公开页面，任何人都可以打开并与该 Workforce 对话。",
+      publish_required: "请先发布该 Workforce，然后再生成分享链接。",
+      public_url: "公开链接",
+      anyone_access: "任何持有此链接的人都可以发起与该 Workforce 的公开对话。",
+      generate_btn: "生成链接",
+      rotate_btn: "重置链接",
+      disable_btn: "停用链接",
+      messages: {
+        enabled: "分享链接已生成",
+        rotated: "分享链接已重置",
+        disabled: "分享链接已停用",
+        failed: "分享链接操作失败",
+        link_copied: "链接已复制到剪贴板",
+      },
+    },
+    widget: {
+      title: "嵌入组件",
+      widget_enabled: "启用组件",
+      widget_enabled_desc: "允许将该组件嵌入到外部网站。",
+      allowed_domains: "允许的域名",
+      allowed_domains_desc: "限制可嵌入该组件的域名。使用 * 表示任意域名。",
+      domain_placeholder: "例如 example.com",
+      add_btn: "添加",
+      invalid_domain: "请输入有效的主机名，例如 example.com（不含协议或路径），或用 * 表示任意域名。",
+      no_domains: "尚未配置域名。除非添加 *，否则组件将拒绝所有嵌入。",
+      snippet_title: "嵌入代码",
+      snippet_desc: "将此脚本标签复制粘贴到你网站的 <body> 中。",
+      rotate_btn: "重置密钥",
+      rotating: "重置中…",
+      rotate_confirm: "重置组件密钥会立即使所有已嵌入的组件失效。重置后请重新复制并部署代码。是否继续？",
+      copy_btn: "复制代码",
+      publish_required: "请先发布该 Workforce，然后再启用组件。",
+      messages: {
+        enabled: "组件已启用",
+        disabled: "组件已停用",
+        updated: "组件配置已更新",
+        rotated: "组件密钥已重置",
+        failed: "组件操作失败",
+        copied: "已复制到剪贴板",
+      },
     },
     fields: {
       name: "名称",
@@ -4242,6 +4353,33 @@ const zh = {
       skillMd: "SKILL.md",
       preview: "预览",
       livePreviewHint: "实时预览将在此显示。",
+    },
+  },
+  ssh: {
+    bindings: {
+      label: "SSH 目标",
+      add: "绑定目标",
+      empty: "该智能体尚未绑定 SSH 目标。",
+      loadFailed: "无法加载 SSH 绑定,请重新加载后再保存,以免丢失 SSH 工具。",
+      targetsLoadFailed: "无法加载 SSH 目标。",
+      saveFirst: "请先保存智能体,再绑定 SSH 目标。",
+      created: "目标已绑定",
+      deleted: "绑定已移除",
+      confirmDelete: "确定要移除该 SSH 目标绑定吗？",
+      approval: {
+        always: "始终需要审批",
+        risk_based: "基于风险审批",
+        not_required: "无需审批",
+      },
+      dialog: {
+        title: "绑定 SSH 目标",
+        targetLabel: "目标",
+        targetPlaceholder: "选择目标",
+        capabilitiesLabel: "权限",
+        capabilitiesPlaceholder: "选择权限",
+        approvalLabel: "审批策略",
+        submit: "绑定",
+      },
     },
   },
 } as const
