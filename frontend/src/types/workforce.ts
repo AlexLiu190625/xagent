@@ -208,6 +208,13 @@ export interface WorkforceShareLink {
   share_updated_at: string | null
 }
 
+export interface WorkforceWidgetConfig {
+  workforce_id: number
+  widget_enabled: boolean
+  widget_key: string | null
+  allowed_domains: string[]
+}
+
 export interface WorkforceBuilderOperation {
   op: string
   [key: string]: unknown

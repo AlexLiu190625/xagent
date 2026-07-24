@@ -20,6 +20,15 @@ def new_share_token() -> str:
     return secrets.token_urlsafe(24)
 
 
+def new_widget_key() -> str:
+    """Generate an unguessable widget embed credential (agent or workforce).
+
+    A 32-byte URL-safe token; the single source of truth for widget keys so a
+    workforce key is indistinguishable from an agent one to embedders.
+    """
+    return secrets.token_urlsafe(32)
+
+
 def get_deployment(
     db: Session, owner_type: DeploymentOwnerType, owner_id: int
 ) -> Deployment | None:
@@ -73,6 +82,24 @@ def find_enabled_share_deployment(
             Deployment.owner_type == owner_type.value,
             Deployment.share_token == share_token,
             Deployment.share_enabled.is_(True),
+        )
+        .first()
+    )
+
+
+def find_enabled_widget_deployment(
+    db: Session, widget_key: str, owner_type: DeploymentOwnerType
+) -> Deployment | None:
+    """Resolve a raw widget key to a widget-enabled deployment of the given
+    type. Mirrors :func:`find_enabled_share_deployment`."""
+    if not widget_key:
+        return None
+    return (
+        db.query(Deployment)
+        .filter(
+            Deployment.owner_type == owner_type.value,
+            Deployment.widget_key == widget_key,
+            Deployment.widget_enabled.is_(True),
         )
         .first()
     )

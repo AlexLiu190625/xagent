@@ -22,6 +22,7 @@ import type {
   WorkforceRunResponse,
   WorkforceShareLink,
   WorkforceUpdatePayload,
+  WorkforceWidgetConfig,
   WorkforceWorker,
   WorkforceWorkerPayload,
   WorkforceWorkerUpdatePayload,
@@ -396,6 +397,43 @@ export async function disableWorkforceShareLink(
   })
   if (!response.ok) {
     throw await parseApiError(response, "Failed to disable workforce share link")
+  }
+  return response.json()
+}
+
+export async function getWorkforceWidgetConfig(
+  workforceId: number | string,
+): Promise<WorkforceWidgetConfig> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget-key`)
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to load workforce widget config")
+  }
+  return response.json()
+}
+
+export async function updateWorkforceWidgetConfig(
+  workforceId: number | string,
+  updates: { widget_enabled?: boolean; allowed_domains?: string[] },
+): Promise<WorkforceWidgetConfig> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget`, {
+    method: "PUT",
+    headers: jsonHeaders(),
+    body: JSON.stringify(updates),
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to update workforce widget config")
+  }
+  return response.json()
+}
+
+export async function rotateWorkforceWidgetKey(
+  workforceId: number | string,
+): Promise<WorkforceWidgetConfig> {
+  const response = await apiRequest(`${getApiUrl()}/api/workforces/${workforceId}/widget-key/rotate`, {
+    method: "POST",
+  })
+  if (!response.ok) {
+    throw await parseApiError(response, "Failed to rotate workforce widget key")
   }
   return response.json()
 }
