@@ -434,6 +434,12 @@ class TestScopedCommandPathGuard:
             "mv --target-directory={parent} own.txt",
             "sed -i.bak 's/secret/changed/' {path}",
             "sort -o {path} own.txt",
+            "sort -o{path} own.txt",
+            "sort -ro{path} own.txt",
+            "sort -T{parent} own.txt",
+            "sort -rT{parent} own.txt",
+            "sort --out={path} own.txt",
+            "sort --temp={parent} own.txt",
             "uniq own.txt {path}",
             "diff --output={path} own.txt own.txt",
             "echo changed > {path}",
@@ -459,6 +465,98 @@ class TestScopedCommandPathGuard:
         assert "outside allowed write paths" in result["error"]
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
         assert own_file.exists()
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'sort -t "$SEPARATOR" own.txt',
+            'sort -t"$SEPARATOR" own.txt',
+            'sort -k "$KEY" own.txt',
+            'sort -k"$KEY" own.txt',
+            'sort --field-separator="$SEPARATOR" own.txt',
+        ],
+    )
+    def test_sort_dynamic_scalar_option_values_are_not_paths(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            'sort -o"$TARGET" own.txt',
+            'sort -ro"$TARGET" own.txt',
+            'sort -T"$TARGET" own.txt',
+            'sort -rT"$TARGET" own.txt',
+            'sort --output="$TARGET" own.txt',
+            'sort --temporary-directory="$TARGET" own.txt',
+        ],
+    )
+    def test_rejects_dynamic_sort_path_option_values(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command_template)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "sort --files0-from={path}",
+            "sort --files0={path}",
+            "sort --random-source={path} own.txt",
+            "sort --random-sour={path} own.txt",
+        ],
+    )
+    def test_rejects_sort_read_control_files_outside_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sort --not-a-sort-option own.txt",
+            "sort --random-s=/dev/zero own.txt",
+            "sort --compress-program=cat own.txt",
+            "sort -q own.txt",
+        ],
+    )
+    def test_rejects_unrecognized_or_ambiguous_sort_options(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sort --human-numeric-sort own.txt",
+            "sort --check=quiet own.txt",
+            "sort -bdfgiMhnRrVcmsuz own.txt",
+        ],
+    )
+    def test_allows_recognized_sort_flag_options(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
 
     @pytest.mark.parametrize(
         "command_template",
@@ -1368,6 +1466,10 @@ class TestScopedCommandPathGuard:
             "cp own.txt {}",
             "cp --target-directory={} own.txt",
             "sort -o {} own.txt",
+            "sort -o{} own.txt",
+            "sort -ro{} own.txt",
+            "sort -T{} own.txt",
+            "sort -rT{} own.txt",
             "uniq own.txt {}",
             "diff --output={} own.txt own.txt",
             "sh -c 'printf changed > {}'",
@@ -1659,6 +1761,10 @@ class TestScopedCommandPathGuard:
         [
             ["tac", "{path}"],
             ["base64", "-i", "{path}"],
+            ["sort", "-o{path}", "own.txt"],
+            ["sort", "-ro{path}", "own.txt"],
+            ["sort", "-T{path}", "own.txt"],
+            ["sort", "-rT{path}", "own.txt"],
             ["tar", "-tf", "{path}"],
             ["dd", "if={path}", "of=copy.bin"],
         ],

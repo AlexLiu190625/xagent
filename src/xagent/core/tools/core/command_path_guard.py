@@ -202,6 +202,17 @@ class _FindExecClause:
     command: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class _PathEvent:
+    value: str
+    access: PathAccess
+
+
+@dataclass(frozen=True)
+class _SortInvocation:
+    path_events: tuple[_PathEvent, ...]
+
+
 TarMode = Literal[
     "create",
     "append",
@@ -826,40 +837,196 @@ class WorkspaceCommandPathGuard:
             self._check_path(raw_path, cwd, "read")
 
     def _check_sort(self, values: Sequence[str], cwd: Path) -> None:
-        positionals: list[str] = []
+        invocation = self._parse_sort_invocation(values)
+        for event in invocation.path_events:
+            self._check_path(event.value, cwd, event.access)
+
+    def _parse_sort_invocation(self, values: Sequence[str]) -> _SortInvocation:
+        short_flag_options = frozenset("bdfgiMhnRrVcCmsuz")
+        short_value_options: dict[str, PathAccess | None] = {
+            "k": None,
+            "o": "write",
+            "S": None,
+            "t": None,
+            "T": "write",
+        }
+        long_path_options: dict[str, PathAccess] = {
+            "--files0-from": "read",
+            "--output": "write",
+            "--random-source": "read",
+            "--temporary-directory": "write",
+        }
+        long_scalar_options = {
+            "--batch-size",
+            "--buffer-size",
+            "--field-separator",
+            "--key",
+            "--parallel",
+            "--sort",
+        }
+        denied_long_options = {"--compress-program"}
+        long_optional_value_options = {"--check"}
+        long_flag_options = {
+            "--debug",
+            "--dictionary-order",
+            "--general-numeric-sort",
+            "--help",
+            "--human-numeric-sort",
+            "--ignore-case",
+            "--ignore-leading-blanks",
+            "--ignore-nonprinting",
+            "--merge",
+            "--month-sort",
+            "--numeric-sort",
+            "--random-sort",
+            "--reverse",
+            "--stable",
+            "--unique",
+            "--version",
+            "--version-sort",
+            "--zero-terminated",
+        }
+        known_long_options = (
+            set(long_path_options)
+            | long_scalar_options
+            | denied_long_options
+            | long_optional_value_options
+            | long_flag_options
+        )
+
+        path_events: list[_PathEvent] = []
         index = 0
         while index < len(values):
             value = values[index]
             if value == "--":
-                positionals.extend(values[index + 1 :])
+                path_events.extend(
+                    _PathEvent(raw_path, "read") for raw_path in values[index + 1 :]
+                )
                 break
-            if value in {"-o", "--output", "-T", "--temporary-directory"}:
-                if index + 1 < len(values):
-                    self._check_path(values[index + 1], cwd, "write")
-                index += 2
-                continue
-            if value.startswith("--output=") or value.startswith(
-                "--temporary-directory="
-            ):
-                self._check_path(value.split("=", 1)[1], cwd, "write")
+
+            value_text = str(value)
+            if value_text.startswith("--"):
+                raw_option, separator, _ = value_text.partition("=")
+                option = self._resolve_sort_long_option(
+                    raw_option,
+                    known_long_options,
+                )
+                path_access = long_path_options.get(option)
+                if path_access is not None:
+                    argument: str
+                    if separator:
+                        argument = self._derived_value(
+                            value,
+                            value[len(raw_option) + 1 :],
+                        )
+                        next_index = index + 1
+                    elif index + 1 < len(values):
+                        argument = values[index + 1]
+                        next_index = index + 2
+                    else:
+                        raise CommandPolicyViolation(
+                            f"missing sort argument for {option}"
+                        )
+                    path_events.append(_PathEvent(argument, path_access))
+                    index = next_index
+                    continue
+
+                if option in denied_long_options:
+                    raise CommandPolicyViolation(
+                        f"sort option {option} cannot safely delegate execution"
+                    )
+
+                if option in long_scalar_options:
+                    if separator:
+                        index += 1
+                    elif index + 1 < len(values):
+                        index += 2
+                    else:
+                        raise CommandPolicyViolation(
+                            f"missing sort argument for {option}"
+                        )
+                    continue
+
+                if option in long_optional_value_options:
+                    index += 1
+                    continue
+
+                if separator:
+                    raise CommandPolicyViolation(
+                        f"sort option {option} does not accept an argument"
+                    )
+
+                # The remaining recognized long options are argument-free.
                 index += 1
                 continue
-            if value == "--files0-from":
-                if index + 1 < len(values):
-                    self._check_path(values[index + 1], cwd, "read")
-                index += 2
+
+            if value_text.startswith("-") and value_text != "-":
+                index = self._parse_sort_short_options(
+                    values,
+                    index,
+                    short_flag_options,
+                    short_value_options,
+                    path_events,
+                )
                 continue
-            if value.startswith("--files0-from="):
-                self._check_path(value.split("=", 1)[1], cwd, "read")
-                index += 1
-                continue
-            if value.startswith("-") and value != "-":
-                index += 1
-                continue
-            positionals.append(value)
+
+            path_events.append(_PathEvent(value, "read"))
             index += 1
-        for raw_path in positionals:
-            self._check_path(raw_path, cwd, "read")
+
+        return _SortInvocation(path_events=tuple(path_events))
+
+    @staticmethod
+    def _resolve_sort_long_option(
+        option: str,
+        known_options: set[str],
+    ) -> str:
+        if option in known_options:
+            return option
+        matches = [
+            candidate for candidate in known_options if candidate.startswith(option)
+        ]
+        if len(matches) != 1:
+            raise CommandPolicyViolation(f"cannot safely resolve sort option {option}")
+        return matches[0]
+
+    def _parse_sort_short_options(
+        self,
+        values: Sequence[str],
+        index: int,
+        flag_options: frozenset[str],
+        value_options: dict[str, PathAccess | None],
+        path_events: list[_PathEvent],
+    ) -> int:
+        source = values[index]
+        options = str(source)[1:]
+        cursor = 0
+        while cursor < len(options):
+            option = options[cursor]
+            if option in flag_options:
+                cursor += 1
+                continue
+            if option not in value_options:
+                raise CommandPolicyViolation(
+                    f"cannot safely resolve sort option -{option}"
+                )
+
+            attached = options[cursor + 1 :]
+            argument: str
+            if attached:
+                argument = self._derived_value(source, attached)
+                next_index = index + 1
+            elif index + 1 < len(values):
+                argument = values[index + 1]
+                next_index = index + 2
+            else:
+                raise CommandPolicyViolation(f"missing sort argument for -{option}")
+
+            access = value_options[option]
+            if access is not None:
+                path_events.append(_PathEvent(argument, access))
+            return next_index
+
+        return index + 1
 
     def _check_uniq(self, values: Sequence[str], cwd: Path) -> None:
         options_with_value = {
