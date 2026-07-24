@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import io
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -117,6 +117,25 @@ def _enable_widget(
     key = body["widget_key"]
     assert isinstance(key, str) and key
     return str(key)
+
+
+def _set_workforce_allowed_domains_raw(
+    workforce_id: int, allowed_domains: object
+) -> None:
+    db = _direct_db_session()
+    try:
+        deployment = (
+            db.query(Deployment)
+            .filter(
+                Deployment.owner_type == DeploymentOwnerType.WORKFORCE.value,
+                Deployment.owner_id == workforce_id,
+            )
+            .one()
+        )
+        cast(Any, deployment).allowed_domains = allowed_domains
+        db.commit()
+    finally:
+        db.close()
 
 
 def _authenticate_widget_guest_by_key(
@@ -374,6 +393,47 @@ def test_widget_embed_ticket_enforces_allowed_domains() -> None:
         headers={"origin": "https://example.com"},
     )
     assert allowed.status_code == 200, allowed.text
+
+
+def test_widget_embed_ticket_rejects_malformed_workforce_allowlist() -> None:
+    workforce_id = _create_workforce("Malformed Domain Gate Widget Workforce")
+    key = _enable_widget(workforce_id, allowed_domains=["example.com"])
+    _set_workforce_allowed_domains_raw(workforce_id, "*")
+
+    response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": key},
+        headers={"origin": "https://example.com"},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: example.com"
+
+
+def test_widget_auth_rejects_ticket_when_workforce_allowlist_becomes_malformed() -> (
+    None
+):
+    workforce_id = _create_workforce("Malformed Live Allowlist Widget Workforce")
+    key = _enable_widget(workforce_id, allowed_domains=["example.com"])
+    ticket_response = client.post(
+        "/api/widget/embed-ticket",
+        json={"widget_key": key},
+        headers={"origin": "https://example.com"},
+    )
+    assert ticket_response.status_code == 200, ticket_response.text
+
+    _set_workforce_allowed_domains_raw(workforce_id, [None, "example.com"])
+
+    response = client.post(
+        "/api/widget/auth",
+        json={
+            "guest_id": "guest_test",
+            "embed_ticket": ticket_response.json()["ticket"],
+        },
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: example.com"
 
 
 def test_widget_auth_rejects_unknown_key() -> None:

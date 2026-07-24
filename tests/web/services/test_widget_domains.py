@@ -39,6 +39,24 @@ def test_domain_allowed_preserves_widget_allowlist_matching(
     assert domain_allowed(origin_domain, allowed_domains) is expected
 
 
+@pytest.mark.parametrize(
+    ("origin_domain", "allowed_domains"),
+    [
+        ("example.com", None),
+        ("e", "example.com"),
+        ("example.com", {"example.com": True}),
+        ("example.com", ["example.com", None]),
+        ("example.com", [None, "example.com"]),
+        ("123", [123]),
+        ("true", [True]),
+    ],
+)
+def test_domain_allowed_rejects_malformed_persisted_allowlists(
+    origin_domain: str, allowed_domains: object
+) -> None:
+    assert not domain_allowed(origin_domain, allowed_domains)
+
+
 def test_normalized_domain_composition_preserves_case_insensitive_allowlists() -> None:
     raw_origin = "https://APP.EXAMPLE.COM/widget"
     raw_allowed_domain = " APP.example.COM "
@@ -68,3 +86,11 @@ def test_require_domain_allowed_preserves_forbidden_response() -> None:
 
     assert exc_info.value.status_code == 403
     assert exc_info.value.detail == "Domain not allowed: untrusted.example"
+
+
+def test_require_domain_allowed_maps_malformed_allowlist_to_forbidden() -> None:
+    with pytest.raises(HTTPException) as exc_info:
+        require_domain_allowed("trusted.example", [None, "trusted.example"])
+
+    assert exc_info.value.status_code == 403
+    assert exc_info.value.detail == "Domain not allowed: trusted.example"

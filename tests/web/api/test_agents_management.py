@@ -6,7 +6,7 @@ import io
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from jose import jwt as jose_jwt
@@ -475,6 +475,31 @@ def test_widget_embed_ticket_rejected_for_disallowed_origin() -> None:
     assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
 
 
+def test_widget_embed_ticket_rejects_malformed_persisted_agent_allowlist() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Malformed Allowlist Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        cast(Any, agent).allowed_domains = {"trusted-site.com": True}
+        db.commit()
+    finally:
+        db.close()
+
+    response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+
+
 def test_embed_ticket_requires_valid_widget_key_despite_spoofed_origin() -> None:
     """#742 (embed-ticket path): a forged allowlisted Origin is worthless
     without the unguessable per-agent widget key."""
@@ -822,6 +847,36 @@ def test_widget_auth_rechecks_ticket_origin_against_current_allowlist() -> None:
         "/api/widget/auth",
         json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
     )
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+
+
+def test_widget_auth_rejects_ticket_when_agent_allowlist_becomes_malformed() -> None:
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Malformed Live Allowlist Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    ticket = _issue_embed_ticket(agent_id, "https://trusted-site.com").json()["ticket"]
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        cast(Any, agent).allowed_domains = ["trusted-site.com", None]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+    )
+
     assert response.status_code == 403
     assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
 

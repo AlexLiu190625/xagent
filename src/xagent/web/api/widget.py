@@ -103,9 +103,11 @@ EMBED_TICKET_OWNER_WORKFORCE = "workforce"
 @dataclass(frozen=True)
 class ResolvedWidgetOwner:
     """A validated widget owner (agent XOR workforce) plus the data the auth
-    and ticket paths need: the embedding allowlist and the resolved key."""
+    and ticket paths need: the raw persisted embedding allowlist and the
+    resolved key. The domain-policy service validates the JSON value before
+    using it as an authorization rule."""
 
-    allowed_domains: list[str]
+    allowed_domains: object
     widget_key: str
     agent: Agent | None = None
     workforce: Workforce | None = None
@@ -158,7 +160,7 @@ def _resolve_widget_owner_by_key(db: Session, widget_key: str) -> ResolvedWidget
     agent = _resolve_widget_agent_by_key(db, widget_key)
     if agent is not None:
         return ResolvedWidgetOwner(
-            allowed_domains=list(agent.allowed_domains or []),
+            allowed_domains=agent.allowed_domains,
             widget_key=widget_key,
             agent=agent,
         )
@@ -172,7 +174,7 @@ def _resolve_widget_owner_by_key(db: Session, widget_key: str) -> ResolvedWidget
         )
         if workforce is not None and workforce.status == "active":
             return ResolvedWidgetOwner(
-                allowed_domains=list(deployment.allowed_domains or []),
+                allowed_domains=deployment.allowed_domains,
                 widget_key=widget_key,
                 workforce=workforce,
             )
@@ -251,7 +253,7 @@ def _workforce_owner_from_ticket(
         or not deployment.widget_key
     ):
         raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
-    allowed_domains = list(deployment.allowed_domains or [])
+    allowed_domains = deployment.allowed_domains
     # Re-check so tickets die immediately if the allowlist shrinks.
     require_domain_allowed(origin_domain, allowed_domains)
     return ResolvedWidgetOwner(
@@ -295,11 +297,11 @@ def _owner_from_embed_ticket(db: Session, embed_ticket: str) -> ResolvedWidgetOw
     if not isinstance(ticket_agent_id, int):
         raise HTTPException(status_code=403, detail="Invalid or expired embed ticket")
     agent = _get_widget_enabled_agent(db, ticket_agent_id)
-    allowed_domains: list[str] = agent.allowed_domains or []  # type: ignore
+    allowed_domains = agent.allowed_domains
     # Re-check so tickets die immediately if the allowlist shrinks.
     require_domain_allowed(origin_domain, allowed_domains)
     return ResolvedWidgetOwner(
-        allowed_domains=list(allowed_domains),
+        allowed_domains=allowed_domains,
         widget_key=str(agent.widget_key or ""),
         agent=agent,
     )
