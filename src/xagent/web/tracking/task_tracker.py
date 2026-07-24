@@ -200,12 +200,12 @@ def _write_task_usage_sync(
         db_session.close()
 
 
-def _check_run_progress_gate_sync(
+def _check_quota_on_event_loop(
     user_id: int | None,
     delta_details: list[dict[str, Any]],
     delta_actions: int,
 ) -> str | None:
-    """Invoke the progress hook with a worker-owned short Session."""
+    """Invoke the legacy progress hook on its documented event-loop thread."""
     from ..services.quota_hooks import check_run_progress_gate
 
     db_session = _new_short_session()
@@ -220,18 +220,38 @@ def _check_run_progress_gate_sync(
         db_session.close()
 
 
+def _record_usage_on_event_loop(
+    user_id: int | None,
+    delta_details: list[dict[str, Any]],
+    delta_actions: int,
+) -> None:
+    """Invoke the legacy completion hook on its established event-loop thread."""
+    from ..services.quota_hooks import record_usage
+
+    db_session = _new_short_session()
+    try:
+        record_usage(
+            db_session,
+            user_id,
+            delta_details,
+            delta_actions,
+        )
+    finally:
+        # The callback owns separate durability and must not leave work pending
+        # on this compatibility Session.
+        if db_session.in_transaction():
+            db_session.rollback()
+        db_session.close()
+
+
 def _complete_task_usage_sync(
     task_id: int,
     usage: TokenUsage,
     expected_run_id: str | None = None,
     expected_runner_id: str | None = None,
-    user_id: int | None = None,
-    delta_details: list[dict[str, Any]] | None = None,
-    delta_actions: int = 0,
 ) -> bool:
-    """Persist and meter one run while its durable ownership fence still wins."""
+    """Persist one run while its durable ownership fence still wins."""
     from ..services.db_runtime import is_database_pool_timeout
-    from ..services.quota_hooks import record_usage
 
     db_session = _new_short_session()
     try:
@@ -267,26 +287,6 @@ def _complete_task_usage_sync(
                 expected_run_id,
             )
             return False
-
-        # The committed conditional UPDATE is the ownership linearization
-        # point. Invoke the independently durable billing hook only after it
-        # succeeds, so a replacement runner that wins first cannot be charged
-        # by this stale tracker. Committing first also returns this Session's
-        # connection before a hook opens its own Session.
-        try:
-            record_usage(
-                db_session,
-                user_id,
-                delta_details or [],
-                delta_actions,
-            )
-        except Exception as e:  # noqa: BLE001
-            logger.warning(f"Quota usage recording failed for task {task_id}: {e}")
-        finally:
-            # Hooks must not leave writes pending on the compatibility Session.
-            # End any read transaction they opened before returning it.
-            if db_session.in_transaction():
-                db_session.rollback()
         return True
     finally:
         db_session.close()
@@ -558,14 +558,10 @@ class TaskTracker:
             return None
         try:
             delta_details, delta_actions = self._turn_delta()
-            user_id = self._user_id
-            copied_delta_details = _copy_details(delta_details)
-            reason = await run_db_io_cancellation_safe(
-                lambda: _check_run_progress_gate_sync(
-                    user_id,
-                    copied_delta_details,
-                    delta_actions,
-                )
+            reason = _check_quota_on_event_loop(
+                self._user_id,
+                _copy_details(delta_details),
+                delta_actions,
             )
             if reason is not None:
                 self.quota_interrupt_reason = reason
@@ -594,9 +590,6 @@ class TaskTracker:
                     usage,
                     self.expected_run_id,
                     self.expected_runner_id,
-                    self._user_id,
-                    _copy_details(delta_details),
-                    delta_actions,
                 )
             )
         except Exception as e:  # noqa: BLE001
@@ -613,6 +606,20 @@ class TaskTracker:
             return usage
         if not persisted:
             return usage
+
+        # The committed conditional UPDATE is the ownership linearization
+        # point. Preserve the established event-loop affinity of application
+        # quota callbacks, and invoke metering only after this runner still owns
+        # the task. The remaining blocking risk is tracked separately from the
+        # database-lifecycle changes in this PR.
+        try:
+            _record_usage_on_event_loop(
+                self._user_id,
+                _copy_details(delta_details),
+                delta_actions,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"Quota usage recording failed for task {self.task_id}: {e}")
 
         # Only log if values have changed from last report
         if (

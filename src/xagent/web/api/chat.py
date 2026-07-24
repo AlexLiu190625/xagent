@@ -778,12 +778,9 @@ def _update_task_title_isolated(task_id: int, task_name: str) -> bool:
         return True
 
 
-def _check_task_run_gate_isolated(
-    task_id: int,
-) -> str | dict[str, Any] | None:
-    """Run the existing start gate in a worker-owned short Session."""
+def _load_task_run_gate_user_id_isolated(task_id: int) -> int | None:
+    """Load the detached quota-gate input in a worker-owned short Session."""
     from ..models.database import get_session_local
-    from ..services.quota_hooks import check_run_gate
 
     SessionLocal = get_session_local()
     with SessionLocal() as gate_db:
@@ -791,10 +788,21 @@ def _check_task_run_gate_isolated(
         if gate_task is None:
             logger.warning("Quota gate: task %s not found; allowing run", task_id)
             return None
-        gate_reason = check_run_gate(gate_db, getattr(gate_task, "user_id", None))
+        user_id = getattr(gate_task, "user_id", None)
+        return int(user_id) if user_id is not None else None
+
+
+def _check_task_run_gate_on_event_loop(
+    user_id: int | None,
+) -> str | dict[str, Any] | None:
+    """Invoke the legacy start hook on its established event-loop thread."""
+    from ..models.database import get_session_local
+    from ..services.quota_hooks import check_run_gate
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as gate_db:
+        gate_reason = check_run_gate(gate_db, user_id)
         if isinstance(gate_reason, Mapping):
-            # Do not return an application-owned Mapping that may retain ORM
-            # state from the worker Session.
             return dict(gate_reason)
         return str(gate_reason) if gate_reason is not None else None
 
@@ -2524,12 +2532,18 @@ class AgentServiceManager:
         # Quota gate: refuse to start a run when the team is out of monthly
         # quota. Non-pool hook errors fail open. A pool checkout timeout propagates
         # before this method performs further DB-backed runtime work, preventing an
-        # immediate cascade into workforce/tracker checkouts. Run the hook in a DB
-        # worker because it may query the application database.
+        # immediate cascade into workforce/tracker checkouts. Only the task lookup
+        # moves to a DB worker here. The application callback keeps its established
+        # event-loop affinity; its remaining blocking risk is tracked separately.
         if tracker_task_id:
             try:
-                gate_reason = await run_db_io_cancellation_safe(
-                    lambda: _check_task_run_gate_isolated(int(tracker_task_id))
+                gate_user_id = await run_db_io_cancellation_safe(
+                    lambda: _load_task_run_gate_user_id_isolated(int(tracker_task_id))
+                )
+                gate_reason = (
+                    _check_task_run_gate_on_event_loop(gate_user_id)
+                    if gate_user_id is not None
+                    else None
                 )
                 if gate_reason:
                     # The gate returns either a plain message or a structured

@@ -82,7 +82,7 @@ def _create_single_connection_runtime_db(tmp_path, filename: str):
 async def test_execute_task_quota_pool_timeout_stops_pre_run_checkouts(
     tmp_path,
 ) -> None:
-    """A quota checkout timeout must terminate before workforce/tracker I/O."""
+    """A run-gate context timeout stops later workforce/tracker checkouts."""
     engine, factory, task_id = _create_single_connection_runtime_db(
         tmp_path,
         "quota-pool-timeout.db",
@@ -144,7 +144,7 @@ async def test_execute_task_workforce_pool_timeout_stops_tracker_checkout(
                 return_value=factory,
             ),
             patch(
-                "xagent.web.api.chat._check_task_run_gate_isolated",
+                "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
                 return_value=None,
             ),
             patch(
@@ -221,7 +221,7 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -321,7 +321,7 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -415,7 +415,7 @@ async def test_execute_task_tracker_pool_timeout_stops_execution_and_release() -
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -463,7 +463,11 @@ async def test_execute_task_non_pool_quota_error_remains_fail_open() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            return_value=7,
+        ),
+        patch(
+            "xagent.web.api.chat._check_task_run_gate_on_event_loop",
             side_effect=RuntimeError("quota service unavailable"),
         ),
         patch(
@@ -495,7 +499,7 @@ async def test_execute_task_non_pool_quota_error_remains_fail_open() -> None:
 async def test_execute_task_preflight_pool_wait_does_not_block_event_loop(
     tmp_path,
 ) -> None:
-    """Quota/workforce preflight must wait for the pool off the event loop."""
+    """Run-gate context/workforce preflight waits off the event loop."""
     engine = create_engine(
         f"sqlite:///{tmp_path / 'execute-preflight-pool.db'}",
         poolclass=QueuePool,
@@ -604,7 +608,7 @@ async def test_execute_task_releases_read_only_caller_checkout_before_worker_io(
     try:
         with (
             patch(
-                "xagent.web.api.chat._check_task_run_gate_isolated",
+                "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
                 side_effect=isolated_gate,
             ),
             patch(
@@ -655,7 +659,7 @@ async def test_execute_task_rejects_dirty_caller_session_before_worker_io(
     try:
         with (
             patch(
-                "xagent.web.api.chat._check_task_run_gate_isolated",
+                "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             ) as quota_gate,
             pytest.raises(
                 RuntimeError,
@@ -883,6 +887,8 @@ async def test_execute_task_start_gate_forwards_structured_reason(db_session) ->
     db_session.commit()
 
     manager = AgentServiceManager()
+    event_loop_thread = threading.get_ident()
+    hook_threads: list[int] = []
     block = {
         "code": "quota_exceeded",
         "metric": "runs_per_month",
@@ -891,9 +897,16 @@ async def test_execute_task_start_gate_forwards_structured_reason(db_session) ->
         "message": "Team quota exhausted for this billing period.",
     }
 
+    def run_gate(*_args):
+        hook_threads.append(threading.get_ident())
+        return block
+
     # The gate short-circuits before lease/tracker/execution, so a patched
     # check_run_gate returning the structured block is enough.
-    with patch("xagent.web.services.quota_hooks.check_run_gate", return_value=block):
+    with patch(
+        "xagent.web.services.quota_hooks.check_run_gate",
+        side_effect=run_gate,
+    ):
         result = await manager.execute_task(
             agent_service=_FakeAgentService(),
             task="hello",
@@ -907,6 +920,7 @@ async def test_execute_task_start_gate_forwards_structured_reason(db_session) ->
     assert result["output"] == block["message"]
     assert result["error_code"] == "quota_exceeded"
     assert result["error_details"] == block
+    assert hook_threads == [event_loop_thread]
 
 
 @pytest.mark.asyncio
@@ -933,7 +947,7 @@ async def test_execute_task_cancellation_during_workforce_sync_releases_lease() 
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -1026,7 +1040,7 @@ async def test_execute_task_cancellation_during_tracker_start_releases_lease() -
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -1200,7 +1214,7 @@ async def test_execute_task_persists_final_usage_before_releasing_lease() -> Non
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -1268,7 +1282,7 @@ async def test_execute_task_releases_sandbox_when_lease_release_raises() -> None
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -1336,7 +1350,7 @@ async def test_execute_task_final_usage_pool_timeout_retains_lease() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -1404,7 +1418,7 @@ async def test_execute_task_heartbeat_pool_timeout_retains_lease() -> None:
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
@@ -1492,7 +1506,7 @@ async def test_execute_task_cancellation_during_heartbeat_stop_drains_cleanup() 
 
     with (
         patch(
-            "xagent.web.api.chat._check_task_run_gate_isolated",
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
             return_value=None,
         ),
         patch(
