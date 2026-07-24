@@ -59,6 +59,30 @@ describe("widget bootstrap", () => {
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Missing data-widget-key"))
   })
 
+  it("generates and persists a guest id for a first-time visitor", async () => {
+    localStorage.removeItem("xagent_guest_id")
+    vi.spyOn(Math, "random")
+      .mockReturnValueOnce(0.123456)
+      .mockReturnValueOnce(0.654321)
+    fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
+      ticket: "ticket/one",
+      agent_id: 17,
+    }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+
+    runWidget({ "data-widget-key": "widget-secret" })
+
+    const guestId = localStorage.getItem("xagent_guest_id")
+    expect(guestId).toEqual(expect.stringMatching(/^guest_[a-z0-9]+$/))
+    await vi.waitFor(() => {
+      expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.src).toBe(
+        `https://chat.example/widget/chat/default?guest_id=${guestId}&agent_id=17&embed_ticket=ticket%2Fone`,
+      )
+    })
+  })
+
   it("loads an embed-ticket iframe URL without exposing the widget key", async () => {
     fetchMock.mockResolvedValueOnce(new Response(JSON.stringify({
       ticket: "ticket/one",
@@ -89,7 +113,7 @@ describe("widget bootstrap", () => {
       .not.toContain("widget-secret")
   })
 
-  it("does not navigate the iframe when embed-ticket authorization is rejected", async () => {
+  it("does not navigate the iframe on a non-OK embed-ticket response", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockResolvedValueOnce(new Response("forbidden", { status: 403 }))
 
@@ -101,7 +125,7 @@ describe("widget bootstrap", () => {
     expect(document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")?.getAttribute("src")).toBeNull()
   })
 
-  it("does not navigate the iframe when embed-ticket authorization rejects", async () => {
+  it("does not navigate the iframe on an embed-ticket network failure", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockRejectedValueOnce(new Error("network unavailable"))
 

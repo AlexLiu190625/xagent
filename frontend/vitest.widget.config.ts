@@ -12,11 +12,13 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
       reporter: ["text", "json-summary"],
       reportsDirectory: "coverage/widget",
       thresholds: {
+        // Keep a practical per-file floor while failing if either shared
+        // widget surface loses most of its regression coverage.
         perFile: true,
-        statements: 1,
-        branches: 1,
-        functions: 1,
-        lines: 1,
+        statements: 80,
+        branches: 55,
+        functions: 45,
+        lines: 80,
       },
     },
   },
