@@ -6,7 +6,7 @@ import io
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from jose import jwt as jose_jwt
@@ -475,6 +475,41 @@ def test_widget_embed_ticket_rejected_for_disallowed_origin() -> None:
     assert response.json()["detail"] == "Domain not allowed: evil-attacker.com"
 
 
+def test_widget_embed_ticket_rejects_malformed_persisted_agent_allowlist(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Malformed Allowlist Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        cast(Any, agent).allowed_domains = {
+            "do-not-log-this-policy-value.example": True
+        }
+        db.commit()
+    finally:
+        db.close()
+
+    response = _issue_embed_ticket(agent_id, "https://trusted-site.com")
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=agent owner_id={agent_id} reason=not_list"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
+
+
 def test_embed_ticket_requires_valid_widget_key_despite_spoofed_origin() -> None:
     """#742 (embed-ticket path): a forged allowlisted Origin is worthless
     without the unguessable per-agent widget key."""
@@ -824,6 +859,47 @@ def test_widget_auth_rechecks_ticket_origin_against_current_allowlist() -> None:
     )
     assert response.status_code == 403
     assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+
+
+def test_widget_auth_rejects_ticket_when_agent_allowlist_becomes_malformed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("WARNING", logger="xagent.web.services.widget_domains")
+    _admin_headers()
+    owner_id = _user_id("admin")
+    agent_id = _create_agent_row(
+        user_id=owner_id,
+        name="Malformed Live Allowlist Widget Agent",
+        status=AgentStatus.PUBLISHED,
+        widget_enabled=True,
+        allowed_domains=["trusted-site.com"],
+    )
+
+    ticket = _issue_embed_ticket(agent_id, "https://trusted-site.com").json()["ticket"]
+
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        cast(Any, agent).allowed_domains = [
+            "do-not-log-this-policy-value.example",
+            None,
+        ]
+        db.commit()
+    finally:
+        db.close()
+
+    response = client.post(
+        "/api/widget/auth",
+        json={"agent_id": agent_id, "guest_id": "guest-1", "embed_ticket": ticket},
+    )
+
+    assert response.status_code == 403
+    assert response.json()["detail"] == "Domain not allowed: trusted-site.com"
+    assert (
+        "Rejected malformed widget allowed-domains policy: "
+        f"owner_type=agent owner_id={agent_id} reason=non_string_entry"
+    ) in caplog.text
+    assert "do-not-log-this-policy-value.example" not in caplog.text
 
 
 def test_widget_embed_ticket_matches_domain_regardless_of_scheme() -> None:
@@ -1301,6 +1377,38 @@ def test_enabling_widget_generates_missing_key() -> None:
         agent = db.query(Agent).filter(Agent.id == agent_id).first()
         assert agent is not None
         assert isinstance(agent.widget_key, str) and len(agent.widget_key) >= 32
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize(
+    "blank_domain",
+    ["", "   ", "\u001c"],
+    ids=["empty", "spaces", "unicode-control-separator"],
+)
+def test_agent_update_rejects_blank_widget_allowed_domain(
+    blank_domain: str,
+) -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Validated Widget Domain Agent")
+    configured = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"allowed_domains": ["existing.example"]},
+    )
+    assert configured.status_code == 200, configured.text
+
+    response = client.put(
+        f"/api/agents/{agent_id}",
+        headers=headers,
+        json={"allowed_domains": [blank_domain]},
+    )
+
+    assert response.status_code == 422, response.text
+    db = _direct_db_session()
+    try:
+        agent = db.query(Agent).filter(Agent.id == agent_id).one()
+        assert agent.allowed_domains == ["existing.example"]
     finally:
         db.close()
 
