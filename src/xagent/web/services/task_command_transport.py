@@ -641,11 +641,8 @@ def defer_task_command(
 def retry_failed_task_command(
     db: Session,
     command_db_id: int,
-    *,
-    target_run_id: str | None,
-    target_runner_id: str | None,
 ) -> bool:
-    """Atomically reset a terminal command for an explicit client retry."""
+    """Reset one failed command without retargeting its immutable execution."""
 
     now = _utc_now()
     updated = (
@@ -663,8 +660,6 @@ def retry_failed_task_command(
                 TaskExecutionCommand.result: None,
                 TaskExecutionCommand.claimed_by: None,
                 TaskExecutionCommand.claim_expires_at: None,
-                TaskExecutionCommand.target_run_id: target_run_id,
-                TaskExecutionCommand.target_runner_id: target_runner_id,
                 TaskExecutionCommand.completed_at: None,
                 TaskExecutionCommand.updated_at: now,
             },

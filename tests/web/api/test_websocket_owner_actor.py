@@ -11,16 +11,22 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
+from dataclasses import is_dataclass
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from sqlalchemy import create_engine
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from xagent.core.execution_scope import (
     ExecutionScope,
     set_execution_scope_resolver,
 )
+from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     _claim_user_message_delivery_isolated,
     _handle_chat_message_unserialized,
@@ -28,6 +34,7 @@ from xagent.web.api.websocket import (
     _handle_resume_task_unserialized,
     background_task_manager,
     execute_resume_background,
+    get_authenticated_user,
     handle_chat_message,
     handle_pause_task,
     handle_resume_task,
@@ -36,6 +43,7 @@ from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.task_command import TaskExecutionCommand
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
 from xagent.web.services.chat_history_service import (
     DELIVERY_DISPATCHED,
@@ -43,6 +51,10 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_PENDING,
 )
 from xagent.web.services.task_execution_controller import StaleTaskRunError
+from xagent.web.services.task_lease_service import (
+    TaskLease,
+    current_task_lease,
+)
 
 
 @pytest.fixture()
@@ -77,6 +89,58 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
     db.commit()
     db.refresh(t)
     return t
+
+
+@pytest.mark.asyncio
+async def test_websocket_authentication_returns_frozen_principal_off_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    event_loop_thread = threading.get_ident()
+    auth_threads: list[int] = []
+    closed_sessions: list[bool] = []
+
+    class TrackingSession:
+        def close(self) -> None:
+            closed_sessions.append(True)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, _exc_type, _exc, _traceback) -> None:
+            self.close()
+
+    def session_factory():
+        return TrackingSession()
+
+    def get_test_db():
+        session = TrackingSession()
+        try:
+            yield session
+        finally:
+            session.close()
+
+    def authenticate(_token: str, _db: object):
+        auth_threads.append(threading.get_ident())
+        return SimpleNamespace(id=73, is_admin=True)
+
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr("xagent.web.models.database.get_db", get_test_db)
+    monkeypatch.setattr(
+        websocket_api,
+        "get_user_from_websocket_token",
+        authenticate,
+    )
+
+    principal = await get_authenticated_user(MagicMock(), "signed-token")
+
+    assert principal is not None
+    assert principal.id == 73
+    assert principal.is_admin is True
+    assert auth_threads == [auth_threads[0]]
+    assert auth_threads[0] != event_loop_thread
+    assert closed_sessions
+    assert is_dataclass(principal)
+    assert principal.__dataclass_params__.frozen is True
 
 
 def _register_current_resume(task_id: int) -> None:
@@ -170,31 +234,55 @@ async def test_chat_admin_append_to_other_users_task_claims_as_owner(
 async def test_chat_new_turn_releases_request_transaction_before_orchestrator(
     db_session,
 ) -> None:
-    """The worker claim must not compete with the request's prior checkout."""
+    """Turn preparation must release its worker checkout before the claim."""
     from xagent.web.models.database import get_session_local
 
     owner = _user(db_session, "new-turn-owner")
     task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
-    request_sessions = []
-    transaction_open_at_begin: list[bool] = []
+    owner_id = int(owner.id)
+    task_id = int(task.id)
+    db_session.close()
+    event_loop_thread = threading.get_ident()
+    preparation_threads: list[int] = []
+    session_closed_before_begin: list[bool] = []
+    closed_sessions: list[bool] = []
+    SessionLocal = get_session_local()
+    prepare_turn = websocket_api._prepare_websocket_turn_sync
 
-    def request_db_generator():
-        request_db = get_session_local()()
-        request_sessions.append(request_db)
-        try:
-            yield request_db
-        finally:
-            request_db.close()
+    class TrackingSessionContext:
+        def __init__(self) -> None:
+            self.session = SessionLocal()
+
+        def __enter__(self):
+            return self.session
+
+        def __exit__(self, _exc_type, _exc, _traceback) -> None:
+            self.session.close()
+            closed_sessions.append(True)
+
+    def tracking_session_factory():
+        return TrackingSessionContext()
+
+    def tracked_prepare_turn(**kwargs):
+        preparation_threads.append(threading.get_ident())
+        return prepare_turn(**kwargs)
 
     async def begin_turn(**_kwargs):
-        transaction_open_at_begin.append(request_sessions[-1].in_transaction())
+        session_closed_before_begin.append(bool(closed_sessions))
 
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
         send_personal_message=AsyncMock(),
     )
     with (
-        patch("xagent.web.api.websocket.get_db", side_effect=request_db_generator),
+        patch(
+            "xagent.web.api.websocket._prepare_websocket_turn_sync",
+            side_effect=tracked_prepare_turn,
+        ),
+        patch(
+            "xagent.web.api.websocket.get_session_local",
+            return_value=tracking_session_factory,
+        ),
         patch("xagent.web.api.websocket.manager", ws_manager),
         patch(
             "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
@@ -203,16 +291,647 @@ async def test_chat_new_turn_releases_request_transaction_before_orchestrator(
     ):
         await _handle_chat_message_unserialized(
             MagicMock(),
-            int(task.id),
+            task_id,
             {
                 "message": "follow-up",
                 "client_message_id": "pool-boundary-turn",
-                "user": owner,
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
                 "files": [],
             },
         )
 
-    assert transaction_open_at_begin == [False]
+    assert preparation_threads
+    assert preparation_threads[0] != event_loop_thread
+    assert session_closed_before_begin == [True]
+
+
+@pytest.mark.asyncio
+async def test_chat_turn_releases_one_slot_pool_before_task_info_broadcast(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task-info snapshot checkout must not overlap turn preparation."""
+
+    from xagent.web.models import database as database_module
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'websocket-turn-broadcast.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with SessionLocal() as db:
+        owner = User(
+            username="broadcast-pool-owner",
+            password_hash="x",
+            is_admin=False,
+        )
+        db.add(owner)
+        db.flush()
+        task = Task(
+            user_id=int(owner.id),
+            title="broadcast pool task",
+            description="d",
+            status=TaskStatus.COMPLETED,
+            execution_mode="balanced",
+            source="sdk",
+        )
+        db.add(task)
+        db.commit()
+        actor_user_id = int(owner.id)
+        task_id = int(task.id)
+
+    def local_get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    class RecordingWebSocket:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        async def send_text(self, message: str) -> None:
+            self.messages.append(message)
+
+    websocket = RecordingWebSocket()
+    local_manager = websocket_api.ConnectionManager()
+    local_manager.register_connection(websocket, task_id)  # type: ignore[arg-type]
+    begin_turn = AsyncMock()
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(websocket_api, "get_db", local_get_db)
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    prepare_turn = websocket_api._prepare_websocket_turn_sync
+
+    def slow_prepare_turn(**kwargs):
+        time.sleep(0.05)
+        return prepare_turn(**kwargs)
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_prepare_websocket_turn_sync",
+        slow_prepare_turn,
+    )
+    monkeypatch.setattr(websocket_api, "manager", local_manager)
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+        begin_turn,
+    )
+
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        await asyncio.wait_for(
+            _handle_chat_message_unserialized(
+                websocket,  # type: ignore[arg-type]
+                task_id,
+                {
+                    "message": "follow-up",
+                    "client_message_id": "broadcast-pool-turn",
+                    "user": SimpleNamespace(id=actor_user_id, is_admin=False),
+                    "files": [],
+                },
+            ),
+            timeout=1.0,
+        )
+        assert ticks >= 3, "WebSocket preparation blocked the asyncio event loop"
+    finally:
+        ticker_stop.set()
+        await ticker_task
+        engine.dispose()
+
+    begin_turn.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_pause_accepted_wait_releases_one_slot_pool_before_previous_run(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Previous-run settlement must acquire the pool while this handler waits."""
+
+    from xagent.web.models import database as database_module
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'websocket-turn-pause.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with SessionLocal() as db:
+        owner = User(
+            username="pause-pool-owner",
+            password_hash="x",
+            is_admin=False,
+        )
+        db.add(owner)
+        db.flush()
+        task = Task(
+            user_id=int(owner.id),
+            title="pause pool task",
+            description="d",
+            status=TaskStatus.RUNNING,
+            execution_mode="balanced",
+            source="sdk",
+            run_id="pause-pool-run",
+            runner_id="pause-pool-runner",
+            control_state="pause_requested",
+        )
+        db.add(task)
+        db.commit()
+        actor_user_id = int(owner.id)
+        task_id = int(task.id)
+
+    def local_get_db():
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    async def settle_previous(_task_id: int) -> None:
+        def settle_sync() -> None:
+            with SessionLocal() as db:
+                current = db.query(Task).filter(Task.id == task_id).one()
+                current.status = TaskStatus.PAUSED
+                current.control_state = "paused"
+                db.commit()
+
+        await asyncio.to_thread(settle_sync)
+
+    background_manager = MagicMock()
+    background_manager.wait_for_previous = AsyncMock(side_effect=settle_previous)
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    begin_turn = AsyncMock()
+    ticker_stop = asyncio.Event()
+    ticks = 0
+
+    async def ticker() -> None:
+        nonlocal ticks
+        while not ticker_stop.is_set():
+            ticks += 1
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(websocket_api, "get_db", local_get_db)
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    prepare_turn = websocket_api._prepare_websocket_turn_sync
+
+    def slow_prepare_turn(**kwargs):
+        time.sleep(0.05)
+        return prepare_turn(**kwargs)
+
+    monkeypatch.setattr(
+        websocket_api,
+        "_prepare_websocket_turn_sync",
+        slow_prepare_turn,
+    )
+    monkeypatch.setattr(websocket_api, "manager", ws_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "background_task_manager",
+        background_manager,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+        begin_turn,
+    )
+
+    websocket_api._mark_task_pause_accepted(task_id)
+    ticker_task = asyncio.create_task(ticker())
+    try:
+        await asyncio.wait_for(
+            _handle_chat_message_unserialized(
+                MagicMock(),
+                task_id,
+                {
+                    "message": "continue after pause",
+                    "client_message_id": "pause-pool-turn",
+                    "user": SimpleNamespace(id=actor_user_id, is_admin=False),
+                    "files": [],
+                },
+            ),
+            timeout=1.0,
+        )
+        assert ticks >= 3, "pause settlement checkout blocked the event loop"
+    finally:
+        websocket_api._clear_task_pause_accepted(task_id)
+        ticker_stop.set()
+        await ticker_task
+        engine.dispose()
+
+    background_manager.wait_for_previous.assert_awaited_once_with(task_id)
+    begin_turn.assert_awaited_once()
+    assert begin_turn.await_args.kwargs["kind"].value == "append"
+
+
+@pytest.mark.asyncio
+async def test_missing_task_create_commits_claim_message_file_and_prelease_together(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The replacement task is already a fully claimed CREATE at first send."""
+
+    from xagent.web.models import database as database_module
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'websocket-missing-create.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    file_path = tmp_path / "atomic.txt"
+    file_path.write_text("atomic file")
+    with SessionLocal() as db:
+        owner = User(
+            username="missing-create-owner",
+            password_hash="x",
+            is_admin=False,
+        )
+        db.add(owner)
+        db.flush()
+        file_record = UploadedFile(
+            file_id="missing-create-file",
+            user_id=int(owner.id),
+            filename="atomic.txt",
+            storage_path=str(file_path),
+            mime_type="text/plain",
+            file_size=file_path.stat().st_size,
+        )
+        db.add(file_record)
+        db.commit()
+        owner_id = int(owner.id)
+
+    observed_task_ids: list[int] = []
+    sent_messages: list[dict] = []
+
+    class AtomicCreateManager:
+        def move_connection(self, _websocket: object, new_task_id: int) -> None:
+            observed_task_ids.append(new_task_id)
+
+        async def send_personal_message(self, event: dict, _websocket: object) -> None:
+            sent_messages.append(event)
+            if event.get("type") != "task_id_updated":
+                return
+            assert engine.pool.checkedout() == 0
+            new_task_id = int(event["new_task_id"])
+            with SessionLocal() as db:
+                task = db.query(Task).filter(Task.id == new_task_id).one()
+                message = (
+                    db.query(TaskChatMessage)
+                    .filter(TaskChatMessage.task_id == new_task_id)
+                    .one()
+                )
+                uploaded = (
+                    db.query(UploadedFile)
+                    .filter(UploadedFile.file_id == "missing-create-file")
+                    .one()
+                )
+                assert task.status == TaskStatus.RUNNING
+                assert task.runner_id
+                assert task.run_id
+                assert task.lease_expires_at is not None
+                assert message.content == "start atomically"
+                assert message.delivery_status == DELIVERY_PENDING
+                assert uploaded.task_id == new_task_id
+
+        async def broadcast_to_task(self, _event: dict, _task_id: int) -> None:
+            assert engine.pool.checkedout() == 0
+
+    ws_manager = AtomicCreateManager()
+    schedule = AsyncMock()
+    begin_turn = AsyncMock()
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(websocket_api, "manager", ws_manager)
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.schedule_claimed_create_turn",
+        schedule,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.begin_turn",
+        begin_turn,
+    )
+
+    try:
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            987654,
+            {
+                "message": "start atomically",
+                "client_message_id": "missing-create-turn",
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
+                "files": [
+                    {
+                        "file_id": "missing-create-file",
+                        "name": "atomic.txt",
+                    }
+                ],
+            },
+        )
+    finally:
+        engine.dispose()
+
+    assert observed_task_ids
+    schedule.assert_awaited_once()
+    assert schedule.await_args.kwargs["task_id"] == observed_task_ids[0]
+    begin_turn.assert_not_awaited()
+    assert any(event.get("type") == "message_accepted" for event in sent_messages)
+
+
+@pytest.mark.asyncio
+async def test_missing_task_file_bind_race_rolls_back_the_whole_create(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A lost file claim cannot expose a Task without its first turn."""
+
+    from xagent.web.models import database as database_module
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'websocket-missing-bind-race.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    file_path = tmp_path / "raced.txt"
+    file_path.write_text("raced file")
+    with SessionLocal() as db:
+        owner = User(
+            username="missing-bind-race-owner",
+            password_hash="x",
+            is_admin=False,
+        )
+        db.add(owner)
+        db.flush()
+        db.add(
+            UploadedFile(
+                file_id="missing-bind-race-file",
+                user_id=int(owner.id),
+                filename="raced.txt",
+                storage_path=str(file_path),
+                mime_type="text/plain",
+                file_size=file_path.stat().st_size,
+            )
+        )
+        db.commit()
+        owner_id = int(owner.id)
+
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    schedule = AsyncMock()
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(websocket_api, "manager", ws_manager)
+    monkeypatch.setattr(
+        websocket_api,
+        "bind_turn_files_no_commit",
+        MagicMock(return_value=["missing-bind-race-file"]),
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.schedule_claimed_create_turn",
+        schedule,
+    )
+
+    try:
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            654321,
+            {
+                "message": "rollback raced create",
+                "client_message_id": "missing-bind-race-turn",
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
+                "files": [
+                    {
+                        "file_id": "missing-bind-race-file",
+                        "name": "raced.txt",
+                    }
+                ],
+            },
+        )
+        with SessionLocal() as db:
+            assert (
+                db.query(Task)
+                .filter(
+                    Task.user_id == owner_id,
+                    Task.title.like("Chat: rollback raced create%"),
+                )
+                .count()
+                == 0
+            )
+            assert db.query(TaskChatMessage).count() == 0
+            uploaded = (
+                db.query(UploadedFile)
+                .filter(UploadedFile.file_id == "missing-bind-race-file")
+                .one()
+            )
+            assert uploaded.task_id is None
+    finally:
+        engine.dispose()
+
+    schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_task_send_failure_leaves_only_ttl_owned_running_claim(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.models import database as database_module
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'websocket-missing-send-failure.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with SessionLocal() as db:
+        owner = User(
+            username="missing-send-failure-owner",
+            password_hash="x",
+            is_admin=False,
+        )
+        db.add(owner)
+        db.commit()
+        owner_id = int(owner.id)
+
+    ws_manager = MagicMock()
+    ws_manager.send_personal_message = AsyncMock(
+        side_effect=RuntimeError("socket send failed")
+    )
+    ws_manager.broadcast_to_task = AsyncMock()
+    schedule = AsyncMock()
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(websocket_api, "manager", ws_manager)
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.schedule_claimed_create_turn",
+        schedule,
+    )
+
+    try:
+        with pytest.raises(RuntimeError, match="socket send failed"):
+            await _handle_chat_message_unserialized(
+                MagicMock(),
+                876543,
+                {
+                    "message": "send may fail",
+                    "client_message_id": "missing-send-failure-turn",
+                    "user": SimpleNamespace(id=owner_id, is_admin=False),
+                    "files": [],
+                },
+            )
+        with SessionLocal() as db:
+            task = (
+                db.query(Task)
+                .filter(
+                    Task.user_id == owner_id,
+                    Task.title.like("Chat: send may fail%"),
+                )
+                .one()
+            )
+            message = (
+                db.query(TaskChatMessage)
+                .filter(TaskChatMessage.task_id == int(task.id))
+                .one()
+            )
+            assert task.status == TaskStatus.RUNNING
+            assert task.runner_id
+            assert task.run_id
+            assert task.lease_expires_at is not None
+            assert message.delivery_status == DELIVERY_FAILED
+    finally:
+        engine.dispose()
+
+    schedule.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_task_cancel_after_atomic_create_never_leaves_pending(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.models import database as database_module
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'websocket-missing-cancel.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.25,
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    with SessionLocal() as db:
+        owner = User(
+            username="missing-cancel-owner",
+            password_hash="x",
+            is_admin=False,
+        )
+        db.add(owner)
+        db.commit()
+        owner_id = int(owner.id)
+
+    worker_finished = threading.Event()
+    release_worker = threading.Event()
+    prepare_turn = websocket_api._prepare_websocket_turn_sync
+
+    def blocked_prepare_turn(**kwargs):
+        preparation = prepare_turn(**kwargs)
+        worker_finished.set()
+        assert release_worker.wait(timeout=2)
+        return preparation
+
+    schedule = AsyncMock()
+    monkeypatch.setattr(websocket_api, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    monkeypatch.setattr(
+        websocket_api,
+        "_prepare_websocket_turn_sync",
+        blocked_prepare_turn,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.task_orchestrator.TaskTurnOrchestrator.schedule_claimed_create_turn",
+        schedule,
+    )
+
+    handler = asyncio.create_task(
+        _handle_chat_message_unserialized(
+            MagicMock(),
+            765432,
+            {
+                "message": "cancel after commit",
+                "client_message_id": "missing-cancel-turn",
+                "user": SimpleNamespace(id=owner_id, is_admin=False),
+                "files": [],
+            },
+        )
+    )
+    try:
+        assert await asyncio.to_thread(worker_finished.wait, 2)
+        handler.cancel()
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await handler
+        with SessionLocal() as db:
+            task = (
+                db.query(Task)
+                .filter(
+                    Task.user_id == owner_id,
+                    Task.title.like("Chat: cancel after commit%"),
+                )
+                .one()
+            )
+            message = (
+                db.query(TaskChatMessage)
+                .filter(TaskChatMessage.task_id == int(task.id))
+                .one()
+            )
+            assert task.status == TaskStatus.RUNNING
+            assert task.runner_id
+            assert task.run_id
+            assert task.lease_expires_at is not None
+            assert message.delivery_status == DELIVERY_PENDING
+    finally:
+        release_worker.set()
+        engine.dispose()
+
+    schedule.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -314,10 +1033,19 @@ async def test_chat_without_client_id_uses_durable_command_id_as_turn_id(
 async def test_running_chat_message_is_persisted_before_resume(db_session) -> None:
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "live-runner"
+    task.run_id = "live-run"
+    db_session.commit()
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
-    agent.post_user_message = AsyncMock(return_value=True)
+    observed_leases: list[TaskLease | None] = []
+
+    async def post_user_message(*_args, **_kwargs) -> bool:
+        observed_leases.append(current_task_lease())
+        return True
+
+    agent.post_user_message = AsyncMock(side_effect=post_user_message)
     mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
     ws_manager = MagicMock(
         broadcast_to_task=AsyncMock(),
@@ -362,6 +1090,13 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
     assert stored.content == "Use the audio tool"
     assert stored.turn_id == "live-turn-1"
     assert agent.post_user_message.await_args.kwargs["turn_id"] == "live-turn-1"
+    assert observed_leases == [
+        TaskLease(
+            task_id=int(task.id),
+            runner_id="live-runner",
+            run_id="live-run",
+        )
+    ]
     bg_mgr.register_reserved_resume.assert_called_once()
     accepted = [
         call.args[0]
@@ -370,6 +1105,56 @@ async def test_running_chat_message_is_persisted_before_resume(db_session) -> No
     ]
     assert len(accepted) == 1
     assert accepted[0]["client_message_id"] == "live-turn-1"
+
+
+@pytest.mark.asyncio
+async def test_legacy_continuation_runtime_fails_closed_without_side_effects(
+    db_session,
+) -> None:
+    owner = _user(db_session, "legacy-continuation-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "runner-a"
+    task.run_id = "run-a"
+    db_session.commit()
+
+    legacy_pattern = MagicMock()
+    legacy_pattern.request_continuation = MagicMock()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = False
+    agent.get_dag_pattern.return_value = legacy_pattern
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+        ) as mark_delivery,
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "must not enter legacy continuation",
+                "client_message_id": "legacy-continuation-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    legacy_pattern.request_continuation.assert_not_called()
+    mark_delivery.assert_not_called()
+    sent_messages = [
+        call.args[0] for call in ws_manager.send_personal_message.call_args_list
+    ]
+    assert any(
+        message.get("message") == "Task does not support message continuation"
+        for message in sent_messages
+    )
 
 
 @pytest.mark.asyncio
@@ -547,7 +1332,11 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
                 .filter_by(task_id=int(task.id), command_id="deferred-turn-1")
                 .one()
             )
-            if stored_command.status == "pending":
+            if (
+                stored_command.status == "pending"
+                and int(stored_command.attempt_count or 0) >= 1
+                and resume_bg.await_count == 1
+            ):
                 break
             await asyncio.sleep(0.01)
         else:
@@ -577,6 +1366,9 @@ async def test_resume_registration_failure_preserves_dispatched_delivery(
 ) -> None:
     owner = _user(db_session, "owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "registration-runner"
+    task.run_id = "registration-run"
+    db_session.commit()
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -642,6 +1434,9 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     """One failed DELIVERY_FAILED checkout still produces one rejection ack."""
     owner = _user(db_session, "pool-timeout-owner")
     task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "pool-timeout-runner"
+    task.run_id = "pool-timeout-run"
+    db_session.commit()
     agent = MagicMock()
     agent.supports_live_control.return_value = True
     agent.get_dag_pattern.return_value = None
@@ -1256,6 +2051,52 @@ async def test_execute_resume_background_persists_missing_checkpoint_failure(
     assert failures[0]["task"]["status"] == TaskStatus.FAILED.value
 
 
+@pytest.mark.parametrize(
+    ("settled", "expected_error_broadcasts"),
+    [(True, 1), (False, 0)],
+)
+@pytest.mark.asyncio
+async def test_resume_failure_broadcasts_only_after_exact_settlement(
+    db_session,
+    settled: bool,
+    expected_error_broadcasts: int,
+) -> None:
+    owner = _user(db_session, "resume-settlement-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.PAUSED)
+    agent = MagicMock(
+        resume_execution_by_id=AsyncMock(side_effect=RuntimeError("resume failed")),
+    )
+    events: list[str] = []
+
+    def settle(*_args, **_kwargs) -> bool:
+        events.append("settle")
+        return settled
+
+    async def broadcast(payload, *_args, **_kwargs) -> None:
+        if payload.get("type") == "task_error":
+            events.append("broadcast")
+
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(side_effect=broadcast),
+    )
+
+    with (
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch(
+            "xagent.web.api.websocket._settle_resumed_task_lease",
+            side_effect=settle,
+        ),
+    ):
+        _register_current_resume(int(task.id))
+        await execute_resume_background(
+            task_id=int(task.id),
+            agent_service=agent,
+            task_owner_user_id=int(owner.id),
+        )
+
+    assert events == ["settle"] + (["broadcast"] * expected_error_broadcasts)
+
+
 @pytest.mark.asyncio
 async def test_deferred_injection_failure_rejects_before_any_acceptance(
     db_session,
@@ -1274,8 +2115,14 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
         )
     )
     db_session.commit()
+    observed_leases: list[TaskLease | None] = []
+
+    async def post_user_message(*_args, **_kwargs) -> bool:
+        observed_leases.append(current_task_lease())
+        return False
+
     agent = MagicMock(
-        post_user_message=AsyncMock(return_value=False),
+        post_user_message=AsyncMock(side_effect=post_user_message),
         resume_execution_by_id=AsyncMock(),
     )
     ws_manager = MagicMock(
@@ -1309,6 +2156,11 @@ async def test_deferred_injection_failure_rejects_before_any_acceptance(
     ]
     assert [event["type"] for event in delivery_events] == ["message_rejected"]
     assert delivery_events[0]["retry_with_new_id"] is True
+    assert len(observed_leases) == 1
+    assert observed_leases[0] is not None
+    assert observed_leases[0].task_id == int(task.id)
+    assert observed_leases[0].runner_id
+    assert observed_leases[0].run_id
     db_session.expire_all()
     delivery = (
         db_session.query(TaskChatMessage)

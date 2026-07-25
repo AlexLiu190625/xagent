@@ -718,7 +718,7 @@ async def test_real_failures_use_a_separate_bounded_budget(db_session) -> None:
     assert row.failure_count == MAX_COMMAND_FAILURES
 
 
-def test_failed_command_can_be_reset_for_explicit_retry(db_session) -> None:
+def test_failed_command_retry_preserves_immutable_target(db_session) -> None:
     user, task = _create_running_task(db_session)
     enqueued = enqueue_task_command(
         db_session,
@@ -740,8 +740,6 @@ def test_failed_command_can_be_reset_for_explicit_retry(db_session) -> None:
     assert retry_failed_task_command(
         db_session,
         enqueued.command_id,
-        target_run_id="run-2",
-        target_runner_id="runner-b",
     )
     db_session.expire_all()
     row = db_session.get(TaskExecutionCommand, enqueued.command_id)
@@ -751,8 +749,8 @@ def test_failed_command_can_be_reset_for_explicit_retry(db_session) -> None:
     assert row.defer_count == 0
     assert row.error is None
     assert row.completed_at is None
-    assert row.target_run_id == "run-2"
-    assert row.target_runner_id == "runner-b"
+    assert row.target_run_id == "run-1"
+    assert row.target_runner_id == "runner-a"
 
 
 @pytest.mark.asyncio

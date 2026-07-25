@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -13,7 +14,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from xagent.core.model.chat.token_context import TokenUsage
-from xagent.web.api.chat import AgentServiceManager
+from xagent.web.api.chat import AgentServiceManager, _update_task_title_isolated
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
@@ -23,8 +24,13 @@ from xagent.web.services import task_lease_service
 from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
+    current_task_lease,
 )
-from xagent.web.services.workforce_runtime import sync_workforce_run_status
+from xagent.web.services.workforce_runtime import (
+    sync_workforce_run_status,
+    sync_workforce_run_status_for_task_id_isolated,
+)
 from xagent.web.tracking.task_tracker import _TaskTrackingSeed
 
 
@@ -76,6 +82,264 @@ def _create_single_connection_runtime_db(tmp_path, filename: str):
         setup_db.commit()
         task_id = int(task.id)
     return engine, factory, task_id
+
+
+@pytest.mark.asyncio
+async def test_execute_task_binds_outer_lease_only_during_agent_execution() -> None:
+    manager = AgentServiceManager()
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    observed_leases: list[TaskLease | None] = []
+
+    class LeaseObservingAgent(_FakeAgentService):
+        async def execute_task(self, **_kwargs):
+            observed_leases.append(current_task_lease())
+            return {"success": True}
+
+    with (
+        patch.object(
+            manager,
+            "_acquire_sandbox_task",
+            new=AsyncMock(return_value=None),
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch(
+            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+    ):
+        result = await manager.execute_task(
+            agent_service=LeaseObservingAgent(),
+            task="hello",
+            manage_task_lease=False,
+            task_lease=lease,
+        )
+
+    assert result["success"] is True
+    assert observed_leases == [lease]
+    assert current_task_lease() is None
+
+
+@pytest.mark.asyncio
+async def test_execute_task_tracks_usage_for_outer_owned_lease() -> None:
+    manager = AgentServiceManager()
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    tracker = MagicMock(
+        start_tracking=AsyncMock(),
+        complete_tracking=AsyncMock(),
+        stop_periodic_updates=AsyncMock(),
+        interrupt_reason_for_quota=AsyncMock(),
+        quota_interrupt_reason=None,
+    )
+
+    with (
+        patch(
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            return_value=7,
+        ),
+        patch(
+            "xagent.web.api.chat._check_task_run_gate_on_event_loop",
+            return_value=None,
+        ),
+        patch(
+            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated"
+        ) as sync_workforce,
+        patch(
+            "xagent.web.tracking.task_tracker.TaskTracker",
+            return_value=tracker,
+        ) as tracker_factory,
+        patch.object(
+            manager,
+            "_acquire_sandbox_task",
+            new=AsyncMock(return_value=None),
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+    ):
+        result = await manager.execute_task(
+            agent_service=_FakeAgentService(),
+            task="hello",
+            tracking_task_id="42",
+            manage_task_lease=False,
+            task_lease=lease,
+        )
+
+    assert result["success"] is True
+    sync_workforce.assert_not_called()
+    tracker_factory.assert_called_once_with(
+        task_id=42,
+        expected_run_id="run-a",
+        expected_runner_id="runner-a",
+    )
+    tracker.start_tracking.assert_awaited_once()
+    tracker.complete_tracking.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_external_lease_loss_cancels_agent_execution() -> None:
+    manager = AgentServiceManager()
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    execution_started = asyncio.Event()
+    execution_cancelled = asyncio.Event()
+
+    class BlockingAgent(_FakeAgentService):
+        async def execute_task(self, **_kwargs):
+            execution_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                execution_cancelled.set()
+
+    async def lose_lease() -> TaskLeaseHeartbeatOutcome:
+        await execution_started.wait()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    heartbeat_task = asyncio.create_task(lose_lease())
+    with (
+        patch.object(
+            manager,
+            "_acquire_sandbox_task",
+            new=AsyncMock(return_value=None),
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch(
+            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+    ):
+        with pytest.raises(TaskLeaseLostError):
+            await manager.execute_task(
+                agent_service=BlockingAgent(),
+                task="hello",
+                manage_task_lease=False,
+                task_lease=lease,
+                task_lease_heartbeat_task=heartbeat_task,
+            )
+
+    assert execution_cancelled.is_set()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_managed_lease_loss_skips_usage_and_release() -> None:
+    manager = AgentServiceManager()
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    execution_started = asyncio.Event()
+    execution_cancelled = asyncio.Event()
+    tracker = MagicMock(
+        start_tracking=AsyncMock(),
+        complete_tracking=AsyncMock(),
+        stop_periodic_updates=AsyncMock(),
+        interrupt_reason_for_quota=AsyncMock(),
+    )
+
+    class BlockingAgent(_FakeAgentService):
+        async def execute_task(self, **_kwargs):
+            execution_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                execution_cancelled.set()
+
+    async def lose_lease(
+        _lease: TaskLease,
+        _stop_event: asyncio.Event,
+    ) -> TaskLeaseHeartbeatOutcome:
+        await execution_started.wait()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    release = MagicMock(return_value=True)
+    with (
+        patch(
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            return_value=None,
+        ),
+        patch(
+            "xagent.web.api.chat.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.api.chat.run_task_lease_heartbeat",
+            new=lose_lease,
+        ),
+        patch(
+            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            release,
+        ),
+        patch(
+            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            return_value=False,
+        ),
+        patch(
+            "xagent.web.tracking.task_tracker.TaskTracker",
+            return_value=tracker,
+        ),
+        patch.object(
+            manager,
+            "_acquire_sandbox_task",
+            new=AsyncMock(return_value=None),
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+    ):
+        with pytest.raises(TaskLeaseLostError):
+            await manager.execute_task(
+                agent_service=BlockingAgent(),
+                task="hello",
+                tracking_task_id="42",
+                manage_task_lease=True,
+            )
+
+    assert execution_cancelled.is_set()
+    tracker.complete_tracking.assert_not_awaited()
+    tracker.stop_periodic_updates.assert_awaited_once()
+    release.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_task_lease_loss_during_title_update_cancels_stale_write() -> (
+    None
+):
+    manager = AgentServiceManager()
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    title_started = asyncio.Event()
+    title_cancelled = asyncio.Event()
+
+    async def update_title(*_args, **_kwargs) -> bool:
+        title_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            title_cancelled.set()
+
+    async def lose_lease() -> TaskLeaseHeartbeatOutcome:
+        await title_started.wait()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    heartbeat_task = asyncio.create_task(lose_lease())
+    with (
+        patch.object(
+            manager,
+            "_acquire_sandbox_task",
+            new=AsyncMock(return_value=None),
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+        patch(
+            "xagent.web.api.chat.update_task_title_from_agent",
+            new=update_title,
+        ),
+        patch(
+            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+    ):
+        with pytest.raises(TaskLeaseLostError):
+            await manager.execute_task(
+                agent_service=_FakeAgentService(),
+                task="hello",
+                task_id="42",
+                manage_task_lease=False,
+                task_lease=lease,
+                task_lease_heartbeat_task=heartbeat_task,
+            )
+
+    assert title_cancelled.is_set()
 
 
 @pytest.mark.asyncio
@@ -279,7 +543,7 @@ async def test_execute_task_pre_run_timeout_waits_for_shared_heartbeat_batch() -
                 execution.cancel()
                 await asyncio.gather(execution, return_exceptions=True)
             await asyncio.wait_for(
-                task_lease_service._wait_for_heartbeat_manager_idle(),
+                task_lease_service.wait_for_heartbeat_manager_idle(),
                 timeout=1,
             )
 
@@ -389,7 +653,7 @@ async def test_execute_task_waits_for_shared_heartbeat_timeout_and_retains_lease
                 execution.cancel()
                 await asyncio.gather(execution, return_exceptions=True)
             await asyncio.wait_for(
-                task_lease_service._wait_for_heartbeat_manager_idle(),
+                task_lease_service.wait_for_heartbeat_manager_idle(),
                 timeout=1,
             )
 
@@ -700,7 +964,11 @@ async def test_execute_task_acquires_and_releases_lease_when_manage_true(
     db_session.add(task)
     db_session.commit()
 
-    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    fake_lease = TaskLease(
+        task_id=int(task.id),
+        runner_id="test-runner",
+        run_id="test-run",
+    )
     manager = AgentServiceManager()
 
     with (
@@ -739,7 +1007,11 @@ async def test_execute_task_acquires_and_releases_lease_when_manage_true(
     assert result["success"] is True
     mock_acquire.assert_called_once()
     mock_release.assert_called_once()
-    mock_sync.assert_called_once_with(int(task.id), TaskStatus.RUNNING)
+    mock_sync.assert_called_once_with(
+        int(task.id),
+        TaskStatus.RUNNING,
+        task_lease=fake_lease,
+    )
 
 
 @pytest.mark.asyncio
@@ -800,7 +1072,11 @@ async def test_execute_task_skips_lease_but_syncs_running_when_manage_false(
     assert result["success"] is True
     mock_acquire.assert_not_called()
     mock_release.assert_not_called()
-    mock_sync.assert_called_once_with(int(task.id), TaskStatus.RUNNING)
+    mock_sync.assert_called_once_with(
+        int(task.id),
+        TaskStatus.RUNNING,
+        task_lease=None,
+    )
     mock_stop_hb.assert_awaited_once_with(None, None)
 
 
@@ -1120,7 +1396,11 @@ async def test_execute_task_cleans_up_when_sandbox_acquire_raises(
     db_session.add(task)
     db_session.commit()
 
-    fake_lease = TaskLease(task_id=int(task.id), runner_id="test-runner")
+    fake_lease = TaskLease(
+        task_id=int(task.id),
+        runner_id="test-runner",
+        run_id="test-run",
+    )
     manager = AgentServiceManager()
     tracker = MagicMock()
     tracker.start_tracking = AsyncMock()
@@ -1468,6 +1748,117 @@ async def test_execute_task_heartbeat_pool_timeout_retains_lease() -> None:
 
 
 @pytest.mark.asyncio
+async def test_execute_task_heartbeat_loss_after_result_rejects_success() -> None:
+    task_id = 106
+    lease = TaskLease(
+        task_id=task_id,
+        runner_id="test-runner",
+        run_id="test-run",
+    )
+    manager = AgentServiceManager()
+    tracker = MagicMock()
+    tracker.start_tracking = AsyncMock()
+    tracker.complete_tracking = AsyncMock()
+    tracker.stop_periodic_updates = AsyncMock()
+    tracker.quota_interrupt_reason = None
+    release_lease = MagicMock()
+
+    with (
+        patch(
+            "xagent.web.api.chat._load_task_run_gate_user_id_isolated",
+            return_value=None,
+        ),
+        patch(
+            "xagent.web.api.chat.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.api.chat.sync_workforce_run_status_for_task_id_isolated",
+            return_value=False,
+        ),
+        patch(
+            "xagent.web.api.chat._release_managed_task_lease_isolated",
+            release_lease,
+        ),
+        patch(
+            "xagent.web.api.chat.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.chat.stop_task_lease_heartbeat",
+            new=AsyncMock(return_value=TaskLeaseHeartbeatOutcome(lease_lost=True)),
+        ),
+        patch(
+            "xagent.web.tracking.task_tracker.TaskTracker",
+            return_value=tracker,
+        ),
+        patch.object(
+            manager,
+            "_acquire_sandbox_task",
+            new=AsyncMock(return_value="user:106"),
+        ),
+        patch.object(manager, "_release_sandbox_task", new=AsyncMock()),
+    ):
+        with pytest.raises(TaskLeaseLostError):
+            await manager.execute_task(
+                agent_service=_FakeAgentService(),
+                task="hello",
+                tracking_task_id=str(task_id),
+                manage_task_lease=True,
+            )
+
+    release_lease.assert_not_called()
+
+
+def test_task_title_update_is_fenced_by_exact_lease(db_session) -> None:
+    user = User(username="title-fence-user", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.flush()
+    task = Task(
+        user_id=user.id,
+        title="Original title",
+        status=TaskStatus.RUNNING,
+        runner_id="current-runner",
+        run_id="current-run",
+    )
+    db_session.add(task)
+    db_session.commit()
+
+    stale = TaskLease(
+        task_id=int(task.id),
+        runner_id="stale-runner",
+        run_id="stale-run",
+    )
+    current = TaskLease(
+        task_id=int(task.id),
+        runner_id="current-runner",
+        run_id="current-run",
+    )
+
+    assert (
+        _update_task_title_isolated(
+            int(task.id),
+            "Stale title",
+            task_lease=stale,
+        )
+        is False
+    )
+    db_session.expire_all()
+    assert db_session.get(Task, task.id).title == "Original title"
+
+    assert (
+        _update_task_title_isolated(
+            int(task.id),
+            "Current title",
+            task_lease=current,
+        )
+        is True
+    )
+    db_session.expire_all()
+    assert db_session.get(Task, task.id).title == "Current title"
+
+
+@pytest.mark.asyncio
 async def test_execute_task_cancellation_during_heartbeat_stop_drains_cleanup() -> None:
     """Caller cancellation during heartbeat shutdown must not strand the
     lease or skip tracker and sandbox cleanup."""
@@ -1624,3 +2015,87 @@ def test_sync_workforce_run_status_running_is_idempotent(db_session) -> None:
     db_session.refresh(run)
     assert run.status == "running"
     assert run.completed_at is None
+
+
+@pytest.mark.parametrize("use_stale_lease", [False, True])
+def test_delayed_workforce_running_projection_cannot_resurrect_terminal_run(
+    db_session,
+    use_stale_lease: bool,
+) -> None:
+    user = User(username="projection-user", password_hash="hash", is_admin=False)
+    db_session.add(user)
+    db_session.flush()
+    manager = Agent(
+        user_id=user.id,
+        name="Projection manager",
+        description="desc",
+        instructions="instr",
+        execution_mode="balanced",
+        models={"general": "test-model"},
+        knowledge_bases=[],
+        skills=[],
+        tool_categories=[],
+        suggested_prompts=[],
+        status=AgentStatus.PUBLISHED,
+    )
+    db_session.add(manager)
+    db_session.flush()
+    workforce = Workforce(
+        owner_user_id=user.id,
+        scope_type="user",
+        scope_id=str(user.id),
+        name="Projection team",
+        description="desc",
+        manager_agent_id=manager.id,
+        status="active",
+    )
+    db_session.add(workforce)
+    db_session.flush()
+    task = Task(
+        user_id=user.id,
+        title="terminal projection",
+        description="test",
+        status=TaskStatus.COMPLETED,
+        runner_id="replacement-b",
+        run_id="same-run",
+        agent_id=manager.id,
+        agent_config={},
+        execution_mode="auto",
+    )
+    db_session.add(task)
+    db_session.flush()
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="completed",
+        completed_at=datetime.now(timezone.utc),
+        snapshot={"version": 1},
+    )
+    db_session.add(run)
+    db_session.flush()
+    task.agent_config = {"workforce_run_id": int(run.id)}
+    db_session.commit()
+
+    stale_lease = (
+        TaskLease(
+            task_id=int(task.id),
+            runner_id="stale-a",
+            run_id="same-run",
+        )
+        if use_stale_lease
+        else None
+    )
+    assert (
+        sync_workforce_run_status_for_task_id_isolated(
+            int(task.id),
+            TaskStatus.RUNNING,
+            task_lease=stale_lease,
+        )
+        is False
+    )
+
+    db_session.expire_all()
+    persisted_run = db_session.get(WorkforceRun, int(run.id))
+    assert persisted_run.status == "completed"
+    assert persisted_run.completed_at is not None

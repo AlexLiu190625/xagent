@@ -476,11 +476,11 @@ async def test_execute_task_background_error_marks_task_failed(_test_db, monkeyp
 async def test_orchestrated_background_error_defers_database_settlement(
     _test_db, monkeypatch
 ):
-    """The lease-owning orchestrator gets the exception and owns one DB settle.
+    """The lease owner settles before any terminal client notification.
 
-    ``execute_task_background`` may still notify the client, but it must not
-    open its own terminal-error Session before the orchestrator finalizes the
-    concrete run/runner lease.
+    ``execute_task_background`` must neither open its own terminal Session nor
+    announce FAILED while the durable row still carries the live run lease.
+    The orchestrator emits the terminal event only after exact settlement.
     """
     db = _direct_db_session()
     try:
@@ -530,7 +530,7 @@ async def test_orchestrated_background_error_defers_database_settlement(
         )
 
     terminal_writer.assert_not_called()
-    assert broadcasts[-1]["type"] == "task_error"
+    assert not any(event.get("type") == "task_error" for event in broadcasts)
 
     db = _direct_db_session()
     try:

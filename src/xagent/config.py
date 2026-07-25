@@ -39,6 +39,13 @@ EXTERNAL_SKILLS_LIBRARY_DIRS = "XAGENT_EXTERNAL_SKILLS_LIBRARY_DIRS"
 AGENT_RUNTIME = "XAGENT_AGENT_RUNTIME"
 TASK_LEASE_TTL_SECONDS = "XAGENT_TASK_LEASE_TTL_SECONDS"
 TASK_LEASE_HEARTBEAT_SECONDS = "XAGENT_TASK_LEASE_HEARTBEAT_SECONDS"
+TASK_LEASE_RECOVERY_INTERVAL_SECONDS = "XAGENT_TASK_LEASE_RECOVERY_INTERVAL_SECONDS"
+TASK_LEASE_RECOVERY_BATCH_SIZE = "XAGENT_TASK_LEASE_RECOVERY_BATCH_SIZE"
+UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS = (
+    "XAGENT_UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS"
+)
+UPLOADED_FILE_RECOVERY_STALE_SECONDS = "XAGENT_UPLOADED_FILE_RECOVERY_STALE_SECONDS"
+UPLOADED_FILE_RECOVERY_BATCH_SIZE = "XAGENT_UPLOADED_FILE_RECOVERY_BATCH_SIZE"
 STORAGE_ROOT = "XAGENT_STORAGE_ROOT"
 MAX_UPLOAD_SIZE = "XAGENT_MAX_UPLOAD_SIZE"
 FILE_STORAGE_URI = "XAGENT_FILE_STORAGE_URI"
@@ -260,6 +267,40 @@ def get_task_lease_heartbeat_seconds() -> int:
         )
         return default
     return min(seconds, max(1, get_task_lease_ttl_seconds() - 1))
+
+
+def get_task_lease_recovery_interval_seconds() -> int:
+    """Get the interval between automatic expired-lease recovery scans."""
+
+    default = max(5, get_task_lease_ttl_seconds() // 3)
+    return _get_positive_int_env(
+        TASK_LEASE_RECOVERY_INTERVAL_SECONDS,
+        default,
+    )
+
+
+def get_task_lease_recovery_batch_size() -> int:
+    """Get the maximum number of expired leases scanned per recovery batch."""
+
+    return _get_positive_int_env(TASK_LEASE_RECOVERY_BATCH_SIZE, 100)
+
+
+def get_uploaded_file_recovery_interval_seconds() -> int:
+    """Get the interval between stale file-compensation recovery scans."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_INTERVAL_SECONDS, 60)
+
+
+def get_uploaded_file_recovery_stale_seconds() -> int:
+    """Get the minimum age of a compensation claim eligible for recovery."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_STALE_SECONDS, 300)
+
+
+def get_uploaded_file_recovery_batch_size() -> int:
+    """Get the maximum file-compensation claims examined per polling tick."""
+
+    return _get_positive_int_env(UPLOADED_FILE_RECOVERY_BATCH_SIZE, 100)
 
 
 def _get_positive_int_env(env_var: str, default: int, *, minimum: int = 1) -> int:

@@ -6,7 +6,6 @@ import logging
 import re
 import shutil
 import uuid
-from contextlib import closing
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -43,10 +42,12 @@ from ...config import (
     get_uploads_dir,
 )
 from ...core.agent.checkpoint import CHECKPOINT_EVENT_TYPE
-from ...core.agent.trace import TraceEvent, TraceHandler, trace_user_message
+from ...core.agent.trace import TraceEvent, TraceHandler
 from ...core.execution_scope import (
+    EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
     ExecutionScopeContext,
+    ExecutionScopeNotProvided,
     resolve_execution_scope,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
@@ -55,6 +56,7 @@ from ..models.chat_message import TaskChatMessage
 from ..models.database import (
     get_db,
     get_session_local,
+    release_db_connection_if_clean,
 )
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
@@ -62,8 +64,12 @@ from ..models.user import User
 
 if TYPE_CHECKING:
     from ..services.task_setup_snapshot import TaskSetupSnapshot
+    from ..services.task_orchestrator import _ClaimedTurn, TaskTurnPayload
 
-from ...core.file_storage.keys import build_task_output_storage_key
+from ...core.file_storage.keys import (
+    build_task_output_storage_key,
+    build_upload_storage_key,
+)
 from ..services.chat_history_service import (
     DELIVERY_COMPLETED,
     DELIVERY_DISPATCHED,
@@ -77,6 +83,8 @@ from ..services.chat_history_service import (
     mark_user_message_delivery_sync,
 )
 from ..services.db_runtime import (
+    await_task_settlement,
+    cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
     run_db_io_cancellation_safe,
@@ -90,6 +98,7 @@ from ..services.file_turn import (
 )
 from ..services.file_turn import (
     bind_turn_files,
+    bind_turn_files_no_commit,
 )
 from ..services.file_turn import (
     build_uploaded_files_context as _build_uploaded_files_context,
@@ -107,9 +116,6 @@ from ..services.hot_path_cache import (
     cache_version_token,
     task_cache_ttl_seconds,
     web_task_history_key,
-)
-from ..services.managed_file_ref import (
-    DurableStorageOperationError,
 )
 from ..services.task_command_transport import (
     COMMAND_FAILED,
@@ -137,19 +143,28 @@ from ..services.task_execution_controller import (
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
-    acquire_task_lease,
+    TaskLeaseLostError,
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_no_commit,
-    mark_task_paused_if_stale,
+    bind_task_lease_context,
     release_task_lease_no_commit,
+    run_while_task_lease_owned,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
 )
-from ..services.uploaded_file_store import UploadedFileStore
+from ..services.uploaded_file_store import (
+    StagedUploadedFile,
+    SupersededObjectCleanupClaim,
+    UploadedFileVersionConflict,
+    UploadedFileVersionSnapshot,
+    UploadedFileStore,
+    cleanup_superseded_uploaded_file_objects,
+    compensate_staged_uploaded_files,
+    snapshot_uploaded_file_version,
+    stage_uploaded_file_from_local_path,
+)
 from ..services.workforce_runtime import (
-    is_workforce_task,
     sync_workforce_run_status,
-    sync_workforce_run_status_for_task_id_isolated,
 )
 from ..tracing import create_ephemeral_tracer
 from ..user_isolated_memory import UserContext
@@ -165,13 +180,6 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_EVENT_TYPE_NAME = str(CHECKPOINT_EVENT_TYPE)
 
 _pause_accepted_task_ids: set[int] = set()
-
-
-class _ResolvedExecutionScopeNotProvided:
-    """Sentinel separating an omitted scope from an explicitly unscoped turn."""
-
-
-_RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED = _ResolvedExecutionScopeNotProvided()
 
 
 def _mark_task_pause_accepted(task_id: int) -> None:
@@ -245,6 +253,25 @@ def _task_error_payload(
     if task_payload is not None:
         payload["task"] = task_payload
     return payload
+
+
+def create_terminal_task_error_event(
+    task_id: int,
+    message: str,
+) -> dict[str, Any]:
+    """Shape an error event after the exact lease owner commits FAILED."""
+
+    return {
+        "type": "task_error",
+        "message": message,
+        "task_id": task_id,
+        "task": {
+            "id": task_id,
+            "status": TaskStatus.FAILED.value,
+        },
+        "error": message,
+        "timestamp": datetime.now(timezone.utc).timestamp(),
+    }
 
 
 def _client_message_id(value: Any) -> str | None:
@@ -572,6 +599,7 @@ def _selected_file_refs_from_task(task: Any, db: Session) -> list[dict[str, Any]
         .filter(
             UploadedFile.file_id.in_(selected_file_ids),
             UploadedFile.user_id == task_owner_id_int,
+            UploadedFile.storage_status != "compensating",
             or_(UploadedFile.task_id == task_id_int, UploadedFile.task_id.is_(None)),
         )
         .all()
@@ -1185,11 +1213,8 @@ def _normalize_file_outputs(
     task_id: int,
     task_user_id: int,
     file_outputs: Any,
-    *,
-    resolved_scope_segments: tuple[str, ...] | None = None,
-    commit_changes: bool = True,
-) -> tuple[list[Dict[str, Any]], Dict[str, str]]:
-    from ..models.uploaded_file import UploadedFile
+) -> tuple[list[Any], Dict[str, str]]:
+    """Project historical file outputs without filesystem or durable writes."""
 
     if isinstance(file_outputs, str):
         file_outputs = [file_outputs] if file_outputs.strip() else []
@@ -1198,22 +1223,87 @@ def _normalize_file_outputs(
     if not file_outputs:
         return [], {}
 
-    normalized_outputs: list[Dict[str, Any]] = []
-    path_to_file_id: Dict[str, str] = {}
-    changed = False
-    # Resolved once per normalization pass: per-storage-key resolution would
-    # re-query the snapshot loader / resolver once per output file (N+1 with
-    # the output-file count — workforce runs can emit dozens).
-    scope_segments = (
-        _scope_segments_for_task(task_id)
-        if resolved_scope_segments is None
-        else resolved_scope_segments
+    parsed_outputs: list[tuple[Any, str, str, tuple[str, ...], str]] = []
+    candidate_file_ids: set[str] = set()
+    candidate_storage_paths: set[str] = set()
+    candidate_workspace_paths: set[str] = set()
+    for item in file_outputs:
+        item_file_id = ""
+        item_filename = ""
+        item_relative_path = ""
+        raw_paths: list[str] = []
+        if isinstance(item, str):
+            raw_paths = [item]
+        elif isinstance(item, dict):
+            if isinstance(item.get("file_id"), str):
+                item_file_id = str(item["file_id"]).strip()
+            if isinstance(item.get("filename"), str):
+                item_filename = str(item["filename"])
+            for key in ("file_path", "download_path", "relative_path", "path"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw_paths.append(value.strip())
+                    if key == "relative_path":
+                        item_relative_path = value
+        else:
+            parsed_outputs.append((item, "", "", (), ""))
+            continue
+
+        normalized_raw_paths = tuple(dict.fromkeys(raw_paths))
+        parsed_outputs.append(
+            (
+                item,
+                item_file_id,
+                item_filename,
+                normalized_raw_paths,
+                item_relative_path,
+            )
+        )
+        if item_file_id:
+            candidate_file_ids.add(item_file_id)
+        candidate_storage_paths.update(normalized_raw_paths)
+        if item_relative_path.strip():
+            candidate_workspace_paths.add(
+                _normalize_workspace_relative_path(item_relative_path)
+            )
+
+    identity_filters = []
+    if candidate_file_ids:
+        identity_filters.append(UploadedFile.file_id.in_(candidate_file_ids))
+    if candidate_storage_paths:
+        identity_filters.append(UploadedFile.storage_path.in_(candidate_storage_paths))
+    if candidate_workspace_paths:
+        identity_filters.append(
+            UploadedFile.workspace_relative_path.in_(candidate_workspace_paths)
+        )
+    candidate_records = (
+        db.query(UploadedFile).filter(or_(*identity_filters)).all()
+        if identity_filters
+        else []
     )
+    by_file_id = {
+        str(record.file_id): record
+        for record in candidate_records
+        if record.file_id is not None
+    }
+    by_storage_path = {
+        str(record.storage_path): record
+        for record in candidate_records
+        if record.storage_path is not None
+    }
+    by_workspace_path: dict[str, list[UploadedFile]] = {}
+    for record in candidate_records:
+        workspace_relative_path = getattr(record, "workspace_relative_path", None)
+        if isinstance(workspace_relative_path, str) and workspace_relative_path:
+            by_workspace_path.setdefault(workspace_relative_path, []).append(record)
+
+    normalized_outputs: list[Any] = []
+    path_to_file_id: Dict[str, str] = {}
 
     def add_normalized_output(
         file_record: UploadedFile,
         fallback_filename: str,
-        raw_paths: list[str],
+        raw_paths: tuple[str, ...],
     ) -> None:
         final_file_id = str(file_record.file_id)
         final_filename = fallback_filename or str(file_record.filename)
@@ -1245,193 +1335,108 @@ def _normalize_file_outputs(
                 path_to_file_id, workspace_relative_path, final_file_id
             )
 
-    for item in file_outputs:
-        item_file_id = ""
-        item_filename = ""
-        item_relative_path = ""
-        raw_paths: list[str] = []
-
-        if isinstance(item, str):
-            raw_paths = [item]
-        elif isinstance(item, dict):
-            if isinstance(item.get("file_id"), str):
-                item_file_id = str(item.get("file_id"))
-            if isinstance(item.get("filename"), str):
-                item_filename = str(item.get("filename"))
-            for key in ("file_path", "download_path", "relative_path", "path"):
-                value = item.get(key)
-                if isinstance(value, str) and value.strip():
-                    raw_paths.append(value)
-                    if key == "relative_path":
-                        item_relative_path = value
-        else:
-            continue
-
-        resolved_info = None
-        for raw_path in raw_paths:
-            resolved_info = _resolve_output_storage_path(raw_path)
-            if resolved_info is not None:
-                break
-
-        if resolved_info is None:
-            if item_file_id:
-                file_record = (
-                    db.query(UploadedFile)
-                    .filter(
-                        UploadedFile.file_id == item_file_id,
-                        UploadedFile.user_id == task_user_id,
-                        or_(
-                            UploadedFile.task_id == task_id,
-                            UploadedFile.task_id.is_(None),
-                        ),
-                    )
-                    .first()
-                )
-                if file_record is None:
-                    logger.warning(
-                        "Skipping file output outside task/user scope: %s",
-                        item_file_id,
-                    )
-                    continue
-                normalized_outputs.append(
-                    build_file_ref(
-                        file_id=str(file_record.file_id),
-                        filename=item_filename or str(file_record.filename),
-                        mime_type=getattr(file_record, "mime_type", None),
-                        size=getattr(file_record, "file_size", None),
-                    )
-                )
-            continue
-
-        resolved_path, relative_path = resolved_info
-        normalized_relative_path = relative_path.lstrip("/")
-        file_record = (
-            db.query(UploadedFile)
-            .filter(UploadedFile.storage_path == str(resolved_path))
-            .first()
-        )
-        if file_record is not None and not _uploaded_file_record_in_task_scope(
-            file_record, task_id, task_user_id
-        ):
-            logger.warning(
-                "Skipping file output record outside task/user scope: %s",
-                getattr(file_record, "file_id", str(resolved_path)),
+    def path_claims_current_task_output(value: str) -> bool:
+        parts = Path(value).parts
+        return any(
+            _output_path_in_current_task_scope(
+                "/".join(parts[index:]),
+                task_id,
+                task_user_id,
             )
-            continue
-
-        if file_record is not None and not _output_path_in_current_task_scope(
-            normalized_relative_path, task_id, task_user_id
-        ):
-            if getattr(file_record, "workspace_category", None) != "output":
-                logger.warning(
-                    "Skipping registered file output outside output category: %s",
-                    getattr(file_record, "file_id", str(resolved_path)),
-                )
-                continue
-            add_normalized_output(file_record, item_filename, raw_paths)
-            continue
-
-        if not _output_path_in_current_task_scope(
-            normalized_relative_path, task_id, task_user_id
-        ):
-            logger.warning(
-                "Skipping file output outside current task output scope: %s",
-                relative_path,
-            )
-            continue
-
-        workspace_relative_path = _normalize_workspace_relative_path(
-            item_relative_path or normalized_relative_path
-        )
-        workspace_category = _workspace_category_from_relative_path(
-            workspace_relative_path
-        )
-        expected_file_id = item_file_id or _build_output_file_id(
-            workspace_relative_path
+            for index in range(len(parts))
         )
 
-        if file_record is None and item_file_id:
-            file_record = (
-                db.query(UploadedFile)
-                .filter(
-                    UploadedFile.file_id == item_file_id,
-                    UploadedFile.user_id == task_user_id,
-                    or_(
-                        UploadedFile.task_id == task_id, UploadedFile.task_id.is_(None)
-                    ),
-                )
-                .first()
-            )
+    for (
+        original_item,
+        item_file_id,
+        item_filename,
+        candidate_raw_paths,
+        item_relative_path,
+    ) in parsed_outputs:
+        file_record: UploadedFile | None = None
+        found_by_file_id = False
+        if item_file_id:
+            file_record = by_file_id.get(item_file_id)
+            found_by_file_id = file_record is not None
 
         if file_record is None:
-            try:
-                file_record = UploadedFileStore(db).create_from_local_path(
-                    local_path=resolved_path,
-                    user_id=task_user_id,
-                    file_id=expected_file_id,
-                    task_id=task_id,
-                    filename=item_filename or resolved_path.name,
-                    mime_type=None,
-                    storage_key=build_task_output_storage_key(
-                        task_user_id,
-                        task_id,
-                        expected_file_id,
-                        workspace_relative_path,
-                        scope_segments=scope_segments,
-                    ),
-                    workspace_relative_path=workspace_relative_path,
-                    workspace_category=workspace_category,
-                )
-                db.flush()
-                changed = True
-            except DurableStorageOperationError:
-                db.rollback()
-                raise
+            file_record = next(
+                (
+                    by_storage_path[raw_path]
+                    for raw_path in candidate_raw_paths
+                    if raw_path in by_storage_path
+                ),
+                None,
+            )
 
-        else:
-            try:
-                file_record = UploadedFileStore(db).upsert_by_storage_path(
-                    user_id=task_user_id,
-                    filename=item_filename or resolved_path.name,
-                    storage_path=resolved_path,
-                    mime_type=None,
-                    file_size=resolved_path.stat().st_size,
-                    storage_key=build_task_output_storage_key(
-                        task_user_id,
-                        task_id,
-                        str(file_record.file_id),
-                        workspace_relative_path,
-                        scope_segments=scope_segments,
-                    ),
-                    task_id=task_id,
-                    workspace_relative_path=workspace_relative_path,
-                    workspace_category=workspace_category,
+        if file_record is None and item_relative_path:
+            workspace_relative_path = _normalize_workspace_relative_path(
+                item_relative_path
+            )
+            scoped_workspace_records = [
+                record
+                for record in by_workspace_path.get(workspace_relative_path, ())
+                if _uploaded_file_record_in_task_scope(
+                    record,
+                    task_id,
+                    task_user_id,
                 )
-                changed = True
-            except DurableStorageOperationError:
-                db.rollback()
-                raise
+                and record.storage_status != "compensating"
+            ]
+            if len(scoped_workspace_records) == 1:
+                file_record = scoped_workspace_records[0]
+
+        if file_record is None:
+            normalized_outputs.append(deepcopy(original_item))
+            continue
+
+        if (
+            not _uploaded_file_record_in_task_scope(
+                file_record,
+                task_id,
+                task_user_id,
+            )
+            or file_record.storage_status == "compensating"
+        ):
+            logger.warning(
+                "Skipping historical file output outside task/user scope: %s",
+                item_file_id or candidate_raw_paths,
+            )
+            continue
+
+        if not found_by_file_id:
+            workspace_category = getattr(file_record, "workspace_category", None)
+            if workspace_category not in (None, "output") or (
+                workspace_category is None
+                and not any(
+                    path_claims_current_task_output(path)
+                    for path in (
+                        *candidate_raw_paths,
+                        str(getattr(file_record, "storage_path", "") or ""),
+                    )
+                    if path
+                )
+            ):
+                logger.warning(
+                    "Skipping registered file output outside output category: %s",
+                    getattr(file_record, "file_id", item_file_id),
+                )
+                continue
 
         if item_file_id:
             path_to_file_id[item_file_id] = str(file_record.file_id)
-        add_normalized_output(file_record, item_filename, raw_paths)
-        _add_file_link_aliases(
-            path_to_file_id, normalized_relative_path, str(file_record.file_id)
+        add_normalized_output(
+            file_record,
+            item_filename,
+            candidate_raw_paths,
         )
 
-        if workspace_relative_path != normalized_relative_path:
-            final_file_id = str(file_record.file_id)
+        if item_relative_path:
             _add_file_link_aliases(
                 path_to_file_id,
-                workspace_relative_path,
-                final_file_id,
+                _normalize_workspace_relative_path(item_relative_path),
+                str(file_record.file_id),
             )
-
-    if changed:
-        if commit_changes:
-            db.commit()
-        else:
-            db.flush()
 
     return normalized_outputs, path_to_file_id
 
@@ -1443,19 +1448,12 @@ def _normalize_task_file_outputs(
     *,
     task_id: Optional[int] = None,
     task_user_id: Optional[int] = None,
-    resolved_scope_segments: tuple[str, ...] | None = None,
-    commit_changes: bool = True,
-) -> tuple[list[Dict[str, Any]], Dict[str, str]]:
-    """Resolve and persist ``file_outputs`` produced by an agent run.
+) -> tuple[list[Any], Dict[str, str]]:
+    """Project only already-registered ``file_outputs`` for historical replay.
 
-    Two callsite shapes:
-      1. WS / legacy paths still hold the ORM ``task`` row in-scope —
-         pass it as ``task`` and the user_id / task_id come from there.
-      2. Snapshot path (``execute_task_background`` with off-loop
-         loader) sets ``task=None`` to avoid ORM session crossings,
-         and supplies ``task_id`` + ``task_user_id`` directly. Without
-         this overload the persistence step silently no-ops because
-         ``_task_user_id(None)`` returns ``None``.
+    History is a read path. Missing legacy metadata is deliberately left
+    unresolved here; durable backfill belongs to a separately fenced
+    reconciler, never to a cache-miss replay.
     """
     resolved_user_id: Optional[int]
     resolved_task_id: Optional[int]
@@ -1474,9 +1472,553 @@ def _normalize_task_file_outputs(
         task_id=resolved_task_id,
         task_user_id=resolved_user_id,
         file_outputs=file_outputs,
-        resolved_scope_segments=resolved_scope_segments,
-        commit_changes=commit_changes,
     )
+
+
+@dataclass(frozen=True)
+class _OutputFileRecordSnapshot:
+    """Detached durable metadata used to plan one output registration."""
+
+    version: UploadedFileVersionSnapshot
+    file_id: str
+    filename: str
+    storage_key: str | None
+    mime_type: str | None
+    file_size: int
+    workspace_relative_path: str | None
+    workspace_category: str | None
+
+
+@dataclass(frozen=True)
+class _TaskOutputStageRequest:
+    """One validated local output whose bytes still need durable staging."""
+
+    item_index: int
+    resolved_path: Path
+    raw_paths: tuple[str, ...]
+    item_file_id: str
+    filename: str
+    normalized_relative_path: str
+    workspace_relative_path: str
+    workspace_category: str
+    existing: _OutputFileRecordSnapshot | None
+
+
+@dataclass(frozen=True)
+class _ResolvedTaskOutputInput:
+    """Filesystem-resolved input that is safe to inspect with a short Session."""
+
+    item_index: int
+    item_file_id: str
+    item_filename: str
+    item_relative_path: str
+    raw_paths: tuple[str, ...]
+    resolved_info: tuple[Path, str] | None
+
+
+@dataclass(frozen=True)
+class _PreparedTaskOutputMutation:
+    """One already-durable object awaiting the fenced metadata transaction."""
+
+    staged: StagedUploadedFile
+    expected: UploadedFileVersionSnapshot | None
+
+
+@dataclass(frozen=True)
+class _PreparedTaskFileOutputs:
+    """Detached result of the no-Session durable-output phase."""
+
+    normalized_outputs: tuple[dict[str, Any], ...]
+    path_to_file_id: tuple[tuple[str, str], ...]
+    mutations: tuple[_PreparedTaskOutputMutation, ...]
+
+    @property
+    def staged_files(self) -> tuple[StagedUploadedFile, ...]:
+        return tuple(mutation.staged for mutation in self.mutations)
+
+
+def _snapshot_output_file(record: UploadedFile) -> _OutputFileRecordSnapshot:
+    return _OutputFileRecordSnapshot(
+        version=snapshot_uploaded_file_version(record),
+        file_id=str(record.file_id),
+        filename=str(record.filename),
+        storage_key=(
+            str(record.storage_key) if record.storage_key is not None else None
+        ),
+        mime_type=str(record.mime_type) if record.mime_type is not None else None,
+        file_size=int(record.file_size or 0),
+        workspace_relative_path=(
+            str(record.workspace_relative_path)
+            if record.workspace_relative_path is not None
+            else None
+        ),
+        workspace_category=(
+            str(record.workspace_category)
+            if record.workspace_category is not None
+            else None
+        ),
+    )
+
+
+def _prepared_output_ref(
+    *,
+    file_id: str,
+    filename: str,
+    mime_type: str | None,
+    file_size: int,
+) -> dict[str, Any]:
+    return build_file_ref(
+        file_id=file_id,
+        filename=filename,
+        mime_type=mime_type,
+        size=file_size,
+    )
+
+
+def _prepare_task_file_outputs_isolated(
+    *,
+    task_id: int,
+    task_user_id: int | None,
+    file_outputs: Any,
+    resolved_scope_segments: tuple[str, ...],
+) -> _PreparedTaskFileOutputs:
+    """Stage task output bytes without retaining a Session or task-row lock.
+
+    The first phase only snapshots existing metadata.  The Session is closed
+    before checksum/object-storage work begins.  A later exact-run transaction
+    applies these detached mutations together with the terminal task state.
+    """
+
+    if isinstance(file_outputs, str):
+        file_outputs = [file_outputs] if file_outputs.strip() else []
+    if not isinstance(file_outputs, list) or not file_outputs:
+        return _PreparedTaskFileOutputs((), (), ())
+
+    SessionLocal = get_session_local()
+    resolved_task_user_id = task_user_id
+    if resolved_task_user_id is None:
+        with SessionLocal() as db:
+            resolved_task_user_id = (
+                db.query(Task.user_id).filter(Task.id == task_id).scalar()
+            )
+        if resolved_task_user_id is None:
+            return _PreparedTaskFileOutputs((), (), ())
+    owner_user_id = int(resolved_task_user_id)
+
+    # Parse and resolve every candidate before opening the metadata Session.
+    # Local files may be backed by slow network mounts; even existence checks
+    # must not pin a database connection.
+    resolved_inputs: list[_ResolvedTaskOutputInput] = []
+    for item_index, item in enumerate(file_outputs):
+        item_file_id = ""
+        item_filename = ""
+        item_relative_path = ""
+        raw_paths: list[str] = []
+        if isinstance(item, str):
+            raw_paths = [item]
+        elif isinstance(item, dict):
+            if isinstance(item.get("file_id"), str):
+                item_file_id = str(item["file_id"]).strip()
+            if isinstance(item.get("filename"), str):
+                item_filename = str(item["filename"])
+            for key in ("file_path", "download_path", "relative_path", "path"):
+                value = item.get(key)
+                if isinstance(value, str) and value.strip():
+                    raw_paths.append(value)
+                    if key == "relative_path":
+                        item_relative_path = value
+        else:
+            continue
+
+        resolved_info: tuple[Path, str] | None = None
+        for raw_path in raw_paths:
+            candidate = _resolve_output_storage_path(raw_path)
+            if candidate is not None:
+                resolved_info = (Path(candidate[0]), str(candidate[1]))
+                break
+        resolved_inputs.append(
+            _ResolvedTaskOutputInput(
+                item_index=item_index,
+                item_file_id=item_file_id,
+                item_filename=item_filename,
+                item_relative_path=item_relative_path,
+                raw_paths=tuple(raw_paths),
+                resolved_info=resolved_info,
+            )
+        )
+
+    stage_requests: list[_TaskOutputStageRequest] = []
+    immediate_outputs: list[
+        tuple[int, dict[str, Any], tuple[str, ...], str | None]
+    ] = []
+    with SessionLocal() as db:
+        for resolved_input in resolved_inputs:
+            if resolved_input.resolved_info is None:
+                if not resolved_input.item_file_id:
+                    continue
+                record = (
+                    db.query(UploadedFile)
+                    .filter(
+                        UploadedFile.file_id == resolved_input.item_file_id,
+                        UploadedFile.user_id == owner_user_id,
+                        or_(
+                            UploadedFile.task_id == task_id,
+                            UploadedFile.task_id.is_(None),
+                        ),
+                        UploadedFile.storage_status != "compensating",
+                    )
+                    .first()
+                )
+                if record is None:
+                    logger.warning(
+                        "Skipping file output outside task/user scope: %s",
+                        resolved_input.item_file_id,
+                    )
+                    continue
+                snapshot = _snapshot_output_file(record)
+                immediate_outputs.append(
+                    (
+                        resolved_input.item_index,
+                        _prepared_output_ref(
+                            file_id=snapshot.file_id,
+                            filename=(
+                                resolved_input.item_filename or snapshot.filename
+                            ),
+                            mime_type=snapshot.mime_type,
+                            file_size=snapshot.file_size,
+                        ),
+                        resolved_input.raw_paths,
+                        snapshot.workspace_relative_path,
+                    )
+                )
+                continue
+
+            resolved_path, relative_path = resolved_input.resolved_info
+            normalized_relative_path = relative_path.lstrip("/")
+            record = (
+                db.query(UploadedFile)
+                .filter(
+                    UploadedFile.storage_path == str(resolved_path),
+                    UploadedFile.storage_status != "compensating",
+                )
+                .first()
+            )
+            if record is not None and not _uploaded_file_record_in_task_scope(
+                record,
+                task_id,
+                owner_user_id,
+            ):
+                logger.warning(
+                    "Skipping file output record outside task/user scope: %s",
+                    getattr(record, "file_id", str(resolved_path)),
+                )
+                continue
+
+            if record is not None and not _output_path_in_current_task_scope(
+                normalized_relative_path,
+                task_id,
+                owner_user_id,
+            ):
+                snapshot = _snapshot_output_file(record)
+                if snapshot.workspace_category != "output":
+                    logger.warning(
+                        "Skipping registered file output outside output category: %s",
+                        snapshot.file_id,
+                    )
+                    continue
+                immediate_outputs.append(
+                    (
+                        resolved_input.item_index,
+                        _prepared_output_ref(
+                            file_id=snapshot.file_id,
+                            filename=(
+                                resolved_input.item_filename or snapshot.filename
+                            ),
+                            mime_type=snapshot.mime_type,
+                            file_size=snapshot.file_size,
+                        ),
+                        resolved_input.raw_paths,
+                        snapshot.workspace_relative_path,
+                    )
+                )
+                continue
+
+            if not _output_path_in_current_task_scope(
+                normalized_relative_path,
+                task_id,
+                owner_user_id,
+            ):
+                logger.warning(
+                    "Skipping file output outside current task output scope: %s",
+                    relative_path,
+                )
+                continue
+
+            workspace_relative_path = _normalize_workspace_relative_path(
+                resolved_input.item_relative_path or normalized_relative_path
+            )
+            workspace_category = _workspace_category_from_relative_path(
+                workspace_relative_path
+            )
+            if record is None and resolved_input.item_file_id:
+                record = (
+                    db.query(UploadedFile)
+                    .filter(
+                        UploadedFile.file_id == resolved_input.item_file_id,
+                        UploadedFile.user_id == owner_user_id,
+                        or_(
+                            UploadedFile.task_id == task_id,
+                            UploadedFile.task_id.is_(None),
+                        ),
+                        UploadedFile.storage_status != "compensating",
+                    )
+                    .first()
+                )
+            existing = _snapshot_output_file(record) if record is not None else None
+            stage_requests.append(
+                _TaskOutputStageRequest(
+                    item_index=resolved_input.item_index,
+                    resolved_path=resolved_path,
+                    raw_paths=resolved_input.raw_paths,
+                    item_file_id=resolved_input.item_file_id,
+                    filename=(resolved_input.item_filename or resolved_path.name),
+                    normalized_relative_path=normalized_relative_path,
+                    workspace_relative_path=workspace_relative_path,
+                    workspace_category=workspace_category,
+                    existing=existing,
+                )
+            )
+
+    normalized_by_index: dict[int, dict[str, Any]] = {
+        index: output for index, output, _raw_paths, _relative in immediate_outputs
+    }
+    path_to_file_id: dict[str, str] = {}
+    for (
+        index,
+        output,
+        immediate_raw_paths,
+        immediate_relative_path,
+    ) in immediate_outputs:
+        del index
+        file_id = str(output["file_id"])
+        for raw_path in immediate_raw_paths:
+            stripped = raw_path.strip()
+            if stripped:
+                _set_file_link_alias(path_to_file_id, stripped, file_id)
+                _set_file_link_alias(path_to_file_id, stripped.lstrip("/"), file_id)
+        if immediate_relative_path:
+            _add_file_link_aliases(
+                path_to_file_id,
+                immediate_relative_path,
+                file_id,
+            )
+
+    mutations: list[_PreparedTaskOutputMutation] = []
+    staged_by_path: dict[str, StagedUploadedFile] = {}
+    try:
+        for request in stage_requests:
+            path_key = str(request.resolved_path)
+            staged = staged_by_path.get(path_key)
+            if staged is None:
+                existing_file_id = (
+                    request.existing.file_id if request.existing is not None else ""
+                )
+                file_id = (
+                    existing_file_id
+                    or request.item_file_id
+                    or _build_output_file_id(request.workspace_relative_path)
+                )
+                # Every staged output gets an immutable generation key,
+                # including first insert. Competing preparations can therefore
+                # compensate only their own object and committed cleanup never
+                # needs to reuse a superseded key.
+                key_relative_path = (
+                    f"_versions/{uuid.uuid4().hex}/{request.workspace_relative_path}"
+                )
+                staged = stage_uploaded_file_from_local_path(
+                    local_path=request.resolved_path,
+                    user_id=int(resolved_task_user_id),
+                    task_id=task_id,
+                    file_id=file_id,
+                    filename=request.filename,
+                    mime_type=None,
+                    storage_key=build_task_output_storage_key(
+                        int(resolved_task_user_id),
+                        task_id,
+                        file_id,
+                        key_relative_path,
+                        scope_segments=resolved_scope_segments,
+                    ),
+                    workspace_relative_path=request.workspace_relative_path,
+                    workspace_category=request.workspace_category,
+                    execution_scope=ExecutionScope(
+                        workspace_segments=resolved_scope_segments,
+                        isolate_external_dirs=bool(resolved_scope_segments),
+                    ),
+                )
+                staged_by_path[path_key] = staged
+                mutations.append(
+                    _PreparedTaskOutputMutation(
+                        staged=staged,
+                        expected=(
+                            request.existing.version
+                            if request.existing is not None
+                            else None
+                        ),
+                    )
+                )
+
+            normalized_by_index[request.item_index] = _prepared_output_ref(
+                file_id=staged.file_id,
+                filename=request.filename or staged.filename,
+                mime_type=staged.mime_type,
+                file_size=staged.file_size,
+            )
+            if request.item_file_id:
+                path_to_file_id[request.item_file_id] = staged.file_id
+            for raw_path in request.raw_paths:
+                stripped = raw_path.strip()
+                if stripped:
+                    _set_file_link_alias(path_to_file_id, stripped, staged.file_id)
+                    _set_file_link_alias(
+                        path_to_file_id,
+                        stripped.lstrip("/"),
+                        staged.file_id,
+                    )
+            _set_file_link_alias(
+                path_to_file_id,
+                str(request.resolved_path),
+                staged.file_id,
+            )
+            _add_file_link_aliases(
+                path_to_file_id,
+                request.normalized_relative_path,
+                staged.file_id,
+            )
+            if request.workspace_relative_path != request.normalized_relative_path:
+                _add_file_link_aliases(
+                    path_to_file_id,
+                    request.workspace_relative_path,
+                    staged.file_id,
+                )
+    except Exception:
+        compensate_staged_uploaded_files(tuple(staged_by_path.values()))
+        raise
+
+    return _PreparedTaskFileOutputs(
+        normalized_outputs=tuple(
+            normalized_by_index[index] for index in sorted(normalized_by_index)
+        ),
+        path_to_file_id=tuple(path_to_file_id.items()),
+        mutations=tuple(mutations),
+    )
+
+
+def _apply_prepared_task_file_outputs(
+    db: Session,
+    prepared: _PreparedTaskFileOutputs,
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, str],
+    tuple[SupersededObjectCleanupClaim, ...],
+]:
+    """Apply metadata only; the caller owns the exact-run transaction."""
+
+    store = UploadedFileStore(db)
+    cleanup_claims: list[SupersededObjectCleanupClaim] = []
+    for mutation in prepared.mutations:
+        applied = store.upsert_already_durable(
+            mutation.staged,
+            expected=mutation.expected,
+        )
+        if applied.superseded_cleanup_claim is not None:
+            cleanup_claims.append(applied.superseded_cleanup_claim)
+    return (
+        [deepcopy(output) for output in prepared.normalized_outputs],
+        dict(prepared.path_to_file_id),
+        tuple(cleanup_claims),
+    )
+
+
+def _settle_prepared_task_file_outputs(
+    prepared: _PreparedTaskFileOutputs,
+    *,
+    metadata_committed: bool,
+    cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = (),
+) -> None:
+    """Complete the object-storage side of the two-phase registration."""
+
+    if metadata_committed:
+        try:
+            failed_cleanup_claims = cleanup_superseded_uploaded_file_objects(
+                cleanup_claims
+            )
+        except Exception:
+            # The metadata transaction is already committed. Object cleanup is
+            # post-commit garbage collection and must never reclassify that
+            # durable success as a failed task execution.
+            logger.exception(
+                "Failed to clean up superseded task output objects after commit"
+            )
+            return
+        if failed_cleanup_claims:
+            logger.warning(
+                "Retained %s superseded task output object(s) because reference, "
+                "backend, or deletion state was unknown",
+                len(failed_cleanup_claims),
+            )
+        return
+    try:
+        failed_staged_files = compensate_staged_uploaded_files(prepared.staged_files)
+    except Exception:
+        # Settlement runs from finalizers' ``finally`` blocks. A best-effort
+        # compensation failure must not replace the original transaction error
+        # that caused rollback.
+        logger.exception("Failed to compensate staged task output objects")
+        return
+    if failed_staged_files:
+        logger.warning(
+            "Failed to compensate %s staged task output object(s)",
+            len(failed_staged_files),
+        )
+
+
+async def _prepare_task_file_outputs_cancellation_safe(
+    *,
+    task_id: int,
+    task_user_id: int | None,
+    file_outputs: Any,
+    resolved_scope_segments: tuple[str, ...],
+) -> _PreparedTaskFileOutputs:
+    """Drain staging and compensate its late result before propagating cancel."""
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _prepare_task_file_outputs_isolated,
+            task_id=task_id,
+            task_user_id=task_user_id,
+            file_outputs=file_outputs,
+            resolved_scope_segments=resolved_scope_segments,
+        )
+    )
+    prepared, cancellation = await await_task_settlement(worker)
+    if cancellation is None:
+        return prepared
+    try:
+        await run_db_io_cancellation_safe(
+            lambda: _settle_prepared_task_file_outputs(
+                prepared,
+                metadata_committed=False,
+            )
+        )
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception(
+            "Failed to compensate task %s outputs after cancelled staging",
+            task_id,
+        )
+    raise cancellation
 
 
 def _rewrite_links_in_payload(payload: Any, path_to_file_id: Dict[str, str]) -> Any:
@@ -1502,6 +2044,21 @@ def _task_user_id(task: Any) -> int | None:
 def _task_run_id(task: Any) -> str | None:
     run_id = getattr(task, "run_id", None)
     return str(run_id) if run_id is not None else None
+
+
+def _task_lease_snapshot(task: Any) -> TaskLease | None:
+    """Detach the exact active run identity needed by live-control writes."""
+
+    task_id = getattr(task, "id", None)
+    runner_id = getattr(task, "runner_id", None)
+    run_id = getattr(task, "run_id", None)
+    if task_id is None or runner_id is None or run_id is None:
+        return None
+    return TaskLease(
+        task_id=int(task_id),
+        runner_id=str(runner_id),
+        run_id=str(run_id),
+    )
 
 
 def _task_control_state_value(task: Any) -> str | None:
@@ -1531,12 +2088,35 @@ def _finalize_task_execution_result_isolated(
     expected_run_id: str | None,
     task_lease: TaskLease | None,
     resolved_scope_segments: tuple[str, ...],
+    prepared_outputs: _PreparedTaskFileOutputs | None = None,
 ) -> _TaskExecutionFinalization:
     """Persist one task result in a worker-owned, ownership-fenced session."""
     from ..services.chat_history_service import persist_assistant_message_no_commit
 
+    if prepared_outputs is None:
+        resolved_output_user_id = task_user_id
+        if resolved_output_user_id is None:
+            SessionLocal = get_session_local()
+            with SessionLocal() as lookup_db:
+                resolved_output_user_id = (
+                    lookup_db.query(Task.user_id).filter(Task.id == task_id).scalar()
+                )
+        prepared_outputs = (
+            _prepare_task_file_outputs_isolated(
+                task_id=task_id,
+                task_user_id=int(resolved_output_user_id),
+                file_outputs=result.get("file_outputs", []),
+                resolved_scope_segments=resolved_scope_segments,
+            )
+            if resolved_output_user_id is not None
+            else _PreparedTaskFileOutputs((), (), ())
+        )
+
     SessionLocal = get_session_local()
-    with SessionLocal() as finalize_db:
+    finalize_db = SessionLocal()
+    metadata_committed = False
+    cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
+    try:
         default_response = "Task completed" if result.get("success", False) else ""
         chat_response = result.get("chat_response")
         if isinstance(chat_response, dict):
@@ -1593,13 +2173,11 @@ def _finalize_task_execution_result_isolated(
                 late_result=True,
             )
 
-        normalized_outputs, path_to_file_id = _normalize_task_file_outputs(
-            finalize_db,
-            task_updated,
-            result.get("file_outputs", []),
-            resolved_scope_segments=resolved_scope_segments,
-            commit_changes=False,
-        )
+        (
+            normalized_outputs,
+            path_to_file_id,
+            cleanup_claims,
+        ) = _apply_prepared_task_file_outputs(finalize_db, prepared_outputs)
         ai_response = _rewrite_file_links_to_file_id(ai_response, path_to_file_id)
         if task_user_id is not None:
             ai_response = reconcile_assistant_file_references(
@@ -1648,6 +2226,7 @@ def _finalize_task_execution_result_isolated(
                     task_updated.status,
                 )
                 finalize_db.commit()
+                metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
             elif result.get("status") == "interrupted":
@@ -1669,6 +2248,7 @@ def _finalize_task_execution_result_isolated(
                     task_updated.status,
                 )
                 finalize_db.commit()
+                metadata_committed = True
                 terminal_state_committed = True
                 waiting_for_control = True
             elif task_updated.status not in {
@@ -1718,6 +2298,7 @@ def _finalize_task_execution_result_isolated(
                     content_is_reconciled=True,
                 )
                 finalize_db.commit()
+                metadata_committed = True
                 terminal_state_committed = True
 
             broadcast_meta = {
@@ -1746,6 +2327,15 @@ def _finalize_task_execution_result_isolated(
             final_task_status=final_task_status,
             broadcast_meta=broadcast_meta,
         )
+    finally:
+        try:
+            finalize_db.close()
+        finally:
+            _settle_prepared_task_file_outputs(
+                prepared_outputs,
+                metadata_committed=metadata_committed,
+                cleanup_claims=cleanup_claims,
+            )
 
 
 async def execute_task_background(
@@ -1760,8 +2350,8 @@ async def execute_task_background(
     expected_run_id: str | None = None,
     task_lease: TaskLease | None = None,
     resolved_execution_scope: Union[
-        ExecutionScope, None, _ResolvedExecutionScopeNotProvided
-    ] = _RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED,
+        ExecutionScope, None, ExecutionScopeNotProvided
+    ] = EXECUTION_SCOPE_NOT_PROVIDED,
 ) -> None:
     """Execute one task without checking out a DB connection on the event loop.
 
@@ -1778,7 +2368,7 @@ async def execute_task_background(
 
     terminal_state_committed = False
     try:
-        if resolved_execution_scope is _RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED:
+        if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
             execution_scope = await run_db_io_cancellation_safe(
                 lambda: resolve_execution_scope(task_id)
             )
@@ -2012,27 +2602,10 @@ async def execute_task_background(
                 e,
                 exc_info=True,
             )
-            try:
-                await manager.broadcast_to_task(
-                    {
-                        "type": "task_error",
-                        "message": str(e),
-                        "task_id": task_id,
-                        "task": {
-                            "id": task_id,
-                            "status": TaskStatus.FAILED.value,
-                        },
-                        "error": str(e),
-                        "timestamp": datetime.now(timezone.utc).timestamp(),
-                    },
-                    task_id,
-                )
-            except Exception as broadcast_error:
-                logger.error("Failed to send error notification: %s", broadcast_error)
             # The concrete run/runner lease belongs to the orchestrator. Let
             # its single worker-owned settlement transaction persist failure
-            # and release the lease; doing DB work here would add another pool
-            # wait and could race a replacement run.
+            # and release the lease before it emits any terminal event. Doing
+            # either DB work or a broadcast here could race a replacement run.
             raise
 
         error_message = str(e)
@@ -2145,6 +2718,8 @@ def _acquire_resume_task_lease(
             db.commit()
             return None
         if task is not None:
+            db.expire(task)
+            db.refresh(task)
             sync_workforce_run_status(db, task, TaskStatus.RUNNING)
         db.commit()
         return lease
@@ -2160,6 +2735,7 @@ def _finalize_resumed_task(
     result: Dict[str, Any],
     task_lease: TaskLease,
     resolved_scope_segments: tuple[str, ...],
+    prepared_outputs: _PreparedTaskFileOutputs | None = None,
 ) -> dict[str, Any]:
     """Persist one fenced resumed result in a single worker transaction."""
     from ..models.agent import Agent
@@ -2180,10 +2756,36 @@ def _finalize_resumed_task(
         "late_result": False,
     }
     if task_lease.run_id is None:
+        if prepared_outputs is not None:
+            _settle_prepared_task_file_outputs(
+                prepared_outputs,
+                metadata_committed=False,
+            )
         finalized["late_result"] = True
         return finalized
+    if prepared_outputs is None:
+        resolved_output_user_id = task_owner_user_id
+        if resolved_output_user_id is None:
+            SessionLocal = get_session_local()
+            with SessionLocal() as lookup_db:
+                resolved_output_user_id = (
+                    lookup_db.query(Task.user_id).filter(Task.id == task_id).scalar()
+                )
+        prepared_outputs = (
+            _prepare_task_file_outputs_isolated(
+                task_id=task_id,
+                task_user_id=int(resolved_output_user_id),
+                file_outputs=result.get("file_outputs", []),
+                resolved_scope_segments=resolved_scope_segments,
+            )
+            if resolved_output_user_id is not None
+            else _PreparedTaskFileOutputs((), (), ())
+        )
     SessionLocal = get_session_local()
-    with SessionLocal() as db:
+    db = SessionLocal()
+    metadata_committed = False
+    cleanup_claims: tuple[SupersededObjectCleanupClaim, ...] = ()
+    try:
         task = (
             db.query(Task)
             .filter(
@@ -2198,13 +2800,11 @@ def _finalize_resumed_task(
             finalized["late_result"] = True
             return finalized
 
-        normalized_outputs, path_to_file_id = _normalize_task_file_outputs(
-            db,
-            task,
-            result.get("file_outputs", []),
-            resolved_scope_segments=resolved_scope_segments,
-            commit_changes=False,
-        )
+        (
+            normalized_outputs,
+            path_to_file_id,
+            cleanup_claims,
+        ) = _apply_prepared_task_file_outputs(db, prepared_outputs)
         if normalized_outputs:
             output = _rewrite_file_links_to_file_id(output, path_to_file_id)
         if task_owner_user_id is not None:
@@ -2277,10 +2877,20 @@ def _finalize_resumed_task(
             finalized["late_result"] = True
             return finalized
         db.commit()
+        metadata_committed = True
         finalized["lease_released"] = True
         finalized["final_status"] = final_task_status.value
         finalized["control_event_state"] = control_snapshot.as_dict()
         return finalized
+    finally:
+        try:
+            db.close()
+        finally:
+            _settle_prepared_task_file_outputs(
+                prepared_outputs,
+                metadata_committed=metadata_committed,
+                cleanup_claims=cleanup_claims,
+            )
 
 
 def _settle_resumed_task_lease(
@@ -2306,21 +2916,26 @@ async def execute_resume_background(
     delivery_client_message_id: str | None = None,
     expected_run_id: str | None = None,
     resolved_execution_scope: Union[
-        ExecutionScope, None, _ResolvedExecutionScopeNotProvided
-    ] = _RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED,
+        ExecutionScope, None, ExecutionScopeNotProvided
+    ] = EXECUTION_SCOPE_NOT_PROVIDED,
+    preacquired_lease: TaskLease | None = None,
+    preacquired_heartbeat_stop: asyncio.Event | None = None,
+    preacquired_heartbeat_task: (asyncio.Task[TaskLeaseHeartbeatOutcome] | None) = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
     """
-    lease_stop_event = None
-    lease_heartbeat_task = None
-    lease: TaskLease | None = None
+    lease_stop_event = preacquired_heartbeat_stop
+    lease_heartbeat_task = preacquired_heartbeat_task
+    lease: TaskLease | None = preacquired_lease
     lease_released = False
     settlement_error: str | None = None
+    broadcast_error_message: str | None = None
     defer_db_cleanup_to_ttl_recovery = False
     result: Dict[str, Any] | None = None
+    prepared_outputs: _PreparedTaskFileOutputs | None = None
     # Token tracking + mid-run quota gate for the resumed segment (resume had
     # neither before, so a resumed run escaped mid-run enforcement entirely).
     resume_tracker = None
@@ -2392,6 +3007,30 @@ async def execute_resume_background(
             return False
 
     try:
+        preacquired_resources = (
+            preacquired_lease,
+            preacquired_heartbeat_stop,
+            preacquired_heartbeat_task,
+        )
+        if any(resource is not None for resource in preacquired_resources) and not all(
+            resource is not None for resource in preacquired_resources
+        ):
+            raise ValueError(
+                "A preacquired resume lease, heartbeat stop event, and heartbeat "
+                "task must be transferred together"
+            )
+        if preacquired_lease is not None:
+            if preacquired_lease.task_id != task_id or preacquired_lease.run_id is None:
+                raise ValueError(
+                    "A preacquired resume lease must match the task and exact run"
+                )
+            if (
+                expected_run_id is not None
+                and preacquired_lease.run_id != expected_run_id
+            ):
+                raise ValueError(
+                    "The preacquired resume lease does not match expected_run_id"
+                )
         if previous_task is not None and not previous_task.done():
             try:
                 await previous_task
@@ -2405,7 +3044,7 @@ async def execute_resume_background(
             raise RuntimeError(f"Task {task_id} resume has no asyncio task")
         background_task_manager.promote_resume_task(task_id, current_task)
 
-        if resolved_execution_scope is _RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED:
+        if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
             execution_scope = await run_db_io_cancellation_safe(
                 lambda: resolve_execution_scope(task_id)
             )
@@ -2415,48 +3054,57 @@ async def execute_resume_background(
                 resolved_execution_scope,
             )
 
-        lease = await acquire_task_lease_cancellation_safe(
-            lambda: _acquire_resume_task_lease(
-                task_id,
-                task_owner_user_id,
-                expected_run_id,
-            ),
-            lambda acquired: _settle_resumed_task_lease(
-                acquired,
-                error_message="resume cancelled during lease acquisition",
-            ),
-        )
         if lease is None:
-            logger.info(
-                "Task %s resume skipped; another runner owns the lease", task_id
+            lease = await acquire_task_lease_cancellation_safe(
+                lambda: _acquire_resume_task_lease(
+                    task_id,
+                    task_owner_user_id,
+                    expected_run_id,
+                ),
+                lambda acquired: _settle_resumed_task_lease(
+                    acquired,
+                    error_message="resume cancelled during lease acquisition",
+                ),
             )
-            if delivery_turn_id is not None and not delivery_was_dispatched:
-                await run_db_io_cancellation_safe(
-                    lambda: mark_user_message_delivery_sync(
-                        task_id,
-                        delivery_turn_id,
-                        DELIVERY_FAILED,
+            if lease is None:
+                logger.info(
+                    "Task %s resume skipped; another runner owns the lease", task_id
+                )
+                if delivery_turn_id is not None and not delivery_was_dispatched:
+                    await run_db_io_cancellation_safe(
+                        lambda: mark_user_message_delivery_sync(
+                            task_id,
+                            delivery_turn_id,
+                            DELIVERY_FAILED,
+                        )
                     )
+                    await notify_deferred_delivery(
+                        False,
+                        "The deferred message could not be delivered. Please retry.",
+                        retry_with_new_id=True,
+                    )
+                await manager.broadcast_to_task(
+                    {
+                        "type": "agent_error",
+                        "message": "Task is already running on another worker.",
+                        "task": {"id": task_id, "status": TaskStatus.RUNNING.value},
+                        "timestamp": datetime.now(timezone.utc).timestamp(),
+                    },
+                    task_id,
                 )
-                await notify_deferred_delivery(
-                    False,
-                    "The deferred message could not be delivered. Please retry.",
-                    retry_with_new_id=True,
-                )
-            await manager.broadcast_to_task(
-                {
-                    "type": "agent_error",
-                    "message": "Task is already running on another worker.",
-                    "task": {"id": task_id, "status": TaskStatus.RUNNING.value},
-                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                },
-                task_id,
+                return
+            lease_stop_event = asyncio.Event()
+            lease_heartbeat_task = asyncio.create_task(
+                run_task_lease_heartbeat(lease, lease_stop_event)
             )
-            return
-        lease_stop_event = asyncio.Event()
-        lease_heartbeat_task = asyncio.create_task(
-            run_task_lease_heartbeat(lease, lease_stop_event)
-        )
+        else:
+            # The caller acquired and committed this exact lease before
+            # injecting a checkpoint message. Ownership of both lease and
+            # heartbeat transfers atomically to this background task; a second
+            # acquisition would either self-block on a size-1 pool or create a
+            # second runner identity for the same resume.
+            assert lease_stop_event is not None
+            assert lease_heartbeat_task is not None
 
         # The task row can become RUNNING before the original AgentRunner has
         # created a context/checkpoint. Retry an early failed injection only
@@ -2465,15 +3113,20 @@ async def execute_resume_background(
         # persist the injection and acknowledge it, then discover that it is
         # not allowed to run the resume.
         if pending_user_message is not None:
-            posted = await agent_service.post_user_message(
-                str(task_id),
-                execution_message=pending_user_message.get("execution_message"),
-                display_message=pending_user_message.get("display_message"),
-                files=pending_user_message.get("files"),
-                turn_id=pending_user_message.get("turn_id"),
-                request_interrupt=False,
-                reason="deferred websocket user message",
-            )
+            assert lease_heartbeat_task is not None
+            with bind_task_lease_context(lease):
+                posted = await run_while_task_lease_owned(
+                    agent_service.post_user_message(
+                        str(task_id),
+                        execution_message=pending_user_message.get("execution_message"),
+                        display_message=pending_user_message.get("display_message"),
+                        files=pending_user_message.get("files"),
+                        turn_id=pending_user_message.get("turn_id"),
+                        request_interrupt=False,
+                        reason="deferred websocket user message",
+                    ),
+                    lease_heartbeat_task,
+                )
             if not posted:
                 raise RuntimeError(
                     "The user message was saved, but no resumable execution "
@@ -2523,8 +3176,16 @@ async def execute_resume_background(
             )
             resume_tracker = None
 
-        with UserContext(task_owner_user_id), ExecutionScopeContext(execution_scope):
-            result = await agent_service.resume_execution_by_id(str(task_id))
+        assert lease_heartbeat_task is not None
+        with (
+            UserContext(task_owner_user_id),
+            ExecutionScopeContext(execution_scope),
+            bind_task_lease_context(lease),
+        ):
+            result = await run_while_task_lease_owned(
+                agent_service.resume_execution_by_id(str(task_id)),
+                lease_heartbeat_task,
+            )
 
         if result is None:
             raise RuntimeError(
@@ -2562,6 +3223,20 @@ async def execute_resume_background(
             agent_service.set_interrupt_checker(None)
             await tracker_to_complete.complete_tracking()
 
+        # Output object storage can be arbitrarily slow. Stage and checksum it
+        # while this exact runner's heartbeat is still active; after heartbeat
+        # shutdown only the short fenced metadata/lease transaction remains.
+        prepared_outputs = await _prepare_task_file_outputs_cancellation_safe(
+            task_id=task_id,
+            task_user_id=task_owner_user_id,
+            file_outputs=result.get("file_outputs", []),
+            resolved_scope_segments=(
+                execution_scope.workspace_segments
+                if execution_scope is not None
+                else ()
+            ),
+        )
+
         heartbeat_outcome = await stop_task_lease_heartbeat(
             lease_heartbeat_task, lease_stop_event
         )
@@ -2586,22 +3261,29 @@ async def execute_resume_background(
             # broadcast this stale runner's result.
             return
 
-        finalized = await run_db_io_cancellation_safe(
-            lambda: _finalize_resumed_task(
-                task_id,
-                status=status,
-                success=success,
-                output=output,
-                task_owner_user_id=task_owner_user_id,
-                result=result,
-                task_lease=lease,
-                resolved_scope_segments=(
-                    execution_scope.workspace_segments
-                    if execution_scope is not None
-                    else ()
-                ),
+        outputs_for_finalizer = prepared_outputs
+        try:
+            finalized = await run_db_io_cancellation_safe(
+                lambda: _finalize_resumed_task(
+                    task_id,
+                    status=status,
+                    success=success,
+                    output=output,
+                    task_owner_user_id=task_owner_user_id,
+                    result=result,
+                    task_lease=lease,
+                    resolved_scope_segments=(
+                        execution_scope.workspace_segments
+                        if execution_scope is not None
+                        else ()
+                    ),
+                    prepared_outputs=outputs_for_finalizer,
+                )
             )
-        )
+        finally:
+            # Once invoked, the fenced finalizer owns success cleanup or
+            # compensation, including cancellation-safe late completion.
+            prepared_outputs = None
         if finalized["late_result"]:
             logger.info(
                 "Ignoring late resume result for task %s run %s; ownership changed",
@@ -2680,6 +3362,13 @@ async def execute_resume_background(
             },
             task_id,
         )
+    except TaskLeaseLostError:
+        defer_db_cleanup_to_ttl_recovery = lease is not None and not lease_released
+        logger.warning(
+            "Task %s resume execution cancelled after lease ownership loss",
+            task_id,
+        )
+        return
     except asyncio.CancelledError:
         settlement_error = "resume execution cancelled"
         logger.info(f"V2 resume background task {task_id} cancelled")
@@ -2724,6 +3413,7 @@ async def execute_resume_background(
                 exc_info=True,
             )
             settlement_error = error_message
+            broadcast_error_message = error_message
             if delivery_turn_id is not None and not delivery_was_dispatched:
                 if await mark_deferred_delivery_failed():
                     await notify_deferred_delivery(
@@ -2732,7 +3422,11 @@ async def execute_resume_background(
                         retry_with_new_id=True,
                     )
             current_snapshot = None
-            if not defer_db_cleanup_to_ttl_recovery and expected_run_id is not None:
+            if (
+                lease is None
+                and not defer_db_cleanup_to_ttl_recovery
+                and expected_run_id is not None
+            ):
                 current_snapshot = await task_execution_controller.snapshot(task_id)
             if (
                 current_snapshot is not None
@@ -2746,21 +3440,16 @@ async def execute_resume_background(
                     current_snapshot.run_id,
                 )
                 return
-        await manager.broadcast_to_task(
-            {
-                "type": "task_error",
-                "message": error_message,
-                "task": {"id": task_id, "status": TaskStatus.FAILED.value},
-                "task_id": task_id,
-                "error": error_message,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
-            },
-            task_id,
-        )
+        if lease is None:
+            await manager.broadcast_to_task(
+                create_terminal_task_error_event(task_id, error_message),
+                task_id,
+            )
     finally:
 
         async def finalize_resume_resources() -> None:
-            nonlocal defer_db_cleanup_to_ttl_recovery
+            nonlocal defer_db_cleanup_to_ttl_recovery, lease_released
+            nonlocal prepared_outputs
 
             try:
                 # Finalize any tracker that did not reach the normal completion
@@ -2823,18 +3512,45 @@ async def execute_resume_background(
                             task_id,
                             exc_info=True,
                         )
+                if prepared_outputs is not None:
+                    outputs_to_compensate = prepared_outputs
+                    prepared_outputs = None
+                    await run_db_io_cancellation_safe(
+                        lambda: _settle_prepared_task_file_outputs(
+                            outputs_to_compensate,
+                            metadata_committed=False,
+                        )
+                    )
                 if (
                     lease is not None
                     and not lease_released
                     and not defer_db_cleanup_to_ttl_recovery
                 ):
                     try:
-                        await run_db_io_cancellation_safe(
+                        settled = await run_db_io_cancellation_safe(
                             lambda: _settle_resumed_task_lease(
                                 lease,
                                 error_message=settlement_error,
                             )
                         )
+                        if settled:
+                            lease_released = True
+                            if broadcast_error_message is not None:
+                                try:
+                                    await manager.broadcast_to_task(
+                                        create_terminal_task_error_event(
+                                            task_id,
+                                            broadcast_error_message,
+                                        ),
+                                        task_id,
+                                    )
+                                except Exception:
+                                    logger.warning(
+                                        "task %s resume failure was committed but "
+                                        "its terminal broadcast failed",
+                                        task_id,
+                                        exc_info=True,
+                                    )
                     except Exception:
                         logger.error(
                             "resume lease settlement failed for task %s; "
@@ -2850,6 +3566,13 @@ async def execute_resume_background(
         await drain_async_task_cancellation_safe(cleanup_task)
 
 
+@dataclass(frozen=True)
+class BackgroundTaskCancelOutcome:
+    """Whether cancellation was requested from live process-local task work."""
+
+    requested: bool
+
+
 # Background task manager: ensures only one active background execution per task
 class BackgroundTaskManager:
     """Manages background task execution, ensuring only one background process per task at a time"""
@@ -2863,6 +3586,24 @@ class BackgroundTaskManager:
         # resume task while that resume task waits for the original execution.
         self.resume_tasks: Dict[int, asyncio.Task] = {}
         self._resume_reservations: set[int] = set()
+        self._shutting_down = False
+        self._shutdown_lock = asyncio.Lock()
+
+    def start_accepting(self) -> None:
+        """Reopen admission for a new application lifespan."""
+
+        if (
+            self._shutdown_lock.locked()
+            or self.running_tasks
+            or self.resume_tasks
+            or self._resume_reservations
+        ):
+            raise RuntimeError("Background task manager still owns background work")
+        # asyncio synchronization primitives are bound to the event loop that
+        # first contends on them. A new application lifespan may use a new loop,
+        # so an idle manager must not retain the previous lifespan's lock.
+        self._shutdown_lock = asyncio.Lock()
+        self._shutting_down = False
 
     async def wait_for_previous(self, task_id: int) -> None:
         """Wait for previous background task of this task to complete"""
@@ -2885,12 +3626,17 @@ class BackgroundTaskManager:
 
     def register_task(self, task_id: int, task: asyncio.Task) -> None:
         """Register new background task"""
+        if self._shutting_down:
+            task.cancel()
+            raise RuntimeError("Background task manager is shutting down")
         self.running_tasks[task_id] = task
         logger.info(f"Registered background task for task {task_id}")
 
     def reserve_resume(self, task_id: int) -> bool:
         """Atomically reserve the single live-control resume slot."""
 
+        if self._shutting_down:
+            return False
         # Keep this check-and-add block synchronous: asyncio task switches can
         # only happen at ``await``, so it is the in-process atomic guard.
         existing = self.resume_tasks.get(task_id)
@@ -2902,6 +3648,9 @@ class BackgroundTaskManager:
         return True
 
     def register_reserved_resume(self, task_id: int, task: asyncio.Task) -> None:
+        if self._shutting_down:
+            task.cancel()
+            raise RuntimeError("Background task manager is shutting down")
         if task_id not in self._resume_reservations:
             raise RuntimeError(f"Task {task_id} has no reserved resume slot")
         self._resume_reservations.discard(task_id)
@@ -2909,9 +3658,13 @@ class BackgroundTaskManager:
         logger.info("Registered resume coordinator for task %s", task_id)
 
     def release_resume_reservation(self, task_id: int) -> None:
+        if self._shutting_down:
+            return
         self._resume_reservations.discard(task_id)
 
     def promote_resume_task(self, task_id: int, task: asyncio.Task) -> None:
+        if self._shutting_down:
+            raise RuntimeError("Background task manager is shutting down")
         existing = self.resume_tasks.get(task_id)
         if existing is not task:
             raise RuntimeError(
@@ -2922,6 +3675,8 @@ class BackgroundTaskManager:
 
     def cleanup_task(self, task_id: int) -> None:
         """Clean up completed background task"""
+        if self._shutting_down:
+            return
         current = asyncio.current_task()
         task = self.running_tasks.get(task_id)
         if task is not None and (task.done() or task is current):
@@ -2932,7 +3687,11 @@ class BackgroundTaskManager:
             self.resume_tasks.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
 
-    async def cancel_task(self, task_id: int, timeout_seconds: float = 0.5) -> None:
+    async def cancel_task(
+        self,
+        task_id: int,
+        timeout_seconds: float = 0.5,
+    ) -> BackgroundTaskCancelOutcome:
         tasks = {
             task
             for task in (
@@ -2942,12 +3701,13 @@ class BackgroundTaskManager:
             if task is not None
         }
         if not tasks:
-            return
+            return BackgroundTaskCancelOutcome(requested=False)
 
+        requested = False
         for task in tasks:
             if task.done():
                 continue
-            task.cancel()
+            requested = task.cancel() or requested
             try:
                 await asyncio.wait_for(task, timeout=timeout_seconds)
             except asyncio.CancelledError:
@@ -2965,9 +3725,40 @@ class BackgroundTaskManager:
                     f"Background task {task_id} raised during cancellation: {e}"
                 )
 
-        self.running_tasks.pop(task_id, None)
-        self.resume_tasks.pop(task_id, None)
-        self._resume_reservations.discard(task_id)
+        if not self._shutting_down:
+            self.running_tasks.pop(task_id, None)
+            self.resume_tasks.pop(task_id, None)
+            self._resume_reservations.discard(task_id)
+        return BackgroundTaskCancelOutcome(requested=requested)
+
+    async def shutdown(self) -> None:
+        """Fence new work, cancel every owned task, and drain its cleanup."""
+
+        self._shutting_down = True
+        async with self._shutdown_lock:
+            current = asyncio.current_task()
+            tasks = {
+                task
+                for task in (*self.running_tasks.values(), *self.resume_tasks.values())
+                if task is not current
+            }
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+
+            async def drain_tasks() -> None:
+                await asyncio.gather(*tasks, return_exceptions=True)
+
+            cleanup_task = asyncio.create_task(drain_tasks())
+            try:
+                await drain_async_task_cancellation_safe(cleanup_task)
+            finally:
+                # ``drain_async_task_cancellation_safe`` reaches this block only
+                # after the owned cleanup task has settled, even when shutdown's
+                # caller is cancelled.
+                self.running_tasks.clear()
+                self.resume_tasks.clear()
+                self._resume_reservations.clear()
 
 
 # Global background task manager
@@ -3083,51 +3874,173 @@ class SharedWebSocketTracer(TraceHandler):
 ws_router = APIRouter()
 
 
+class _LegacyPreviewRegistrationError(RuntimeError):
+    """A legacy preview path cannot be registered for a public redirect."""
+
+
+def _register_legacy_preview_isolated(legacy_path: str) -> str:
+    """Register one legacy local preview without overlapping DB and file I/O.
+
+    Owner discovery and the final insert each own a short Session. Durable
+    staging happens between those phases, with no Session alive. The final
+    transaction revalidates the unique ``storage_path`` and task ownership
+    before using :class:`UploadedFileStore`'s optimistic insert contract.
+    """
+
+    resolved_info = _resolve_legacy_preview_storage_path(legacy_path)
+    if resolved_info is None:
+        raise _LegacyPreviewRegistrationError("Legacy preview target not found")
+    resolved_path, relative_path = resolved_info
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as lookup_db:
+        existing = (
+            lookup_db.query(UploadedFile)
+            .filter(UploadedFile.storage_path == str(resolved_path))
+            .first()
+        )
+        if existing is not None:
+            return str(existing.file_id)
+
+        owner_info = _infer_owner_from_relative_path(lookup_db, relative_path)
+        if owner_info is None:
+            raise _LegacyPreviewRegistrationError(
+                "Cannot infer owner for legacy preview path"
+            )
+        owner_user_id, task_id = owner_info
+
+    generated_file_id = _build_output_file_id(relative_path)
+    scope_segments = _scope_segments_for_task(task_id)
+    workspace_relative_path = _normalize_workspace_relative_path(relative_path)
+    workspace_category = _workspace_category_from_relative_path(workspace_relative_path)
+    storage_key = (
+        build_task_output_storage_key(
+            owner_user_id,
+            task_id,
+            generated_file_id,
+            (
+                f"_versions/{uuid.uuid4().hex}/"
+                f"{workspace_relative_path or resolved_path.name}"
+            ),
+            scope_segments=scope_segments,
+        )
+        if task_id is not None
+        else build_upload_storage_key(
+            owner_user_id,
+            generated_file_id,
+            resolved_path.name,
+            scope_segments=scope_segments,
+        )
+    )
+    staged = stage_uploaded_file_from_local_path(
+        local_path=resolved_path,
+        user_id=owner_user_id,
+        file_id=generated_file_id,
+        task_id=task_id,
+        filename=resolved_path.name,
+        mime_type=None,
+        storage_key=storage_key,
+        workspace_relative_path=workspace_relative_path,
+        workspace_category=workspace_category,
+        execution_scope=(
+            ExecutionScope(
+                workspace_segments=scope_segments,
+                isolate_external_dirs=bool(scope_segments),
+            )
+            if scope_segments
+            else None
+        ),
+    )
+
+    metadata_committed = False
+    try:
+        with SessionLocal() as write_db:
+            current = (
+                write_db.query(UploadedFile)
+                .filter(UploadedFile.storage_path == str(resolved_path))
+                .with_for_update()
+                .first()
+            )
+            if current is not None:
+                return str(current.file_id)
+
+            if task_id is not None:
+                current_owner = (
+                    write_db.query(Task.user_id)
+                    .filter(Task.id == task_id)
+                    .with_for_update()
+                    .scalar()
+                )
+                if current_owner is None or int(current_owner) != owner_user_id:
+                    raise _LegacyPreviewRegistrationError(
+                        "Legacy preview task ownership changed during registration"
+                    )
+            elif (
+                write_db.query(User.id).filter(User.id == owner_user_id).scalar()
+                is None
+            ):
+                raise _LegacyPreviewRegistrationError(
+                    "Legacy preview owner no longer exists"
+                )
+
+            try:
+                applied = UploadedFileStore(write_db).upsert_already_durable(
+                    staged,
+                    expected=None,
+                )
+                write_db.commit()
+            except UploadedFileVersionConflict:
+                # A competing request can win the unique storage_path insert
+                # after our revalidation. Re-read that winner and discard only
+                # our own immutable staged object.
+                write_db.rollback()
+                winner = (
+                    write_db.query(UploadedFile)
+                    .filter(UploadedFile.storage_path == str(resolved_path))
+                    .first()
+                )
+                if winner is None:
+                    raise
+                return str(winner.file_id)
+            metadata_committed = True
+            return applied.snapshot.file_id
+    finally:
+        if not metadata_committed:
+            try:
+                failed_file_ids = compensate_staged_uploaded_files((staged,))
+            except Exception:
+                logger.exception(
+                    "Failed to compensate staged legacy preview object %s",
+                    staged.file_id,
+                )
+            else:
+                if failed_file_ids:
+                    logger.warning(
+                        "Retained staged legacy preview object %s because "
+                        "reference or deletion state was unknown",
+                        staged.file_id,
+                    )
+
+
 @ws_router.get("/preview/{legacy_path:path}", response_model=None)
 async def redirect_legacy_preview(
     legacy_path: str,
     db: Session = Depends(get_db),
 ) -> Any:
-    resolved_info = _resolve_legacy_preview_storage_path(legacy_path)
-    if resolved_info is None:
-        raise HTTPException(status_code=404, detail="Legacy preview target not found")
-
-    resolved_path, relative_path = resolved_info
-    file_record = (
-        db.query(UploadedFile)
-        .filter(UploadedFile.storage_path == str(resolved_path))
-        .first()
-    )
-
-    if file_record is None:
-        owner_info = _infer_owner_from_relative_path(db, relative_path)
-        if owner_info is None:
-            raise HTTPException(
-                status_code=404, detail="Cannot infer owner for legacy preview path"
-            )
-
-        owner_user_id, task_id = owner_info
-        generated_file_id = _build_output_file_id(relative_path)
-        file_record = UploadedFileStore(db).create_from_local_path(
-            local_path=resolved_path,
-            user_id=owner_user_id,
-            file_id=generated_file_id,
-            task_id=task_id,
-            filename=resolved_path.name,
-            mime_type=None,
-            storage_key=build_task_output_storage_key(
-                owner_user_id,
-                cast(int, task_id),
-                generated_file_id,
-                relative_path,
-                scope_segments=_scope_segments_for_task(task_id),
-            ),
+    if not release_db_connection_if_clean(db):
+        raise RuntimeError(
+            "Cannot register a legacy preview while the request database "
+            "session has pending writes"
         )
-        db.commit()
-        db.refresh(file_record)
+    try:
+        file_id = await run_db_io_cancellation_safe(
+            lambda: _register_legacy_preview_isolated(legacy_path)
+        )
+    except _LegacyPreviewRegistrationError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     return RedirectResponse(
-        url=f"/api/files/public/preview/{file_record.file_id}",
+        url=f"/api/files/public/preview/{file_id}",
         status_code=307,
     )
 
@@ -3213,6 +4126,38 @@ def _event_task_control_state(message: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _with_task_control_state_snapshot(
+    message: dict[str, Any],
+    *,
+    task_id: int,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Attach one already-loaded control-state tuple without database I/O."""
+
+    if not _is_versioned_task_event(message):
+        return deepcopy(message)
+    resolved_state = _event_task_control_state(message) or state
+    enriched = deepcopy(message)
+    enriched.update(resolved_state)
+    enriched["task_id"] = task_id
+
+    if enriched.get("type") == "trace_event":
+        data = enriched.get("data")
+        enriched["data"] = {
+            **(data if isinstance(data, dict) else {}),
+            **resolved_state,
+        }
+
+    task_data = enriched.get("task")
+    if isinstance(task_data, dict):
+        enriched["task"] = {
+            **task_data,
+            **resolved_state,
+            "id": task_id,
+        }
+    return enriched
+
+
 async def _with_current_task_control_state(
     message: dict[str, Any],
     *,
@@ -3237,18 +4182,11 @@ async def _with_current_task_control_state(
         if snapshot is None:
             return message
         state = snapshot.as_dict()
-    enriched = dict(message)
-    enriched.update(state)
-    enriched["task_id"] = task_id
-
-    if enriched.get("type") == "trace_event":
-        data = enriched.get("data")
-        enriched["data"] = {**(data if isinstance(data, dict) else {}), **state}
-
-    task_data = enriched.get("task")
-    if isinstance(task_data, dict):
-        enriched["task"] = {**task_data, **state, "id": task_id}
-    return enriched
+    return _with_task_control_state_snapshot(
+        message,
+        task_id=task_id,
+        state=state,
+    )
 
 
 # Connection manager
@@ -3450,65 +4388,16 @@ def _claim_user_message_delivery_isolated(
         return _snapshot_user_message_delivery(claim)
 
 
-@dataclass(frozen=True)
-class _ContinuationResumeResult:
-    lease_acquired: bool
-    task_event: dict[str, Any] | None = None
-
-
-def _resume_continuation_isolated(task_id: int) -> _ContinuationResumeResult:
-    """Resume a legacy continuation without retaining its Session for IO."""
-
-    SessionLocal = get_session_local()
-    with SessionLocal() as db:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        if task is None or acquire_task_lease(db, task_id) is None:
-            return _ContinuationResumeResult(lease_acquired=False)
-        db.refresh(task)
-        if sync_workforce_run_status(db, task, task.status):
-            db.commit()
-
-        (
-            model_id,
-            small_fast_model_id,
-            visual_model_id,
-            compact_model_id,
-        ) = _resolve_task_llm_ids(task, db)
-        event = create_stream_event(
-            "task_info",
-            task_id,
-            {
-                "id": task.id,
-                "title": task.title,
-                "description": task.description,
-                "status": task.status.value,
-                "model_id": model_id,
-                "small_fast_model_id": small_fast_model_id,
-                "visual_model_id": visual_model_id,
-                "compact_model_id": compact_model_id,
-                "model_name": task.model_name,
-                "small_fast_model_name": task.small_fast_model_name,
-                "visual_model_name": task.visual_model_name,
-                "compact_model_name": task.compact_model_name,
-                "execution_mode": task.execution_mode,
-                "created_at": (
-                    safe_timestamp_to_unix(task.created_at) if task.created_at else None
-                ),
-                "updated_at": (
-                    safe_timestamp_to_unix(task.updated_at) if task.updated_at else None
-                ),
-            },
-            task.created_at if task.created_at else None,
-        )
-        return _ContinuationResumeResult(lease_acquired=True, task_event=event)
-
-
 def _register_uploaded_files_for_agent(
     agent_service: Any,
     file_info_list: List[Dict[str, Any]],
-    db: Session,
+    db: Session | None = None,
 ) -> None:
-    """Expose staged upload records to the agent workspace under its DB session."""
+    """Bind already-durable inputs to the workspace without another upload."""
+
+    # Kept only for compatibility with direct callers. Durable metadata was
+    # committed by the upload/turn transaction before this runtime step.
+    del db
     workspace = getattr(agent_service, "workspace", None)
     if not workspace:
         return
@@ -3555,17 +4444,16 @@ def _register_uploaded_files_for_agent(
                 shutil.copy2(source_path, candidate)
                 workspace_link_path = candidate
 
-        registration_path = source_path.resolve()
-        workspace.register_file(
-            str(registration_path),
+        registration = workspace.describe_file_registration(str(source_path.resolve()))
+        workspace.bind_already_durable_file(
+            registration,
             file_id=file_id,
-            db_session=db,
         )
-        file_info["path"] = str(registration_path)
+        file_info["path"] = str(registration.path)
         file_info["workspace_path"] = str(workspace_link_path)
         logger.info(
             "File registered for agent workspace: storage=%s input_link=%s",
-            registration_path,
+            registration.path,
             workspace_link_path,
         )
 
@@ -3574,16 +4462,36 @@ def _register_uploaded_files_for_agent_isolated(
     agent_service: Any,
     file_info_list: List[Dict[str, Any]],
 ) -> None:
-    """Register staged uploads with a worker-owned short Session."""
+    """Bind upload metadata already committed by the turn transaction."""
+
+    _register_uploaded_files_for_agent(agent_service, file_info_list)
+
+
+@dataclass(frozen=True)
+class WebSocketPrincipal:
+    """The complete authenticated identity needed by WebSocket transports."""
+
+    id: int
+    is_admin: bool
+
+
+def _load_websocket_principal_sync(token: str) -> WebSocketPrincipal | None:
+    """Authenticate one token inside a worker-owned short Session."""
+
     SessionLocal = get_session_local()
     with SessionLocal() as db:
-        _register_uploaded_files_for_agent(agent_service, file_info_list, db)
-        db.commit()
+        user = get_user_from_websocket_token(token, db)
+        if user is None or user.id is None:
+            return None
+        return WebSocketPrincipal(
+            id=int(user.id),
+            is_admin=bool(user.is_admin),
+        )
 
 
 async def get_authenticated_user(
     websocket: WebSocket, token: Optional[str] = None
-) -> Optional[User]:
+) -> Optional[WebSocketPrincipal]:
     """
     Get authenticated user from WebSocket connection
 
@@ -3592,21 +4500,16 @@ async def get_authenticated_user(
         token: Optional authentication token
 
     Returns:
-        User if authenticated, None otherwise
+        Frozen WebSocket principal if authenticated, None otherwise
     """
+    del websocket
     if not token:
         return None
 
     try:
-        from ..models.database import get_db
-
-        db_gen = get_db()
-        db = next(db_gen)
-
-        try:
-            return get_user_from_websocket_token(token, db)
-        finally:
-            db.close()
+        return await run_db_io_cancellation_safe(
+            lambda: _load_websocket_principal_sync(token)
+        )
     except Exception as e:
         logger.error(f"Error authenticating WebSocket user: {e}")
         return None
@@ -3778,6 +4681,511 @@ async def _enqueue_websocket_task_command(
     )
 
 
+@dataclass(frozen=True)
+class _WebSocketTaskRoutingSnapshot:
+    """Detached task state used by WebSocket turn routing and presentation."""
+
+    task_id: int
+    task_owner_user_id: int
+    status: TaskStatus
+    control_state: str | None
+    run_id: str | None
+    task_lease: TaskLease | None
+    task_input: str
+    task_info: dict[str, Any]
+    task_context: dict[str, Any]
+    created_at: datetime | None
+
+
+@dataclass(frozen=True)
+class _WebSocketTurnPreparation:
+    """All synchronous state needed before WebSocket turn orchestration.
+
+    The preparation owner opens and closes its own Session in a worker thread.
+    Only primitives and frozen application-layer values cross back to asyncio;
+    no ORM row or Session may survive into a network wait, broadcast, agent
+    construction, or turn claim.
+    """
+
+    requested_task_id: int
+    routing: _WebSocketTaskRoutingSnapshot
+    task_created: bool
+    execution_context: dict[str, Any]
+    user_message_for_llm: str
+    display_user_message: str
+    display_file_refs: tuple[dict[str, Any], ...]
+    persisted_attachments: tuple[dict[str, Any], ...]
+    turn_payload: "TaskTurnPayload"
+    claimed_created_turn: "_ClaimedTurn | None"
+    existing_delivery: _UserMessageDeliverySnapshot | None
+    recovered_delivery: _UserMessageDeliverySnapshot | None
+    delivery_claimed: bool
+    delivery_dispatched: bool
+    uses_live_control: bool
+
+
+def _agent_builder_skill_enabled(skills: Any) -> bool:
+    if isinstance(skills, list):
+        return any(skill == "agent-builder" for skill in skills)
+    return isinstance(skills, str) and "agent-builder" in skills
+
+
+def _load_websocket_task_routing_snapshot(
+    db: Session,
+    task: Task,
+) -> tuple[_WebSocketTaskRoutingSnapshot, bool]:
+    """Project one authorized Task row without leaking ORM state."""
+
+    from ..models.agent import Agent
+
+    agent_name: str | None = None
+    agent_logo_url: str | None = None
+    agent_execution_mode: str | None = None
+    agent_skills: Any = None
+    if task.agent_id is not None:
+        agent_fields = (
+            db.query(
+                Agent.name,
+                Agent.logo_url,
+                Agent.execution_mode,
+                Agent.skills,
+            )
+            .filter(Agent.id == task.agent_id)
+            .first()
+        )
+        if agent_fields is not None:
+            agent_name = str(agent_fields[0]) if agent_fields[0] is not None else None
+            agent_logo_url = (
+                str(agent_fields[1]) if agent_fields[1] is not None else None
+            )
+            agent_execution_mode = (
+                str(agent_fields[2]) if agent_fields[2] is not None else None
+            )
+            agent_skills = deepcopy(agent_fields[3])
+
+    (
+        model_id,
+        small_fast_model_id,
+        visual_model_id,
+        compact_model_id,
+    ) = _resolve_task_llm_ids(task, db)
+
+    task_context: dict[str, Any] = {}
+    if task.execution_mode:
+        task_context["execution_mode"] = str(task.execution_mode)
+    if task.process_description:
+        task_context["process_description"] = str(task.process_description)
+    if task.examples:
+        task_context["examples"] = deepcopy(task.examples)
+
+    created_at = cast(datetime | None, task.created_at)
+    status = cast(TaskStatus, task.status)
+    return (
+        _WebSocketTaskRoutingSnapshot(
+            task_id=int(task.id),
+            task_owner_user_id=int(task.user_id),
+            status=status,
+            control_state=_task_control_state_value(task),
+            run_id=_task_run_id(task),
+            task_lease=_task_lease_snapshot(task),
+            task_input=str(task.input or ""),
+            task_info={
+                "id": int(task.id),
+                "title": task.title,
+                "description": task.description,
+                "status": status.value,
+                "model_id": model_id,
+                "small_fast_model_id": small_fast_model_id,
+                "visual_model_id": visual_model_id,
+                "compact_model_id": compact_model_id,
+                "model_name": task.model_name,
+                "small_fast_model_name": task.small_fast_model_name,
+                "visual_model_name": task.visual_model_name,
+                "compact_model_name": task.compact_model_name,
+                "execution_mode": task.execution_mode,
+                "agent_id": task.agent_id,
+                "agent_name": agent_name,
+                "agent_logo_url": agent_logo_url,
+                "is_dag": (
+                    agent_execution_mode == "think"
+                    if agent_execution_mode is not None
+                    else None
+                ),
+                "created_at": (
+                    safe_timestamp_to_unix(task.created_at) if task.created_at else None
+                ),
+                "updated_at": (
+                    safe_timestamp_to_unix(task.updated_at) if task.updated_at else None
+                ),
+            },
+            task_context=task_context,
+            created_at=created_at,
+        ),
+        _agent_builder_skill_enabled(agent_skills),
+    )
+
+
+def _load_websocket_task_routing_snapshot_sync(
+    task_id: int,
+    *,
+    task_owner_user_id: int,
+    actor_user_id: int,
+    actor_is_admin: bool,
+) -> _WebSocketTaskRoutingSnapshot | None:
+    """Reload routing state after an async wait in a fresh worker Session."""
+
+    if not actor_is_admin and actor_user_id != task_owner_user_id:
+        return None
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.user_id == task_owner_user_id,
+            )
+            .first()
+        )
+        if task is None:
+            return None
+        routing, _is_agent_builder = _load_websocket_task_routing_snapshot(db, task)
+        return routing
+
+
+def _recover_recent_websocket_file_refs(
+    db: Session,
+    *,
+    task_id: int,
+    actor_user_id: int,
+) -> list[dict[str, Any]]:
+    cutoff = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(minutes=5)
+    pending = (
+        db.query(UploadedFile)
+        .filter(
+            UploadedFile.user_id == actor_user_id,
+            UploadedFile.task_id == task_id,
+            UploadedFile.created_at >= cutoff,
+        )
+        .order_by(UploadedFile.created_at.desc())
+        .all()
+    )
+    return [_uploaded_file_ref(record) for record in pending]
+
+
+def _prepare_websocket_turn_sync(
+    *,
+    requested_task_id: int,
+    actor_user_id: int,
+    actor_is_admin: bool,
+    user_message: str,
+    raw_context: dict[str, Any],
+    raw_files: list[dict[str, Any]],
+    client_message_id: str | None,
+    turn_id: str,
+    durable_attempt_count: int,
+    durable_target_run_id: str | None,
+    pause_accepted: bool,
+) -> _WebSocketTurnPreparation:
+    """Authorize, normalize, and detach one WebSocket turn off the event loop."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        files = deepcopy(raw_files)
+        if not files:
+            try:
+                files = _recover_recent_websocket_file_refs(
+                    db,
+                    task_id=requested_task_id,
+                    actor_user_id=actor_user_id,
+                )
+                if files:
+                    logger.info(
+                        "📁 Race fallback: recovered %s uploaded file(s) from DB "
+                        "for task %s",
+                        len(files),
+                        requested_task_id,
+                    )
+            except Exception as error:  # noqa: BLE001
+                logger.warning(
+                    "Race fallback file lookup failed for task %s: %s",
+                    requested_task_id,
+                    error,
+                )
+
+        task_query = db.query(Task).filter(Task.id == requested_task_id)
+        if not actor_is_admin:
+            task_query = task_query.filter(Task.user_id == actor_user_id)
+        task = task_query.first()
+        task_created = False
+        if task is None:
+            existing_task = db.query(Task).filter(Task.id == requested_task_id).first()
+            if existing_task is not None:
+                logger.warning(
+                    "User %s attempted to access task %s belonging to user %s",
+                    actor_user_id,
+                    requested_task_id,
+                    existing_task.user_id,
+                )
+                raise ValueError(
+                    f"Access denied: Task {requested_task_id} does not belong to you"
+                )
+            task_created = True
+
+        if task is not None and not files and task.status == TaskStatus.PENDING:
+            files = _selected_file_refs_from_task(task, db)
+            if files:
+                logger.info(
+                    "📁 Recovered %s selected file(s) from task %s for initial "
+                    "chat turn",
+                    len(files),
+                    task.id,
+                )
+
+        routing: _WebSocketTaskRoutingSnapshot | None = None
+        if task is not None:
+            routing, is_agent_builder = _load_websocket_task_routing_snapshot(db, task)
+            file_owner_user_id = routing.task_owner_user_id
+            file_task_id: int | None = routing.task_id
+        else:
+            # A missing task has no persisted execution scope or binding yet.
+            # Resolve and materialize its unbound uploads while this Session is
+            # still read-only; only then create and claim the task atomically.
+            is_agent_builder = False
+            file_owner_user_id = actor_user_id
+            file_task_id = None
+        logger.info("📁 Files used for execution: %s", len(files))
+        for index, file_ref in enumerate(files):
+            logger.info(
+                "📄 File %s: %s (%s bytes)",
+                index,
+                file_ref.get("name", "unknown"),
+                file_ref.get("size", 0),
+            )
+
+        file_info_list: list[dict[str, Any]] = []
+        execution_context = deepcopy(raw_context)
+        if files:
+            file_ids = [
+                str(file_ref.get("file_id"))
+                for file_ref in files
+                if file_ref.get("file_id")
+            ]
+            file_info_list, missing = resolve_turn_file_infos(
+                file_ids=file_ids,
+                owner_user_id=file_owner_user_id,
+                db=db,
+                task_id=file_task_id,
+            )
+            for missing_id in missing:
+                logger.warning(
+                    "File record not accessible for task %s: %s",
+                    requested_task_id,
+                    missing_id,
+                )
+            if not task_created:
+                assert routing is not None
+                bind_turn_files(
+                    file_ids=[
+                        str(file_info["file_id"]) for file_info in file_info_list
+                    ],
+                    task_id=routing.task_id,
+                    owner_user_id=routing.task_owner_user_id,
+                    db=db,
+                )
+
+        if task_created:
+            task_title = f"Chat: {user_message}"
+            if len(task_title) > 50:
+                task_title = task_title[:50] + "..."
+            task = Task(
+                user_id=actor_user_id,
+                title=task_title,
+                description=user_message,
+                status=TaskStatus.PENDING,
+                execution_mode=get_default_task_execution_mode(),
+                connector_runtime_selected_refs=[],
+            )
+            db.add(task)
+            db.flush()
+            assert task is not None
+            routing, is_agent_builder = _load_websocket_task_routing_snapshot(db, task)
+
+        assert routing is not None
+        uploaded_files_context = _build_uploaded_files_context(
+            file_info_list,
+            is_agent_builder=is_agent_builder,
+        )
+        if file_info_list:
+            uploaded_file_paths = [
+                str(file_info["path"]) for file_info in file_info_list
+            ]
+            execution_context["uploaded_files"] = uploaded_file_paths
+            execution_context["file_info"] = deepcopy(file_info_list)
+            file_ids = [str(file_info["file_id"]) for file_info in file_info_list]
+            file_names = [file_info["name"] for file_info in file_info_list]
+            file_id_list_str = ", ".join(f'"{file_id}"' for file_id in file_ids)
+            file_prompt = (
+                "## UPLOADED FILES\n"
+                f"The user has uploaded {len(file_info_list)} file(s): "
+                f"{file_names}\n\n"
+                f"{FILE_REF_MODEL_INSTRUCTIONS}\n\n"
+            )
+            if is_agent_builder:
+                file_prompt += (
+                    "Use these exact file_ids (UUIDs) with "
+                    "`create_knowledge_base_from_file`:\n"
+                    f"  file_ids = [{file_id_list_str}]\n\n"
+                    "IMPORTANT: The file_ids above are UUIDs (e.g. "
+                    "'5d983e39-a83b-...'). Do NOT use file paths as file_ids. "
+                    "Call `create_knowledge_base_from_file` with the file_ids "
+                    "listed above, then create or update the agent with the "
+                    "returned collection_name. Do NOT generate a 'wait for "
+                    "upload' step — the files are already uploaded."
+                )
+            else:
+                file_prompt += (
+                    "These files have been successfully uploaded to the workspace "
+                    "and are ready for processing.\nYou can use standard workspace "
+                    "tools to read, analyze, or process them."
+                )
+            existing_prompt = execution_context.get("system_prompt")
+            execution_context["system_prompt"] = (
+                f"{existing_prompt}\n\n{file_prompt}"
+                if existing_prompt
+                else file_prompt
+            )
+
+        user_message_for_llm = _append_uploaded_files_context_to_message(
+            user_message,
+            uploaded_files_context,
+        )
+        display_user_message = _display_message_for_user(
+            user_message,
+            bool(file_info_list),
+        )
+        display_file_refs = _display_file_refs_from_file_info(file_info_list)
+        execution_context["display_message"] = display_user_message
+        execution_context["files"] = deepcopy(display_file_refs)
+        persisted_attachments = _normalize_attachments_for_persistence(file_info_list)
+
+        from ..services.task_orchestrator import (
+            TaskTurnOrchestrator,
+            TaskTurnPayload,
+        )
+
+        turn_payload = TaskTurnPayload(
+            transcript_message=display_user_message,
+            execution_message=user_message_for_llm,
+            attachments=deepcopy(persisted_attachments) or None,
+            turn_id=turn_id,
+        )
+        claimed_created_turn = None
+        existing_delivery_snapshot: _UserMessageDeliverySnapshot | None = None
+        recovered_delivery: _UserMessageDeliverySnapshot | None = None
+        delivery_claimed = False
+        delivery_dispatched = False
+        if task_created:
+            assert task is not None
+            claimed_created_turn = TaskTurnOrchestrator.claim_created_turn_no_commit(
+                db,
+                task_id=routing.task_id,
+                task_owner_user_id=routing.task_owner_user_id,
+                payload=turn_payload,
+            )
+            missing_bindings = bind_turn_files_no_commit(
+                file_ids=[str(file_info["file_id"]) for file_info in file_info_list],
+                task_id=routing.task_id,
+                owner_user_id=routing.task_owner_user_id,
+                db=db,
+            )
+            if missing_bindings:
+                raise ValueError(
+                    "Files are no longer bindable: " + ", ".join(missing_bindings)
+                )
+            # The atomic claim uses a bulk UPDATE. Refresh the Task before
+            # projecting the detached routing snapshot so the first
+            # task_info event reflects the committed RUNNING lease.
+            db.expire(task)
+            db.refresh(task)
+            routing, _is_agent_builder = _load_websocket_task_routing_snapshot(
+                db,
+                task,
+            )
+            db.commit()
+            delivery_claimed = True
+            logger.info(
+                "Created and claimed task %s, replacing old task_id %s",
+                routing.task_id,
+                requested_task_id,
+            )
+        elif client_message_id is not None:
+            existing_delivery = inspect_user_message_delivery(
+                db,
+                routing.task_id,
+                display_user_message,
+                attachments=persisted_attachments or None,
+                turn_id=turn_id,
+            )
+            if existing_delivery is not None:
+                if (
+                    durable_attempt_count > 1
+                    and existing_delivery.pending
+                    and existing_delivery.payload_matches
+                ):
+                    recovered_delivery = _UserMessageDeliverySnapshot(
+                        claimed=True,
+                        payload_matches=True,
+                        failed=False,
+                        pending=True,
+                    )
+                    delivery_claimed = True
+                    if (
+                        routing.status == TaskStatus.RUNNING
+                        and routing.task_input.strip() == display_user_message.strip()
+                    ):
+                        mark_user_message_delivery(
+                            db,
+                            task_id=routing.task_id,
+                            turn_id=turn_id,
+                            status=DELIVERY_DISPATCHED,
+                        )
+                        delivery_dispatched = True
+                else:
+                    existing_delivery_snapshot = _snapshot_user_message_delivery(
+                        existing_delivery
+                    )
+
+        uses_live_control = _task_status_uses_live_control(
+            routing.status,
+            control_state=routing.control_state,
+            pause_accepted=pause_accepted,
+        )
+        if claimed_created_turn is not None:
+            # This RUNNING row is the just-claimed first turn, not a
+            # continuation into an already-running agent.
+            uses_live_control = False
+        if recovered_delivery is not None and durable_target_run_id == routing.run_id:
+            uses_live_control = True
+
+        return _WebSocketTurnPreparation(
+            requested_task_id=requested_task_id,
+            routing=routing,
+            task_created=task_created,
+            execution_context=deepcopy(execution_context),
+            user_message_for_llm=user_message_for_llm,
+            display_user_message=display_user_message,
+            display_file_refs=tuple(deepcopy(display_file_refs)),
+            persisted_attachments=tuple(deepcopy(persisted_attachments)),
+            turn_payload=turn_payload,
+            claimed_created_turn=claimed_created_turn,
+            existing_delivery=existing_delivery_snapshot,
+            recovered_delivery=recovered_delivery,
+            delivery_claimed=delivery_claimed,
+            delivery_dispatched=delivery_dispatched,
+            uses_live_control=uses_live_control,
+        )
+
+
 async def _handle_chat_message_unserialized(
     websocket: WebSocket, task_id: int, message_data: dict
 ) -> None:
@@ -3879,450 +5287,183 @@ async def _handle_chat_message_unserialized(
 
     try:
         user_message = message_data.get("message", "")
-
-        context = message_data.get("context", {})
-        files = message_data.get("files", [])
+        raw_context = message_data.get("context", {})
+        raw_files = message_data.get("files", [])
         user = message_data.get("user")
         authorized_task_id: int | None = None
 
-        # Race-condition fallback: when the message arrives without `files`
-        # in its payload, the frontend may still have uploaded files via the
-        # HTTP /api/files/upload endpoint a moment earlier. Look those up in
-        # the DB and treat them as if they had been declared inline. This
-        # fixes the task-36 scenario where the agent's first turn answered
-        # "I don't see any documents" despite a successful HTTP upload.
-        if not files and user is not None:
-            try:
-                with closing(get_db()) as _db_iter:
-                    _db: Session = next(_db_iter)
-                    cutoff = datetime.now(timezone.utc).replace(
-                        tzinfo=None
-                    ) - timedelta(minutes=5)
-                    pending = (
-                        _db.query(UploadedFile)
-                        .filter(
-                            UploadedFile.user_id == int(user.id),
-                            UploadedFile.task_id == int(task_id),
-                            UploadedFile.created_at >= cutoff,
-                        )
-                        .order_by(UploadedFile.created_at.desc())
-                        .all()
-                    )
-                    if pending:
-                        files = [
-                            {
-                                "file_id": str(record.file_id),
-                                "name": str(record.filename),
-                                "size": int(record.file_size or 0),
-                                "type": record.mime_type,
-                            }
-                            for record in pending
-                        ]
-                        logger.info(
-                            f"📁 Race fallback: recovered {len(files)} "
-                            f"uploaded file(s) from DB for task {task_id}"
-                        )
-            except Exception as _e:  # noqa: BLE001
-                logger.warning(
-                    f"Race fallback file lookup failed for task {task_id}: {_e}"
-                )
+        if user is None:
+            raise ValueError("User authentication required for task access")
+        if not isinstance(user_message, str):
+            raise TypeError("Chat message must be a string")
+        if not isinstance(raw_context, dict):
+            raise TypeError("Chat context must be an object")
+        if not isinstance(raw_files, list):
+            raise TypeError("Chat files must be a list")
+
+        actor_user_id = int(user.id)
+        actor_is_admin = bool(user.is_admin)
+        pause_accepted = _is_task_pause_accepted(task_id)
+        preparation = await run_db_io_cancellation_safe(
+            lambda: _prepare_websocket_turn_sync(
+                requested_task_id=task_id,
+                actor_user_id=actor_user_id,
+                actor_is_admin=actor_is_admin,
+                user_message=user_message,
+                raw_context=deepcopy(raw_context),
+                raw_files=deepcopy(raw_files),
+                client_message_id=client_message_id,
+                turn_id=turn_id,
+                durable_attempt_count=int(
+                    message_data.get("_durable_attempt_count") or 0
+                ),
+                durable_target_run_id=message_data.get("_durable_target_run_id"),
+                pause_accepted=pause_accepted,
+            )
+        )
+        routing = preparation.routing
+        task_id = routing.task_id
+        authorized_task_id = task_id
+        context = deepcopy(preparation.execution_context)
+        user_message_for_llm = preparation.user_message_for_llm
+        display_user_message = preparation.display_user_message
+        display_file_refs = [
+            deepcopy(file_ref) for file_ref in preparation.display_file_refs
+        ]
+        persisted_attachments = [
+            deepcopy(attachment) for attachment in preparation.persisted_attachments
+        ]
+        turn_payload = preparation.turn_payload
+        recovered_delivery = preparation.recovered_delivery
+        delivery_claimed = preparation.delivery_claimed
+        delivery_dispatched = preparation.delivery_dispatched
 
         logger.info(f"Received chat message for task {task_id}")
-        logger.info(f"👤 User: {user.id if user else 'unknown'}")
+        logger.info(f"👤 User: {actor_user_id}")
         logger.info(f"📄 Message: {user_message}")
-        logger.info(f"📁 Files received from websocket/fallback: {len(files)}")
+        logger.info(
+            "📁 Files received from websocket/fallback: %s",
+            len(display_file_refs),
+        )
 
         # Call Agent to handle - use same agent manager as chat API
         try:
             from .chat import get_agent_manager
 
-            # Get database session
-            db_gen = get_db()
-            db: Session = next(db_gen)
-
-            try:
-                # Verify user permissions and get task
-                if not user:
-                    raise ValueError("User authentication required for task access")
-
-                # Check if task exists and belongs to current user, unless admin
-                if user.is_admin:
-                    task = db.query(Task).filter(Task.id == task_id).first()
-                else:
-                    task = (
-                        db.query(Task)
-                        .filter(Task.id == task_id, Task.user_id == user.id)
-                        .first()
-                    )
-
-                if not task:
-                    # Check if task exists but doesn't belong to current user
-                    existing_task = db.query(Task).filter(Task.id == task_id).first()
-                    if existing_task:
-                        # Task exists but doesn't belong to current user, deny access
-                        logger.warning(
-                            f"User {user.id} attempted to access task {task_id} belonging to user {existing_task.user_id}"
-                        )
-                        raise ValueError(
-                            f"Access denied: Task {task_id} does not belong to you"
-                        )
-                    else:
-                        # Task doesn't exist (may have been deleted), create new task
-                        # This is a fresh start, don't use continuation logic
-                        logger.info(
-                            f"Task {task_id} not found (may have been deleted). Creating new task."
-                        )
-                        task_title = f"Chat: {user_message}"
-                        if len(task_title) > 50:
-                            task_title = task_title[:50] + "..."
-
-                        task = Task(
-                            user_id=int(user.id),  # Use authenticated user ID
-                            title=task_title,
-                            description=user_message,
-                            status=TaskStatus.PENDING,  # Use PENDING instead of RUNNING
-                            execution_mode=get_default_task_execution_mode(),
-                            connector_runtime_selected_refs=[],
-                        )
-                        db.add(task)
-                        db.commit()
-                        db.refresh(task)
-
-                        # Update task_id to newly created task ID
-                        old_task_id = task_id
-                        task_id = int(task.id)
-                        logger.info(
-                            f"Created new task with ID {task_id}, replacing old task_id {old_task_id}"
-                        )
-
-                        # Move WebSocket connection to new task_id
-                        manager.move_connection(websocket, task_id)
-
-                        # Send task ID update event to notify frontend
-                        await manager.send_personal_message(
-                            {
-                                "type": "task_id_updated",
-                                "old_task_id": old_task_id,
-                                "new_task_id": task_id,
-                            },
-                            websocket,
-                        )
-
-                        # Send task info event to update frontend state
-                        logger.info(
-                            f"Sending task_info event for new task {task_id}, status: {task.status.value}"
-                        )
-
-                        # Determine is_dag from agent config if agent_id exists
-                        is_dag = None
-                        if task.agent_id:
-                            from ..models.agent import Agent
-
-                            agent = (
-                                db.query(Agent)
-                                .filter(Agent.id == task.agent_id)
-                                .first()
-                            )
-                            if agent:
-                                is_dag = agent.execution_mode == "think"
-
-                        (
-                            model_id,
-                            small_fast_model_id,
-                            visual_model_id,
-                            compact_model_id,
-                        ) = _resolve_task_llm_ids(task, db)
-
-                        task_event = create_stream_event(
-                            "task_info",
-                            task_id,
-                            {
-                                "id": task.id,
-                                "title": task.title,
-                                "description": task.description,
-                                "status": task.status.value,
-                                "model_id": model_id,
-                                "small_fast_model_id": small_fast_model_id,
-                                "visual_model_id": visual_model_id,
-                                "compact_model_id": compact_model_id,
-                                "model_name": task.model_name,
-                                "small_fast_model_name": task.small_fast_model_name,
-                                "visual_model_name": task.visual_model_name,
-                                "compact_model_name": task.compact_model_name,
-                                "execution_mode": task.execution_mode,
-                                "agent_id": task.agent_id,
-                                "agent_name": task.agent.name if task.agent else None,
-                                "agent_logo_url": task.agent.logo_url
-                                if task.agent
-                                else None,
-                                "is_dag": is_dag,
-                                "created_at": safe_timestamp_to_unix(task.created_at)
-                                if task.created_at
-                                else None,
-                                "updated_at": safe_timestamp_to_unix(task.updated_at)
-                                if task.updated_at
-                                else None,
-                            },
-                            task.created_at if task.created_at else None,
-                        )
-                        await manager.broadcast_to_task(task_event, task_id)
-                        logger.info(f"task_info event sent for task {task_id}")
-
-                authorized_task_id = int(task.id)
-
-                if not files and task.status == TaskStatus.PENDING:
-                    files = _selected_file_refs_from_task(task, db)
-                    if files:
-                        logger.info(
-                            f"📁 Recovered {len(files)} selected file(s) from task "
-                            f"{task_id} for initial chat turn"
-                        )
-
-                logger.info(f"📁 Files used for execution: {len(files)}")
-                for i, file_info in enumerate(files):
-                    logger.info(
-                        f"📄 File {i}: {file_info.get('name', 'unknown')} ({file_info.get('size', 0)} bytes)"
-                    )
-
-                # Handle file upload if files present
-                uploaded_file_paths = []
-                file_info_list = []
-                uploaded_files_context = ""
-                if files:
-                    # Process file upload
-                    upload_result = await handle_file_upload_for_task(
+            if preparation.task_created:
+                old_task_id = preparation.requested_task_id
+                manager.move_connection(websocket, task_id)
+                await manager.send_personal_message(
+                    {
+                        "type": "task_id_updated",
+                        "old_task_id": old_task_id,
+                        "new_task_id": task_id,
+                    },
+                    websocket,
+                )
+                await manager.broadcast_to_task(
+                    create_stream_event(
+                        "task_info",
                         task_id,
-                        files,
-                        db,
-                        user,
-                        task_owner_id=int(task.user_id),
-                    )
-                    uploaded_file_paths = upload_result.get("uploaded_files", [])
-                    file_info_list = upload_result.get("file_info_list", [])
-
-                    if file_info_list:
-                        context["uploaded_files"] = uploaded_file_paths
-                        context["file_info"] = file_info_list
-                        file_ids = [f["file_id"] for f in file_info_list]
-                        file_names = [f["name"] for f in file_info_list]
-                        file_id_list_str = ", ".join(f'"{fid}"' for fid in file_ids)
-
-                        # Check if this task is an agent-builder task to inject KB instructions
-                        is_agent_builder = False
-                        if task.agent_id:
-                            from ..models.agent import Agent
-
-                            agent_record = (
-                                db.query(Agent)
-                                .filter(Agent.id == task.agent_id)
-                                .first()
-                            )
-                            if agent_record and agent_record.skills:
-                                if isinstance(agent_record.skills, list):
-                                    is_agent_builder = any(
-                                        s == "agent-builder"
-                                        for s in agent_record.skills
-                                    )
-                                elif isinstance(agent_record.skills, str):
-                                    is_agent_builder = (
-                                        "agent-builder" in agent_record.skills
-                                    )
-
-                        uploaded_files_context = _build_uploaded_files_context(
-                            file_info_list,
-                            is_agent_builder=is_agent_builder,
-                        )
-                        file_prompt = (
-                            "## UPLOADED FILES\n"
-                            f"The user has uploaded {len(file_info_list)} file(s): {file_names}\n\n"
-                            f"{FILE_REF_MODEL_INSTRUCTIONS}\n\n"
-                        )
-
-                        if is_agent_builder:
-                            file_prompt += (
-                                f"Use these exact file_ids (UUIDs) with `create_knowledge_base_from_file`:\n"
-                                f"  file_ids = [{file_id_list_str}]\n\n"
-                                "IMPORTANT: The file_ids above are UUIDs (e.g. '5d983e39-a83b-...'). "
-                                "Do NOT use file paths as file_ids. "
-                                "Call `create_knowledge_base_from_file` with the file_ids listed above, "
-                                "then create or update the agent with the returned collection_name. "
-                                "Do NOT generate a 'wait for upload' step — the files are already uploaded."
-                            )
-                        else:
-                            file_prompt += (
-                                "These files have been successfully uploaded to the workspace and are ready for processing.\n"
-                                "You can use standard workspace tools to read, analyze, or process them."
-                            )
-
-                        existing_prompt = context.get("system_prompt")
-                        if existing_prompt:
-                            context["system_prompt"] = (
-                                f"{existing_prompt}\n\n{file_prompt}"
-                            )
-                        else:
-                            context["system_prompt"] = file_prompt
-
-                user_message_for_llm = _append_uploaded_files_context_to_message(
-                    user_message,
-                    uploaded_files_context,
-                )
-                display_user_message = _display_message_for_user(
-                    user_message,
-                    bool(file_info_list),
-                )
-                display_file_refs = _display_file_refs_from_file_info(file_info_list)
-                context["display_message"] = display_user_message
-                context["files"] = display_file_refs
-
-                persisted_attachments = _normalize_attachments_for_persistence(
-                    file_info_list
+                        deepcopy(routing.task_info),
+                        routing.created_at,
+                    ),
+                    task_id,
                 )
 
-                # Retry inspection happens after file normalization so the
-                # same text with different attachments cannot alias an older
-                # durable turn. Legacy rows with no delivery status are
-                # treated as delivered; failed handoffs are explicitly
-                # rejected so the frontend can retry with a fresh id.
-                if client_message_id is not None:
-                    existing_delivery = inspect_user_message_delivery(
-                        db,
+            if preparation.claimed_created_turn is not None:
+                from ..services.task_orchestrator import TaskTurnOrchestrator
+
+                await TaskTurnOrchestrator.schedule_claimed_create_turn(
+                    task_id=task_id,
+                    task_owner_user_id=routing.task_owner_user_id,
+                    actor_user_id=actor_user_id,
+                    payload=turn_payload,
+                    claimed=preparation.claimed_created_turn,
+                    context=context,
+                )
+                # Scheduling owns the durable PENDING -> DISPATCHED update.
+                # Keep the local flag aligned so a later WebSocket ack failure
+                # cannot rewrite an already-running turn as failed delivery.
+                delivery_dispatched = True
+                await finish_delivery(True)
+                return
+
+            if preparation.existing_delivery is not None:
+                await finish_existing_delivery(preparation.existing_delivery)
+                return
+            if delivery_dispatched:
+                await finish_delivery(True)
+                return
+
+            # DAG plan-execute will automatically send the user_message trace
+            # event. The transcript write for a new turn is owned atomically by
+            # TaskTurnOrchestrator.begin_turn.
+            task_uses_live_control = preparation.uses_live_control
+            task_owner_user_id = routing.task_owner_user_id
+            task_status = routing.status
+            task_run_id = routing.run_id
+            live_task_lease = (
+                routing.task_lease if task_status == TaskStatus.RUNNING else None
+            )
+            agent_service = None
+            supports_live_control = False
+            if task_uses_live_control:
+                resolved_execution_scope = await run_db_io_cancellation_safe(
+                    lambda: resolve_execution_scope(task_id)
+                )
+                from ..services.task_setup_snapshot import (
+                    load_task_setup_snapshot_sync,
+                )
+
+                task_setup_snapshot = await run_db_io_cancellation_safe(
+                    lambda: load_task_setup_snapshot_sync(
                         task_id,
-                        display_user_message,
-                        attachments=persisted_attachments or None,
-                        turn_id=turn_id,
+                        task_owner_user_id,
+                        actor_user_id=actor_user_id,
+                        actor_is_admin=actor_is_admin,
                     )
-                    if existing_delivery is not None:
-                        durable_replay = (
-                            int(message_data.get("_durable_attempt_count") or 0) > 1
-                        )
-                        if (
-                            durable_replay
-                            and existing_delivery.pending
-                            and existing_delivery.payload_matches
-                        ):
-                            # The command claim is the exclusive replay lease,
-                            # so it may safely adopt a PENDING transcript row
-                            # left by a worker that died mid-application.
-                            recovered_delivery = _UserMessageDeliverySnapshot(
-                                claimed=True,
-                                payload_matches=True,
-                                failed=False,
-                                pending=True,
-                            )
-                            delivery_claimed = True
-                            if (
-                                task.status == TaskStatus.RUNNING
-                                and str(task.input or "").strip()
-                                == display_user_message.strip()
-                            ):
-                                # New-turn claim committed before the old
-                                # worker died. Do not start or inject it again.
-                                mark_user_message_delivery(
-                                    db,
-                                    task_id=task_id,
-                                    turn_id=turn_id,
-                                    status=DELIVERY_DISPATCHED,
-                                )
-                                delivery_dispatched = True
-                                db.close()
-                                await finish_delivery(True)
-                                return
-                        else:
-                            existing_delivery_snapshot = (
-                                _snapshot_user_message_delivery(existing_delivery)
-                            )
-                            db.close()
-                            await finish_existing_delivery(existing_delivery_snapshot)
-                            return
-
-                # DAG plan-execute will automatically send user_message trace event
-
-                # The user message is persisted inside
-                # ``TaskTurnOrchestrator.begin_turn`` as part of the atomic
-                # transition (claim + persist + schedule commit together).
-
-                # Messages to an actively executing task are control-plane
-                # input. A PAUSED task plus a fresh user message is a new
-                # turn on the same task/thread; only an explicit resume event
-                # should continue the paused checkpoint.
-                pause_accepted = _is_task_pause_accepted(task_id)
-                task_uses_live_control = _task_status_uses_live_control(
-                    task.status,
-                    control_state=_task_control_state_value(task),
-                    pause_accepted=pause_accepted,
                 )
-                if (
-                    recovered_delivery is not None
-                    and message_data.get("_durable_target_run_id") == task.run_id
-                ):
-                    # A crashed owner may have already interrupted the run and
-                    # persisted PAUSED before its command claim was completed.
-                    # This is the same durable guidance command, not a new turn.
-                    task_uses_live_control = True
-                agent_service = None
-                dag_pattern = None
-                supports_live_control = False
-                has_continuation = False
-                if task_uses_live_control:
-                    task_owner_user_id = int(task.user_id)
-                    task_status = cast(TaskStatus, task.status)
-                    task_run_id = _task_run_id(task)
-                    actor_user_id = int(user.id)
-                    actor_is_admin = bool(user.is_admin)
-                    # No request Session or ORM row may survive into agent
-                    # construction. The setup loader owns its worker Session
-                    # and returns only frozen application-layer values.
-                    db.close()
-                    resolved_execution_scope = await run_db_io_cancellation_safe(
-                        lambda: resolve_execution_scope(task_id)
+                if task_setup_snapshot is None:
+                    raise ValueError(f"Task {task_id} is no longer available")
+                agent_service = await get_agent_manager().get_agent_for_task(
+                    task_id,
+                    None,
+                    user=task_setup_snapshot.runtime_user,
+                    task_setup_snapshot=task_setup_snapshot,
+                    task_owner_user_id=task_owner_user_id,
+                    resolved_execution_scope=resolved_execution_scope,
+                )
+                if hasattr(agent_service, "set_outbound_message_handler"):
+                    agent_service.set_outbound_message_handler(
+                        make_agent_outbound_handler(task_id)
                     )
-                    from ..services.task_setup_snapshot import (
-                        load_task_setup_snapshot_sync,
-                    )
+                supports_live_control = getattr(
+                    agent_service, "supports_live_control", lambda: False
+                )()
 
-                    task_setup_snapshot = await run_db_io_cancellation_safe(
-                        lambda: load_task_setup_snapshot_sync(
-                            task_id,
-                            task_owner_user_id,
-                            actor_user_id=actor_user_id,
-                            actor_is_admin=actor_is_admin,
-                        )
+            if task_uses_live_control and supports_live_control:
+                logger.info(f"Using agent message control for task {task_id}")
+                assert agent_service is not None
+                if not background_task_manager.reserve_resume(task_id):
+                    await finish_delivery(
+                        False,
+                        "A previous guidance message is still being applied. "
+                        "Please wait for it to finish.",
                     )
-                    if task_setup_snapshot is None:
-                        raise ValueError(f"Task {task_id} is no longer available")
-                    agent_service = await get_agent_manager().get_agent_for_task(
-                        task_id,
-                        None,
-                        user=task_setup_snapshot.runtime_user,
-                        task_setup_snapshot=task_setup_snapshot,
-                        task_owner_user_id=task_owner_user_id,
-                        resolved_execution_scope=resolved_execution_scope,
-                    )
-                    if hasattr(agent_service, "set_outbound_message_handler"):
-                        agent_service.set_outbound_message_handler(
-                            make_agent_outbound_handler(task_id)
-                        )
-                    dag_pattern = (
-                        agent_service.get_dag_pattern()
-                        if hasattr(agent_service, "get_dag_pattern")
-                        else None
-                    )
-                    supports_live_control = getattr(
-                        agent_service, "supports_live_control", lambda: False
-                    )()
-                    has_continuation = bool(
-                        dag_pattern and hasattr(dag_pattern, "request_continuation")
-                    )
-
-                if (
-                    task_uses_live_control
-                    and has_continuation
-                    and not supports_live_control
-                ):
-                    # Use continuation: old task will handle at appropriate time
-                    logger.info(f"Using continuation for running task {task_id}")
-                    assert dag_pattern is not None  # for mypy type checking
-
+                    return
+                # Pass the user-typed bubble text + display-safe file refs
+                # alongside the LLM-augmented execution text. The runner
+                # persists them onto Message.metadata so its tracing
+                # callback can emit the bubble with the typed content +
+                # file chips rather than the inflated prompt; matches what
+                # historical replay shows on reload.
+                # ``post_user_message`` routes into
+                # ``AgentRunner.inject_user_message``, whose
+                # ``on_user_message_posted`` callback is the single trace
+                # emission point. Do not emit a second user-message trace.
+                bg_task: asyncio.Task[None] | None = None
+                try:
                     if recovered_delivery is not None:
                         delivery_claim = recovered_delivery
                     else:
@@ -4337,512 +5478,321 @@ async def _handle_chat_message_unserialized(
                         )
                     recovered_delivery = None
                     if not delivery_claim.claimed:
+                        background_task_manager.release_resume_reservation(task_id)
                         await finish_existing_delivery(delivery_claim)
                         return
                     delivery_claimed = True
 
-                    # Immediately send trace_user_message to display user message on interface
-                    if hasattr(dag_pattern, "tracer") and hasattr(
-                        dag_pattern, "task_id"
-                    ):
-                        trace_data: Dict[str, Any] = {
-                            "context": context,
-                            "pattern": "DAG Plan-Execute Continuation",
-                            "continuation": "true",
-                            "files": display_file_refs,
-                            "turn_id": turn_id,
-                        }
-                        # Surface uploaded files at the top level so the
-                        # frontend user-message renderer can show clickable
-                        # file chips alongside the continuation bubble
-                        # (matches what historical replay shows on reload).
-                        # ``files`` is already populated above via #455's
-                        # display_file_refs; mirror it under ``attachments``
-                        # for the historical-replay client contract.
-                        if display_file_refs:
-                            trace_data["attachments"] = display_file_refs
-                        await trace_user_message(
-                            dag_pattern.tracer,
-                            str(dag_pattern.task_id),
-                            display_user_message,
-                            trace_data,
-                        )
-
-                    dag_pattern.request_continuation(user_message_for_llm, context)
-                    await run_db_io_cancellation_safe(
-                        lambda: mark_user_message_delivery_sync(
+                    posted = False
+                    if live_task_lease is not None:
+                        with bind_task_lease_context(live_task_lease):
+                            posted = await agent_service.post_user_message(
+                                str(task_id),
+                                execution_message=user_message_for_llm,
+                                display_message=display_user_message,
+                                files=display_file_refs,
+                                turn_id=turn_id,
+                                request_interrupt=True,
+                                reason="new websocket user message",
+                            )
+                    if not posted:
+                        logger.warning(
+                            "Agent execution %s had no exact live lease or "
+                            "checkpoint; deferring the durable user message "
+                            "until the resume owner is ready",
                             task_id,
-                            turn_id,
-                            DELIVERY_DISPATCHED,
                         )
-                    )
-                    # The existing DAG worker owns terminal execution and has
-                    # no per-continuation completion callback. For this path,
-                    # DISPATCHED is the terminal delivery state: it means the
-                    # continuation was accepted, not that the whole DAG ended.
-                    delivery_dispatched = True
-
-                    # If previously PAUSED/WAITING_FOR_USER, update status to RUNNING
-                    if task_status in {
-                        TaskStatus.PAUSED,
-                        TaskStatus.WAITING_FOR_USER,
-                    }:
-                        continuation_resume = await run_db_io_cancellation_safe(
-                            lambda: _resume_continuation_isolated(task_id)
-                        )
-                        if not continuation_resume.lease_acquired:
-                            await manager.send_personal_message(
-                                {
-                                    "type": "error",
-                                    "message": (
-                                        "Task is already running on another worker"
-                                    ),
-                                },
-                                websocket,
-                            )
-                            await finish_delivery(True)
-                            return
-                        assert continuation_resume.task_event is not None
-                        await manager.broadcast_to_task(
-                            continuation_resume.task_event, task_id
-                        )
-                        logger.info(f"Task {task_id} status updated to RUNNING")
-
-                    # Continuation will be handled by old task, return directly
-                    await finish_delivery(True)
-                    return
-                if task_uses_live_control and supports_live_control:
-                    logger.info(f"Using agent message control for task {task_id}")
-                    assert agent_service is not None
-                    if not background_task_manager.reserve_resume(task_id):
-                        await finish_delivery(
-                            False,
-                            "A previous guidance message is still being applied. "
-                            "Please wait for it to finish.",
-                        )
-                        return
-                    # Pass the user-typed bubble text + display-safe file refs
-                    # alongside the LLM-augmented execution text. The runner
-                    # persists them onto Message.metadata so its tracing
-                    # callback can emit the bubble with the typed content +
-                    # file chips rather than the inflated prompt; matches what
-                    # historical replay shows on reload.
-                    # ``post_user_message`` routes into ``AgentRunner.inject_user_message``,
-                    # which dispatches ``on_user_message_posted`` — that callback
-                    # is the single emission point for the live-control
-                    # continuation user-message trace. Do not emit a second
-                    # ``trace_user_message`` here; doing so would render the
-                    # bubble twice in the live UI. The DAG Plan-Execute
-                    # continuation path above is a separate code path and
-                    # keeps its own immediate trace.
-                    bg_task: asyncio.Task[None] | None = None
-                    try:
-                        if recovered_delivery is not None:
-                            delivery_claim = recovered_delivery
-                        else:
-                            delivery_claim = await run_db_io_cancellation_safe(
-                                lambda: _claim_user_message_delivery_isolated(
-                                    task_id=task_id,
-                                    task_owner_user_id=task_owner_user_id,
-                                    content=display_user_message,
-                                    attachments=persisted_attachments or None,
-                                    turn_id=turn_id,
-                                )
-                            )
-                        recovered_delivery = None
-                        if not delivery_claim.claimed:
-                            background_task_manager.release_resume_reservation(task_id)
-                            await finish_existing_delivery(delivery_claim)
-                            return
-                        delivery_claimed = True
-
-                        posted = await agent_service.post_user_message(
-                            str(task_id),
-                            execution_message=user_message_for_llm,
-                            display_message=display_user_message,
-                            files=display_file_refs,
-                            turn_id=turn_id,
-                            request_interrupt=task_status == TaskStatus.RUNNING,
-                            reason="new websocket user message",
-                        )
-                        if not posted:
-                            logger.warning(
-                                "Agent execution %s was not live; deferring the "
-                                "durable user message until its checkpoint is ready",
+                    else:
+                        await run_db_io_cancellation_safe(
+                            lambda: mark_user_message_delivery_sync(
                                 task_id,
+                                turn_id,
+                                DELIVERY_DISPATCHED,
                             )
-                        else:
-                            await run_db_io_cancellation_safe(
-                                lambda: mark_user_message_delivery_sync(
-                                    task_id,
-                                    turn_id,
-                                    DELIVERY_DISPATCHED,
-                                )
-                            )
-                        # ``post_user_message`` has already durably injected the
-                        # turn when it returns True. Preserve that fact even if
-                        # the resume reservation is concurrently withdrawn
-                        # before the coordinator can be registered.
-                        delivery_dispatched = posted
+                        )
+                    # ``post_user_message`` has already durably injected the
+                    # turn when it returns True. Preserve that fact even if
+                    # the resume reservation is concurrently withdrawn
+                    # before the coordinator can be registered.
+                    delivery_dispatched = posted
 
-                        await task_execution_controller.transition(
-                            task_id,
-                            TaskControlState.RESUME_REQUESTED,
+                    await task_execution_controller.transition(
+                        task_id,
+                        TaskControlState.RESUME_REQUESTED,
+                        expected_run_id=task_run_id,
+                    )
+
+                    previous_task = background_task_manager.running_tasks.get(task_id)
+                    bg_task = asyncio.create_task(
+                        execute_resume_background(
+                            task_id=task_id,
+                            agent_service=agent_service,
+                            task_owner_user_id=task_owner_user_id,
                             expected_run_id=task_run_id,
+                            previous_task=previous_task,
+                            resolved_execution_scope=resolved_execution_scope,
+                            pending_user_message=(
+                                None
+                                if posted
+                                else {
+                                    "execution_message": user_message_for_llm,
+                                    "display_message": display_user_message,
+                                    "files": display_file_refs,
+                                    "turn_id": turn_id,
+                                }
+                            ),
+                            delivery_turn_id=turn_id,
+                            delivery_already_dispatched=posted,
+                            delivery_websocket=(
+                                None if posted or suppress_delivery_ack else websocket
+                            ),
+                            delivery_client_message_id=(
+                                None
+                                if posted or suppress_delivery_ack
+                                else client_message_id
+                            ),
                         )
+                    )
+                    background_task_manager.register_reserved_resume(task_id, bg_task)
+                except BaseException:
+                    if bg_task is not None:
+                        bg_task.cancel()
+                    background_task_manager.release_resume_reservation(task_id)
+                    raise
 
-                        previous_task = background_task_manager.running_tasks.get(
-                            task_id
-                        )
-                        bg_task = asyncio.create_task(
-                            execute_resume_background(
-                                task_id=task_id,
-                                agent_service=agent_service,
-                                task_owner_user_id=task_owner_user_id,
-                                expected_run_id=task_run_id,
-                                previous_task=previous_task,
-                                resolved_execution_scope=resolved_execution_scope,
-                                pending_user_message=(
-                                    None
-                                    if posted
-                                    else {
-                                        "execution_message": user_message_for_llm,
-                                        "display_message": display_user_message,
-                                        "files": display_file_refs,
-                                        "turn_id": turn_id,
-                                    }
-                                ),
-                                delivery_turn_id=turn_id,
-                                delivery_already_dispatched=posted,
-                                delivery_websocket=(
-                                    None
-                                    if posted or suppress_delivery_ack
-                                    else websocket
-                                ),
-                                delivery_client_message_id=(
-                                    None
-                                    if posted or suppress_delivery_ack
-                                    else client_message_id
-                                ),
-                            )
-                        )
-                        background_task_manager.register_reserved_resume(
-                            task_id, bg_task
-                        )
-                    except BaseException:
-                        if bg_task is not None:
-                            bg_task.cancel()
-                        background_task_manager.release_resume_reservation(task_id)
-                        raise
-
-                    if posted:
-                        await finish_delivery(True)
-                    return
-                elif task_uses_live_control and not has_continuation:
-                    # Task is running but doesn't support continuation (shouldn't happen)
-                    logger.error(
-                        f"Task {task_id} is running but does not support continuation"
+                if posted:
+                    await finish_delivery(True)
+                return
+            elif task_uses_live_control:
+                # A runtime without the durable checkpoint/live-control
+                # contract cannot safely accept a continuation: there is no
+                # exact lease handoff or completion owner to fence it.
+                logger.error(
+                    "Task %s does not support durable message continuation",
+                    task_id,
+                )
+                await manager.send_personal_message(
+                    {
+                        "type": "error",
+                        "message": "Task does not support message continuation",
+                    },
+                    websocket,
+                )
+                await finish_delivery(
+                    False, "Task does not support message continuation."
+                )
+                return
+            else:
+                # New task/turn (PENDING/COMPLETED/FAILED/PAUSED), execute normally
+                if pause_accepted and routing.status in {
+                    TaskStatus.RUNNING,
+                    TaskStatus.WAITING_FOR_USER,
+                }:
+                    logger.info(
+                        "Task %s has an accepted pause request; waiting for "
+                        "the active run to persist its control state before "
+                        "routing the follow-up message",
+                        task_id,
                     )
-                    await manager.send_personal_message(
-                        {
-                            "type": "error",
-                            "message": "Task does not support message continuation",
-                        },
-                        websocket,
+                    await background_task_manager.wait_for_previous(task_id)
+                    refreshed_routing = await run_db_io_cancellation_safe(
+                        lambda: _load_websocket_task_routing_snapshot_sync(
+                            task_id,
+                            task_owner_user_id=routing.task_owner_user_id,
+                            actor_user_id=actor_user_id,
+                            actor_is_admin=actor_is_admin,
+                        )
                     )
-                    await finish_delivery(
-                        False, "Task does not support message continuation."
-                    )
-                    return
-                else:
-                    # New task/turn (PENDING/COMPLETED/FAILED/PAUSED), execute normally
-                    if pause_accepted and task.status in {
+                    if refreshed_routing is None:
+                        raise ValueError(f"Task {task_id} is no longer available")
+                    routing = refreshed_routing
+                    if routing.status in {
                         TaskStatus.RUNNING,
                         TaskStatus.WAITING_FOR_USER,
                     }:
-                        logger.info(
-                            "Task %s has an accepted pause request; waiting for "
-                            "the active run to persist its control state before "
-                            "routing the follow-up message",
+                        error_payload = await _read_task_error_payload_offloop(
                             task_id,
-                        )
-                        await background_task_manager.wait_for_previous(task_id)
-                        db.refresh(task)
-                        if task.status in {
-                            TaskStatus.RUNNING,
-                            TaskStatus.WAITING_FOR_USER,
-                        }:
-                            await manager.broadcast_to_task(
-                                {
-                                    **_task_error_payload(
-                                        db,
-                                        task_id,
-                                        (
-                                            "Task pause is still being applied; "
-                                            "please retry shortly."
-                                        ),
-                                        event_type="agent_error",
-                                    ),
-                                    "timestamp": datetime.now(timezone.utc).timestamp(),
-                                },
-                                task_id,
-                            )
-                            await finish_delivery(
-                                False,
-                                "Task pause is still being applied; please retry shortly.",
-                            )
-                            return
-                        _clear_task_pause_accepted(task_id)
-
-                    logger.info(
-                        f"Task {task_id} starting new execution turn (status: {task.status.value})"
-                    )
-
-                    # The execution wrapper acquires the lease just before it
-                    # starts running. Avoid acquiring it during setup so setup
-                    # failures cannot leave the task locked.
-                    if task.status != TaskStatus.RUNNING:
-                        logger.info(
-                            f"Sending task_info event for existing task {task_id}, status: {task.status.value}"
-                        )
-
-                        # Determine is_dag from agent config if agent_id exists
-                        is_dag = None
-                        if task.agent_id:
-                            from ..models.agent import Agent
-
-                            agent = (
-                                db.query(Agent)
-                                .filter(Agent.id == task.agent_id)
-                                .first()
-                            )
-                            if agent:
-                                is_dag = agent.execution_mode == "think"
-
-                        (
-                            model_id,
-                            small_fast_model_id,
-                            visual_model_id,
-                            compact_model_id,
-                        ) = _resolve_task_llm_ids(task, db)
-
-                        task_event = create_stream_event(
-                            "task_info",
-                            task_id,
-                            {
-                                "id": task.id,
-                                "title": task.title,
-                                "description": task.description,
-                                "status": task.status.value,
-                                "model_id": model_id,
-                                "small_fast_model_id": small_fast_model_id,
-                                "visual_model_id": visual_model_id,
-                                "compact_model_id": compact_model_id,
-                                "model_name": task.model_name,
-                                "small_fast_model_name": task.small_fast_model_name,
-                                "visual_model_name": task.visual_model_name,
-                                "compact_model_name": task.compact_model_name,
-                                "execution_mode": task.execution_mode,
-                                "agent_id": task.agent_id,
-                                "agent_name": task.agent.name if task.agent else None,
-                                "agent_logo_url": task.agent.logo_url
-                                if task.agent
-                                else None,
-                                "is_dag": is_dag,
-                                "created_at": safe_timestamp_to_unix(task.created_at)
-                                if task.created_at
-                                else None,
-                                "updated_at": safe_timestamp_to_unix(task.updated_at)
-                                if task.updated_at
-                                else None,
-                            },
-                            task.created_at if task.created_at else None,
-                        )
-                        await manager.broadcast_to_task(task_event, task_id)
-                        logger.info(f"task_info event sent for existing task {task_id}")
-
-                    # Build context with vibe mode information if available
-                    if hasattr(task, "execution_mode") and task.execution_mode:
-                        context["execution_mode"] = task.execution_mode
-                    if (
-                        hasattr(task, "process_description")
-                        and task.process_description
-                    ):
-                        context["process_description"] = task.process_description
-                    if hasattr(task, "examples") and task.examples:
-                        context["examples"] = task.examples
-
-                    # WS builds the display/execution payload here and
-                    # delegates the full new-turn transition to the
-                    # shared orchestrator. ``begin_turn`` owns the
-                    # atomic claim (status flip + input set + terminal-
-                    # field reset), the transcript persist, the
-                    # single-commit transaction, and the lease-aware bg
-                    # schedule -- so WS and /v1 SDK use one turn-
-                    # lifecycle state machine.
-                    from ..services.task_orchestrator import (
-                        TaskTurnError,
-                        TaskTurnNotFoundError,
-                        TaskTurnOrchestrator,
-                        TaskTurnPayload,
-                        TurnKind,
-                    )
-
-                    # Strip absolute filesystem paths before the row hits
-                    # disk — the attachments column is exposed to historical-
-                    # replay clients, so paths must not leak.
-                    payload = TaskTurnPayload(
-                        transcript_message=display_user_message,
-                        execution_message=user_message_for_llm,
-                        attachments=persisted_attachments or None,
-                        turn_id=turn_id,
-                    )
-                    # WS path has these legal entries into begin_turn:
-                    #   PENDING                  → CREATE
-                    #   COMPLETED / FAILED       → APPEND
-                    #   PAUSED + user message    → APPEND (new turn)
-                    # WAITING_FOR_USER / RUNNING should have been intercepted
-                    # by the live-control path above. Reaching this branch
-                    # with either is an upstream-dispatch bug; surface it as
-                    # an agent_error rather than silently letting begin_turn
-                    # 409 on the wrong status.
-                    if task.status == TaskStatus.PENDING:
-                        turn_kind = TurnKind.CREATE
-                        turn_force_fresh = False
-                    elif task.status in (
-                        TaskStatus.COMPLETED,
-                        TaskStatus.FAILED,
-                    ):
-                        turn_kind = TurnKind.APPEND
-                        turn_force_fresh = False
-                    elif task.status == TaskStatus.PAUSED:
-                        turn_kind = TurnKind.APPEND
-                        turn_force_fresh = False
-                    else:
-                        logger.error(
-                            f"WS schedule reached for task {task_id} with "
-                            f"unexpected status={task.status}; expected "
-                            "PENDING, PAUSED, or terminal. Live-control path "
-                            "should have intercepted."
+                            (
+                                "Task pause is still being applied; "
+                                "please retry shortly."
+                            ),
+                            event_type="agent_error",
                         )
                         await manager.broadcast_to_task(
                             {
-                                **_task_error_payload(
-                                    db,
-                                    task_id,
-                                    "Internal dispatch error; please retry.",
-                                    event_type="agent_error",
-                                ),
+                                **error_payload,
                                 "timestamp": datetime.now(timezone.utc).timestamp(),
                             },
                             task_id,
                         )
                         await finish_delivery(
-                            False, "Internal dispatch error; please retry."
+                            False,
+                            "Task pause is still being applied; please retry shortly.",
                         )
                         return
+                    _clear_task_pause_accepted(task_id)
 
-                    turn_task_id = int(task.id)
-                    turn_owner_user_id = int(task.user_id)
-                    turn_actor_user_id = int(user.id)
-                    turn_is_workforce_task = is_workforce_task(task)
-                    # All response/context fields needed above are now detached
-                    # primitives. Return the request's read transaction before
-                    # the orchestrator worker opens its claim Session; otherwise
-                    # a one-slot pool deterministically becomes a nested checkout.
-                    db.close()
-                    try:
-                        await TaskTurnOrchestrator.begin_turn(
-                            task_id=turn_task_id,
-                            # Owner, not the acting principal: ``task`` was
-                            # already authorized above (admin bypass / owner
-                            # check), and the turn must run as the task owner,
-                            # not an admin acting on someone else's task.
-                            task_owner_user_id=turn_owner_user_id,
-                            # The acting principal (the admin when acting on
-                            # another user's task) -- audit/logging only.
-                            actor_user_id=turn_actor_user_id,
-                            payload=payload,
-                            kind=turn_kind,
-                            force_fresh=turn_force_fresh,
-                            context=context,
-                        )
-                        logger.info(f"Task {task_id} started in background")
-                        # ``begin_turn`` flips the Task to RUNNING but does
-                        # not project that onto the WorkforceRun. Use a
-                        # worker-owned short Session so the request Session
-                        # remains closed across the orchestrator await.
-                        if turn_is_workforce_task:
-                            try:
-                                await run_db_io_cancellation_safe(
-                                    lambda: (
-                                        sync_workforce_run_status_for_task_id_isolated(
-                                            turn_task_id,
-                                            TaskStatus.RUNNING,
-                                        )
-                                    )
-                                )
-                            except Exception:
-                                logger.warning(
-                                    "Failed to sync workforce run status after "
-                                    "WS turn for task %s",
-                                    task_id,
-                                    exc_info=True,
-                                )
-                        await finish_delivery(True)
-                    except TaskTurnNotFoundError:
-                        # Task vanished or changed ownership between the
-                        # resolve above and the atomic claim — surface it the
-                        # same way as a busy refusal (no row was mutated).
-                        logger.warning(
-                            "begin_turn: task %s not found / not owned at claim",
-                            task_id,
-                        )
-                        error_payload = await _read_task_error_payload_offloop(
-                            task_id,
-                            "Task is no longer available.",
-                            event_type="agent_error",
-                        )
-                        await manager.broadcast_to_task(
-                            {
-                                **error_payload,
-                                "timestamp": datetime.now(timezone.utc).timestamp(),
-                            },
-                            task_id,
-                        )
-                        await finish_delivery(False, "Task is no longer available.")
-                    except TaskTurnError as busy_err:
-                        # begin_turn's atomic transaction rolls back on
-                        # bg_inflight / busy — neither the status flip
-                        # nor the user message persists, so no transcript
-                        # cleanup is needed here. The rejected-turn-leaves-
-                        # no-side-effect contract makes the previous
-                        # best-effort delete unnecessary.
-                        logger.warning(
-                            f"Refused to schedule bg for task {task_id}: "
-                            f"{busy_err.reason}"
-                        )
-                        rejection_message = _TURN_REJECTION_MESSAGES.get(
-                            busy_err.reason,
-                            "Task is currently busy; please wait for the previous "
-                            "turn to finish before sending another message.",
-                        )
-                        error_payload = await _read_task_error_payload_offloop(
-                            task_id,
-                            rejection_message,
-                            event_type="agent_error",
-                        )
-                        await manager.broadcast_to_task(
-                            {
-                                **error_payload,
-                                "timestamp": datetime.now(timezone.utc).timestamp(),
-                            },
-                            task_id,
-                        )
-                        await finish_delivery(False, rejection_message)
+                logger.info(
+                    "Task %s starting new execution turn (status: %s)",
+                    task_id,
+                    routing.status.value,
+                )
 
-            finally:
-                db.close()
+                # The execution wrapper acquires the lease just before it
+                # starts running. Avoid acquiring it during setup so setup
+                # failures cannot leave the task locked.
+                if routing.status != TaskStatus.RUNNING:
+                    logger.info(
+                        "Sending task_info event for task %s, status: %s",
+                        task_id,
+                        routing.status.value,
+                    )
+                    task_event = create_stream_event(
+                        "task_info",
+                        task_id,
+                        deepcopy(routing.task_info),
+                        routing.created_at,
+                    )
+                    await manager.broadcast_to_task(task_event, task_id)
+                    logger.info(f"task_info event sent for existing task {task_id}")
+
+                context.update(deepcopy(routing.task_context))
+
+                # WS builds the display/execution payload here and
+                # delegates the full new-turn transition to the
+                # shared orchestrator. ``begin_turn`` owns the
+                # atomic claim (status flip + input set + terminal-
+                # field reset), the transcript persist, the
+                # single-commit transaction, and the lease-aware bg
+                # schedule -- so WS and /v1 SDK use one turn-
+                # lifecycle state machine.
+                from ..services.task_orchestrator import (
+                    TaskTurnError,
+                    TaskTurnNotFoundError,
+                    TaskTurnOrchestrator,
+                    TurnKind,
+                )
+
+                # Preparation already built the shared transcript/execution
+                # payload after stripping absolute paths from persisted
+                # attachments. Both the missing-task atomic CREATE path and
+                # existing-task begin_turn path use this same value.
+                payload = turn_payload
+                # WS path has these legal entries into begin_turn:
+                #   PENDING                  → CREATE
+                #   COMPLETED / FAILED       → APPEND
+                #   PAUSED + user message    → APPEND (new turn)
+                # WAITING_FOR_USER / RUNNING should have been intercepted
+                # by the live-control path above. Reaching this branch
+                # with either is an upstream-dispatch bug; surface it as
+                # an agent_error rather than silently letting begin_turn
+                # 409 on the wrong status.
+                if routing.status == TaskStatus.PENDING:
+                    turn_kind = TurnKind.CREATE
+                    turn_force_fresh = False
+                elif routing.status in (
+                    TaskStatus.COMPLETED,
+                    TaskStatus.FAILED,
+                ):
+                    turn_kind = TurnKind.APPEND
+                    turn_force_fresh = False
+                elif routing.status == TaskStatus.PAUSED:
+                    turn_kind = TurnKind.APPEND
+                    turn_force_fresh = False
+                else:
+                    logger.error(
+                        f"WS schedule reached for task {task_id} with "
+                        f"unexpected status={routing.status}; expected "
+                        "PENDING, PAUSED, or terminal. Live-control path "
+                        "should have intercepted."
+                    )
+                    error_payload = await _read_task_error_payload_offloop(
+                        task_id,
+                        "Internal dispatch error; please retry.",
+                        event_type="agent_error",
+                    )
+                    await manager.broadcast_to_task(
+                        {
+                            **error_payload,
+                            "timestamp": datetime.now(timezone.utc).timestamp(),
+                        },
+                        task_id,
+                    )
+                    await finish_delivery(
+                        False, "Internal dispatch error; please retry."
+                    )
+                    return
+
+                turn_task_id = routing.task_id
+                turn_owner_user_id = routing.task_owner_user_id
+                turn_actor_user_id = actor_user_id
+                try:
+                    await TaskTurnOrchestrator.begin_turn(
+                        task_id=turn_task_id,
+                        # Owner, not the acting principal: ``task`` was
+                        # already authorized above (admin bypass / owner
+                        # check), and the turn must run as the task owner,
+                        # not an admin acting on someone else's task.
+                        task_owner_user_id=turn_owner_user_id,
+                        # The acting principal (the admin when acting on
+                        # another user's task) -- audit/logging only.
+                        actor_user_id=turn_actor_user_id,
+                        payload=payload,
+                        kind=turn_kind,
+                        force_fresh=turn_force_fresh,
+                        context=context,
+                    )
+                    logger.info(f"Task {task_id} started in background")
+                    await finish_delivery(True)
+                except TaskTurnNotFoundError:
+                    # Task vanished or changed ownership between the
+                    # resolve above and the atomic claim — surface it the
+                    # same way as a busy refusal (no row was mutated).
+                    logger.warning(
+                        "begin_turn: task %s not found / not owned at claim",
+                        task_id,
+                    )
+                    error_payload = await _read_task_error_payload_offloop(
+                        task_id,
+                        "Task is no longer available.",
+                        event_type="agent_error",
+                    )
+                    await manager.broadcast_to_task(
+                        {
+                            **error_payload,
+                            "timestamp": datetime.now(timezone.utc).timestamp(),
+                        },
+                        task_id,
+                    )
+                    await finish_delivery(False, "Task is no longer available.")
+                except TaskTurnError as busy_err:
+                    # begin_turn's atomic transaction rolls back on
+                    # bg_inflight / busy — neither the status flip
+                    # nor the user message persists, so no transcript
+                    # cleanup is needed here. The rejected-turn-leaves-
+                    # no-side-effect contract makes the previous
+                    # best-effort delete unnecessary.
+                    logger.warning(
+                        f"Refused to schedule bg for task {task_id}: {busy_err.reason}"
+                    )
+                    rejection_message = _TURN_REJECTION_MESSAGES.get(
+                        busy_err.reason,
+                        "Task is currently busy; please wait for the previous "
+                        "turn to finish before sending another message.",
+                    )
+                    error_payload = await _read_task_error_payload_offloop(
+                        task_id,
+                        rejection_message,
+                        event_type="agent_error",
+                    )
+                    await manager.broadcast_to_task(
+                        {
+                            **error_payload,
+                            "timestamp": datetime.now(timezone.utc).timestamp(),
+                        },
+                        task_id,
+                    )
+                    await finish_delivery(False, rejection_message)
 
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error
@@ -5139,10 +6089,20 @@ async def handle_execute_task(
         raise
 
 
-async def send_historical_data_as_stream(
-    websocket: WebSocket, task_id: int, user: User
-) -> None:
-    """Send historical data as stream messages - using unified trace event format"""
+@dataclass(frozen=True)
+class _HistoricalStreamSnapshot:
+    """A complete, detached historical replay ready for network delivery."""
+
+    events: tuple[dict[str, Any], ...]
+
+
+def _load_historical_stream_snapshot_sync(
+    task_id: int,
+    *,
+    actor_user_id: int,
+    actor_is_admin: bool,
+) -> _HistoricalStreamSnapshot | None:
+    """Load, normalize, and cache one historical replay in a short Session."""
     try:
         # Load historical data directly from database
         from ..models.agent import Agent
@@ -5158,24 +6118,22 @@ async def send_historical_data_as_stream(
             task = db.query(Task).filter(Task.id == task_id).first()
             if not task:
                 logger.warning(f"Task {task_id} not found")
-                return
+                return None
 
             # Verify user permissions
             if not task.user_id:
                 logger.warning(f"Task {task_id} has no user association")
-                return
+                return None
 
             # Verify user permissions - admin can access any task
-            if not user.is_admin and task.user_id != int(user.id):
+            if not actor_is_admin and task.user_id != actor_user_id:
                 logger.warning(
-                    f"User {user.id} attempted to access task {task_id} belonging to user {task.user_id}"
+                    "User %s attempted to access task %s belonging to user %s",
+                    actor_user_id,
+                    task_id,
+                    task.user_id,
                 )
-                return
-
-            if mark_task_paused_if_stale(db, task):
-                db.refresh(task)
-                if sync_workforce_run_status(db, task, task.status):
-                    db.commit()
+                return None
 
             is_workforce_run = (
                 db.query(WorkforceRun.id)
@@ -5207,7 +6165,14 @@ async def send_historical_data_as_stream(
             )
             cache_key = web_task_history_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)
-            cached = cache_get(cache_key)
+            control_state = task_control_snapshot(task).as_dict()
+            # Redis is synchronous I/O. Never spend its timeout budget while
+            # pinning a database pool slot: this phase is read-only, so return
+            # the connection before consulting the cache. The Session remains
+            # usable and transparently re-checks out for a cache miss replay.
+            cached = (
+                cache_get(cache_key) if release_db_connection_if_clean(db) else None
+            )
             if (
                 isinstance(cached, dict)
                 and cached.get("trace_scope") == trace_scope
@@ -5216,10 +6181,16 @@ async def send_historical_data_as_stream(
                 and cached.get("max_chat_message_id") == int(max_chat_message_id)
                 and isinstance(cached.get("events"), list)
             ):
-                for cached_event in cached["events"]:
-                    if isinstance(cached_event, dict):
-                        await manager.send_personal_message(cached_event, websocket)
-                return
+                cached_events = tuple(
+                    _with_task_control_state_snapshot(
+                        cached_event,
+                        task_id=task_id,
+                        state=control_state,
+                    )
+                    for cached_event in cached["events"]
+                    if isinstance(cached_event, dict)
+                )
+                return _HistoricalStreamSnapshot(events=cached_events)
 
             cached_stream_events: list[dict[str, Any]] = []
 
@@ -5276,7 +6247,6 @@ async def send_historical_data_as_stream(
                 },
                 task.created_at if task.created_at else None,
             )
-            await manager.send_personal_message(task_event, websocket)
             cached_stream_events.append(task_event)
 
             # Replay only top-level task events. Delegated Agent internals can
@@ -5328,12 +6298,15 @@ async def send_historical_data_as_stream(
                             normalized_event_data
                         )
                         continue
+                    trace_file_outputs = normalized_event_data.get("file_outputs", [])
                     normalized_outputs, path_to_file_id = _normalize_task_file_outputs(
                         db,
-                        task,
-                        normalized_event_data.get("file_outputs", []),
+                        None,
+                        trace_file_outputs,
+                        task_id=task_id,
+                        task_user_id=int(task.user_id),
                     )
-                    if normalized_outputs:
+                    if "file_outputs" in normalized_event_data:
                         normalized_event_data["file_outputs"] = normalized_outputs
                     if path_to_file_id:
                         historical_path_to_file_id.update(path_to_file_id)
@@ -5575,7 +6548,6 @@ async def send_historical_data_as_stream(
                     # Add step_id at the top level if present (consistent with WebSocketTraceHandler)
                     if event_data.get("step_id"):
                         stream_event["step_id"] = str(event_data["step_id"])
-                    await manager.send_personal_message(stream_event, websocket)
                     cached_stream_events.append(stream_event)
                 else:
                     # For other events, use original format
@@ -5587,7 +6559,6 @@ async def send_historical_data_as_stream(
                             event_data,
                             event["timestamp"],
                         )
-                        await manager.send_personal_message(event_obj, websocket)
                         cached_stream_events.append(event_obj)
 
             # Send historical data completion marker
@@ -5599,7 +6570,6 @@ async def send_historical_data_as_stream(
                     "total_trace_events": len(trace_events),
                 },
             )
-            await manager.send_personal_message(completion_event, websocket)
             cached_stream_events.append(completion_event)
 
             # Historical trace replay can end with an in-flight event from before a
@@ -5635,20 +6605,33 @@ async def send_historical_data_as_stream(
                     status_event["question"] = question_message
                 if isinstance(question_interactions, list):
                     status_event["interactions"] = question_interactions
-                await manager.send_personal_message(status_event, websocket)
                 cached_stream_events.append(status_event)
 
-            cache_set(
-                cache_key,
-                {
-                    "trace_scope": trace_scope,
-                    "updated_at": task_updated_at,
-                    "max_trace_event_id": int(max_trace_event_id),
-                    "max_chat_message_id": int(max_chat_message_id),
-                    "events": cached_stream_events,
-                },
-                ttl_seconds=task_cache_ttl_seconds(),
-            )
+            detached_events = [
+                _with_task_control_state_snapshot(
+                    event,
+                    task_id=task_id,
+                    state=control_state,
+                )
+                for event in cached_stream_events
+            ]
+            # The replay is fully detached before cache serialization. If an
+            # unexpected pending mutation prevents a clean release, skip this
+            # optional cache write instead of holding the connection across
+            # remote cache I/O.
+            if release_db_connection_if_clean(db):
+                cache_set(
+                    cache_key,
+                    {
+                        "trace_scope": trace_scope,
+                        "updated_at": task_updated_at,
+                        "max_trace_event_id": int(max_trace_event_id),
+                        "max_chat_message_id": int(max_chat_message_id),
+                        "events": detached_events,
+                    },
+                    ttl_seconds=task_cache_ttl_seconds(),
+                )
+            return _HistoricalStreamSnapshot(events=tuple(detached_events))
 
         except (ValueError, KeyError, TypeError) as e:
             # Data format error
@@ -5672,7 +6655,33 @@ async def send_historical_data_as_stream(
             db.close()
 
     except (ValueError, KeyError, TypeError) as e:
-        # Data format error
+        logger.error(f"Data format error building historical data stream: {e}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error building historical data stream: {e}")
+        raise
+
+
+async def send_historical_data_as_stream(
+    websocket: WebSocket,
+    task_id: int,
+    user: Union[User, WebSocketPrincipal],
+) -> None:
+    """Send one detached historical snapshot in stream-event order."""
+
+    try:
+        snapshot = await run_db_io_cancellation_safe(
+            lambda: _load_historical_stream_snapshot_sync(
+                task_id,
+                actor_user_id=int(user.id),
+                actor_is_admin=bool(user.is_admin),
+            )
+        )
+        if snapshot is None:
+            return
+        for event in snapshot.events:
+            await manager.send_personal_message(deepcopy(event), websocket)
+    except (ValueError, KeyError, TypeError) as e:
         logger.error(f"Data format error sending historical data stream: {e}")
         error_event = create_stream_event(
             "error",
@@ -5684,16 +6693,18 @@ async def send_historical_data_as_stream(
         await manager.send_personal_message(error_event, websocket)
         raise
     except (ConnectionError, WebSocketDisconnect) as e:
-        # Connection error
         logger.error(f"Connection error sending historical data stream: {e}")
         raise
     except Exception as e:
-        # Other unknown errors, re-raise
         logger.error(f"Unexpected error sending historical data stream: {e}")
         raise
 
 
-async def handle_status_request(websocket: WebSocket, task_id: int, user: User) -> None:
+async def handle_status_request(
+    websocket: WebSocket,
+    task_id: int,
+    user: Union[User, WebSocketPrincipal],
+) -> None:
     """Handle status request - send historical data as stream messages"""
     await send_historical_data_as_stream(websocket, task_id, user)
 
@@ -6355,7 +7366,6 @@ async def _execute_durable_task_command(
     elif command.kind == TaskCommandKind.RESUME:
         await _handle_resume_task_unserialized(websocket, command.task_id, message_data)
     elif command.kind == TaskCommandKind.CANCEL:
-        from ..models.agent import Agent
         from .a2a import _cancel_task_unserialized
 
         agent_id_value = message_data.get("agent_id")
@@ -6367,19 +7377,24 @@ async def _execute_durable_task_command(
             raise ValueError(
                 f"Agent ID {agent_id_value!r} is invalid in cancel command payload"
             ) from exc
-        SessionLocal = get_session_local()
-        with SessionLocal() as db:
-            agent = db.query(Agent).filter(Agent.id == agent_id).first()
-            if agent is None:
-                raise ValueError(f"Agent {agent_id} not found for cancel command")
-            try:
+        target_state_version = message_data.get("target_state_version")
+        if isinstance(target_state_version, bool) or not isinstance(
+            target_state_version, int
+        ):
+            raise TaskCommandRejected(
+                f"Cancel command {command.command_id} has no exact state-version target",
+                reason="stale_run",
+            )
+        try:
+            async with task_execution_controller.command(command.task_id):
                 await _cancel_task_unserialized(
                     task_id=command.task_id,
-                    agent=agent,
-                    db=db,
+                    agent_id=agent_id,
+                    expected_run_id=command.target_run_id,
+                    expected_state_version=target_state_version,
                 )
-            except StaleTaskRunError as exc:
-                raise TaskCommandRejected(str(exc), reason="stale_run") from exc
+        except StaleTaskRunError as exc:
+            raise TaskCommandRejected(str(exc), reason="stale_run") from exc
     else:  # pragma: no cover - enum construction rejects this earlier
         raise ValueError(f"Unsupported task command kind: {command.kind}")
     durable_error = message_data.get("_durable_command_error")
@@ -6472,6 +7487,7 @@ async def websocket_builder_chat_endpoint(
 
     await websocket.accept()
     logger.info(f"Builder chat WebSocket connection established for user {user.id}")
+    active_chat_task: asyncio.Task[None] | None = None
 
     try:
         while True:
@@ -6481,16 +7497,13 @@ async def websocket_builder_chat_endpoint(
             message_data = json.loads(data)
 
             # Run in background to not block receiving
-            if (
-                hasattr(websocket.state, "chat_task")
-                and websocket.state.chat_task
-                and not websocket.state.chat_task.done()
-            ):
-                websocket.state.chat_task.cancel()
+            if active_chat_task is not None:
+                await cancel_and_drain_async_task(active_chat_task)
 
-            websocket.state.chat_task = asyncio.create_task(
+            active_chat_task = asyncio.create_task(
                 handle_builder_chat(websocket, message_data, user)
             )
+            websocket.state.chat_task = active_chat_task
 
     except WebSocketDisconnect:
         logger.info(f"Builder chat WebSocket disconnected for user {user.id}")
@@ -6498,12 +7511,16 @@ async def websocket_builder_chat_endpoint(
         logger.error(f"Connection error in builder chat WebSocket: {e}")
     except Exception as e:
         logger.error(f"Unexpected error in builder chat WebSocket: {e}")
+    finally:
+        if active_chat_task is not None:
+            await cancel_and_drain_async_task(active_chat_task)
+        websocket.state.chat_task = None
 
 
 async def handle_builder_chat(
     websocket: WebSocket,
     message_data: dict,
-    user: User,
+    user: Union[User, WebSocketPrincipal],
 ) -> None:
     """Handle individual builder chat requests via WebSocket using an in-memory ReAct agent.
 
@@ -6526,11 +7543,10 @@ async def handle_builder_chat(
     from ...core.agent.service import AgentService
     from ...core.memory.in_memory import InMemoryMemoryStore
     from ...skills.utils import create_skill_manager
-    from ..models.database import get_db
-    from ..services.llm_utils import UserAwareModelStorage
+    from ..services.builder_chat_runtime import load_builder_chat_runtime_inputs
 
-    db_gen = get_db()
-    db = next(db_gen)
+    user_id = int(user.id)
+    is_admin = bool(user.is_admin)
 
     # Generate task_id for builder chat (reuse if exists)
     if not hasattr(websocket.state, "builder_task_id"):
@@ -6542,7 +7558,10 @@ async def handle_builder_chat(
         websocket_handler=SharedWebSocketTracer(
             websocket, builder_task_id, is_preview=False
         ),
-        user=user,
+        # The tracer only consumes ``user.id``. The cast keeps compatibility
+        # with its HTTP-oriented annotation while WebSockets carry a frozen
+        # principal instead of a detached ORM row.
+        user=cast(User, user),
         is_preview=False,
     )
 
@@ -6557,35 +7576,6 @@ async def handle_builder_chat(
             last_msg = message_data["messages"][-1]
             if isinstance(last_msg, dict) and last_msg.get("role") == "user":
                 user_message = last_msg.get("content", "")
-
-        # Handle uploaded files: upload to server and inject file_ids into message
-        files = message_data.get("files", [])
-        if files:
-            from ..models.uploaded_file import UploadedFile as _UploadedFile
-
-            file_ids = []
-            for file_info in files:
-                file_id = file_info.get("file_id")
-                if not file_id:
-                    continue
-                record = (
-                    db.query(_UploadedFile)
-                    .filter(
-                        _UploadedFile.file_id == file_id,
-                        _UploadedFile.user_id == int(user.id),
-                    )
-                    .first()
-                )
-                if record:
-                    file_ids.append(file_id)
-
-            if file_ids:
-                user_message += (
-                    f"\n\n[Uploaded file_ids: {file_ids}. "
-                    "Use file_id as the canonical file handle and do not guess storage paths. "
-                    "Please call `create_knowledge_base_from_file` with these file_ids immediately, "
-                    "then create or update the agent with the resulting collection_name.]"
-                )
 
         # Build current_config back from top-level keys
         models = message_data.get("models")
@@ -6603,6 +7593,31 @@ async def handle_builder_chat(
             "knowledge_bases": message_data.get("selectedKbs", []),
             "execution_mode": message_data.get("executionMode", "balanced"),
         }
+
+        # Resolve all database-backed inputs in one worker-owned short Session.
+        files = message_data.get("files", [])
+        requested_file_ids: list[str] = []
+        if isinstance(files, list):
+            for file_info in files:
+                if not isinstance(file_info, dict):
+                    continue
+                file_id = file_info.get("file_id")
+                if file_id:
+                    requested_file_ids.append(str(file_id))
+
+        runtime_inputs = await load_builder_chat_runtime_inputs(
+            user_id=user_id,
+            requested_file_ids=requested_file_ids,
+            model_name=current_config.get("model"),
+            compact_model_name=current_config.get("compact_model"),
+        )
+        if runtime_inputs.authorized_file_ids:
+            user_message += (
+                f"\n\n[Uploaded file_ids: {list(runtime_inputs.authorized_file_ids)}. "
+                "Use file_id as the canonical file handle and do not guess storage paths. "
+                "Please call `create_knowledge_base_from_file` with these file_ids immediately, "
+                "then create or update the agent with the resulting collection_name.]"
+            )
 
         skill_manager = create_skill_manager()
         agent_builder_skill = await skill_manager.get_skill("agent-builder")
@@ -6655,35 +7670,8 @@ clarification questions as plain assistant text.
                 )
             )
 
-        # Get LLM configuration
-        model_name = current_config.get("model")
-        compact_model_name = current_config.get("compact_model")
-        resolver = UserAwareModelStorage(db)
-        llm = None
-        compact_llm = None
-
-        if model_name:
-            llm = resolver.get_llm_by_name_with_access(
-                model_name,
-                user_id=user.id,  # type: ignore[arg-type]
-            )
-
-        if compact_model_name:
-            compact_llm = resolver.get_llm_by_name_with_access(
-                compact_model_name,
-                user_id=user.id,  # type: ignore[arg-type]
-            )
-
-        if not llm or compact_llm is None:
-            default_llm, _fast_llm, _vision_llm, default_compact_llm = (
-                resolver.get_configured_defaults(
-                    user_id=user.id  # type: ignore[arg-type]
-                )
-            )
-            if not llm:
-                llm = default_llm
-            if compact_llm is None:
-                compact_llm = default_compact_llm
+        llm = runtime_inputs.llm
+        compact_llm = runtime_inputs.compact_llm
 
         if not llm:
             await websocket.send_text(
@@ -6720,36 +7708,35 @@ clarification questions as plain assistant text.
             )
 
             # Create only the necessary tools directly (much faster than loading all tools)
+            session_factory = get_session_local()
             create_agent_tool = CreateAgentTool(
-                session_factory=get_session_local(),
-                user_id=int(user.id),
+                session_factory=session_factory,
+                user_id=user_id,
                 task_id=builder_task_id,
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
             )
             update_agent_tool = UpdateAgentTool(
-                session_factory=get_session_local(),
-                user_id=int(user.id),
+                session_factory=session_factory,
+                user_id=user_id,
                 task_id=builder_task_id,
                 workspace_base_dir=str(get_uploads_dir() / "builder_chat"),
             )
             list_skills_tool = ListAvailableSkillsTool()
             list_tool_categories_tool = ListToolCategoriesTool()
-            list_kbs_tool = ListKnowledgeBasesTool(
-                user_id=int(user.id), is_admin=bool(user.is_admin)
-            )
+            list_kbs_tool = ListKnowledgeBasesTool(user_id=user_id, is_admin=is_admin)
             create_kb_url_tool = CreateKnowledgeBaseFromUrlTool(
-                user_id=int(user.id), is_admin=bool(user.is_admin)
+                user_id=user_id, is_admin=is_admin
             )
             create_kb_file_tool = CreateKnowledgeBaseFromFileTool(
-                user_id=int(user.id), is_admin=bool(user.is_admin)
+                user_id=user_id, is_admin=is_admin
             )
 
             # Build allowed external directories
             allowed_external_dirs = []
-            if user and user.id:
+            if user_id:
                 from ...core.workspace import scoped_user_root
 
-                user_upload_dir = scoped_user_root(get_uploads_dir(), int(user.id))
+                user_upload_dir = scoped_user_root(get_uploads_dir(), user_id)
                 allowed_external_dirs.append(str(user_upload_dir))
             allowed_external_dirs.extend([str(d) for d in get_external_upload_dirs()])
 
@@ -6827,7 +7814,7 @@ clarification questions as plain assistant text.
                 )
 
             # Execute task with the agent
-            with UserContext(int(user.id)):
+            with UserContext(user_id):
                 result = await agent_service.execute_task(
                     task=user_message,
                     context=execution_context,
@@ -6926,8 +7913,6 @@ clarification questions as plain assistant text.
     except Exception as e:
         logger.error(f"Error handling builder chat: {e}", exc_info=True)
         await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
-    finally:
-        db.close()
 
 
 @ws_router.websocket("/ws/build/preview")
@@ -7025,7 +8010,7 @@ async def websocket_build_preview_endpoint(
 async def handle_build_preview_execution(
     websocket: WebSocket,
     message_data: dict,
-    user: User,
+    user: Union[User, WebSocketPrincipal],
 ) -> None:
     """Create a normal preview task and schedule it through the chat task flow."""
     from ..schemas.chat import TaskCreateRequest
@@ -7089,7 +8074,14 @@ async def handle_build_preview_execution(
         db_gen = database_module.get_db()
         preview_db = next(db_gen)
         try:
-            task_response = await create_task(task_request, db=preview_db, user=user)
+            # create_task's implementation only consumes ``user.id``; keep its
+            # HTTP dependency annotation local instead of widening the
+            # WebSocket principal back into an ORM object.
+            task_response = await create_task(
+                task_request,
+                db=preview_db,
+                user=cast(User, user),
+            )
             preview_task_id = int(task_response.task_id)
         finally:
             preview_db.close()

@@ -1,3 +1,4 @@
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -430,8 +431,7 @@ async def test_late_execution_result_does_not_resurrect_canceled_a2a_task(
 async def test_execution_failure_is_deferred_to_concrete_lease_owner(
     db_session, monkeypatch
 ):
-    """The executor notifies the client but leaves durable settlement to the
-    orchestrator that owns the exact run/runner lease."""
+    """Only the concrete lease owner may settle and emit terminal failure."""
     user = _create_user(db_session, 1, "owner")
     lease = _task_lease(11)
     _create_task(
@@ -492,7 +492,7 @@ async def test_execution_failure_is_deferred_to_concrete_lease_owner(
         )
 
     assert payload_calls == []
-    assert "task_error" in sent_events
+    assert sent_events == []
     db_session.expire_all()
     task = db_session.query(Task).filter(Task.id == 11).one()
     assert task.status == TaskStatus.RUNNING
@@ -786,7 +786,6 @@ def test_selected_file_refs_from_task_revalidates_owner_and_task_binding(
         task_id=11,
         filename="other-task.txt",
     )
-
     assert _selected_file_refs_from_task(task, db_session) == [
         {
             "file_id": "task-file",
@@ -848,7 +847,7 @@ def test_normalize_file_outputs_rejects_foreign_storage_path_record(
     assert path_to_file_id == {}
 
 
-def test_normalize_file_outputs_rejects_foreign_untracked_storage_path(
+def test_normalize_file_outputs_preserves_unregistered_legacy_path(
     db_session,
     tmp_path,
     monkeypatch,
@@ -857,18 +856,19 @@ def test_normalize_file_outputs_rejects_foreign_untracked_storage_path(
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_dir))
     _create_user(db_session, 1, "owner")
     _create_task(db_session, task_id=20, user_id=1)
-    foreign_path = uploads_dir / "user_2" / "web_task_10" / "output" / "secret.txt"
-    foreign_path.parent.mkdir(parents=True)
-    foreign_path.write_text("secret")
+    legacy_path = uploads_dir / "user_1" / "web_task_20" / "output" / "legacy.txt"
+    legacy_path.parent.mkdir(parents=True)
+    legacy_path.write_text("legacy")
+    legacy_output = {"path": str(legacy_path), "filename": "legacy.txt"}
 
     normalized_outputs, path_to_file_id = _normalize_file_outputs(
         db_session,
         task_id=20,
         task_user_id=1,
-        file_outputs=[{"path": str(foreign_path)}],
+        file_outputs=[legacy_output],
     )
 
-    assert normalized_outputs == []
+    assert normalized_outputs == [legacy_output]
     assert path_to_file_id == {}
     assert db_session.query(UploadedFile).count() == 0
 
@@ -1051,7 +1051,7 @@ def test_normalize_file_outputs_rejects_registered_non_output_agent_file(
     assert path_to_file_id == {}
 
 
-def test_normalize_file_outputs_registers_current_task_output_path(
+def test_normalize_file_outputs_preserves_mixed_registered_and_legacy_order(
     db_session,
     tmp_path,
     monkeypatch,
@@ -1062,30 +1062,53 @@ def test_normalize_file_outputs_registers_current_task_output_path(
     get_unscoped_file_storage.cache_clear()
     _create_user(db_session, 1, "owner")
     _create_task(db_session, task_id=20, user_id=1)
-    output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
-    output_path.parent.mkdir(parents=True)
-    output_path.write_text("report")
+    registered_path = (
+        uploads_dir / "user_1" / "web_task_20" / "output" / "registered.txt"
+    )
+    legacy_path = uploads_dir / "user_1" / "web_task_20" / "output" / "legacy.txt"
+    registered_path.parent.mkdir(parents=True)
+    registered_path.write_text("registered")
+    legacy_path.write_text("legacy")
+    db_session.add(
+        UploadedFile(
+            file_id="registered-output",
+            user_id=1,
+            task_id=20,
+            filename="registered.txt",
+            storage_path=str(registered_path),
+            storage_status="legacy",
+            mime_type="text/plain",
+            file_size=len("registered"),
+            workspace_relative_path="output/registered.txt",
+            workspace_category="output",
+        )
+    )
+    db_session.flush()
+    legacy_output = {"path": str(legacy_path), "filename": "legacy.txt"}
 
     try:
         normalized_outputs, path_to_file_id = _normalize_file_outputs(
             db_session,
             task_id=20,
             task_user_id=1,
-            file_outputs=[{"path": str(output_path), "filename": "report.txt"}],
+            file_outputs=[
+                {
+                    "path": str(registered_path),
+                    "filename": "registered.txt",
+                },
+                legacy_output,
+            ],
         )
     finally:
         get_unscoped_file_storage.cache_clear()
 
-    assert len(normalized_outputs) == 1
-    assert normalized_outputs[0]["filename"] == "report.txt"
-    assert path_to_file_id[str(output_path)] == normalized_outputs[0]["file_id"]
-    file_record = db_session.query(UploadedFile).one()
-    assert file_record.user_id == 1
-    assert file_record.task_id == 20
-    assert file_record.storage_path == str(output_path)
+    assert normalized_outputs[0]["file_id"] == "registered-output"
+    assert normalized_outputs[1] == legacy_output
+    assert path_to_file_id[str(registered_path)] == "registered-output"
+    assert db_session.query(UploadedFile).count() == 1
 
 
-def test_normalize_task_file_outputs_registers_preview_output_normally(
+def test_normalize_task_file_outputs_projects_registered_preview_output(
     db_session,
     tmp_path,
     monkeypatch,
@@ -1098,6 +1121,21 @@ def test_normalize_task_file_outputs_registers_preview_output_normally(
     output_path = uploads_dir / "user_1" / "web_task_20" / "output" / "report.txt"
     output_path.parent.mkdir(parents=True)
     output_path.write_text("preview report")
+    db_session.add(
+        UploadedFile(
+            file_id="preview-output",
+            user_id=1,
+            task_id=20,
+            filename="report.txt",
+            storage_path=str(output_path),
+            storage_status="legacy",
+            mime_type="text/plain",
+            file_size=len("preview report"),
+            workspace_relative_path="output/report.txt",
+            workspace_category="output",
+        )
+    )
+    db_session.flush()
 
     normalized_outputs, path_to_file_id = _normalize_task_file_outputs(
         db_session,
@@ -1106,12 +1144,14 @@ def test_normalize_task_file_outputs_registers_preview_output_normally(
     )
 
     assert len(normalized_outputs) == 1
+    assert normalized_outputs[0]["file_id"] == "preview-output"
     assert normalized_outputs[0]["filename"] == "report.txt"
-    assert path_to_file_id[str(output_path)] == normalized_outputs[0]["file_id"]
+    assert path_to_file_id[str(output_path)] == "preview-output"
     file_record = db_session.query(UploadedFile).one()
     assert file_record.user_id == 1
     assert file_record.task_id == 20
     assert file_record.storage_path == str(output_path)
+    assert file_record.storage_status == "legacy"
 
 
 @pytest.mark.asyncio
@@ -1148,6 +1188,10 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
         task_id=11,
         filename="other-task.txt",
     )
+    # Turn-file resolution may release its read-only connection before local
+    # restore/checksum work. Persist setup first so the test exercises that
+    # production boundary instead of carrying fixture writes into storage I/O.
+    db_session.commit()
 
     import xagent.web.api.chat as chat_api
 
@@ -1174,7 +1218,7 @@ async def test_handle_file_upload_for_task_rejects_unowned_and_wrong_task_files(
     assert valid_file.task_id == 10
 
 
-def test_register_uploaded_files_for_agent_uses_execution_db_session(
+def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     db_session,
     tmp_path,
 ):
@@ -1192,8 +1236,11 @@ def test_register_uploaded_files_for_agent_uses_execution_db_session(
             self.input_dir = str(tmp_path / "workspace" / "input")
             self.registered_files = []
 
-        def register_file(self, path, file_id, db_session=None):
-            self.registered_files.append((path, file_id, db_session))
+        def describe_file_registration(self, path):
+            return SimpleNamespace(path=Path(path))
+
+        def bind_already_durable_file(self, registration, *, file_id):
+            self.registered_files.append((registration.path, file_id))
 
     workspace = Workspace()
     file_info = {
@@ -1210,7 +1257,6 @@ def test_register_uploaded_files_for_agent_uses_execution_db_session(
     )
 
     assert [item[1] for item in workspace.registered_files] == ["valid-file"]
-    assert workspace.registered_files[0][2] is db_session
     assert file_info["workspace_path"]
 
 

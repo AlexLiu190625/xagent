@@ -16,14 +16,21 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_lease_service
+from xagent.web.services.task_lease_recovery import (
+    recover_task_lease_candidate_isolated,
+)
 from xagent.web.services.task_lease_service import (
+    TASK_RUN_ID_TRACE_FIELD,
     TaskLease,
+    TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
     TaskLeaseRefreshState,
     acquire_task_lease,
     acquire_task_lease_no_commit,
-    mark_task_paused_if_stale,
+    get_expired_task_lease_candidates,
     refresh_task_lease,
     release_task_lease,
+    run_while_task_lease_owned,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
     utc_now,
@@ -76,6 +83,113 @@ def _create_task(db, *, status=TaskStatus.PENDING) -> Task:
     db.commit()
     db.refresh(task)
     return task
+
+
+def _recover_expired_task(db, task: Task) -> TaskStatus | None:
+    candidate = get_expired_task_lease_candidates(
+        db,
+        cutoff=utc_now(),
+        limit=1,
+    )[0]
+    db.rollback()
+    return recover_task_lease_candidate_isolated(
+        candidate,
+        recovered_at=utc_now(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_guard_cancels_and_drains_execution_on_lease_loss() -> None:
+    operation_started = asyncio.Event()
+    operation_cancelled = asyncio.Event()
+
+    async def operation() -> None:
+        operation_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            operation_cancelled.set()
+
+    async def heartbeat() -> TaskLeaseHeartbeatOutcome:
+        await operation_started.wait()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    with pytest.raises(TaskLeaseLostError):
+        await run_while_task_lease_owned(operation(), heartbeat_task)
+
+    assert operation_cancelled.is_set()
+    assert heartbeat_task.done()
+
+
+@pytest.mark.asyncio
+async def test_guard_keeps_execution_running_for_settlement_ready() -> None:
+    operation_started = asyncio.Event()
+    allow_operation_to_finish = asyncio.Event()
+
+    async def operation() -> str:
+        operation_started.set()
+        await allow_operation_to_finish.wait()
+        return "completed"
+
+    async def heartbeat() -> TaskLeaseHeartbeatOutcome:
+        await operation_started.wait()
+        allow_operation_to_finish.set()
+        return TaskLeaseHeartbeatOutcome()
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+
+    assert await run_while_task_lease_owned(operation(), heartbeat_task) == "completed"
+
+
+@pytest.mark.asyncio
+async def test_guard_does_not_cancel_for_transient_heartbeat_pool_timeout() -> None:
+    timeout_observed = asyncio.Event()
+    stop_heartbeat = asyncio.Event()
+
+    async def heartbeat() -> TaskLeaseHeartbeatOutcome:
+        timeout_observed.set()
+        await stop_heartbeat.wait()
+        return TaskLeaseHeartbeatOutcome(
+            pool_timeout=SQLAlchemyTimeoutError("transient pool timeout")
+        )
+
+    async def operation() -> str:
+        await timeout_observed.wait()
+        return "kept-running"
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    assert (
+        await run_while_task_lease_owned(operation(), heartbeat_task) == "kept-running"
+    )
+    assert not heartbeat_task.done()
+    stop_heartbeat.set()
+    outcome = await heartbeat_task
+    assert outcome.pool_timeout is not None
+
+
+@pytest.mark.asyncio
+async def test_guard_cancels_and_drains_execution_when_heartbeat_crashes() -> None:
+    operation_started = asyncio.Event()
+    operation_cancelled = asyncio.Event()
+
+    async def operation() -> None:
+        operation_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            operation_cancelled.set()
+
+    async def heartbeat() -> TaskLeaseHeartbeatOutcome:
+        await operation_started.wait()
+        raise RuntimeError("heartbeat crashed")
+
+    heartbeat_task = asyncio.create_task(heartbeat())
+    with pytest.raises(RuntimeError, match="heartbeat crashed"):
+        await run_while_task_lease_owned(operation(), heartbeat_task)
+
+    assert operation_cancelled.is_set()
+    assert heartbeat_task.done()
 
 
 def test_task_model_default_execution_mode_is_auto(db_session) -> None:
@@ -410,9 +524,44 @@ async def test_stop_heartbeat_waits_for_shared_batch_result(monkeypatch) -> None
 
     allow_refresh_to_finish.set()
     outcome = await asyncio.wait_for(stopping, timeout=1)
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert outcome.requires_ttl_recovery is False
+
+
+@pytest.mark.asyncio
+async def test_wait_for_heartbeat_manager_idle_drains_before_caller_cancellation(
+    monkeypatch,
+) -> None:
+    manager = task_lease_service._TaskLeaseHeartbeatManager(asyncio.get_running_loop())
+    runner_started = asyncio.Event()
+    allow_runner_to_finish = asyncio.Event()
+
+    async def runner() -> None:
+        runner_started.set()
+        await allow_runner_to_finish.wait()
+
+    manager._runner = asyncio.create_task(runner())
+    monkeypatch.setattr(
+        task_lease_service,
+        "_task_lease_heartbeat_manager",
+        manager,
+    )
+    await runner_started.wait()
+
+    waiter = asyncio.create_task(task_lease_service.wait_for_heartbeat_manager_idle())
+    await asyncio.sleep(0)
+    assert not waiter.done()
+    waiter.cancel()
+    await asyncio.sleep(0)
+
+    assert not waiter.done()
+    assert manager._runner is not None
+    assert not manager._runner.done()
+
+    allow_runner_to_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
 
 
 @pytest.mark.asyncio
@@ -483,7 +632,7 @@ async def test_repeated_cancellation_drains_heartbeat_close_and_waiters(
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(heartbeat_task, timeout=1)
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert refresh_waiter.done()
     assert entry.refresh_waiter is None
@@ -544,7 +693,7 @@ async def test_heartbeat_batches_registered_leases(monkeypatch) -> None:
 
     await stop_task_lease_heartbeat(first_task, first_stop)
     await stop_task_lease_heartbeat(second_task, second_stop)
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     # The 1 ms test interval may legitimately permit another refresh for the
     # second lease between the two sequential stop calls.  The batching
@@ -625,7 +774,7 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
         replacement_stopping,
         timeout=1,
     )
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert replacement_outcome.requires_ttl_recovery is False
 
@@ -671,7 +820,7 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(monkeypatch) -> 
 
     allow_timeout.set()
     outcome = await asyncio.wait_for(stopping, timeout=1)
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert outcome.pool_timeout is heartbeat_timeout
     assert outcome.lease_lost is False
@@ -709,7 +858,7 @@ async def test_stop_heartbeat_reports_lost_ownership(monkeypatch) -> None:
     await asyncio.wait_for(heartbeat_task, timeout=1)
 
     outcome = await stop_task_lease_heartbeat(heartbeat_task, stop_event)
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert outcome.lease_lost is True
     assert outcome.pool_timeout is None
@@ -738,7 +887,7 @@ async def test_heartbeat_does_not_report_owned_terminal_task_as_lease_lost(
         run_task_lease_heartbeat(lease, asyncio.Event()),
         timeout=1,
     )
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert outcome.lease_lost is False
     assert outcome.requires_ttl_recovery is False
@@ -787,7 +936,7 @@ async def test_batch_heartbeat_recovers_after_transient_pool_timeout(
     assert await asyncio.to_thread(refresh_recovered.wait, 1)
 
     outcome = await stop_task_lease_heartbeat(heartbeat_task, stop_event)
-    await task_lease_service._wait_for_heartbeat_manager_idle()
+    await task_lease_service.wait_for_heartbeat_manager_idle()
 
     assert outcome.requires_ttl_recovery is False
 
@@ -831,6 +980,8 @@ async def test_cancellation_safe_acquire_drains_and_cleans_returned_lease() -> N
 
 def test_new_run_lease_claim_rejects_a_second_claim(db_session) -> None:
     task = _create_task(db_session)
+    task.last_checkpoint_event_id = "previous-run-checkpoint"
+    db_session.commit()
 
     first = acquire_task_lease(
         db_session,
@@ -850,6 +1001,29 @@ def test_new_run_lease_claim_rejects_a_second_claim(db_session) -> None:
     assert second is None
     db_session.refresh(task)
     assert task.run_id == first.run_id
+    assert task.last_checkpoint_event_id is None
+
+
+def test_same_run_resume_lease_preserves_checkpoint_pointer(db_session) -> None:
+    task = _create_task(db_session, status=TaskStatus.WAITING_FOR_USER)
+    task.run_id = "resumable-run"
+    task.last_checkpoint_event_id = "current-run-checkpoint"
+    db_session.commit()
+
+    lease = acquire_task_lease(
+        db_session,
+        int(task.id),
+        runner_id="resume-runner",
+        expected_run_id="resumable-run",
+    )
+
+    assert lease == TaskLease(
+        task_id=int(task.id),
+        runner_id="resume-runner",
+        run_id="resumable-run",
+    )
+    db_session.refresh(task)
+    assert task.last_checkpoint_event_id == "current-run-checkpoint"
 
 
 def test_lease_acquire_rejects_a_superseded_run(db_session) -> None:
@@ -894,7 +1068,9 @@ def test_old_lease_cannot_refresh_or_release_a_new_run(db_session) -> None:
 def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
+    task.run_id = "checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
+    task.last_checkpoint_event_id = "checkpoint-1"
     db_session.add(
         TraceEvent(
             task_id=task.id,
@@ -906,12 +1082,13 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
             data={
                 "checkpoint_type": CHECKPOINT_TYPE,
                 "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: "checkpoint-run",
             },
         )
     )
     db_session.commit()
 
-    assert mark_task_paused_if_stale(db_session, task) is True
+    assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
     db_session.refresh(task)
     assert task.status == TaskStatus.PAUSED
     assert task.runner_id is None
@@ -921,7 +1098,9 @@ def test_stale_running_task_with_checkpoint_becomes_paused(db_session) -> None:
 def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
+    task.run_id = "child-checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
+    task.last_checkpoint_event_id = "child-checkpoint-1"
     db_session.add(
         TraceEvent(
             task_id=task.id,
@@ -934,12 +1113,13 @@ def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
             data={
                 "checkpoint_type": CHECKPOINT_TYPE,
                 "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: "child-checkpoint-run",
             },
         )
     )
     db_session.commit()
 
-    assert mark_task_paused_if_stale(db_session, task) is True
+    assert _recover_expired_task(db_session, task) == TaskStatus.FAILED
     db_session.refresh(task)
     assert task.status == TaskStatus.FAILED
     assert task.runner_id is None
@@ -949,7 +1129,9 @@ def test_stale_running_task_ignores_child_agent_checkpoint(db_session) -> None:
 def test_stale_running_task_with_legacy_checkpoint_becomes_paused(db_session) -> None:
     task = _create_task(db_session, status=TaskStatus.RUNNING)
     task.runner_id = "dead-runner"
+    task.run_id = "legacy-checkpoint-run"
     task.lease_expires_at = utc_now() - timedelta(seconds=1)
+    task.last_checkpoint_event_id = "legacy-checkpoint-1"
     db_session.add(
         TraceEvent(
             task_id=task.id,
@@ -961,12 +1143,13 @@ def test_stale_running_task_with_legacy_checkpoint_becomes_paused(db_session) ->
             data={
                 "checkpoint_type": next(iter(LEGACY_CHECKPOINT_TYPES)),
                 "snapshot": {"type": "checkpoint"},
+                TASK_RUN_ID_TRACE_FIELD: "legacy-checkpoint-run",
             },
         )
     )
     db_session.commit()
 
-    assert mark_task_paused_if_stale(db_session, task) is True
+    assert _recover_expired_task(db_session, task) == TaskStatus.PAUSED
     db_session.refresh(task)
     assert task.status == TaskStatus.PAUSED
     assert task.runner_id is None

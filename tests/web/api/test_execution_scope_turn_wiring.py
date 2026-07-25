@@ -28,6 +28,7 @@ from xagent.core.execution_scope import (
     ExecutionScope,
     get_execution_scope,
     set_execution_scope_resolver,
+    set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.websocket import (
     _acquire_resume_task_lease,
@@ -46,8 +47,10 @@ from xagent.web.services.task_lease_service import (
 @pytest.fixture(autouse=True)
 def _clear_resolver():
     set_execution_scope_resolver(None)
+    set_execution_scope_snapshot_loader(None)
     yield
     set_execution_scope_resolver(None)
+    set_execution_scope_snapshot_loader(None)
 
 
 def _make_task_orm() -> Task:
@@ -260,6 +263,39 @@ async def test_bg_turn_explicit_unscoped_does_not_resolve_again() -> None:
 
 
 @pytest.mark.asyncio
+async def test_owned_bg_failure_waits_for_exact_settlement_before_broadcast() -> None:
+    """The lease owner must durably settle before any terminal event is sent."""
+    agent_service = MagicMock()
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(side_effect=RuntimeError("owned run failed")),
+    )
+    broadcast = AsyncMock()
+    patches = _bg_patches(_build_db_mock())
+    patches[-1] = patch(
+        "xagent.web.api.websocket.manager",
+        MagicMock(broadcast_to_task=broadcast),
+    )
+
+    with _Patches(patches), pytest.raises(RuntimeError, match="owned run failed"):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_lease=TaskLease(
+                task_id=42,
+                runner_id="runner-a",
+                run_id="run-a",
+            ),
+            resolved_execution_scope=None,
+        )
+
+    broadcast.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None:
     """Scope and setup snapshot are resolved sequentially in workers."""
     main_thread_id = threading.get_ident()
@@ -356,7 +392,11 @@ async def test_resumed_turn_re_resolves_scope() -> None:
             ),
             patch(
                 "xagent.web.api.websocket._acquire_resume_task_lease",
-                return_value=object(),
+                return_value=TaskLease(
+                    task_id=42,
+                    runner_id="scope-runner",
+                    run_id="scope-run",
+                ),
             ),
             patch(
                 "xagent.web.api.websocket.run_task_lease_heartbeat",
@@ -401,6 +441,76 @@ async def test_resumed_turn_re_resolves_scope() -> None:
     assert resolver_calls == ["42"]
     assert seen["scope_at_resume"] is scope
     assert get_execution_scope() is None
+
+
+@pytest.mark.asyncio
+async def test_resume_background_adopts_preacquired_lease_without_reacquiring() -> None:
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    heartbeat_stop = asyncio.Event()
+
+    async def transferred_heartbeat() -> TaskLeaseHeartbeatOutcome:
+        await heartbeat_stop.wait()
+        return TaskLeaseHeartbeatOutcome()
+
+    heartbeat_task = asyncio.create_task(transferred_heartbeat())
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(
+        return_value={"status": "completed", "success": True, "output": "ok"}
+    )
+    acquire = MagicMock()
+    start_heartbeat = MagicMock()
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket._acquire_resume_task_lease",
+                new=acquire,
+            ),
+            patch(
+                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                new=start_heartbeat,
+            ),
+            patch(
+                "xagent.web.api.websocket._finalize_resumed_task",
+                return_value={
+                    "task_title": "prelease",
+                    "task_description": "x",
+                    "task_execution_mode": "flash",
+                    "task_agent_id": None,
+                    "agent_name": None,
+                    "agent_logo_url": None,
+                    "final_status": TaskStatus.COMPLETED.value,
+                    "lease_released": True,
+                    "control_event_state": {},
+                    "normalized_outputs": [],
+                    "output": "ok",
+                    "late_result": False,
+                },
+            ),
+            patch(
+                "xagent.web.api.websocket.manager",
+                MagicMock(broadcast_to_task=AsyncMock()),
+            ),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+        ]
+    ):
+        await execute_resume_background(
+            task_id=42,
+            agent_service=agent_service,
+            task_owner_user_id=1,
+            expected_run_id="run-a",
+            resolved_execution_scope=None,
+            preacquired_lease=lease,
+            preacquired_heartbeat_stop=heartbeat_stop,
+            preacquired_heartbeat_task=heartbeat_task,
+        )
+
+    acquire.assert_not_called()
+    start_heartbeat.assert_not_called()
+    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    assert heartbeat_task.done()
 
 
 @pytest.mark.asyncio
@@ -946,6 +1056,97 @@ async def test_resume_heartbeat_pool_timeout_skips_result_and_lease_checkouts() 
 
     finalize.assert_not_called()
     settle.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_resume_lease_loss_cancels_execution_without_stale_side_effects() -> None:
+    lease = TaskLease(task_id=42, runner_id="runner-a", run_id="run-a")
+    resume_started = asyncio.Event()
+    resume_cancelled = asyncio.Event()
+    finalize = MagicMock()
+    settle = MagicMock()
+    tracker_instances: list[Any] = []
+
+    class FakeTracker:
+        quota_interrupt_reason = None
+
+        def __init__(self, *, task_id: int, **kwargs: Any) -> None:
+            assert task_id == 42
+            assert kwargs == {
+                "expected_run_id": "run-a",
+                "expected_runner_id": "runner-a",
+            }
+            self.complete_tracking = AsyncMock()
+            self.stop_periodic_updates = AsyncMock()
+            tracker_instances.append(self)
+
+        async def start_tracking(self) -> None:
+            return None
+
+        async def interrupt_reason_for_quota(self) -> None:
+            return None
+
+    async def resume(_task_id: str) -> dict[str, Any]:
+        resume_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            resume_cancelled.set()
+
+    async def lose_lease(
+        _lease: TaskLease,
+        _stop_event: asyncio.Event,
+    ) -> TaskLeaseHeartbeatOutcome:
+        await resume_started.wait()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    agent_service = MagicMock()
+    agent_service.resume_execution_by_id = AsyncMock(side_effect=resume)
+    ws_manager = MagicMock(broadcast_to_task=AsyncMock())
+
+    with _Patches(
+        [
+            patch(
+                "xagent.web.api.websocket._acquire_resume_task_lease",
+                return_value=lease,
+            ),
+            patch(
+                "xagent.web.api.websocket.run_task_lease_heartbeat",
+                new=lose_lease,
+            ),
+            patch("xagent.web.api.websocket._finalize_resumed_task", finalize),
+            patch(
+                "xagent.web.api.websocket._settle_resumed_task_lease",
+                settle,
+            ),
+            patch("xagent.web.api.websocket.manager", ws_manager),
+            patch(
+                "xagent.web.api.websocket.background_task_manager.promote_resume_task"
+            ),
+            patch("xagent.web.api.websocket.background_task_manager.cleanup_task"),
+            patch("xagent.web.tracking.task_tracker.TaskTracker", FakeTracker),
+        ]
+    ):
+        await asyncio.wait_for(
+            execute_resume_background(
+                task_id=42,
+                agent_service=agent_service,
+                task_owner_user_id=1,
+                resolved_execution_scope=None,
+            ),
+            timeout=1,
+        )
+
+    assert resume_cancelled.is_set()
+    agent_service.resume_execution_by_id.assert_awaited_once_with("42")
+    finalize.assert_not_called()
+    settle.assert_not_called()
+    assert [
+        call.args[0]["type"] for call in ws_manager.broadcast_to_task.call_args_list
+    ] == ["task_resumed"]
+    assert tracker_instances
+    tracker_instances[0].complete_tracking.assert_not_awaited()
+    tracker_instances[0].stop_periodic_updates.assert_awaited_once()
 
 
 @pytest.mark.asyncio

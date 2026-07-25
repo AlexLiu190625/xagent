@@ -77,3 +77,16 @@ async def drain_async_task_cancellation_safe(task: asyncio.Task[_T]) -> _T:
     if cancellation is not None:
         raise cancellation
     return result
+
+
+async def cancel_and_drain_async_task(task: asyncio.Task[_T]) -> None:
+    """Cancel an owned task and drain all of its asynchronous cleanup."""
+
+    if not task.done():
+        task.cancel()
+
+    async def drain() -> None:
+        await asyncio.gather(task, return_exceptions=True)
+
+    cleanup = asyncio.create_task(drain())
+    await drain_async_task_cancellation_safe(cleanup)

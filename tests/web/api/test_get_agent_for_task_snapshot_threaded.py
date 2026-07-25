@@ -36,13 +36,18 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.tools.adapters.vibe.config import MCPFailurePolicy
+from xagent.core.workspace import TaskWorkspace
 from xagent.web.api import chat as chat_module
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models import Base, Task
 from xagent.web.models import database as database_module
 from xagent.web.models.task import TaskStatus
+from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.models.user import User
+from xagent.web.services import uploaded_file_store as uploaded_file_store_module
+from xagent.web.services.managed_file_ref import ensure_uploaded_file_local_path
 from xagent.web.services.task_setup_snapshot import (
     RuntimeUserFields,
     TaskSetupSnapshot,
@@ -169,6 +174,110 @@ async def test_live_request_session_releases_clean_read_before_snapshot_worker(
     assert runtime_users == [RuntimeUserFields(id=user_id, is_admin=False)]
     assert engine.pool.checkedout() == 0
     request_db.close()
+    engine.dispose()
+
+
+def test_selected_file_registration_materializes_after_read_session_closes(
+    tmp_path,
+    monkeypatch,
+    mock_workspace_db,
+) -> None:
+    del mock_workspace_db
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'selected-file-boundary.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        pool_timeout=0.15,
+    )
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    monkeypatch.setattr(database_module, "_SessionLocal", session_factory)
+    monkeypatch.setattr(
+        uploaded_file_store_module,
+        "get_session_local",
+        lambda: session_factory,
+    )
+
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+    source_dir = tmp_path / "uploads"
+    source_dir.mkdir()
+    source_path = source_dir / "selected.txt"
+    source_path.write_text("selected input", encoding="utf-8")
+
+    with session_factory() as setup_db:
+        user = User(
+            username="selected-file-boundary-user",
+            password_hash="hash",
+            is_admin=False,
+        )
+        setup_db.add(user)
+        setup_db.flush()
+        task = Task(
+            user_id=int(user.id),
+            title="selected file task",
+            description="test",
+            status=TaskStatus.PENDING,
+            execution_mode="flash",
+        )
+        setup_db.add(task)
+        setup_db.flush()
+        selected = UploadedFile(
+            file_id="selected-file-id",
+            user_id=int(user.id),
+            task_id=None,
+            filename=source_path.name,
+            storage_path=str(source_path),
+            storage_status="available",
+            mime_type="text/plain",
+            file_size=source_path.stat().st_size,
+        )
+        setup_db.add(selected)
+        setup_db.commit()
+        user_id = int(user.id)
+        task_id = int(task.id)
+
+    observed_checked_out: list[int] = []
+
+    def observed_materialization(record):
+        observed_checked_out.append(engine.pool.checkedout())
+        return ensure_uploaded_file_local_path(record)
+
+    monkeypatch.setattr(
+        chat_module,
+        "ensure_uploaded_file_local_path",
+        observed_materialization,
+    )
+    workspace = TaskWorkspace(
+        id=f"web_task_{task_id}",
+        base_dir=str(tmp_path / "workspaces"),
+        allowed_external_dirs=[str(source_dir)],
+    )
+
+    chat_module._register_selected_task_files_isolated(
+        workspace,
+        task_id=task_id,
+        task_owner_id=user_id,
+        selected_file_ids=["selected-file-id"],
+    )
+
+    assert observed_checked_out == [0]
+    assert engine.pool.checkedout() == 0
+    with session_factory() as verify_db:
+        record = (
+            verify_db.query(UploadedFile)
+            .filter(UploadedFile.file_id == "selected-file-id")
+            .one()
+        )
+        assert record.task_id == task_id
+        assert str(record.storage_key).startswith(
+            f"users/{user_id}/tasks/{task_id}/outputs/selected-file-id/_versions/"
+        )
+
+    get_unscoped_file_storage.cache_clear()
     engine.dispose()
 
 

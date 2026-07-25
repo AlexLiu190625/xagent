@@ -131,3 +131,31 @@ async def test_cancelling_waiter_does_not_cancel_previous_execution() -> None:
 
     allow_previous_to_finish.set()
     await previous
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_reports_when_live_local_work_was_cancelled() -> None:
+    manager = BackgroundTaskManager()
+    started = asyncio.Event()
+
+    async def local_execution() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(local_execution())
+    manager.register_task(7, task)
+    await started.wait()
+
+    outcome = await manager.cancel_task(7)
+
+    assert outcome.requested is True
+    assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_cancel_task_reports_no_request_without_live_local_work() -> None:
+    manager = BackgroundTaskManager()
+
+    outcome = await manager.cancel_task(7)
+
+    assert outcome.requested is False

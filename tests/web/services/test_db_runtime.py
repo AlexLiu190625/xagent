@@ -197,3 +197,20 @@ def test_pool_timeout_classifier_walks_exception_chain() -> None:
 
     assert is_database_pool_timeout(wrapped) is True
     assert is_database_pool_timeout(RuntimeError("different failure")) is False
+
+
+def test_pool_timeout_classifier_walks_context_only_chain() -> None:
+    timeout = SQLAlchemyTimeoutError("pool checkout timed out")
+    wrapped = RuntimeError("database operation failed")
+    wrapped.__context__ = timeout
+
+    assert is_database_pool_timeout(wrapped) is True
+
+
+def test_pool_timeout_classifier_stops_at_cause_context_cycle_without_timeout() -> None:
+    first = RuntimeError("first failure")
+    second = RuntimeError("second failure")
+    first.__cause__ = second
+    second.__context__ = first
+
+    assert is_database_pool_timeout(first) is False

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, TypeVar, Union, cast
 
 from fastapi import APIRouter, Depends, HTTPException, Request
-from sqlalchemy import func, or_
+from sqlalchemy import func, or_, update
 from sqlalchemy.orm import Session
 
 from ...config import (
@@ -19,7 +19,9 @@ from ...config import (
 )
 from ...core.agent.service import AgentService
 from ...core.execution_scope import (
+    EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
+    ExecutionScopeNotProvided,
     ScopeFingerprint,
     get_execution_scope,
     resolve_execution_scope,
@@ -89,10 +91,12 @@ from ..services.task_execution_context_service import (
 from ..services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_isolated,
-    mark_task_paused_if_stale,
+    bind_task_lease_context,
     run_task_lease_heartbeat,
+    run_while_task_lease_owned,
     stop_task_lease_heartbeat,
 )
 from ..services.task_setup_snapshot import (
@@ -118,12 +122,6 @@ logger = logging.getLogger(__name__)
 # resolver-flap detection; catches scope cycles up to this period.
 _EVICTED_FINGERPRINT_MEMORY = 4
 
-
-class _ResolvedExecutionScopeNotProvided:
-    """Sentinel separating an omitted scope from an explicitly unscoped turn."""
-
-
-_RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED = _ResolvedExecutionScopeNotProvided()
 
 # Create router
 chat_router = APIRouter(prefix="/api/chat", tags=["chat"])
@@ -672,14 +670,19 @@ def _register_selected_task_files_isolated(
     task_owner_id: int,
     selected_file_ids: list[str],
 ) -> None:
-    """Bind and register selected files inside one worker-owned Session."""
+    """Materialize selected files between short read and registration phases."""
     if not selected_file_ids:
         return
 
     from ..models.database import get_session_local
     from ..models.uploaded_file import UploadedFile
+    from ..services.uploaded_file_store import (
+        UploadedFileVersionSnapshot,
+        snapshot_uploaded_file_version,
+    )
 
     SessionLocal = get_session_local()
+    selected_files: list[UploadedFileVersionSnapshot] = []
     with SessionLocal() as file_db:
         for selected_file_id in selected_file_ids:
             uploaded_file = (
@@ -687,6 +690,7 @@ def _register_selected_task_files_isolated(
                 .filter(
                     UploadedFile.file_id == selected_file_id,
                     UploadedFile.user_id == task_owner_id,
+                    UploadedFile.storage_status != "compensating",
                     or_(
                         UploadedFile.task_id == task_id,
                         UploadedFile.task_id.is_(None),
@@ -696,24 +700,30 @@ def _register_selected_task_files_isolated(
             )
             if uploaded_file is None:
                 continue
+            selected_files.append(snapshot_uploaded_file_version(uploaded_file))
 
-            source_path = ensure_uploaded_file_local_path(uploaded_file)
-            if not source_path.exists() or not source_path.is_file():
-                continue
+    registrations: list[tuple[str, Optional[str]]] = []
+    for selected_file in selected_files:
+        source_path = ensure_uploaded_file_local_path(selected_file)
+        if not source_path.exists() or not source_path.is_file():
+            continue
 
-            if uploaded_file.task_id is None:
-                setattr(uploaded_file, "task_id", task_id)
-
-            workspace.register_file(
+        registrations.append(
+            (
                 str(source_path.resolve()),
-                file_id=selected_file_id,
-                db_session=file_db,
+                selected_file.file_id,
             )
-        file_db.commit()
+        )
+
+    if registrations:
+        workspace.register_files(registrations)
 
 
 async def update_task_title_from_agent(
-    agent_service: AgentService, task_id: int
+    agent_service: AgentService,
+    task_id: int,
+    *,
+    task_lease: TaskLease | None = None,
 ) -> bool:
     """Update task title with generated task_name from agent service.
 
@@ -743,7 +753,11 @@ async def update_task_title_from_agent(
         # Title persistence owns a short Session on a worker. A saturated
         # QueuePool must not block the asyncio loop after the agent finishes.
         return await run_db_io_cancellation_safe(
-            lambda: _update_task_title_isolated(task_id, str(task_name))
+            lambda: _update_task_title_isolated(
+                task_id,
+                str(task_name),
+                task_lease=task_lease,
+            )
         )
 
     except Exception as e:
@@ -753,12 +767,42 @@ async def update_task_title_from_agent(
         return False
 
 
-def _update_task_title_isolated(task_id: int, task_name: str) -> bool:
-    """Persist a generated title using a worker-owned short Session."""
+def _update_task_title_isolated(
+    task_id: int,
+    task_name: str,
+    *,
+    task_lease: TaskLease | None = None,
+) -> bool:
+    """Persist a generated title under an optional exact lease fence."""
     from ..models.database import get_session_local
 
     SessionLocal = get_session_local()
     with SessionLocal() as title_db:
+        if task_lease is not None:
+            if task_lease.run_id is None:
+                return False
+            updated = title_db.execute(
+                update(Task)
+                .where(
+                    Task.id == task_id,
+                    Task.runner_id == task_lease.runner_id,
+                    Task.run_id == task_lease.run_id,
+                    Task.title != task_name,
+                )
+                .values(title=task_name)
+                .execution_options(synchronize_session=False)
+            )
+            if int(getattr(updated, "rowcount", 0) or 0) != 1:
+                title_db.rollback()
+                return False
+            title_db.commit()
+            logger.info(
+                "Updated task %s title under run %s",
+                task_id,
+                task_lease.run_id,
+            )
+            return True
+
         task_record = title_db.query(Task).filter(Task.id == task_id).first()
         if task_record is None:
             logger.warning("No task record found for task_id=%s", task_id)
@@ -1615,8 +1659,8 @@ class AgentServiceManager:
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
         resolved_execution_scope: Union[
-            ExecutionScope, None, _ResolvedExecutionScopeNotProvided
-        ] = _RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED,
+            ExecutionScope, None, ExecutionScopeNotProvided
+        ] = EXECUTION_SCOPE_NOT_PROVIDED,
     ) -> AgentService:
         lock = self._agent_build_locks.get(task_id)
         if lock is None:
@@ -1642,8 +1686,8 @@ class AgentServiceManager:
         task_owner_user_id: Optional[int] = None,
         connector_runtime_turn_id: Optional[str] = None,
         resolved_execution_scope: Union[
-            ExecutionScope, None, _ResolvedExecutionScopeNotProvided
-        ] = _RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED,
+            ExecutionScope, None, ExecutionScopeNotProvided
+        ] = EXECUTION_SCOPE_NOT_PROVIDED,
     ) -> AgentService:
         """Get or create AgentService instance for specific task.
 
@@ -1729,7 +1773,7 @@ class AgentServiceManager:
         # resolved value explicitly, including ``None`` for an intentionally
         # unscoped turn. Legacy callers omit it and retain the contextvar-first
         # fallback used by channels and direct WS paths.
-        if resolved_execution_scope is _RESOLVED_EXECUTION_SCOPE_NOT_PROVIDED:
+        if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
             scope = get_execution_scope()
             if scope is None:
                 scope = await _run_agent_runtime_db_io(
@@ -2485,6 +2529,9 @@ class AgentServiceManager:
         *,
         manage_task_lease: bool = True,
         task_lease: TaskLease | None = None,
+        task_lease_heartbeat_task: (
+            asyncio.Task[TaskLeaseHeartbeatOutcome] | None
+        ) = None,
     ) -> Dict[str, Any]:
         """
         Execute task with automatic token tracking.
@@ -2511,6 +2558,9 @@ class AgentServiceManager:
                 snapshot, leaving tasks stuck RUNNING for SDK clients.
             task_lease: Lease owned by an outer orchestrator. Its run id fences
                 tracker writes when this method does not manage the lease.
+            task_lease_heartbeat_task: Heartbeat owned by an inline transport
+                for ``task_lease``. When provided, definitive ownership loss
+                cancels and drains agent execution before this method returns.
 
         Returns:
             Execution result dictionary
@@ -2523,6 +2573,7 @@ class AgentServiceManager:
         lease_heartbeat_task = None
         result: Dict[str, Any] | None = None
         sandbox_task_key = None
+        lease_ownership_lost = False
 
         # Establish the caller/worker handoff before the first isolated quota,
         # lease, workforce, or tracker checkout. A read-only legacy Session may
@@ -2612,12 +2663,13 @@ class AgentServiceManager:
 
         pre_run_pool_timeout: BaseException | None = None
         try:
-            if tracker_task_id:
+            if tracker_task_id and (lease is not None or task_lease is None):
                 try:
                     await run_db_io_cancellation_safe(
                         lambda: sync_workforce_run_status_for_task_id_isolated(
                             int(tracker_task_id),
                             TaskStatus.RUNNING,
+                            task_lease=lease,
                         )
                     )
                 except Exception as exc:
@@ -2636,6 +2688,7 @@ class AgentServiceManager:
                         "Failed to sync workforce run status after lease acquisition",
                         exc_info=True,
                     )
+            if tracker_task_id:
                 try:
                     from ..tracking.task_tracker import TaskTracker
 
@@ -2692,40 +2745,76 @@ class AgentServiceManager:
                 f"=== About to execute task: task_id={task_id}, has_db_session={db_session is not None} ==="
             )
 
-            # Execute the task
-            result = await agent_service.execute_task(
-                task=task, context=context, task_id=task_id
-            )
+            # Execute the task. The lease ContextVar is bound at the runtime
+            # owner rather than on the cached AgentService/trace handler so a
+            # reused service observes the exact current run.
+            execution_lease = lease or task_lease
 
-            # If a mid-run quota gate stopped the run, surface the reason the way
-            # the start gate does — a terminal quota_exceeded result carrying the
-            # reason as output — instead of the pattern-interrupt path's silent
-            # flip to PAUSED (which persists no message).
-            if tracker is not None and isinstance(result, dict):
-                quota_reason = getattr(tracker, "quota_interrupt_reason", None)
-                if quota_reason:
-                    result = {
-                        **result,
-                        "success": False,
-                        "status": "quota_exceeded",
-                        "output": quota_reason,
-                        "error": quota_reason,
-                        # A mid-run interrupt is always the quota checker, so the
-                        # code is known even though the reason is a plain string.
-                        # Match the start gate so the client pops the same dialog.
-                        "error_code": "quota_exceeded",
-                    }
+            async def execute_agent_task() -> Dict[str, Any]:
+                if execution_lease is None:
+                    return await agent_service.execute_task(
+                        task=task,
+                        context=context,
+                        task_id=task_id,
+                    )
+                with bind_task_lease_context(execution_lease):
+                    return await agent_service.execute_task(
+                        task=task,
+                        context=context,
+                        task_id=task_id,
+                    )
 
-            logger.info("=== Task executed successfully, updating title if needed ===")
+            async def execute_owned_turn() -> Dict[str, Any]:
+                turn_result = await execute_agent_task()
 
-            # Update task title with generated task_name (clean architecture: Core provides API, Web handles DB)
-            if task_id and result and result.get("success"):
-                await update_task_title_from_agent(agent_service, int(task_id))
+                # If a mid-run quota gate stopped the run, surface the reason
+                # the way the start gate does instead of silently pausing.
+                if tracker is not None and isinstance(turn_result, dict):
+                    quota_reason = getattr(
+                        tracker,
+                        "quota_interrupt_reason",
+                        None,
+                    )
+                    if quota_reason:
+                        turn_result = {
+                            **turn_result,
+                            "success": False,
+                            "status": "quota_exceeded",
+                            "output": quota_reason,
+                            "error": quota_reason,
+                            "error_code": "quota_exceeded",
+                        }
+
+                logger.info(
+                    "=== Task executed successfully, updating title if needed ==="
+                )
+                if task_id and turn_result.get("success"):
+                    await update_task_title_from_agent(
+                        agent_service,
+                        int(task_id),
+                        task_lease=execution_lease,
+                    )
+                return turn_result
+
+            execution_heartbeat_task = lease_heartbeat_task or task_lease_heartbeat_task
+            try:
+                if execution_heartbeat_task is None:
+                    result = await execute_owned_turn()
+                else:
+                    result = await run_while_task_lease_owned(
+                        execute_owned_turn(),
+                        execution_heartbeat_task,
+                    )
+            except TaskLeaseLostError:
+                lease_ownership_lost = True
+                raise
 
             return result
         finally:
 
             async def finalize_execution_resources() -> None:
+                nonlocal lease_ownership_lost
+
                 tracker_pool_timeout: Exception | None = None
                 heartbeat_pool_timeout: BaseException | None = None
                 heartbeat_lost = False
@@ -2740,10 +2829,14 @@ class AgentServiceManager:
                         # tracker.
                         agent_service.set_interrupt_checker(None)
                         try:
-                            await tracker.complete_tracking()
-                            logger.info(
-                                f"Completed token tracking for task {tracker_task_id}"
-                            )
+                            if lease_ownership_lost:
+                                await tracker.stop_periodic_updates()
+                            else:
+                                await tracker.complete_tracking()
+                                logger.info(
+                                    "Completed token tracking for task %s",
+                                    tracker_task_id,
+                                )
                         except Exception as e:
                             if is_database_pool_timeout(e):
                                 tracker_pool_timeout = e
@@ -2778,6 +2871,12 @@ class AgentServiceManager:
                                 heartbeat_lost,
                                 heartbeat_pool_timeout is not None,
                             )
+                    if heartbeat_lost:
+                        lease_ownership_lost = True
+                        raise TaskLeaseLostError(
+                            "task execution result rejected after lease "
+                            "ownership was lost"
+                        )
                     if (
                         manage_task_lease
                         and lease
@@ -2785,6 +2884,7 @@ class AgentServiceManager:
                         and tracker_pool_timeout is None
                         and heartbeat_pool_timeout is None
                         and not heartbeat_lost
+                        and not lease_ownership_lost
                     ):
                         if result is None:
                             final_status = TaskStatus.FAILED
@@ -3115,6 +3215,7 @@ async def create_task(
                         UploadedFile.file_id == file_id,
                         UploadedFile.user_id == int(user.id),
                         UploadedFile.task_id.is_(None),
+                        UploadedFile.storage_status != "compensating",
                     )
                     .first()
                 )
@@ -3415,6 +3516,7 @@ async def create_task(
                     UploadedFile.file_id.in_(selected_file_ids),
                     UploadedFile.user_id == int(user.id),
                     UploadedFile.task_id.is_(None),
+                    UploadedFile.storage_status != "compensating",
                 )
                 .update(
                     {UploadedFile.task_id: int(task.id)},
@@ -3668,9 +3770,6 @@ async def get_task(
                 )
             if not task:
                 raise HTTPException(status_code=404, detail="Task not found")
-
-            mark_task_paused_if_stale(db, task)
-            db.refresh(task)
 
             cache_key = web_task_detail_key(task_id)
             task_updated_at = cache_version_token(task.updated_at)

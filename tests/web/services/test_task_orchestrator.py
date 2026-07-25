@@ -69,6 +69,7 @@ from xagent.web.services.task_orchestrator import (
     _ClaimedTurn,
     _schedule_bg,
     finish_turn,
+    settle_task_lease_isolated,
 )
 
 # ---------------------------------------------------------------------------
@@ -270,8 +271,8 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
     assert task.input == "first turn"
     assert task.output is None
     assert task.error_message is None
-    assert task.runner_id is None
-    assert task.lease_expires_at is None
+    assert task.runner_id == get_runner_id()
+    assert task.lease_expires_at is not None
     assert task.run_id == started.run_id
     assert task.state_version == started.state_version == 1
     assert task.control_state == started.control_state == "running"
@@ -284,7 +285,53 @@ async def test_begin_turn_create_clears_no_terminal_fields_when_pending(
 
 
 @pytest.mark.asyncio
-async def test_begin_turn_claim_clears_stale_lease_columns(
+async def test_begin_turn_projects_workforce_running_in_claim_transaction(
+    db_session,
+    mock_schedule_bg,
+) -> None:
+    user = _create_user(db_session)
+    manager = Agent(user_id=user.id, name="claim projection manager")
+    db_session.add(manager)
+    db_session.flush()
+    workforce = Workforce(
+        owner_user_id=user.id,
+        scope_type="user",
+        scope_id=str(user.id),
+        name="claim projection workforce",
+        manager_agent_id=manager.id,
+        status="active",
+    )
+    db_session.add(workforce)
+    db_session.flush()
+    task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+    run = WorkforceRun(
+        workforce_id=workforce.id,
+        task_id=task.id,
+        user_id=user.id,
+        status="failed",
+        snapshot={"version": 1},
+        completed_at=datetime.now(timezone.utc),
+    )
+    db_session.add(run)
+    db_session.flush()
+    task.agent_config = {"workforce_run_id": int(run.id)}
+    db_session.commit()
+
+    await TaskTurnOrchestrator.begin_turn(
+        task_id=int(task.id),
+        task_owner_user_id=int(user.id),
+        payload=TaskTurnPayload("retry"),
+        kind=TurnKind.CREATE,
+    )
+
+    db_session.expire_all()
+    persisted_run = db_session.get(WorkforceRun, int(run.id))
+    assert persisted_run.status == "running"
+    assert persisted_run.completed_at is None
+
+
+@pytest.mark.asyncio
+async def test_begin_turn_claim_replaces_stale_lease_and_checkpoint_pointer(
     db_session,
     mock_schedule_bg,
 ) -> None:
@@ -302,6 +349,7 @@ async def test_begin_turn_claim_clears_stale_lease_columns(
     )
     task.runner_id = "dead-runner-from-crash"
     task.lease_expires_at = utc_now() + timedelta(hours=1)
+    task.last_checkpoint_event_id = "previous-run-checkpoint"
     db_session.commit()
 
     await TaskTurnOrchestrator.begin_turn(
@@ -314,8 +362,9 @@ async def test_begin_turn_claim_clears_stale_lease_columns(
 
     db_session.refresh(task)
     assert task.status == TaskStatus.RUNNING
-    assert task.runner_id is None
-    assert task.lease_expires_at is None
+    assert task.runner_id == get_runner_id()
+    assert task.lease_expires_at is not None
+    assert task.last_checkpoint_event_id is None
 
 
 @pytest.mark.asyncio
@@ -627,10 +676,16 @@ def test_schedule_failure_compensation_does_not_fail_foreign_live_lease(
     task.error_message = "replacement still running"
     db_session.commit()
 
-    task_orchestrator_module._mark_task_failed_if_running(
-        int(task.id),
-        "stale schedule failure",
-        expected_run_id="claimed-run",
+    assert (
+        settle_task_lease_isolated(
+            TaskLease(
+                task_id=int(task.id),
+                runner_id="stale-runner",
+                run_id="claimed-run",
+            ),
+            error_message="stale schedule failure",
+        )
+        is False
     )
 
     db_session.expire_all()
@@ -643,6 +698,46 @@ def test_schedule_failure_compensation_does_not_fail_foreign_live_lease(
         db_session.query(WorkforceRun).filter(WorkforceRun.id == run.id).one()
     )
     assert persisted_run.status == "running"
+
+
+def test_error_settlement_releases_terminal_lease_without_reporting_failure(
+    db_session,
+) -> None:
+    """A post-commit presentation error must not rewrite or announce COMPLETED."""
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.COMPLETED)
+    task.run_id = "completed-run"
+    task.runner_id = "completed-runner"
+    task.lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(user.id),
+            role="assistant",
+            content="durable result",
+            message_type="assistant_message",
+        )
+    )
+    db_session.commit()
+
+    error_committed = settle_task_lease_isolated(
+        TaskLease(
+            task_id=int(task.id),
+            runner_id="completed-runner",
+            run_id="completed-run",
+        ),
+        error_message="completion broadcast failed",
+    )
+
+    assert error_committed is False
+    db_session.expire_all()
+    persisted = db_session.query(Task).filter(Task.id == task.id).one()
+    assert persisted.status == TaskStatus.COMPLETED
+    assert persisted.output == "durable result"
+    assert persisted.error_message is None
+    assert persisted.runner_id is None
+    assert persisted.lease_expires_at is None
 
 
 @pytest.mark.asyncio
@@ -713,7 +808,7 @@ async def test_begin_turn_dispatch_projection_failure_keeps_scheduled_turn(
             side_effect=RuntimeError("delivery projection failed"),
         ) as mark_delivery,
         patch(
-            "xagent.web.services.task_orchestrator._mark_task_failed_if_running"
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated"
         ) as compensate,
     ):
         started = await TaskTurnOrchestrator.begin_turn(
@@ -751,11 +846,7 @@ async def test_schedule_failure_pool_timeout_does_not_checkout_delivery_again(
     task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
     payload = TaskTurnPayload("cannot schedule")
     mark_delivery = MagicMock()
-    terminal_session = MagicMock()
-    terminal_db = terminal_session.__enter__.return_value
-    terminal_db.query.side_effect = SQLAlchemyTimeoutError("terminal pool exhausted")
-    terminal_session_factory = MagicMock(return_value=terminal_session)
-    claim_session_factory = database_module.get_session_local()
+    settle = MagicMock(side_effect=SQLAlchemyTimeoutError("terminal pool exhausted"))
 
     caplog.set_level(logging.ERROR, logger="xagent.web.services.task_orchestrator")
     with (
@@ -764,8 +855,8 @@ async def test_schedule_failure_pool_timeout_does_not_checkout_delivery_again(
             side_effect=RuntimeError("schedule boom"),
         ),
         patch(
-            "xagent.web.models.database.get_session_local",
-            side_effect=(claim_session_factory, terminal_session_factory),
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+            settle,
         ),
         patch(
             "xagent.web.services.task_orchestrator.mark_user_message_delivery_sync",
@@ -780,7 +871,7 @@ async def test_schedule_failure_pool_timeout_does_not_checkout_delivery_again(
             kind=TurnKind.CREATE,
         )
 
-    terminal_db.query.assert_called_once_with(Task)
+    settle.assert_called_once()
     mark_delivery.assert_not_called()
     assert (
         "component=turn-schedule-terminal database pool checkout timed out"
@@ -802,10 +893,16 @@ async def test_begin_turn_schedules_even_when_caller_cancelled(db_session) -> No
     def slow_claim(task_id, task_owner_user_id, *, payload, kind):
         _time.sleep(0.15)  # window during which we cancel the caller
         return _ClaimedTurn(
+            task_lease=TaskLease(
+                task_id=task_id,
+                runner_id=get_runner_id(),
+                run_id="slow-claim-run",
+            ),
             status=TaskStatus.RUNNING,
             updated_at=datetime.now(timezone.utc),
             before_message_id=1,
             task_source="sdk",
+            run_id="slow-claim-run",
         )
 
     sched = MagicMock(return_value=MagicMock())
@@ -853,10 +950,16 @@ async def test_repeated_cancellation_keeps_turn_command_gate_until_claim_settles
         claim_started.set()
         assert release_claim.wait(timeout=2)
         return _ClaimedTurn(
+            task_lease=TaskLease(
+                task_id=task_id,
+                runner_id=get_runner_id(),
+                run_id="blocked-claim-run",
+            ),
             status=TaskStatus.RUNNING,
             updated_at=datetime.now(timezone.utc),
             before_message_id=1,
             task_source="sdk",
+            run_id="blocked-claim-run",
         )
 
     async def contender() -> None:
@@ -940,6 +1043,11 @@ async def test_schedule_claimed_create_turn_offloads_cache_invalidation(
         fake_schedule,
     )
     claimed = _ClaimedTurn(
+        task_lease=TaskLease(
+            task_id=task_id,
+            runner_id=get_runner_id(),
+            run_id="committed-run",
+        ),
         status=TaskStatus.RUNNING,
         updated_at=None,
         before_message_id=None,
@@ -1268,6 +1376,140 @@ def test_finish_turn_mirrors_failed_task_to_trigger_run(db_session) -> None:
 # ---------------------------------------------------------------------------
 # _schedule_bg lease lifecycle
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_schedule_bg_cancels_execution_after_heartbeat_loses_lease(
+    db_session,
+) -> None:
+    from xagent.web.api.websocket import background_task_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task.runner_id = "test-runner"
+    task.run_id = "run-a"
+    db_session.commit()
+    lease = TaskLease(int(task.id), "test-runner", "run-a")
+    execution_started = asyncio.Event()
+    execution_cancelled = asyncio.Event()
+
+    async def heartbeat(*_args, **_kwargs) -> TaskLeaseHeartbeatOutcome:
+        await execution_started.wait()
+        return TaskLeaseHeartbeatOutcome(lease_lost=True)
+
+    async def execute(**_kwargs) -> None:
+        execution_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            execution_cancelled.set()
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=heartbeat,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=MagicMock(),
+        ),
+        patch.object(
+            task_orchestrator_module,
+            "resolve_execution_scope",
+            return_value=None,
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=execute,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+        ) as settle,
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        await _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            run_id="run-a",
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+
+    assert execution_cancelled.is_set()
+    settle.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_delayed_preclaimed_scheduler_does_not_resurrect_recovered_task(
+    db_session,
+) -> None:
+    from xagent.web.api.websocket import background_task_manager
+    from xagent.web.services.task_lease_recovery import (
+        recover_expired_task_leases_until_cutoff,
+    )
+    from xagent.web.services.task_lease_service import utc_now
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.PENDING)
+    payload = TaskTurnPayload("claimed before scheduler delay")
+    claimed = _begin_turn_atomic_sync(
+        int(task.id),
+        int(user.id),
+        payload=payload,
+        kind=TurnKind.CREATE,
+    )
+    db_session.expire_all()
+    persisted = db_session.get(Task, int(task.id))
+    persisted.lease_expires_at = utc_now() - timedelta(seconds=1)
+    db_session.commit()
+
+    assert (
+        await recover_expired_task_leases_until_cutoff(
+            cutoff=utc_now(),
+            batch_size=10,
+        )
+        == 1
+    )
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(),
+        ) as execute,
+        patch(
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+        ) as settle,
+        patch.object(background_task_manager, "register_task"),
+    ):
+        await _schedule_bg(
+            task_id=int(task.id),
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            run_id=claimed.run_id,
+            task_lease=claimed.task_lease,
+            payload=payload,
+            force_fresh=False,
+            context=None,
+        )
+
+    execute.assert_not_awaited()
+    settle.assert_not_called()
+    db_session.expire_all()
+    assert db_session.get(Task, int(task.id)).status == TaskStatus.FAILED
 
 
 @pytest.mark.asyncio
@@ -1915,6 +2157,81 @@ async def test_schedule_bg_releases_lease_on_execute_task_background_exception(
     mock_settle.assert_called_once()
     assert get_ephemeral_runtime_values(payload.turn_id) is None
     assert pop_ephemeral_runtime_values(payload.turn_id) is None
+
+
+@pytest.mark.parametrize(
+    ("settled", "expected_broadcasts"),
+    [(True, 1), (False, 0)],
+)
+@pytest.mark.asyncio
+async def test_schedule_bg_broadcasts_failure_only_after_exact_settlement(
+    db_session,
+    settled: bool,
+    expected_broadcasts: int,
+) -> None:
+    """A replacement owner must never inherit a stale runner's error event."""
+    from xagent.web.api.websocket import background_task_manager
+
+    user = _create_user(db_session)
+    task = _create_task(db_session, user.id, status=TaskStatus.RUNNING)
+    task_id = int(task.id)
+    lease = TaskLease(task_id=task_id, runner_id="runner-a", run_id="run-a")
+    events: list[str] = []
+
+    def settle(*_args, **_kwargs) -> bool:
+        events.append("settle")
+        return settled
+
+    async def broadcast(*_args, **_kwargs) -> None:
+        events.append("broadcast")
+
+    with (
+        patch(
+            "xagent.web.services.task_orchestrator.acquire_task_lease_isolated",
+            return_value=lease,
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.run_task_lease_heartbeat",
+            new=AsyncMock(),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.load_task_setup_snapshot_sync",
+            return_value=MagicMock(),
+        ),
+        patch.object(
+            task_orchestrator_module,
+            "resolve_execution_scope",
+            return_value=None,
+            create=True,
+        ),
+        patch(
+            "xagent.web.api.websocket.execute_task_background",
+            new=AsyncMock(side_effect=RuntimeError("owned run failed")),
+        ),
+        patch(
+            "xagent.web.services.task_orchestrator.settle_task_lease_isolated",
+            side_effect=settle,
+        ),
+        patch(
+            "xagent.web.api.websocket.manager",
+            MagicMock(broadcast_to_task=AsyncMock(side_effect=broadcast)),
+        ),
+        patch.object(background_task_manager, "register_task"),
+        patch(
+            "xagent.web.services.task_orchestrator._get_agent_manager",
+            return_value=MagicMock(),
+        ),
+    ):
+        await _schedule_bg(
+            task_id=task_id,
+            task_owner_user_id=int(user.id),
+            task_source=task.source,
+            payload=TaskTurnPayload("hello"),
+            force_fresh=False,
+            context=None,
+        )
+
+    assert events == ["settle"] + (["broadcast"] * expected_broadcasts)
 
 
 @pytest.mark.asyncio

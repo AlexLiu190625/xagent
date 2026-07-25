@@ -240,6 +240,7 @@ def _bind_selected_files_to_task(
         .filter(
             UploadedFile.file_id.in_(selected_file_ids),
             UploadedFile.user_id == int(user.id),
+            UploadedFile.storage_status != "compensating",
             or_(UploadedFile.task_id.is_(None), UploadedFile.task_id == int(task.id)),
         )
         .all()
@@ -560,37 +561,13 @@ def _create_claimed_workforce_run_isolated(
     )
 
 
-async def create_workforce_run(
-    db: Session,
-    user: User,
-    workforce: Workforce | None,
+async def _start_normalized_workforce_run(
     *,
-    message: str,
-    selected_file_ids: list[str] | None = None,
-    execution_mode: str | None = None,
-    is_preview: bool = False,
-    is_visible: bool = True,
-    source: str | None = None,
-    idempotency_key: str | None = None,
-    extra_agent_config: dict[str, Any] | None = None,
+    user_id: int,
+    workforce_id: int,
+    request: _NormalizedWorkforceRunRequest,
 ) -> WorkforceRunStartResult:
-    request = _normalize_workforce_run_request(
-        message=message,
-        selected_file_ids=selected_file_ids,
-        execution_mode=execution_mode,
-        is_preview=is_preview,
-        is_visible=is_visible,
-        source=source,
-        idempotency_key=idempotency_key,
-        extra_agent_config=extra_agent_config,
-    )
-    if workforce is None:
-        raise HTTPException(status_code=404, detail="Workforce not found")
-    user_id = int(user.id)
-    workforce_id = int(workforce.id)
-
-    if not release_db_connection_if_clean(db):
-        raise RuntimeError("request DB transaction is not clean at turn boundary")
+    """Create and schedule a normalized run without a caller-owned Session."""
 
     async def _create_and_schedule() -> WorkforceRunStartResult:
         prepared = await run_db_io_cancellation_safe(
@@ -628,3 +605,79 @@ async def create_workforce_run(
     # reaches the request.
     start_task = asyncio.create_task(_create_and_schedule())
     return await drain_async_task_cancellation_safe(start_task)
+
+
+async def create_workforce_run_by_id(
+    *,
+    user_id: int,
+    workforce_id: int,
+    message: str,
+    selected_file_ids: list[str] | None = None,
+    execution_mode: str | None = None,
+    is_preview: bool = False,
+    is_visible: bool = True,
+    source: str | None = None,
+    idempotency_key: str | None = None,
+    extra_agent_config: dict[str, Any] | None = None,
+) -> WorkforceRunStartResult:
+    """Create a run from detached identities.
+
+    API adapters that already authenticated an owner should use this entry
+    point so no request Session or attached ORM row survives into the async
+    turn-start boundary.
+    """
+
+    request = _normalize_workforce_run_request(
+        message=message,
+        selected_file_ids=selected_file_ids,
+        execution_mode=execution_mode,
+        is_preview=is_preview,
+        is_visible=is_visible,
+        source=source,
+        idempotency_key=idempotency_key,
+        extra_agent_config=extra_agent_config,
+    )
+    return await _start_normalized_workforce_run(
+        user_id=int(user_id),
+        workforce_id=int(workforce_id),
+        request=request,
+    )
+
+
+async def create_workforce_run(
+    db: Session,
+    user: User,
+    workforce: Workforce | None,
+    *,
+    message: str,
+    selected_file_ids: list[str] | None = None,
+    execution_mode: str | None = None,
+    is_preview: bool = False,
+    is_visible: bool = True,
+    source: str | None = None,
+    idempotency_key: str | None = None,
+    extra_agent_config: dict[str, Any] | None = None,
+) -> WorkforceRunStartResult:
+    """Compatibility entry point for callers that still own ORM identities."""
+
+    if workforce is None:
+        raise HTTPException(status_code=404, detail="Workforce not found")
+    user_id = int(user.id)
+    workforce_id = int(workforce.id)
+    request = _normalize_workforce_run_request(
+        message=message,
+        selected_file_ids=selected_file_ids,
+        execution_mode=execution_mode,
+        is_preview=is_preview,
+        is_visible=is_visible,
+        source=source,
+        idempotency_key=idempotency_key,
+        extra_agent_config=extra_agent_config,
+    )
+    if not release_db_connection_if_clean(db):
+        raise RuntimeError("request DB transaction is not clean at turn boundary")
+    return await _start_normalized_workforce_run(
+        user_id=user_id,
+        workforce_id=workforce_id,
+        request=request,
+    )

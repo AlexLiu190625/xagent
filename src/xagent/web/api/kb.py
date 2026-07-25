@@ -158,7 +158,13 @@ from ..services.managed_file_ref import (
     DurableObjectMissingError,
     ManagedFileRef,
 )
-from ..services.uploaded_file_store import UploadedFileStore
+from ..services.uploaded_file_store import (
+    UploadedFileVersionConflict,
+    UploadedFileVersionSnapshot,
+    UploadedFileStore,
+    cleanup_superseded_uploaded_file_objects,
+    snapshot_uploaded_file_version,
+)
 from .cloud_storage import get_google_credentials
 
 T = TypeVar("T", bound=Callable[..., Any])
@@ -205,58 +211,70 @@ def _create_file_compensation_restore(
     backup_path: Optional[Path],
     record_snapshot: dict[str, Any],
     had_existing_file: bool = True,
+    previous_version: UploadedFileVersionSnapshot | None = None,
+    expected_current_version: UploadedFileVersionSnapshot | None = None,
 ) -> Callable[[], None]:
     """Create a FILE-boundary compensation callback for restoring a refreshed/recreated web file."""
 
     def _compensate() -> None:
+        _ = record_snapshot  # Retained for compatibility with downstream callers.
         if had_existing_file and (backup_path is None or not backup_path.exists()):
             raise FileNotFoundError(
                 f"Missing web ingest rollback backup: {backup_path}"
             )
+        _restore_ingest_file_backup(
+            file_path=existing_path,
+            backup_path=backup_path,
+            had_existing_file=had_existing_file,
+        )
         SessionLocal = get_session_local()
         rollback_db = SessionLocal()
+        cleanup_claim = None
         try:
             refreshed_record = (
                 rollback_db.query(UploadedFile)
                 .filter(UploadedFile.file_id == file_record_id)
                 .first()
             )
-            if refreshed_record is None:
-                _restore_ingest_file_backup(
-                    file_path=existing_path,
-                    backup_path=backup_path,
-                    had_existing_file=had_existing_file,
-                )
-            else:
-                current_storage_key = str(
-                    getattr(refreshed_record, "storage_key", "") or ""
-                )
-                previous_storage_key = str(record_snapshot.get("storage_key") or "")
-                if current_storage_key and current_storage_key != previous_storage_key:
-                    ManagedFileRef(refreshed_record).delete_durable()
-
-                _restore_ingest_file_backup(
-                    file_path=existing_path,
-                    backup_path=backup_path,
-                    had_existing_file=had_existing_file,
-                )
-                _restore_uploaded_file_record_snapshot(
-                    refreshed_record, record_snapshot
-                )
-                if previous_storage_key and backup_path is not None:
-                    UploadedFileStore(rollback_db).sync_existing(
-                        refreshed_record,
-                        storage_key=previous_storage_key,
-                        mime_type=record_snapshot.get("mime_type"),
+            if refreshed_record is not None:
+                if previous_version is None or expected_current_version is None:
+                    logger.warning(
+                        "Skipping legacy uploaded-file metadata rollback without "
+                        "both previous and applied version receipts: %s",
+                        file_record_id,
+                    )
+                elif had_existing_file:
+                    UploadedFileStore(rollback_db).upsert_by_storage_path(
+                        user_id=previous_version.user_id,
+                        file_id=previous_version.file_id,
+                        filename=previous_version.filename,
+                        storage_path=existing_path,
+                        mime_type=previous_version.mime_type,
+                        file_size=existing_path.stat().st_size,
+                        expected_version=expected_current_version,
+                        replacement_metadata=previous_version,
                     )
                 else:
-                    rollback_db.flush()
-            rollback_db.commit()
+                    applied = UploadedFileStore(
+                        rollback_db
+                    ).restore_metadata_version_no_commit(
+                        expected=expected_current_version,
+                        replacement=previous_version,
+                    )
+                    cleanup_claim = applied.superseded_cleanup_claim
+                rollback_db.commit()
         except Exception:
             rollback_db.rollback()
             raise
         finally:
             rollback_db.close()
+        if cleanup_claim is not None:
+            failed_claims = cleanup_superseded_uploaded_file_objects((cleanup_claim,))
+            if failed_claims:
+                raise RuntimeError(
+                    "Failed to clean superseded uploaded-file generation "
+                    "during rollback"
+                )
 
     return _compensate
 
@@ -2239,13 +2257,6 @@ def _snapshot_uploaded_file_record(file_record: UploadedFile) -> Dict[str, Any]:
     }
 
 
-def _restore_uploaded_file_record_snapshot(
-    file_record: UploadedFile, snapshot: Dict[str, Any]
-) -> None:
-    for field, value in snapshot.items():
-        setattr(file_record, field, value)
-
-
 def _cleanup_failed_web_uploaded_file_setup(
     db_session: Session,
     *,
@@ -2603,6 +2614,11 @@ def _refresh_existing_file_if_changed(
     """
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
+    previous_version = (
+        snapshot_uploaded_file_version(existing_record)
+        if getattr(existing_record, "id", None) is not None
+        else None
+    )
     if not existing_path.exists():
         try:
             existing_path = ManagedFileRef(existing_record).ensure_local()
@@ -2732,6 +2748,8 @@ def _refresh_existing_file_if_changed(
         existing_path=existing_path,
         backup_path=backup_path,
         record_snapshot=record_snapshot,
+        previous_version=previous_version,
+        expected_current_version=snapshot_uploaded_file_version(file_record),
     )
     document_compensation = _create_document_compensation(
         collection_name=collection_name,
@@ -2841,6 +2859,11 @@ def _recreate_missing_existing_file(
 ) -> FileHandlerResult:
     existing_path = Path(str(existing_record.storage_path))
     record_snapshot = _snapshot_uploaded_file_record(existing_record)
+    previous_version = (
+        snapshot_uploaded_file_version(existing_record)
+        if getattr(existing_record, "id", None) is not None
+        else None
+    )
     ingestion_runs_snapshot = _snapshot_ingestion_runs_for_uploaded_file(
         str(existing_record.file_id)
     )
@@ -2910,27 +2933,14 @@ def _recreate_missing_existing_file(
                 .filter(UploadedFile.file_id == str(existing_record.file_id))
                 .first()
             )
-            if refreshed_record is not None:
-                current_storage_key = str(
-                    getattr(refreshed_record, "storage_key", "") or ""
+            if refreshed_record is not None and (
+                previous_version is None
+                or snapshot_uploaded_file_version(refreshed_record) != previous_version
+            ):
+                raise UploadedFileVersionConflict(
+                    "Uploaded file changed while recreate setup failed; "
+                    "skipped unsafe metadata rollback"
                 )
-                previous_storage_key = str(record_snapshot.get("storage_key") or "")
-                if current_storage_key and (
-                    current_storage_key != previous_storage_key or not had_existing_file
-                ):
-                    ManagedFileRef(refreshed_record).delete_durable()
-                _restore_uploaded_file_record_snapshot(
-                    refreshed_record, record_snapshot
-                )
-                if previous_storage_key and existing_path.exists():
-                    UploadedFileStore(db_session).sync_existing(
-                        refreshed_record,
-                        storage_key=previous_storage_key,
-                        mime_type=record_snapshot.get("mime_type"),
-                    )
-                else:
-                    db_session.flush()
-                db_session.commit()
         except Exception as exc:  # noqa: BLE001
             db_session.rollback()
             restore_error = exc
@@ -2967,6 +2977,8 @@ def _recreate_missing_existing_file(
         backup_path=backup_for_failure,
         record_snapshot=record_snapshot,
         had_existing_file=had_existing_file,
+        previous_version=previous_version,
+        expected_current_version=snapshot_uploaded_file_version(file_record),
     )
     document_compensation = _create_document_compensation(
         collection_name=collection_name,
@@ -3994,23 +4006,21 @@ async def ingest(
         api_result = _get_api_compatibility_facade().with_result(api_result, result)
 
         if result.status in {"error", "partial"}:
-            rollback_execution = (
-                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                    api_result,
-                    lambda: _rollback_failed_ingestion(
-                        db=db,
-                        user=_user,
-                        collection_name=collection,
-                        result=result,
-                        file_path=file_path,
-                        file_record=file_record,
-                        collection_existed_before=effective_collection_existed_before,
-                        uploaded_file_existed_before=uploaded_file_existed_before,
-                        file_backup_path=file_backup_path,
-                        had_existing_file=had_existing_file,
-                        embedding_model_id=embedding_model_id,
-                    ),
-                )
+            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                api_result,
+                lambda: _rollback_failed_ingestion(
+                    db=db,
+                    user=_user,
+                    collection_name=collection,
+                    result=result,
+                    file_path=file_path,
+                    file_record=file_record,
+                    collection_existed_before=effective_collection_existed_before,
+                    uploaded_file_existed_before=uploaded_file_existed_before,
+                    file_backup_path=file_backup_path,
+                    had_existing_file=had_existing_file,
+                    embedding_model_id=embedding_model_id,
+                ),
             )
             api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:
@@ -4065,23 +4075,21 @@ async def ingest(
                 message="Ingestion setup failed before completion.",
             )
             rollback_api_result = KBApiOperationResult(result=rollback_result)
-            rollback_execution = (
-                await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
-                    rollback_api_result,
-                    lambda: _rollback_failed_ingestion(
-                        db=db,
-                        user=_user,
-                        collection_name=collection,
-                        result=rollback_result,
-                        file_path=file_path,
-                        file_record=file_record,
-                        collection_existed_before=effective_collection_existed_before,
-                        uploaded_file_existed_before=uploaded_file_existed_before,
-                        file_backup_path=file_backup_path,
-                        had_existing_file=had_existing_file,
-                        embedding_model_id=embedding_model_id,
-                    ),
-                )
+            rollback_execution = await _get_api_compatibility_facade().run_failed_ingest_rollback_async(
+                rollback_api_result,
+                lambda: _rollback_failed_ingestion(
+                    db=db,
+                    user=_user,
+                    collection_name=collection,
+                    result=rollback_result,
+                    file_path=file_path,
+                    file_record=file_record,
+                    collection_existed_before=effective_collection_existed_before,
+                    uploaded_file_existed_before=uploaded_file_existed_before,
+                    file_backup_path=file_backup_path,
+                    had_existing_file=had_existing_file,
+                    embedding_model_id=embedding_model_id,
+                ),
             )
             rollback_api_result = rollback_execution.operation_result
             if rollback_execution.error is not None:

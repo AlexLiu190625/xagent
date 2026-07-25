@@ -738,6 +738,7 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
 
     from xagent.web.api.websocket import handle_chat_message
     from xagent.web.models.workforce import WorkforceAgent
+    from xagent.web.services import task_orchestrator as task_orchestrator_service
     from xagent.web.services.workforce_snapshot import build_workforce_snapshot
 
     workforce_id = _create_workforce("Append Sync Workforce")
@@ -780,30 +781,17 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
     finally:
         db.close()
 
-    from xagent.web.services import task_orchestrator as task_orchestrator_service
-
     turn_started = asyncio.Event()
-    release_turn = asyncio.Event()
 
-    async def _claiming_begin_turn(**kwargs: Any) -> SimpleNamespace:
+    def _observe_schedule(**_kwargs: Any) -> asyncio.Task[None]:
         turn_started.set()
-        await release_turn.wait()
-        # Simulate the orchestrator's atomic claim flipping the task RUNNING.
-        claim_db = _direct_db_session()
-        try:
-            claim_db.query(Task).filter(Task.id == int(kwargs["task_id"])).update(
-                {"status": TaskStatus.RUNNING}
-            )
-            claim_db.commit()
-        finally:
-            claim_db.close()
-        return SimpleNamespace(background_task=None)
 
-    monkeypatch.setattr(
-        task_orchestrator_service.TaskTurnOrchestrator,
-        "begin_turn",
-        _claiming_begin_turn,
-    )
+        async def _noop() -> None:
+            return None
+
+        return asyncio.create_task(_noop())
+
+    monkeypatch.setattr(task_orchestrator_service, "_schedule_bg", _observe_schedule)
 
     db = _direct_db_session()
     try:
@@ -822,7 +810,6 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
             try:
                 await asyncio.wait_for(turn_started.wait(), timeout=1.0)
                 await asyncio.wait_for(asyncio.shield(handler_task), timeout=1.0)
-                release_turn.set()
 
                 for _ in range(100):
                     command_db = _direct_db_session()
@@ -848,7 +835,6 @@ async def test_ws_append_syncs_workforce_run_back_to_running(
                         "to running"
                     )
             finally:
-                release_turn.set()
                 if not handler_task.done():
                     await asyncio.wait_for(handler_task, timeout=1.0)
     finally:

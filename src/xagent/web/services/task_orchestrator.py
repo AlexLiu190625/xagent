@@ -52,7 +52,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from uuid import uuid4
 
-from sqlalchemy import func, update
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from ...core.execution_scope import resolve_execution_scope
@@ -73,13 +73,18 @@ from .task_execution_controller import (
 from .task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
+    TaskLeaseLostError,
+    TaskLeaseRefreshState,
     acquire_task_lease_cancellation_safe,
     acquire_task_lease_isolated,
+    acquire_task_lease_no_commit,
     fail_and_release_task_lease_no_commit,
     get_runner_id,
     release_task_lease,
+    run_while_task_lease_owned,
     run_task_lease_heartbeat,
     stop_task_lease_heartbeat,
+    validate_preacquired_task_lease_isolated,
 )
 from .task_setup_snapshot import load_task_setup_snapshot_sync
 
@@ -147,10 +152,9 @@ class TurnKind(str, enum.Enum):
     assert in ``begin_turn``).
 
     Continuation paths (PAUSED / WAITING_FOR_USER resumed onto the same
-    turn) are deliberately not modeled here: they go through
-    ``dag_pattern.request_continuation`` instead, because continuation
-    is the *same* turn picking up where it paused — terminal-field reset
-    would be wrong.
+    turn) are deliberately not modeled here: the resume executor adopts
+    the exact run-fenced checkpoint and lease instead of claiming a new
+    turn, because terminal-field reset would be wrong.
     """
 
     CREATE = "create"  # PENDING → RUNNING; new task's first turn
@@ -320,6 +324,18 @@ class TaskTurnOrchestrator:
                 raise
 
     @staticmethod
+    def ensure_no_background_turn(task_id: int) -> None:
+        """Reject a new claim while this worker still owns a live runner.
+
+        Domain-owned transactions call this before staging an APPEND claim.
+        The database status predicate remains the cross-worker authority; this
+        process-local guard covers the shorter tail window where a runner is
+        still registered after its terminal task status has committed.
+        """
+
+        _refuse_if_bg_inflight(task_id)
+
+    @staticmethod
     async def _begin_turn_unserialized(
         *,
         task_id: int,
@@ -470,38 +486,63 @@ class TaskTurnOrchestrator:
         )
 
     @staticmethod
-    async def schedule_claimed_create_turn(
+    def claim_append_turn_no_commit(
+        db: Session,
+        *,
+        task_id: int,
+        task_owner_user_id: int,
+        payload: TaskTurnPayload,
+    ) -> "_ClaimedTurn":
+        """Stage one APPEND turn inside a domain-owned transaction.
+
+        File/runtime domain mutations that must be atomic with acceptance can
+        run in the same transaction before the caller commits. A busy or
+        missing task raises before any staged mutation becomes visible.
+        """
+
+        return _claim_turn_no_commit(
+            db,
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            payload=payload,
+            kind=TurnKind.APPEND,
+        )
+
+    @staticmethod
+    async def schedule_claimed_turn(
         *,
         task_id: int,
         task_owner_user_id: int,
         actor_user_id: int | None,
         payload: TaskTurnPayload,
         claimed: "_ClaimedTurn",
+        kind: TurnKind,
+        force_fresh: bool = False,
         context: Optional[Dict[str, Any]] = None,
     ) -> TurnStarted:
-        """Schedule a CREATE turn already committed by its domain owner."""
+        """Schedule a turn already committed by its transaction owner."""
 
         async def _schedule() -> TurnStarted:
-            # ``claim_created_turn_no_commit`` delegates commit to its domain
-            # owner, so invalidate only once that owner has returned with a
-            # committed claim and before scheduling can observe cached state.
+            # The no-commit claim delegates commit to its domain owner, so
+            # invalidate only once that owner has returned with a committed
+            # claim and before scheduling can observe cached state.
             # The configured cache backend may perform synchronous Redis I/O,
             # so keep that work off the event-loop thread.
-            await asyncio.to_thread(_invalidate_task_cache_best_effort, task_id)
+            await asyncio.to_thread(invalidate_task_cache_best_effort, task_id)
             async with task_execution_controller.command(task_id):
                 background_task = await _schedule_committed_turn(
                     task_id=task_id,
                     task_owner_user_id=task_owner_user_id,
                     payload=payload,
                     claimed=claimed,
-                    force_fresh=False,
+                    force_fresh=force_fresh,
                     context=context,
                 )
                 return _turn_started_snapshot(
                     task_id=task_id,
                     task_owner_user_id=task_owner_user_id,
                     actor_user_id=actor_user_id,
-                    kind=TurnKind.CREATE,
+                    kind=kind,
                     claimed=claimed,
                     background_task=background_task,
                 )
@@ -511,6 +552,28 @@ class TaskTurnOrchestrator:
         # existing compensated failure path before it can propagate.
         schedule_task = asyncio.create_task(_schedule())
         return await drain_async_task_cancellation_safe(schedule_task)
+
+    @staticmethod
+    async def schedule_claimed_create_turn(
+        *,
+        task_id: int,
+        task_owner_user_id: int,
+        actor_user_id: int | None,
+        payload: TaskTurnPayload,
+        claimed: "_ClaimedTurn",
+        context: Optional[Dict[str, Any]] = None,
+    ) -> TurnStarted:
+        """Compatibility wrapper for an already committed CREATE claim."""
+
+        return await TaskTurnOrchestrator.schedule_claimed_turn(
+            task_id=task_id,
+            task_owner_user_id=task_owner_user_id,
+            actor_user_id=actor_user_id,
+            payload=payload,
+            claimed=claimed,
+            kind=TurnKind.CREATE,
+            context=context,
+        )
 
 
 # ===== internal helpers =====
@@ -522,6 +585,7 @@ class _ClaimedTurn:
     commits, so ``begin_turn`` can build :class:`TurnStarted` without the
     caller re-reading the ORM."""
 
+    task_lease: TaskLease
     status: TaskStatus
     updated_at: Optional[datetime]
     before_message_id: Optional[int]
@@ -550,6 +614,7 @@ async def _schedule_committed_turn(
             task_owner_user_id=task_owner_user_id,
             task_source=claimed.task_source,
             run_id=claimed.run_id,
+            task_lease=claimed.task_lease,
             payload=payload,
             force_fresh=force_fresh,
             context=context,
@@ -559,11 +624,11 @@ async def _schedule_committed_turn(
         # Schedule failed after the claim committed -> force FAILED so the row
         # is not left RUNNING. The terminal write remains off-loop.
         try:
-            await asyncio.to_thread(
-                _mark_task_failed_if_running,
-                task_id,
-                "turn scheduling failed after claim commit",
-                claimed.run_id,
+            await run_db_io_cancellation_safe(
+                lambda: settle_task_lease_isolated(
+                    claimed.task_lease,
+                    error_message="turn scheduling failed after claim commit",
+                )
             )
         except Exception as terminal_error:
             if not is_database_pool_timeout(terminal_error):
@@ -654,34 +719,13 @@ def _turn_started_snapshot(
     )
 
 
-def _turn_claim_values(
-    payload: TaskTurnPayload,
-    *,
-    run_id: str,
-    state_version: Any,
-) -> dict[str, Any]:
-    """Return the shared persisted state for a newly owned task turn."""
-
-    return {
-        "status": TaskStatus.RUNNING,
-        "input": payload.transcript_message,
-        "output": None,
-        "error_message": None,
-        "runner_id": None,
-        "lease_expires_at": None,
-        "last_heartbeat_at": None,
-        "run_id": run_id,
-        "state_version": state_version,
-        "control_state": TaskControlState.RUNNING.value,
-    }
-
-
 def _persist_claimed_turn_no_commit(
     db: Session,
     *,
     task_id: int,
     task_owner_user_id: int,
     payload: TaskTurnPayload,
+    task_lease: TaskLease,
 ) -> _ClaimedTurn:
     """Persist the first message and snapshot one already-claimed turn."""
 
@@ -724,6 +768,7 @@ def _persist_claimed_turn_no_commit(
         .one()
     )
     return _ClaimedTurn(
+        task_lease=task_lease,
         status=status,
         updated_at=updated_at,
         before_message_id=before_message_id,
@@ -735,7 +780,7 @@ def _persist_claimed_turn_no_commit(
     )
 
 
-def _invalidate_task_cache_best_effort(task_id: int) -> None:
+def invalidate_task_cache_best_effort(task_id: int) -> None:
     """Keep cache invalidation best-effort after a committed task write."""
 
     try:
@@ -764,11 +809,6 @@ def _claim_turn_no_commit(
         status_filter = Task.status.in_(_APPENDABLE_STATUSES)
 
     run_id = str(uuid4())
-    claim_values = _turn_claim_values(
-        payload,
-        run_id=run_id,
-        state_version=func.coalesce(Task.state_version, 0) + 1,
-    )
     claimed = (
         db.query(Task)
         .filter(
@@ -777,7 +817,19 @@ def _claim_turn_no_commit(
             status_filter,
         )
         .update(
-            {getattr(Task, key): value for key, value in claim_values.items()},
+            {
+                Task.status: TaskStatus.RUNNING,
+                Task.input: payload.transcript_message,
+                Task.output: None,
+                Task.error_message: None,
+                Task.runner_id: None,
+                Task.lease_expires_at: None,
+                Task.last_heartbeat_at: None,
+                Task.run_id: run_id,
+                Task.last_checkpoint_event_id: None,
+                Task.state_version: func.coalesce(Task.state_version, 0) + 1,
+                Task.control_state: TaskControlState.RUNNING.value,
+            },
             synchronize_session=False,
         )
     )
@@ -791,11 +843,22 @@ def _claim_turn_no_commit(
             raise TaskTurnNotFoundError(task_id)
         raise TaskTurnError("busy")
 
+    task_lease = acquire_task_lease_no_commit(
+        db,
+        task_id,
+        expected_run_id=run_id,
+    )
+    if task_lease is None:
+        raise RuntimeError(
+            f"task {task_id} claim could not stage its exact execution lease"
+        )
+
     result = _persist_claimed_turn_no_commit(
         db,
         task_id=task_id,
         task_owner_user_id=task_owner_user_id,
         payload=payload,
+        task_lease=task_lease,
     )
     agent_config = result.agent_config
     if isinstance(agent_config, dict) and isinstance(
@@ -818,6 +881,22 @@ def _claim_turn_no_commit(
             )
         except WorkforceTurnRejectedError as exc:
             raise TaskTurnError(exc.reason) from exc
+        # Keep the WorkforceRun projection in the same transaction as the
+        # Task RUNNING claim and exact prelease. A later best-effort worker can
+        # otherwise arrive after completion and resurrect the projection.
+        from .workforce_runtime import sync_workforce_run_status
+
+        claimed_task = (
+            db.query(Task)
+            .filter(
+                Task.id == task_id,
+                Task.status == TaskStatus.RUNNING,
+                Task.runner_id == task_lease.runner_id,
+                Task.run_id == task_lease.run_id,
+            )
+            .one()
+        )
+        sync_workforce_run_status(db, claimed_task, TaskStatus.RUNNING)
     return result
 
 
@@ -870,7 +949,7 @@ def _begin_turn_atomic_sync(
     finally:
         db.close()
 
-    _invalidate_task_cache_best_effort(task_id)
+    invalidate_task_cache_best_effort(task_id)
     return result
 
 
@@ -910,55 +989,6 @@ def _get_agent_manager() -> Any:
     return get_agent_manager()
 
 
-def _mark_task_failed_if_running(
-    task_id: int,
-    error_message: str,
-    expected_run_id: str | None = None,
-) -> None:
-    """Fail a committed claim if scheduling fails before a lease is acquired."""
-    from ..models.database import get_session_local
-
-    SessionLocal = get_session_local()
-    try:
-        with SessionLocal() as db:
-            statement = (
-                update(Task)
-                .where(
-                    Task.id == task_id,
-                    Task.status == TaskStatus.RUNNING,
-                    Task.runner_id.is_(None),
-                )
-                .values(
-                    status=TaskStatus.FAILED,
-                    control_state=TaskControlState.FAILED.value,
-                    state_version=func.coalesce(Task.state_version, 0) + 1,
-                    error_message=error_message,
-                )
-            )
-            if expected_run_id is not None:
-                statement = statement.where(Task.run_id == expected_run_id)
-            # The compensation owns only the still-unleased claim it committed.
-            # One conditional write makes the ownership test atomic on both
-            # PostgreSQL and SQLite; a replacement runner that wins the lease
-            # race makes this UPDATE a no-op.
-            result = db.execute(statement.execution_options(synchronize_session=False))
-            if int(getattr(result, "rowcount", 0) or 0) != 1:
-                return
-            task = db.query(Task).filter(Task.id == task_id).one()
-            from .workforce_runtime import sync_workforce_run_status
-
-            sync_workforce_run_status(db, task, TaskStatus.FAILED)
-            db.commit()
-    except Exception as error:
-        logger.error(
-            "Failed to mark task %s as FAILED after scheduling error: %s",
-            task_id,
-            error,
-            exc_info=True,
-        )
-        raise
-
-
 def settle_task_lease_isolated(
     lease: TaskLease,
     *,
@@ -971,6 +1001,12 @@ def settle_task_lease_isolated(
     transcript are staged in that same transaction. If the row is already
     terminal (for example a completion broadcast failed), ``finish_turn``
     reconciles and releases it without rewriting the outcome.
+
+    The return value means that the requested outcome was committed. With an
+    ``error_message`` it is ``True`` only when this call changed the exact owned
+    run to FAILED. A pre-existing terminal/control outcome may still be
+    reconciled and released, but returns ``False`` so callers do not publish a
+    contradictory failure event.
 
     On checkout or commit failure the transaction is rolled back and the lease
     is intentionally retained for TTL recovery; this function never creates an
@@ -992,7 +1028,7 @@ def settle_task_lease_isolated(
                 if failed:
                     task = settle_db.query(Task).filter(Task.id == lease.task_id).one()
                     sync_workforce_run_status(settle_db, task, TaskStatus.FAILED)
-                    _sync_trigger_run_status(settle_db, task, TaskStatus.FAILED)
+                    sync_trigger_run_status(settle_db, task, TaskStatus.FAILED)
                     if task.user_id is not None:
                         persist_assistant_message_no_commit(
                             settle_db,
@@ -1002,7 +1038,7 @@ def settle_task_lease_isolated(
                             message_type="chat_response",
                         )
                     settle_db.commit()
-                    _invalidate_task_cache_best_effort(lease.task_id)
+                    invalidate_task_cache_best_effort(lease.task_id)
                     return True
 
                 # The task may already have committed a terminal/control state.
@@ -1010,11 +1046,14 @@ def settle_task_lease_isolated(
                 # fenced terminal reconciliation below.
                 settle_db.rollback()
 
-            return finish_turn(
+            settled = finish_turn(
                 settle_db,
                 lease.task_id,
                 task_lease=lease,
             )
+            if error_message is not None:
+                return False
+            return settled
         except Exception:
             settle_db.rollback()
             raise
@@ -1096,11 +1135,11 @@ def finish_turn(
         if task_lease is not None:
             released = release_task_lease(bg_db, task_lease, status=status)
             if released:
-                _invalidate_task_cache_best_effort(task_id)
+                invalidate_task_cache_best_effort(task_id)
             return released
         if changed:
             bg_db.commit()
-            _invalidate_task_cache_best_effort(task_id)
+            invalidate_task_cache_best_effort(task_id)
         return changed
 
     status = fresh.status
@@ -1119,7 +1158,7 @@ def finish_turn(
             fresh.output = latest_assistant.content
             fresh.error_message = None
             sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
-            _sync_trigger_run_status(bg_db, fresh, TaskStatus.COMPLETED)
+            sync_trigger_run_status(bg_db, fresh, TaskStatus.COMPLETED)
             committed = commit_terminal(TaskStatus.COMPLETED)
             logger.info(
                 "finish_turn: task %s output written (%d chars)",
@@ -1133,7 +1172,7 @@ def finish_turn(
                 task_id,
             )
             run_changed = sync_workforce_run_status(bg_db, fresh, TaskStatus.COMPLETED)
-            trigger_run_changed = _sync_trigger_run_status(
+            trigger_run_changed = sync_trigger_run_status(
                 bg_db, fresh, TaskStatus.COMPLETED
             )
             return commit_terminal(
@@ -1154,7 +1193,7 @@ def finish_turn(
             fresh.output = None
             changed = True
         run_changed = sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
-        trigger_run_changed = _sync_trigger_run_status(bg_db, fresh, TaskStatus.FAILED)
+        trigger_run_changed = sync_trigger_run_status(bg_db, fresh, TaskStatus.FAILED)
         if changed or run_changed or trigger_run_changed:
             committed = commit_terminal(TaskStatus.FAILED)
             logger.info(
@@ -1199,7 +1238,7 @@ def finish_turn(
         fresh.error_message = "Task execution failed without status update; see /steps."
         fresh.output = None  # latest-turn snapshot invariant
         sync_workforce_run_status(bg_db, fresh, TaskStatus.FAILED)
-        _sync_trigger_run_status(bg_db, fresh, TaskStatus.FAILED)
+        sync_trigger_run_status(bg_db, fresh, TaskStatus.FAILED)
         committed = commit_terminal(TaskStatus.FAILED)
         logger.warning(
             "finish_turn: task %s bg coroutine returned with status=RUNNING; "
@@ -1215,7 +1254,13 @@ def finish_turn(
     return False
 
 
-def _sync_trigger_run_status(bg_db: Any, task: Task, status: TaskStatus) -> bool:
+def sync_trigger_run_status(
+    bg_db: Any,
+    task: Task,
+    status: TaskStatus,
+    *,
+    error_message: str | None = None,
+) -> bool:
     """Best-effort mirror from task terminal state to trigger run history."""
     from ..models.trigger import TriggerRun, TriggerRunStatus
 
@@ -1241,8 +1286,8 @@ def _sync_trigger_run_status(bg_db: Any, task: Task, status: TaskStatus) -> bool
     for run in rows:
         run.status = run_status
         run.finished_at = now
-        if status == TaskStatus.FAILED:
-            run.error_message = task.error_message
+        if status in {TaskStatus.FAILED, TaskStatus.PAUSED}:
+            run.error_message = error_message or task.error_message
         else:
             run.error_message = None
         bg_db.add(run)
@@ -1255,6 +1300,7 @@ def _schedule_bg(
     task_owner_user_id: int,
     task_source: Optional[str],
     run_id: str | None = None,
+    task_lease: TaskLease | None = None,
     payload: TaskTurnPayload,
     force_fresh: bool,
     context: Optional[Dict[str, Any]],
@@ -1270,13 +1316,12 @@ def _schedule_bg(
 
     Owns the full lease lifecycle for the bg run:
 
-      - acquire at ``_runner`` entry. If another worker already holds
-        the lease the scheduler returns immediately without invoking
-        ``execute_task_background`` or ``finish_turn`` — the
-        running-elsewhere short-circuit. ``finish_turn``'s ownership
-        guard would catch the same situation a level deeper, but
-        skipping at the entry means we never even attempt local work
-        on a task another worker is executing.
+      - primary turn claims supply the exact lease committed with the turn
+        state. Delayed execution validates that same run/runner fence before
+        doing local work. Legacy ``schedule_existing`` callers acquire at
+        ``_runner`` entry instead. If another worker already owns the task,
+        the scheduler returns without invoking ``execute_task_background`` or
+        ``finish_turn``.
       - heartbeat alongside the run.
       - release in ``finally`` as the single owner of the release call when
         execution returns normally or raises a non-pool error.
@@ -1291,13 +1336,19 @@ def _schedule_bg(
     bg run loads its own snapshot and opens its own sessions, so no
     caller-bound ORM object crosses into the coroutine.
     """
-    from ..api.websocket import background_task_manager, execute_task_background
+    from ..api.websocket import (
+        background_task_manager,
+        create_terminal_task_error_event,
+        execute_task_background,
+        manager as websocket_manager,
+    )
 
     async def _runner() -> None:
-        lease: TaskLease | None = None
+        lease: TaskLease | None = task_lease
         stop_event: asyncio.Event | None = None
         hb_task: asyncio.Task[TaskLeaseHeartbeatOutcome] | None = None
         settlement_error: str | None = None
+        broadcast_error_message: str | None = None
         defer_settlement_to_ttl_recovery = False
         cleanup_cancellation: asyncio.CancelledError | None = None
         try:
@@ -1305,23 +1356,28 @@ def _schedule_bg(
             # await returns. Drain that worker and settle any late lease before
             # propagating cancellation, otherwise the task remains RUNNING
             # with no coroutine that knows it owns the lease.
-            lease = await acquire_task_lease_cancellation_safe(
-                lambda: acquire_task_lease_isolated(
-                    task_id,
-                    expected_run_id=run_id,
-                ),
-                lambda acquired: settle_task_lease_isolated(
-                    acquired,
-                    error_message="task execution cancelled during lease acquisition",
-                ),
-            )
+            preacquired_lease = lease is not None
             if lease is None:
-                logger.info(
-                    "task %s acquired by another worker; skipping "
-                    "execution and finish_turn",
-                    task_id,
+                lease = await acquire_task_lease_cancellation_safe(
+                    lambda: acquire_task_lease_isolated(
+                        task_id,
+                        expected_run_id=run_id,
+                    ),
+                    lambda acquired: settle_task_lease_isolated(
+                        acquired,
+                        error_message=(
+                            "task execution cancelled during lease acquisition"
+                        ),
+                    ),
                 )
-                return
+                if lease is None:
+                    logger.info(
+                        "task %s acquired by another worker; skipping "
+                        "execution and finish_turn",
+                        task_id,
+                    )
+                    return
+            assert lease is not None
 
             # INVARIANT: ``asyncio.create_task(run_task_lease_heartbeat(...))``
             # MUST be scheduled before any ``await`` that yields the
@@ -1335,34 +1391,64 @@ def _schedule_bg(
             stop_event = asyncio.Event()
             hb_task = asyncio.create_task(run_task_lease_heartbeat(lease, stop_event))
             try:
-                # Snapshot and scope resolution each own a short Session in a
-                # worker. Drain either worker if cancellation arrives so final
-                # settlement never races an abandoned pool checkout.
-                snapshot = await run_db_io_cancellation_safe(
-                    lambda: load_task_setup_snapshot_sync(
-                        task_id,
-                        task_owner_user_id,
-                        before_message_id=before_message_id,
+                if preacquired_lease:
+                    validation = await run_db_io_cancellation_safe(
+                        lambda: validate_preacquired_task_lease_isolated(lease)
                     )
-                )
-                if snapshot is None:
-                    raise RuntimeError("task vanished before snapshot load")
+                    if validation == TaskLeaseRefreshState.LOST:
+                        defer_settlement_to_ttl_recovery = True
+                        logger.info(
+                            "task %s pre-acquired lease is no longer current; "
+                            "skipping delayed local execution",
+                            task_id,
+                        )
+                        return
+                    if validation == TaskLeaseRefreshState.SETTLEMENT_READY:
+                        return
 
-                scope = await run_db_io_cancellation_safe(
-                    lambda: resolve_execution_scope(task_id)
+                async def execute_owned_run() -> None:
+                    # Snapshot and scope resolution each own a short Session in a
+                    # worker. Drain either worker if cancellation arrives so final
+                    # settlement never races an abandoned pool checkout.
+                    snapshot = await run_db_io_cancellation_safe(
+                        lambda: load_task_setup_snapshot_sync(
+                            task_id,
+                            task_owner_user_id,
+                            before_message_id=before_message_id,
+                        )
+                    )
+                    if snapshot is None:
+                        raise RuntimeError("task vanished before snapshot load")
+
+                    scope = await run_db_io_cancellation_safe(
+                        lambda: resolve_execution_scope(task_id)
+                    )
+                    await execute_task_background(
+                        task_id=task_id,
+                        user_message=payload.transcript_message,
+                        context=_execution_context_with_turn_id(
+                            context,
+                            payload.turn_id,
+                        ),
+                        agent_manager=_get_agent_manager(),
+                        task_owner_user_id=task_owner_user_id,
+                        before_message_id=before_message_id,
+                        llm_user_message=payload.execution_message,
+                        task_setup_snapshot=snapshot,
+                        expected_run_id=lease.run_id,
+                        task_lease=lease,
+                        resolved_execution_scope=scope,
+                    )
+
+                await run_while_task_lease_owned(
+                    execute_owned_run(),
+                    hb_task,
                 )
-                await execute_task_background(
-                    task_id=task_id,
-                    user_message=payload.transcript_message,
-                    context=_execution_context_with_turn_id(context, payload.turn_id),
-                    agent_manager=_get_agent_manager(),
-                    task_owner_user_id=task_owner_user_id,
-                    before_message_id=before_message_id,
-                    llm_user_message=payload.execution_message,
-                    task_setup_snapshot=snapshot,
-                    expected_run_id=run_id,
-                    task_lease=lease,
-                    resolved_execution_scope=scope,
+            except TaskLeaseLostError:
+                defer_settlement_to_ttl_recovery = True
+                logger.warning(
+                    "task %s execution cancelled after lease ownership loss",
+                    task_id,
                 )
             except asyncio.CancelledError:
                 settlement_error = "task execution cancelled"
@@ -1397,6 +1483,7 @@ def _schedule_bg(
                             "setup/run error: "
                             f"{type(setup_or_run_err).__name__}: {setup_or_run_err}"
                         )
+                    broadcast_error_message = str(setup_or_run_err)
                     logger.error(
                         "bg task %s setup/run failed: %s",
                         task_id,
@@ -1434,12 +1521,28 @@ def _schedule_bg(
 
                 if not defer_settlement_to_ttl_recovery:
                     try:
-                        await run_db_io_cancellation_safe(
+                        settled = await run_db_io_cancellation_safe(
                             lambda: settle_task_lease_isolated(
                                 lease,
                                 error_message=settlement_error,
                             )
                         )
+                        if settled and broadcast_error_message is not None:
+                            try:
+                                await websocket_manager.broadcast_to_task(
+                                    create_terminal_task_error_event(
+                                        task_id,
+                                        broadcast_error_message,
+                                    ),
+                                    task_id,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "task %s failure was committed but its "
+                                    "terminal broadcast failed",
+                                    task_id,
+                                    exc_info=True,
+                                )
                     except asyncio.CancelledError as exc:
                         cleanup_cancellation = cleanup_cancellation or exc
                     except Exception as settle_err:
