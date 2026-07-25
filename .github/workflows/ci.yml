@@ -637,6 +637,10 @@ jobs:
         working-directory: ./frontend
         run: npm ci
 
+      - name: Run widget regression tests with coverage
+        working-directory: ./frontend
+        run: npm run test:widget:coverage
+
       # Static export is the default build (served by FastAPI in the pip/uvx
       # deployment). Verify it produces a servable bundle: index shell plus the
       # dynamic-route __shell__ pages the SPA fallback depends on.
