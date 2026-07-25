@@ -10,8 +10,10 @@ from typing import Any, Dict, Mapping, Optional, Type
 from pydantic import BaseModel, Field
 
 from ....workspace import TaskWorkspace
-from ...core.command_executor import CommandExecutorCore
-from ...core.command_path_guard import WorkspaceCommandPathGuard
+from ...core.command_executor import (
+    CommandExecutorCore,
+    execution_scope_restricts_command_paths,
+)
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .function import FunctionTool
 from .sandboxed_tool.sandbox_config import sandbox_config
@@ -51,6 +53,18 @@ class CommandExecutorTool(AbstractBaseTool):
         self._workspace = workspace
         self._restrict_paths = restrict_paths
 
+    @classmethod
+    def from_execution_scope(
+        cls,
+        workspace: TaskWorkspace,
+        execution_scope: Any | None,
+    ) -> "CommandExecutorTool":
+        """Build a workspace tool with the scope-owned command path policy."""
+        return cls(
+            workspace=workspace,
+            restrict_paths=execution_scope_restricts_command_paths(execution_scope),
+        )
+
     @property
     def name(self) -> str:
         return "command_executor"
@@ -63,21 +77,50 @@ class CommandExecutorTool(AbstractBaseTool):
             if working_directory
             else "Commands run in the current process working directory."
         )
-        boundary_line = (
-            "Common shell file operations are checked against the current "
-            "workspace; external allowed directories are read-only. This is a "
-            "cooperative, best-effort check, not an operating-system security "
-            "boundary; unknown commands remain outside its classification."
-            if self._restrict_paths
-            else ""
+        lines = [
+            "Execute shell commands and scripts.",
+            (
+                "Supports shell commands including system commands, pipes, "
+                "and redirects."
+            ),
+            workspace_line,
+        ]
+        if self._restrict_paths:
+            lines.append(
+                "Common shell file operations are checked against the current "
+                "workspace; external allowed directories are read-only. This is "
+                "a cooperative, best-effort check, not an operating-system "
+                "security boundary; unknown commands are not classified. "
+                "Runtime-generated file arguments (for example xargs), active "
+                "globs, implicit shell initialization, unsupported control "
+                "structures such as unparsable for/case forms, and scripts "
+                "that cannot be inspected are rejected. Enumerate concrete "
+                "paths, split unsupported control flow into separate tool "
+                "calls, and use recognized commands when path checks matter."
+            )
+        lines.extend(
+            [
+                (
+                    "Use concrete paths, URLs, or file identifiers already "
+                    "returned by previous tool results directly. If a tool "
+                    "returned an absolute path or a path relative to the command "
+                    "working directory, pass that path to the next command "
+                    "instead of rediscovering it."
+                ),
+                (
+                    "Only search for files when no usable path was provided, "
+                    "and keep searches scoped to the command working directory "
+                    "or another explicitly relevant directory. Do not run broad "
+                    "recursive searches from `/` or the user's home directory "
+                    "unless the user explicitly asks for that scope."
+                ),
+                (
+                    "Examples: ls -la output, grep -r 'pattern' ./output, "
+                    "cat file.txt | grep error"
+                ),
+            ]
         )
-        return f"""Execute shell commands and scripts.
-Supports any shell command including system commands, scripts, pipes, and redirects.
-{workspace_line}
-{boundary_line}
-Use concrete paths, URLs, or file identifiers already returned by previous tool results directly. If a tool returned an absolute path or a path relative to the command working directory, pass that path to the next command instead of rediscovering it.
-Only search for files when no usable path was provided, and keep searches scoped to the command working directory or another explicitly relevant directory. Do not run broad recursive searches from `/` or the user's home directory unless the user explicitly asks for that scope.
-Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt | grep error"""
+        return "\n".join(lines)
 
     @property
     def tags(self) -> list[str]:
@@ -92,16 +135,7 @@ Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt |
     def run_json_sync(self, args: Mapping[str, Any]) -> Any:
         exec_args = CommandExecutorArgs.model_validate(args)
 
-        # Determine working directory
-        working_directory = self._get_working_directory()
-
-        # Create core executor instance
-        path_guard = (
-            WorkspaceCommandPathGuard(self._workspace)
-            if self._restrict_paths and self._workspace is not None
-            else None
-        )
-        executor = CommandExecutorCore(working_directory, path_guard=path_guard)
+        executor = self._create_executor()
 
         # Execute command
         result = executor.execute_command(exec_args.command, timeout=exec_args.timeout)
@@ -110,6 +144,14 @@ Examples: ls -la output, grep -r 'pattern' ./output, ./deploy.sh, cat file.txt |
 
     async def run_json_async(self, args: Mapping[str, Any]) -> Any:
         return await asyncio.to_thread(self.run_json_sync, args)
+
+    def _create_executor(self) -> CommandExecutorCore:
+        if self._workspace is not None:
+            return CommandExecutorCore.for_workspace(
+                self._workspace,
+                restrict_paths=self._restrict_paths,
+            )
+        return CommandExecutorCore()
 
     def _get_working_directory(self) -> Optional[str]:
         """Determine the working directory based on workspace settings"""
@@ -146,7 +188,14 @@ def get_command_executor_tool(info: Optional[dict[str, Any]] = None) -> Function
         workspace = info["workspace"]
 
     # Create workspace-bound command executor
-    executor = CommandExecutorTool(workspace=workspace)
+    executor = (
+        CommandExecutorTool.from_execution_scope(
+            workspace,
+            info.get("execution_scope") if info else None,
+        )
+        if workspace is not None
+        else CommandExecutorTool()
+    )
 
     # Wrap as LangChain tool
     def execute_command(command: str, timeout: Optional[int] = None) -> Dict[str, Any]:
@@ -161,6 +210,8 @@ def get_command_executor_tool(info: Optional[dict[str, Any]] = None) -> Function
 
 def create_command_executor_tool(
     workspace: TaskWorkspace,
+    *,
+    execution_scope: Any | None = None,
 ) -> AbstractBaseTool:
     """Create command executor tool bound to workspace"""
-    return CommandExecutorTool(workspace)
+    return CommandExecutorTool.from_execution_scope(workspace, execution_scope)

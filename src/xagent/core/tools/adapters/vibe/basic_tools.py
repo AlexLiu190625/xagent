@@ -78,14 +78,10 @@ async def create_basic_tools(config: "BaseToolConfig") -> List[Any]:
     if workspace:
         from .command_executor import CommandExecutorToolForBasic
 
-        scope = config.get_execution_scope()
         tools.append(
-            CommandExecutorToolForBasic(
-                workspace=workspace,
-                restrict_paths=bool(
-                    scope is not None
-                    and getattr(scope, "restrict_command_paths", False)
-                ),
+            CommandExecutorToolForBasic.from_execution_scope(
+                workspace,
+                config.get_execution_scope(),
             )
         )
 

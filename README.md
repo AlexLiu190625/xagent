@@ -79,6 +79,22 @@ On first startup, Xagent redirects to `/setup` to create the first administrator
 docker compose exec backend python -m xagent.web.reset_admin_password --username <admin_username>
 ```
 
+### Command execution safety
+
+A workspace path and command working directory do not isolate a spawned shell
+from other paths mounted into the same container. Embedders can opt in to
+`ExecutionScope(restrict_command_paths=True)` for a cooperative, default-off
+guard over recognized shell file operations. The guard rejects paths outside
+the task workspace, treats configured external directories as read-only, and
+fails closed for supported syntax it cannot resolve, such as active globs and
+stdin-generated `xargs` arguments.
+
+This guard is defense in depth, not a sandbox boundary. Unrecognized commands
+receive no path inspection, and it does not constrain Python or JavaScript
+tools. Deployments that run mutually untrusted users must isolate their
+processes and mounts—for example with per-principal containers or mount
+namespaces that expose only that principal's subtree.
+
 ---
 
 ## One platform, three ways to use it

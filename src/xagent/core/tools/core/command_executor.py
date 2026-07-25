@@ -7,6 +7,7 @@ Execute shell commands and scripts with proper controls.
 import logging
 import os
 import re
+import shlex
 import subprocess
 import tempfile
 from pathlib import Path
@@ -25,6 +26,14 @@ TIMEOUT_EXIT_CODE = -999
 
 # Conventional shell exit code for a command found but not permitted to run.
 COMMAND_REJECTED_EXIT_CODE = 126
+
+
+def execution_scope_restricts_command_paths(execution_scope: Any | None) -> bool:
+    """Return the command policy bit owned by an execution scope."""
+    return bool(
+        execution_scope is not None
+        and getattr(execution_scope, "restrict_command_paths", False)
+    )
 
 
 def _command_rejected_result(reason: object) -> Dict[str, Any]:
@@ -160,6 +169,18 @@ class CommandExecutorCore:
         self.path_guard = path_guard
         self.timeout = 300  # 5 minutes default
 
+    @classmethod
+    def for_workspace(
+        cls,
+        workspace: Any,
+        *,
+        restrict_paths: bool = False,
+    ) -> "CommandExecutorCore":
+        """Build the canonical executor for a workspace-bound command tool."""
+        working_directory = str(workspace.resolve_path(""))
+        path_guard = WorkspaceCommandPathGuard(workspace) if restrict_paths else None
+        return cls(working_directory, path_guard=path_guard)
+
     def execute_command(
         self,
         command: str | list[str],
@@ -188,13 +209,13 @@ class CommandExecutorCore:
         timeout = _validate_timeout(timeout, self.timeout)
         _validate_working_directory(self.working_directory)
 
+        if shell and not isinstance(command, str):
+            return _command_rejected_result("shell=True requires a string command")
+
         if self.path_guard is not None:
             try:
                 if shell:
-                    if not isinstance(command, str):
-                        return _command_rejected_result(
-                            "shell=True requires a string command when path restrictions are enabled"
-                        )
+                    assert isinstance(command, str)
                     self.path_guard.validate(command)
                 else:
                     # The Vibe adapter currently sends shell strings, but argv
@@ -289,6 +310,25 @@ class CommandExecutorCore:
         """
         timeout = _validate_timeout(timeout, self.timeout)
 
+        if self.path_guard is not None:
+            interpreter_argv = shlex.split(interpreter)
+            if not interpreter_argv:
+                return _command_rejected_result("script interpreter is required")
+            if os.path.basename(interpreter_argv[0]) not in {
+                "bash",
+                "dash",
+                "sh",
+                "zsh",
+            }:
+                return _command_rejected_result(
+                    "restricted execute_script supports shell interpreters only"
+                )
+            return self.execute_command(
+                [*interpreter_argv, "-c", script_content],
+                timeout=timeout,
+                shell=False,
+            )
+
         try:
             logger.info(
                 f"CommandExecutor: Executing script with interpreter: {interpreter}"
@@ -328,6 +368,9 @@ def execute_command(
     command: str,
     working_directory: Optional[str] = None,
     timeout: Optional[int] = None,
+    *,
+    workspace: Any | None = None,
+    execution_scope: Any | None = None,
 ) -> Dict[str, Any]:
     """
     Execute a shell command.
@@ -340,7 +383,14 @@ def execute_command(
     Returns:
         Dictionary with execution result
     """
-    executor = CommandExecutorCore(working_directory)
+    executor = (
+        CommandExecutorCore.for_workspace(
+            workspace,
+            restrict_paths=execution_scope_restricts_command_paths(execution_scope),
+        )
+        if workspace is not None
+        else CommandExecutorCore(working_directory)
+    )
     return executor.execute_command(command, timeout=timeout)
 
 
@@ -349,6 +399,9 @@ def execute_script(
     interpreter: str = "bash",
     working_directory: Optional[str] = None,
     timeout: Optional[int] = None,
+    *,
+    workspace: Any | None = None,
+    execution_scope: Any | None = None,
 ) -> Dict[str, Any]:
     """
     Execute script content.
@@ -362,7 +415,14 @@ def execute_script(
     Returns:
         Dictionary with execution result
     """
-    executor = CommandExecutorCore(working_directory)
+    executor = (
+        CommandExecutorCore.for_workspace(
+            workspace,
+            restrict_paths=execution_scope_restricts_command_paths(execution_scope),
+        )
+        if workspace is not None
+        else CommandExecutorCore(working_directory)
+    )
     return executor.execute_script(script_content, interpreter, timeout)
 
 
@@ -407,9 +467,6 @@ def get_command_executor_tool(_info: Optional[dict[str, Any]] = None) -> Any:
             # Search for a pattern in files
             command_executor("grep -r 'pattern' /path/to/dir")
 
-            # Run a shell script
-            command_executor("./deploy.sh")
-
             # Use pipes to chain commands
             command_executor("cat data.csv | grep error | wc -l")
 
@@ -419,17 +476,16 @@ def get_command_executor_tool(_info: Optional[dict[str, Any]] = None) -> Any:
             # Run Python script
             command_executor("python script.py --arg value")
         """
-        # Get working directory from info if provided
-        working_dir = None
-        if _info and "workspace" in _info:
-            workspace = _info["workspace"]
-            # Use resolve_path method for consistency with adapter
-            if hasattr(workspace, "resolve_path"):
-                working_dir = str(workspace.resolve_path(""))
-            elif hasattr(workspace, "path"):
-                working_dir = workspace.path
-
-        executor = CommandExecutorCore(working_dir)
+        workspace = _info.get("workspace") if _info else None
+        execution_scope = _info.get("execution_scope") if _info else None
+        if workspace is not None and hasattr(workspace, "resolve_path"):
+            executor = CommandExecutorCore.for_workspace(
+                workspace,
+                restrict_paths=execution_scope_restricts_command_paths(execution_scope),
+            )
+        else:
+            working_dir = getattr(workspace, "path", None)
+            executor = CommandExecutorCore(working_dir)
         return executor.execute_command(command, timeout=timeout)
 
     return command_executor
