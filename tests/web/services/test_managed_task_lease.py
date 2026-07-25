@@ -7,9 +7,9 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
-from xagent.web.models.database import Base, get_db, get_engine, init_db
-from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.agent import Agent
+from xagent.web.models.chat_message import TaskChatMessage
+from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
 from xagent.web.models.workforce import Workforce, WorkforceRun

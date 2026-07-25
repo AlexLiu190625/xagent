@@ -10,8 +10,8 @@ documented behavior.
 
 import pytest
 
-from xagent.core.file_storage import normalize_storage_key
 from xagent.core.file_storage import keys as storage_keys
+from xagent.core.file_storage import normalize_storage_key
 from xagent.core.file_storage.keys import (
     build_task_output_storage_key,
     build_upload_storage_key,

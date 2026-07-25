@@ -42,11 +42,11 @@ from ..models.database import get_db, release_db_connection_if_clean
 from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
-from ..services.kb_file_service import aggregate_uploaded_file_statuses
 from ..services.db_runtime import (
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
+from ..services.kb_file_service import aggregate_uploaded_file_statuses
 from ..services.managed_file_ref import (
     FILE_INTEGRITY_REUPLOAD_MESSAGE,
     DurableObjectIntegrityError,
@@ -57,8 +57,8 @@ from ..services.managed_file_ref import (
 )
 from ..services.uploaded_file_store import (
     LocalUploadRegistration,
-    UploadedFileVersionConflict,
     UploadedFileStore,
+    UploadedFileVersionConflict,
     compensate_registered_uploads_sync,
     delete_legacy_preview_caches,
     delete_registered_preview_caches,

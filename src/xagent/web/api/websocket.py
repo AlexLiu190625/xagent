@@ -148,16 +148,16 @@ from ..services.task_lease_service import (
     acquire_task_lease_no_commit,
     bind_task_lease_context,
     release_task_lease_no_commit,
-    run_while_task_lease_owned,
     run_task_lease_heartbeat,
+    run_while_task_lease_owned,
     stop_task_lease_heartbeat,
 )
 from ..services.uploaded_file_store import (
     StagedUploadedFile,
     SupersededObjectCleanupClaim,
+    UploadedFileStore,
     UploadedFileVersionConflict,
     UploadedFileVersionSnapshot,
-    UploadedFileStore,
     cleanup_superseded_uploaded_file_objects,
     compensate_staged_uploaded_files,
     snapshot_uploaded_file_version,

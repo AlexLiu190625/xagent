@@ -81,8 +81,8 @@ from .task_lease_service import (
     fail_and_release_task_lease_no_commit,
     get_runner_id,
     release_task_lease,
-    run_while_task_lease_owned,
     run_task_lease_heartbeat,
+    run_while_task_lease_owned,
     stop_task_lease_heartbeat,
     validate_preacquired_task_lease_isolated,
 )
@@ -1340,8 +1340,8 @@ def _schedule_bg(
         background_task_manager,
         create_terminal_task_error_event,
         execute_task_background,
-        manager as websocket_manager,
     )
+    from ..api.websocket import manager as websocket_manager
 
     async def _runner() -> None:
         lease: TaskLease | None = task_lease

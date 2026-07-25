@@ -30,7 +30,6 @@ from .conftest import (
     _install_one_slot_queue_pool,
 )
 
-
 pytestmark = pytest.mark.usefixtures("_test_db")
 
 

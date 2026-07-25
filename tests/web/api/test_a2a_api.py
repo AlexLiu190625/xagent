@@ -17,9 +17,9 @@ from xagent.web.models.database import Base
 from xagent.web.models.task import Task, TaskStatus, TraceEvent
 from xagent.web.models.task_command import TaskExecutionCommand
 from xagent.web.services.a2a_protocol import (
+    A2A_MAX_MESSAGE_TEXT_LENGTH,
     A2AApiError,
     A2ATaskSnapshot,
-    A2A_MAX_MESSAGE_TEXT_LENGTH,
 )
 from xagent.web.services.task_command_transport import (
     COMMAND_FAILED,

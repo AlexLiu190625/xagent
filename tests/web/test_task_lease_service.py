@@ -30,8 +30,8 @@ from xagent.web.services.task_lease_service import (
     get_expired_task_lease_candidates,
     refresh_task_lease,
     release_task_lease,
-    run_while_task_lease_owned,
     run_task_lease_heartbeat,
+    run_while_task_lease_owned,
     stop_task_lease_heartbeat,
     utc_now,
 )

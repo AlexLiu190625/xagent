@@ -28,8 +28,8 @@ from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
-from ..services.deployments import get_deployment
 from ..services.db_runtime import run_db_io_cancellation_safe
+from ..services.deployments import get_deployment
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
