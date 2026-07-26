@@ -204,3 +204,44 @@ jobs:
           pytest tests/web/services/test_gmail_provisioning.py -k contend -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+  migrations-summary:
+    name: Migrations Summary
+    runs-on: ubuntu-latest
+    # always() is what makes this fail-closed. Without it a failure in
+    # detect-migration-changes would skip this job too, and a *skipped* required
+    # check is reported to branch protection as a success -- so the merge would
+    # go through with neither migration job having run. The individual job names
+    # cannot be required contexts for the same reason; this one can, because it
+    # always runs and turns every non-success into an explicit failure.
+    if: always()
+    needs:
+      - detect-migration-changes
+      - test-sqlite-migrations
+      - test-postgresql-migrations
+
+    steps:
+      - name: Check required jobs
+        shell: bash
+        env:
+          DETECT_RESULT: ${{ needs.detect-migration-changes.result }}
+          SQLITE_RESULT: ${{ needs.test-sqlite-migrations.result }}
+          POSTGRESQL_RESULT: ${{ needs.test-postgresql-migrations.result }}
+        run: |
+          set -uo pipefail
+
+          failed=0
+          check_job() {
+            local name="$1"
+            local result="$2"
+            if [ "$result" != "success" ]; then
+              echo "::error::$name finished with result: $result"
+              failed=1
+            fi
+          }
+
+          check_job "detect-migration-changes" "$DETECT_RESULT"
+          check_job "test-sqlite-migrations" "$SQLITE_RESULT"
+          check_job "test-postgresql-migrations" "$POSTGRESQL_RESULT"
+
+          exit "$failed"
