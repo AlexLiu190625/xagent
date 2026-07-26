@@ -18,6 +18,7 @@ from xagent.core.execution_scope import (
     get_execution_scope,
     reset_execution_scope,
     resolve_execution_scope,
+    scope_fingerprint,
     set_execution_scope,
     set_execution_scope_resolver,
     turn_execution_scope,
@@ -75,6 +76,7 @@ class TestExecutionScope:
         assert dict(scope.memory_dimensions) == {}
         assert scope.strict_memory_isolation is False
         assert scope.isolate_external_dirs is False
+        assert scope.restrict_command_paths is False
 
     def test_frozen(self):
         scope = ExecutionScope()
@@ -131,10 +133,22 @@ class TestExecutionScope:
 
     def test_boolean_flags_independent_of_other_fields(self):
         """Flags are consumable with an otherwise-empty scope (independent fields)."""
-        scope = ExecutionScope(strict_memory_isolation=True)
+        scope = ExecutionScope(
+            strict_memory_isolation=True,
+            restrict_command_paths=True,
+        )
         assert scope.strict_memory_isolation is True
+        assert scope.restrict_command_paths is True
         assert scope.sandbox_key_suffix is None
         assert scope.workspace_segments == ()
+
+    def test_command_path_flag_round_trips_and_changes_fingerprint(self):
+        guarded = ExecutionScope(restrict_command_paths=True)
+        restored = ExecutionScope.from_dict(guarded.to_dict())
+
+        assert restored == guarded
+        assert guarded.to_dict()["restrict_command_paths"] is True
+        assert scope_fingerprint(guarded) != scope_fingerprint(ExecutionScope())
 
 
 class TestSandboxMountSegments:

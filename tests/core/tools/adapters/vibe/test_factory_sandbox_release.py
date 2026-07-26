@@ -6,7 +6,11 @@ sandbox workspace setup because override/allowlist reads may reopen it.
 
 import pytest
 
+from xagent.core.tools.adapters.vibe.command_executor import (
+    CommandExecutorToolForBasic,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
+from xagent.core.workspace import TaskWorkspace
 
 
 class _FakeSandbox:
@@ -150,3 +154,32 @@ async def test_release_db_before_sandbox_workspace_setup(monkeypatch):
     assert calls.index("release_db") > calls.index("load_overrides")
     assert calls.index("release_db") > calls.index("load_allowlist")
     assert calls.index("release_db") < calls.index("sandbox_exec")
+
+
+@pytest.mark.asyncio
+async def test_sandbox_wrap_failure_keeps_command_path_guard(monkeypatch, tmp_path):
+    workspace = TaskWorkspace("task", str(tmp_path / "alice"))
+    sibling = tmp_path / "bob" / "secret.txt"
+    sibling.parent.mkdir()
+    sibling.write_text("secret", encoding="utf-8")
+    tool = CommandExecutorToolForBasic(workspace=workspace, restrict_paths=True)
+
+    from xagent.core.tools.adapters.vibe.sandboxed_tool import (
+        sandboxed_tool_wrapper,
+    )
+
+    async def fail_to_wrap(*args, **kwargs):
+        raise RuntimeError("sandbox wrapper unavailable")
+
+    monkeypatch.setattr(
+        sandboxed_tool_wrapper,
+        "create_sandboxed_tool",
+        fail_to_wrap,
+    )
+
+    wrapped = await ToolFactory._wrap_sandbox_tools([tool], _FakeSandbox())
+    result = wrapped[0].run_json_sync({"command": f"cat {sibling}"})
+
+    assert wrapped == [tool]
+    assert result["success"] is False
+    assert result["return_code"] == 126
