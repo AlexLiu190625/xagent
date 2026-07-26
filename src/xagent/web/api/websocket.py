@@ -2654,8 +2654,23 @@ async def execute_task_background(
                 )
             except Exception as broadcast_error:
                 logger.error(f"Failed to send error notification: {broadcast_error}")
-    except asyncio.CancelledError:
-        logger.info(f"Background task {task_id} cancelled")
+    except asyncio.CancelledError as cancellation:
+        deferred_error = cancellation.__cause__
+        if deferred_error is not None and not isinstance(
+            deferred_error, asyncio.CancelledError
+        ):
+            logger.warning(
+                "Background task %s cancelled after deferred work failed: %s",
+                task_id,
+                deferred_error,
+                exc_info=(
+                    type(deferred_error),
+                    deferred_error,
+                    deferred_error.__traceback__,
+                ),
+            )
+        else:
+            logger.info("Background task %s cancelled", task_id)
         raise
     finally:
         # Clean up background task record

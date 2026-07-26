@@ -65,13 +65,18 @@ def propagate_deferred_cancellation(
 
     Resource owners may need to finish durable work and best-effort follow-up
     after :func:`await_task_settlement` records cancellation. Once that work
-    starts, neither an early return nor a later exception may silently replace
-    the caller's cancellation.
+    starts, neither an early return nor a later operational exception may
+    silently replace the caller's cancellation. Process-control exceptions
+    such as ``SystemExit`` and ``KeyboardInterrupt`` still propagate unchanged.
     """
 
     try:
         yield
-    except BaseException as error:
+    except asyncio.CancelledError as error:
+        if cancellation is not None:
+            raise cancellation from error
+        raise
+    except Exception as error:
         if cancellation is not None:
             raise cancellation from error
         raise

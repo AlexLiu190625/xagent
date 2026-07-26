@@ -12,6 +12,7 @@ from xagent.web.services.db_runtime import (
     await_task_settlement,
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
+    propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
 
@@ -20,6 +21,77 @@ async def _wait_for_thread_event(event: threading.Event) -> None:
     async with asyncio.timeout(1):
         while not event.is_set():
             await asyncio.sleep(0.001)
+
+
+def test_propagate_deferred_cancellation_without_capture_preserves_flow() -> None:
+    with propagate_deferred_cancellation(None):
+        pass
+
+
+def test_propagate_deferred_cancellation_without_capture_preserves_error() -> None:
+    late_error = RuntimeError("late durable work failed")
+
+    with pytest.raises(RuntimeError) as exc_info:
+        with propagate_deferred_cancellation(None):
+            raise late_error
+
+    assert exc_info.value is late_error
+
+
+def test_propagate_deferred_cancellation_restores_capture_on_normal_exit() -> None:
+    cancellation = asyncio.CancelledError("caller cancelled")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            pass
+
+    assert exc_info.value is cancellation
+
+
+def test_propagate_deferred_cancellation_preserves_late_error_as_cause() -> None:
+    cancellation = asyncio.CancelledError("caller cancelled")
+    late_error = RuntimeError("late durable work failed")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            raise late_error
+
+    assert exc_info.value is cancellation
+    assert exc_info.value.__cause__ is late_error
+
+
+def test_propagate_deferred_cancellation_preserves_later_cancellation_as_cause() -> (
+    None
+):
+    cancellation = asyncio.CancelledError("caller cancelled")
+    later_cancellation = asyncio.CancelledError("cancelled again")
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            raise later_cancellation
+
+    assert exc_info.value is cancellation
+    assert exc_info.value.__cause__ is later_cancellation
+
+
+@pytest.mark.parametrize(
+    "process_control_error",
+    [
+        SystemExit("shutdown"),
+        KeyboardInterrupt("interrupt"),
+        GeneratorExit("generator closed"),
+    ],
+)
+def test_propagate_deferred_cancellation_does_not_mask_process_control_error(
+    process_control_error: BaseException,
+) -> None:
+    cancellation = asyncio.CancelledError("caller cancelled")
+
+    with pytest.raises(type(process_control_error)) as exc_info:
+        with propagate_deferred_cancellation(cancellation):
+            raise process_control_error
+
+    assert exc_info.value is process_control_error
 
 
 @pytest.mark.asyncio

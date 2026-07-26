@@ -20,6 +20,7 @@ What this test pins:
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 from collections import Counter
 from time import monotonic
@@ -328,7 +329,9 @@ async def test_cancellation_during_finalization_broadcasts_committed_result(
 @pytest.mark.parametrize("with_task_lease", [False, True])
 async def test_cancellation_after_uncommitted_finalization_always_propagates(
     with_task_lease: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    caplog.set_level(logging.WARNING, logger="xagent.web.api.websocket")
     snapshot = _make_snapshot()
     agent_service = _build_fake_agent_service()
     agent_manager = MagicMock(
@@ -410,6 +413,9 @@ async def test_cancellation_after_uncommitted_finalization_always_propagates(
 
     assert exc_info.value.__cause__ is broadcast_error
     broadcast.assert_awaited_once()
+    assert (
+        "Background task 42 cancelled after deferred work failed: client disconnected"
+    ) in caplog.text
 
 
 @pytest.mark.asyncio

@@ -29,6 +29,7 @@ from ..models.task_command import TaskExecutionCommand
 from .db_runtime import (
     await_task_settlement,
     is_database_pool_timeout,
+    propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
 from .task_lease_service import get_runner_id
@@ -871,30 +872,27 @@ async def dispatch_one_task_command(
             heartbeat
         )
 
-    if heartbeat_outcome.requires_ttl_recovery:
-        logger.error(
-            "task_id=%s component=task-command-heartbeat claim is unresolved; "
-            "retaining command claim for expiry (command_id=%s, kind=%s, "
-            "attempt=%s, claim_lost=%s, pool_timeout=%s)",
-            command.task_id,
-            command.command_id,
-            command.kind.value,
-            command.attempt_count,
-            heartbeat_outcome.claim_lost,
-            heartbeat_outcome.pool_timeout,
-        )
-        if heartbeat_cancellation is not None:
-            raise heartbeat_cancellation
+    with propagate_deferred_cancellation(heartbeat_cancellation):
+        if heartbeat_outcome.requires_ttl_recovery:
+            logger.error(
+                "task_id=%s component=task-command-heartbeat claim is unresolved; "
+                "retaining command claim for expiry (command_id=%s, kind=%s, "
+                "attempt=%s, claim_lost=%s, pool_timeout=%s)",
+                command.task_id,
+                command.command_id,
+                command.kind.value,
+                command.attempt_count,
+                heartbeat_outcome.claim_lost,
+                heartbeat_outcome.pool_timeout,
+            )
+            return True
+        if disposition_name is not None and disposition_operation is not None:
+            await _persist_task_command_disposition(
+                command,
+                disposition=disposition_name,
+                operation=disposition_operation,
+            )
         return True
-    if disposition_name is not None and disposition_operation is not None:
-        await _persist_task_command_disposition(
-            command,
-            disposition=disposition_name,
-            operation=disposition_operation,
-        )
-    if heartbeat_cancellation is not None:
-        raise heartbeat_cancellation
-    return True
 
 
 async def dispatch_task_command_promptly(

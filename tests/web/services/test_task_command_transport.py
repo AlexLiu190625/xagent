@@ -1501,6 +1501,70 @@ async def test_dispatch_cancellation_during_heartbeat_persists_completion(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_cancellation_during_heartbeat_preserves_late_write_error(
+    db_session,
+    monkeypatch,
+) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="cancel-before-command-write-error",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    heartbeat_stopping = asyncio.Event()
+    allow_heartbeat_to_finish = asyncio.Event()
+    persistence_error = RuntimeError("disposition write failed")
+
+    async def delayed_heartbeat(
+        _command_db_id: int,
+        _runner_id: str,
+        _attempt_count: int,
+        stop_event: asyncio.Event,
+    ):
+        await stop_event.wait()
+        heartbeat_stopping.set()
+        await allow_heartbeat_to_finish.wait()
+        return task_command_transport_module.TaskCommandClaimHeartbeatOutcome()
+
+    def failing_finish(*_args, **_kwargs) -> bool:
+        raise persistence_error
+
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "_claim_heartbeat",
+        delayed_heartbeat,
+    )
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "finish_task_command",
+        failing_finish,
+    )
+
+    dispatch = asyncio.create_task(
+        dispatch_one_task_command(
+            lambda _command: asyncio.sleep(0, result={"ok": True}),
+            command_db_id=enqueued.command_id,
+        )
+    )
+    await heartbeat_stopping.wait()
+    dispatch.cancel()
+    await asyncio.sleep(0)
+    assert not dispatch.done()
+
+    allow_heartbeat_to_finish.set()
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await dispatch
+
+    assert exc_info.value.__cause__ is persistence_error
+
+
+@pytest.mark.asyncio
 async def test_claim_heartbeat_cancellation_drains_inflight_renewal(
     monkeypatch,
 ) -> None:
