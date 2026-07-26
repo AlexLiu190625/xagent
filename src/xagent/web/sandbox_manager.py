@@ -5,6 +5,7 @@ Sandbox management in application layer.
 import asyncio
 import logging
 import os
+import posixpath
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -14,7 +15,9 @@ from pathlib import Path
 from typing import Optional
 
 from ..config import (
+    SANDBOX_VOLUMES,
     get_boxlite_home_dir,
+    get_external_upload_dirs,
     get_sandbox_cpus,
     get_sandbox_env,
     get_sandbox_host_storage_root,
@@ -1934,6 +1937,103 @@ class SandboxManager:
             logger.info("Sandbox cleanup completed")
         except Exception as e:
             logger.error(f"Failed to cleanup sandboxes: {e}")
+
+
+def _check_no_conflicting_readiness_volumes(
+    volumes: list[tuple[str, str, str]],
+) -> None:
+    """Reject readiness volumes that disagree at a shared host or guest path.
+
+    Two directions, both against the same normalized triple set:
+
+    - host conflict: two entries share a host path but disagree on guest
+      path or mode (the backend indexes bind mounts by host path and would
+      silently drop one of them).
+    - guest conflict ("guest crash"): two entries share a guest path but
+      disagree on host source (whichever bind wins container-creation
+      ordering silently shadows the other).
+
+    An exactly identical triple repeated across sources (e.g. the same
+    directory named twice) collapses onto itself in both directions and is
+    legal.
+    """
+    seen_by_host: dict[str, tuple[str, str]] = {}
+    seen_by_guest: dict[str, tuple[str, str]] = {}
+    for host_path, guest_path, mode in volumes:
+        norm_host = posixpath.normpath(host_path)
+        norm_guest = posixpath.normpath(guest_path)
+
+        host_key = (norm_guest, mode)
+        prior_for_host = seen_by_host.get(norm_host)
+        if prior_for_host is not None and prior_for_host != host_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting sandbox volume mounts for host path "
+                f"{norm_host!r}: {prior_for_host} vs {host_key}"
+            )
+        seen_by_host[norm_host] = host_key
+
+        guest_key = (norm_host, mode)
+        prior_for_guest = seen_by_guest.get(norm_guest)
+        if prior_for_guest is not None and prior_for_guest != guest_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting sandbox volume mounts for guest path "
+                f"{norm_guest!r}: {prior_for_guest} vs {guest_key}"
+            )
+        seen_by_guest[norm_guest] = guest_key
+
+
+async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
+    """Validate static sandbox mount configuration before serving traffic.
+
+    Called once at app startup, before ``cleanup()``/``warmup()``: a
+    misconfigured deployment fails to start instead of only surfacing as a
+    per-task ``SandboxRuntimeConflictError`` once real workloads land. Also
+    resolves and caches ``sandbox_mgr``'s backend-capability probe as a side
+    effect (via ``_resolve_backend_probe()``), so the cleanup step that runs
+    right after reads the cached value instead of resolving it again.
+
+    Only meaningful for backends that support spec reconciliation (Docker
+    today): the legacy Boxlite route never reconciles a desired spec against
+    a live container, so there is nothing here for it to protect. Skipped
+    entirely when neither ``SANDBOX_VOLUMES`` nor
+    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured — code mounts alone never
+    conflict with themselves.
+
+    Domain discipline: ``SANDBOX_VOLUMES`` (via ``get_sandbox_volumes``,
+    using the same ``host_side_sources`` flag the runtime build path uses)
+    and code mounts (``build_code_mount_volumes``) are already host-domain
+    triples and are compared as-is. External upload dirs are backend-domain
+    paths: they are folded (normalized + deduplicated, the same backend-
+    domain normalization ``SandboxMountIntent`` itself applies) before being
+    converted to host domain through the same ``SandboxPathMapper`` the
+    runtime mount-building path uses. Conflict detection itself always runs
+    in the post-mapper host domain, over the combined triple set from all
+    three sources.
+
+    Raises:
+        SandboxRuntimeConflictError: Two configured mounts disagree at a
+            shared host or guest path.
+    """
+    if not await sandbox_mgr._resolve_backend_probe():
+        return
+
+    external_dirs = get_external_upload_dirs()
+    if not os.getenv(SANDBOX_VOLUMES, "").strip() and not external_dirs:
+        return
+
+    path_mapper = SandboxPathMapper.from_env()
+    volumes = list(
+        get_sandbox_volumes(host_side_sources=path_mapper.uses_host_storage_root)
+    )
+    volumes.extend(build_code_mount_volumes())
+
+    folded_external = SandboxMountIntent(
+        extra_mounts=tuple(str(d) for d in external_dirs)
+    ).extra_mounts
+    for backend_dir in folded_external:
+        volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
+
+    _check_no_conflicting_readiness_volumes(volumes)
 
 
 # Global sandbox manager instance
