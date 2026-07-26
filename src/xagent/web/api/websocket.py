@@ -2363,9 +2363,6 @@ async def execute_task_background(
     )
     from ..services.task_setup_snapshot import load_task_setup_snapshot_sync
 
-    # Wait for previous background task to complete
-    await background_task_manager.wait_for_previous(task_id)
-
     terminal_state_committed = False
     finalization_cancellation: asyncio.CancelledError | None = None
     try:
