@@ -7733,7 +7733,6 @@ dependencies = [
     { name = "anthropic" },
     { name = "asyncssh" },
     { name = "authlib" },
-    { name = "bashlex" },
     { name = "bcrypt" },
     { name = "beartype" },
     { name = "beautifulsoup4" },
@@ -7799,6 +7798,7 @@ ai-document = [
     { name = "docling" },
 ]
 all = [
+    { name = "bashlex" },
     { name = "chromadb" },
     { name = "curl-cffi" },
     { name = "docling" },
@@ -7821,6 +7821,9 @@ browser = [
 ]
 chromadb = [
     { name = "chromadb" },
+]
+command-path-guard = [
+    { name = "bashlex" },
 ]
 document-processing = [
     { name = "numba" },
@@ -7879,6 +7882,7 @@ backend-image = [
 ]
 dev = [
     { name = "asyncssh" },
+    { name = "bashlex" },
     { name = "chromadb" },
     { name = "copilotkit" },
     { name = "flake8" },
@@ -7912,6 +7916,7 @@ static-type-check = [
 ]
 test = [
     { name = "asyncssh" },
+    { name = "bashlex" },
     { name = "chromadb" },
     { name = "copilotkit" },
     { name = "langgraph-prebuilt" },
@@ -7937,7 +7942,8 @@ requires-dist = [
     { name = "anthropic", specifier = ">=0.84.0" },
     { name = "asyncssh", specifier = ">=2.14.0" },
     { name = "authlib", specifier = ">=1.7.2" },
-    { name = "bashlex", specifier = ">=0.18" },
+    { name = "bashlex", marker = "extra == 'all'", specifier = ">=0.18" },
+    { name = "bashlex", marker = "extra == 'command-path-guard'", specifier = ">=0.18" },
     { name = "bcrypt", specifier = ">=4.0.0" },
     { name = "beartype", specifier = ">=0.18.5" },
     { name = "beautifulsoup4", specifier = ">=4.12.3" },
@@ -8035,7 +8041,7 @@ requires-dist = [
     { name = "xrouter-llm", marker = "extra == 'router'", specifier = ">=0.1.2" },
     { name = "zai-sdk", specifier = ">=0.0.3.2" },
 ]
-provides-extras = ["ai-document", "all", "browser", "chromadb", "document-processing", "duckdb", "milvus", "postgresql", "router", "waf-crawl"]
+provides-extras = ["ai-document", "all", "browser", "chromadb", "command-path-guard", "document-processing", "duckdb", "milvus", "postgresql", "router", "waf-crawl"]
 
 [package.metadata.requires-dev]
 backend-image = [
@@ -8060,6 +8066,7 @@ backend-image = [
 ]
 dev = [
     { name = "asyncssh", specifier = ">=2.14.0" },
+    { name = "bashlex", specifier = ">=0.18" },
     { name = "chromadb" },
     { name = "copilotkit", specifier = "==0.1.69" },
     { name = "flake8", specifier = ">=7.3.0" },
@@ -8093,6 +8100,7 @@ static-type-check = [
 ]
 test = [
     { name = "asyncssh", specifier = ">=2.14.0" },
+    { name = "bashlex", specifier = ">=0.18" },
     { name = "chromadb" },
     { name = "copilotkit", specifier = "==0.1.69" },
     { name = "langgraph-prebuilt", specifier = "<1.0.9" },

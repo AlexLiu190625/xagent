@@ -13,6 +13,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from xagent.core.execution_scope import (
+    ExecutionScope,
+    reset_execution_scope,
+    set_execution_scope,
+)
 from xagent.web.api.agents import AgentPreviewRequest, preview_agent
 from xagent.web.models.user import User
 
@@ -113,3 +118,15 @@ async def test_preview_omitted_categories_keep_builtins_but_not_custom_apis():
     assert spec.includes_custom_api() is False
     # Legacy ALL mode does not pay MCP server init on the preview path.
     assert tool_config._include_mcp_tools is False
+
+
+@pytest.mark.asyncio
+async def test_preview_config_captures_active_execution_scope():
+    scope = ExecutionScope(restrict_command_paths=True)
+    token = set_execution_scope(scope)
+    try:
+        tool_config = await _run_preview(["basic"])
+    finally:
+        reset_execution_scope(token)
+
+    assert tool_config.get_execution_scope() is scope

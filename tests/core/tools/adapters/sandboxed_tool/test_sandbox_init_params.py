@@ -156,6 +156,17 @@ class TestExtractInitParams:
         wrapper = SandboxedToolWrapper(tool, _make_sandbox())
         assert "bashlex>=0.18" in wrapper._requirements
 
+    def test_unrestricted_command_tool_does_not_install_policy_parser(self, tmp_path):
+        workspace = TaskWorkspace(id="test-command", base_dir=str(tmp_path))
+        tool = CommandExecutorToolForBasic(
+            workspace=workspace,
+            restrict_paths=False,
+        )
+
+        wrapper = SandboxedToolWrapper(tool, _make_sandbox())
+
+        assert "bashlex>=0.18" not in wrapper._requirements
+
 
 class TestSerializeInitParams:
     """Tests for _serialize_init_params()."""

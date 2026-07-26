@@ -5,7 +5,7 @@ Framework wrapper around the pure command executor tool
 
 import asyncio
 import logging
-from typing import Any, Dict, Mapping, Optional, Type
+from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
@@ -15,16 +15,13 @@ from ...core.command_executor import (
     execution_scope_restricts_command_paths,
 )
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
-from .function import FunctionTool
-from .sandboxed_tool.sandbox_config import sandbox_config
+from .sandboxed_tool.sandbox_config import (
+    SandboxConfig,
+    sandbox_config,
+    set_instance_sandbox_config,
+)
 
 logger = logging.getLogger(__name__)
-
-
-class CommandExecutorFunctionTool(FunctionTool):
-    """Command executor tool with BASIC category."""
-
-    category = ToolCategory.BASIC
 
 
 class CommandExecutorArgs(BaseModel):
@@ -91,6 +88,8 @@ class CommandExecutorTool(AbstractBaseTool):
                 "workspace; external allowed directories are read-only. This is "
                 "a cooperative, best-effort check, not an operating-system "
                 "security boundary; unknown commands are not classified. "
+                "Restricted commands use Bash syntax; sh, dash, and zsh "
+                "subprocess dialects are rejected. "
                 "Runtime-generated file arguments (for example xargs), active "
                 "globs, implicit shell initialization, unsupported control "
                 "structures such as unparsable for/case forms, and scripts "
@@ -161,57 +160,25 @@ class CommandExecutorTool(AbstractBaseTool):
         return None
 
 
-@sandbox_config(packages=("bashlex>=0.18",))
+@sandbox_config()
 class CommandExecutorToolForBasic(CommandExecutorTool):
     """Command executor tool with BASIC category."""
 
     category = ToolCategory.BASIC
 
+    def __init__(
+        self,
+        workspace: Optional[TaskWorkspace] = None,
+        restrict_paths: bool = False,
+    ) -> None:
+        super().__init__(workspace=workspace, restrict_paths=restrict_paths)
+        set_instance_sandbox_config(
+            self,
+            SandboxConfig(
+                packages=("bashlex>=0.18",) if restrict_paths else (),
+            ),
+        )
+
     @property
     def name(self) -> str:
         return "execute_command"
-
-
-def get_command_executor_tool(info: Optional[dict[str, Any]] = None) -> FunctionTool:
-    """
-    Create a workspace-bound command executor tool.
-
-    Args:
-        info: Dictionary containing workspace information
-
-    Returns:
-        A command executor tool bound to the specified workspace
-    """
-    # Extract workspace from info if provided
-    workspace = None
-    if info and "workspace" in info:
-        workspace = info["workspace"]
-
-    # Create workspace-bound command executor
-    executor = (
-        CommandExecutorTool.from_execution_scope(
-            workspace,
-            info.get("execution_scope") if info else None,
-        )
-        if workspace is not None
-        else CommandExecutorTool()
-    )
-
-    # Wrap as LangChain tool
-    def execute_command(command: str, timeout: Optional[int] = None) -> Dict[str, Any]:
-        """Execute shell command."""
-        result: Dict[str, Any] = executor.run_json_sync(
-            {"command": command, "timeout": timeout}
-        )
-        return result
-
-    return CommandExecutorFunctionTool(execute_command)
-
-
-def create_command_executor_tool(
-    workspace: TaskWorkspace,
-    *,
-    execution_scope: Any | None = None,
-) -> AbstractBaseTool:
-    """Create command executor tool bound to workspace"""
-    return CommandExecutorTool.from_execution_scope(workspace, execution_scope)

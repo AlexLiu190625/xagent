@@ -87,13 +87,18 @@ from other paths mounted into the same container. Embedders can opt in to
 guard over recognized shell file operations. The guard rejects paths outside
 the task workspace, treats configured external directories as read-only, and
 fails closed for supported syntax it cannot resolve, such as active globs and
-stdin-generated `xargs` arguments.
+stdin-generated `xargs` arguments. Host-side embedders that enable this policy
+should install the `command-path-guard` package extra; restricted sandbox tools
+install the parser dependency only for those tool instances.
 
 This guard is defense in depth, not a sandbox boundary. Unrecognized commands
-receive no path inspection, and it does not constrain Python or JavaScript
-tools. Deployments that run mutually untrusted users must isolate their
-processes and mounts—for example with per-principal containers or mount
-namespaces that expose only that principal's subtree.
+receive no path inspection, and it does not constrain Python, JavaScript, MCP
+stdio subprocesses, or SSH command execution. Restricted shell commands are
+parsed and executed with Bash; alternate shell dialects are rejected rather
+than interpreted with mismatched semantics. Deployments that run mutually
+untrusted users must isolate their processes and mounts—for example with
+per-principal containers or mount namespaces that expose only that principal's
+subtree.
 
 ---
 

@@ -291,6 +291,20 @@ def test_resolve_authorized_path_can_exclude_external_write_roots(tmp_path):
         )
 
 
+def test_resolve_authorized_path_rejects_symlink_escape(workspace, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    link = workspace.output_dir / "outside-link"
+    link.symlink_to(outside)
+
+    with pytest.raises(ValueError):
+        workspace.resolve_authorized_path(
+            link,
+            base_dir=workspace.output_dir,
+            include_external_dirs=False,
+        )
+
+
 @pytest.mark.parametrize("error_type", [OSError, RuntimeError])
 def test_resolve_authorized_path_normalizes_resolution_failures(
     workspace, monkeypatch, error_type

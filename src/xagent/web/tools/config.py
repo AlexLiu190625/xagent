@@ -59,6 +59,7 @@ from ..services.tool_credentials import (
 
 logger = logging.getLogger(__name__)
 
+_CAPTURE_ACTIVE_EXECUTION_SCOPE = object()
 
 OAUTH_TOKEN_EXPIRY_SKEW = timedelta(minutes=5)
 OAUTH_TOKEN_GENERATION_MAX_LENGTH = 1024
@@ -1008,7 +1009,7 @@ class WebToolConfig(BaseToolConfig):
         sandbox: Optional[Any] = None,
         tool_selection_spec: Optional[Any] = None,
         mcp_auth_context: Optional[Dict[str, Any]] = None,
-        execution_scope: Optional[Any] = None,
+        execution_scope: Any = _CAPTURE_ACTIVE_EXECUTION_SCOPE,
         connector_runtime_turn_id: Optional[str] = None,
         mcp_failure_policy: MCPFailurePolicy = MCPFailurePolicy.BEST_EFFORT,
         mcp_load_summary_tracer: Optional[Any] = None,
@@ -1061,6 +1062,13 @@ class WebToolConfig(BaseToolConfig):
                 raw_auth_context if isinstance(raw_auth_context, dict) else None
             )
         self._workspace_config = workspace_config
+        if execution_scope is _CAPTURE_ACTIVE_EXECUTION_SCOPE:
+            # Capture at the config construction boundary so preview and other
+            # in-turn builders cannot silently drop the active task policy.
+            # Explicit None remains available for display-only configurations.
+            from ...core.execution_scope import get_execution_scope
+
+            execution_scope = get_execution_scope()
         # ExecutionScope (typed as Any to avoid importing core into every
         # config consumer) the tool set is built under. Nested agent tools
         # snapshot it at construction so delegated executions re-activate

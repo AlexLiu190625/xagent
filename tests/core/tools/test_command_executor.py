@@ -14,7 +14,6 @@ from xagent.core.tools.adapters.vibe.command_executor import (
     CommandExecutorResult,
     CommandExecutorTool,
     CommandExecutorToolForBasic,
-    create_command_executor_tool,
 )
 from xagent.core.tools.core.command_executor import (
     CommandExecutorCore,
@@ -150,22 +149,6 @@ class TestCommandExecutorTool:
 
         result = tool.run_json_sync({"command": f"cat {shlex.quote(str(sibling))}"})
 
-        assert result["return_code"] == 126
-        assert "secret" not in result["output"]
-
-    def test_public_factory_uses_execution_scope_policy(self, tmp_path):
-        from xagent.core.execution_scope import ExecutionScope
-
-        workspace = TaskWorkspace("task", str(tmp_path))
-        tool = create_command_executor_tool(
-            workspace,
-            execution_scope=ExecutionScope(restrict_command_paths=True),
-        )
-        sibling = tmp_path.parent / f"{tmp_path.name}-public-factory-secret"
-        sibling.write_text("secret", encoding="utf-8")
-
-        assert isinstance(tool, CommandExecutorTool)
-        result = tool.run_json_sync({"command": f"cat {shlex.quote(str(sibling))}"})
         assert result["return_code"] == 126
         assert "secret" not in result["output"]
 
@@ -515,6 +498,87 @@ class TestScopedCommandPathGuard:
         assert result["success"] is True
         assert "sibling secret" in result["output"]
 
+    def test_recognized_name_workspace_script_is_inspected_before_dispatch(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = workspace.output_dir / "cat"
+        script.write_text(
+            f"#!/usr/bin/env bash\ncat {shlex.quote(str(sibling_file))}\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            f"{workspace.output_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": str(script)})
+
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+
+    def test_bare_recognized_name_uses_validated_executable_identity(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = workspace.output_dir / "cat"
+        script.write_text(
+            f"#!/usr/bin/env bash\n/bin/cat {shlex.quote(str(sibling_file))}\n",
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            f"{workspace.output_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": "cat"})
+
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "PATH=. cat own.txt",
+            "env PATH=. cat own.txt",
+            "export PATH=.; cat own.txt",
+            "hash -p ./cat cat; cat own.txt",
+        ],
+    )
+    def test_rejects_runtime_command_identity_changes(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_rejects_alias_definition_before_shell_execution(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": (f"alias leak='cat {shlex.quote(str(sibling_file))}'\nleak")}
+        )
+
+        assert result["return_code"] == 126
+        assert "alias" in result["error"]
+        assert "sibling secret" not in result["output"]
+
     @pytest.mark.parametrize(
         "command_template",
         [
@@ -530,7 +594,6 @@ class TestScopedCommandPathGuard:
             "awk -f {path} own.txt",
             "awk -f{path} own.txt",
             "find {parent} -type f -exec cat {{}} \\;",
-            "find -L {parent} -type f -exec cat {{}} \\;",
         ],
     )
     def test_rejects_common_reads_from_sibling(
@@ -592,6 +655,336 @@ class TestScopedCommandPathGuard:
         assert "outside allowed write paths" in result["error"]
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
         assert own_file.exists()
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "unlink {path}",
+            "shred {path}",
+            "gzip {path}",
+            "install own.txt {path}",
+            "rsync own.txt {path}",
+            "curl -o {path} https://example.invalid/file",
+            "wget -O {path} https://example.invalid/file",
+        ],
+    )
+    def test_rejects_newly_classified_tool_writes_to_sibling(
+        self,
+        scoped_command_workspace,
+        command_template,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": command_template.format(path=shlex.quote(str(sibling_file)))}
+        )
+
+        assert result["return_code"] == 126
+        assert "outside allowed write paths" in result["error"]
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "install {path} installed.txt",
+            "rsync {path} copied.txt",
+        ],
+    )
+    def test_rejects_newly_classified_tool_reads_from_sibling(
+        self,
+        scoped_command_workspace,
+        command_template,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": command_template.format(path=shlex.quote(str(sibling_file)))}
+        )
+
+        assert result["return_code"] == 126
+        assert "outside allowed read paths" in result["error"]
+        assert "sibling secret" not in result["output"]
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "unlink own.txt",
+            "shred -n3 own.txt",
+            "gzip -c own.txt",
+            "install -m755 own.txt installed.txt",
+            "rsync -av own.txt copied.txt",
+            "curl -oout.txt https://example.invalid/file",
+            "wget -Oout.txt https://example.invalid/file",
+        ],
+    )
+    def test_allows_newly_classified_tool_workspace_paths(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_gzip_stdout_mode_keeps_external_operand_read_only(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"gzip -c {shlex.quote(str(external_file))}")
+        guard.validate(f"gzip -lt {shlex.quote(str(external_file))}")
+
+    def test_rsync_link_dest_requires_write_authorization(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"rsync -a --link-dest={shlex.quote(str(external_file.parent))} "
+                "source copied"
+            )
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -O https://example.invalid/file",
+            "wget --config config",
+            "rsync host:/secret copied",
+            "rsync --files-from=list.txt source copied",
+        ],
+    )
+    def test_rejects_uninspectable_new_tool_path_sources(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "find -L . -type f -exec cat {} \\;",
+            "find -H . -type f -exec cat {} \\;",
+            "cp -rL . copied",
+            "cp --recursive --dereference . copied",
+        ],
+    )
+    def test_rejects_recursive_symlink_dereference_modes(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="symbolic links"):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "find -L source -name secret.txt -exec cat {} \\;",
+            "cp -rL source copied",
+        ],
+    )
+    def test_recursive_symlink_dereference_is_rejected_before_execution(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        source = workspace.output_dir / "source"
+        source.mkdir()
+        (source / "external-link").symlink_to(sibling_file.parent)
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": command})
+
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+        assert not (workspace.output_dir / "copied").exists()
+
+    def test_find_delete_treats_root_as_write_target(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"find {shlex.quote(str(external_file.parent))} -type f -delete"
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_hard_link_source_requires_write_authorization(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"ln {shlex.quote(str(external_file))} external-alias.txt")
+
+        assert exc_info.value.access == "write"
+
+    def test_allows_literal_quoted_here_document(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": "cat <<'EOF'\n$HOME `printf not-executed`\nEOF\n"}
+        )
+
+        assert result["success"] is True
+        assert result["output"] == "$HOME `printf not-executed`\n"
+
+    def test_quoted_heredoc_normalization_does_not_mask_later_commands(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(
+                f"printf %s \"<<'EOF'\"\ncat {shlex.quote(str(sibling_file))}\nEOF\n"
+            )
+
+    def test_allows_time_keyword_with_validated_nested_command(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        own_file = workspace.output_dir / "own.txt"
+        own_file.write_text("own", encoding="utf-8")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync({"command": "time cat own.txt"})
+
+        assert result["success"] is True
+        assert result["output"] == "own"
+
+    def test_time_keyword_propagates_builtin_directory_state(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"time cd {shlex.quote(str(external_file.parent))} && tee leaked.txt"
+            )
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize("shell_name", ["sh", "dash", "zsh"])
+    def test_rejects_shell_dialects_not_owned_by_policy_parser(
+        self,
+        scoped_command_workspace,
+        shell_name,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="shell dialect"):
+            guard.validate(f"{shell_name} -c 'cat own.txt'")
+
+    def test_guarded_shell_execution_uses_bash_dialect(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        captured = {}
+
+        def fake_run(command, **kwargs):
+            captured.update(kwargs)
+            return type(
+                "Completed",
+                (),
+                {"returncode": 0, "stdout": "", "stderr": ""},
+            )()
+
+        monkeypatch.setattr(
+            "xagent.core.tools.core.command_executor.subprocess.run",
+            fake_run,
+        )
+        executor = CommandExecutorCore.for_workspace(workspace, restrict_paths=True)
+
+        result = executor.execute_command("printf ok")
+
+        assert result["success"] is True
+        assert os.path.basename(captured["executable"]) == "bash"
+
+    def test_unsupported_operator_error_is_actionable(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="unsupported shell operator.*separate command calls",
+        ):
+            guard.validate("printf one & printf two")
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "printf changed >> {path}",
+            "cat missing 2> {path}",
+        ],
+    )
+    def test_append_and_stderr_redirects_require_write_authorization(
+        self,
+        scoped_command_workspace,
+        command_template,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                command_template.format(path=shlex.quote(str(external_file)))
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_possible_directory_state_growth_is_bounded(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        for index in range(17):
+            (workspace.output_dir / f"d{index}").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+        command = " || ".join(f"cd d{index}" for index in range(17))
+
+        with pytest.raises(CommandPolicyViolation, match="too many possible"):
+            guard.validate(command)
 
     @pytest.mark.parametrize(
         "command",
@@ -763,20 +1156,14 @@ class TestScopedCommandPathGuard:
         assert result["success"] is True
         assert result["output"] == "literal"
 
-    def test_rejects_glob_that_expands_to_out_of_scope_symlink(
-        self, scoped_command_workspace
-    ):
-        workspace, _, sibling_file = scoped_command_workspace
-        glob_dir = workspace.output_dir / "glob-dir"
-        glob_dir.mkdir()
-        (glob_dir / "leak").symlink_to(sibling_file)
+    def test_rejects_active_glob_before_execution(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
         tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
 
-        result = tool.run_json_sync({"command": "cat glob-dir/*"})
+        result = tool.run_json_sync({"command": "cat *.txt"})
 
         assert result["success"] is False
         assert result["return_code"] == 126
-        assert "sibling secret" not in result["output"]
 
     def test_external_directory_is_read_only(self, scoped_command_workspace):
         workspace, external_file, _ = scoped_command_workspace
@@ -1251,9 +1638,25 @@ class TestScopedCommandPathGuard:
         monkeypatch.setenv("BASH_ENV", str(hook))
         tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
 
-        result = tool.run_json_sync({"command": "bash -c true"})
+        result = tool.run_json_sync({"command": "printf safe"})
 
         assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+
+    def test_rejects_ambient_cdpath_that_changes_directory_resolution(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        monkeypatch.setenv("CDPATH", str(sibling_file.parent.parent))
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": f"cd {shlex.quote(sibling_file.parent.name)}; cat secret.txt"}
+        )
+
         assert result["return_code"] == 126
         assert "sibling secret" not in result["output"]
 
@@ -1958,7 +2361,7 @@ class TestScopedCommandPathGuard:
             "sort -rT{} own.txt",
             "uniq own.txt {}",
             "diff --output={} own.txt own.txt",
-            "sh -c 'printf changed > {}'",
+            "bash -c 'printf changed > {}'",
         ],
     )
     def test_find_exec_placeholder_write_requires_writable_root(
@@ -2400,7 +2803,7 @@ class TestScopedCommandPathGuard:
         with pytest.raises(CommandPathViolation) as exc_info:
             guard.validate(
                 f"find {shlex.quote(str(external_file.parent))} "
-                "-type f -execdir sh -c 'printf changed > marker' \\;"
+                "-type f -execdir bash -c 'printf changed > marker' \\;"
             )
 
         assert exc_info.value.access == "write"
