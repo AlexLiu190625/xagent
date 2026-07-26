@@ -86,6 +86,136 @@ describe("useWidgetSession", () => {
     expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
   })
 
+  it("owns recoverable transport failures with the existing one-shot reconnect latch", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    postMessage.mockClear()
+
+    act(() => {
+      result.current.handleConnectionFailure({
+        code: "transport_error",
+        recoverable: true,
+        error: new Error("physical transport failed"),
+      })
+      result.current.handleConnectionClose(
+        new CloseEvent("close", { code: 1006 }),
+      )
+      result.current.handleConnectionFailure({
+        code: "transport_error",
+        recoverable: true,
+        error: new Error("duplicate physical transport failure"),
+      })
+    })
+
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.session).toBeNull()
+    expect(result.current.agent?.name).toBe("Support Agent")
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toEqual([
+      [{
+        xagent: true,
+        v: 1,
+        type: "reconnect_request",
+        reason: "ws_closed",
+      }, PARENT_ORIGIN],
+    ])
+  })
+
+  it.each(["creation_failed", "protocol_mismatch", "unknown"] as const)(
+    "fails terminal and wipes Session credentials for %s connection failure",
+    (code) => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+      postMessage.mockClear()
+
+      act(() => {
+        result.current.handleConnectionFailure({
+          code,
+          recoverable: false,
+          error: new Error("sanitized failure"),
+        })
+      })
+
+      expect(result.current.status).toBe("terminal")
+      expect(result.current.terminalCode).toBe("unexpected_error")
+      expect(result.current.session).toBeNull()
+      expect(result.current.agent).toBeNull()
+      expect(postMessage).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([4401, 1006, 4500])(
+    "owns abnormal WebSocket close %s and requests one parent reconnect",
+    (code) => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+
+      let disposition: "handled" | "default" | undefined
+      act(() => {
+        disposition = result.current.handleConnectionClose(
+          new CloseEvent("close", { code }),
+        )
+      })
+
+      expect(disposition).toBe("handled")
+      expect(result.current.status).toBe("refreshing")
+      expect(result.current.session).toBeNull()
+      expect(result.current.agent?.name).toBe("Support Agent")
+      expect(postMessage).toHaveBeenLastCalledWith(
+        { xagent: true, v: 1, type: "reconnect_request", reason: "ws_closed" },
+        PARENT_ORIGIN,
+      )
+    },
+  )
+
+  it.each([
+    [4403, "ws_4403"],
+    [4408, "ws_4408"],
+  ])(
+    "owns terminal WebSocket close %s without asking the parent to reconnect",
+    (code, terminalCode) => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage())
+      postMessage.mockClear()
+
+      let disposition: "handled" | "default" | undefined
+      act(() => {
+        disposition = result.current.handleConnectionClose(
+          new CloseEvent("close", { code }),
+        )
+      })
+
+      expect(disposition).toBe("handled")
+      expect(result.current.status).toBe("terminal")
+      expect(result.current.terminalCode).toBe(terminalCode)
+      expect(result.current.session).toBeNull()
+      expect(result.current.agent).toBeNull()
+      expect(postMessage).not.toHaveBeenCalled()
+    },
+  )
+
+  it("owns a normal WebSocket close without reconnecting or changing bridge state", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    postMessage.mockClear()
+
+    let disposition: "handled" | "default" | undefined
+    act(() => {
+      disposition = result.current.handleConnectionClose(
+        new CloseEvent("close", { code: 1000 }),
+      )
+    })
+
+    expect(disposition).toBe("handled")
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.token).toBe("st_session_token")
+    expect(postMessage).not.toHaveBeenCalled()
+  })
+
   it("does nothing when a retained reconnect callback runs after unmount", () => {
     const postMessage = vi.spyOn(window, "postMessage")
     const { result, unmount } = renderHook(() => useWidgetSession(), { wrapper: StrictMode })
@@ -194,6 +324,7 @@ describe("useWidgetSession", () => {
 
     expect(result.current.status).toBe("terminal")
     expect(result.current.session).toBeNull()
+    expect(result.current.agent).toBeNull()
     expect(result.current.isAbsoluteExpiryWarningVisible).toBe(false)
     expect(clearTimeout).toHaveBeenCalled()
   })

@@ -13,17 +13,38 @@ const appState = vi.hoisted(() => ({
   dagExecution: null,
   steps: [],
 }))
+const openFilePreviewMock = vi.hoisted(() => vi.fn())
+const sendMessageMock = vi.hoisted(() => vi.fn())
+const appControls = vi.hoisted(() => ({
+  filesDisabled: false,
+  isConversationResetPending: false,
+  isMessageDeliveryPending: false,
+}))
+const chatInputProps = vi.hoisted(() => ({
+  current: null as null | {
+    files?: File[]
+    filesDisabled?: boolean
+    hideFileUpload?: boolean
+    isLoading?: boolean
+    onFilesChange?: (files: File[]) => void
+    onSend: (message: string, config?: unknown, files?: File[]) => Promise<void> | void
+  },
+}))
 
 vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     state: appState,
-    sendMessage: vi.fn(),
+    filesDisabled: appControls.filesDisabled,
+    sendMessage: sendMessageMock,
     pauseTask: vi.fn(),
     resumeTask: vi.fn(),
-    openFilePreview: vi.fn(),
+    openFilePreview: openFilePreviewMock,
     closeFilePreview: vi.fn(),
     requestStatus: vi.fn(),
     dispatch: vi.fn(),
+    getFileDownloadUrl: vi.fn(),
+    isConversationResetPending: appControls.isConversationResetPending,
+    isMessageDeliveryPending: appControls.isMessageDeliveryPending,
   }),
 }))
 
@@ -107,7 +128,27 @@ vi.mock("@/components/chat/ChatMessage", () => ({
 }))
 
 vi.mock("@/components/chat/ChatInput", () => ({
-  ChatInput: () => <div data-testid="chat-input" />,
+  ChatInput: (props: NonNullable<typeof chatInputProps.current>) => {
+    chatInputProps.current = props
+    return (
+      <div data-testid="chat-input">
+        <button
+          type="button"
+          onClick={() => props.onFilesChange?.([
+            new File(["draft"], "draft.txt", { type: "text/plain" }),
+          ])}
+        >
+          stage file
+        </button>
+        <button
+          type="button"
+          onClick={() => void props.onSend("send draft", { mode: "balanced" })}
+        >
+          send draft
+        </button>
+      </div>
+    )
+  },
 }))
 
 vi.mock("@/components/chat/TokenUsageDisplay", () => ({
@@ -115,7 +156,9 @@ vi.mock("@/components/chat/TokenUsageDisplay", () => ({
 }))
 
 vi.mock("@/components/file/task-file-manager", () => ({
-  TaskFileManager: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TaskFileManager: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="task-file-manager">{children}</div>
+  ),
 }))
 
 vi.mock("@/components/file/file-preview-content", () => ({
@@ -123,7 +166,9 @@ vi.mock("@/components/file/file-preview-content", () => ({
 }))
 
 vi.mock("@/components/file/file-preview-action-buttons", () => ({
-  FilePreviewActionButtons: () => null,
+  FilePreviewActionButtons: () => (
+    <div data-testid="file-preview-actions" />
+  ),
 }))
 
 vi.mock("@/components/preview-sheet", () => ({
@@ -151,6 +196,13 @@ import { TaskConversationPanel } from "./task-conversation-panel"
 describe("TaskConversationPanel", () => {
   beforeEach(() => {
     vi.spyOn(console, "error").mockImplementation(() => undefined)
+    openFilePreviewMock.mockReset()
+    sendMessageMock.mockReset()
+    sendMessageMock.mockResolvedValue(undefined)
+    chatInputProps.current = null
+    appControls.isConversationResetPending = false
+    appControls.isMessageDeliveryPending = false
+    appControls.filesDisabled = false
   })
 
   afterEach(() => {
@@ -162,6 +214,75 @@ describe("TaskConversationPanel", () => {
     appState.isProcessing = false
     appState.isHistoryLoading = false
     appState.filePreview = { isOpen: false, fileName: "", viewMode: "preview" }
+  })
+
+  it("disables every file surface and drops staged files when the capability is disabled", async () => {
+    appState.filePreview = {
+      isOpen: true,
+      fileName: "secret.txt",
+      viewMode: "preview",
+    }
+    const { rerender } = render(
+      <TaskConversationPanel mode="page" />
+    )
+
+    fireEvent.click(screen.getByRole("button", { name: "stage file" }))
+    expect(chatInputProps.current?.files).toHaveLength(1)
+
+    appControls.filesDisabled = true
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.hideFileUpload).toBe(true)
+    expect(chatInputProps.current?.filesDisabled).toBe(true)
+    expect(chatInputProps.current?.files).toEqual([])
+    expect(screen.queryByTestId("task-file-manager")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("file-preview-content")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("file-preview-actions")).not.toBeInTheDocument()
+
+    window.dispatchEvent(new CustomEvent("openFilePreview", {
+      detail: { filePath: "file-secret", fileName: "secret.txt" },
+    }))
+    expect(openFilePreviewMock).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole("button", { name: "send draft" }))
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "send draft",
+      { mode: "balanced" },
+      [],
+    )
+  })
+
+  it("preserves the existing file behavior when the capability is enabled", () => {
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.hideFileUpload).toBe(false)
+    expect(chatInputProps.current?.filesDisabled).toBe(false)
+    expect(screen.getByTestId("task-file-manager")).toBeInTheDocument()
+
+    window.dispatchEvent(new CustomEvent("openFilePreview", {
+      detail: { filePath: "file-default", fileName: "default.txt" },
+    }))
+    expect(openFilePreviewMock).toHaveBeenCalledWith(
+      "file-default",
+      "default.txt",
+    )
+  })
+
+  it("keeps the composer busy during Session reset and durable delivery", () => {
+    appControls.isConversationResetPending = true
+    const { rerender } = render(
+      <TaskConversationPanel mode="page" />
+    )
+    expect(chatInputProps.current?.isLoading).toBe(true)
+
+    appControls.isConversationResetPending = false
+    appControls.isMessageDeliveryPending = true
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(chatInputProps.current?.isLoading).toBe(true)
+
+    appControls.isMessageDeliveryPending = false
+    rerender(<TaskConversationPanel mode="page" />)
+    expect(chatInputProps.current?.isLoading).toBe(false)
   })
 
   it("renders waiting-for-user prompts from normal task state", () => {

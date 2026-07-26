@@ -20,7 +20,8 @@ export function useFileMention(
   editorRef: React.RefObject<HTMLElement | null>,
   containerRef: React.RefObject<HTMLElement | null>,
   onInput: () => void,
-  t: Translate
+  t: Translate,
+  filesDisabled = false,
 ) {
   const [showFilePicker, setShowFilePicker] = useState(false);
   const [fileList, setFileList] = useState<FileItem[]>([]);
@@ -44,6 +45,8 @@ export function useFileMention(
   };
 
   const fetchFiles = async (query: string) => {
+    if (filesDisabled) return;
+
     const requestId = latestFetchRequestRef.current + 1;
     latestFetchRequestRef.current = requestId;
     const params = new URLSearchParams({
@@ -85,6 +88,8 @@ export function useFileMention(
   };
 
   const checkTrigger = () => {
+    if (filesDisabled) return;
+
     const selection = window.getSelection();
     if (!selection || !selection.rangeCount) {
       resetMention();
@@ -142,7 +147,7 @@ export function useFileMention(
   };
 
   useEffect(() => {
-    if (!showFilePicker) {
+    if (filesDisabled || !showFilePicker) {
       return;
     }
 
@@ -151,7 +156,20 @@ export function useFileMention(
     }, 150);
 
     return () => window.clearTimeout(timer);
-  }, [showFilePicker, currentQuery]);
+  }, [filesDisabled, showFilePicker, currentQuery]);
+
+  useEffect(() => {
+    if (!filesDisabled) return;
+
+    latestFetchRequestRef.current += 1;
+    setShowFilePicker(false);
+    setFileList([]);
+    setFilteredFiles([]);
+    setSelectedFileIndex(0);
+    setCurrentQuery("");
+    setIsLoadingFiles(false);
+    setDropdownPosition(null);
+  }, [filesDisabled]);
 
   const moveCursorToEnd = () => {
     const editor = editorRef.current;
@@ -168,6 +186,8 @@ export function useFileMention(
   };
 
   const insertFile = (file: FileItem) => {
+    if (filesDisabled) return;
+
     const filePath = file.relative_path || file.filename;
     const fileId = file.file_id || '';
     const filename = file.filename;
@@ -207,6 +227,8 @@ export function useFileMention(
   };
 
   const handleKeyDown = (e: React.KeyboardEvent): boolean => {
+    if (filesDisabled) return false;
+
     if (showFilePicker) {
       if (e.key === "ArrowUp") {
         e.preventDefault();
@@ -235,16 +257,18 @@ export function useFileMention(
   };
 
   return {
-    showFilePicker,
-    isLoadingFiles,
-    filteredFiles,
-    selectedFileIndex,
-    fileList,
-    dropdownPosition,
+    showFilePicker: filesDisabled ? false : showFilePicker,
+    isLoadingFiles: filesDisabled ? false : isLoadingFiles,
+    filteredFiles: filesDisabled ? [] : filteredFiles,
+    selectedFileIndex: filesDisabled ? 0 : selectedFileIndex,
+    fileList: filesDisabled ? [] : fileList,
+    dropdownPosition: filesDisabled ? null : dropdownPosition,
     insertFile,
     handleKeyDown,
     checkTrigger,
     resetMention,
-    setShowFilePicker
+    setShowFilePicker: (visible: boolean) => {
+      if (!filesDisabled) setShowFilePicker(visible);
+    },
   };
 }

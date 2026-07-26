@@ -182,7 +182,11 @@ export interface Interaction {
   accept?: string[] | string;
   multiple?: boolean;
 }
-import { useWebSocket, type WebSocketConnection } from "@/hooks/use-websocket"
+import {
+  useWebSocket,
+  type WebSocketConnection,
+  type WebSocketConnectionFailure,
+} from "@/hooks/use-websocket"
 import { useAuth } from "@/contexts/auth-context"
 import { generateClientMessageId, getApiUrl, getUploadApiUrl, shouldAutoOpenTaskPreview } from "@/lib/utils"
 import { apiRequest, getApiErrorMessage, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper"
@@ -1360,6 +1364,7 @@ interface PendingMessage {
 interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
+  filesDisabled: boolean
   sendMessage: (message: string, config?: any, files?: File[]) => Promise<void>
   executeTask: (description: string) => void
   pauseTask: () => void
@@ -1396,6 +1401,7 @@ export interface AppProviderTransportConfig {
   session?: {
     connection: WebSocketConnection | null
     onConnectionClose: (event: CloseEvent) => "handled"
+    onConnectionFailure: (failure: WebSocketConnectionFailure) => void
     allowTasklessChat: true
     supportsConversationReset: true
     preserveConversationOnReconnect: true
@@ -1434,6 +1440,7 @@ export function AppProvider({
   const pendingMessageRef = useRef(pendingMessage)
   pendingMessageRef.current = pendingMessage
   const sessionTransport = transport?.session
+  const filesDisabled = sessionTransport?.files === "disabled"
   const sessionConnectionIdentity =
     sessionTransport?.connection?.identity ?? null
   const [deliveryGeneration, setDeliveryGeneration] = useState(0)
@@ -1619,6 +1626,7 @@ export function AppProvider({
         ? undefined
         : deliveryGeneration,
     onConnectionClose: sessionTransport?.onConnectionClose,
+    onConnectionFailure: sessionTransport?.onConnectionFailure,
     onMessage: (message) => {
       if (sessionTransport) {
         if (
@@ -3094,7 +3102,10 @@ export function AppProvider({
                   id: msgId,
                   role: "assistant",
                   content: <div className="space-y-2">
-                    <MarkdownRenderer content={clarificationMessage} />
+                    <MarkdownRenderer
+                      content={clarificationMessage}
+                      filesDisabled={options?.filesDisabled}
+                    />
                     <ClarificationForm
                       interactions={clarification.interactions}
                       messageId={msgId}
@@ -3258,6 +3269,7 @@ export function AppProvider({
                   <div className="ml-6">
                     <JsonRenderer
                       data={metaInfo}
+                      filesDisabled={options?.filesDisabled}
                       onFileClick={options?.filesDisabled ? undefined : openFilePreview}
                       onAgentClick={(agentId) => router.push(`/agent/${agentId}`)}
                     />
@@ -5472,6 +5484,7 @@ export function AppProvider({
       value={{
         state,
         dispatch,
+        filesDisabled,
         sendMessage,
         executeTask,
         pauseTask,

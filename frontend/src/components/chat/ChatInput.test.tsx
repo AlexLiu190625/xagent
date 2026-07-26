@@ -91,6 +91,7 @@ describe("ChatInput", () => {
 
   afterEach(() => {
     cleanup()
+    Reflect.deleteProperty(document, "execCommand")
   })
 
   it("requires a model when submitting generic chat", async () => {
@@ -110,6 +111,84 @@ describe("ChatInput", () => {
       expect(screen.getByText("chatPage.input.noModelAlert")).toBeInTheDocument()
     })
     expect(onSend).not.toHaveBeenCalled()
+  })
+
+  it("suppresses preseeded files and restored file previews when files are disabled", () => {
+    const onSend = vi.fn()
+    const onFilesChange = vi.fn()
+    const uploadFile = vi.fn()
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+    Object.defineProperty(document, "execCommand", {
+      configurable: true,
+      value: vi.fn(),
+    })
+    const { container } = render(
+      <ChatInput
+        files={[file]}
+        filesDisabled
+        hideConfig
+        inputValue="[secret.txt](file:file-secret)"
+        onFilesChange={onFilesChange}
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+        uploadFile={uploadFile}
+      />
+    )
+
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+    expect(container.querySelector(".file-chip-preview")).toBeNull()
+    expect(screen.queryByText("secret.txt")).not.toBeInTheDocument()
+
+    const editor = screen.getByRole("textbox")
+    editor.innerHTML = '<span class="file-chip-preview" data-file-path="file-secret">secret</span>'
+    fireEvent.click(editor.querySelector(".file-chip-preview") as HTMLElement)
+
+    fireEvent.drop(container.querySelector("form") as HTMLFormElement, {
+      dataTransfer: { types: ["Files"] },
+    })
+    fireEvent.paste(editor, {
+      clipboardData: {
+        items: [{
+          kind: "file",
+          type: "text/plain",
+          getAsFile: () => file,
+        }],
+        getData: () => "",
+      },
+    })
+
+    expect(openFilePreviewMock).not.toHaveBeenCalled()
+    expect(onFilesChange).not.toHaveBeenCalled()
+    expect(uploadFile).not.toHaveBeenCalled()
+    expect(onSend).not.toHaveBeenCalled()
+    expect(
+      apiRequestMock.mock.calls.some(
+        ([url]) => typeof url === "string" && url.includes("/api/files/"),
+      )
+    ).toBe(false)
+  })
+
+  it("keeps restored file preview semantics when only upload UI is hidden", () => {
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="[report.txt](file:file-report)"
+        onInputChange={vi.fn()}
+        onSend={vi.fn()}
+        readOnlyConfig
+      />
+    )
+
+    const chip = container.querySelector(".file-chip-preview")
+    expect(chip).not.toBeNull()
+    fireEvent.click(chip as HTMLElement)
+    expect(openFilePreviewMock).toHaveBeenCalledWith(
+      "file-report",
+      "file-report",
+      [{ fileName: "file-report", fileId: "file-report" }],
+    )
   })
 
   it("allows selected agent submissions without a local model", async () => {

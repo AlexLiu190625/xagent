@@ -51,11 +51,146 @@ vi.mock('@/contexts/i18n-context', () => ({
   }),
 }))
 
-import { MarkdownRenderer } from '../markdown-renderer'
+import {
+  getFilesDisabledFileLabel,
+  JsonRenderer,
+  MarkdownRenderer,
+  projectFilesDisabledValue,
+  sanitizeFilesDisabledText,
+} from '../markdown-renderer'
 
 describe('MarkdownRenderer', () => {
   beforeEach(() => {
     apiRequestMock.mockReset()
+  })
+
+  it('retains snake-case filenames as the safe label for file records', () => {
+    expect(getFilesDisabledFileLabel({
+      file_path: '/private/report.pdf',
+      file_name: 'report.pdf',
+    })).toBe('report.pdf')
+  })
+
+  it('preserves unrelated backtick URLs while inertizing file references', () => {
+    expect(sanitizeFilesDisabledText(
+      'Call `https://api.example/tasks/42` then [open report](file:secret-id).',
+    )).toBe(
+      'Call `https://api.example/tasks/42` then open report.',
+    )
+  })
+
+  it('removes producer-shaped local path fields without erasing sibling business identity', () => {
+    expect(projectFilesDisabledValue({
+      success: true,
+      id: 'workspace-id',
+      url: 'https://api.example/workspaces/workspace-id',
+      workspace_dir: '/private/workspaces/workspace-id',
+      output_dir: '/private/workspaces/workspace-id/output',
+      message: [
+        'Workspace /private/workspaces/workspace-id',
+        'writes to /private/workspaces/workspace-id/output',
+      ].join(' '),
+      files: [{ path: 'SKILL.md', size: 1234 }],
+    })).toEqual({
+      success: true,
+      id: 'workspace-id',
+      url: 'https://api.example/workspaces/workspace-id',
+      message: 'Workspace workspace-id writes to output',
+      files: [{ size: 1234 }],
+    })
+  })
+
+  it('preserves connector business paths that have no file evidence', () => {
+    const connectorResult = {
+      request_path: '/v1/shifts',
+      method: 'GET',
+      shift: {
+        path: '/care/shift/42',
+        directory: 'north-region',
+        status: 'open',
+      },
+      sizedShift: {
+        path: '/care/shift/43',
+        size: 20,
+        status: 'open',
+      },
+      preview: {
+        id: 'invoice-42',
+        preview_url: 'https://api.example/invoices/42/preview',
+        url: 'https://api.example/invoices/42',
+        status: 'ready',
+      },
+      edge: {
+        source: 'care-service',
+        destination: 'billing-service',
+        size: 20,
+      },
+    }
+
+    expect(projectFilesDisabledValue(connectorResult)).toEqual({
+      ...connectorResult,
+      preview: {
+        id: 'invoice-42',
+        url: 'https://api.example/invoices/42',
+        status: 'ready',
+      },
+    })
+  })
+
+  it('removes local path fields emitted by current workspace, media, and document tools', () => {
+    const projected = projectFilesDisabledValue({
+      audio_path: '/private/output/audio.mp3',
+      videoPath: '/private/output/video.mp4',
+      translation_path: '/private/output/translation.json',
+      transcriptionPath: '/private/output/transcription.txt',
+      full_path: '/private/uploads/report.pdf',
+      sourcePath: '/private/source/report.pdf',
+      json_path: '/private/chunks/report.json',
+      uploadsDirectory: '/private/uploads',
+      current_path: '/private/workspace/current',
+      markedImagePath: '/private/output/marked.png',
+      copiedFile: {
+        source: '/private/skills/example/SKILL.md',
+        destination: 'output/SKILL.md',
+        size: 1234,
+        extracted: false,
+      },
+      safe: 'keep this',
+    })
+
+    expect(projected).toEqual({
+      copiedFile: {
+        size: 1234,
+        extracted: false,
+      },
+      safe: 'keep this',
+    })
+  })
+
+  it('removes all file identities and the HTML source from prepared asset results', () => {
+    expect(projectFilesDisabledValue({
+      success: true,
+      source_file_id: 'source-file-id',
+      assetFileID: 'asset-file-id',
+      html_src: 'assets/chart.png',
+      file_id: 'registered-file-id',
+      filename: 'chart.png',
+      mime_type: 'image/png',
+      preview_url: 'https://files.example/preview/registered-file-id',
+      file_ref: {
+        file_id: 'nested-file-id',
+        filename: 'chart.png',
+        relative_path: 'output/assets/chart.png',
+        preview_url: 'https://files.example/preview/nested-file-id',
+      },
+    })).toEqual({
+      success: true,
+      filename: 'chart.png',
+      mime_type: 'image/png',
+      file_ref: {
+        filename: 'chart.png',
+      },
+    })
   })
 
   afterEach(() => {
@@ -116,6 +251,157 @@ describe('MarkdownRenderer', () => {
 
     expect(handleFileClick).toHaveBeenCalledTimes(1)
     expect(handleFileClick).toHaveBeenCalledWith('/tmp/test.txt', 'open file')
+  })
+
+  it('renders file links and images as inert text when files are disabled', () => {
+    const handleFileClick = vi.fn()
+    const content = [
+      '[report.docx](file:doc-file-id)',
+      '![generated image](file:output/generated.png)',
+    ].join('\n\n')
+
+    const { container } = render(
+      <MarkdownRenderer
+        content={content}
+        filesDisabled
+        onFileClick={handleFileClick}
+      />
+    )
+
+    expect(screen.getByText('report.docx')).not.toHaveAttribute('href')
+    expect(screen.getByText('generated image')).not.toHaveAttribute('src')
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+    expect(screen.queryByTestId('docx-preview')).not.toBeInTheDocument()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(container.innerHTML).not.toContain('doc-file-id')
+    expect(container.innerHTML).not.toContain('output/generated.png')
+
+    fireEvent.click(screen.getByText('report.docx'))
+    fireEvent.click(screen.getByText('generated image'))
+    expect(handleFileClick).not.toHaveBeenCalled()
+  })
+
+  it('keeps nested JSON markdown file metadata inert when files are disabled', () => {
+    const handleFileClick = vi.fn()
+    const data = JSON.stringify({
+      goal: 'Create a report',
+      output: '[nested report.docx](file:nested-doc-id)',
+    })
+
+    const { container } = render(
+      <JsonRenderer
+        data={data}
+        filesDisabled
+        onFileClick={handleFileClick}
+      />
+    )
+
+    expect(screen.getByText('nested report.docx')).not.toHaveAttribute('href')
+    expect(screen.queryByTestId('docx-preview')).not.toBeInTheDocument()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(container.innerHTML).not.toContain('nested-doc-id')
+    fireEvent.click(screen.getByText('nested report.docx'))
+    expect(handleFileClick).not.toHaveBeenCalled()
+  })
+
+  it('projects nested file metadata out of JSON DOM while preserving unrelated values', () => {
+    const data = {
+      requestUrl: 'https://api.example/tasks/42',
+      artifacts: [
+        {
+          file_id: 'nested-file-id',
+          id: 'generic-file-record-id',
+          file_path: '/private/reports/secret.pdf',
+          storage_path: '/workspace/storage/nested-file-id/report.pdf',
+          absolute_path: '/sandbox/absolute/report.pdf',
+          image_path: '/sandbox/images/report.png',
+          local_path: '/sandbox/local/report.pdf',
+          output_dir: '/sandbox/output',
+          output_path: '/sandbox/output/report.pdf',
+          preview_url: 'https://files.example/preview/secret',
+          downloadUrl: 'https://files.example/download/secret',
+          signed_url: 'https://files.example/signed/secret',
+          signedURL: 'https://files.example/signed/acronym-secret',
+          url: 'https://files.example/generic-secret-url',
+          filename: 'report.pdf',
+          mime_type: 'application/pdf',
+          text: '[open report](file:nested-file-id)',
+        },
+        {
+          fileId: 'camel-file-id',
+          path: '/private/camel.txt',
+          storagePath: '/workspace/storage/camel-file-id/camel.txt',
+          absolutePath: '/sandbox/camel/absolute.txt',
+          imagePath: '/sandbox/camel/image.png',
+          localPath: '/sandbox/camel/local.txt',
+          outputDir: '/sandbox/camel/output',
+          outputPath: '/sandbox/camel/output/camel.txt',
+          previewUrl: 'https://files.example/preview/camel',
+          previewURL: 'https://files.example/preview/acronym-camel',
+          download_url: 'https://files.example/download/camel',
+          downloadURL: 'https://files.example/download/acronym-camel',
+          fileName: 'camel.txt',
+          type: 'text/plain',
+        },
+      ],
+      nested: { message: 'keep this' },
+      request: { id: 'unrelated-request-id', url: 'https://api.example/requests/42' },
+      rawToolPaths: [
+        {
+          absolute_path: '/raw/absolute/result.txt',
+          text: 'safe absolute result',
+        },
+        {
+          imagePath: '/raw/images/result.png',
+          text: 'safe image result',
+        },
+        {
+          outputDir: '/raw/output',
+          text: 'safe output result',
+        },
+      ],
+    }
+
+    const { container } = render(<JsonRenderer data={data} filesDisabled />)
+
+    expect(container).toHaveTextContent('report.pdf')
+    expect(container).toHaveTextContent('camel.txt')
+    expect(container).toHaveTextContent('open report')
+    expect(container).toHaveTextContent('https://api.example/tasks/42')
+    expect(container).toHaveTextContent('keep this')
+    expect(container).toHaveTextContent('unrelated-request-id')
+    expect(container).toHaveTextContent('https://api.example/requests/42')
+    expect(container).toHaveTextContent('safe absolute result')
+    expect(container).toHaveTextContent('safe image result')
+    expect(container).toHaveTextContent('safe output result')
+    expect(container.innerHTML).not.toContain('nested-file-id')
+    expect(container.innerHTML).not.toContain('generic-file-record-id')
+    expect(container.innerHTML).not.toContain('/private/reports/secret.pdf')
+    expect(container.innerHTML).not.toContain('/workspace/storage/nested-file-id/report.pdf')
+    expect(container.innerHTML).not.toContain('/sandbox/absolute/report.pdf')
+    expect(container.innerHTML).not.toContain('/sandbox/images/report.png')
+    expect(container.innerHTML).not.toContain('/sandbox/local/report.pdf')
+    expect(container.innerHTML).not.toContain('/sandbox/output')
+    expect(container.innerHTML).not.toContain('https://files.example/preview/secret')
+    expect(container.innerHTML).not.toContain('https://files.example/download/secret')
+    expect(container.innerHTML).not.toContain('https://files.example/signed/secret')
+    expect(container.innerHTML).not.toContain('https://files.example/signed/acronym-secret')
+    expect(container.innerHTML).not.toContain('https://files.example/generic-secret-url')
+    expect(container.innerHTML).not.toContain('camel-file-id')
+    expect(container.innerHTML).not.toContain('/private/camel.txt')
+    expect(container.innerHTML).not.toContain('/workspace/storage/camel-file-id/camel.txt')
+    expect(container.innerHTML).not.toContain('/sandbox/camel/absolute.txt')
+    expect(container.innerHTML).not.toContain('/sandbox/camel/image.png')
+    expect(container.innerHTML).not.toContain('/sandbox/camel/local.txt')
+    expect(container.innerHTML).not.toContain('/sandbox/camel/output')
+    expect(container.innerHTML).not.toContain('/raw/absolute/result.txt')
+    expect(container.innerHTML).not.toContain('/raw/images/result.png')
+    expect(container.innerHTML).not.toContain('/raw/output')
+    expect(container.innerHTML).not.toContain('https://files.example/preview/camel')
+    expect(container.innerHTML).not.toContain('https://files.example/preview/acronym-camel')
+    expect(container.innerHTML).not.toContain('https://files.example/download/camel')
+    expect(container.innerHTML).not.toContain('https://files.example/download/acronym-camel')
   })
 
   it('renders pptx file links as inline previews', async () => {

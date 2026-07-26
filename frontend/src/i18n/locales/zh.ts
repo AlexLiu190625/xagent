@@ -484,6 +484,20 @@ const zh = {
       powered_by: "由 {appName} 提供"
     }
   },
+  widgetSession: {
+    startNewConversation: "开始新对话",
+    resetting: "正在开始...",
+    resetFailed: "无法开始新对话，请重试。",
+    expiryWarning: "此聊天会话即将过期，请刷新页面以继续。",
+    expired: {
+      title: "聊天会话已过期",
+      description: "请刷新页面以开始新的聊天会话。",
+    },
+    unavailable: {
+      title: "聊天暂不可用",
+      description: "目前无法打开此聊天，请稍后重试。",
+    },
+  },
   channels: {
     page_title: "渠道管理",
     page_description: "管理您的沟通渠道和机器人。",

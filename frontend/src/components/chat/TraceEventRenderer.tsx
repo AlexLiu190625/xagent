@@ -20,7 +20,12 @@ import {
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
 import { useI18n, type Translate } from '@/contexts/i18n-context';
-import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
+import {
+  getFilesDisabledFileLabel,
+  MarkdownRenderer,
+  projectFilesDisabledToolResultOutput,
+  serializeFilesDisabledValue,
+} from "@/components/ui/markdown-renderer";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
 import { InlineFilePreview } from '@/components/file/inline-file-preview';
@@ -35,14 +40,6 @@ interface ToolArgs {
   file_path?: string;
   content?: string;
   [key: string]: unknown;
-}
-
-interface ToolResult {
-  success?: boolean;
-  output?: string;
-  error?: string;
-  message?: string;
-  artifacts?: ToolArtifact[];
 }
 
 interface ToolArtifact {
@@ -79,7 +76,7 @@ interface TraceEvent {
       answer?: string;
       assistant_content?: string;
     };
-    result?: ToolResult | string;
+    result?: unknown;
     tools?: Array<{
       function: {
         name: string;
@@ -150,6 +147,7 @@ interface StepAction {
     args?: any;
     code?: string;
     output?: any;
+    rawResult?: unknown;
     artifacts?: ToolArtifact[];
     reasoning?: string;
     assistant_content?: string;
@@ -162,9 +160,12 @@ interface StepAction {
   };
 }
 
-function formatActionContent(value: unknown): string {
+function formatActionContent(value: unknown, filesDisabled = false): string {
   if (value === undefined || value === null) {
     return '';
+  }
+  if (filesDisabled) {
+    return serializeFilesDisabledValue(value)
   }
   if (typeof value === 'string') {
     return value;
@@ -662,6 +663,7 @@ export function processTraceEvents(
         const artifacts =
           typeof result === 'object' &&
             result !== null &&
+            'artifacts' in result &&
             Array.isArray(result.artifacts)
             ? result.artifacts
             : undefined;
@@ -673,6 +675,7 @@ export function processTraceEvents(
         if (action) {
           action.status = 'completed';
           action.data.output = output;
+          action.data.rawResult = result;
           if (artifacts) {
             action.data.artifacts = artifacts;
           }
@@ -686,6 +689,7 @@ export function processTraceEvents(
             timestamp,
             data: {
               output,
+              rawResult: result,
               artifacts,
               sandboxed: !!event.data?.sandboxed
             }
@@ -833,11 +837,22 @@ const ActionButton = ({ icon: Icon, onClick, title, className }: any) => (
   </button>
 );
 
-const CopyButton = ({ text, title }: { text: string, title?: string }) => {
+const CopyButton = ({
+  value,
+  filesDisabled,
+  title,
+}: {
+  value: unknown,
+  filesDisabled: boolean,
+  title?: string,
+}) => {
   const { t } = useI18n();
   const [copied, setCopied] = useState(false);
   const handleCopy = (e: React.MouseEvent) => {
     e.stopPropagation();
+    const text = filesDisabled
+      ? serializeFilesDisabledValue(value)
+      : formatActionContent(value);
     navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
@@ -853,12 +868,37 @@ const CopyButton = ({ text, title }: { text: string, title?: string }) => {
   );
 };
 
-const ToolArtifactsDisplay = ({ artifacts, onFileClick, t }: { artifacts?: ToolArtifact[]; onFileClick?: (filePath: string, fileName: string) => void; t: Translate }) => {
+const ToolArtifactsDisplay = ({
+  artifacts,
+  filesDisabled,
+  onFileClick,
+  t,
+}: {
+  artifacts?: ToolArtifact[];
+  filesDisabled: boolean;
+  onFileClick?: (filePath: string, fileName: string) => void;
+  t: Translate;
+}) => {
   const displayArtifacts = (artifacts || []).filter(
     artifact => artifact && (artifact.preview_url || artifact.file_id) && (artifact.display === undefined || artifact.display === 'inline')
   );
 
   if (displayArtifacts.length === 0) return null;
+
+  if (filesDisabled) {
+    return (
+      <div className="mt-4 grid gap-2">
+        {displayArtifacts.map((artifact, index) => (
+          <span
+            key={`${artifact.file_id || artifact.preview_url || index}`}
+            className="text-xs text-muted-foreground break-all"
+          >
+            {artifact.filename || artifact.type || t('traceEventRenderer.filePrefix')}
+          </span>
+        ))}
+      </div>
+    );
+  }
 
   return (
     <div className="mt-4 grid gap-3">
@@ -881,64 +921,102 @@ const ToolArtifactsDisplay = ({ artifacts, onFileClick, t }: { artifacts?: ToolA
   );
 };
 
-const ToolOutputDisplay = ({ action, isRunning, t, onFileClick, onAgentClick }: { action: StepAction, isRunning: boolean, t: any, onFileClick?: (filePath: string, fileName: string) => void, onAgentClick?: (agentId: string, agentName: string) => void }) => (
-  <>
-    <ToolArtifactsDisplay artifacts={action.data.artifacts} onFileClick={onFileClick} t={t} />
-    {action.data.output !== undefined && action.data.output !== '' && (
-      <div className="mt-4 flex flex-col gap-1.5">
-        <div className="text-xs text-muted-foreground px-1 flex justify-between items-center">
-          <span>{t('traceEventRenderer.output')}</span>
-          <CopyButton text={typeof action.data.output === 'string' ? action.data.output : JSON.stringify(action.data.output, null, 2)} />
-        </div>
-        <div className="p-3 bg-muted/30 border border-border/50 rounded-xl text-[10px] sm:text-xs overflow-x-auto">
-          {typeof action.data.output === 'string' ? (
-            <MarkdownRenderer
-              content={action.data.output}
-              onFileClick={onFileClick}
-              onAgentClick={onAgentClick}
-              className="prose-sm max-w-none"
-            />
-          ) : (
-            <pre className="text-foreground/80 whitespace-pre-wrap break-all font-mono">
-              {JSON.stringify(action.data.output, null, 2)}
-            </pre>
-          )}
-        </div>
-      </div>
-    )}
-    {(action.data.output === undefined || action.data.output === '') && isRunning && (
-      <div className="mt-4 p-3 bg-muted/30 border border-border/50 rounded-xl text-muted-foreground italic flex items-center gap-2 text-xs">
-        <Loader2 className="w-4 h-4 animate-spin" />
-        {t('traceEventRenderer.executing')}
-      </div>
-    )}
+const ToolOutputDisplay = ({
+  action,
+  filesDisabled,
+  isRunning,
+  t,
+  onFileClick,
+  onAgentClick,
+}: {
+  action: StepAction,
+  filesDisabled: boolean,
+  isRunning: boolean,
+  t: any,
+  onFileClick?: (filePath: string, fileName: string) => void,
+  onAgentClick?: (agentId: string, agentName: string) => void,
+}) => {
+  const displayOutput = filesDisabled && action.data.rawResult !== undefined
+    ? projectFilesDisabledToolResultOutput(action.data.rawResult)
+    : action.data.output;
 
-  </>
-);
+  return (
+    <>
+      <ToolArtifactsDisplay
+        artifacts={action.data.artifacts}
+        filesDisabled={filesDisabled}
+        onFileClick={onFileClick}
+        t={t}
+      />
+      {displayOutput !== undefined && displayOutput !== '' && (
+        <div className="mt-4 flex flex-col gap-1.5">
+          <div className="text-xs text-muted-foreground px-1 flex justify-between items-center">
+            <span>{t('traceEventRenderer.output')}</span>
+            <CopyButton value={displayOutput} filesDisabled={filesDisabled} />
+          </div>
+          <div className="p-3 bg-muted/30 border border-border/50 rounded-xl text-[10px] sm:text-xs overflow-x-auto">
+            {typeof displayOutput === 'string' ? (
+              <MarkdownRenderer
+                content={filesDisabled ? serializeFilesDisabledValue(displayOutput) : displayOutput}
+                filesDisabled={filesDisabled}
+                onFileClick={onFileClick}
+                onAgentClick={onAgentClick}
+                className="prose-sm max-w-none"
+              />
+            ) : (
+              <pre className="text-foreground/80 whitespace-pre-wrap break-all font-mono">
+                {filesDisabled
+                  ? serializeFilesDisabledValue(displayOutput)
+                  : JSON.stringify(displayOutput, null, 2)}
+              </pre>
+            )}
+          </div>
+        </div>
+      )}
+      {(displayOutput === undefined || displayOutput === '') && isRunning && (
+        <div className="mt-4 p-3 bg-muted/30 border border-border/50 rounded-xl text-muted-foreground italic flex items-center gap-2 text-xs">
+          <Loader2 className="w-4 h-4 animate-spin" />
+          {t('traceEventRenderer.executing')}
+        </div>
+      )}
+    </>
+  );
+};
 
-const ToolErrorDisplay = ({ action, t }: { action: StepAction, t: any }) => {
+const ToolErrorDisplay = ({
+  action,
+  filesDisabled,
+  t,
+}: {
+  action: StepAction,
+  filesDisabled: boolean,
+  t: any,
+}) => {
   if (action.status === 'failed' && action.data.error) {
     return (
       <div className="mb-2 mt-2 p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 whitespace-pre-wrap break-all text-xs">
-        <span className="font-semibold">{t('traceEventRenderer.errorLabel')}</span> {String(action.data.error)}
+        <span className="font-semibold">{t('traceEventRenderer.errorLabel')}</span> {formatActionContent(action.data.error, filesDisabled)}
       </div>
     );
   }
   return null;
 };
 
-const PythonToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
+const PythonToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
   const code = action.data.code;
   const filePath = action.data.args?.file_path;
+  const fileLabel = filesDisabled
+    ? getFilesDisabledFileLabel(action.data.args)
+    : filePath;
   return (
     <div className="pt-2">
       {code !== undefined && (
         <div className="flex flex-col gap-1.5">
-          {filePath && (
+          {fileLabel && (
             <div className="mb-1 flex">
               <span className="inline-flex px-2 py-1 bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded-md font-mono text-[11px] items-center gap-1.5 border border-blue-500/20">
                 <FileText className="w-3.5 h-3.5" />
-                {filePath}
+                {fileLabel}
               </span>
             </div>
           )}
@@ -946,7 +1024,7 @@ const PythonToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick,
             <div className="flex items-center gap-2">
               <span>{t('traceEventRenderer.code')}</span>
             </div>
-            <CopyButton text={code} />
+            <CopyButton value={code} filesDisabled={filesDisabled} />
           </div>
           <div className="p-3 bg-muted/30 border border-border/50 rounded-xl font-mono text-[10px] sm:text-xs overflow-x-auto relative group">
             <span className="absolute right-3 top-3 text-[10px] font-bold text-muted-foreground/50 select-none">PYTHON</span>
@@ -954,20 +1032,24 @@ const PythonToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick,
           </div>
         </div>
       )}
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      <ToolOutputDisplay action={action} filesDisabled={filesDisabled} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const BashToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
-  const command = action.data.args?.command || JSON.stringify(action.data.args);
+const BashToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
+  const command = action.data.args?.command || (
+    filesDisabled
+      ? serializeFilesDisabledValue(action.data.args)
+      : JSON.stringify(action.data.args)
+  );
   return (
     <div className="pt-2">
       {command !== undefined && (
         <div className="flex flex-col gap-1.5">
           <div className="text-xs text-muted-foreground px-1 flex justify-between items-center">
             <span>{t('traceEventRenderer.command')}</span>
-            <CopyButton text={command} />
+            <CopyButton value={command} filesDisabled={filesDisabled} />
           </div>
           <div className="p-3 bg-muted/30 border border-border/50 rounded-xl font-mono text-[10px] sm:text-xs overflow-x-auto text-foreground/80 whitespace-pre-wrap break-all">
             <span className="text-green-500/70 mr-2 select-none">$</span>
@@ -975,51 +1057,63 @@ const BashToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, o
           </div>
         </div>
       )}
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      <ToolOutputDisplay action={action} filesDisabled={filesDisabled} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const SearchToolRenderer = ({ action, isRunning, t, onFileClick, onAgentClick }: any) => {
-  const query = action.data.args?.query || JSON.stringify(action.data.args);
+const SearchToolRenderer = ({ action, filesDisabled, isRunning, t, onFileClick, onAgentClick }: any) => {
+  const query = action.data.args?.query || (
+    filesDisabled
+      ? serializeFilesDisabledValue(action.data.args)
+      : JSON.stringify(action.data.args)
+  );
   return (
     <div className="pt-2">
       <div className="flex flex-col gap-1.5">
         <div className="text-xs text-muted-foreground px-1 flex justify-between items-center">
           <span>{t('traceEventRenderer.searchQuery')}</span>
-          <CopyButton text={query} />
+          <CopyButton value={query} filesDisabled={filesDisabled} />
         </div>
         <div className="p-3 bg-muted/30 border border-border/50 rounded-xl text-xs flex items-start gap-2">
           <Search className="w-4 h-4 text-muted-foreground mt-0.5 shrink-0" />
           <span className="italic text-foreground/80 whitespace-pre-wrap break-all">{query}</span>
         </div>
       </div>
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      <ToolOutputDisplay action={action} filesDisabled={filesDisabled} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const FileToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
+const FileToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
   const { args, tool } = action.data;
   const filePath = args?.file_path || args?.path;
+  const fileLabel = filesDisabled
+    ? getFilesDisabledFileLabel(args)
+    : filePath;
   const content = args?.content || args?.text || args?.code;
-  const fallbackText = !content ? JSON.stringify(args, null, 2) : undefined;
+  const fallbackText = !content
+    ? (filesDisabled ? serializeFilesDisabledValue(args) : JSON.stringify(args, null, 2))
+    : undefined;
 
   return (
     <div className="pt-2">
       <div className="flex flex-col gap-1.5">
-        {filePath && (
+        {fileLabel && (
           <div className="mb-1 flex">
             <span
-              className="inline-flex px-2 py-1 bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded-md font-mono text-[11px] items-center gap-1.5 border border-blue-500/20 cursor-pointer hover:bg-blue-500/20 transition-colors"
-              onClick={(e) => {
+              className={cn(
+                "inline-flex px-2 py-1 bg-blue-500/10 text-blue-600 dark:text-blue-400 rounded-md font-mono text-[11px] items-center gap-1.5 border border-blue-500/20",
+                !filesDisabled && "cursor-pointer hover:bg-blue-500/20 transition-colors",
+              )}
+              onClick={filesDisabled ? undefined : (e) => {
                 e.stopPropagation();
                 onOpenTerminal(String(content || fallbackText || ''), typeof action.data.output === 'string' ? action.data.output : JSON.stringify(action.data.output ?? ''), tool || 'file_tool', filePath);
               }}
-              title={t('traceEventRenderer.previewFile')}
+              title={filesDisabled ? undefined : t('traceEventRenderer.previewFile')}
             >
               <FileText className="w-3.5 h-3.5" />
-              {filePath}
+              {fileLabel}
             </span>
           </div>
         )}
@@ -1028,7 +1122,9 @@ const FileToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, o
             <span>{content ? (t('traceEventRenderer.content')) : (t('traceEventRenderer.args'))}</span>
           </div>
           <div className="flex items-center gap-1">
-            {(content || fallbackText) && <CopyButton text={String(content || fallbackText)} />}
+            {(content || fallbackText) && (
+              <CopyButton value={content || fallbackText} filesDisabled={filesDisabled} />
+            )}
           </div>
         </div>
         <div className="p-3 bg-muted/30 border border-border/50 rounded-xl font-mono text-[10px] sm:text-xs overflow-x-auto text-foreground/80 whitespace-pre-wrap break-all">
@@ -1039,47 +1135,49 @@ const FileToolRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, o
           )}
         </div>
       </div>
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      <ToolOutputDisplay action={action} filesDisabled={filesDisabled} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const DefaultToolRenderer = ({ action, isRunning, t, onFileClick, onAgentClick }: any) => {
-  const args = JSON.stringify(action.data.args, null, 2);
+const DefaultToolRenderer = ({ action, filesDisabled, isRunning, t, onFileClick, onAgentClick }: any) => {
+  const args = filesDisabled
+    ? serializeFilesDisabledValue(action.data.args)
+    : JSON.stringify(action.data.args, null, 2);
   return (
     <div className="pt-2">
       <div className="flex flex-col gap-1.5">
         <div className="text-xs text-muted-foreground px-1 flex justify-between items-center">
           <span>{t('traceEventRenderer.args')}</span>
-          <CopyButton text={args} />
+          <CopyButton value={args} filesDisabled={filesDisabled} />
         </div>
         <div className="p-3 bg-muted/30 border border-border/50 rounded-xl font-mono text-[10px] sm:text-xs overflow-x-auto text-foreground/80 whitespace-pre-wrap break-all">
           <pre className="whitespace-pre-wrap break-all">{args}</pre>
         </div>
       </div>
-      <ToolOutputDisplay action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      <ToolOutputDisplay action={action} filesDisabled={filesDisabled} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
     </div>
   );
 };
 
-const ToolDetailsRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
+const ToolDetailsRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
   const toolName = action.data.tool;
   let rendererContent = null;
   if (toolName === 'python_executor' || toolName === 'execute_python_code') {
-    rendererContent = <PythonToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
+    rendererContent = <PythonToolRenderer action={action} filesDisabled={filesDisabled} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else if (toolName === 'bash') {
-    rendererContent = <BashToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
+    rendererContent = <BashToolRenderer action={action} filesDisabled={filesDisabled} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else if (toolName === 'web_search' || toolName === 'tavily_web_search') {
-    rendererContent = <SearchToolRenderer action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
+    rendererContent = <SearchToolRenderer action={action} filesDisabled={filesDisabled} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else if (toolName && (toolName.includes('file') || toolName === 'list_directory')) {
-    rendererContent = <FileToolRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
+    rendererContent = <FileToolRenderer action={action} filesDisabled={filesDisabled} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   } else {
-    rendererContent = <DefaultToolRenderer action={action} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
+    rendererContent = <DefaultToolRenderer action={action} filesDisabled={filesDisabled} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />;
   }
 
   return (
     <div className="flex flex-col">
-      <ToolErrorDisplay action={action} t={t} />
+      <ToolErrorDisplay action={action} filesDisabled={filesDisabled} t={t} />
       {rendererContent}
     </div>
   );
@@ -1090,13 +1188,21 @@ const ToolDetailsRenderer = ({ action, onOpenTerminal, isRunning, t, onFileClick
 // Step Action Item Component
 interface StepActionItemProps {
   action: StepAction;
+  filesDisabled: boolean;
   onViewDetail: (action: StepAction) => void;
   onOpenTerminal: (code: string, output: string, toolName: string, filePath?: string) => void;
   onFileClick?: (filePath: string, fileName: string) => void;
   onAgentClick?: (agentId: string, agentName: string) => void;
 }
 
-function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onAgentClick }: StepActionItemProps) {
+function StepActionItem({
+  action,
+  filesDisabled,
+  onViewDetail,
+  onOpenTerminal,
+  onFileClick,
+  onAgentClick,
+}: StepActionItemProps) {
   const { t } = useI18n();
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -1140,7 +1246,10 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
   const summary = useMemo(() => {
     if (action.type === 'llm') {
       if (action.data.reasoning) {
-        const clean = action.data.reasoning.replace(/[\n\r\s]+/g, ' ').trim();
+        const clean = formatActionContent(
+          action.data.reasoning,
+          filesDisabled,
+        ).replace(/[\n\r\s]+/g, ' ').trim();
         return clean.length > 50 ? clean.slice(0, 50) + '...' : clean;
       }
       return null;
@@ -1159,9 +1268,13 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
       }
 
       if (args && typeof args === 'object') {
-        if ('file_path' in args) return `${t('traceEventRenderer.filePrefix')} ${String(args.file_path)}`;
+        if ('file_path' in args || 'path' in args) {
+          const fileLabel = filesDisabled ? getFilesDisabledFileLabel(args) : (
+            'file_path' in args ? String(args.file_path) : String(args.path)
+          );
+          return fileLabel ? `${t('traceEventRenderer.filePrefix')} ${fileLabel}` : null;
+        }
         if ('query' in args) return `${t('traceEventRenderer.queryPrefix')} ${String(args.query)}`;
-        if ('path' in args) return `${t('traceEventRenderer.pathPrefix')} ${String(args.path)}`;
       }
 
       if (code) {
@@ -1171,17 +1284,19 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
 
       if (args) {
         try {
-          const str = JSON.stringify(args);
+          const str = filesDisabled
+            ? serializeFilesDisabledValue(args)
+            : JSON.stringify(args);
           return str.length > 50 ? str.slice(0, 50) + '...' : str;
         } catch (e) { return null; }
       }
     }
     if (action.type === 'info' && action.data.output) {
-      const clean = formatActionContent(action.data.output).replace(/[\n\r\s]+/g, ' ').trim();
+      const clean = formatActionContent(action.data.output, filesDisabled).replace(/[\n\r\s]+/g, ' ').trim();
       return clean.length > 50 ? clean.slice(0, 50) + '...' : clean;
     }
     return null;
-  }, [action.type, action.data, t]);
+  }, [action.type, action.data, filesDisabled, t]);
 
   const updateToolSummaryVisibility = useCallback(() => {
     if (action.type !== 'tool' || !summary) {
@@ -1228,7 +1343,8 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
     return (
       <div className="px-3 py-1.5">
         <MarkdownRenderer
-          content={formatActionContent(action.data.output)}
+          content={formatActionContent(action.data.output, filesDisabled)}
+          filesDisabled={filesDisabled}
           onFileClick={onFileClick}
           className="text-sm leading-relaxed text-foreground prose-neutral dark:prose-invert max-w-none [&>p]:mb-1.5 [&>p:last-child]:mb-0"
         />
@@ -1241,7 +1357,11 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
       <div className="group transition-all duration-300">
         {action.data.reasoning && (
           <MarkdownRenderer
-            content={action.data.reasoning}
+            content={formatActionContent(
+              action.data.reasoning,
+              filesDisabled,
+            )}
+            filesDisabled={filesDisabled}
             onFileClick={onFileClick}
             className="
                 text-sm text-muted-foreground leading-relaxed
@@ -1252,7 +1372,10 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
         )}
         {action.status === 'failed' && action.data.error && (
           <div className="text-red-400 text-sm mt-1 whitespace-pre-wrap">
-            {t('traceEventRenderer.errorLabel')}{String(action.data.error)}
+            {t('traceEventRenderer.errorLabel')}{formatActionContent(
+              action.data.error,
+              filesDisabled,
+            )}
           </div>
         )}
       </div>
@@ -1334,22 +1457,37 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
           >
             <ScrollArea ref={scrollRef} className="max-h-[300px] w-full mt-1 bg-muted/30 border border-border/50 rounded-md overflow-auto">
               <div
-                className="p-3 space-y-2 font-mono text-xs cursor-pointer hover:bg-muted/50 transition-colors"
-                onClick={() => onViewDetail(action)}
+                className={cn(
+                  "p-3 space-y-2 font-mono text-xs",
+                  !filesDisabled && "cursor-pointer hover:bg-muted/50 transition-colors",
+                )}
+                onClick={filesDisabled ? undefined : () => onViewDetail(action)}
               >
                 {action.type === 'tool' && (
-                  <ToolDetailsRenderer action={action} onOpenTerminal={onOpenTerminal} isRunning={isRunning} t={t} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+                  <ToolDetailsRenderer
+                    action={action}
+                    filesDisabled={filesDisabled}
+                    onOpenTerminal={onOpenTerminal}
+                    isRunning={isRunning}
+                    t={t}
+                    onFileClick={onFileClick}
+                    onAgentClick={onAgentClick}
+                  />
                 )}
 
                 {action.type === 'error' && (
                   <div className="text-red-400 whitespace-pre-wrap">
-                    {String(action.data.error)}
+                    {formatActionContent(
+                      action.data.error,
+                      filesDisabled,
+                    )}
                   </div>
                 )}
 
                 {action.type === 'info' && (
                   <MarkdownRenderer
-                    content={formatActionContent(action.data.output)}
+                    content={formatActionContent(action.data.output, filesDisabled)}
+                    filesDisabled={filesDisabled}
                     onFileClick={onFileClick}
                     className="text-sm leading-relaxed prose-neutral dark:prose-invert max-w-none"
                   />
@@ -1367,6 +1505,7 @@ function StepActionItem({ action, onViewDetail, onOpenTerminal, onFileClick, onA
 interface StepItemProps {
   step: ProcessedStep;
   index: number;
+  filesDisabled: boolean;
   onOpenTerminal: (code: string, output: string, toolName: string, filePath?: string) => void;
   onViewDetail: (action: StepAction) => void;
   onFileClick?: (filePath: string, fileName: string) => void;
@@ -1375,7 +1514,17 @@ interface StepItemProps {
   defaultExpanded?: boolean;
 }
 
-function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAgentClick, onAgentExecutionClick, defaultExpanded = false }: StepItemProps) {
+function StepItem({
+  step,
+  index,
+  filesDisabled,
+  onOpenTerminal,
+  onViewDetail,
+  onFileClick,
+  onAgentClick,
+  onAgentExecutionClick,
+  defaultExpanded = false,
+}: StepItemProps) {
   const { t } = useI18n();
   const isCompleted = step.status === 'completed';
   const isFailed = step.status === 'failed';
@@ -1476,8 +1625,11 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
       {workforceSummaries.map((action) => (
         <div key={`${action.id}-summary`} className="ml-7 pr-2 text-sm">
           <MarkdownRenderer
-            content={String(action.data.output)}
+            content={filesDisabled
+              ? serializeFilesDisabledValue(action.data.output)
+              : String(action.data.output)}
             className="prose-sm leading-relaxed"
+            filesDisabled={filesDisabled}
             onFileClick={onFileClick}
             onAgentClick={onAgentClick}
           />
@@ -1499,6 +1651,7 @@ function StepItem({ step, index, onOpenTerminal, onViewDetail, onFileClick, onAg
                 <StepActionItem
                   key={action.id}
                   action={action}
+                  filesDisabled={filesDisabled}
                   onViewDetail={onViewDetail}
                   onOpenTerminal={onOpenTerminal}
                   onFileClick={onFileClick}
@@ -1524,7 +1677,7 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
   const steps = useProcessedSteps(sanitizedEvents, processStatus);
   const router = useRouter();
 
-  const { openFilePreview, dispatch } = useApp();
+  const { filesDisabled, openFilePreview, dispatch } = useApp();
 
   const handleAgentClick = useCallback((agentId: string, agentName: string) => {
     router.push(`/agent/${agentId}`);
@@ -1584,6 +1737,8 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
   };
 
   const handleOpenTerminal = useCallback((code: string, output: string, toolName: string, filePath?: string) => {
+    if (filesDisabled) return;
+
     if (filePath && filePath.trim()) {
       const fileName = getFileNameFromPath(filePath) || `${toolName || 'terminal'}-execution.txt`;
       openFilePreview(filePath, fileName);
@@ -1600,9 +1755,11 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
       contentSections.push(`\n\n${t('traceEventRenderer.outputResult')}\n\n${String(output).trim()}`);
     }
     dispatch({ type: "SET_FILE_PREVIEW_CONTENT", payload: { content: contentSections.join('\n'), error: null } });
-  }, [openFilePreview, dispatch, t]);
+  }, [filesDisabled, openFilePreview, dispatch, t]);
 
   const handleViewActionDetail = useCallback((action: StepAction) => {
+    if (filesDisabled) return;
+
     const title = `${action.title.replace(/\s+/g, '_')}.json`;
     openFilePreview('', title);
 
@@ -1631,7 +1788,7 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
     }
 
     dispatch({ type: "SET_FILE_PREVIEW_CONTENT", payload: { content, error: null } });
-  }, [openFilePreview, dispatch, t]);
+  }, [filesDisabled, openFilePreview, dispatch, t]);
 
   return (
     <div className="space-y-4">
@@ -1669,9 +1826,10 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
               key={step.stepId}
               step={step}
               index={index}
+              filesDisabled={filesDisabled}
               onOpenTerminal={handleOpenTerminal}
               onViewDetail={handleViewActionDetail}
-              onFileClick={openFilePreview}
+              onFileClick={filesDisabled ? undefined : openFilePreview}
               onAgentClick={handleAgentClick}
               onAgentExecutionClick={onAgentExecutionClick}
               defaultExpanded={defaultExpandSteps}

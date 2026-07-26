@@ -60,6 +60,18 @@ export interface WebSocketConnection {
   credentialOwner: WebSocketCredentialOwner
 }
 
+export type WebSocketConnectionFailure =
+  | {
+    code: "creation_failed" | "protocol_mismatch" | "unknown"
+    recoverable: false
+    error: Error
+  }
+  | {
+    code: "transport_error"
+    recoverable: true
+    error: Error
+  }
+
 interface PendingDelivery {
   resolve: (ack: MessageDeliveryAck) => void
   reject: (error: Error) => void
@@ -86,10 +98,31 @@ interface MessagePreparationClaim {
 
 interface WebSocketCallbacks {
   onConnectionClose?: (event: CloseEvent) => "handled" | "default"
+  onConnectionFailure?: (failure: WebSocketConnectionFailure) => void
   onConnect?: () => void
   onDisconnect?: () => void
   onError?: (error: Error) => void
   onMessage?: (message: WebSocketMessage) => void
+}
+
+const reportConnectionFailure = (
+  callbacks: WebSocketCallbacks,
+  failure: WebSocketConnectionFailure,
+) => {
+  const invokeSafely = <T,>(
+    callback: ((value: T) => void) | undefined,
+    value: T,
+  ) => {
+    if (!callback) return
+    try {
+      callback(value)
+    } catch {
+      console.error("WebSocket connection failure callback failed")
+    }
+  }
+
+  invokeSafely(callbacks.onConnectionFailure, failure)
+  invokeSafely(callbacks.onError, failure.error)
 }
 
 interface SocketOwner {
@@ -122,6 +155,7 @@ export interface UseWebSocketOptions {
   connection?: WebSocketConnection | null
   deliveryGeneration?: number
   onConnectionClose?: (event: CloseEvent) => "handled" | "default"
+  onConnectionFailure?: (failure: WebSocketConnectionFailure) => void
   autoConnect?: boolean
   onMessage?: (message: WebSocketMessage) => void
   onConnect?: () => void
@@ -160,6 +194,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     connection: connectionOption,
     deliveryGeneration = 0,
     onConnectionClose,
+    onConnectionFailure,
     autoConnect = true,
     onMessage,
     onConnect,
@@ -232,6 +267,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const recentMessagesRef = useRef<RecentMessage[]>([])
   const callbacksRef = useRef<WebSocketCallbacks>({
     onConnectionClose,
+    onConnectionFailure,
     onConnect,
     onDisconnect,
     onError,
@@ -459,6 +495,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     deliveryGenerationRef.current = deliveryGeneration
     callbacksRef.current = {
       onConnectionClose,
+      onConnectionFailure,
       onConnect,
       onDisconnect,
       onError,
@@ -536,7 +573,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           isConnectingRef.current = false
           setIsConnected(false)
           setConnectionError(protocolError)
-          owner.callbacks.onError?.(protocolError)
+          reportConnectionFailure(owner.callbacks, {
+            code: "protocol_mismatch",
+            recoverable: false,
+            error: protocolError,
+          })
           socket.close(1002, "WebSocket subprotocol mismatch")
           return
         }
@@ -564,7 +605,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             const handlerError = new Error("WebSocket close handler failed.")
             console.error("WebSocket close handler failed")
             setConnectionError(handlerError)
-            owner.callbacks.onError?.(handlerError)
+            reportConnectionFailure(owner.callbacks, {
+              code: "unknown",
+              recoverable: false,
+              error: handlerError,
+            })
           }
           return
         }
@@ -664,7 +709,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         setConnectionError(connectionError)
         setIsConnected(false)
         isConnectingRef.current = false
-        owner.callbacks.onError?.(connectionError)
+        reportConnectionFailure(owner.callbacks, {
+          code: "transport_error",
+          recoverable: true,
+          error: connectionError,
+        })
 
         // Reset reconnect attempts to prevent immediate reconnection when backend is not available
         clearRetryTimers()
@@ -840,7 +889,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       const connectionError = new Error("Failed to create WebSocket connection.")
       isConnectingRef.current = false
       setConnectionError(connectionError)
-      callbacksRef.current.onError?.(connectionError)
+      reportConnectionFailure(callbacksRef.current, {
+        code: "creation_failed",
+        recoverable: false,
+        error: connectionError,
+      })
     }
   }, [
     clearRetryTimers,

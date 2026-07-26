@@ -27,6 +27,11 @@ const webSocketOptions = vi.hoisted(() => ({
     } | null
     deliveryGeneration?: number
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
+    onConnectionFailure?: (failure: {
+      code: "creation_failed" | "protocol_mismatch" | "transport_error" | "unknown"
+      recoverable: boolean
+      error: Error
+    }) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: () => void
     uploadFiles?: unknown
@@ -71,6 +76,11 @@ vi.mock("@/hooks/use-websocket", () => ({
     } | null
     deliveryGeneration?: number
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
+    onConnectionFailure?: (failure: {
+      code: "creation_failed" | "protocol_mismatch" | "transport_error" | "unknown"
+      recoverable: boolean
+      error: Error
+    }) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: () => void
     uploadFiles?: unknown
@@ -178,6 +188,9 @@ function SessionControlsProbe() {
       <div data-testid="message-delivery-pending">
         {String(sessionControls.isMessageDeliveryPending)}
       </div>
+      <div data-testid="files-disabled">
+        {String(sessionControls.filesDisabled)}
+      </div>
     </>
   )
 }
@@ -205,6 +218,7 @@ const makeSessionTransport = (
   session: {
     connection,
     onConnectionClose: () => "handled" as const,
+    onConnectionFailure: vi.fn(),
     allowTasklessChat: true as const,
     supportsConversationReset: true as const,
     preserveConversationOnReconnect: true as const,
@@ -1334,6 +1348,9 @@ describe("AppProvider websocket message routing", () => {
     expect(webSocketOptions.current?.onConnectionClose).toBe(
       transport.session.onConnectionClose
     )
+    expect(webSocketOptions.current?.onConnectionFailure).toBe(
+      transport.session.onConnectionFailure
+    )
     expect(webSocketOptions.current?.uploadFiles).toBeUndefined()
 
     let delivery!: Promise<void>
@@ -2003,6 +2020,7 @@ describe("AppProvider websocket message routing", () => {
         <MessageContentProbe />
       </AppProvider>
     )
+    expect(screen.getByTestId("files-disabled").textContent).toBe("true")
     const file = new File(["secret"], "secret.txt", { type: "text/plain" })
 
     await expect(

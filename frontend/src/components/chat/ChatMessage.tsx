@@ -5,12 +5,19 @@ import { cn } from "@/lib/utils";
 import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
-import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
+import {
+  MarkdownRenderer,
+  sanitizeFilesDisabledText,
+  serializeFilesDisabledValue,
+} from "@/components/ui/markdown-renderer";
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
 import { ClarificationForm } from "./clarification-form";
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status";
+
+const MARKDOWN_FILE_REF_RE = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
+const BACKTICK_FILE_REF_RE = /`([^`]+)`/g;
 
 interface ToolArgs {
   code?: string;
@@ -137,7 +144,13 @@ function GeneratingIndicator({ latestTitle, taskStatus, errorMessage }: { latest
   );
 }
 
-function ExpandableMessage({ content }: { content: string }) {
+function ExpandableMessage({
+  content,
+  filesDisabled,
+}: {
+  content: string;
+  filesDisabled: boolean;
+}) {
   const [isExpanded, setIsExpanded] = useState(false);
   const [isOverflowing, setIsOverflowing] = useState(false);
   const contentRef = useRef<HTMLDivElement>(null);
@@ -166,8 +179,19 @@ function ExpandableMessage({ content }: { content: string }) {
 
   if (!content) return null;
 
-  const markdownRegex = /\[([^\]]+)\]\(file:(?:\/\/)?([^)]+)\)/g;
-  const backtickRegex = /`([^`]+)`/g;
+  if (filesDisabled) {
+    const inertContent = sanitizeFilesDisabledText(content);
+    return (
+      <div className="relative max-w-full min-w-0">
+        <div className="max-w-full min-w-0 text-sm leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] py-[2px]">
+          {inertContent}
+        </div>
+      </div>
+    );
+  }
+
+  const markdownRegex = new RegExp(MARKDOWN_FILE_REF_RE);
+  const backtickRegex = new RegExp(BACKTICK_FILE_REF_RE);
 
   const segments: React.ReactNode[] = [];
   let lastIndex = 0;
@@ -287,16 +311,19 @@ export function ChatMessage({
   onSendInteraction,
 }: ChatMessageProps) {
   const { t, tDynamic } = useI18n();
-  const { openFilePreview } = useApp();
+  const { filesDisabled, openFilePreview } = useApp();
   const router = useRouter();
   const isUser = role === "user";
   const [copied, setCopied] = useState(false);
 
   const copyableContent = typeof content === "string" ? content : rawContent;
+  const filesDisabledCopyableContent = filesDisabled && copyableContent
+    ? serializeFilesDisabledValue(copyableContent)
+    : copyableContent;
 
   const handleCopy = () => {
-    if (copyableContent) {
-      navigator.clipboard.writeText(copyableContent);
+    if (filesDisabledCopyableContent) {
+      navigator.clipboard.writeText(filesDisabledCopyableContent);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
@@ -307,6 +334,7 @@ export function ChatMessage({
   };
 
   const handleFileClick = (filePath: string, fileName: string) => {
+    if (filesDisabled) return;
     openFilePreview?.(filePath, fileName, [{ fileName, fileId: filePath }]);
   };
 
@@ -413,13 +441,17 @@ export function ChatMessage({
               ) : content ? (
                 typeof content === "string" ? (
                   isUser ? (
-                    <ExpandableMessage content={content} />
+                    <ExpandableMessage
+                      content={content}
+                      filesDisabled={filesDisabled}
+                    />
                   ) : (
                     <MarkdownRenderer
                       content={content}
                       className="prose-sm pt-2 leading-relaxed break-words [overflow-wrap:anywhere]"
+                      filesDisabled={filesDisabled}
                       onAgentClick={handleAgentClick}
-                      onFileClick={handleFileClick}
+                      onFileClick={filesDisabled ? undefined : handleFileClick}
                     />
                   )
                 ) : (

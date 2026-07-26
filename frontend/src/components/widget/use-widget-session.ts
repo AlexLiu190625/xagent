@@ -1,6 +1,7 @@
 "use client"
 
 import { useCallback, useEffect, useRef, useState } from "react"
+import type { WebSocketConnectionFailure } from "@/hooks/use-websocket"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
@@ -27,6 +28,7 @@ export interface WidgetSession {
 interface WidgetSessionBridgeState {
   status: WidgetSessionStatus
   session: WidgetSession | null
+  agent: WidgetSessionAgent | null
   terminalCode: string | null
   isAbsoluteExpiryWarningVisible: boolean
 }
@@ -40,6 +42,7 @@ interface ProtocolMessage extends Record<string, unknown> {
 const initialState: WidgetSessionBridgeState = {
   status: "waiting",
   session: null,
+  agent: null,
   terminalCode: null,
   isAbsoluteExpiryWarningVisible: false,
 }
@@ -119,6 +122,7 @@ export function useWidgetSession() {
     setState({
       status: "terminal",
       session: null,
+      agent: null,
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
@@ -130,14 +134,42 @@ export function useWidgetSession() {
 
     reconnectRequestedRef.current = true
     clearWarningTimer()
-    setState({
+    setState((current) => ({
       status: "refreshing",
       session: null,
+      agent: current.agent,
       terminalCode: null,
       isAbsoluteExpiryWarningVisible: false,
-    })
+    }))
     window.parent.postMessage({ xagent: true, v: 1, type: "reconnect_request", reason }, targetOrigin)
   }, [clearWarningTimer])
+
+  const handleConnectionClose = useCallback((event: CloseEvent): "handled" => {
+    if (event.code === 1000) return "handled"
+
+    if (event.code === 4403) {
+      transitionTerminal("ws_4403")
+      return "handled"
+    }
+
+    if (event.code === 4408) {
+      transitionTerminal("ws_4408")
+      return "handled"
+    }
+
+    requestReconnect("ws_closed")
+    return "handled"
+  }, [requestReconnect, transitionTerminal])
+
+  const handleConnectionFailure = useCallback((
+    failure: WebSocketConnectionFailure,
+  ) => {
+    if (failure.code === "transport_error" && failure.recoverable) {
+      requestReconnect("ws_closed")
+      return
+    }
+    transitionTerminal("unexpected_error")
+  }, [requestReconnect, transitionTerminal])
 
   const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
     clearWarningTimer()
@@ -203,6 +235,7 @@ export function useWidgetSession() {
       setState({
         status: "active",
         session,
+        agent,
         terminalCode: null,
         isAbsoluteExpiryWarningVisible: false,
       })
@@ -223,5 +256,7 @@ export function useWidgetSession() {
     ...state,
     parentOrigin,
     requestReconnect,
+    handleConnectionClose,
+    handleConnectionFailure,
   }
 }

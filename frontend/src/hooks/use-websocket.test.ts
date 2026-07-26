@@ -454,16 +454,23 @@ describe("useWebSocket normalized connections", () => {
     MockWebSocket.constructorError = new Error(`constructor rejected ${secret}`)
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
     const onError = vi.fn()
+    const onConnectionFailure = vi.fn()
 
     const { result } = renderHook(() => useWebSocket({
       connection: sessionConnection({
         protocols: ["xagent-session-v1", secret],
       }),
       onError,
+      onConnectionFailure,
     }))
 
     await waitFor(() => expect(result.current.connectionError).not.toBeNull())
     expect(onError).toHaveBeenCalledOnce()
+    expect(onConnectionFailure).toHaveBeenCalledWith({
+      code: "creation_failed",
+      recoverable: false,
+      error: result.current.connectionError,
+    })
     const exposed = [
       result.current.connectionError?.message,
       ...onError.mock.calls.map(([error]) => (error as Error).message),
@@ -478,10 +485,12 @@ describe("useWebSocket normalized connections", () => {
   it("fails closed when the server omits the required Session subprotocol echo", async () => {
     const onConnect = vi.fn()
     const onError = vi.fn()
+    const onConnectionFailure = vi.fn()
     const { result } = renderHook(() => useWebSocket({
       connection: sessionConnection(),
       onConnect,
       onError,
+      onConnectionFailure,
     }))
 
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -491,7 +500,76 @@ describe("useWebSocket normalized connections", () => {
     expect(result.current.isConnected).toBe(false)
     expect(onConnect).not.toHaveBeenCalled()
     expect(onError).toHaveBeenCalledOnce()
+    expect(onConnectionFailure).toHaveBeenCalledWith({
+      code: "protocol_mismatch",
+      recoverable: false,
+      error: result.current.connectionError,
+    })
     expect(socket.close).toHaveBeenCalled()
+  })
+
+  it.each(["legacy error", "typed owner"] as const)(
+    "isolates a throwing %s callback while closing a protocol mismatch",
+    async (throwingCallback) => {
+      const secret = `callback-secret-${throwingCallback}`
+      const order: string[] = []
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
+      const onError = vi.fn(() => {
+        order.push("legacy")
+        if (throwingCallback === "legacy error") {
+          throw new Error(secret)
+        }
+      })
+      const onConnectionFailure = vi.fn(() => {
+        order.push("typed")
+        if (throwingCallback === "typed owner") {
+          throw new Error(secret)
+        }
+      })
+      renderHook(() => useWebSocket({
+        connection: sessionConnection(),
+        onError,
+        onConnectionFailure,
+      }))
+
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+      const socket = MockWebSocket.instances[0]
+
+      expect(() => act(() => socket.open())).not.toThrow()
+      expect(order).toEqual(["typed", "legacy"])
+      expect(onConnectionFailure).toHaveBeenCalledOnce()
+      expect(onError).toHaveBeenCalledOnce()
+      expect(socket.close).toHaveBeenCalledWith(
+        1002,
+        "WebSocket subprotocol mismatch",
+      )
+      expect(consoleError.mock.calls.flat().map(String).join(" "))
+        .not.toContain(secret)
+    },
+  )
+
+  it("classifies a physical socket error as a recoverable connection failure", async () => {
+    const onError = vi.fn()
+    const onConnectionFailure = vi.fn()
+    const { result } = renderHook(() => useWebSocket({
+      connection: sessionConnection(),
+      onError,
+      onConnectionFailure,
+    }))
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    socket.protocol = "xagent-session-v1"
+    act(() => socket.open())
+    act(() => socket.triggerError())
+
+    expect(result.current.isConnected).toBe(false)
+    expect(onError).toHaveBeenCalledOnce()
+    expect(onConnectionFailure).toHaveBeenCalledWith({
+      code: "transport_error",
+      recoverable: true,
+      error: result.current.connectionError,
+    })
   })
 
   it("sends and acknowledges taskless Session chat without a task id", async () => {
@@ -572,6 +650,7 @@ describe("useWebSocket normalized connections", () => {
     const secret = "xagent-session-token.st_close_delegate_secret"
     authState.refreshAccessToken.mockResolvedValue(true)
     const onError = vi.fn()
+    const onConnectionFailure = vi.fn()
     const onDisconnect = vi.fn()
     const consoleError = vi.spyOn(console, "error").mockImplementation(() => {})
     const { result } = renderHook(() => useWebSocket({
@@ -581,6 +660,7 @@ describe("useWebSocket normalized connections", () => {
       },
       onDisconnect,
       onError,
+      onConnectionFailure,
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const socket = MockWebSocket.instances[0]
@@ -610,6 +690,11 @@ describe("useWebSocket normalized connections", () => {
     expect(result.current.isConnected).toBe(false)
     expect(result.current.connectionError).not.toBeNull()
     expect(onError).toHaveBeenCalledOnce()
+    expect(onConnectionFailure).toHaveBeenCalledWith({
+      code: "unknown",
+      recoverable: false,
+      error: result.current.connectionError,
+    })
     expect(onDisconnect).not.toHaveBeenCalled()
     expect(authState.refreshAccessToken).not.toHaveBeenCalled()
     await act(async () => {

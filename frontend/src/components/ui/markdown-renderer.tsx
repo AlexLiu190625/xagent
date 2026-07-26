@@ -43,9 +43,317 @@ const isLikelyMarkdown = (s: string): boolean => {
   )
 }
 
+const FILE_NAME_KEYS = new Set(['filename', 'file_name', 'name'])
+const FILE_DESCRIPTOR_KEYS = new Set(['mime_type', 'type'])
+const GENERIC_IDENTITY_AND_LOCATION_KEYS = new Set(['id', 'url', 'href', 'uri'])
+const FILE_RECORD_COLLECTION_KEYS = new Set(['artifacts', 'documents', 'files'])
+const KNOWN_FILE_DESCRIPTOR_VALUES = new Set([
+  'audio',
+  'document',
+  'file',
+  'image',
+  'presentation',
+  'spreadsheet',
+  'video',
+])
+const LOCAL_FILE_LOCATION_KEYS = new Set([
+  // Backend artifacts.LOCAL_PATH_KEYS.
+  'absolute_path',
+  'file_path',
+  'image_path',
+  'local_path',
+  'output_dir',
+  'output_path',
+  // Additional local locations emitted by current tool-result producers.
+  'audio_path',
+  'backup_path',
+  'base_dir',
+  'current_path',
+  'full_path',
+  'json_path',
+  'marked_image_path',
+  'relative_path',
+  'source_path',
+  'storage_path',
+  'transcription_path',
+  'translation_path',
+  'uploads_directory',
+  'video_path',
+  'workspace_dir',
+])
+const AMBIGUOUS_FILE_LOCATION_KEYS = new Set(['path', 'directory'])
+const FILE_MARKDOWN_REFERENCE_RE = /!?\[([^\]]*)\]\(\s*file:(?:\/\/)?[^)]*\)/g
+const BACKTICK_FILE_PATH_RE = /`([^`\n]*[\\/][^`\n]*)`/g
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function normalizeFileMetadataKey(key: string): string {
+  return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
+}
+
+function isFileIdKey(key: string): boolean {
+  const normalized = normalizeFileMetadataKey(key)
+  return normalized === 'file_id' || normalized.endsWith('_file_id')
+}
+
+function isFileAccessKey(key: string): boolean {
+  const normalized = normalizeFileMetadataKey(key)
+  return /(^|_)(preview|download|signed|file)_url$/.test(normalized)
+}
+
+function hasStrongFileIdentity(value: Record<string, unknown>): boolean {
+  const entries = Object.entries(value)
+  const keys = entries.map(([key]) => normalizeFileMetadataKey(key))
+  if (keys.some(isFileIdKey)) {
+    return true
+  }
+  if (keys.some((key) => key === 'filename' || key === 'file_name')) {
+    return true
+  }
+
+  const hasName = keys.some((key) => FILE_NAME_KEYS.has(key))
+  const descriptor = entries.find(([key]) => (
+    FILE_DESCRIPTOR_KEYS.has(normalizeFileMetadataKey(key))
+  ))?.[1]
+  return (
+    hasName
+    && typeof descriptor === 'string'
+    && (
+      descriptor.includes('/')
+      || KNOWN_FILE_DESCRIPTOR_VALUES.has(descriptor.toLowerCase())
+    )
+  )
+}
+
+function hasFileCopyEvidence(value: Record<string, unknown>): boolean {
+  const keys = new Set(Object.keys(value).map(normalizeFileMetadataKey))
+  return (
+    keys.has('source')
+    && keys.has('destination')
+    && typeof value.extracted === 'boolean'
+  )
+}
+
+function isLocalFileLocationKey(
+  key: string,
+  owner: Record<string, unknown>,
+  fileRecordContext = false,
+): boolean {
+  const normalized = normalizeFileMetadataKey(key)
+  if (LOCAL_FILE_LOCATION_KEYS.has(normalized)) {
+    return true
+  }
+  if (AMBIGUOUS_FILE_LOCATION_KEYS.has(normalized)) {
+    return fileRecordContext || hasStrongFileIdentity(owner)
+  }
+  if (normalized === 'html_src') {
+    return hasStrongFileIdentity(owner)
+  }
+  if (normalized === 'source' || normalized === 'destination') {
+    return hasFileCopyEvidence(owner)
+  }
+  return false
+}
+
+function basename(value: string): string | null {
+  const parts = value.split(/[\\/]/).filter(Boolean)
+  return parts.at(-1) || null
+}
+
+function rawFileLabel(value: Record<string, unknown>): string | null {
+  for (const key of ['filename', 'file_name', 'fileName', 'name']) {
+    const candidate = value[key]
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return basename(candidate) || candidate
+    }
+  }
+  return null
+}
+
+function collectKnownLocalPaths(value: unknown): Map<string, string> {
+  const paths = new Map<string, string>()
+
+  const visit = (item: unknown, fileRecordContext = false): void => {
+    if (Array.isArray(item)) {
+      item.forEach((child) => visit(child, fileRecordContext))
+      return
+    }
+    if (!isRecord(item)) {
+      return
+    }
+
+    const label = rawFileLabel(item)
+    Object.entries(item).forEach(([key, child]) => {
+      if (
+        isLocalFileLocationKey(key, item, fileRecordContext)
+        && typeof child === 'string'
+        && child.trim()
+      ) {
+        const fallback = basename(child)
+        if (label || fallback) {
+          paths.set(child, label ?? fallback ?? child)
+        }
+      }
+      visit(
+        child,
+        fileRecordContext
+        || FILE_RECORD_COLLECTION_KEYS.has(normalizeFileMetadataKey(key)),
+      )
+    })
+  }
+
+  visit(value)
+  return paths
+}
+
+function replaceKnownLocalPaths(
+  value: string,
+  knownPaths: Map<string, string>,
+): string {
+  return [...knownPaths.entries()]
+    .sort(([left], [right]) => right.length - left.length)
+    .reduce(
+      (result, [path, replacement]) => result.split(path).join(replacement),
+      value,
+    )
+}
+
+function projectFilesDisabledValueWithPaths(
+  value: unknown,
+  knownPaths: Map<string, string>,
+  fileRecordContext = false,
+): unknown {
+  if (typeof value === 'string') {
+    return sanitizeFilesDisabledText(replaceKnownLocalPaths(value, knownPaths))
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => (
+      projectFilesDisabledValueWithPaths(item, knownPaths, fileRecordContext)
+    ))
+  }
+
+  if (!isRecord(value)) {
+    return value
+  }
+
+  const strongFileIdentity = hasStrongFileIdentity(value)
+  return Object.fromEntries(
+    Object.entries(value).flatMap(([key, child]) => {
+      const normalizedKey = normalizeFileMetadataKey(key)
+      if (
+        isFileIdKey(normalizedKey)
+        || isFileAccessKey(normalizedKey)
+        || isLocalFileLocationKey(normalizedKey, value, fileRecordContext)
+      ) {
+        return []
+      }
+      if (
+        strongFileIdentity
+        && GENERIC_IDENTITY_AND_LOCATION_KEYS.has(normalizedKey)
+      ) {
+        return []
+      }
+      return [[
+        key,
+        projectFilesDisabledValueWithPaths(
+          child,
+          knownPaths,
+          fileRecordContext || FILE_RECORD_COLLECTION_KEYS.has(normalizedKey),
+        ),
+      ]]
+    }),
+  )
+}
+
+export function sanitizeFilesDisabledText(value: string): string {
+  return value
+    .replace(FILE_MARKDOWN_REFERENCE_RE, (_match, label: string) => label)
+    .replace(BACKTICK_FILE_PATH_RE, (match, path: string) => {
+      const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(path.trim())
+      if (scheme && scheme[1].toLowerCase() !== 'file') {
+        return match
+      }
+      return path.split(/[\\/]/).pop() || path
+    })
+}
+
+/**
+ * Produces the inert, display-safe representation of structured file metadata.
+ * Local file locations are removed from any tool-result record. Generic
+ * identifiers and URLs are removed only when that record has explicit file
+ * identity; unrelated business records retain those fields.
+ */
+export function projectFilesDisabledValue(value: unknown): unknown {
+  return projectFilesDisabledValueWithPaths(value, collectKnownLocalPaths(value))
+}
+
+export function projectFilesDisabledToolResultOutput(value: unknown): unknown {
+  const projected = projectFilesDisabledValue(value)
+  if (isRecord(projected)) {
+    if ('output' in projected) {
+      return projected.output
+    }
+    if ('message' in projected) {
+      return projected.message
+    }
+  }
+  return projected
+}
+
+export function getFilesDisabledFileLabel(value: unknown): string | null {
+  if (isRecord(value)) {
+    const label = rawFileLabel(value)
+    if (label) {
+      return label
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (isLocalFileLocationKey(key, value, true) && typeof child === 'string') {
+        const pathLabel = basename(child)
+        if (pathLabel) {
+          return pathLabel
+        }
+      }
+    }
+  }
+
+  const projected = projectFilesDisabledValue(value)
+  if (!isRecord(projected)) {
+    return null
+  }
+
+  for (const key of ['filename', 'file_name', 'fileName', 'name']) {
+    const candidate = projected[key]
+    if (typeof candidate === 'string' && candidate.trim()) {
+      return candidate
+    }
+  }
+  return null
+}
+
+export function serializeFilesDisabledValue(value: unknown): string {
+  if (typeof value === 'string') {
+    try {
+      return JSON.stringify(projectFilesDisabledValue(JSON.parse(value)), null, 2)
+    } catch {
+      return sanitizeFilesDisabledText(value)
+    }
+  }
+
+  try {
+    const serialized = JSON.stringify(projectFilesDisabledValue(value), null, 2)
+    return serialized ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
 interface MarkdownRendererProps {
   content: string
   className?: string
+  filesDisabled?: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
 }
@@ -243,6 +551,7 @@ function containsPreviewFileLinkNode(node: any): boolean {
 }
 
 type MarkdownRendererContextValue = {
+  filesDisabled: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
   openLabel: string
@@ -289,7 +598,13 @@ function MarkdownLink({
   children,
   ...props
 }: MarkdownComponentProps<'a'>) {
-  const { onFileClick, onAgentClick, openLabel, loadErrorText } =
+  const {
+    filesDisabled,
+    onFileClick,
+    onAgentClick,
+    openLabel,
+    loadErrorText,
+  } =
     useMarkdownRendererContext()
 
   if (href && href.startsWith('file:')) {
@@ -299,6 +614,10 @@ function MarkdownLink({
     const fileName = title || linkText || fileNameFromPath
     const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
     const fileId = resolveInlineFileId(filePath)
+
+    if (filesDisabled) {
+      return <span>{children}</span>
+    }
 
     if (preview) {
       return (
@@ -369,7 +688,7 @@ function MarkdownImage({
   title,
   ...props
 }: MarkdownComponentProps<'img'>) {
-  const { onFileClick, openLabel, loadErrorText } =
+  const { filesDisabled, onFileClick, openLabel, loadErrorText } =
     useMarkdownRendererContext()
   const resolvedSrc = src || ''
 
@@ -379,6 +698,10 @@ function MarkdownImage({
     const fileName = title || alt || fileNameFromPath
     const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
     const previewKind = preview?.previewKind ?? 'image'
+    if (filesDisabled) {
+      return <span>{fileName}</span>
+    }
+
     return (
       <InlineFilePreview
         source={{
@@ -407,16 +730,23 @@ const markdownComponents: Components = {
   img: MarkdownImage,
 }
 
-export function MarkdownRenderer({ content, className = '', onFileClick, onAgentClick }: MarkdownRendererProps) {
+export function MarkdownRenderer({
+  content,
+  className = '',
+  filesDisabled = false,
+  onFileClick,
+  onAgentClick,
+}: MarkdownRendererProps) {
   const { t } = useI18n()
   const contextValue = React.useMemo<MarkdownRendererContextValue>(
     () => ({
+      filesDisabled,
       onFileClick,
       onAgentClick,
       openLabel: t('files.previewDialog.buttons.open'),
       loadErrorText: t('files.previewDialog.errors.loadFailed'),
     }),
-    [onFileClick, onAgentClick, t]
+    [filesDisabled, onFileClick, onAgentClick, t]
   )
 
   return (
@@ -438,44 +768,81 @@ export function MarkdownRenderer({ content, className = '', onFileClick, onAgent
 interface JsonRendererProps {
   data: any
   className?: string
+  filesDisabled?: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
 }
 
-export function JsonRenderer({ data, className = '', onFileClick, onAgentClick }: JsonRendererProps) {
+export function JsonRenderer({
+  data,
+  className = '',
+  filesDisabled = false,
+  onFileClick,
+  onAgentClick,
+}: JsonRendererProps) {
   const [expanded, setExpanded] = React.useState(true)
 
   if (typeof data === 'string') {
     // Try to parse as JSON first
     try {
       const parsed = JSON.parse(data)
-      return <JsonRenderer data={parsed} className={className} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      return (
+        <JsonRenderer
+          data={parsed}
+          className={className}
+          filesDisabled={filesDisabled}
+          onFileClick={onFileClick}
+          onAgentClick={onAgentClick}
+        />
+      )
     } catch {
       // If not JSON, try to identify Markdown more comprehensively
-      if (isLikelyMarkdown(data)) {
-        return <MarkdownRenderer content={data} className={className} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+      const displayText = filesDisabled ? sanitizeFilesDisabledText(data) : data
+      if (isLikelyMarkdown(displayText)) {
+        return (
+          <MarkdownRenderer
+            content={displayText}
+            className={className}
+            filesDisabled={filesDisabled}
+            onFileClick={onFileClick}
+            onAgentClick={onAgentClick}
+          />
+        )
       }
       // Otherwise display as plain text
       return (
         <pre className={`py-3 rounded text-sm font-mono overflow-x-auto whitespace-pre-wrap ${className}`}>
-          {data}
+          {displayText}
         </pre>
       )
     }
   }
 
-  if (typeof data === 'object' && data !== null) {
+  const displayData = filesDisabled ? projectFilesDisabledValue(data) : data
+
+  if (typeof displayData === 'object' && displayData !== null) {
     // Check if it's a result object with output that might be markdown
-    if (data.output && typeof data.output === 'string' && isLikelyMarkdown(data.output.trim())) {
+    if (
+      isRecord(data) &&
+      typeof data.output === 'string' &&
+      isLikelyMarkdown(data.output.trim()) &&
+      isRecord(displayData) &&
+      typeof displayData.output === 'string'
+    ) {
       return (
         <div className={`space-y-3 ${className}`}>
           <div className="bg-muted p-3 rounded text-sm font-mono overflow-x-auto whitespace-pre-wrap">
             <div className="text-green-400 mb-2">✅ Task completed successfully</div>
-            <div className="text-gray-400">Goal: {data.goal}</div>
+            <div className="text-gray-400">Goal: {displayData.goal as React.ReactNode}</div>
           </div>
           <div className="border-t border-border pt-3">
             <div className="text-sm font-medium text-foreground mb-2">Result:</div>
-            <MarkdownRenderer content={data.output} onFileClick={onFileClick} onAgentClick={onAgentClick} />
+            <MarkdownRenderer
+              content={displayData.output}
+              filesDisabled={filesDisabled}
+              onFileClick={onFileClick}
+              onAgentClick={onAgentClick}
+            />
           </div>
         </div>
       )
@@ -492,7 +859,7 @@ export function JsonRenderer({ data, className = '', onFileClick, onAgentClick }
         </button>
         {expanded && (
           <pre className="bg-muted p-3 rounded text-xs font-mono overflow-x-auto whitespace-pre-wrap">
-            {JSON.stringify(data, null, 2)}
+            {JSON.stringify(displayData, null, 2)}
           </pre>
         )}
       </div>

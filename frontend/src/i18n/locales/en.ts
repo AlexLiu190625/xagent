@@ -484,6 +484,20 @@ Build when you need.`,
       powered_by: "Powered by {appName}"
     }
   },
+  widgetSession: {
+    startNewConversation: "Start new conversation",
+    resetting: "Starting...",
+    resetFailed: "Could not start a new conversation. Please try again.",
+    expiryWarning: "This chat session will expire soon. Refresh the page to continue.",
+    expired: {
+      title: "Chat session expired",
+      description: "Refresh the page to start a new chat session.",
+    },
+    unavailable: {
+      title: "Chat unavailable",
+      description: "This chat cannot be opened right now. Please try again later.",
+    },
+  },
   channels: {
     page_title: "Channels Management",
     page_description: "Manage your communication channels and bots.",
