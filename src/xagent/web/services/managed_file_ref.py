@@ -15,7 +15,7 @@ from ...core.execution_scope import (
     ExecutionScope,
     ExecutionScopeInput,
     get_execution_scope,
-    resolve_execution_scope,
+    resolve_execution_scope_off_turn,
 )
 from ...core.file_storage import (
     FsspecFileStorage,
@@ -149,8 +149,8 @@ class ManagedFileRef:
         # matters on off-turn paths (bot/builder-chat handlers never enter
         # ``turn_execution_scope``, so the contextvar is None): a workforce
         # sub-task carries its scope only in the persisted snapshot, and
-        # without recovering it here ``sync_to_durable`` would write the file
-        # under the owner root instead of the sub-task's scoped subtree.
+        # without recovering it here ``sync_to_durable`` would write a new
+        # file under the owner root instead of the sub-task's scoped subtree.
         # Explicit ``None`` means owner-root. Only an omitted argument may
         # inherit the ambient turn scope or consult per-task resolution.
         scope_input = self.execution_scope
@@ -158,8 +158,18 @@ class ManagedFileRef:
             scope = get_execution_scope()
             if scope is None:
                 task_id = getattr(self.record, "task_id", None)
-                if task_id is not None:
-                    scope = resolve_execution_scope(task_id)
+                if task_id is not None and not self.storage_key:
+                    # A record with no durable key yet is the write path: a
+                    # fresh object is about to be placed under this scope's
+                    # subtree, so off-turn resolution matters. A record that
+                    # already has a durable key is the read (or
+                    # rewrite-in-place) path: that key already fixes the
+                    # object's location, off-turn re-resolution is
+                    # unnecessary, and -- on a resolver/snapshot drift --
+                    # would make an already-legitimate key look foreign to a
+                    # narrower re-derived scope (see ``storage`` binding
+                    # below).
+                    scope = resolve_execution_scope_off_turn(task_id)
         else:
             scope = cast(ExecutionScope | None, scope_input)
         self._scope_segments = (

@@ -53,6 +53,7 @@ from ...core.execution_scope import (
     ExecutionScopeContext,
     ExecutionScopeNotProvided,
     resolve_execution_scope,
+    resolve_execution_scope_off_turn,
 )
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS, build_file_ref
 from ..auth_dependencies import get_user_from_websocket_token
@@ -1168,10 +1169,15 @@ def _scope_segments_for_task(task_id: Any) -> tuple[str, ...]:
     A None ``task_id`` (e.g. the legacy-preview backfill, whose owner
     inference may find a user but no task) means there is no task identity
     to resolve a scope from — unscoped, never the string ``"None"``.
+
+    Resolves off-turn (see ``resolve_execution_scope_off_turn``): this
+    composes a storage key outside any turn, so a resolver/snapshot
+    authority mismatch is downgraded to the resolver's answer plus a
+    warning instead of raising.
     """
     if task_id is None:
         return ()
-    scope = resolve_execution_scope(task_id)
+    scope = resolve_execution_scope_off_turn(task_id)
     return scope.workspace_segments if scope is not None else ()
 
 

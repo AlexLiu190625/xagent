@@ -3,34 +3,46 @@
 Slice 1 of #757: the ExecutionScope skeleton carries no consumers yet, so
 these tests cover the value type, the contextvar helpers, the resolver hook,
 and the per-turn activation contract (including restart/resume re-resolution).
+
+The resolver is authoritative
+over a persisted snapshot rather than always losing to it. The resolver
+fixtures below register through
+``acknowledges_snapshot_candidate_contract=True`` -- see
+``TestSnapshotCandidateAuthority`` for the full resolver/snapshot precedence
+matrix and ``tests/web/test_execution_scope_delegation.py`` for the
+web-layer snapshot loader wiring. The resolver/loader globals themselves are
+reset by the root-level ``isolate_execution_scope_hooks`` autouse fixture in
+``tests/conftest.py``, not by a fixture in this module.
 """
 
 import asyncio
 import contextvars
 import dataclasses
+import logging
 
 import pytest
 
 from xagent.core.execution_scope import (
+    EXECUTION_SCOPE_SHAPE_VERSION,
+    DeferToSnapshot,
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     ExecutionScopeContext,
+    ExecutionScopeResolverContractError,
     InvalidScopeComponentError,
+    defer_to_snapshot,
+    execution_scope_resolver_registered,
     get_execution_scope,
     reset_execution_scope,
     resolve_execution_scope,
+    resolve_execution_scope_off_turn,
+    scope_fingerprint,
     set_execution_scope,
     set_execution_scope_resolver,
+    set_execution_scope_snapshot_loader,
     turn_execution_scope,
     validate_scope_component,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    """Each test starts and ends with no registered resolver."""
-    set_execution_scope_resolver(None)
-    yield
-    set_execution_scope_resolver(None)
 
 
 class TestValidateScopeComponent:
@@ -317,13 +329,17 @@ class TestResolverHook:
             seen.append(task_id)
             return None
 
-        set_execution_scope_resolver(resolver)
+        set_execution_scope_resolver(
+            resolver, acknowledges_snapshot_candidate_contract=True
+        )
         resolve_execution_scope(42)
         assert seen == ["42"]
 
     def test_resolver_result_is_returned(self):
         scope = ExecutionScope(sandbox_key_suffix="s1")
-        set_execution_scope_resolver(lambda task_id: scope)
+        set_execution_scope_resolver(
+            lambda task_id: scope, acknowledges_snapshot_candidate_contract=True
+        )
         assert resolve_execution_scope("42") is scope
 
     def test_resolver_exception_propagates(self):
@@ -332,7 +348,9 @@ class TestResolverHook:
         def resolver(task_id):
             raise RuntimeError("resolver down")
 
-        set_execution_scope_resolver(resolver)
+        set_execution_scope_resolver(
+            resolver, acknowledges_snapshot_candidate_contract=True
+        )
         with pytest.raises(RuntimeError, match="resolver down"):
             resolve_execution_scope("42")
 
@@ -340,13 +358,19 @@ class TestResolverHook:
         """str(None) would silently query the resolver for "None"; a caller
         with no task identity must treat the execution as unscoped itself."""
         seen = []
-        set_execution_scope_resolver(lambda task_id: seen.append(task_id))
+        set_execution_scope_resolver(
+            lambda task_id: seen.append(task_id),
+            acknowledges_snapshot_candidate_contract=True,
+        )
         with pytest.raises(ValueError, match="task_id cannot be None"):
             resolve_execution_scope(None)
         assert seen == []
 
     def test_resolver_can_be_cleared(self):
-        set_execution_scope_resolver(lambda task_id: ExecutionScope())
+        set_execution_scope_resolver(
+            lambda task_id: ExecutionScope(),
+            acknowledges_snapshot_candidate_contract=True,
+        )
         set_execution_scope_resolver(None)
         assert resolve_execution_scope("42") is None
 
@@ -354,7 +378,10 @@ class TestResolverHook:
 class TestTurnExecutionScope:
     def test_activates_resolved_scope_for_the_turn(self):
         scope = ExecutionScope(workspace_segments=("proj",))
-        set_execution_scope_resolver(lambda task_id: scope if task_id == "7" else None)
+        set_execution_scope_resolver(
+            lambda task_id: scope if task_id == "7" else None,
+            acknowledges_snapshot_candidate_contract=True,
+        )
         with turn_execution_scope(7) as active:
             assert active is scope
             assert get_execution_scope() is scope
@@ -372,7 +399,9 @@ class TestTurnExecutionScope:
             calls.append(task_id)
             return ExecutionScope(sandbox_key_suffix=f"t{task_id}")
 
-        set_execution_scope_resolver(resolver)
+        set_execution_scope_resolver(
+            resolver, acknowledges_snapshot_candidate_contract=True
+        )
         with turn_execution_scope("7"):
             pass
         with turn_execution_scope("7"):
@@ -380,7 +409,10 @@ class TestTurnExecutionScope:
         assert calls == ["7", "7"]
 
     def test_scope_restored_on_exception(self):
-        set_execution_scope_resolver(lambda task_id: ExecutionScope())
+        set_execution_scope_resolver(
+            lambda task_id: ExecutionScope(),
+            acknowledges_snapshot_candidate_contract=True,
+        )
         with pytest.raises(RuntimeError):
             with turn_execution_scope("7"):
                 raise RuntimeError("turn failed")
@@ -410,7 +442,9 @@ class TestTurnExecutionScope:
             return resolver
 
         def run_turn():
-            set_execution_scope_resolver(make_resolver())
+            set_execution_scope_resolver(
+                make_resolver(), acknowledges_snapshot_candidate_contract=True
+            )
             with turn_execution_scope("99") as scope:
                 return scope, get_execution_scope()
 
@@ -427,7 +461,9 @@ class TestTurnExecutionScope:
     def test_scope_visible_inside_async_turn(self):
         """The activated scope propagates into the turn's async execution."""
         scope = ExecutionScope(sandbox_key_suffix="s1")
-        set_execution_scope_resolver(lambda task_id: scope)
+        set_execution_scope_resolver(
+            lambda task_id: scope, acknowledges_snapshot_candidate_contract=True
+        )
 
         async def fake_agent_execution():
             await asyncio.sleep(0)
@@ -438,3 +474,450 @@ class TestTurnExecutionScope:
                 return await fake_agent_execution()
 
         assert asyncio.run(turn()) is scope
+
+
+class TestDeferToSnapshot:
+    """The carrier for a resolver's explicit abstention ."""
+
+    def test_requires_an_execution_scope_fallback(self):
+        with pytest.raises(TypeError):
+            defer_to_snapshot("not-a-scope")
+
+    def test_carrier_is_not_an_execution_scope(self):
+        carrier = defer_to_snapshot(ExecutionScope())
+        assert isinstance(carrier, DeferToSnapshot)
+        assert isinstance(carrier, ExecutionScope) is False
+
+    def test_carrier_has_no_public_bare_singleton(self):
+        """Only the fallback-carrying factory is exported -- a bare
+        module-level sentinel would let "defer" mean "unscoped on miss"
+        implicitly instead of requiring an explicit fallback."""
+        import xagent.core.execution_scope as scope_module
+
+        assert not hasattr(scope_module, "DEFER_TO_SNAPSHOT")
+
+    def test_carrier_exposes_the_fallback(self):
+        fallback = ExecutionScope(sandbox_key_suffix="fallback")
+        assert defer_to_snapshot(fallback).fallback == fallback
+
+
+class TestSetExecutionScopeResolverAckToken:
+    """The confirmation-token contract on ``set_execution_scope_resolver``."""
+
+    def test_registering_a_resolver_without_ack_raises(self):
+        with pytest.raises(TypeError, match="acknowledges_snapshot_candidate_contract"):
+            set_execution_scope_resolver(lambda task_id: None)
+
+    def test_clearing_the_resolver_never_needs_ack(self):
+        # None never triggers the check: the ~20 cleanup call sites across
+        # the test suite that reset the resolver to None stay unchanged.
+        set_execution_scope_resolver(None)
+        assert execution_scope_resolver_registered() is False
+
+    def test_ack_true_registers_successfully(self):
+        set_execution_scope_resolver(
+            lambda task_id: None, acknowledges_snapshot_candidate_contract=True
+        )
+        assert execution_scope_resolver_registered() is True
+
+    def test_ack_false_explicitly_still_raises(self):
+        with pytest.raises(TypeError):
+            set_execution_scope_resolver(
+                lambda task_id: None,
+                acknowledges_snapshot_candidate_contract=False,
+            )
+
+
+class TestExecutionScopeAuthorityErrorInheritance:
+    """Pin: distinguishable from the two exceptions this module
+    already raises, so no existing ``except RuntimeError``/``except
+    ValueError`` clause silently folds an authority conflict into them."""
+
+    def test_not_a_runtime_error(self):
+        assert not issubclass(ExecutionScopeAuthorityError, RuntimeError)
+
+    def test_not_a_value_error(self):
+        assert not issubclass(ExecutionScopeAuthorityError, ValueError)
+
+    def test_is_a_plain_exception(self):
+        assert issubclass(ExecutionScopeAuthorityError, Exception)
+
+
+class TestExecutionScopeResolverContractErrorInheritance:
+    """Pin: the resolve-boundary "unknown return type" error
+    must not be catchable by the ``except (ValueError, KeyError, TypeError)``
+    clauses several websocket handlers wrap around the turn-execution path
+    -- those fold anything in that tuple into a generic "client message
+    format error" response, which would misreport a resolver author's bug
+    as a malformed client message."""
+
+    def test_not_a_runtime_error(self):
+        assert not issubclass(ExecutionScopeResolverContractError, RuntimeError)
+
+    def test_not_a_value_error(self):
+        assert not issubclass(ExecutionScopeResolverContractError, ValueError)
+
+    def test_not_a_type_error(self):
+        assert not issubclass(ExecutionScopeResolverContractError, TypeError)
+
+    def test_is_a_plain_exception(self):
+        assert issubclass(ExecutionScopeResolverContractError, Exception)
+
+    def test_not_folded_by_the_websocket_validation_except_tuple(self):
+        """Reproduces the exact tuple websocket.py catches around the
+        turn-execution path (e.g. lines ~5802/5864/7029/7257): the new
+        error must fall through it and propagate."""
+        folded = False
+        try:
+            raise ExecutionScopeResolverContractError("boom")
+        except (ValueError, KeyError, TypeError):
+            folded = True
+        except ExecutionScopeResolverContractError:
+            pass
+        assert not folded
+
+
+class TestExecutionScopeShapeVersionAlignment:
+    """``to_dict``'s key set must track every dataclass field (1a precedent:
+    test_runtime_spec.py:315) so a newly added field cannot silently miss
+    persistence -- which would make a historical snapshot indistinguishable
+    from a current one that simply left the field at its default."""
+
+    def test_to_dict_keys_match_dataclass_fields(self):
+        field_names = {f.name for f in dataclasses.fields(ExecutionScope)}
+        assert set(ExecutionScope().to_dict().keys()) == field_names
+
+    def test_fresh_scope_is_current_version(self):
+        assert ExecutionScope().version == EXECUTION_SCOPE_SHAPE_VERSION
+
+    def test_from_dict_missing_version_defaults_to_legacy_zero(self):
+        data = ExecutionScope(sandbox_key_suffix="x").to_dict()
+        del data["version"]
+        assert ExecutionScope.from_dict(data).version == 0
+
+    def test_version_is_excluded_from_equality(self):
+        current = ExecutionScope(sandbox_key_suffix="x")
+        legacy_data = current.to_dict()
+        legacy_data["version"] = 0
+        legacy = ExecutionScope.from_dict(legacy_data)
+        assert legacy.version == 0
+        assert legacy == current
+
+
+class TestSnapshotCandidateAuthority:
+    """Full resolver x snapshot precedence matrix (#296).
+
+    Axes: resolver registered x (ExecutionScope / None / DeferToSnapshot) x
+    (snapshot equal / namespace-differing / policy-only-differing / absent /
+    stale-version / loader-broken). Plus the "no resolver registered" golden
+    (unchanged from the resolver-less contract) and the resolver-exception
+    short-circuit.
+    """
+
+    RESOLVER_SCOPE = ExecutionScope(sandbox_key_suffix="from-resolver")
+
+    def _register(self, resolver, loader=None):
+        set_execution_scope_resolver(
+            resolver, acknowledges_snapshot_candidate_contract=True
+        )
+        if loader is not None:
+            set_execution_scope_snapshot_loader(loader)
+
+    # --- resolver returns None: authoritative unscoped -------------------
+    def test_resolver_none_is_authoritative_unscoped_even_with_snapshot(self):
+        loader_calls = []
+
+        def loader(task_id):
+            loader_calls.append(task_id)
+            return self.RESOLVER_SCOPE
+
+        self._register(lambda task_id: None, loader)
+        assert resolve_execution_scope("1") is None
+        assert loader_calls == []  # None short-circuits before the snapshot
+
+    # --- resolver returns ExecutionScope -----------------------------------
+    def test_resolver_scope_with_no_snapshot(self):
+        self._register(lambda task_id: self.RESOLVER_SCOPE, lambda task_id: None)
+        assert resolve_execution_scope("1") == self.RESOLVER_SCOPE
+
+    def test_resolver_scope_with_equal_snapshot_corroborates_silently(self):
+        self._register(
+            lambda task_id: self.RESOLVER_SCOPE, lambda task_id: self.RESOLVER_SCOPE
+        )
+        assert resolve_execution_scope("1") == self.RESOLVER_SCOPE
+
+    @pytest.mark.parametrize(
+        "field_name,snapshot_kwargs",
+        [
+            ("sandbox_key_suffix", {"sandbox_key_suffix": "other"}),
+            ("workspace_segments", {"workspace_segments": ("other",)}),
+            (
+                "sandbox_mount_segments",
+                {
+                    "workspace_segments": ("a", "b"),
+                    "sandbox_mount_segments": ("a",),
+                },
+            ),
+            ("memory_dimensions", {"memory_dimensions": {"k": "v"}}),
+            ("isolate_external_dirs", {"isolate_external_dirs": True}),
+        ],
+    )
+    def test_namespace_field_mismatch_fails_the_turn(self, field_name, snapshot_kwargs):
+        resolver_scope = ExecutionScope()
+        snapshot_scope = ExecutionScope(**snapshot_kwargs)
+        self._register(lambda task_id: resolver_scope, lambda task_id: snapshot_scope)
+
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
+            resolve_execution_scope("1")
+        assert field_name in exc_info.value.mismatched_fields
+        assert exc_info.value.resolver_scope == resolver_scope
+        assert exc_info.value.snapshot_scope == snapshot_scope
+
+    def test_policy_only_mismatch_does_not_fail_the_turn(self, caplog):
+        """strict_memory_isolation is a policy field: a disagreement there
+        does not change which key/path is touched, so the resolver's value
+        wins without raising. The disagreement must still be observable --
+        a silently-won policy mismatch would otherwise be undebuggable."""
+        resolver_scope = ExecutionScope(strict_memory_isolation=False)
+        snapshot_scope = ExecutionScope(strict_memory_isolation=True)
+        self._register(lambda task_id: resolver_scope, lambda task_id: snapshot_scope)
+
+        with caplog.at_level(logging.WARNING, logger="xagent.core.execution_scope"):
+            assert resolve_execution_scope("1") == resolver_scope
+        assert any(
+            "policy-only mismatch" in r.message
+            and "strict_memory_isolation" in r.message
+            for r in caplog.records
+        )
+
+    def test_stale_version_snapshot_is_ignored_even_if_it_would_mismatch(self, caplog):
+        resolver_scope = ExecutionScope()
+        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+        del stale_data["version"]  # predates EXECUTION_SCOPE_SHAPE_VERSION
+        stale_snapshot = ExecutionScope.from_dict(stale_data)
+        assert stale_snapshot.version == 0
+
+        self._register(lambda task_id: resolver_scope, lambda task_id: stale_snapshot)
+        with caplog.at_level(logging.WARNING, logger="xagent.core.execution_scope"):
+            assert resolve_execution_scope("1") == resolver_scope
+        assert any(
+            "shape" in r.message and "sandbox_key_suffix" in r.message
+            for r in caplog.records
+        )
+
+    def test_newer_version_snapshot_is_ignored_too(self):
+        """A mixed-version rollout can also see a snapshot stamped by a
+        *newer* process than this one (e.g. during a rolling deploy where
+        some workers already run the next shape). ``!=`` (not ``<``) covers
+        this direction too: the snapshot's shape can't be safely compared
+        field-by-field against a scope built under a different shape,
+        regardless of which side is newer."""
+        resolver_scope = ExecutionScope()
+        newer_data = ExecutionScope(sandbox_key_suffix="from-the-future").to_dict()
+        newer_data["version"] = EXECUTION_SCOPE_SHAPE_VERSION + 1
+        newer_snapshot = ExecutionScope.from_dict(newer_data)
+
+        self._register(lambda task_id: resolver_scope, lambda task_id: newer_snapshot)
+        assert resolve_execution_scope("1") == resolver_scope
+
+    def test_broken_snapshot_loader_does_not_veto_resolver_scope(self):
+        def boom(task_id):
+            raise RuntimeError("db down")
+
+        self._register(lambda task_id: self.RESOLVER_SCOPE, boom)
+        assert resolve_execution_scope("1") == self.RESOLVER_SCOPE
+
+    # --- resolver returns DeferToSnapshot -----------------------------------
+    def test_defer_uses_snapshot_when_present(self):
+        snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: snapshot_scope,
+        )
+        assert resolve_execution_scope("1") == snapshot_scope
+
+    def test_defer_uses_fallback_when_snapshot_absent(self):
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback), lambda task_id: None
+        )
+        assert resolve_execution_scope("1") == fallback
+
+    def test_defer_uses_fallback_when_loader_is_broken(self):
+        def boom(task_id):
+            raise RuntimeError("db down")
+
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        self._register(lambda task_id: defer_to_snapshot(fallback), boom)
+        assert resolve_execution_scope("1") == fallback
+
+    # --- boundary judgment / resolver misbehavior ---------------------------
+    def test_resolver_returning_unexpected_type_raises_contract_error(self):
+        self._register(lambda task_id: "not-a-scope")
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope("1")
+
+    def test_resolver_exception_short_circuits_before_the_snapshot(self):
+        loader_calls = []
+
+        def boom(task_id):
+            raise RuntimeError("resolver down")
+
+        self._register(boom, lambda task_id: loader_calls.append(task_id))
+        with pytest.raises(RuntimeError, match="resolver down"):
+            resolve_execution_scope("1")
+        assert loader_calls == []
+
+    # --- no resolver registered: golden: unchanged resolver-less contract --------
+    def test_no_resolver_registered_snapshot_alone_drives(self):
+        set_execution_scope_snapshot_loader(lambda task_id: self.RESOLVER_SCOPE)
+        assert resolve_execution_scope("1") == self.RESOLVER_SCOPE
+
+    def test_no_resolver_registered_no_snapshot_is_unscoped(self):
+        assert resolve_execution_scope("1") is None
+
+    def test_no_resolver_registered_loader_exception_propagates(self):
+        def boom(task_id):
+            raise RuntimeError("db down")
+
+        set_execution_scope_snapshot_loader(boom)
+        with pytest.raises(RuntimeError, match="db down"):
+            resolve_execution_scope("1")
+
+
+class TestResolveExecutionScopeOffTurn:
+    """Off-turn consumers (websocket ``_scope_segments_for_task``,
+    ``ManagedFileRef``) downgrade a namespace mismatch instead of failing."""
+
+    def test_passthrough_when_no_mismatch(self):
+        scope = ExecutionScope(sandbox_key_suffix="s")
+        set_execution_scope_resolver(
+            lambda task_id: scope, acknowledges_snapshot_candidate_contract=True
+        )
+        assert resolve_execution_scope_off_turn("1") == scope
+
+    def test_namespace_mismatch_downgrades_to_resolver_value_with_warning(self, caplog):
+        resolver_scope = ExecutionScope(sandbox_key_suffix="from-resolver")
+        snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
+        set_execution_scope_resolver(
+            lambda task_id: resolver_scope,
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot_scope)
+
+        with caplog.at_level("WARNING"):
+            result = resolve_execution_scope_off_turn("1")
+
+        assert result == resolver_scope
+        assert any("authority mismatch" in r.message.lower() for r in caplog.records)
+
+    def test_other_exceptions_still_propagate(self):
+        def boom(task_id):
+            raise RuntimeError("resolver down")
+
+        set_execution_scope_resolver(
+            boom, acknowledges_snapshot_candidate_contract=True
+        )
+        with pytest.raises(RuntimeError, match="resolver down"):
+            resolve_execution_scope_off_turn("1")
+
+
+class TestDeferCarrierNeverActivated:
+    """The carrier is never mistaken for a real scope, and the turn
+    contextvar only ever holds the resolved fallback/snapshot, never the
+    carrier itself."""
+
+    def test_carrier_is_not_an_execution_scope_instance(self):
+        carrier = defer_to_snapshot(ExecutionScope())
+        assert isinstance(carrier, ExecutionScope) is False
+
+    def test_turn_activates_the_fallback_not_the_carrier(self):
+        fallback = ExecutionScope(sandbox_key_suffix="fallback")
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        with turn_execution_scope("1") as active:
+            assert active == fallback
+            current = get_execution_scope()
+            assert isinstance(current, ExecutionScope)
+            assert isinstance(current, DeferToSnapshot) is False
+
+
+class TestScopeFingerprintCoversIsolateExternalDirs:
+    """(#296) ``isolate_external_dirs`` is baked into the
+    cached ``AgentService``'s ``Workspace.allowed_external_dirs`` at build
+    time (see ``AgentServiceManager.get_agent_for_task`` ->
+    ``_build_allowed_external_dirs``), so an isolate_external_dirs-only
+    change must change the fingerprint or the cache never evicts and the
+    stale allowed-dirs list keeps being enforced."""
+
+    def test_isolate_external_dirs_only_change_changes_the_fingerprint(self):
+        base = ExecutionScope(workspace_segments=("tenant-a",))
+        isolated = ExecutionScope(
+            workspace_segments=("tenant-a",), isolate_external_dirs=True
+        )
+        assert scope_fingerprint(base) != scope_fingerprint(isolated)
+
+    def test_strict_memory_isolation_only_change_does_not_change_the_fingerprint(
+        self,
+    ):
+        """Read fresh from the contextvar on every memory operation
+        (``UserIsolatedMemoryStore``); nothing cached here goes stale."""
+        relaxed = ExecutionScope(strict_memory_isolation=False)
+        strict = ExecutionScope(strict_memory_isolation=True)
+        assert scope_fingerprint(relaxed) == scope_fingerprint(strict)
+
+
+class TestExecutionScopeFieldClassificationCompleteness:
+    """Every dataclass field must be
+    explicitly bucketed as namespace-affecting or policy-only, so a newly
+    added field can't silently miss ``resolve_execution_scope``'s
+    authority-mismatch classification. A field landing in neither bucket
+    would never be compared at all (not even logged), which is worse than
+    being misclassified into either one.
+    """
+
+    def test_every_field_is_classified_as_namespace_policy_or_version(self):
+        from xagent.core import execution_scope as scope_module
+
+        field_names = {f.name for f in dataclasses.fields(ExecutionScope)}
+        classified = (
+            set(scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS)
+            | set(scope_module._EXECUTION_SCOPE_POLICY_FIELDS)
+            | {"version"}
+        )
+        assert classified == field_names
+
+    def test_fingerprint_tracks_exactly_the_namespace_fields(self):
+        """``scope_fingerprint``'s tuple corresponds 1:1 to the
+        namespace-field bucket -- ``sandbox_mount_segments`` is represented
+        via the derived ``effective_mount_segments`` rather than the raw
+        field (two scopes with an unset vs. full-length
+        ``sandbox_mount_segments`` that select the identical mount must
+        still fingerprint identically), and ``version`` is excluded from
+        both (bookkeeping, not a namespace/policy field; see
+        ``ExecutionScope.version``'s docstring).
+
+        No namespace field is currently exempted from the fingerprint. If
+        one ever needs to be, it must be added to
+        ``exempted_from_fingerprint`` below with a comment explaining why
+        the cache doesn't need to evict on that field changing -- not
+        silently dropped from the set comparison.
+        """
+        from xagent.core import execution_scope as scope_module
+
+        namespace_fields = set(scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS)
+        fingerprint_represented_fields = {
+            "sandbox_key_suffix",
+            "workspace_segments",
+            "sandbox_mount_segments",  # via effective_mount_segments
+            "memory_dimensions",
+            "isolate_external_dirs",
+        }
+        exempted_from_fingerprint: set[str] = set()  # none today
+        assert (
+            namespace_fields - exempted_from_fingerprint
+            == fingerprint_represented_fields
+        )

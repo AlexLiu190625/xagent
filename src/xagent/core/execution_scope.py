@@ -97,6 +97,16 @@ def validate_scope_component(value: Any, *, field_name: str = "scope component")
     return value
 
 
+# Shape version stamped by ``to_dict`` / read back by ``from_dict``. Bump
+# whenever a namespace-affecting field is added so ``resolve_execution_scope``
+# can tell a snapshot written against a different shape (``version`` missing,
+# lower, or -- during a mixed-version rollout -- higher than this constant)
+# from one written against the current shape.
+# ``from_dict`` cannot distinguish "field absent because pre-dates it" from
+# "field explicitly at its default" any other way -- it fills both the same.
+EXECUTION_SCOPE_SHAPE_VERSION = 1
+
+
 @dataclass(frozen=True)
 class ExecutionScope:
     """Immutable execution scope. All fields default to current behavior.
@@ -118,8 +128,8 @@ class ExecutionScope:
             scope's task can read and write a co-mounted sibling's subtree.
             Only the orchestrator-side file/workspace API enforces
             ``scoped_user_root``. Therefore this field must only group scopes
-            that are already the **same trust principal**; never use it to
-            co-mount scopes belonging to different end users. Must be a prefix
+            that already share one **runtime trust domain**; never use it to
+            co-mount scopes across distinct runtime trust domains. Must be a prefix
             of ``workspace_segments``. ``None`` (the default) means the mount
             covers the full ``workspace_segments`` — byte-identical to
             pre-existing behavior. Consumed only by the sandbox-mount
@@ -134,6 +144,13 @@ class ExecutionScope:
             is empty.
         isolate_external_dirs: When True, KB/upload external dirs become
             scope-local instead of shared across the user's scopes.
+        version: Shape version this instance was constructed against
+            (see :data:`EXECUTION_SCOPE_SHAPE_VERSION`). Excluded from
+            equality (``compare=False``): it is bookkeeping for
+            :func:`resolve_execution_scope`'s snapshot-vs-resolver
+            comparison, not a namespace-affecting field, and two otherwise
+            identical scopes built at different times must still compare
+            equal. Not intended for callers to set explicitly.
     """
 
     sandbox_key_suffix: Optional[str] = None
@@ -142,6 +159,7 @@ class ExecutionScope:
     memory_dimensions: Mapping[str, str] = field(default_factory=dict)
     strict_memory_isolation: bool = False
     isolate_external_dirs: bool = False
+    version: int = field(default=EXECUTION_SCOPE_SHAPE_VERSION, compare=False)
 
     @property
     def effective_mount_segments(self) -> tuple[str, ...]:
@@ -188,11 +206,18 @@ class ExecutionScope:
             "memory_dimensions": dict(self.memory_dimensions),
             "strict_memory_isolation": self.strict_memory_isolation,
             "isolate_external_dirs": self.isolate_external_dirs,
+            "version": self.version,
         }
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionScope":
-        """Rebuild a scope from :meth:`to_dict` output (re-validated)."""
+        """Rebuild a scope from :meth:`to_dict` output (re-validated).
+
+        ``version`` defaults to ``0`` (not
+        :data:`EXECUTION_SCOPE_SHAPE_VERSION`) when the key is absent: a
+        snapshot persisted before this field existed must decode as
+        distinguishably older, not silently pass as current-shape.
+        """
         raw_mount = data.get("sandbox_mount_segments")
         return cls(
             sandbox_key_suffix=data.get("sandbox_key_suffix"),
@@ -201,6 +226,7 @@ class ExecutionScope:
             memory_dimensions=dict(data.get("memory_dimensions") or {}),
             strict_memory_isolation=bool(data.get("strict_memory_isolation", False)),
             isolate_external_dirs=bool(data.get("isolate_external_dirs", False)),
+            version=int(data.get("version") or 0),
         )
 
     def __post_init__(self) -> None:
@@ -268,7 +294,9 @@ class ExecutionScope:
 # Reserved key under which a task's ``agent_config`` JSON carries a
 # persisted scope snapshot (ExecutionScope.to_dict()). Internally created
 # tasks (workforce runs) have task ids the embedder's resolver cannot map;
-# the snapshot is written at task creation and preferred over the resolver.
+# the snapshot is written at task creation and read back as a corroborating
+# candidate when a resolver is registered (see resolve_execution_scope), or
+# as the sole answer when no resolver is registered.
 EXECUTION_SCOPE_AGENT_CONFIG_KEY = "execution_scope"
 
 
@@ -277,9 +305,13 @@ def execution_scope_from_agent_config(
 ) -> Optional[ExecutionScope]:
     """Decode the persisted scope snapshot owned by a task config.
 
-    ``None`` means the task has no persisted snapshot and the canonical
-    resolution flow may consult the registered resolver. Invalid snapshots
-    propagate instead of silently degrading to an unscoped namespace.
+    ``None`` means the task has no persisted snapshot. The canonical
+    resolution flow (:func:`resolve_execution_scope`) always calls a
+    registered resolver first; this snapshot is only a corroborating
+    candidate for the resolver's answer, or the sole answer when no
+    resolver is registered -- it is never consulted ahead of the resolver.
+    Invalid snapshots propagate instead of silently degrading to an
+    unscoped namespace.
     """
 
     if not isinstance(agent_config, Mapping):
@@ -322,9 +354,13 @@ def metadata_carries_scope_dimensions(metadata: Mapping[str, Any]) -> bool:
 
 # Hashable identity of a scope's namespace-affecting fields:
 # (sandbox_key_suffix, workspace_segments, effective_mount_segments,
-#  sorted memory_dimensions items).
+#  sorted memory_dimensions items, isolate_external_dirs).
 ScopeFingerprint = tuple[
-    Optional[str], tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]
+    Optional[str],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[tuple[str, str], ...],
+    bool,
 ]
 
 
@@ -332,13 +368,23 @@ def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerpr
     """Hashable fingerprint of the namespaces a scope selects.
 
     Per-task caches that bake scope-derived state in at build time (sandbox
-    keys, workspace paths, sandbox mount root, memory dimensions) key their
-    eviction checks on this. The mount root is captured via
-    ``effective_mount_segments`` so a changed mount prefix invalidates the
-    cache instead of silently reusing a stale ``base_dir`` (which a later
-    rebuild would then reject in ``SandboxManager._ensure_config_equivalent``).
-    ``None`` is the sentinel for unscoped, distinct from an empty scope's
-    fingerprint.
+    keys, workspace paths, sandbox mount root, memory dimensions,
+    ``allowed_external_dirs``) key their eviction checks on this. The mount
+    root is captured via ``effective_mount_segments`` so a changed mount
+    prefix invalidates the cache instead of silently reusing a stale
+    ``base_dir`` (which a later rebuild would then reject in
+    ``SandboxManager._ensure_config_equivalent``). ``isolate_external_dirs``
+    is included for the same reason: it is baked
+    into the cached ``AgentService``'s ``Workspace.allowed_external_dirs``
+    at build time (``_build_allowed_external_dirs`` -> ``AgentService.
+    __init__`` -> ``WorkspaceManager.get_or_create_workspace``) rather than
+    read fresh per call, so an isolate_external_dirs-only change across
+    turns must evict the cache or the stale allowed-dirs list (shared root
+    vs. scope-local) keeps being enforced. ``strict_memory_isolation`` is
+    intentionally excluded: it is read fresh from the contextvar on every
+    memory operation (``UserIsolatedMemoryStore``), so nothing cached here
+    goes stale when only that flag changes. ``None`` is the sentinel for
+    unscoped, distinct from an empty scope's fingerprint.
     """
     if scope is None:
         return None
@@ -347,6 +393,7 @@ def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerpr
         scope.workspace_segments,
         scope.effective_mount_segments,
         tuple(sorted(scope.memory_dimensions.items())),
+        scope.isolate_external_dirs,
     )
 
 
@@ -402,15 +449,73 @@ class ExecutionScopeContext:
             reset_execution_scope(self.token)
 
 
+class DeferToSnapshot:
+    """Resolver return value meaning "defer to the persisted snapshot".
+
+    Not an :class:`ExecutionScope`: it never enters
+    :func:`resolve_execution_scope`'s return value directly, is never
+    activated on the ``current_execution_scope`` contextvar, and carries no
+    scope attributes of its own. Construct via :func:`defer_to_snapshot`;
+    the ``fallback`` is used only when no snapshot is persisted for the
+    task (a task id the resolver's embedder does not itself recognize, with
+    no Task-table snapshot either).
+    """
+
+    __slots__ = ("fallback",)
+
+    def __init__(self, fallback: ExecutionScope) -> None:
+        if not isinstance(fallback, ExecutionScope):
+            raise TypeError(
+                "defer_to_snapshot(fallback) requires an ExecutionScope, "
+                f"got {fallback!r}"
+            )
+        self.fallback = fallback
+
+
+def defer_to_snapshot(fallback: ExecutionScope) -> DeferToSnapshot:
+    """Build a resolver return value that defers to the persisted snapshot.
+
+    ``fallback`` is mandatory (not ``Optional``, no default): it is the
+    scope used when the task carries no persisted snapshot, and must be the
+    resolver's own most conservative answer for that task (e.g. today's
+    creator-direct scope) so a defer never resolves *wider* than the
+    resolver's own answer would have. This cannot be enforced by
+    ``resolve_execution_scope`` itself (a resolver can pass anything as
+    ``fallback``); it is the resolver author's obligation. An implicit
+    ``None`` fallback would silently mean "authoritative unscoped on a
+    snapshot miss" and must instead be spelled out explicitly by the caller.
+    """
+    return DeferToSnapshot(fallback)
+
+
 # The embedding application injects a scope resolver via
 # set_execution_scope_resolver() (same injection pattern as
-# set_user_tool_overrides_hook in the web layer).
-ExecutionScopeResolver = Callable[[str], Optional[ExecutionScope]]
+# set_user_tool_overrides_hook in the web layer). Three return values:
+#
+# - ``ExecutionScope``: authoritative for this task.
+# - ``None``: authoritative unscoped for this task (not "abstain").
+# - ``DeferToSnapshot`` (see :func:`defer_to_snapshot`): abstain in favor of
+#   the persisted snapshot, with a fallback for when none is persisted.
+ExecutionScopeResolver = Callable[[str], Union[ExecutionScope, None, DeferToSnapshot]]
 
 _execution_scope_resolver: Optional[ExecutionScopeResolver] = None
 
 
-def set_execution_scope_resolver(resolver: Optional[ExecutionScopeResolver]) -> None:
+def execution_scope_resolver_registered() -> bool:
+    """Whether an embedder has registered a scope resolver.
+
+    Used at startup to log which authority mode is active: with a resolver
+    registered, persisted snapshots are a corroborating candidate (see
+    :func:`resolve_execution_scope`); with none, they are the sole answer.
+    """
+    return _execution_scope_resolver is not None
+
+
+def set_execution_scope_resolver(
+    resolver: Optional[ExecutionScopeResolver],
+    *,
+    acknowledges_snapshot_candidate_contract: bool = False,
+) -> None:
     """Register the resolver that maps a ``task_id`` to its ExecutionScope.
 
     Resolver contract:
@@ -420,13 +525,47 @@ def set_execution_scope_resolver(resolver: Optional[ExecutionScopeResolver]) -> 
       equal scope for the same ``task_id`` every time. Reassigning a task to
       a different scope between turns is possible but expensive (per-task
       caches rebuild); a resolver that flaps A -> B -> A is a bug.
-    - Return ``None`` for tasks that run unscoped. No registered resolver
-      means every task runs unscoped.
+    - **Three-valued return**: an ``ExecutionScope`` is authoritative for
+      the task; ``None`` is authoritative *unscoped* for the task (not an
+      abstention); :func:`defer_to_snapshot` abstains in favor of the
+      persisted snapshot, with a mandatory fallback for tasks that carry
+      none. No registered resolver means every task runs unscoped.
+    - **Provenance, not existence**: whether to defer must be decided from
+      the task's own provenance (e.g. whether the embedder's own records
+      show it as one of its tasks), never from whether a snapshot happens
+      to exist for it. Deferring merely because a snapshot is present
+      degrades this contract back into "snapshot always wins".
     - Scope fields are consumed independently by subsystems; the resolver
       may populate any subset.
     - An exception from the resolver fails the turn: falling back to
       unscoped on error would silently merge namespaces.
+    - When a persisted snapshot also exists for the task,
+      :func:`resolve_execution_scope` treats it as a corroborating
+      candidate, not an override: a namespace-affecting disagreement with
+      an authoritative (non-defer) answer fails the turn instead of
+      silently picking one side.
+
+    Args:
+        resolver: The resolver, or ``None`` to clear it.
+        acknowledges_snapshot_candidate_contract: Must be ``True`` to
+            register a non-``None`` resolver.
+
+    Raises:
+        TypeError: a non-``None`` resolver is registered without passing
+            ``acknowledges_snapshot_candidate_contract=True``. This fails at
+            registration time (e.g. embedder import/startup) instead of the
+            first turn silently treating a persisted snapshot as an override
+            by an embedder that has not read the contract above.
     """
+    if resolver is not None and not acknowledges_snapshot_candidate_contract:
+        raise TypeError(
+            "set_execution_scope_resolver(resolver) requires "
+            "acknowledges_snapshot_candidate_contract=True: a persisted "
+            "scope snapshot is now a corroborating candidate rather than an "
+            "override, and callers must confirm they have read the "
+            "resolver's three-valued / provenance contract in this "
+            "function's docstring before registering one"
+        )
     global _execution_scope_resolver
     _execution_scope_resolver = resolver
 
@@ -445,14 +584,135 @@ def set_execution_scope_snapshot_loader(
     """Register the loader for persisted per-task scope snapshots.
 
     The loader returns the snapshot persisted at task creation, or None for
-    tasks without one. A persisted snapshot is preferred over the resolver:
-    internally created tasks (workforce runs) have ids the embedder's
-    resolver cannot map, and the snapshot is what keeps them scoped across
-    process restarts. Loader exceptions fail the turn — falling back to the
-    resolver (or unscoped) on error could silently switch namespaces.
+    tasks without one. With a resolver registered, the snapshot is a
+    corroborating candidate for the resolver's authoritative answer (see
+    :func:`resolve_execution_scope`); with no resolver registered, it is the
+    sole answer -- this is what keeps internally created tasks (workforce
+    runs, whose ids the embedder's resolver cannot map) scoped across
+    process restarts. Loader exceptions fail the turn when no resolver is
+    registered; otherwise a broken candidate is logged and ignored rather
+    than vetoing the resolver's already-given authoritative answer.
     """
     global _execution_scope_snapshot_loader
     _execution_scope_snapshot_loader = loader
+
+
+class ExecutionScopeResolverContractError(Exception):
+    """A registered resolver returned something outside its three-valued contract.
+
+    Deliberately not a subclass of ``RuntimeError``, ``ValueError``, or
+    ``TypeError``: several websocket handlers catch
+    ``except (ValueError, KeyError, TypeError)`` around the turn-execution
+    path and fold anything in that tuple into a generic "client message
+    format error" response. A resolver author's bug at the ``resolve_execution_scope``
+    boundary is a server-side contract violation, not a malformed client
+    message, and must not be swallowed by that handler as if it were one.
+
+    Only used for the return-type check inside ``resolve_execution_scope``
+    itself. The ``TypeError`` that :func:`set_execution_scope_resolver`
+    raises for a missing acknowledgment token is unrelated -- that happens
+    at registration time (embedder import/startup, before any request
+    handler exists) and is intentionally left as a plain ``TypeError``.
+    """
+
+
+class ExecutionScopeAuthorityError(Exception):
+    """A persisted snapshot disagrees with the resolver's authoritative scope.
+
+    Deliberately not a subclass of ``RuntimeError`` or ``ValueError``:
+    ``resolve_execution_scope`` already raises plain ``ValueError`` for a
+    ``None`` task_id, and callers/tests must be able to tell an authority
+    conflict apart from that structural error instead of both being folded
+    by the same ``except ValueError`` (or a broad ``except RuntimeError``)
+    clause.
+
+    Carries the resolver's answer (``resolver_scope``) so a caller that must
+    not fail a turn that has already ended or never started (see
+    :func:`resolve_execution_scope_off_turn`) can log a structured warning
+    and continue with the authoritative value instead of raising.
+
+    ``str()`` on this exception deliberately carries only the ``task_id``
+    and the names of the mismatched fields, never the scope values: it
+    ends up in ``task.error_message`` and in the client's terminal error
+    event (see ``task_orchestrator``'s setup/run failure handling, which
+    formats durable/broadcast error strings from ``str(exc)``), and the
+    scope values include ``sandbox_key_suffix``, ``workspace_segments``,
+    and ``memory_dimensions`` -- namespace components that can carry
+    end-user/client identifiers. The full scopes and the field-level value
+    diff are logged via ``logger.error`` at the raise site instead, which
+    stays server-side.
+    """
+
+    def __init__(
+        self,
+        task_id: str,
+        *,
+        resolver_scope: ExecutionScope,
+        snapshot_scope: ExecutionScope,
+        mismatched_fields: Mapping[str, tuple[Any, Any]],
+    ) -> None:
+        self.task_id = task_id
+        self.resolver_scope = resolver_scope
+        self.snapshot_scope = snapshot_scope
+        self.mismatched_fields = dict(mismatched_fields)
+        super().__init__(
+            f"execution scope authority mismatch for task {task_id!r}: "
+            f"mismatched_fields={sorted(self.mismatched_fields)!r}"
+        )
+
+
+# Namespace-affecting fields: a disagreement here changes which sandbox key,
+# workspace path, mount root, or memory-dimension notes a task's execution
+# actually touches, so resolve_execution_scope fails the turn rather than
+# silently picking one side.
+_EXECUTION_SCOPE_NAMESPACE_FIELDS: tuple[str, ...] = (
+    "sandbox_key_suffix",
+    "workspace_segments",
+    "sandbox_mount_segments",
+    "memory_dimensions",
+    "isolate_external_dirs",
+)
+
+# Policy fields: change post-filter behavior on an otherwise-identical
+# namespace, never which key/path is touched. A disagreement here is logged
+# and the resolver's value wins, but does not fail the turn.
+_EXECUTION_SCOPE_POLICY_FIELDS: tuple[str, ...] = ("strict_memory_isolation",)
+
+
+def _execution_scope_field_diff(
+    snapshot: ExecutionScope, resolver: ExecutionScope
+) -> dict[str, tuple[Any, Any]]:
+    """Per-field ``(snapshot_value, resolver_value)`` for differing fields.
+
+    Compares every namespace/policy field (excludes ``version``, which is
+    shape bookkeeping, not a scope field).
+    """
+    diff: dict[str, tuple[Any, Any]] = {}
+    for name in _EXECUTION_SCOPE_NAMESPACE_FIELDS + _EXECUTION_SCOPE_POLICY_FIELDS:
+        snapshot_value = getattr(snapshot, name)
+        resolver_value = getattr(resolver, name)
+        if snapshot_value != resolver_value:
+            diff[name] = (snapshot_value, resolver_value)
+    return diff
+
+
+def _load_execution_scope_snapshot(
+    task_id: str | int,
+    persisted_snapshot: ExecutionScopeInput,
+) -> Optional[ExecutionScope]:
+    """Fetch the persisted snapshot, honoring an explicitly-passed override.
+
+    A database owner that already read the persisted snapshot in its own
+    Session may pass it via ``persisted_snapshot`` to skip the registered
+    loader (see :func:`resolve_execution_scope`).
+    """
+    if persisted_snapshot is EXECUTION_SCOPE_NOT_PROVIDED:
+        return (
+            _execution_scope_snapshot_loader(str(task_id))
+            if _execution_scope_snapshot_loader is not None
+            else None
+        )
+    return cast(Optional[ExecutionScope], persisted_snapshot)
 
 
 def resolve_execution_scope(
@@ -462,38 +722,166 @@ def resolve_execution_scope(
 ) -> Optional[ExecutionScope]:
     """Resolve the scope for ``task_id``.
 
-    A persisted snapshot (see :func:`set_execution_scope_snapshot_loader`)
-    is preferred over the resolver; with neither registered, or both
-    returning None, the task runs unscoped. Loader/resolver exceptions
-    propagate to the caller. A database owner that already read the persisted
-    snapshot may pass it explicitly; this skips the registered loader while
-    preserving the same snapshot-then-resolver precedence. Explicit ``None``
-    means "snapshot absent", not "force an unscoped task".
+    With no resolver registered, the persisted snapshot (see
+    :func:`set_execution_scope_snapshot_loader`) is the sole answer,
+    byte-identical to the pre-authority behavior standalone/workforce
+    deployments rely on for restart/resume. With a resolver registered, the
+    resolver is authoritative and runs first; the snapshot (when the
+    resolver's answer needs one) is a corroborating candidate only:
+
+    - Resolver raises: propagates immediately: the snapshot is not consulted.
+    - Resolver returns ``None``: authoritative unscoped; the snapshot is not
+      consulted.
+    - Resolver returns :func:`defer_to_snapshot`'s carrier: the snapshot is
+      used if present, else the carrier's fallback. A broken snapshot loader
+      here is logged and treated as absent (falls back), matching the
+      principle below that a broken candidate cannot veto an answer the
+      resolver has already committed to (the fallback *is* that answer).
+    - Resolver returns an ``ExecutionScope``: authoritative. A snapshot
+      loader exception is logged and ignored (the candidate is corrupt, but
+      an authoritative answer already exists). A snapshot whose shape
+      version does not match the current one (:data:`EXECUTION_SCOPE_SHAPE_VERSION`,
+      including one missing the field entirely, and also a snapshot stamped
+      by a *newer* process during a mixed-version rollout) is logged
+      (field-level diff) and ignored rather than compared -- a field the
+      current shape added or changed always looks "different" from a
+      freshly-resolved scope built against a different shape, and that is
+      not a real conflict. Otherwise: a namespace-affecting difference (see
+      :data:`_EXECUTION_SCOPE_NAMESPACE_FIELDS`) raises
+      :class:`ExecutionScopeAuthorityError`; a policy-only difference (see
+      :data:`_EXECUTION_SCOPE_POLICY_FIELDS`) is logged and the resolver's
+      value still wins.
+
+    A database owner that already read the persisted snapshot may pass it
+    explicitly via ``persisted_snapshot``; this skips the registered loader
+    while preserving the same precedence. Explicit ``None`` means "snapshot
+    absent", not "force an unscoped task".
 
     Raises:
         ValueError: ``task_id`` is None — ``str(None)`` would silently
             query the loader/resolver for the literal string ``"None"``.
             Callers that legitimately have no task identity must treat
             that as unscoped themselves instead of passing None.
+        ExecutionScopeAuthorityError: a persisted snapshot disagrees with
+            the resolver's authoritative scope on a namespace-affecting
+            field.
     """
     if task_id is None:
         raise ValueError(
             "task_id cannot be None; a caller without a task identity "
             "must treat the execution as unscoped instead"
         )
-    if persisted_snapshot is EXECUTION_SCOPE_NOT_PROVIDED:
-        snapshot = (
-            _execution_scope_snapshot_loader(str(task_id))
-            if _execution_scope_snapshot_loader is not None
-            else None
-        )
-    else:
-        snapshot = cast(Optional[ExecutionScope], persisted_snapshot)
-    if snapshot is not None:
-        return snapshot
+
     if _execution_scope_resolver is None:
+        return _load_execution_scope_snapshot(task_id, persisted_snapshot)
+
+    resolved = _execution_scope_resolver(str(task_id))
+
+    if isinstance(resolved, DeferToSnapshot):
+        try:
+            snapshot = _load_execution_scope_snapshot(task_id, persisted_snapshot)
+        except Exception:
+            logger.warning(
+                "Snapshot loader failed while resolver deferred for task %s; "
+                "using the resolver's fallback",
+                task_id,
+                exc_info=True,
+            )
+            return resolved.fallback
+        return snapshot if snapshot is not None else resolved.fallback
+
+    if resolved is None:
         return None
-    return _execution_scope_resolver(str(task_id))
+
+    if not isinstance(resolved, ExecutionScope):
+        raise ExecutionScopeResolverContractError(
+            f"execution scope resolver returned {resolved!r}; expected an "
+            "ExecutionScope, None, or defer_to_snapshot(...)"
+        )
+
+    try:
+        snapshot = _load_execution_scope_snapshot(task_id, persisted_snapshot)
+    except Exception:
+        logger.warning(
+            "Snapshot loader failed while the resolver returned an "
+            "authoritative scope for task %s; ignoring the candidate",
+            task_id,
+            exc_info=True,
+        )
+        return resolved
+
+    if snapshot is None:
+        return resolved
+
+    if snapshot.version != EXECUTION_SCOPE_SHAPE_VERSION:
+        # Not just "older": a mixed-version rollout can also see a snapshot
+        # stamped by a newer process than this one. Either direction means
+        # the snapshot's shape cannot be safely compared field-by-field
+        # against a freshly-resolved scope built against *this* process's
+        # shape, so the candidate is ignored rather than raised on.
+        logger.warning(
+            "Ignoring execution scope snapshot candidate for task %s: shape "
+            "version %s does not match the current version %s; diff=%s",
+            task_id,
+            snapshot.version,
+            EXECUTION_SCOPE_SHAPE_VERSION,
+            _execution_scope_field_diff(snapshot, resolved),
+        )
+        return resolved
+
+    diff = _execution_scope_field_diff(snapshot, resolved)
+    if not diff:
+        return resolved
+
+    namespace_diff = {
+        name: values
+        for name, values in diff.items()
+        if name in _EXECUTION_SCOPE_NAMESPACE_FIELDS
+    }
+    if namespace_diff:
+        logger.error(
+            "Execution scope authority mismatch for task %s: %s",
+            task_id,
+            diff,
+        )
+        raise ExecutionScopeAuthorityError(
+            str(task_id),
+            resolver_scope=resolved,
+            snapshot_scope=snapshot,
+            mismatched_fields=diff,
+        )
+
+    logger.warning(
+        "Execution scope policy-only mismatch for task %s (resolver wins): %s",
+        task_id,
+        diff,
+    )
+    return resolved
+
+
+def resolve_execution_scope_off_turn(task_id: str | int) -> Optional[ExecutionScope]:
+    """Resolve scope for a consumer outside the turn lifecycle.
+
+    Used by off-turn storage-key/workspace-segment composition (legacy
+    preview backfill, a not-yet-persisted durable object) that cannot fail a
+    turn that has already ended or never started. An
+    :class:`ExecutionScopeAuthorityError` here would otherwise surface as a
+    misleading "file not found" or a bulk endpoint's 500, at a point where
+    the resolver has already produced an authoritative answer -- so it is
+    downgraded to that answer plus a structured warning instead of raised.
+    Every other exception (resolver/loader failure, ``task_id`` None) still
+    propagates unchanged.
+    """
+    try:
+        return resolve_execution_scope(task_id)
+    except ExecutionScopeAuthorityError as exc:
+        logger.warning(
+            "Execution scope authority mismatch resolved off-turn for task "
+            "%s (using the resolver's answer): %s",
+            exc.task_id,
+            exc.mismatched_fields,
+        )
+        return exc.resolver_scope
 
 
 @contextmanager

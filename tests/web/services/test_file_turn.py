@@ -9,9 +9,9 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
-    set_execution_scope_resolver,
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.models import database as database_module
@@ -268,7 +268,7 @@ def test_resolve_preserves_registered_scope_fallback_without_nested_checkout(
     monkeypatch.setattr(database_module, "_engine", engine)
     monkeypatch.setattr(database_module, "_SessionLocal", SessionLocal)
     set_execution_scope_snapshot_loader(load_task_execution_scope_snapshot)
-    set_execution_scope_resolver(lambda _task_id: isolated_scope)
+    register_scope_resolver(lambda _task_id: isolated_scope)
     try:
         with SessionLocal() as db:
             user = User(
@@ -330,6 +330,6 @@ def test_resolve_preserves_registered_scope_fallback_without_nested_checkout(
         assert observed_checked_out == [0]
         assert observed_prefixes == ["users/1/clients/3/end_users/7"]
     finally:
-        set_execution_scope_resolver(None)
+        register_scope_resolver(None)
         set_execution_scope_snapshot_loader(None)
         engine.dispose()

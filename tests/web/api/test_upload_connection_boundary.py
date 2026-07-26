@@ -13,6 +13,7 @@ import pytest
 from fastapi import HTTPException
 from fastapi.datastructures import UploadFile
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.core.file_storage.storage import FsspecFileStorage
 from xagent.core.workspace import TaskWorkspace
@@ -857,6 +858,74 @@ async def test_failed_compensation_does_not_skip_request_local_cleanup(
 
     assert local_paths
     assert all(not path.exists() for path in local_paths)
+
+
+@pytest.mark.asyncio
+async def test_store_uploaded_files_fails_closed_on_scope_authority_mismatch(
+    isolated_upload_storage,
+) -> None:
+    """``store_uploaded_files`` selects the write namespace (workspace
+    segments / storage key) for the bytes it writes, unlike the off-turn
+    *read* paths (``resolve_execution_scope_off_turn``) that downgrade an
+    authority mismatch to a warning and keep going. A registered
+    resolver/persisted-snapshot disagreement here must propagate and fail
+    the request instead of silently choosing a namespace."""
+    from xagent.core.execution_scope import (
+        ExecutionScope,
+        ExecutionScopeAuthorityError,
+        set_execution_scope_snapshot_loader,
+    )
+    from xagent.web.models.task import Task, TaskStatus
+    from xagent.web.services.execution_scope_snapshot import (
+        load_task_execution_scope_snapshot,
+    )
+
+    _admin_headers()
+    db = _direct_db_session()
+    try:
+        user_id = int(db.query(User.id).filter(User.username == "admin").scalar())
+        task = Task(
+            user_id=user_id,
+            title="scope mismatch",
+            description="scope mismatch",
+            status=TaskStatus.COMPLETED,
+            source="sdk",
+            agent_config={
+                "execution_scope": ExecutionScope(
+                    workspace_segments=("snapshot-tenant",),
+                ).to_dict()
+            },
+        )
+        db.add(task)
+        db.commit()
+        db.refresh(task)
+        task_id = int(task.id)
+    finally:
+        db.close()
+
+    set_execution_scope_snapshot_loader(load_task_execution_scope_snapshot)
+    register_scope_resolver(
+        lambda _task_id: ExecutionScope(workspace_segments=("resolver-tenant",)),
+    )
+    try:
+        with pytest.raises(ExecutionScopeAuthorityError):
+            await files_api.store_uploaded_files(
+                upload_items=[
+                    UploadFile(
+                        filename="mismatch.txt",
+                        file=io.BytesIO(b"payload"),
+                        headers={"content-type": "text/plain"},
+                    )
+                ],
+                task_type="general",
+                task_id=str(task_id),
+                folder=None,
+                user_id=user_id,
+                single_file_mode=True,
+            )
+    finally:
+        register_scope_resolver(None)
+        set_execution_scope_snapshot_loader(None)
 
 
 def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(

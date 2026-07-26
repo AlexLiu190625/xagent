@@ -16,10 +16,10 @@ from typing import Any, List, Optional
 
 import pytest
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
     ExecutionScopeContext,
-    set_execution_scope_resolver,
     turn_execution_scope,
 )
 from xagent.core.memory.base import MemoryStore
@@ -96,9 +96,9 @@ class FakeBaseStore(MemoryStore):
 
 @pytest.fixture(autouse=True)
 def _clear_resolver():
-    set_execution_scope_resolver(None)
+    register_scope_resolver(None)
     yield
-    set_execution_scope_resolver(None)
+    register_scope_resolver(None)
 
 
 @pytest.fixture
@@ -249,7 +249,7 @@ class TestResolverPathAndNestedReactivation:
     def test_turn_scope_reaches_memory_via_resolver(self, store):
         """The resolver path: memory operations inside a turn carry the
         resolved scope without any explicit plumbing."""
-        set_execution_scope_resolver(lambda task_id: SCOPE_A)
+        register_scope_resolver(lambda task_id: SCOPE_A)
         with UserContext(1):
             with turn_execution_scope(42):
                 stamped = _add(store, "from the turn")

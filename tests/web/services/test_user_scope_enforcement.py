@@ -9,11 +9,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
     reset_execution_scope,
     set_execution_scope,
-    set_execution_scope_resolver,
+    set_execution_scope_snapshot_loader,
 )
 from xagent.core.file_storage import StorageKeyScopeError
 from xagent.core.file_storage.factory import get_unscoped_file_storage
@@ -43,14 +44,6 @@ def storage_env(monkeypatch, tmp_path):
     get_unscoped_file_storage.cache_clear()
     yield tmp_path
     get_unscoped_file_storage.cache_clear()
-
-
-@pytest.fixture
-def clear_scope_resolver():
-    """Start and end each test with no registered resolver."""
-    set_execution_scope_resolver(None)
-    yield
-    set_execution_scope_resolver(None)
 
 
 def _record(local_path: Path, **overrides) -> UploadedFile:
@@ -273,19 +266,19 @@ def test_isolated_handle_rejects_sibling_end_user_key(storage_env, tmp_path):
 # recoverable from the per-task resolver/snapshot keyed on record.task_id.
 
 
-def test_resolver_narrows_handle_when_contextvar_absent(
-    storage_env, tmp_path, clear_scope_resolver
-):
-    set_execution_scope_resolver(
-        lambda task_id: _ISOLATED_SCOPE if task_id == "99" else None
+def test_resolver_narrows_handle_when_contextvar_absent(storage_env, tmp_path):
+    register_scope_resolver(
+        lambda task_id: _ISOLATED_SCOPE if task_id == "99" else None,
     )
     record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
     # No ambient contextvar, no explicit scope: fall back to the resolver.
     assert ManagedFileRef(record).storage.prefix == "users/7/clients/3/end_users/7"
 
 
-def test_contextvar_beats_resolver(storage_env, tmp_path, clear_scope_resolver):
-    set_execution_scope_resolver(lambda task_id: _NON_ISOLATED_SCOPE)
+def test_contextvar_beats_resolver(storage_env, tmp_path):
+    register_scope_resolver(
+        lambda task_id: _NON_ISOLATED_SCOPE,
+    )
     record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
     token = set_execution_scope(_ISOLATED_SCOPE)
     try:
@@ -294,29 +287,25 @@ def test_contextvar_beats_resolver(storage_env, tmp_path, clear_scope_resolver):
         reset_execution_scope(token)
 
 
-def test_explicit_scope_beats_resolver(storage_env, tmp_path, clear_scope_resolver):
-    set_execution_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
+def test_explicit_scope_beats_resolver(storage_env, tmp_path):
+    register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
     record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
     ref = ManagedFileRef(record, execution_scope=_NON_ISOLATED_SCOPE)
     assert ref.storage.prefix == "users/7"
 
 
-def test_resolver_not_consulted_without_task_id(
-    storage_env, tmp_path, clear_scope_resolver
-):
+def test_resolver_not_consulted_without_task_id(storage_env, tmp_path):
     def _boom(task_id):
         raise AssertionError("resolver must not run when the record has no task_id")
 
-    set_execution_scope_resolver(_boom)
+    register_scope_resolver(_boom)
     record = _record(tmp_path / "uploads" / "missing.txt")  # task_id defaults to None
     assert ManagedFileRef(record).storage.prefix == "users/7"
 
 
-def test_sync_to_durable_uses_resolved_scope(
-    storage_env, tmp_path, clear_scope_resolver
-):
-    set_execution_scope_resolver(
-        lambda task_id: _ISOLATED_SCOPE if task_id == "99" else None
+def test_sync_to_durable_uses_resolved_scope(storage_env, tmp_path):
+    register_scope_resolver(
+        lambda task_id: _ISOLATED_SCOPE if task_id == "99" else None,
     )
     source = tmp_path / "uploads" / "source.txt"
     source.parent.mkdir()
@@ -325,3 +314,68 @@ def test_sync_to_durable_uses_resolved_scope(
 
     stored = ManagedFileRef(record).sync_to_durable()
     assert stored.key == "users/7/clients/3/end_users/7/uploads/file-123/source.txt"
+
+
+# --- read path skips off-turn re-resolution (#296) ------
+# A record that already has a durable storage_key fixes its own location;
+# off-turn re-resolving the scope is unnecessary and, on a resolver/snapshot
+# drift, would make an already-legitimate key look foreign to a narrower
+# re-derived scope. Only a record with no storage_key yet (a new object about
+# to be written) still resolves off-turn.
+
+
+def test_existing_storage_key_skips_off_turn_resolution(storage_env, tmp_path):
+    def _boom(task_id):
+        raise AssertionError(
+            "off-turn resolution must not run when the record already has "
+            "a durable storage_key"
+        )
+
+    register_scope_resolver(_boom)
+    record = _record(
+        tmp_path / "uploads" / "missing.txt",
+        task_id=99,
+        storage_key="users/7/clients/3/end_users/7/uploads/file-123/source.txt",
+        storage_backend="file",
+        storage_status="available",
+    )
+
+    # Owner root, not the resolver's (never-called) narrower prefix.
+    assert ManagedFileRef(record).storage.prefix == "users/7"
+
+
+def test_existing_storage_key_binding_tolerates_resolver_snapshot_mismatch(
+    storage_env, tmp_path
+):
+    """An off-turn authority mismatch would otherwise fail closed (see
+    ``resolve_execution_scope_off_turn``); the read path never even reaches
+    that check because it does not resolve off-turn at all."""
+    register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(workspace_segments=("other-tenant",))
+    )
+    record = _record(
+        tmp_path / "uploads" / "missing.txt",
+        task_id=99,
+        storage_key="users/7/uploads/file-123/source.txt",
+        storage_backend="file",
+        storage_status="available",
+    )
+
+    assert ManagedFileRef(record).storage.prefix == "users/7"
+
+
+def test_new_object_write_path_still_resolves_off_turn_on_mismatch(
+    storage_env, tmp_path
+):
+    """No storage_key yet (a fresh upload): the write path still resolves
+    off-turn, and a namespace-affecting authority mismatch downgrades to the
+    resolver's own answer instead of raising (see
+    ``resolve_execution_scope_off_turn``)."""
+    register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(workspace_segments=("other-tenant",))
+    )
+    record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
+
+    assert ManagedFileRef(record).storage.prefix == "users/7/clients/3/end_users/7"

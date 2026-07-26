@@ -895,13 +895,23 @@ async def startup_event() -> None:
     start_uploaded_file_recovery_task(app)
     start_orphan_upload_gc_task(app)
 
-    # Persisted ExecutionScope snapshots (workforce sub-tasks) are preferred
-    # over the embedder's resolver during per-task scope resolution.
+    # Persisted ExecutionScope snapshots (workforce sub-tasks) keep a
+    # sub-task scoped across process restarts. With no resolver registered
+    # they are the sole answer; with one registered they are a
+    # corroborating candidate (see
+    # xagent.core.execution_scope.resolve_execution_scope).
+    from ..core.execution_scope import execution_scope_resolver_registered
     from .services.execution_scope_snapshot import (
         register_execution_scope_snapshot_loader,
     )
 
     register_execution_scope_snapshot_loader()
+    logger.info(
+        "Execution scope authority mode: %s",
+        "resolver-authoritative (snapshot is a corroborating candidate)"
+        if execution_scope_resolver_registered()
+        else "snapshot-only (no resolver registered)",
+    )
 
     from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
 

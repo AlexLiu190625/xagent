@@ -24,10 +24,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
+from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     get_execution_scope,
-    set_execution_scope_resolver,
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.websocket import (
@@ -42,15 +43,6 @@ from xagent.web.services.task_lease_service import (
     TaskLease,
     TaskLeaseHeartbeatOutcome,
 )
-
-
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
-    yield
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
 
 
 def _make_task_orm() -> Task:
@@ -163,7 +155,7 @@ async def test_bg_turn_resolves_and_activates_scope() -> None:
         resolver_calls.append(task_id)
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
 
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
@@ -237,7 +229,7 @@ async def test_bg_turn_explicit_unscoped_does_not_resolve_again() -> None:
     def unexpected_resolver(task_id: str) -> ExecutionScope:
         raise AssertionError(f"scope for task {task_id} was resolved twice")
 
-    set_execution_scope_resolver(unexpected_resolver)
+    register_scope_resolver(unexpected_resolver)
     agent_service = MagicMock()
     agent_manager = MagicMock(
         get_agent_for_task=AsyncMock(return_value=agent_service),
@@ -296,6 +288,41 @@ async def test_owned_bg_failure_waits_for_exact_settlement_before_broadcast() ->
 
 
 @pytest.mark.asyncio
+async def test_bg_turn_authority_mismatch_fails_the_turn() -> None:
+    """Turn-face consumer (#296): a namespace-affecting
+    disagreement between the registered resolver and a persisted snapshot
+    must fail the turn -- unlike the off-turn consumers in
+    ``websocket._scope_segments_for_task`` and ``ManagedFileRef``, which
+    downgrade the same mismatch to the resolver's answer plus a warning."""
+    register_scope_resolver(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver"),
+    )
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(sandbox_key_suffix="from-snapshot")
+    )
+    agent_manager = MagicMock()
+
+    with (
+        _Patches(_bg_patches(_build_db_mock())),
+        pytest.raises(ExecutionScopeAuthorityError),
+    ):
+        await execute_task_background(
+            task_id=42,
+            user_message="hi",
+            context={},
+            agent_manager=agent_manager,
+            task_owner_user_id=1,
+            task_lease=TaskLease(
+                task_id=42,
+                runner_id="runner-a",
+                run_id="run-a",
+            ),
+        )
+
+    agent_manager.get_agent_for_task.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None:
     """Scope and setup snapshot are resolved sequentially in workers."""
     main_thread_id = threading.get_ident()
@@ -306,7 +333,7 @@ async def test_bg_turn_resolves_scope_before_loading_snapshot_off_loop() -> None
         events.append(("resolve", threading.get_ident()))
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
 
     def load_snapshot(*_args: Any, **_kwargs: Any) -> Any:
         events.append(("snapshot", threading.get_ident()))
@@ -365,7 +392,7 @@ async def test_resumed_turn_re_resolves_scope() -> None:
         resolver_calls.append(task_id)
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
 
     seen: dict[str, Any] = {}
     agent_service = MagicMock()
@@ -528,7 +555,7 @@ async def test_resume_handler_resolves_scope_once_off_loop_and_passes_it_through
         resolver_threads.append(threading.get_ident())
         return scope
 
-    set_execution_scope_resolver(resolver)
+    register_scope_resolver(resolver)
     snapshot = SimpleNamespace(
         task=SimpleNamespace(
             id=42,

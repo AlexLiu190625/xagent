@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
+    EXECUTION_SCOPE_SHAPE_VERSION,
     get_execution_scope,
 )
 from xagent.core.tools.adapters.vibe.agent_tool_names import (
@@ -373,10 +374,22 @@ def build_workforce_task_config(
         config["selected_file_ids"] = selected_file_ids
     # Workforce runs create fresh Task rows whose ids the embedder's scope
     # resolver cannot map. Persist the creating context's ExecutionScope
-    # snapshot into agent_config (no schema migration); per-turn activation
-    # prefers this snapshot over the resolver, so the run executes fully
-    # scoped even after a process restart.
+    # snapshot into agent_config (no schema migration); resolve_execution_scope
+    # treats this as a corroborating candidate, not an override -- it is
+    # authoritative only when a resolver defers to it or none is registered,
+    # and is ignored when its version predates the current shape -- so the
+    # run stays scoped across a process restart without ever overriding a
+    # registered resolver's answer.
     scope = get_execution_scope()
     if scope is not None:
-        config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = scope.to_dict()
+        snapshot_data = scope.to_dict()
+        # Stamp the current shape version rather than propagating
+        # ``scope.version``: the dict below is being constructed *now*, in
+        # the current shape, regardless of whether the in-context scope was
+        # itself decoded from an older persisted snapshot (which would carry
+        # a stale/low version). Propagating that stale value here would let
+        # a decoded-then-re-persisted scope masquerade as pre-dating fields
+        # it actually has, permanently ignoring it as a candidate.
+        snapshot_data["version"] = EXECUTION_SCOPE_SHAPE_VERSION
+        config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = snapshot_data
     return config
