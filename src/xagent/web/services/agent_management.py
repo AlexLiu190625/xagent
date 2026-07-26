@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import datetime
-from typing import Any, Literal, cast
+from datetime import datetime, timezone
+from types import TracebackType
+from typing import Any, Callable, Literal, cast
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
@@ -19,14 +21,21 @@ from ...core.utils.api_key import (
 )
 from ...templates.manager import TemplateManager
 from ..models.agent import Agent
+from ..models.agent_api_key import AgentApiKey
 from ..models.database import get_session_local, release_db_connection_if_clean
 from ..models.model import Model as DBModel
 from ..models.user import User
 from ..models.workforce import Workforce, WorkforceAgent, WorkforceRun
 from ..schemas.agent_api_key import APIKeyGenerateResponse
 from ..services.agent_store import AgentStore, invalidate_agent_cache
-from .api_keys import AgentApiKeyService, ApiKeyCandidate, KeyRotationConflict
-from .db_runtime import run_db_io_cancellation_safe
+from .api_keys import (
+    AgentApiKeyService,
+    ApiKeyCandidate,
+    KeyRotationConflict,
+    RuntimeKeyDeliveryError,
+    RuntimeKeyReceipt,
+)
+from .db_runtime import await_task_settlement, run_db_io_cancellation_safe
 from .workforce_access import can_edit_workforce, filter_visible_workforces
 from .workforce_lifecycle import is_workforce_manager_discard_safe
 
@@ -221,6 +230,16 @@ class AgentDeleteResult:
     logo_url: str | None
 
 
+@dataclass(frozen=True)
+class _RuntimeKeyDeliveryOutcome:
+    """Detached worker result that retains an exact key receipt on failure."""
+
+    result: object | None
+    receipt: RuntimeKeyReceipt | None
+    error: BaseException | None
+    traceback: TracebackType | None
+
+
 class AgentWorkforceConflictError(RuntimeError):
     """Raised when a Workforce FK prevents deletion of an Agent."""
 
@@ -249,6 +268,7 @@ class AgentManagementService:
         self.store = AgentStore(db)
         self.template_manager = template_manager
         self.key_service = AgentApiKeyService(db)
+        self.runtime_key_receipt: RuntimeKeyReceipt | None = None
 
     def list_agents_for_user(self, user_id: int) -> list[dict[str, Any]]:
         return self.store.list_agent_items(user_id)
@@ -590,41 +610,69 @@ class AgentManagementService:
         # translation wraps key staging + commit together. See the
         # contract note in the docstring above.
         staged_key = None
+        self.runtime_key_receipt = None
+        commit_attempted = False
         try:
             if generate_runtime_key:
                 staged_key = self.key_service.stage_rotated_key(
                     int(agent.id),
                     candidate=runtime_key_candidate,
                 )
+                self.runtime_key_receipt = self.key_service.runtime_key_receipt
+            commit_attempted = True
             self.db.commit()  # single transaction boundary for both writes
         except IntegrityError as exc:
             self.db.rollback()
             raise KeyRotationConflict(str(exc)) from exc
+        except BaseException as exc:
+            if commit_attempted and self.runtime_key_receipt is not None:
+                raise RuntimeKeyDeliveryError(
+                    self.runtime_key_receipt,
+                    exc,
+                    exc.__traceback__,
+                ) from exc
+            raise
 
-        key_resp: APIKeyGenerateResponse | None = None
-        self.db.refresh(agent)
-        agent_id = int(agent.id)
-        agent_team_id = cast("int | None", agent.team_id)
-        if staged_key is not None:
-            new_row, full_key = staged_key
-            self.db.refresh(new_row)
-            key_resp = APIKeyGenerateResponse(
-                full_key=full_key,
-                key_prefix=new_row.key_prefix,
-                created_at=new_row.created_at,
-            )
-        # Preserve the fully-loaded response row as a detached object. The
-        # read-only transaction release below expires attached ORM state.
-        self.db.expunge(agent)
-        # Refreshes above open a new read-only transaction. End it before
-        # cache invalidation, which may perform synchronous remote I/O.
-        release_db_connection_if_clean(self.db)
-        invalidate_agent_cache(
-            user_id,
-            agent_id,
-            agent_team_id,
-        )
-        return agent, key_resp
+        try:
+            key_resp: APIKeyGenerateResponse | None = None
+            self.db.refresh(agent)
+            agent_id = int(agent.id)
+            agent_team_id = cast("int | None", agent.team_id)
+            if staged_key is not None:
+                new_row, full_key = staged_key
+                self.db.refresh(new_row)
+                key_resp = APIKeyGenerateResponse(
+                    full_key=full_key,
+                    key_prefix=new_row.key_prefix,
+                    created_at=new_row.created_at,
+                )
+            # Preserve the fully-loaded response row as a detached object. The
+            # read-only transaction release below expires attached ORM state.
+            self.db.expunge(agent)
+            # Refreshes above open a new read-only transaction. End it before
+            # cache invalidation, which may perform synchronous remote I/O.
+            release_db_connection_if_clean(self.db)
+            try:
+                invalidate_agent_cache(
+                    user_id,
+                    agent_id,
+                    agent_team_id,
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to invalidate cache after creating agent %s",
+                    agent_id,
+                    exc_info=True,
+                )
+            return agent, key_resp
+        except BaseException as exc:
+            if self.runtime_key_receipt is not None:
+                raise RuntimeKeyDeliveryError(
+                    self.runtime_key_receipt,
+                    exc,
+                    exc.__traceback__,
+                ) from exc
+            raise
 
     async def create_agent_from_template(
         self,
@@ -705,10 +753,12 @@ class AgentManagementService:
         agent = self.store.get_owned_agent(user_id, agent_id)
         if agent is None:
             return None
-        return self.key_service.rotate_key(
+        response = self.key_service.rotate_key_for_runtime_delivery(
             agent_id,
             candidate=runtime_key_candidate,
         )
+        self.runtime_key_receipt = self.key_service.runtime_key_receipt
+        return response
 
     def _validate_models(
         self, models: dict[str, Any] | None, *, user_id: int
@@ -822,6 +872,10 @@ def _is_runtime_key_prefix_collision(error: BaseException) -> bool:
     return False
 
 
+def _is_process_control(error: BaseException) -> bool:
+    return not isinstance(error, (Exception, asyncio.CancelledError))
+
+
 async def _validate_agent_knowledge_bases(
     *,
     knowledge_bases: tuple[str, ...],
@@ -877,6 +931,84 @@ class AgentManagementRuntime:
             payloads = AgentManagementService(db).list_agents_for_user(user_id)
             return tuple(_agent_summary_snapshot(payload) for payload in payloads)
 
+    @staticmethod
+    def _run_runtime_key_session_operation(
+        operation: Callable[[AgentManagementService], _RuntimeKeyDeliveryOutcome],
+    ) -> _RuntimeKeyDeliveryOutcome:
+        """Detach runtime-key outcomes before closing their worker Session.
+
+        A committed key receipt is needed even when the service reports a
+        post-commit failure.  ``Session.__exit__`` can itself fail, so this
+        boundary converts the service failure to detached data before close;
+        an operational close failure cannot replace that earlier failure.
+        """
+
+        db: Session | None = None
+        service: AgentManagementService | None = None
+        outcome: _RuntimeKeyDeliveryOutcome | None = None
+        try:
+            SessionLocal = get_session_local()
+            db = SessionLocal()
+            service = AgentManagementService(db)
+            try:
+                outcome = operation(service)
+            except RuntimeKeyDeliveryError as exc:
+                outcome = _RuntimeKeyDeliveryOutcome(
+                    result=None,
+                    receipt=exc.receipt,
+                    error=exc.error,
+                    traceback=exc.traceback,
+                )
+            except BaseException as exc:
+                outcome = _RuntimeKeyDeliveryOutcome(
+                    result=None,
+                    receipt=(
+                        None
+                        if isinstance(exc, KeyRotationConflict) or service is None
+                        else service.runtime_key_receipt
+                    ),
+                    error=exc,
+                    traceback=exc.__traceback__,
+                )
+        except BaseException as exc:
+            outcome = _RuntimeKeyDeliveryOutcome(
+                result=None,
+                receipt=None,
+                error=exc,
+                traceback=exc.__traceback__,
+            )
+        finally:
+            if db is not None:
+                try:
+                    db.close()
+                except BaseException as close_error:
+                    if outcome is None or outcome.error is None:
+                        outcome = _RuntimeKeyDeliveryOutcome(
+                            result=None,
+                            receipt=None if outcome is None else outcome.receipt,
+                            error=close_error,
+                            traceback=close_error.__traceback__,
+                        )
+                    elif _is_process_control(close_error):
+                        outcome = _RuntimeKeyDeliveryOutcome(
+                            result=None,
+                            receipt=outcome.receipt,
+                            error=close_error,
+                            traceback=close_error.__traceback__,
+                        )
+                    else:
+                        logger.warning(
+                            "Failed to close runtime-key worker session after a "
+                            "delivery failure",
+                            exc_info=(
+                                type(close_error),
+                                close_error,
+                                close_error.__traceback__,
+                            ),
+                        )
+        assert outcome is not None
+        return outcome
+
     async def create_agent(
         self,
         *,
@@ -890,19 +1022,20 @@ class AgentManagementRuntime:
             user_id=user_id,
             is_admin=is_admin,
         )
-        return await run_db_io_cancellation_safe(
+        result = await self._run_runtime_key_delivery(
             lambda: self._create_agent_with_retry_sync(
                 user_id=user_id,
                 spec=spec,
             )
         )
+        return cast("AgentCreateSnapshot", result)
 
     @staticmethod
     def _create_agent_with_retry_sync(
         *,
         user_id: int,
         spec: AgentCreateSpec,
-    ) -> AgentCreateSnapshot:
+    ) -> _RuntimeKeyDeliveryOutcome:
         attempts = PREFIX_COLLISION_RETRIES if spec.generate_runtime_key else 1
         for attempt in range(attempts):
             # Candidate generation includes bcrypt. It deliberately precedes
@@ -912,41 +1045,56 @@ class AgentManagementRuntime:
                 if spec.generate_runtime_key
                 else None
             )
-            SessionLocal = get_session_local()
-            try:
-                with SessionLocal() as db:
-                    service = AgentManagementService(db)
-                    agent, key_response = service.create_agent_with_optional_key(
-                        user_id=user_id,
-                        name=spec.name,
-                        description=spec.description,
-                        instructions=spec.instructions,
-                        execution_mode=spec.execution_mode,
-                        models=spec.model_mapping(),
-                        knowledge_bases=list(spec.knowledge_bases),
-                        skills=list(spec.skills),
-                        tool_categories=list(spec.tool_categories),
-                        suggested_prompts=list(spec.suggested_prompts),
-                        generate_runtime_key=spec.generate_runtime_key,
-                        runtime_key_candidate=candidate,
-                    )
-                    agent_snapshot = _agent_response_snapshot(
-                        service.store.agent_to_response_dict(agent)
-                    )
-                    return AgentCreateSnapshot(
+
+            def create_attempt(
+                service: AgentManagementService,
+            ) -> _RuntimeKeyDeliveryOutcome:
+                agent, key_response = service.create_agent_with_optional_key(
+                    user_id=user_id,
+                    name=spec.name,
+                    description=spec.description,
+                    instructions=spec.instructions,
+                    execution_mode=spec.execution_mode,
+                    models=spec.model_mapping(),
+                    knowledge_bases=list(spec.knowledge_bases),
+                    skills=list(spec.skills),
+                    tool_categories=list(spec.tool_categories),
+                    suggested_prompts=list(spec.suggested_prompts),
+                    generate_runtime_key=spec.generate_runtime_key,
+                    runtime_key_candidate=candidate,
+                )
+                agent_snapshot = _agent_response_snapshot(
+                    service.store.agent_to_response_dict(agent)
+                )
+                return _RuntimeKeyDeliveryOutcome(
+                    result=AgentCreateSnapshot(
                         agent=agent_snapshot,
                         api_key=_runtime_key_snapshot(key_response),
-                    )
-            except KeyRotationConflict as exc:
-                if (
-                    candidate is not None
-                    and _is_runtime_key_prefix_collision(exc)
-                    and attempt + 1 < attempts
-                ):
-                    continue
-                raise
-        raise KeyRotationConflict(
+                    ),
+                    receipt=service.runtime_key_receipt,
+                    error=None,
+                    traceback=None,
+                )
+
+            outcome = AgentManagementRuntime._run_runtime_key_session_operation(
+                create_attempt
+            )
+            if (
+                isinstance(outcome.error, KeyRotationConflict)
+                and candidate is not None
+                and _is_runtime_key_prefix_collision(outcome.error)
+                and attempt + 1 < attempts
+            ):
+                continue
+            return outcome
+        error = KeyRotationConflict(
             "Failed to generate a unique runtime key prefix after retrying."
+        )
+        return _RuntimeKeyDeliveryOutcome(
+            result=None,
+            receipt=None,
+            error=error,
+            traceback=error.__traceback__,
         )
 
     async def create_agent_from_template(
@@ -1021,37 +1169,130 @@ class AgentManagementRuntime:
         user_id: int,
         agent_id: int,
     ) -> RuntimeKeySnapshot | None:
-        return await run_db_io_cancellation_safe(
+        result = await self._run_runtime_key_delivery(
             lambda: self._rotate_agent_runtime_key_with_retry_sync(
                 user_id=user_id,
                 agent_id=agent_id,
             )
         )
+        return cast("RuntimeKeySnapshot | None", result)
 
     @staticmethod
     def _rotate_agent_runtime_key_with_retry_sync(
         *,
         user_id: int,
         agent_id: int,
-    ) -> RuntimeKeySnapshot | None:
+    ) -> _RuntimeKeyDeliveryOutcome:
         for attempt in range(PREFIX_COLLISION_RETRIES):
             candidate = generate_api_key(None, kind=ApiKeyKind.AGENT)
-            SessionLocal = get_session_local()
-            try:
-                with SessionLocal() as db:
-                    response = AgentManagementService(db).generate_agent_runtime_key(
-                        user_id=user_id,
-                        agent_id=agent_id,
-                        runtime_key_candidate=candidate,
-                    )
-                    return _runtime_key_snapshot(response)
-            except KeyRotationConflict as exc:
-                if (
-                    _is_runtime_key_prefix_collision(exc)
-                    and attempt + 1 < PREFIX_COLLISION_RETRIES
-                ):
-                    continue
-                raise
-        raise KeyRotationConflict(
+
+            def rotate_attempt(
+                service: AgentManagementService,
+            ) -> _RuntimeKeyDeliveryOutcome:
+                response = service.generate_agent_runtime_key(
+                    user_id=user_id,
+                    agent_id=agent_id,
+                    runtime_key_candidate=candidate,
+                )
+                return _RuntimeKeyDeliveryOutcome(
+                    result=_runtime_key_snapshot(response),
+                    receipt=service.runtime_key_receipt,
+                    error=None,
+                    traceback=None,
+                )
+
+            outcome = AgentManagementRuntime._run_runtime_key_session_operation(
+                rotate_attempt
+            )
+            if (
+                isinstance(outcome.error, KeyRotationConflict)
+                and _is_runtime_key_prefix_collision(outcome.error)
+                and attempt + 1 < PREFIX_COLLISION_RETRIES
+            ):
+                continue
+            return outcome
+        error = KeyRotationConflict(
             "Failed to generate a unique runtime key prefix after retrying."
         )
+        return _RuntimeKeyDeliveryOutcome(
+            result=None,
+            receipt=None,
+            error=error,
+            traceback=error.__traceback__,
+        )
+
+    async def _run_runtime_key_delivery(
+        self,
+        operation: Callable[[], _RuntimeKeyDeliveryOutcome],
+    ) -> object | None:
+        """Settle key delivery before exposing cancellation or worker failure."""
+
+        worker = asyncio.create_task(asyncio.to_thread(operation))
+        outcome, cancellation = await await_task_settlement(worker)
+        compensation_error: BaseException | None = None
+        if outcome.receipt is not None and (
+            cancellation is not None or outcome.error is not None
+        ):
+            compensation_error = await self._compensate_runtime_key(outcome.receipt)
+
+        if outcome.error is not None:
+            error = outcome.error.with_traceback(outcome.traceback)
+            if _is_process_control(error):
+                raise error
+            if cancellation is not None:
+                raise cancellation from error
+            if compensation_error is not None:
+                raise error from compensation_error
+            raise error
+        if cancellation is not None:
+            if compensation_error is not None:
+                raise cancellation from compensation_error
+            raise cancellation
+        return outcome.result
+
+    @staticmethod
+    def _revoke_runtime_key_sync(receipt: RuntimeKeyReceipt) -> None:
+        """Idempotently revoke only the exact key produced by this request."""
+
+        SessionLocal = get_session_local()
+        with SessionLocal() as db:
+            now = datetime.now(timezone.utc)
+            try:
+                db.execute(
+                    update(AgentApiKey)
+                    .where(
+                        AgentApiKey.id == receipt.key_id,
+                        AgentApiKey.agent_id == receipt.agent_id,
+                        AgentApiKey.key_prefix == receipt.key_prefix,
+                        AgentApiKey.revoked_at.is_(None),
+                    )
+                    .values(revoked_at=now, updated_at=now)
+                )
+                db.commit()
+            except BaseException:
+                db.rollback()
+                raise
+
+    async def _compensate_runtime_key(
+        self,
+        receipt: RuntimeKeyReceipt,
+    ) -> BaseException | None:
+        """Run exact revocation in a fresh worker-owned Session."""
+
+        worker = asyncio.create_task(
+            asyncio.to_thread(self._revoke_runtime_key_sync, receipt)
+        )
+        try:
+            _result, _cancellation = await await_task_settlement(worker)
+        except BaseException as exc:
+            if not isinstance(exc, (Exception, asyncio.CancelledError)):
+                raise
+            logger.warning(
+                "Failed to revoke undelivered runtime key id=%s agent_id=%s prefix=%s",
+                receipt.key_id,
+                receipt.agent_id,
+                receipt.key_prefix,
+                exc_info=True,
+            )
+            return exc
+        return None

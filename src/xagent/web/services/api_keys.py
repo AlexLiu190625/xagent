@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import TracebackType
 from typing import Any, NamedTuple
 
 from sqlalchemy import func, or_
@@ -40,6 +42,30 @@ logger = logging.getLogger(__name__)
 ApiKeyCandidate = tuple[str, str, str]
 
 
+@dataclass(frozen=True)
+class RuntimeKeyReceipt:
+    """Exact identity of a staged runtime key that may need revocation."""
+
+    key_id: int
+    agent_id: int
+    key_prefix: str
+
+
+class RuntimeKeyDeliveryError(Exception):
+    """Carry a post-commit runtime-key failure without losing its receipt."""
+
+    def __init__(
+        self,
+        receipt: RuntimeKeyReceipt,
+        error: BaseException,
+        traceback: TracebackType | None,
+    ) -> None:
+        super().__init__(str(error))
+        self.receipt = receipt
+        self.error = error
+        self.traceback = traceback
+
+
 class KeyRotationConflict(RuntimeError):
     """Raised when a concurrent key rotation wins the active-key race."""
 
@@ -61,6 +87,7 @@ class AgentApiKeyService:
 
     def __init__(self, db: Session) -> None:
         self.db = db
+        self.runtime_key_receipt: RuntimeKeyReceipt | None = None
 
     def stage_rotated_key(
         self,
@@ -108,6 +135,11 @@ class AgentApiKeyService:
         )
         self.db.add(new_row)
         self.db.flush()
+        self.runtime_key_receipt = RuntimeKeyReceipt(
+            key_id=int(new_row.id),
+            agent_id=int(agent_id),
+            key_prefix=str(new_row.key_prefix),
+        )
         logger.info(
             "Staged runtime API key for agent %s (prefix=%s, revoked=%d)",
             agent_id,
@@ -152,6 +184,45 @@ class AgentApiKeyService:
             key_prefix=new_row.key_prefix,
             created_at=new_row.created_at,
         )
+
+    def rotate_key_for_runtime_delivery(
+        self,
+        agent_id: int,
+        *,
+        candidate: ApiKeyCandidate | None = None,
+    ) -> APIKeyGenerateResponse:
+        """Rotate a V1 one-shot key while retaining post-commit evidence."""
+
+        self.runtime_key_receipt = None
+        receipt: RuntimeKeyReceipt | None = None
+        commit_attempted = False
+        try:
+            new_row, full_key = self.stage_rotated_key(
+                agent_id,
+                candidate=candidate,
+            )
+            receipt = self.runtime_key_receipt
+            commit_attempted = True
+            self.db.commit()
+        except IntegrityError as exc:
+            self.db.rollback()
+            raise KeyRotationConflict(str(exc)) from exc
+        except BaseException as exc:
+            if commit_attempted and receipt is not None:
+                raise RuntimeKeyDeliveryError(receipt, exc, exc.__traceback__) from exc
+            raise
+
+        try:
+            self.db.refresh(new_row)
+            return APIKeyGenerateResponse(
+                full_key=full_key,
+                key_prefix=new_row.key_prefix,
+                created_at=new_row.created_at,
+            )
+        except BaseException as exc:
+            if receipt is not None:
+                raise RuntimeKeyDeliveryError(receipt, exc, exc.__traceback__) from exc
+            raise
 
     def get_metadata(self, agent_id: int) -> APIKeyMetadataResponse | None:
         # An agent can now have more than one active key (via the

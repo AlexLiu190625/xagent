@@ -11,6 +11,10 @@ from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 _T = TypeVar("_T")
 
 
+def _is_process_control(error: BaseException) -> bool:
+    return not isinstance(error, (Exception, asyncio.CancelledError))
+
+
 def is_database_pool_timeout(error: BaseException) -> bool:
     """Return whether an exception chain represents pool checkout exhaustion."""
     current: BaseException | None = error
@@ -49,8 +53,12 @@ async def await_task_settlement(
             try:
                 result = task.result()
             except BaseException as task_error:
+                if _is_process_control(task_error):
+                    raise
                 raise cancellation from task_error
         except BaseException as task_error:
+            if _is_process_control(task_error):
+                raise
             if cancellation is not None:
                 raise cancellation from task_error
             raise
