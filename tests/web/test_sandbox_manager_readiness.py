@@ -120,6 +120,31 @@ async def test_readiness_allows_identical_triple_duplicated_across_sources():
 
 
 @pytest.mark.asyncio
+async def test_readiness_groups_paths_the_backend_would_collapse():
+    """``//foo`` and ``/foo`` are one mount point to the backend.
+
+    ``posixpath.normpath`` keeps a leading ``//``, so normalizing with it
+    alone would file these under two different host keys and let a real
+    duplicate-mount conflict past the startup gate; the shared
+    ``canonical_sandbox_path`` owner collapses the leading slash run the
+    same way the desired spec does.
+    """
+    with (
+        patch.dict(
+            "os.environ",
+            {"SANDBOX_VOLUMES": "//foo:/guest1:ro"},
+            clear=True,
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[("/foo", "/guest2", "ro")],
+        ),
+    ):
+        with pytest.raises(SandboxRuntimeConflictError):
+            await check_sandbox_static_readiness(_ProbeStub(True))
+
+
+@pytest.mark.asyncio
 async def test_readiness_checks_folded_external_dirs_against_host_domain(
     tmp_path: Path,
 ):

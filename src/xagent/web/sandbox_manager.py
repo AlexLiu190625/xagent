@@ -5,7 +5,6 @@ Sandbox management in application layer.
 import asyncio
 import logging
 import os
-import posixpath
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -50,6 +49,7 @@ from ..sandbox.base import (
     SandboxRuntimeConflictError,
     SandboxTemplate,
     SpecVerdict,
+    canonical_sandbox_path,
     spec_matches_inspection,
 )
 from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
@@ -2123,13 +2123,15 @@ def _check_no_conflicting_readiness_volumes(
 
     An exactly identical triple repeated across sources (e.g. the same
     directory named twice) collapses onto itself in both directions and is
-    legal.
+    legal. Paths are canonicalized through ``canonical_sandbox_path``, the
+    same owner the desired spec uses, so this check groups exactly the
+    spellings the backend itself would collapse onto one mount point.
     """
     seen_by_host: dict[str, tuple[str, str]] = {}
     seen_by_guest: dict[str, tuple[str, str]] = {}
     for host_path, guest_path, mode in volumes:
-        norm_host = posixpath.normpath(host_path)
-        norm_guest = posixpath.normpath(guest_path)
+        norm_host = canonical_sandbox_path(host_path)
+        norm_guest = canonical_sandbox_path(guest_path)
 
         host_key = (norm_guest, mode)
         prior_for_host = seen_by_host.get(norm_host)
