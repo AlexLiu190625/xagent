@@ -2367,6 +2367,7 @@ async def execute_task_background(
     await background_task_manager.wait_for_previous(task_id)
 
     terminal_state_committed = False
+    finalization_cancellation: asyncio.CancelledError | None = None
     try:
         if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
             execution_scope = await run_db_io_cancellation_safe(
@@ -2444,7 +2445,7 @@ async def execute_task_background(
                 recovery_state.get("skill_context")
             )
             await run_db_io_cancellation_safe(
-                lambda: _register_uploaded_files_for_agent_isolated(
+                lambda: _register_uploaded_files_for_agent(
                     agent_service,
                     context_dict.get("file_info", []),
                 )
@@ -2467,22 +2468,29 @@ async def execute_task_background(
         finalize_run_id = (
             task_lease.run_id if task_lease is not None else expected_run_id
         )
-        finalized = await run_db_io_cancellation_safe(
-            lambda: _finalize_task_execution_result_isolated(
-                task_id=task_id,
-                task_user_id=effective_user_id,
-                pre_run_status=cast(TaskStatus, snapshot.task.status),
-                result=result,
-                expected_run_id=finalize_run_id,
-                task_lease=task_lease,
-                resolved_scope_segments=(
-                    execution_scope.workspace_segments
-                    if execution_scope is not None
-                    else ()
-                ),
+        finalization_worker = asyncio.create_task(
+            asyncio.to_thread(
+                lambda: _finalize_task_execution_result_isolated(
+                    task_id=task_id,
+                    task_user_id=effective_user_id,
+                    pre_run_status=cast(TaskStatus, snapshot.task.status),
+                    result=result,
+                    expected_run_id=finalize_run_id,
+                    task_lease=task_lease,
+                    resolved_scope_segments=(
+                        execution_scope.workspace_segments
+                        if execution_scope is not None
+                        else ()
+                    ),
+                )
             )
         )
+        finalized, finalization_cancellation = await await_task_settlement(
+            finalization_worker
+        )
         if finalized.late_result:
+            if finalization_cancellation is not None:
+                raise finalization_cancellation
             return
 
         normalized_outputs = finalized.normalized_outputs
@@ -2530,6 +2538,8 @@ async def execute_task_background(
                 task_id,
             )
             logger.info(f"Background task {task_id} paused for v2 control")
+            if finalization_cancellation is not None:
+                raise finalization_cancellation
             return
 
         # Send task completion event (includes agent response info)
@@ -2560,6 +2570,8 @@ async def execute_task_background(
             task_id,
         )
         logger.info(f"Background task {task_id} execution completed")
+        if finalization_cancellation is not None:
+            raise finalization_cancellation
 
     except Exception as e:
         # The outer try also spans the post-terminal steps -- assistant
@@ -2571,6 +2583,15 @@ async def execute_task_background(
         # execution failure. Otherwise a failed post-completion broadcast
         # would rewrite an already-COMPLETED task as FAILED and store the
         # broadcast error as the task's failure cause.
+        if finalization_cancellation is not None and terminal_state_committed:
+            logger.warning(
+                "Background task %s terminal result was committed but its "
+                "notification failed during cancellation: %s",
+                task_id,
+                e,
+                exc_info=True,
+            )
+            raise finalization_cancellation from e
         if task_lease is not None:
             if terminal_state_committed:
                 logger.warning(
@@ -2734,8 +2755,7 @@ def _finalize_resumed_task(
     task_owner_user_id: int | None,
     result: Dict[str, Any],
     task_lease: TaskLease,
-    resolved_scope_segments: tuple[str, ...],
-    prepared_outputs: _PreparedTaskFileOutputs | None = None,
+    prepared_outputs: _PreparedTaskFileOutputs,
 ) -> dict[str, Any]:
     """Persist one fenced resumed result in a single worker transaction."""
     from ..models.agent import Agent
@@ -2756,31 +2776,12 @@ def _finalize_resumed_task(
         "late_result": False,
     }
     if task_lease.run_id is None:
-        if prepared_outputs is not None:
-            _settle_prepared_task_file_outputs(
-                prepared_outputs,
-                metadata_committed=False,
-            )
+        _settle_prepared_task_file_outputs(
+            prepared_outputs,
+            metadata_committed=False,
+        )
         finalized["late_result"] = True
         return finalized
-    if prepared_outputs is None:
-        resolved_output_user_id = task_owner_user_id
-        if resolved_output_user_id is None:
-            SessionLocal = get_session_local()
-            with SessionLocal() as lookup_db:
-                resolved_output_user_id = (
-                    lookup_db.query(Task.user_id).filter(Task.id == task_id).scalar()
-                )
-        prepared_outputs = (
-            _prepare_task_file_outputs_isolated(
-                task_id=task_id,
-                task_user_id=int(resolved_output_user_id),
-                file_outputs=result.get("file_outputs", []),
-                resolved_scope_segments=resolved_scope_segments,
-            )
-            if resolved_output_user_id is not None
-            else _PreparedTaskFileOutputs((), (), ())
-        )
     SessionLocal = get_session_local()
     db = SessionLocal()
     metadata_committed = False
@@ -2927,6 +2928,10 @@ async def execute_resume_background(
     ``task_owner_user_id`` is the task OWNER's id -- the runtime identity the
     resume executes as (``UserContext``), not the acting principal.
     """
+    resume_owner_task = asyncio.current_task()
+    if resume_owner_task is None:
+        raise RuntimeError(f"Task {task_id} resume has no asyncio task")
+
     lease_stop_event = preacquired_heartbeat_stop
     lease_heartbeat_task = preacquired_heartbeat_task
     lease: TaskLease | None = preacquired_lease
@@ -3039,10 +3044,7 @@ async def execute_resume_background(
                     f"Previous background task {task_id} ended before resume: {e}"
                 )
 
-        current_task = asyncio.current_task()
-        if current_task is None:
-            raise RuntimeError(f"Task {task_id} resume has no asyncio task")
-        background_task_manager.promote_resume_task(task_id, current_task)
+        background_task_manager.promote_resume_task(task_id, resume_owner_task)
 
         if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
             execution_scope = await run_db_io_cancellation_safe(
@@ -3272,11 +3274,6 @@ async def execute_resume_background(
                     task_owner_user_id=task_owner_user_id,
                     result=result,
                     task_lease=lease,
-                    resolved_scope_segments=(
-                        execution_scope.workspace_segments
-                        if execution_scope is not None
-                        else ()
-                    ),
                     prepared_outputs=outputs_for_finalizer,
                 )
             )
@@ -3560,7 +3557,10 @@ async def execute_resume_background(
                         )
             finally:
                 _clear_task_pause_accepted(task_id)
-                background_task_manager.cleanup_task(task_id)
+                background_task_manager.cleanup_task(
+                    task_id,
+                    expected_task=resume_owner_task,
+                )
 
         cleanup_task = asyncio.create_task(finalize_resume_resources())
         await drain_async_task_cancellation_safe(cleanup_task)
@@ -3673,17 +3673,28 @@ class BackgroundTaskManager:
         self.running_tasks[task_id] = task
         logger.info("Promoted resume coordinator for task %s", task_id)
 
-    def cleanup_task(self, task_id: int) -> None:
+    def cleanup_task(
+        self,
+        task_id: int,
+        *,
+        expected_task: asyncio.Task | None = None,
+    ) -> None:
         """Clean up completed background task"""
         if self._shutting_down:
             return
-        current = asyncio.current_task()
+        current = expected_task or asyncio.current_task()
+
+        def owns_registration(task: asyncio.Task) -> bool:
+            if expected_task is not None:
+                return task is expected_task
+            return task.done() or task is current
+
         task = self.running_tasks.get(task_id)
-        if task is not None and (task.done() or task is current):
+        if task is not None and owns_registration(task):
             self.running_tasks.pop(task_id, None)
             logger.info(f"Cleaned up background task for task {task_id}")
         resume_task = self.resume_tasks.get(task_id)
-        if resume_task is not None and (resume_task.done() or resume_task is current):
+        if resume_task is not None and owns_registration(resume_task):
             self.resume_tasks.pop(task_id, None)
             logger.info("Cleaned up resume coordinator for task %s", task_id)
 
@@ -4391,13 +4402,9 @@ def _claim_user_message_delivery_isolated(
 def _register_uploaded_files_for_agent(
     agent_service: Any,
     file_info_list: List[Dict[str, Any]],
-    db: Session | None = None,
 ) -> None:
     """Bind already-durable inputs to the workspace without another upload."""
 
-    # Kept only for compatibility with direct callers. Durable metadata was
-    # committed by the upload/turn transaction before this runtime step.
-    del db
     workspace = getattr(agent_service, "workspace", None)
     if not workspace:
         return
@@ -4456,15 +4463,6 @@ def _register_uploaded_files_for_agent(
             registration.path,
             workspace_link_path,
         )
-
-
-def _register_uploaded_files_for_agent_isolated(
-    agent_service: Any,
-    file_info_list: List[Dict[str, Any]],
-) -> None:
-    """Bind upload metadata already committed by the turn transaction."""
-
-    _register_uploaded_files_for_agent(agent_service, file_info_list)
 
 
 @dataclass(frozen=True)
@@ -5239,11 +5237,12 @@ async def _handle_chat_message_unserialized(
             # issue the same write again against the exhausted pool.
             delivery_failure_persist_attempted = True
             try:
-                await asyncio.to_thread(
-                    mark_user_message_delivery_sync,
-                    task_id,
-                    turn_id,
-                    DELIVERY_FAILED,
+                await run_db_io_cancellation_safe(
+                    lambda: mark_user_message_delivery_sync(
+                        task_id,
+                        turn_id,
+                        DELIVERY_FAILED,
+                    )
                 )
             except Exception as delivery_error:
                 if not is_database_pool_timeout(delivery_error):
@@ -7361,42 +7360,56 @@ async def _execute_durable_task_command(
             raise TaskCommandRejected(
                 f"Message {command.command_id} could not be applied"
             )
-    elif command.kind == TaskCommandKind.PAUSE:
-        await _handle_pause_task_unserialized(websocket, command.task_id, message_data)
-    elif command.kind == TaskCommandKind.RESUME:
-        await _handle_resume_task_unserialized(websocket, command.task_id, message_data)
-    elif command.kind == TaskCommandKind.CANCEL:
-        from .a2a import _cancel_task_unserialized
-
-        agent_id_value = message_data.get("agent_id")
-        if agent_id_value is None:
-            raise ValueError("Agent ID is missing or null in cancel command payload")
+    else:
         try:
-            agent_id = int(agent_id_value)
-        except (TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Agent ID {agent_id_value!r} is invalid in cancel command payload"
-            ) from exc
-        target_state_version = message_data.get("target_state_version")
-        if isinstance(target_state_version, bool) or not isinstance(
-            target_state_version, int
-        ):
-            raise TaskCommandRejected(
-                f"Cancel command {command.command_id} has no exact state-version target",
-                reason="stale_run",
-            )
-        try:
-            async with task_execution_controller.command(command.task_id):
-                await _cancel_task_unserialized(
-                    task_id=command.task_id,
-                    agent_id=agent_id,
-                    expected_run_id=command.target_run_id,
-                    expected_state_version=target_state_version,
+            if command.kind == TaskCommandKind.PAUSE:
+                await _handle_pause_task_unserialized(
+                    websocket,
+                    command.task_id,
+                    message_data,
                 )
+            elif command.kind == TaskCommandKind.RESUME:
+                await _handle_resume_task_unserialized(
+                    websocket,
+                    command.task_id,
+                    message_data,
+                )
+            elif command.kind == TaskCommandKind.CANCEL:
+                from .a2a import _cancel_task_unserialized
+
+                agent_id_value = message_data.get("agent_id")
+                if agent_id_value is None:
+                    raise ValueError(
+                        "Agent ID is missing or null in cancel command payload"
+                    )
+                try:
+                    agent_id = int(agent_id_value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Agent ID {agent_id_value!r} is invalid in cancel "
+                        "command payload"
+                    ) from exc
+                target_state_version = message_data.get("target_state_version")
+                if isinstance(target_state_version, bool) or not isinstance(
+                    target_state_version,
+                    int,
+                ):
+                    raise TaskCommandRejected(
+                        f"Cancel command {command.command_id} has no exact "
+                        "state-version target",
+                        reason="stale_run",
+                    )
+                async with task_execution_controller.command(command.task_id):
+                    await _cancel_task_unserialized(
+                        task_id=command.task_id,
+                        agent_id=agent_id,
+                        expected_run_id=command.target_run_id,
+                        expected_state_version=target_state_version,
+                    )
+            else:  # pragma: no cover - enum construction rejects this earlier
+                raise ValueError(f"Unsupported task command kind: {command.kind}")
         except StaleTaskRunError as exc:
             raise TaskCommandRejected(str(exc), reason="stale_run") from exc
-    else:  # pragma: no cover - enum construction rejects this earlier
-        raise ValueError(f"Unsupported task command kind: {command.kind}")
     durable_error = message_data.get("_durable_command_error")
     if isinstance(durable_error, str) and durable_error:
         raise TaskCommandRejected(durable_error)

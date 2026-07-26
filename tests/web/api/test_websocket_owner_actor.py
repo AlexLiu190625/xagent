@@ -29,6 +29,7 @@ from xagent.core.execution_scope import (
 from xagent.web.api import websocket as websocket_api
 from xagent.web.api.websocket import (
     _claim_user_message_delivery_isolated,
+    _execute_durable_task_command,
     _handle_chat_message_unserialized,
     _handle_pause_task_unserialized,
     _handle_resume_task_unserialized,
@@ -51,6 +52,11 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_PENDING,
 )
 from xagent.web.services.task_execution_controller import StaleTaskRunError
+from xagent.web.services.task_command_transport import (
+    ClaimedTaskCommand,
+    TaskCommandKind,
+    TaskCommandRejected,
+)
 from xagent.web.services.task_lease_service import (
     TaskLease,
     current_task_lease,
@@ -1492,6 +1498,71 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
 
 
 @pytest.mark.asyncio
+async def test_delivery_failure_persistence_drains_before_cancellation(
+    db_session,
+) -> None:
+    owner = _user(db_session, "delivery-cancellation-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "delivery-cancellation-runner"
+    task.run_id = "delivery-cancellation-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(side_effect=RuntimeError("inject failed"))
+    agent_manager = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    bg_manager = MagicMock()
+    bg_manager.reserve_resume.return_value = True
+    persistence_started = threading.Event()
+    allow_persistence = threading.Event()
+    persistence_finished = threading.Event()
+
+    def blocking_mark_delivery(*_args, **_kwargs) -> None:
+        persistence_started.set()
+        assert allow_persistence.wait(timeout=2)
+        persistence_finished.set()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=agent_manager),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.background_task_manager", bg_manager),
+        patch(
+            "xagent.web.api.websocket.mark_user_message_delivery_sync",
+            side_effect=blocking_mark_delivery,
+        ),
+    ):
+        handling = asyncio.create_task(
+            _handle_chat_message_unserialized(
+                MagicMock(),
+                int(task.id),
+                {
+                    "message": "apply once",
+                    "client_message_id": "delivery-cancellation-turn",
+                    "user": owner,
+                    "files": [],
+                },
+            )
+        )
+        await asyncio.wait_for(
+            asyncio.to_thread(persistence_started.wait, 1),
+            timeout=1,
+        )
+        handling.cancel()
+        await asyncio.sleep(0)
+        assert not handling.done()
+
+        allow_persistence.set()
+        with pytest.raises(asyncio.CancelledError):
+            await handling
+
+    assert persistence_finished.is_set()
+
+
+@pytest.mark.asyncio
 async def test_retried_durable_message_is_accepted_without_reexecution(
     db_session,
 ) -> None:
@@ -1719,6 +1790,49 @@ async def test_durable_resume_propagates_stale_run_error(db_session) -> None:
             {"user": owner, "_durable_ack_sent": True},
         )
     bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("kind", "handler_name"),
+    [
+        (TaskCommandKind.PAUSE, "_handle_pause_task_unserialized"),
+        (TaskCommandKind.RESUME, "_handle_resume_task_unserialized"),
+    ],
+)
+async def test_durable_control_converts_handler_stale_run_to_terminal_rejection(
+    db_session,
+    kind: TaskCommandKind,
+    handler_name: str,
+) -> None:
+    owner = _user(db_session, f"durable-{kind.value}-stale-owner")
+    task = _task(db_session, owner.id)
+    task.runner_id = None
+    task.run_id = "run-a"
+    db_session.commit()
+    command = ClaimedTaskCommand(
+        id=1,
+        task_id=int(task.id),
+        actor_user_id=int(owner.id),
+        command_id=f"{kind.value}-stale-handler",
+        kind=kind,
+        payload={"type": f"{kind.value}_task"},
+        target_run_id="run-a",
+        attempt_count=1,
+    )
+
+    with (
+        patch.object(websocket_api.manager, "connections_for_task", return_value=[]),
+        patch(
+            f"xagent.web.api.websocket.{handler_name}",
+            new=AsyncMock(side_effect=StaleTaskRunError("run rotated")),
+        ),
+        pytest.raises(TaskCommandRejected) as exc_info,
+    ):
+        await _execute_durable_task_command(command)
+
+    assert exc_info.value.reason == "stale_run"
+    assert "run rotated" in str(exc_info.value)
 
 
 @pytest.mark.asyncio

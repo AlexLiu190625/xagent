@@ -26,7 +26,11 @@ from ...config import (
 )
 from ..models.task import Task, TaskStatus
 from ..models.task_command import TaskExecutionCommand
-from .db_runtime import is_database_pool_timeout, run_db_io_cancellation_safe
+from .db_runtime import (
+    await_task_settlement,
+    is_database_pool_timeout,
+    run_db_io_cancellation_safe,
+)
 from .task_lease_service import get_runner_id
 
 logger = logging.getLogger(__name__)
@@ -775,6 +779,7 @@ async def dispatch_one_task_command(
     disposition_name: str | None = None
     disposition_operation: CommandDisposition | None = None
     heartbeat_outcome = TaskCommandClaimHeartbeatOutcome()
+    heartbeat_cancellation: asyncio.CancelledError | None = None
     try:
         result = await executor(command)
     except asyncio.CancelledError:
@@ -862,7 +867,9 @@ async def dispatch_one_task_command(
         disposition_operation = persist_completion
     finally:
         stop_event.set()
-        heartbeat_outcome = await heartbeat
+        heartbeat_outcome, heartbeat_cancellation = await await_task_settlement(
+            heartbeat
+        )
 
     if heartbeat_outcome.requires_ttl_recovery:
         logger.error(
@@ -876,6 +883,8 @@ async def dispatch_one_task_command(
             heartbeat_outcome.claim_lost,
             heartbeat_outcome.pool_timeout,
         )
+        if heartbeat_cancellation is not None:
+            raise heartbeat_cancellation
         return True
     if disposition_name is not None and disposition_operation is not None:
         await _persist_task_command_disposition(
@@ -883,6 +892,8 @@ async def dispatch_one_task_command(
             disposition=disposition_name,
             operation=disposition_operation,
         )
+    if heartbeat_cancellation is not None:
+        raise heartbeat_cancellation
     return True
 
 

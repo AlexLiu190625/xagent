@@ -1442,6 +1442,65 @@ async def test_dispatch_cancellation_drains_inflight_completion_worker(
 
 
 @pytest.mark.asyncio
+async def test_dispatch_cancellation_during_heartbeat_persists_completion(
+    db_session,
+    monkeypatch,
+) -> None:
+    user, task = _create_running_task(db_session)
+    task.runner_id = None
+    task.lease_expires_at = None
+    db_session.commit()
+    enqueued = enqueue_task_command(
+        db_session,
+        task_id=int(task.id),
+        actor_user_id=int(user.id),
+        command_id="cancel-while-stopping-command-heartbeat",
+        kind=TaskCommandKind.PAUSE,
+        payload={"type": "pause_task"},
+    )
+    heartbeat_stopping = asyncio.Event()
+    allow_heartbeat_to_finish = asyncio.Event()
+
+    async def delayed_heartbeat(
+        _command_db_id: int,
+        _runner_id: str,
+        _attempt_count: int,
+        stop_event: asyncio.Event,
+    ):
+        await stop_event.wait()
+        heartbeat_stopping.set()
+        await allow_heartbeat_to_finish.wait()
+        return task_command_transport_module.TaskCommandClaimHeartbeatOutcome()
+
+    monkeypatch.setattr(
+        task_command_transport_module,
+        "_claim_heartbeat",
+        delayed_heartbeat,
+    )
+
+    dispatch = asyncio.create_task(
+        dispatch_one_task_command(
+            lambda _command: asyncio.sleep(0, result={"ok": True}),
+            command_db_id=enqueued.command_id,
+        )
+    )
+    await heartbeat_stopping.wait()
+    dispatch.cancel()
+    await asyncio.sleep(0)
+    assert not dispatch.done()
+
+    allow_heartbeat_to_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+
+    db_session.expire_all()
+    stored = db_session.get(TaskExecutionCommand, enqueued.command_id)
+    assert stored is not None
+    assert stored.status == COMMAND_COMPLETED
+    assert stored.result == {"ok": True}
+
+
+@pytest.mark.asyncio
 async def test_claim_heartbeat_cancellation_drains_inflight_renewal(
     monkeypatch,
 ) -> None:

@@ -362,40 +362,6 @@ def get_next_expired_task_lease_candidate_for_update(
     return _task_lease_recovery_candidate_from_row(row)
 
 
-def task_lease_recovery_candidate_from_task(
-    task: Task,
-    *,
-    cutoff: datetime,
-) -> TaskLeaseRecoveryCandidate | None:
-    """Snapshot ``task`` when it is a RUNNING lease expired before ``cutoff``."""
-
-    if task.status != TaskStatus.RUNNING or task.lease_expires_at is None:
-        return None
-    expires_at = cast(datetime, task.lease_expires_at)
-    comparable_expiry = (
-        expires_at.replace(tzinfo=timezone.utc)
-        if expires_at.tzinfo is None
-        else expires_at
-    )
-    comparable_cutoff = (
-        cutoff.replace(tzinfo=timezone.utc) if cutoff.tzinfo is None else cutoff
-    )
-    if comparable_expiry >= comparable_cutoff:
-        return None
-    return TaskLeaseRecoveryCandidate(
-        task_id=int(task.id),
-        runner_id=str(task.runner_id) if task.runner_id is not None else None,
-        run_id=str(task.run_id) if task.run_id is not None else None,
-        lease_expires_at=expires_at,
-        state_version=int(task.state_version or 0),
-        last_checkpoint_event_id=(
-            str(task.last_checkpoint_event_id)
-            if task.last_checkpoint_event_id is not None
-            else None
-        ),
-    )
-
-
 def recover_expired_task_lease_no_commit(
     db: Session,
     candidate: TaskLeaseRecoveryCandidate,
@@ -927,6 +893,14 @@ class _TaskLeaseHeartbeatManager:
             await drain_async_task_cancellation_safe(runner)
 
     async def _run(self) -> None:
+        active_refresh_waiters: tuple[
+            tuple[
+                TaskLeaseKey,
+                _TaskLeaseHeartbeatEntry,
+                asyncio.Future[TaskLeaseHeartbeatOutcome],
+            ],
+            ...,
+        ] = ()
         try:
             next_refresh_at = self._loop.time() + get_task_lease_heartbeat_seconds()
             while self._entries:
@@ -951,6 +925,7 @@ class _TaskLeaseHeartbeatManager:
                     (key, entry, self._loop.create_future())
                     for key, entry in snapshot_entries
                 )
+                active_refresh_waiters = refresh_waiters
                 for _, entry, waiter in refresh_waiters:
                     entry.refresh_waiter = waiter
                 try:
@@ -1007,12 +982,19 @@ class _TaskLeaseHeartbeatManager:
                                 waiter,
                                 TaskLeaseHeartbeatOutcome(),
                             )
+                active_refresh_waiters = ()
                 interval = get_task_lease_heartbeat_seconds()
                 next_refresh_at += interval
                 now = self._loop.time()
                 while next_refresh_at <= now:
                     next_refresh_at += interval
         finally:
+            for _, entry, waiter in active_refresh_waiters:
+                self._settle_refresh_waiter(
+                    entry,
+                    waiter,
+                    entry.outcome,
+                )
             self._runner = None
 
 

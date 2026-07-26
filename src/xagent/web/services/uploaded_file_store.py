@@ -1215,8 +1215,7 @@ def compensate_registered_uploads_sync(
         db.commit()
 
     cleaned: list[ClaimedRegisteredUploadCompensation] = []
-    deferred_exists: list[ClaimedRegisteredUploadCompensation] = []
-    deferred: list[ClaimedRegisteredUploadCompensation] = []
+    unresolved: list[ClaimedRegisteredUploadCompensation] = []
     for claimed_version in claimed:
         presence = delete_uploaded_file_compensation_object(
             user_id=claimed_version.user_id,
@@ -1224,10 +1223,8 @@ def compensate_registered_uploads_sync(
         )
         if presence == "absent":
             cleaned.append(claimed_version)
-        elif presence == "exists":
-            deferred_exists.append(claimed_version)
         else:
-            deferred.append(claimed_version)
+            unresolved.append(claimed_version)
 
     if cleaned:
         cleaned_file_ids: list[str] = []
@@ -1249,7 +1246,6 @@ def compensate_registered_uploads_sync(
         for file_id in cleaned_file_ids:
             delete_registered_preview_caches(file_id)
 
-    unresolved = (*deferred_exists, *deferred)
     if unresolved:
         failed_ids = ", ".join(claim.file_id for claim in unresolved)
         raise DurableStorageOperationError(

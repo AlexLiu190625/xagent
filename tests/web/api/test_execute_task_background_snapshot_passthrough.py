@@ -149,7 +149,7 @@ def _common_patches(db: Any, agent_service: Any) -> list[Any]:
             new=AsyncMock(),
         ),
         patch(
-            "xagent.web.api.websocket._register_uploaded_files_for_agent_isolated",
+            "xagent.web.api.websocket._register_uploaded_files_for_agent",
         ),
         patch(
             "xagent.web.api.websocket._finalize_task_execution_result_isolated",
@@ -238,6 +238,89 @@ async def test_snapshot_path_skips_task_and_user_queries() -> None:
     ]
     assert forwarded_snapshot is snapshot
     assert forwarded_snapshot.task.source == "trigger"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("broadcast_fails", [False, True])
+async def test_cancellation_during_finalization_broadcasts_committed_result(
+    broadcast_fails: bool,
+) -> None:
+    snapshot = _make_snapshot()
+    agent_service = _build_fake_agent_service()
+    agent_manager = MagicMock(
+        get_agent_for_task=AsyncMock(return_value=agent_service),
+        execute_task=AsyncMock(
+            return_value={"success": True, "output": "ok", "status": "completed"}
+        ),
+    )
+    finalization_started = threading.Event()
+    allow_finalization = threading.Event()
+    broadcast = AsyncMock(
+        side_effect=RuntimeError("client disconnected") if broadcast_fails else None
+    )
+
+    def blocking_finalize(**_kwargs: Any) -> Any:
+        finalization_started.set()
+        assert allow_finalization.wait(timeout=2)
+        return SimpleNamespace(
+            normalized_outputs=[],
+            ai_response="ok",
+            chat_response=None,
+            waiting_for_control=False,
+            terminal_state_committed=True,
+            final_control_snapshot=None,
+            final_task_status=TaskStatus.COMPLETED.value,
+            broadcast_meta={
+                "id": 42,
+                "title": "exec-bg test",
+                "description": "x",
+                "execution_mode": "flash",
+                "updated_at": None,
+            },
+            late_result=False,
+        )
+
+    patches = [
+        patch(
+            "xagent.web.api.websocket.background_task_manager.wait_for_previous",
+            new=AsyncMock(),
+        ),
+        patch("xagent.web.api.websocket._register_uploaded_files_for_agent"),
+        patch(
+            "xagent.web.api.websocket._finalize_task_execution_result_isolated",
+            side_effect=blocking_finalize,
+        ),
+        patch(
+            "xagent.web.api.websocket.manager.broadcast_to_task",
+            new=broadcast,
+        ),
+    ]
+    with _Patches(patches):
+        execution = asyncio.create_task(
+            execute_task_background(
+                task_id=42,
+                user_message="hi",
+                context={},
+                agent_manager=agent_manager,
+                task_owner_user_id=1,
+                task_setup_snapshot=snapshot,
+                resolved_execution_scope=None,
+            )
+        )
+        await asyncio.wait_for(
+            asyncio.to_thread(finalization_started.wait, 1),
+            timeout=1,
+        )
+        execution.cancel()
+        await asyncio.sleep(0)
+        assert not execution.done()
+
+        allow_finalization.set()
+        with pytest.raises(asyncio.CancelledError):
+            await execution
+
+    broadcast.assert_awaited_once()
+    assert broadcast.await_args.args[0]["type"] == "task_completed"
 
 
 @pytest.mark.asyncio

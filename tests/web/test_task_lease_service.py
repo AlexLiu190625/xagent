@@ -530,6 +530,55 @@ async def test_stop_heartbeat_waits_for_shared_batch_result(monkeypatch) -> None
 
 
 @pytest.mark.asyncio
+async def test_cancelled_heartbeat_manager_settles_active_registration(
+    monkeypatch,
+) -> None:
+    refresh_started = threading.Event()
+    allow_refresh_to_finish = threading.Event()
+
+    def blocking_refresh(
+        leases: tuple[TaskLease, ...],
+    ) -> dict[tuple[int, str, str | None], TaskLeaseRefreshState]:
+        refresh_started.set()
+        assert allow_refresh_to_finish.wait(timeout=2)
+        return {
+            (lease.task_id, lease.runner_id, lease.run_id): (
+                TaskLeaseRefreshState.REFRESHED
+            )
+            for lease in leases
+        }
+
+    monkeypatch.setattr(
+        task_lease_service,
+        "refresh_task_leases_isolated",
+        blocking_refresh,
+    )
+    monkeypatch.setattr(
+        task_lease_service,
+        "get_task_lease_heartbeat_seconds",
+        lambda: 0.001,
+    )
+
+    manager = task_lease_service._TaskLeaseHeartbeatManager(asyncio.get_running_loop())
+    registration = manager.register(
+        TaskLease(task_id=1, runner_id="runner-a", run_id="run-a")
+    )
+    await asyncio.wait_for(asyncio.to_thread(refresh_started.wait, 1), timeout=1)
+
+    runner = manager._runner
+    assert runner is not None
+    runner.cancel()
+    allow_refresh_to_finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await runner
+
+    outcome = await asyncio.wait_for(registration.close(), timeout=1)
+
+    assert outcome.requires_ttl_recovery is False
+    assert registration._entry.refresh_waiter is None
+
+
+@pytest.mark.asyncio
 async def test_wait_for_heartbeat_manager_idle_drains_before_caller_cancellation(
     monkeypatch,
 ) -> None:

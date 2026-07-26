@@ -112,7 +112,7 @@ def _bg_patches(db: Any) -> list[Any]:
             "xagent.web.api.websocket.background_task_manager.wait_for_previous",
             new=AsyncMock(),
         ),
-        patch("xagent.web.api.websocket._register_uploaded_files_for_agent_isolated"),
+        patch("xagent.web.api.websocket._register_uploaded_files_for_agent"),
         patch(
             "xagent.web.api.websocket._finalize_task_execution_result_isolated",
             return_value=SimpleNamespace(

@@ -1253,7 +1253,6 @@ def test_register_uploaded_files_for_agent_binds_existing_durable_metadata(
     _register_uploaded_files_for_agent(
         SimpleNamespace(workspace=workspace),
         [file_info],
-        db_session,
     )
 
     assert [item[1] for item in workspace.registered_files] == ["valid-file"]

@@ -15,6 +15,7 @@ import unicodedata
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -176,6 +177,7 @@ class TaskWorkspace:
             Path(base_dir).expanduser().resolve()
         )  # Resolve base_dir to absolute path for consistent workspace reconstruction
         self.db_session = None  # Optional database session for file registration
+        self._registration_lock = RLock()
         self._recently_registered_files: Dict[str, str] = {}  # path -> file_id mapping
         self._file_id_to_path: Dict[str, Path] = {}  # file_id -> path reverse mapping
         self.owner_user_id: Optional[int] = None
@@ -206,6 +208,19 @@ class TaskWorkspace:
         # Create directory structure
         self._ensure_directories()
 
+    def __getstate__(self) -> dict[str, Any]:
+        """Serialize durable workspace state without process-local synchronization."""
+
+        state = dict(self.__dict__)
+        state.pop("_registration_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        """Restore a fresh registration owner in the receiving process."""
+
+        self.__dict__.update(state)
+        self._registration_lock = RLock()
+
     def register_file(
         self, file_path: str, file_id: Optional[str] = None, db_session: Any = None
     ) -> str:
@@ -221,6 +236,19 @@ class TaskWorkspace:
         *,
         db_session: Any = None,
     ) -> tuple[str, ...]:
+        """Serialize one workspace's registration read/stage/commit sequence."""
+
+        if not files:
+            return ()
+        with self._registration_lock:
+            return self._register_files_locked(files, db_session=db_session)
+
+    def _register_files_locked(
+        self,
+        files: Sequence[tuple[str, Optional[str]]],
+        *,
+        db_session: Any,
+    ) -> tuple[str, ...]:
         """Register files through detached read, storage, and metadata phases.
 
         ``db_session`` is a compatibility reference for the caller's database
@@ -231,21 +259,12 @@ class TaskWorkspace:
         returns. A later caller rollback therefore cannot orphan durable bytes.
         """
 
-        if not files:
-            return ()
-
         resolved_db_session = db_session if db_session is not None else self.db_session
         self._release_registration_session_if_clean(resolved_db_session)
 
         # Path resolution, validation, and stat-like filesystem work happen
         # only after any clean caller transaction has returned its connection.
-        registrations = tuple(
-            (
-                self.describe_file_registration(file_path),
-                str(file_id).strip() if file_id else None,
-            )
-            for file_path, file_id in files
-        )
+        registrations, result_indexes = self._normalize_file_registrations(files)
         plans = self._load_file_registration_plans(
             registrations,
             db_session=resolved_db_session,
@@ -289,11 +308,73 @@ class TaskWorkspace:
                 plan.file_id,
                 plan.registration.path,
             )
-        return tuple(plan.file_id for plan in plans)
+        unique_file_ids = tuple(plan.file_id for plan in plans)
+        return tuple(unique_file_ids[index] for index in result_indexes)
 
-    # Keep the former private batch seam while downstream integrations migrate
-    # to the public owner method.
-    _register_files = register_files
+    def _normalize_file_registrations(
+        self,
+        files: Sequence[tuple[str, Optional[str]]],
+    ) -> tuple[
+        tuple[tuple[WorkspaceFileRegistration, Optional[str]], ...],
+        tuple[int, ...],
+    ]:
+        """Collapse duplicate canonical paths before staging durable generations."""
+
+        unique: list[tuple[WorkspaceFileRegistration, Optional[str]]] = []
+        index_by_path: dict[str, int] = {}
+        path_by_requested_file_id: dict[str, str] = {}
+        result_indexes: list[int] = []
+
+        for file_path, file_id in files:
+            registration = self.describe_file_registration(file_path)
+            path_key = str(registration.path)
+            requested_file_id = str(file_id).strip() if file_id is not None else None
+            if not requested_file_id:
+                requested_file_id = None
+
+            existing_index = index_by_path.get(path_key)
+            if existing_index is not None:
+                existing_registration, existing_file_id = unique[existing_index]
+                if (
+                    existing_file_id is not None
+                    and requested_file_id is not None
+                    and existing_file_id != requested_file_id
+                ):
+                    raise ValueError(
+                        "One workspace path cannot be registered with multiple "
+                        "file ids in the same batch"
+                    )
+                if existing_file_id is None and requested_file_id is not None:
+                    unique[existing_index] = (
+                        existing_registration,
+                        requested_file_id,
+                    )
+                if requested_file_id is not None:
+                    existing_path = path_by_requested_file_id.get(requested_file_id)
+                    if existing_path is not None and existing_path != path_key:
+                        raise ValueError(
+                            "One file id cannot identify multiple workspace paths "
+                            "in the same batch"
+                        )
+                    path_by_requested_file_id[requested_file_id] = path_key
+                result_indexes.append(existing_index)
+                continue
+
+            if requested_file_id is not None:
+                existing_path = path_by_requested_file_id.get(requested_file_id)
+                if existing_path is not None and existing_path != path_key:
+                    raise ValueError(
+                        "One file id cannot identify multiple workspace paths "
+                        "in the same batch"
+                    )
+                path_by_requested_file_id[requested_file_id] = path_key
+
+            unique_index = len(unique)
+            index_by_path[path_key] = unique_index
+            unique.append((registration, requested_file_id))
+            result_indexes.append(unique_index)
+
+        return tuple(unique), tuple(result_indexes)
 
     @staticmethod
     def _release_registration_session_if_clean(db: Any) -> None:
@@ -668,7 +749,7 @@ class TaskWorkspace:
     ) -> None:
         """Compatibility facade for legacy callers and test seams.
 
-        Registration is owned by :meth:`_register_files`; this private method
+        Registration is owned by :meth:`register_files`; this private method
         remains callable while downstream integrations migrate away from
         patching the former single-phase persistence hook.
         """
@@ -694,7 +775,8 @@ class TaskWorkspace:
         normalized_file_id = str(file_id).strip()
         if not normalized_file_id:
             raise ValueError("file_id is required for an already durable file")
-        self._remember_file_registration(normalized_file_id, registration.path)
+        with self._registration_lock:
+            self._remember_file_registration(normalized_file_id, registration.path)
         return normalized_file_id
 
     def describe_file_registration(self, file_path: str) -> WorkspaceFileRegistration:
@@ -745,9 +827,10 @@ class TaskWorkspace:
         return resolved_path
 
     def _remember_file_registration(self, file_id: str, file_path: Path) -> None:
-        path_str = str(file_path)
-        self._recently_registered_files[path_str] = file_id
-        self._file_id_to_path[file_id] = file_path
+        with self._registration_lock:
+            path_str = str(file_path)
+            self._recently_registered_files[path_str] = file_id
+            self._file_id_to_path[file_id] = file_path
 
     def _is_delegated_db_task_workspace(self, task_id: int) -> bool:
         if self.db_task_id is None:
@@ -905,8 +988,9 @@ class TaskWorkspace:
             return None
 
         # Check in-memory cache first
-        if file_id in self._file_id_to_path:
-            cached_path = self._file_id_to_path[file_id]
+        with self._registration_lock:
+            cached_path = self._file_id_to_path.get(file_id)
+        if cached_path is not None:
             if cached_path.exists():
                 logger.debug(
                     f"resolve_file_id: Found in cache: {file_id} -> {cached_path}"
@@ -917,7 +1001,9 @@ class TaskWorkspace:
                     f"resolve_file_id: Cached path doesn't exist: {cached_path}"
                 )
                 # Remove stale cache entry
-                del self._file_id_to_path[file_id]
+                with self._registration_lock:
+                    if self._file_id_to_path.get(file_id) == cached_path:
+                        self._file_id_to_path.pop(file_id, None)
 
         # Query from database
         from .storage.manager import create_db_session
@@ -1414,7 +1500,8 @@ class TaskWorkspace:
             files_after = self._scan_all_files()
             changed_files = files_after - files_before
             for file_path in files_after & files_before:
-                cached_file_id = self._recently_registered_files.get(str(file_path))
+                with self._registration_lock:
+                    cached_file_id = self._recently_registered_files.get(str(file_path))
                 if cached_file_id or self._get_file_id_from_db(
                     file_path, self.db_session
                 ):
@@ -1423,24 +1510,23 @@ class TaskWorkspace:
 
             if changed_files:
                 ordered_files = tuple(sorted(changed_files, key=str))
-                try:
-                    file_ids = self.register_files(
-                        tuple((str(file_path), None) for file_path in ordered_files),
-                        db_session=self.db_session,
-                    )
-                    for file_path, file_id in zip(ordered_files, file_ids):
+                for file_path in ordered_files:
+                    try:
+                        file_id = self.register_file(
+                            str(file_path),
+                            db_session=self.db_session,
+                        )
                         logger.debug(
                             "Auto-registered file: %s -> %s", file_path, file_id
                         )
-                except Exception as e:
-                    # Don't generate fake file_ids: the entire metadata batch is
-                    # rolled back and every staged generation is compensated.
-                    logger.error(
-                        "Failed to auto-register %s workspace file(s): %s. "
-                        "Files exist on disk but are not in database and require backfill.",
-                        len(ordered_files),
-                        e,
-                    )
+                    except Exception as e:
+                        logger.error(
+                            "Failed to auto-register workspace file %s: %s. "
+                            "The file exists on disk but is not in the database "
+                            "and requires backfill.",
+                            file_path,
+                            e,
+                        )
 
     def _scan_all_files(self) -> set[Path]:
         """Scan all files in workspace and return as set."""
@@ -1469,22 +1555,24 @@ class TaskWorkspace:
 
             # Check in-memory cache first (for files just registered)
             logger.debug(f"get_file_id_from_path: Looking for {resolved_str}")
+            with self._registration_lock:
+                cache_snapshot = dict(self._recently_registered_files)
             logger.debug(
-                f"get_file_id_from_path: Cache has {len(self._recently_registered_files)} entries: {list(self._recently_registered_files.keys())}"
+                f"get_file_id_from_path: Cache has {len(cache_snapshot)} entries: {list(cache_snapshot.keys())}"
             )
 
-            if resolved_str in self._recently_registered_files:
+            if resolved_str in cache_snapshot:
                 logger.debug(
-                    f"get_file_id_from_path: Found in cache: {self._recently_registered_files[resolved_str]}"
+                    f"get_file_id_from_path: Found in cache: {cache_snapshot[resolved_str]}"
                 )
-                return self._recently_registered_files[resolved_str]
+                return cache_snapshot[resolved_str]
 
             # Also try the original path (not resolved)
-            if file_path in self._recently_registered_files:
+            if file_path in cache_snapshot:
                 logger.debug(
-                    f"get_file_id_from_path: Found in cache with original path: {self._recently_registered_files[file_path]}"
+                    f"get_file_id_from_path: Found in cache with original path: {cache_snapshot[file_path]}"
                 )
-                return self._recently_registered_files[file_path]
+                return cache_snapshot[file_path]
 
             logger.debug("get_file_id_from_path: Not found in cache, checking DB")
             # Fall back to database query

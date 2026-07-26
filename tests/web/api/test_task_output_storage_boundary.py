@@ -548,7 +548,6 @@ def test_resumed_finalizer_uses_same_prepared_output_transaction(
                 runner_id="resume-runner",
                 run_id="resume-run",
             ),
-            resolved_scope_segments=(),
             prepared_outputs=prepared,
         )
 
@@ -640,7 +639,6 @@ def test_lost_resume_owner_compensates_new_version_without_deleting_committed_ob
                 runner_id="version-runner-old",
                 run_id="version-run-old",
             ),
-            resolved_scope_segments=(),
             prepared_outputs=prepared,
         )
 
@@ -863,7 +861,6 @@ def _assert_cleanup_failure_does_not_reclassify_committed_finalization(
                 task_owner_user_id=user_id,
                 result={"success": True, "output": "done", "file_outputs": []},
                 task_lease=lease,
-                resolved_scope_segments=(),
                 prepared_outputs=prepared,
             )
             assert resumed_finalization["late_result"] is False

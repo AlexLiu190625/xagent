@@ -343,7 +343,7 @@ def test_http_durable_upload_is_bound_to_agent_workspace_without_second_put(
         base_dir=str(tmp_path := upload_root / "agent-workspaces"),
         allowed_external_dirs=[str(Path(storage_path).parent)],
     )
-    websocket_api._register_uploaded_files_for_agent_isolated(
+    websocket_api._register_uploaded_files_for_agent(
         type("AgentService", (), {"workspace": workspace})(),
         [file_info],
     )

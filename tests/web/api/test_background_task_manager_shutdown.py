@@ -184,6 +184,46 @@ async def test_start_accepting_reopens_only_an_idle_manager() -> None:
     assert replacement.cancelled()
 
 
+@pytest.mark.asyncio
+async def test_cleanup_child_can_release_completed_owner_registration() -> None:
+    manager = BackgroundTaskManager()
+    allow_owner_to_finish = asyncio.Event()
+
+    async def owner() -> None:
+        await allow_owner_to_finish.wait()
+
+    owner_task = asyncio.create_task(owner())
+    manager.register_task(7, owner_task)
+    assert manager.reserve_resume(7)
+    manager.register_reserved_resume(7, owner_task)
+
+    allow_owner_to_finish.set()
+    await owner_task
+
+    async def cleanup_child() -> None:
+        manager.cleanup_task(7, expected_task=owner_task)
+
+    await asyncio.create_task(cleanup_child())
+
+    assert manager.running_tasks == {}
+    assert manager.resume_tasks == {}
+    manager.start_accepting()
+
+
+@pytest.mark.asyncio
+async def test_owner_cleanup_does_not_remove_replacement_registration() -> None:
+    manager = BackgroundTaskManager()
+    completed_owner = asyncio.create_task(asyncio.sleep(0))
+    await completed_owner
+    replacement = asyncio.create_task(asyncio.sleep(60))
+    manager.register_task(7, replacement)
+
+    manager.cleanup_task(7, expected_task=completed_owner)
+
+    assert manager.running_tasks == {7: replacement}
+    await manager.shutdown()
+
+
 def test_concurrent_shutdown_lock_is_recreated_for_each_event_loop() -> None:
     manager = BackgroundTaskManager()
 

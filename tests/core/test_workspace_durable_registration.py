@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier, BrokenBarrierError
 from uuid import UUID
 
 import pytest
@@ -1005,6 +1007,175 @@ def test_auto_register_files_resyncs_modified_existing_file(
         ) == "new content"
     finally:
         db.close()
+        engine.dispose()
+
+
+def test_auto_register_files_isolates_one_file_registration_failure(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+    constrained_workspace_db,
+):
+    del mock_workspace_db
+    _engine, _SessionLocal, db = constrained_workspace_db
+    _seed_workspace_task(
+        db,
+        task_id=9010,
+        username="workspace-auto-register-isolation-user",
+    )
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+
+    workspace = TaskWorkspace(
+        id="web_task_9010",
+        base_dir=str(tmp_path / "workspaces"),
+    )
+    workspace.db_session = db
+    original_describe = workspace.describe_file_registration
+
+    def describe_with_one_failure(file_path: str):
+        if file_path.endswith("bad.txt"):
+            raise RuntimeError("injected registration failure")
+        return original_describe(file_path)
+
+    monkeypatch.setattr(
+        workspace,
+        "describe_file_registration",
+        describe_with_one_failure,
+    )
+
+    with workspace.auto_register_files():
+        (workspace.output_dir / "bad.txt").write_text("bad", encoding="utf-8")
+        (workspace.output_dir / "good.txt").write_text("good", encoding="utf-8")
+
+    records = db.query(UploadedFile).all()
+    assert [record.filename for record in records] == ["good.txt"]
+
+
+def test_register_files_deduplicates_one_canonical_path(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+    constrained_workspace_db,
+):
+    del mock_workspace_db
+    _engine, _SessionLocal, db = constrained_workspace_db
+    _seed_workspace_task(
+        db,
+        task_id=9011,
+        username="workspace-batch-dedup-user",
+    )
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+
+    workspace = TaskWorkspace(
+        id="web_task_9011",
+        base_dir=str(tmp_path / "workspaces"),
+    )
+    output_path = workspace.output_dir / "report.txt"
+    output_path.write_text("one artifact", encoding="utf-8")
+
+    file_ids = workspace.register_files(
+        (
+            (str(output_path), None),
+            (str(output_path.resolve()), None),
+        ),
+        db_session=db,
+    )
+
+    assert len(file_ids) == 2
+    assert file_ids[0] == file_ids[1]
+    assert db.query(UploadedFile).count() == 1
+
+
+@pytest.mark.parametrize("conflict", ["path", "file_id"])
+def test_register_files_rejects_conflicting_batch_identity(
+    tmp_path,
+    conflict: str,
+) -> None:
+    workspace = TaskWorkspace(
+        id="non_db_workspace",
+        base_dir=str(tmp_path / "workspaces"),
+    )
+    first_path = workspace.output_dir / "first.txt"
+    second_path = workspace.output_dir / "second.txt"
+    first_path.write_text("first", encoding="utf-8")
+    second_path.write_text("second", encoding="utf-8")
+    files = (
+        ((str(first_path), "file-a"), (str(first_path), "file-b"))
+        if conflict == "path"
+        else ((str(first_path), "file-a"), (str(second_path), "file-a"))
+    )
+
+    with pytest.raises(ValueError):
+        workspace.register_files(files)
+
+
+def test_concurrent_registration_of_one_path_uses_one_workspace_owner(
+    monkeypatch,
+    tmp_path,
+    mock_workspace_db,
+):
+    del mock_workspace_db
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'workspace-concurrency.db'}",
+        connect_args={"check_same_thread": False},
+        poolclass=QueuePool,
+        pool_size=4,
+        max_overflow=0,
+    )
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    Base.metadata.create_all(bind=engine)
+    with SessionLocal() as db:
+        _seed_workspace_task(
+            db,
+            task_id=9012,
+            username="workspace-concurrent-registration-user",
+        )
+
+    from xagent.web.models import database as database_module
+
+    monkeypatch.setattr(database_module, "get_session_local", lambda: SessionLocal)
+    object_root = tmp_path / "objects"
+    monkeypatch.setenv("XAGENT_FILE_STORAGE_URI", object_root.as_uri())
+    get_unscoped_file_storage.cache_clear()
+
+    workspace = TaskWorkspace(
+        id="web_task_9012",
+        base_dir=str(tmp_path / "workspaces"),
+    )
+    output_path = workspace.output_dir / "report.txt"
+    output_path.write_text("one artifact", encoding="utf-8")
+    load_barrier = Barrier(2)
+    original_load = workspace._load_file_registration_plans
+
+    def synchronized_load(*args, **kwargs):
+        plans = original_load(*args, **kwargs)
+        try:
+            load_barrier.wait(timeout=0.2)
+        except BrokenBarrierError:
+            pass
+        return plans
+
+    monkeypatch.setattr(
+        workspace,
+        "_load_file_registration_plans",
+        synchronized_load,
+    )
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [
+                executor.submit(workspace.register_file, str(output_path))
+                for _ in range(2)
+            ]
+            file_ids = [future.result() for future in futures]
+
+        assert file_ids[0] == file_ids[1]
+        with SessionLocal() as verify_db:
+            assert verify_db.query(UploadedFile).count() == 1
+    finally:
         engine.dispose()
 
 
