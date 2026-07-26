@@ -84,8 +84,7 @@ async def test_readiness_raises_on_host_conflict():
 @pytest.mark.asyncio
 async def test_readiness_raises_on_guest_crash():
     """Two mounts sharing a guest path but disagreeing on host source raise
-    (the symmetric direction ``_check_no_conflicting_volumes`` alone does
-    not cover)."""
+    at startup, instead of only when a task's create() reaches the daemon."""
     with (
         patch.dict(
             "os.environ",
