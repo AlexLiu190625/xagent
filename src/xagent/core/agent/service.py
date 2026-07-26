@@ -560,7 +560,10 @@ class AgentService:
 
     def _create_default_tool_config(self) -> Any:
         try:
+            from ...core.execution_scope import get_execution_scope
             from ...core.tools.adapters.vibe.config import ToolConfig
+
+            execution_scope = get_execution_scope()
 
             class DefaultToolConfig(ToolConfig):
                 def __init__(self, workspace_config: dict[str, Any] | None = None):
@@ -568,6 +571,10 @@ class AgentService:
                     if workspace_config:
                         config_dict["task_id"] = workspace_config.get("task_id")
                     super().__init__(config_dict)
+                    self._execution_scope = execution_scope
+
+                def get_execution_scope(self) -> Any | None:
+                    return self._execution_scope
 
                 def get_workspace_config(self) -> dict[str, Any] | None:
                     return self.workspace_config

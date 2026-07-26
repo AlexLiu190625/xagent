@@ -26,6 +26,11 @@ These tests pin the four behaviorally distinct combinations.
 from __future__ import annotations
 
 from xagent.core.agent.service import AgentService
+from xagent.core.execution_scope import (
+    ExecutionScope,
+    reset_execution_scope,
+    set_execution_scope,
+)
 
 
 def _make_service(**kwargs):
@@ -96,3 +101,15 @@ def test_tools_list_is_copied_not_aliased():
     service = _make_service(tools=caller_list)
     caller_list.append(object())
     assert len(service.tools) == 1
+
+
+def test_default_tool_config_captures_active_execution_scope():
+    service = _make_service()
+    scope = ExecutionScope(restrict_command_paths=True)
+    token = set_execution_scope(scope)
+    try:
+        config = service._create_default_tool_config()
+    finally:
+        reset_execution_scope(token)
+
+    assert config.get_execution_scope() is scope

@@ -99,6 +99,43 @@ class TestCommandExecutorTool:
         assert "active globs" in description
         assert "./deploy.sh" not in description
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("restricted", [False, True])
+    async def test_basic_tools_project_policy_from_execution_scope(
+        self,
+        tmp_path,
+        restricted,
+    ):
+        from xagent.core.execution_scope import ExecutionScope
+        from xagent.core.tools.adapters.vibe.basic_tools import create_basic_tools
+        from xagent.core.tools.adapters.vibe.config import ToolConfig
+
+        config = ToolConfig(
+            {
+                "workspace": {
+                    "task_id": "42",
+                    "base_dir": str(tmp_path),
+                },
+                "tool_credentials": {},
+            }
+        )
+        scope = ExecutionScope(restrict_command_paths=restricted)
+        config.get_execution_scope = lambda: scope
+
+        tools = await create_basic_tools(config)
+
+        command_tool = next(
+            tool for tool in tools if isinstance(tool, CommandExecutorToolForBasic)
+        )
+        sibling = tmp_path.parent / f"{tmp_path.name}-sibling-secret"
+        sibling.write_text("sibling secret", encoding="utf-8")
+        result = command_tool.run_json_sync(
+            {"command": f"cat {shlex.quote(str(sibling))}"}
+        )
+
+        assert result["success"] is (not restricted)
+        assert ("sibling secret" in result["output"]) is (not restricted)
+
     def test_execution_scope_factory_projects_command_path_policy(self, tmp_path):
         from xagent.core.execution_scope import ExecutionScope
 

@@ -291,6 +291,7 @@ async def get_available_tools(
         task_id="tools_list",  # Generic task ID for tool listing
         browser_tools_enabled=True,  # Enable browser automation tools
         sandbox=sandbox,
+        execution_scope=None,  # Display-only listing never constructs task tools.
     )
 
     # Use ToolFactory.create_all_tools() to get all tools

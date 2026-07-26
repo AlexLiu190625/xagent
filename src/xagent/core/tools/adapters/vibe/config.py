@@ -166,6 +166,10 @@ def normalize_tool_allowlist(value: Any) -> Optional[List[str]]:
 class BaseToolConfig(ABC):
     """Abstract base class for tool configuration."""
 
+    def get_execution_scope(self) -> Optional[Any]:
+        """Execution scope baked into this tool set, if any."""
+        return None
+
     @abstractmethod
     def get_workspace_config(self) -> Optional[Dict[str, Any]]:
         """Get workspace configuration."""
