@@ -566,19 +566,26 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
     finally:
         db.close()
 
-    write_started = asyncio.Event()
-    allow_write = asyncio.Event()
+    write_started = threading.Event()
+    allow_write = threading.Event()
     written_path = None
 
-    async def delayed_write(_uploaded, target_path):  # type: ignore[no-untyped-def]
+    def delayed_copy(uploaded, *, task_id, folder, user_id):  # type: ignore[no-untyped-def]
         nonlocal written_path
+        target_path = files_api.get_upload_path(
+            uploaded.filename or "",
+            task_id,
+            folder,
+            user_id,
+        )
         written_path = target_path
-        target_path.write_bytes(b"partial")
+        with open(target_path, "xb") as buffer:
+            buffer.write(b"partial")
         write_started.set()
-        await allow_write.wait()
-        return 7
+        assert allow_write.wait(timeout=2)
+        return target_path, 7
 
-    monkeypatch.setattr(files_api, "_write_upload_with_size_limit", delayed_write)
+    monkeypatch.setattr(files_api, "_reserve_and_copy_upload", delayed_copy)
     upload = UploadFile(
         filename="cancelled-upload.txt",
         file=io.BytesIO(b"payload"),
@@ -594,7 +601,7 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
             user_id=user_id,
         )
     )
-    await write_started.wait()
+    assert await asyncio.to_thread(write_started.wait, 2)
     upload_task.cancel()
     allow_write.set()
     with pytest.raises(asyncio.CancelledError):
