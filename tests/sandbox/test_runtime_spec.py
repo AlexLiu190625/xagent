@@ -28,6 +28,7 @@ from xagent.sandbox.base import (
     SandboxService,
     SandboxTemplate,
     SpecVerdict,
+    canonical_sandbox_path,
     spec_matches_inspection,
 )
 
@@ -151,6 +152,52 @@ class TestSpecOrderInsensitivity:
         b = _make_spec(volumes=[("/host/x/../a", "/guest/./a", "ro")])
         assert a == b
         assert a.fingerprint() == b.fingerprint()
+
+
+# --- canonical_sandbox_path: the leading-// case normpath alone keeps ---
+
+
+class TestCanonicalSandboxPath:
+    """A desired path must be spelled the way the backend reports it back.
+
+    ``posixpath.normpath`` preserves exactly two leading slashes (POSIX
+    reserves ``//`` for implementation-defined interpretation) while Docker
+    collapses them in ``Mounts.Destination`` and ``Config.WorkingDir``, so a
+    ``//``-prefixed desired path would fail create()'s
+    publish-before-verify byte comparison against a container that is in
+    fact exactly what was asked for.
+    """
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("//data/uploads", "/data/uploads"),
+            ("///data/uploads", "/data/uploads"),
+            ("//data/./uploads/../uploads", "/data/uploads"),
+            ("//", "/"),
+            ("/data/uploads", "/data/uploads"),
+            ("/data//uploads", "/data/uploads"),
+        ],
+    )
+    def test_collapses_leading_slash_run(self, raw, expected):
+        assert canonical_sandbox_path(raw) == expected
+
+    def test_double_slash_spec_equals_single_slash_spec(self):
+        a = _make_spec(volumes=[("/host/a", "/guest/a", "ro")], working_dir="/home")
+        b = _make_spec(volumes=[("//host/a", "//guest/a", "ro")], working_dir="//home")
+        assert a == b
+        assert a.fingerprint() == b.fingerprint()
+
+    def test_spec_paths_match_what_the_backend_reports_back(self):
+        """The observed side stays backend-native; the desired side is the
+        one that has to be canonical."""
+        spec = _make_spec(
+            volumes=[("//data/uploads", "//workspace", "rw")],
+            working_dir="//home",
+        )
+        # What Docker echoes for that request (leading run collapsed).
+        assert spec.volumes == (("/data/uploads", "/workspace", "rw"),)
+        assert spec.working_dir == "/home"
 
 
 # --- ResolvedSandboxRuntimeSpec: repr redaction ---

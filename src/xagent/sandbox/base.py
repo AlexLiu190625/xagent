@@ -190,6 +190,35 @@ class ExecResult(BaseModel):
 SPEC_CONTRACT_VERSION = 1
 
 
+def canonical_sandbox_path(path: str) -> str:
+    """Canonicalize one sandbox-domain path for desired-state comparison.
+
+    The sandbox path domain is POSIX on both sides of a mount: guest paths
+    are container paths, and host bind sources are paths on the machine
+    running the container backend (in Docker sibling mode, the Docker
+    host — not necessarily this process's filesystem, see
+    ``XAGENT_SANDBOX_HOST_STORAGE_ROOT``). Normalization therefore belongs
+    to ``posixpath``, never to ``os.path``.
+
+    ``posixpath.normpath`` alone is not a canonical form: POSIX reserves a
+    leading ``//`` for implementation-defined interpretation, so normpath
+    keeps exactly two leading slashes (``'//data'`` stays ``'//data'``)
+    while Docker collapses them in the paths it reports back
+    (``Mounts.Destination``, ``Config.WorkingDir``). A desired-state path
+    that keeps ``//`` can therefore never byte-match what the backend
+    echoes, which turns a correctly-created container into a
+    publish-verification mismatch, and lets ``'//x'`` and ``'/x'`` pass the
+    pre-create conflict checks as if they were different mount points when
+    the backend would collapse them onto the same one. Collapsing the
+    leading slash run is what makes the desired form the form the backend
+    reports.
+    """
+    normalized = posixpath.normpath(path)
+    if normalized.startswith("//"):
+        normalized = "/" + normalized.lstrip("/")
+    return normalized
+
+
 @dataclass(frozen=True, repr=False)
 class ResolvedSandboxRuntimeSpec:
     """Fully-resolved, canonical desired runtime configuration for a sandbox.
@@ -259,20 +288,24 @@ class ResolvedSandboxRuntimeSpec:
     ) -> "ResolvedSandboxRuntimeSpec":
         """Build a spec, normalizing all collection fields.
 
-        Paths are normalized with ``normpath``; env/volumes/ports are sorted
-        and exactly deduplicated so that input order and duplicate entries
-        never affect equality or the fingerprint. ``cpus``/``memory`` fall
-        back to the same defaults the Docker backend applies at container
-        creation (``cpus or 1``, ``memory or 512``) so a resolved spec never
-        carries a 0/None value the backend would silently have upgraded on
-        its own. ``working_dir`` defaults to ``"/home"`` and is normalized
-        with ``normpath``.
+        Paths are canonicalized with ``canonical_sandbox_path``; env/volumes/
+        ports are sorted and exactly deduplicated so that input order and
+        duplicate entries never affect equality or the fingerprint.
+        ``cpus``/``memory`` fall back to the same defaults the Docker backend
+        applies at container creation (``cpus or 1``, ``memory or 512``) so a
+        resolved spec never carries a 0/None value the backend would silently
+        have upgraded on its own. ``working_dir`` defaults to ``"/home"`` and
+        is canonicalized the same way.
         """
         normalized_env = tuple(sorted((env or {}).items()))
         normalized_volumes = tuple(
             sorted(
                 {
-                    (posixpath.normpath(host), posixpath.normpath(guest), mode)
+                    (
+                        canonical_sandbox_path(host),
+                        canonical_sandbox_path(guest),
+                        mode,
+                    )
                     for host, guest, mode in (volumes or [])
                 }
             )
@@ -284,7 +317,9 @@ class ResolvedSandboxRuntimeSpec:
             template_type=template_type,
             image=image,
             snapshot_id=snapshot_id,
-            working_dir=posixpath.normpath(working_dir) if working_dir else "/home",
+            working_dir=(
+                canonical_sandbox_path(working_dir) if working_dir else "/home"
+            ),
             cpus=cpus or 1,
             memory=memory or 512,
             env=normalized_env,
@@ -422,8 +457,8 @@ class SandboxMountIntent:
     """A desired mount root plus a set of independently-declared extra mounts.
 
     Construction never raises (aside from type errors on non-string input):
-    inputs are normalized with ``normpath``, sorted, and exactly
-    deduplicated, but nothing is dropped or rejected here.
+    inputs are canonicalized with ``canonical_sandbox_path``, sorted, and
+    exactly deduplicated, but nothing is dropped or rejected here.
 
     Classification into ``covered_extras`` / ``covering_extras`` /
     ``disjoint_extras`` is purely lexical string comparison over the
@@ -441,10 +476,12 @@ class SandboxMountIntent:
 
     def __post_init__(self) -> None:
         normalized_root = (
-            posixpath.normpath(self.mount_root) if self.mount_root is not None else None
+            canonical_sandbox_path(self.mount_root)
+            if self.mount_root is not None
+            else None
         )
         normalized_extras = tuple(
-            sorted({posixpath.normpath(path) for path in self.extra_mounts})
+            sorted({canonical_sandbox_path(path) for path in self.extra_mounts})
         )
         object.__setattr__(self, "mount_root", normalized_root)
         object.__setattr__(self, "extra_mounts", normalized_extras)

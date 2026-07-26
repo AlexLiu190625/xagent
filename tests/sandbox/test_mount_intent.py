@@ -36,6 +36,18 @@ class TestMountIntentNormalization:
         intent = SandboxMountIntent(mount_root=None, extra_mounts=("/a",))
         assert intent.mount_root is None
 
+    def test_collapses_leading_double_slash(self):
+        """``normpath`` alone keeps a leading ``//``, which would make the
+        lexical prefix comparison read ``//data`` and ``/data/x`` as
+        unrelated paths."""
+        intent = SandboxMountIntent(
+            mount_root="//data", extra_mounts=("//data/x", "/data/y")
+        )
+        assert intent.mount_root == "/data"
+        assert intent.extra_mounts == ("/data/x", "/data/y")
+        assert intent.covered_extras == ("/data/x", "/data/y")
+        assert intent.disjoint_extras == ()
+
 
 class TestMountIntentNeverRaises:
     def test_empty_intent_does_not_raise(self):

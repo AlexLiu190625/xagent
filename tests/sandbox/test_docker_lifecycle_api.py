@@ -167,6 +167,21 @@ class TestCheckNoConflictingPorts:
         docker_sandbox_module._check_no_conflicting_ports([(0, 80), (0, 81), (0, 82)])
 
 
+class TestCheckNoConflictingVolumes:
+    def test_rejects_host_path_spelled_with_a_leading_double_slash(self):
+        # Docker collapses the leading slash run, so both entries land on the
+        # same host key and one guest path would be silently dropped.
+        with pytest.raises(SandboxRuntimeConflictError, match="host path"):
+            docker_sandbox_module._check_no_conflicting_volumes(
+                [("//data", "/guest/a", "rw"), ("/data", "/guest/b", "rw")]
+            )
+
+    def test_accepts_duplicate_triples_spelled_differently(self):
+        docker_sandbox_module._check_no_conflicting_volumes(
+            [("//data", "//guest/a", "rw"), ("/data", "/guest/a", "rw")]
+        )
+
+
 # --- supports_runtime_spec ---
 
 

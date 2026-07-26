@@ -41,6 +41,7 @@ from .base import (
     SandboxService,
     SandboxSnapshot,
     SandboxTemplate,
+    canonical_sandbox_path,
 )
 
 if TYPE_CHECKING:
@@ -359,15 +360,17 @@ def _check_no_conflicting_volumes(
     path, so two entries with the same host path but a different guest path
     or mode would silently drop one of them. Exactly identical triples
     (duplicates) are accepted and simply collapse; this only rejects a real
-    disagreement, normalizing paths first so equivalent-but-differently-
-    spelled host paths are treated as the same key.
+    disagreement, canonicalizing paths first (via
+    ``canonical_sandbox_path``, the same owner the desired spec uses) so
+    equivalent-but-differently-spelled host paths are treated as the same
+    key.
     """
     if not volumes:
         return
     seen: dict[str, tuple[str, str]] = {}
     for host_path, guest_path, mode in volumes:
-        key = (posixpath.normpath(guest_path), mode)
-        normalized_host = posixpath.normpath(host_path)
+        key = (canonical_sandbox_path(guest_path), mode)
+        normalized_host = canonical_sandbox_path(host_path)
         prior = seen.get(normalized_host)
         if prior is not None and prior != key:
             raise SandboxRuntimeConflictError(
