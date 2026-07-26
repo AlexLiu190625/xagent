@@ -128,7 +128,7 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) ->
         return new_provider
 
     sandbox_mgr._service.list_sandboxes.side_effect = slow_list_sandboxes
-    sandbox_mgr.create_lease_provider = AsyncMock(side_effect=create_provider)
+    sandbox_mgr._create_lease_provider_locked = AsyncMock(side_effect=create_provider)
     await _seed_attached_provider(sandbox_mgr, 7, AsyncMock())
 
     release_task = asyncio.create_task(manager._release_sandbox_task("user:7"))
@@ -138,7 +138,7 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) ->
         manager._get_or_create_task_sandbox(
             task_id=3,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
         )
     )
 
@@ -154,7 +154,7 @@ async def test_worker_cleanup_blocks_same_user_provider_recreate(sandbox_mgr) ->
         await asyncio.gather(release_task, create_task, return_exceptions=True)
 
     assert sandbox is new_provider
-    sandbox_mgr.create_lease_provider.assert_awaited_once()
+    sandbox_mgr._create_lease_provider_locked.assert_awaited_once()
 
 
 @pytest.mark.asyncio
@@ -322,7 +322,7 @@ async def test_capacity_error_rejects_task_by_default(sandbox_mgr, monkeypatch) 
         await manager._get_or_create_task_sandbox(
             task_id=1,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
         )
 
     assert 1 not in manager._agent_sandbox_keys
@@ -342,7 +342,7 @@ async def test_capacity_error_falls_back_locally_when_enabled(
     sandbox = await manager._get_or_create_task_sandbox(
         task_id=1,
         workspace_owner_id=7,
-        workspace_config={},
+        mount_intent=None,
     )
 
     assert sandbox is None
@@ -363,7 +363,7 @@ async def test_sandbox_unavailability_keeps_local_fallback(
     sandbox = await manager._get_or_create_task_sandbox(
         task_id=1,
         workspace_owner_id=7,
-        workspace_config={},
+        mount_intent=None,
     )
 
     assert sandbox is None
@@ -426,7 +426,7 @@ async def test_suffix_scoped_execution_fails_closed(
         await manager._get_or_create_task_sandbox(
             task_id=1,
             workspace_owner_id=7,
-            workspace_config={},
+            mount_intent=None,
             scope=_SCOPE,
         )
 
@@ -470,7 +470,7 @@ async def test_suffixless_scope_keeps_unscoped_fallback(
     sandbox = await manager._get_or_create_task_sandbox(
         task_id=1,
         workspace_owner_id=7,
-        workspace_config={},
+        mount_intent=None,
         scope=_SUFFIXLESS_SCOPE,
     )
 

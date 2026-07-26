@@ -41,6 +41,7 @@ from ...core.tools.adapters.vibe.config import (
 )
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
 from ...core.workspace import scoped_user_root
+from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
@@ -111,6 +112,7 @@ from ..services.workforce_runtime import (
     resolve_workforce_task_runtime,
     sync_workforce_run_status_for_task_id_isolated,
 )
+from ..services.workspace_binding import build_chat_workspace_binding
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
@@ -1075,7 +1077,7 @@ class AgentServiceManager:
         *,
         task_id: int,
         workspace_owner_id: int,
-        workspace_config: Mapping[str, Any],
+        mount_intent: Optional[SandboxMountIntent],
         scope: Optional[ExecutionScope] = None,
     ) -> Any | None:
         """Get the task's sandbox lease provider, or None for local execution.
@@ -1127,7 +1129,7 @@ class AgentServiceManager:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
                 USER_LIFECYCLE_TYPE,
                 make_user_lifecycle_id(workspace_owner_id, suffix),
-                workspace_config=workspace_config,
+                mount_intent=mount_intent,
             )
         except SandboxCapacityError as e:
             self._agent_sandbox_keys.pop(task_id, None)
@@ -1603,25 +1605,10 @@ class AgentServiceManager:
             agent_config, workforce_runtime, task_id=task_id
         )
         workspace_owner_id = int(task.user_id)
-        scope_segments = scope.workspace_segments if scope is not None else ()
-        # The sandbox bind mount covers the scope's mount prefix (the full
-        # workspace_segments when no prefix is declared); the deeper
-        # workspace subtree lives inside it but is NOT isolated from a
-        # co-mounted sibling — the rw mount and the code-execution tools
-        # bypass scoped_user_root, so a mount prefix must only group scopes
-        # of the same trust principal (see ExecutionScope.sandbox_mount_segments).
-        mount_segments = scope.effective_mount_segments if scope is not None else ()
-        sandbox_workspace_config = {
-            "base_dir": str(
-                scoped_user_root(get_uploads_dir(), workspace_owner_id, mount_segments)
-            ),
-            "task_id": f"web_task_{task_id}",
-            "user_id": workspace_owner_id,
-            "allowed_external_dirs": _build_allowed_external_dirs(
-                workspace_owner_id, scope=scope
-            ),
-            "scope_segments": scope_segments,
-        }
+        # Actor-logical access policy + CA-physical mount intent, built by
+        # the single shared projection (see build_chat_workspace_binding's
+        # docstring for the covered/covering/disjoint folding it applies).
+        workspace_binding = build_chat_workspace_binding(workspace_owner_id, scope)
 
         # Sandbox startup is container/network work that can take seconds;
         # don't hold this session's read transaction (and its pool slot)
@@ -1631,7 +1618,7 @@ class AgentServiceManager:
         sandbox = await self._get_or_create_task_sandbox(
             task_id=task_id,
             workspace_owner_id=workspace_owner_id,
-            workspace_config=sandbox_workspace_config,
+            mount_intent=workspace_binding.mount_intent,
             scope=scope,
         )
 
@@ -2263,28 +2250,13 @@ class AgentServiceManager:
                     else int(runtime_user.id)
                 )
                 scope_segments = scope.workspace_segments if scope is not None else ()
-                # Sandbox mount covers the scope's mount prefix (full
-                # workspace_segments when no prefix is declared); the deeper
-                # subtree is NOT isolated from a co-mounted sibling (rw mount,
-                # code-execution tools bypass scoped_user_root), so a mount
-                # prefix must only group scopes of the same trust principal
-                # (see ExecutionScope.sandbox_mount_segments).
-                mount_segments = (
-                    scope.effective_mount_segments if scope is not None else ()
+                # Actor-logical access policy + CA-physical mount intent,
+                # built by the single shared projection (see
+                # build_chat_workspace_binding's docstring for the
+                # covered/covering/disjoint folding it applies).
+                workspace_binding = build_chat_workspace_binding(
+                    workspace_owner_id, scope
                 )
-                sandbox_workspace_config = {
-                    "base_dir": str(
-                        scoped_user_root(
-                            get_uploads_dir(), workspace_owner_id, mount_segments
-                        )
-                    ),
-                    "task_id": f"web_task_{task_id}",
-                    "user_id": workspace_owner_id,
-                    "allowed_external_dirs": _build_allowed_external_dirs(
-                        workspace_owner_id, scope=scope
-                    ),
-                    "scope_segments": scope_segments,
-                }
 
                 # Sandbox startup is container/network work that can take
                 # seconds; don't hold this session's read transaction (and
@@ -2294,7 +2266,7 @@ class AgentServiceManager:
                 sandbox = await self._get_or_create_task_sandbox(
                     task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
-                    workspace_config=sandbox_workspace_config,
+                    mount_intent=workspace_binding.mount_intent,
                     scope=scope,
                 )
 

@@ -9,7 +9,12 @@ from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     build_code_mount_volumes,
 )
-from xagent.sandbox.base import SandboxConfig, SandboxInfo, SandboxTemplate
+from xagent.sandbox.base import (
+    SandboxConfig,
+    SandboxInfo,
+    SandboxMountIntent,
+    SandboxTemplate,
+)
 from xagent.web.sandbox_manager import SandboxManager
 
 
@@ -82,13 +87,10 @@ def test_default_volumes_map_user_workspace_to_host_storage(
         volumes = manager._make_default_volumes(
             "user",
             "42",
-            ensure_dir=False,
-            workspace_config={
-                "base_dir": str(backend_user_dir),
-                "task_id": "web_task_9",
-                "user_id": 42,
-                "allowed_external_dirs": [str(backend_user_dir)],
-            },
+            mount_intent=SandboxMountIntent(
+                mount_root=str(backend_user_dir),
+                extra_mounts=(str(backend_user_dir),),
+            ),
         )
 
     assert volumes == [
@@ -127,13 +129,10 @@ def test_default_volumes_include_build_preview_and_user_dirs(
         volumes = manager._make_default_volumes(
             "user",
             "7",
-            ensure_dir=False,
-            workspace_config={
-                "base_dir": str(build_preview_dir),
-                "task_id": "build_preview_abcd1234",
-                "user_id": 7,
-                "allowed_external_dirs": [str(user_dir)],
-            },
+            mount_intent=SandboxMountIntent(
+                mount_root=str(build_preview_dir),
+                extra_mounts=(str(user_dir),),
+            ),
         )
 
     assert volumes == [
@@ -173,12 +172,10 @@ def test_default_volumes_keep_external_dirs_outside_storage(
         volumes = manager._make_default_volumes(
             "user",
             "5",
-            ensure_dir=False,
-            workspace_config={
-                "base_dir": str(base_dir),
-                "task_id": "web_task_5",
-                "allowed_external_dirs": [str(external_dir)],
-            },
+            mount_intent=SandboxMountIntent(
+                mount_root=str(base_dir),
+                extra_mounts=(str(external_dir),),
+            ),
         )
 
     assert (str(external_dir), str(external_dir), "rw") in volumes
@@ -209,13 +206,10 @@ def test_default_volumes_mount_workspace_owner_not_current_user(
         volumes = manager._make_default_volumes(
             "user",
             "1",
-            ensure_dir=False,
-            workspace_config={
-                "base_dir": str(owner_dir),
-                "task_id": "web_task_123",
-                "user_id": 99,
-                "allowed_external_dirs": [str(owner_dir)],
-            },
+            mount_intent=SandboxMountIntent(
+                mount_root=str(owner_dir),
+                extra_mounts=(str(owner_dir),),
+            ),
         )
 
     assert (

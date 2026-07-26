@@ -8,7 +8,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from tests.web.sandbox_fakes import FakeSandboxService
-from xagent.sandbox.base import SandboxConfig, SandboxInfo, SandboxTemplate
+from xagent.sandbox.base import (
+    SandboxConfig,
+    SandboxInfo,
+    SandboxMountIntent,
+    SandboxRuntimeConflictError,
+    SandboxTemplate,
+)
 from xagent.web.sandbox_manager import (
     SandboxManager,
     _create_boxlite_service,
@@ -549,13 +555,17 @@ class TestSandboxLifecycleConfig:
             await manager.get_or_create_sandbox(
                 "user",
                 "42",
-                workspace_config={"base_dir": str(tmp_path / "user_42")},
+                mount_intent=SandboxMountIntent(mount_root=str(tmp_path / "user_42")),
             )
-            with pytest.raises(RuntimeError, match="different runtime configuration"):
+            with pytest.raises(
+                SandboxRuntimeConflictError, match="different runtime configuration"
+            ):
                 await manager.get_or_create_sandbox(
                     "user",
                     "42",
-                    workspace_config={"base_dir": str(tmp_path / "build_preview")},
+                    mount_intent=SandboxMountIntent(
+                        mount_root=str(tmp_path / "build_preview")
+                    ),
                 )
 
         service.delete.assert_not_awaited()
@@ -577,12 +587,14 @@ class TestSandboxLifecycleConfig:
             await manager.get_or_create_sandbox(
                 "user",
                 "42",
-                workspace_config={"base_dir": str(tmp_path / "user_42")},
+                mount_intent=SandboxMountIntent(mount_root=str(tmp_path / "user_42")),
             )
             await manager.get_or_create_sandbox(
                 "build_preview",
                 "42",
-                workspace_config={"base_dir": str(tmp_path / "build_preview")},
+                mount_intent=SandboxMountIntent(
+                    mount_root=str(tmp_path / "build_preview")
+                ),
             )
 
         assert service.get_or_create.await_count == 2
@@ -616,7 +628,7 @@ class TestSandboxLeaseProvider:
             provider = await manager.create_lease_provider(
                 "user",
                 "42",
-                workspace_config={"base_dir": str(tmp_path / "user_42")},
+                mount_intent=SandboxMountIntent(mount_root=str(tmp_path / "user_42")),
             )
             async with provider.lease(concurrency_safe=False) as sandbox:
                 assert sandbox.name == "user::42"
@@ -649,7 +661,7 @@ class TestSandboxLeaseProvider:
             provider = await manager.create_lease_provider(
                 "user",
                 "42",
-                workspace_config={"base_dir": str(tmp_path / "user_42")},
+                mount_intent=SandboxMountIntent(mount_root=str(tmp_path / "user_42")),
             )
             async with provider.lease(concurrency_safe=True) as first:
                 async with provider.lease(concurrency_safe=True) as second:
@@ -688,7 +700,7 @@ class TestSandboxLeaseProvider:
             provider = await manager.create_lease_provider(
                 "user",
                 "42",
-                workspace_config={"base_dir": str(workspace_dir)},
+                mount_intent=SandboxMountIntent(mount_root=str(workspace_dir)),
             )
             async with provider.lease(concurrency_safe=True):
                 pass
@@ -727,7 +739,7 @@ class TestSandboxLeaseProvider:
             provider = await manager.create_lease_provider(
                 "user",
                 "42",
-                workspace_config={"base_dir": str(tmp_path / "user_42")},
+                mount_intent=SandboxMountIntent(mount_root=str(tmp_path / "user_42")),
             )
             async with provider.lease(concurrency_safe=True):
                 pass
@@ -959,14 +971,14 @@ class TestGetOrCreateLeaseProvider:
     async def test_returns_cached_provider_for_same_lifecycle(self):
         manager = self._make_manager()
         provider = MagicMock()
-        manager.create_lease_provider = AsyncMock(return_value=provider)
+        manager._create_lease_provider_locked = AsyncMock(return_value=provider)
 
         first = await manager.get_or_create_lease_provider("user", "7")
         second = await manager.get_or_create_lease_provider("user", "7")
 
         assert first is provider
         assert second is provider
-        manager.create_lease_provider.assert_awaited_once()
+        manager._create_lease_provider_locked.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_concurrent_requests_create_single_provider(self):
@@ -976,20 +988,20 @@ class TestGetOrCreateLeaseProvider:
             await asyncio.sleep(0)
             return MagicMock()
 
-        manager.create_lease_provider = AsyncMock(side_effect=create_provider)
+        manager._create_lease_provider_locked = AsyncMock(side_effect=create_provider)
 
         providers = await asyncio.gather(
             *(manager.get_or_create_lease_provider("user", "7") for _ in range(5))
         )
 
         assert len({id(p) for p in providers}) == 1
-        manager.create_lease_provider.assert_awaited_once()
+        manager._create_lease_provider_locked.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_release_to_zero_drops_cache_and_recreates(self):
         manager = self._make_manager()
         providers = [MagicMock(), MagicMock()]
-        manager.create_lease_provider = AsyncMock(side_effect=providers)
+        manager._create_lease_provider_locked = AsyncMock(side_effect=providers)
 
         first = await manager.get_or_create_lease_provider("user", "7")
         await manager.attach("user", "7")

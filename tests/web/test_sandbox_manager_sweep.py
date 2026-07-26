@@ -127,7 +127,7 @@ async def test_fresh_provider_fetch_resets_idle_clock(clock) -> None:
     """get_or_create_lease_provider bumps activity, protecting the
     create-to-attach window from a concurrent sweep."""
     manager = _make_manager(["user::7"])
-    manager.create_lease_provider = AsyncMock(return_value=MagicMock())
+    manager._create_lease_provider_locked = AsyncMock(return_value=MagicMock())
 
     clock.advance(TTL + 1)
     await manager.get_or_create_lease_provider("user", "7")
@@ -160,7 +160,7 @@ async def test_swept_sandbox_is_recreated_cleanly_on_next_use(clock) -> None:
     manager._cache["user::7"] = MagicMock()
     manager._config_cache["user::7"] = MagicMock()
     providers = [MagicMock(), MagicMock()]
-    manager.create_lease_provider = AsyncMock(side_effect=providers)
+    manager._create_lease_provider_locked = AsyncMock(side_effect=providers)
 
     first = await manager.get_or_create_lease_provider("user", "7")
     clock.advance(TTL + 1)
@@ -256,7 +256,7 @@ async def test_concurrent_recreate_during_sweep_waits_for_lifecycle_lock(
 
     manager._service.delete.side_effect = slow_delete
     providers = [MagicMock(), MagicMock()]
-    manager.create_lease_provider = AsyncMock(side_effect=providers)
+    manager._create_lease_provider_locked = AsyncMock(side_effect=providers)
 
     clock.advance(TTL + 1)
     sweep_task = asyncio.create_task(manager.sweep_idle_sandboxes(TTL))
@@ -274,5 +274,5 @@ async def test_concurrent_recreate_during_sweep_waits_for_lifecycle_lock(
 
     assert reclaimed == ["user::7"]
     assert provider is providers[0]
-    manager.create_lease_provider.assert_awaited_once()
+    manager._create_lease_provider_locked.assert_awaited_once()
     assert manager._lease_providers["user::7"] is provider

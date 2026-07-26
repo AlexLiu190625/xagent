@@ -1,0 +1,498 @@
+"""PR-1b stage 2: the spec-reconciliation matrix in ``SandboxManager``.
+
+Exercises the routing gate (``_resolve_backend_probe``), the reconciliation
+matrix cell by cell (absent / MATCH / UNVERIFIED with and without a store
+row / MISMATCH with each ref-count and state combination), the per-key
+rebuild budget, the ``SandboxAlreadyExistsError`` cross-process retry, and
+provider ABA (``attach_provider``). All tests use ``FakeSandboxService(
+runtime_spec_supported=True)`` so the manager takes the reconciliation route
+end to end against the fake's small in-memory container/store model (see
+``tests/web/sandbox_fakes.py``).
+"""
+
+from __future__ import annotations
+
+from unittest.mock import patch
+
+import pytest
+
+from tests.web.sandbox_fakes import FakeSandboxService, _FakeReconcileContainer
+from xagent.sandbox.base import (
+    ResolvedSandboxRuntimeSpec,
+    SandboxAlreadyExistsError,
+    SandboxConfig,
+    SandboxInfo,
+    SandboxMountIntent,
+    SandboxRecoveryRequiredError,
+    SandboxRuntimeConflictError,
+    SandboxTemplate,
+)
+from xagent.web.sandbox_manager import SandboxManager
+
+
+@pytest.fixture
+def _env(tmp_path):
+    """Isolate sandbox env config and neutralize code mounts."""
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[("/repo/src", "/app/src", "ro")],
+        ),
+    ):
+        yield
+
+
+def _intent(tmp_path, name: str = "workspace") -> SandboxMountIntent:
+    return SandboxMountIntent(mount_root=str(tmp_path / name))
+
+
+def _make_manager() -> tuple[SandboxManager, FakeSandboxService]:
+    service = FakeSandboxService(runtime_spec_supported=True)
+    return SandboxManager(service), service
+
+
+class TestBackendProbeRouting:
+    @pytest.mark.asyncio
+    async def test_probe_resolved_once_and_cached(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+        await manager.get_or_create_sandbox(
+            "user", "2", mount_intent=_intent(tmp_path, "workspace2")
+        )
+
+        service.supports_runtime_spec.assert_awaited_once()
+        assert manager._backend_probe is True
+
+    @pytest.mark.asyncio
+    async def test_legacy_backend_never_calls_reconcile_methods(
+        self, _env, tmp_path
+    ) -> None:
+        """probe=False routes through service.get_or_create(), never
+        inspect/create/start_existing/stop_existing."""
+        service = FakeSandboxService()  # runtime_spec_supported=False (default)
+        manager = SandboxManager(service)
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert sandbox.name == "user::1"
+        service.get_or_create.assert_awaited_once()
+
+
+class TestReconcileMatrixAbsent:
+    @pytest.mark.asyncio
+    async def test_absent_creates(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert sandbox.name == "user::1"
+        service.create.assert_awaited_once()
+        assert "user::1" in service._containers
+        assert "user::1" in service._store
+
+    @pytest.mark.asyncio
+    async def test_already_exists_retries_once_via_reinspect(
+        self, _env, tmp_path
+    ) -> None:
+        """A cross-process race: another process created the name between
+        our inspect() and create(). A single re-inspect must recover it
+        instead of failing closed."""
+        manager, service = _make_manager()
+
+        async def racy_create(name, template, config):
+            # Simulate a concurrent process winning the create() race: the
+            # container actually gets created (so the re-inspect finds it),
+            # but this call itself still reports the conflict.
+            await service._create_impl(name, template, config)
+            raise SandboxAlreadyExistsError("raced")
+
+        service.create.side_effect = racy_create
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert sandbox is not None
+        assert service.create.await_count == 1
+
+
+class TestReconcileMatrixMatch:
+    @pytest.mark.asyncio
+    async def test_match_with_store_row_reuses(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+        service.create.reset_mock()
+        manager._cache.clear()
+        manager._config_cache.clear()
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert sandbox.name == "user::1"
+        service.create.assert_not_awaited()
+        service.start_existing.assert_awaited_once_with("user::1")
+
+    @pytest.mark.asyncio
+    async def test_match_without_store_row_backfills_then_reuses(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+        # Simulate create()'s store write having failed independently of
+        # the container (label is immutable and unaffected).
+        service._store.pop("user::1", None)
+        manager._cache.clear()
+        manager._config_cache.clear()
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert sandbox.name == "user::1"
+        service.persist_store_record.assert_awaited_once()
+        assert "user::1" in service._store
+        service.create.assert_awaited_once()  # only the original creation
+
+
+class TestReconcileMatrixUnverified:
+    @pytest.mark.asyncio
+    async def test_unverified_with_matching_store_row_reuses(
+        self, _env, tmp_path
+    ) -> None:
+        """A legacy-created container (no fingerprint label) whose store
+        row's recorded spec matches the freshly desired one converges by
+        reuse, staying UNVERIFIED (no label is ever backfilled)."""
+        manager, service = _make_manager()
+        intent = _intent(tmp_path)
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        template, config = desired.to_backend_config()
+
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped", spec=desired, fingerprint_label=None, version_label=None
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1", state="stopped", template=template, config=config
+        )
+
+        sandbox = await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+
+        assert sandbox.name == "user::1"
+        service.start_existing.assert_awaited_once_with("user::1")
+        service.create.assert_not_awaited()
+        service.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_unverified_with_diverging_store_row_rebuilds(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        intent = _intent(tmp_path)
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped", spec=desired, fingerprint_label=None, version_label=None
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1",
+            state="stopped",
+            template=SandboxTemplate(type="image", image="stale:v0"),
+            config=SandboxConfig(),
+        )
+
+        sandbox = await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+
+        assert sandbox.name == "user::1"
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_unverified_with_no_store_row_rebuilds(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+        intent = _intent(tmp_path)
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped", spec=desired, fingerprint_label=None, version_label=None
+        )
+        # No store row at all.
+
+        sandbox = await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+
+        assert sandbox.name == "user::1"
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+
+
+class TestReconcileMatrixMismatch:
+    @staticmethod
+    def _seed_mismatch(
+        service: FakeSandboxService,
+        manager: SandboxManager,
+        name: str,
+        *,
+        state: str,
+        tmp_path,
+    ) -> None:
+        stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="stale:v0"
+        )
+        service._containers[name] = _FakeReconcileContainer(
+            state=state,
+            spec=stale_spec,
+            fingerprint_label=stale_spec.fingerprint(),
+            version_label="1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_stopped_mismatch_ref_zero_rebuilds(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+        self._seed_mismatch(
+            service, manager, "user::1", state="stopped", tmp_path=tmp_path
+        )
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert sandbox.name == "user::1"
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+        service.stop_existing.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stopped_mismatch_ref_nonzero_rejects_new_caller(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        self._seed_mismatch(
+            service, manager, "user::1", state="stopped", tmp_path=tmp_path
+        )
+        manager._lease_providers["user::1"] = object()
+        assert await manager.attach("user", "1")
+
+        with pytest.raises(SandboxRuntimeConflictError):
+            await manager.get_or_create_sandbox(
+                "user", "1", mount_intent=_intent(tmp_path)
+            )
+
+        service.delete.assert_not_awaited()
+        service.create.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_running_mismatch_ref_zero_stops_then_rebuilds(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        self._seed_mismatch(
+            service, manager, "user::1", state="running", tmp_path=tmp_path
+        )
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+
+        assert sandbox.name == "user::1"
+        service.stop_existing.assert_awaited_once_with("user::1")
+        service.delete.assert_awaited_once_with("user::1")
+        service.create.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_running_mismatch_ref_nonzero_rejects_and_never_deletes(
+        self, _env, tmp_path
+    ) -> None:
+        """The safety contract's strongest form: a mismatched RUNNING
+        sandbox still in use is never stopped or deleted — the new caller
+        is rejected instead."""
+        manager, service = _make_manager()
+        self._seed_mismatch(
+            service, manager, "user::1", state="running", tmp_path=tmp_path
+        )
+        manager._lease_providers["user::1"] = object()
+        assert await manager.attach("user", "1")
+
+        with pytest.raises(SandboxRuntimeConflictError):
+            await manager.get_or_create_sandbox(
+                "user", "1", mount_intent=_intent(tmp_path)
+            )
+
+        service.stop_existing.assert_not_awaited()
+        service.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stop_failure_raises_recovery_required(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+        self._seed_mismatch(
+            service, manager, "user::1", state="running", tmp_path=tmp_path
+        )
+        service.stop_existing.side_effect = RuntimeError("docker daemon unreachable")
+
+        with pytest.raises(SandboxRecoveryRequiredError):
+            await manager.get_or_create_sandbox(
+                "user", "1", mount_intent=_intent(tmp_path)
+            )
+
+        service.delete.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_stop_that_does_not_take_raises_recovery_required(
+        self, _env, tmp_path
+    ) -> None:
+        """stop_existing() returns without error but the container is
+        still observably running on re-inspect: fail closed rather than
+        delete a running container."""
+        manager, service = _make_manager()
+        self._seed_mismatch(
+            service, manager, "user::1", state="running", tmp_path=tmp_path
+        )
+
+        async def fake_stop_existing(name, *, timeout=None):
+            return None  # no-op: state stays "running"
+
+        service.stop_existing.side_effect = fake_stop_existing
+
+        with pytest.raises(SandboxRecoveryRequiredError):
+            await manager.get_or_create_sandbox(
+                "user", "1", mount_intent=_intent(tmp_path)
+            )
+
+        service.delete.assert_not_awaited()
+
+
+class TestReconcileBudget:
+    @pytest.mark.asyncio
+    async def test_second_mismatch_rebuild_is_rejected(self, _env, tmp_path) -> None:
+        """Default budget is 1 rebuild per base lifecycle name."""
+        manager, service = _make_manager()
+        stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="stale:v0"
+        )
+
+        def _seed_stale() -> None:
+            service._containers["user::1"] = _FakeReconcileContainer(
+                state="stopped",
+                spec=stale_spec,
+                fingerprint_label=stale_spec.fingerprint(),
+                version_label="1",
+            )
+
+        _seed_stale()
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+        assert manager._reconcile_budget["user::1"] == 0
+
+        # Force a second mismatch for the same base name.
+        manager._cache.pop("user::1", None)
+        manager._config_cache.pop("user::1", None)
+        _seed_stale()
+
+        with pytest.raises(SandboxRuntimeConflictError):
+            await manager.get_or_create_sandbox(
+                "user", "1", mount_intent=_intent(tmp_path)
+            )
+        service.delete.assert_called_once()  # only the first rebuild deleted
+
+    @pytest.mark.asyncio
+    async def test_absent_create_never_consumes_budget(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+
+        assert "user::1" not in manager._reconcile_budget
+
+    @pytest.mark.asyncio
+    async def test_delete_does_not_reset_budget(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+        stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="stale:v0"
+        )
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=stale_spec,
+            fingerprint_label=stale_spec.fingerprint(),
+            version_label="1",
+        )
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+        assert manager._reconcile_budget["user::1"] == 0
+
+        # An unrelated deletion of the same name must not reset the budget.
+        await manager.delete_sandbox("user", "1")
+
+        assert manager._reconcile_budget["user::1"] == 0
+
+    @pytest.mark.asyncio
+    async def test_cleanup_quiesce_resets_budget(self, _env, tmp_path) -> None:
+        manager, service = _make_manager()
+        manager._reconcile_budget["user::1"] = 0
+
+        await manager.cleanup()
+
+        assert manager._reconcile_budget == {}
+
+
+class TestProviderABA:
+    @pytest.mark.asyncio
+    async def test_attach_provider_true_for_current_object(self, _env) -> None:
+        manager = SandboxManager(FakeSandboxService(runtime_spec_supported=True))
+        provider = object()
+        manager._lease_providers["user::1"] = provider
+
+        assert await manager.attach_provider("user", "1", provider) is True
+        assert manager.ref_count("user", "1") == 1
+
+    @pytest.mark.asyncio
+    async def test_attach_provider_false_for_stale_handle(self, _env) -> None:
+        """A provider replaced by a rebuild fails attach_provider for a
+        caller still holding the old (now-stale) handle, even though the
+        key itself resolves to a live (different) provider."""
+        manager = SandboxManager(FakeSandboxService(runtime_spec_supported=True))
+        old_provider = object()
+        new_provider = object()
+        manager._lease_providers["user::1"] = old_provider
+
+        manager._lease_providers["user::1"] = new_provider
+
+        assert await manager.attach_provider("user", "1", old_provider) is False
+        assert manager.ref_count("user", "1") == 0
+
+    @pytest.mark.asyncio
+    async def test_attach_provider_false_when_nothing_cached(self, _env) -> None:
+        manager = SandboxManager(FakeSandboxService(runtime_spec_supported=True))
+
+        assert await manager.attach_provider("user", "1", object()) is False
+
+
+class TestWorkerReconcileDegradation:
+    @pytest.mark.asyncio
+    async def test_worker_mismatch_degrades_to_primary(self, _env, tmp_path) -> None:
+        """A worker whose reconciliation hits a runtime-config conflict
+        degrades to the primary sandbox instead of failing the tool
+        mid-task (the same sharing semantics a capacity failure gets)."""
+        manager, service = _make_manager()
+        intent = _intent(tmp_path)
+        provider = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=intent
+        )
+
+        stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="stale:v0"
+        )
+        service._containers["user::1::worker::0"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=stale_spec,
+            fingerprint_label=stale_spec.fingerprint(),
+            version_label="1",
+        )
+        # Exhaust the base lifecycle's rebuild budget (shared by primary and
+        # workers) so reconciliation rejects instead of silently rebuilding,
+        # forcing the degrade path.
+        manager._reconcile_budget["user::1"] = 0
+
+        worker = await provider.get_worker_sandbox(0)
+
+        assert worker is provider.primary_sandbox
