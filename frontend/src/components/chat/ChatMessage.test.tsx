@@ -171,4 +171,95 @@ describe("ChatMessage Session file capability", () => {
       requestUrl: "https://api.example/tasks/42",
     })
   })
+
+  it("sanitizes failed message display and copy content only when files are disabled", () => {
+    const failureText = "Failed to read [secret-report.pdf](file:failed-file-id) at `/private/run/secret-report.pdf`"
+    appContextMock.filesDisabled = true
+
+    const { container, rerender } = render(
+      <ChatMessage
+        role="assistant"
+        content={failureText}
+        processStatus="failed"
+      />,
+    )
+
+    expect(container).not.toHaveTextContent("failed-file-id")
+    expect(container).not.toHaveTextContent("/private/run/secret-report.pdf")
+    expect(container).toHaveTextContent(
+      "Failed to read secret-report.pdf at secret-report.pdf",
+    )
+    fireEvent.click(screen.getByTitle("common.copy"))
+    expect(clipboardWriteTextMock).toHaveBeenCalledWith(
+      "Failed to read secret-report.pdf at secret-report.pdf",
+    )
+
+    appContextMock.filesDisabled = false
+    rerender(
+      <ChatMessage
+        role="assistant"
+        content={failureText}
+        processStatus="failed"
+      />,
+    )
+
+    expect(container).toHaveTextContent(failureText)
+    fireEvent.click(screen.getByTitle("common.copy"))
+    expect(clipboardWriteTextMock).toHaveBeenLastCalledWith(failureText)
+  })
+
+  it("sanitizes trace-derived failed message text when files are disabled", () => {
+    const traceFailure = "Unable to open [trace-secret.csv](file:trace-file-id) from `/private/run/trace-secret.csv`"
+    appContextMock.filesDisabled = true
+
+    const { container } = render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        processStatus="failed"
+        traceEvents={[{
+          event_type: "task_failed",
+          data: { error: traceFailure },
+        }]}
+      />,
+    )
+
+    expect(container).not.toHaveTextContent("trace-file-id")
+    expect(container).not.toHaveTextContent("/private/run/trace-secret.csv")
+    expect(container).toHaveTextContent(
+      "Unable to open trace-secret.csv from trace-secret.csv",
+    )
+    fireEvent.click(screen.getByTitle("common.copy"))
+    expect(clipboardWriteTextMock).toHaveBeenCalledWith(
+      "Unable to open trace-secret.csv from trace-secret.csv",
+    )
+    expect(clipboardWriteTextMock).not.toHaveBeenCalledWith(traceFailure)
+  })
+
+  it("copies the resolved failure instead of mismatched raw content", () => {
+    const traceFailure = "Unable to open [trace-secret.csv](file:trace-file-id) from `/private/run/trace-secret.csv`"
+    const rawContent = "Ignored [raw-secret.csv](file:raw-file-id) from `/private/raw-secret.csv`"
+    appContextMock.filesDisabled = true
+
+    render(
+      <ChatMessage
+        role="assistant"
+        content={null}
+        rawContent={rawContent}
+        processStatus="failed"
+        traceEvents={[{
+          event_type: "task_failed",
+          data: { error: traceFailure },
+        }]}
+      />,
+    )
+
+    fireEvent.click(screen.getByTitle("common.copy"))
+    expect(clipboardWriteTextMock).toHaveBeenCalledWith(
+      "Unable to open trace-secret.csv from trace-secret.csv",
+    )
+    const copied = clipboardWriteTextMock.mock.calls[0][0]
+    expect(copied).not.toContain("raw-file-id")
+    expect(copied).not.toContain("/private/raw-secret.csv")
+  })
 })

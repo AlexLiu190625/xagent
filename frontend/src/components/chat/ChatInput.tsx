@@ -42,6 +42,7 @@ interface ChatInputProps {
   readOnlyConfig?: boolean;
   hideFileUpload?: boolean;
   filesDisabled?: boolean;
+  voiceInputEnabled?: boolean;
   compact?: boolean;
   autoFocus?: boolean;
   minHeightClass?: string;
@@ -96,6 +97,7 @@ export function ChatInput({
   readOnlyConfig = false,
   hideFileUpload = false,
   filesDisabled = false,
+  voiceInputEnabled = true,
   compact = false,
   autoFocus = false,
   minHeightClass = "min-h-[130px]",
@@ -119,7 +121,7 @@ export function ChatInput({
   const dragDepthRef = useRef(0);
   const { t } = useI18n();
   const { openFilePreview } = useApp();
-  const voiceInput = useVoiceInputControls();
+  const voiceInput = useVoiceInputControls({ enabled: voiceInputEnabled });
 
   useEffect(() => {
     if (!autoFocus || !editorRef.current) return;
@@ -541,7 +543,7 @@ export function ChatInput({
       voiceInput.stopRecording();
       return;
     }
-    if (voiceInput.status === "idle") {
+    if (voiceInputEnabled && voiceInput.status === "idle") {
       voiceInput.startRecording(editorRef.current);
     }
   };
@@ -968,7 +970,7 @@ export function ChatInput({
                   </Button>
                 </>
               )}
-              {voiceInput.hasAsrModel && (
+              {voiceInputEnabled && voiceInput.hasAsrModel && (
                 <Button
                   type="button"
                   variant="ghost"
@@ -1095,7 +1097,7 @@ export function ChatInput({
                 <span className="text-[13px] font-medium text-muted-foreground/50 select-none mr-1">
                   ⏎ {t("common.send")}
                 </span>
-                {voiceInput.hasAsrModel && (
+                {voiceInputEnabled && voiceInput.hasAsrModel && (
                   <Button
                     type="button"
                     variant="ghost"

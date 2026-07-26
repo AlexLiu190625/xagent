@@ -53,6 +53,7 @@ interface ChatStartScreenProps {
   compactInput?: boolean;
   deferFileUpload?: boolean;
   filesDisabled?: boolean;
+  voiceInputEnabled?: boolean;
   taskConfig?: any;
   autoFocus?: boolean;
   inputMinHeightClass?: string;
@@ -81,6 +82,7 @@ export function ChatStartScreen({
   compactInput = false,
   deferFileUpload = false,
   filesDisabled = false,
+  voiceInputEnabled = true,
   taskConfig,
   autoFocus = false,
   inputMinHeightClass
@@ -125,6 +127,7 @@ export function ChatStartScreen({
             compact={compactInput}
             deferFileUpload={deferFileUpload}
             filesDisabled={filesDisabled}
+            voiceInputEnabled={voiceInputEnabled}
             hideFileUpload={filesDisabled}
             taskConfig={taskConfig}
             autoFocus={autoFocus}

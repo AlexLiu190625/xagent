@@ -15,8 +15,12 @@ const appState = vi.hoisted(() => ({
 }))
 const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
+const pauseTaskMock = vi.hoisted(() => vi.fn())
+const resumeTaskMock = vi.hoisted(() => vi.fn())
 const appControls = vi.hoisted(() => ({
   filesDisabled: false,
+  voiceInputEnabled: true,
+  taskControlsEnabled: true,
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
 }))
@@ -24,9 +28,12 @@ const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
     files?: File[]
     filesDisabled?: boolean
+    voiceInputEnabled?: boolean
     hideFileUpload?: boolean
     isLoading?: boolean
     onFilesChange?: (files: File[]) => void
+    onPause?: () => void
+    onResume?: () => void
     onSend: (message: string, config?: unknown, files?: File[]) => Promise<void> | void
   },
 }))
@@ -35,9 +42,11 @@ vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     state: appState,
     filesDisabled: appControls.filesDisabled,
+    voiceInputEnabled: appControls.voiceInputEnabled,
+    taskControlsEnabled: appControls.taskControlsEnabled,
     sendMessage: sendMessageMock,
-    pauseTask: vi.fn(),
-    resumeTask: vi.fn(),
+    pauseTask: pauseTaskMock,
+    resumeTask: resumeTaskMock,
     openFilePreview: openFilePreviewMock,
     closeFilePreview: vi.fn(),
     requestStatus: vi.fn(),
@@ -199,10 +208,14 @@ describe("TaskConversationPanel", () => {
     openFilePreviewMock.mockReset()
     sendMessageMock.mockReset()
     sendMessageMock.mockResolvedValue(undefined)
+    pauseTaskMock.mockReset()
+    resumeTaskMock.mockReset()
     chatInputProps.current = null
     appControls.isConversationResetPending = false
     appControls.isMessageDeliveryPending = false
     appControls.filesDisabled = false
+    appControls.voiceInputEnabled = true
+    appControls.taskControlsEnabled = true
   })
 
   afterEach(() => {
@@ -266,6 +279,33 @@ describe("TaskConversationPanel", () => {
       "file-default",
       "default.txt",
     )
+  })
+
+  it("passes the transport voice capability through to ChatInput", () => {
+    const { rerender } = render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.voiceInputEnabled).toBe(true)
+
+    appControls.voiceInputEnabled = false
+    rerender(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.voiceInputEnabled).toBe(false)
+  })
+
+  it("omits task controls from ChatInput when the transport disables them", () => {
+    appControls.taskControlsEnabled = false
+
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onPause).toBeUndefined()
+    expect(chatInputProps.current?.onResume).toBeUndefined()
+  })
+
+  it("preserves task control callbacks when the transport leaves them enabled", () => {
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(chatInputProps.current?.onPause).toBe(pauseTaskMock)
+    expect(chatInputProps.current?.onResume).toBe(resumeTaskMock)
   })
 
   it("keeps the composer busy during Session reset and durable delivery", () => {

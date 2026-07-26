@@ -34,6 +34,7 @@ const app = vi.hoisted(() => ({
   },
   isConnected: false,
   filesDisabled: true,
+  voiceInputEnabled: false,
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
 }))
@@ -66,6 +67,7 @@ vi.mock("@/contexts/app-context-chat", () => ({
   useApp: () => ({
     state: app.state,
     filesDisabled: app.filesDisabled,
+    voiceInputEnabled: app.voiceInputEnabled,
     isConnected: app.isConnected,
     sendMessage: app.sendMessage,
     startNewConversation: app.startNewConversation,
@@ -190,6 +192,8 @@ describe("SessionAgentChatPage", () => {
       adoptTaskIdFromTaskInfo: true,
       history: "none",
       files: "disabled",
+      voice: "disabled",
+      taskControls: "disabled",
     })
   })
 
@@ -245,6 +249,7 @@ describe("SessionAgentChatPage", () => {
       description: "Answers schedules",
       prompts: ["Show my schedule"],
       filesDisabled: true,
+      voiceInputEnabled: false,
     }))
 
     fireEvent.click(screen.getByRole("button", { name: "start:Support Agent" }))

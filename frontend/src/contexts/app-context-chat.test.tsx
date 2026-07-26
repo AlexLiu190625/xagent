@@ -191,6 +191,12 @@ function SessionControlsProbe() {
       <div data-testid="files-disabled">
         {String(sessionControls.filesDisabled)}
       </div>
+      <div data-testid="voice-input-enabled">
+        {String(sessionControls.voiceInputEnabled)}
+      </div>
+      <div data-testid="task-controls-enabled">
+        {String(sessionControls.taskControlsEnabled)}
+      </div>
     </>
   )
 }
@@ -225,6 +231,8 @@ const makeSessionTransport = (
     adoptTaskIdFromTaskInfo: true as const,
     history: "none" as const,
     files: "disabled" as const,
+    voice: "disabled" as const,
+    taskControls: "disabled" as const,
   },
 })
 
@@ -2021,6 +2029,8 @@ describe("AppProvider websocket message routing", () => {
       </AppProvider>
     )
     expect(screen.getByTestId("files-disabled").textContent).toBe("true")
+    expect(screen.getByTestId("voice-input-enabled").textContent).toBe("false")
+    expect(screen.getByTestId("task-controls-enabled").textContent).toBe("false")
     const file = new File(["secret"], "secret.txt", { type: "text/plain" })
 
     await expect(

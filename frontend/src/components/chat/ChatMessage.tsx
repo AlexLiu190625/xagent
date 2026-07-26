@@ -316,19 +316,6 @@ export function ChatMessage({
   const isUser = role === "user";
   const [copied, setCopied] = useState(false);
 
-  const copyableContent = typeof content === "string" ? content : rawContent;
-  const filesDisabledCopyableContent = filesDisabled && copyableContent
-    ? serializeFilesDisabledValue(copyableContent)
-    : copyableContent;
-
-  const handleCopy = () => {
-    if (filesDisabledCopyableContent) {
-      navigator.clipboard.writeText(filesDisabledCopyableContent);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    }
-  };
-
   const handleAgentClick = (agentId: string, agentName: string) => {
     router.push(`/agent/${agentId}`);
   };
@@ -392,6 +379,21 @@ export function ChatMessage({
     typeof content === "string" && content.trim()
       ? content
       : errorMessage || t("common.errors.unknown");
+  const isAssistantFailure = !isUser && resolvedProcessStatus === "failed";
+  const copyableContent = isAssistantFailure
+    ? failedMessageText
+    : typeof content === "string" ? content : rawContent;
+  const displayCopyableContent = filesDisabled && copyableContent
+    ? serializeFilesDisabledValue(copyableContent)
+    : copyableContent;
+
+  const handleCopy = () => {
+    if (displayCopyableContent) {
+      navigator.clipboard.writeText(displayCopyableContent);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
 
   return (
     <div className="w-full space-y-2 animate-fade-in group">
@@ -434,9 +436,9 @@ export function ChatMessage({
 
             {/* Message content */}
             <div className={cn("flex-1 min-w-0")}>
-              {!isUser && resolvedProcessStatus === "failed" ? (
+              {isAssistantFailure ? (
                 <div className="py-3 text-sm leading-relaxed text-red-500 break-words [overflow-wrap:anywhere]">
-                  {failedMessageText}
+                  {displayCopyableContent}
                 </div>
               ) : content ? (
                 typeof content === "string" ? (

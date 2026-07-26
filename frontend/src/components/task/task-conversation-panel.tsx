@@ -194,6 +194,8 @@ export function TaskConversationPanel({
     state,
     sendMessage,
     filesDisabled,
+    voiceInputEnabled,
+    taskControlsEnabled,
     pauseTask,
     resumeTask,
     openFilePreview,
@@ -803,8 +805,8 @@ export function TaskConversationPanel({
               showModeToggle={false}
               hideConfig={hideConfig}
               taskStatus={state.currentTask?.status}
-              onPause={pauseTask}
-              onResume={resumeTask}
+              onPause={taskControlsEnabled ? pauseTask : undefined}
+              onResume={taskControlsEnabled ? resumeTask : undefined}
               taskConfig={state.currentTask ? {
                 model: state.currentTask.modelId || state.currentTask.modelName,
                 smallFastModel: state.currentTask.smallFastModelId,
@@ -814,6 +816,7 @@ export function TaskConversationPanel({
               } : undefined}
               readOnlyConfig={true}
               filesDisabled={filesDisabled}
+              voiceInputEnabled={voiceInputEnabled}
               hideFileUpload={hideFileUpload || filesDisabled}
               compact={compactInput}
               minHeightClass={compactInput ? "min-h-[44px]" : undefined}

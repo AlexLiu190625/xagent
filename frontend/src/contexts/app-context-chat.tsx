@@ -1365,6 +1365,8 @@ interface AppContextType {
   state: AppState
   dispatch: React.Dispatch<AppAction>
   filesDisabled: boolean
+  voiceInputEnabled: boolean
+  taskControlsEnabled: boolean
   sendMessage: (message: string, config?: any, files?: File[]) => Promise<void>
   executeTask: (description: string) => void
   pauseTask: () => void
@@ -1408,6 +1410,8 @@ export interface AppProviderTransportConfig {
     adoptTaskIdFromTaskInfo: true
     history: "none"
     files: "disabled"
+    voice: "disabled"
+    taskControls: "disabled"
   }
 }
 
@@ -1441,6 +1445,8 @@ export function AppProvider({
   pendingMessageRef.current = pendingMessage
   const sessionTransport = transport?.session
   const filesDisabled = sessionTransport?.files === "disabled"
+  const voiceInputEnabled = sessionTransport?.voice !== "disabled"
+  const taskControlsEnabled = sessionTransport?.taskControls !== "disabled"
   const sessionConnectionIdentity =
     sessionTransport?.connection?.identity ?? null
   const [deliveryGeneration, setDeliveryGeneration] = useState(0)
@@ -5485,6 +5491,8 @@ export function AppProvider({
         state,
         dispatch,
         filesDisabled,
+        voiceInputEnabled,
+        taskControlsEnabled,
         sendMessage,
         executeTask,
         pauseTask,

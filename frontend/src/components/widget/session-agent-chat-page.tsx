@@ -43,6 +43,7 @@ function SessionConversationContent({
   const {
     state,
     filesDisabled,
+    voiceInputEnabled,
     isConnected,
     sendMessage,
     startNewConversation,
@@ -195,6 +196,7 @@ function SessionConversationContent({
                 compactInput={true}
                 deferFileUpload={true}
                 filesDisabled={filesDisabled}
+                voiceInputEnabled={voiceInputEnabled}
                 autoFocus={true}
                 inputMinHeightClass="min-h-[44px]"
               />
@@ -236,6 +238,8 @@ export function SessionAgentChatPage() {
       adoptTaskIdFromTaskInfo: true,
       history: "none",
       files: "disabled",
+      voice: "disabled",
+      taskControls: "disabled",
     },
   }), [
     bridge.handleConnectionClose,
