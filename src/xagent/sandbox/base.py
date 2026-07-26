@@ -44,12 +44,21 @@ class SandboxAlreadyExistsError(SandboxContractError):
 
 
 class SandboxRuntimeConflictError(SandboxContractError):
-    """Raised when desired volume mounts conflict at the same host path.
+    """Raised when a sandbox's desired state conflicts with itself or with
+    what the backend actually materialized.
 
-    Two mount entries that share a host path but disagree on guest path or
-    mode cannot both be honored; the backend's internal container-creation
-    path indexes mounts by host path and would silently drop one of them, so
-    this is raised instead of allowing that silent loss.
+    Covers two distinct checks against the same ``create()`` desired spec:
+
+    - Static pre-create validation: two volume mounts that share a host path
+      but disagree on guest path or mode, or two port mappings that share a
+      guest port but disagree on host port (or vice versa). The backend's
+      internal container-creation path indexes mounts by host path and ports
+      by guest port, so it would otherwise silently drop one of them.
+    - Publish-before-verify: after the container is created and started, its
+      observed runtime facts disagree with the desired spec it was created
+      from (see ``create()``'s step 6). The container is removed and this is
+      raised rather than publishing a store record for a container that
+      isn't what was asked for.
     """
 
 
@@ -927,9 +936,11 @@ class SandboxService(abc.ABC):
         Raises:
             SandboxAlreadyExistsError: A container with this name exists.
             SandboxRuntimeConflictError: The desired volumes conflict at the
-                same host path with a different guest path or mode, or the
+                same host path with a different guest path or mode, the
                 desired ports conflict at the same guest port with a
-                different host port.
+                different host port, or the container's observed facts
+                disagreed with the desired spec at publish-before-verify
+                (step 6).
             SandboxReconcileUnsupportedError: This backend does not
                 implement spec-based reconciliation.
         """
