@@ -51,12 +51,12 @@ from xagent.web.services.chat_history_service import (
     DELIVERY_FAILED,
     DELIVERY_PENDING,
 )
-from xagent.web.services.task_execution_controller import StaleTaskRunError
 from xagent.web.services.task_command_transport import (
     ClaimedTaskCommand,
     TaskCommandKind,
     TaskCommandRejected,
 )
+from xagent.web.services.task_execution_controller import StaleTaskRunError
 from xagent.web.services.task_lease_service import (
     TaskLease,
     current_task_lease,
