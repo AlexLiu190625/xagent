@@ -2117,8 +2117,9 @@ def _check_no_conflicting_readiness_volumes(
       path or mode (the backend indexes bind mounts by host path and would
       silently drop one of them).
     - guest conflict ("guest crash"): two entries share a guest path but
-      disagree on host source (whichever bind wins container-creation
-      ordering silently shadows the other).
+      disagree on host source (Docker rejects the duplicate mount point at
+      container creation; failing here at startup surfaces the bad static
+      configuration before any task is accepted).
 
     An exactly identical triple repeated across sources (e.g. the same
     directory named twice) collapses onto itself in both directions and is
