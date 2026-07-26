@@ -5,17 +5,18 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
-from tests.web.sandbox_fakes import FakeSandboxService
+from tests.web.sandbox_fakes import FakeSandboxService, _FakeReconcileContainer
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     build_code_mount_volumes,
 )
 from xagent.sandbox.base import (
+    ResolvedSandboxRuntimeSpec,
     SandboxConfig,
     SandboxInfo,
     SandboxMountIntent,
     SandboxTemplate,
 )
-from xagent.web.sandbox_manager import SandboxManager
+from xagent.web.sandbox_manager import _SANDBOX_STOP_TIMEOUT_SECONDS, SandboxManager
 
 
 def _make_sb_info(
@@ -429,3 +430,40 @@ async def test_cleanup_handles_non_managed_sandbox(
     # Config matches (except volumes which is skipped), so just stop
     service.delete.assert_not_awaited()
     mock_box.stop.assert_awaited_once()
+
+
+class TestQuiesceReconcilingBackend:
+    """``cleanup()`` on a backend that supports spec reconciliation routes to
+    ``_quiesce`` instead of ``_legacy_cleanup``: stop every running managed
+    container, never delete or inspect any container's configuration (that
+    convergence decision belongs to the reconciliation matrix on next use,
+    not to cleanup)."""
+
+    @pytest.mark.asyncio
+    async def test_quiesce_stops_running_and_never_deletes(self) -> None:
+        service = FakeSandboxService(runtime_spec_supported=True)
+        spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="img:v1"
+        )
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="running",
+            spec=spec,
+            fingerprint_label=spec.fingerprint(),
+            version_label="1",
+        )
+        service._containers["user::2"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=spec,
+            fingerprint_label=spec.fingerprint(),
+            version_label="1",
+        )
+        service.containers = {"user::1", "user::2"}
+
+        manager = SandboxManager(service)
+
+        await manager.cleanup()
+
+        service.delete.assert_not_awaited()
+        service.stop_existing.assert_awaited_once_with(
+            "user::1", timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+        )

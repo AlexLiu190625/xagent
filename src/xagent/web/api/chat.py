@@ -1108,6 +1108,7 @@ class AgentServiceManager:
         workspace_owner_id: int,
         mount_intent: Optional[SandboxMountIntent],
         scope: Optional[ExecutionScope] = None,
+        prepare_root: Optional[str] = None,
     ) -> Any | None:
         """Get the task's sandbox lease provider, or None for local execution.
 
@@ -1115,6 +1116,11 @@ class AgentServiceManager:
         becomes ``user:{owner}:{suffix}`` — a separate container family per
         scope under the same platform user. Unscoped execution keeps
         producing ``user:{owner}`` and reuses today's containers untouched.
+
+        ``prepare_root`` (``ChatWorkspaceBinding.prepare_root``) is the
+        on-host directory that must exist for this task's own files — the
+        pre-fold mount root, which folding may have re-rooted ``mount_intent``
+        onto a shallower, shared ancestor (see ``build_chat_workspace_binding``).
 
         Capacity exhaustion, sandbox lifecycle contract violations, and
         general sandbox-service unavailability are distinct failure classes.
@@ -1179,6 +1185,7 @@ class AgentServiceManager:
                 USER_LIFECYCLE_TYPE,
                 make_user_lifecycle_id(workspace_owner_id, suffix),
                 mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
         except SandboxCapacityError as e:
             self._agent_sandbox_keys.pop(task_id, None)
@@ -1691,6 +1698,7 @@ class AgentServiceManager:
             workspace_owner_id=workspace_owner_id,
             mount_intent=workspace_binding.mount_intent,
             scope=scope,
+            prepare_root=workspace_binding.prepare_root,
         )
 
         return await create_default_tools(
@@ -2343,6 +2351,7 @@ class AgentServiceManager:
                     workspace_owner_id=workspace_owner_id,
                     mount_intent=workspace_binding.mount_intent,
                     scope=scope,
+                    prepare_root=workspace_binding.prepare_root,
                 )
 
                 tool_selection_spec = _build_tool_selection_spec_for_task(

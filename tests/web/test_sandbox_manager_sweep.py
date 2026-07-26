@@ -239,6 +239,30 @@ async def test_sweep_loop_runs_periodically_and_survives_errors(monkeypatch) -> 
 
 
 @pytest.mark.asyncio
+async def test_reconcile_route_idle_sandbox_is_swept(clock, monkeypatch) -> None:
+    """The idle sweep also reclaims containers created via the
+    spec-reconciliation route (``FakeSandboxService(runtime_spec_supported=
+    True)``), not only the legacy ``get_or_create()`` route the rest of this
+    module drives."""
+    monkeypatch.setattr(
+        sandbox_manager_module,
+        "build_code_mount_volumes",
+        lambda: [("/repo/src", "/app/src", "ro")],
+    )
+    service = FakeSandboxService(runtime_spec_supported=True)
+    manager = SandboxManager(service)
+    await manager.get_or_create_sandbox("task", "7")
+    assert "task::7" in service._containers
+
+    clock.advance(TTL + 1)
+    reclaimed = await manager.sweep_idle_sandboxes(TTL)
+
+    assert reclaimed == ["task::7"]
+    assert "task::7" in service.deleted
+    assert "task::7" not in service._containers
+
+
+@pytest.mark.asyncio
 async def test_concurrent_recreate_during_sweep_waits_for_lifecycle_lock(
     clock,
 ) -> None:

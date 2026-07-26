@@ -109,7 +109,7 @@ class TestScopedSandboxAcquisition:
 
         assert sandbox is provider
         sandbox_mgr.get_or_create_lease_provider.assert_awaited_once_with(
-            "user", "7", mount_intent=None
+            "user", "7", mount_intent=None, prepare_root=None
         )
         assert manager._agent_sandbox_keys[1] == "user:7"
 
@@ -126,7 +126,7 @@ class TestScopedSandboxAcquisition:
 
         assert sandbox is provider
         sandbox_mgr.get_or_create_lease_provider.assert_awaited_once_with(
-            "user", "7:tenant-a", mount_intent=None
+            "user", "7:tenant-a", mount_intent=None, prepare_root=None
         )
         assert manager._agent_sandbox_keys[1] == "user:7:tenant-a"
 
@@ -143,7 +143,7 @@ class TestScopedSandboxAcquisition:
         )
 
         sandbox_mgr.get_or_create_lease_provider.assert_awaited_once_with(
-            "user", "7", mount_intent=None
+            "user", "7", mount_intent=None, prepare_root=None
         )
         assert manager._agent_sandbox_keys[1] == "user:7"
 

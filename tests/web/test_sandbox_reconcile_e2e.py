@@ -1,4 +1,4 @@
-"""PR-1b stage 4: end-to-end reconciliation against a real Docker daemon.
+"""End-to-end spec reconciliation against a real Docker daemon (#296).
 
 Unlike ``test_sandbox_manager_reconcile.py`` (``FakeSandboxService``, no
 Docker), every test here drives the real ``SandboxManager`` on top of a real

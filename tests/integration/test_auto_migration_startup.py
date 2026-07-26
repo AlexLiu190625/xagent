@@ -28,6 +28,7 @@ from xagent.migrations.lancedb.backfill_user_id import (
     backfill_orphaned_embeddings,
 )
 from xagent.providers.vector_store.lancedb import get_connection_from_env
+from xagent.sandbox.base import SandboxRuntimeConflictError
 
 
 def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1151,6 +1152,100 @@ async def test_startup_event_runs_sandbox_readiness_before_cleanup_and_warmup(
         await asyncio.gather(*created_tasks)
 
     assert call_order == ["probe", "cleanup", "warmup"]
+
+
+@pytest.mark.asyncio
+async def test_startup_event_raises_on_readiness_conflict_with_probe_true(
+    monkeypatch: pytest.MonkeyPatch, temp_lancedb_dir
+):
+    """probe=True plus a genuine SANDBOX_VOLUMES/code-mount conflict must
+    fail startup outright, before cleanup()/warmup() ever run -- the actual
+    static-conflict path ``check_sandbox_static_readiness`` exists to guard,
+    not just the probe=False short-circuit the sibling test above covers."""
+    import importlib
+
+    _patch_channel_modules_disabled(monkeypatch)
+    _patch_task_command_dispatcher_disabled(monkeypatch)
+    web_app_module = importlib.import_module("xagent.web.app")
+
+    class _FakeManager:
+        async def initialize(self) -> None:
+            return None
+
+        async def list_skills(self) -> list[str]:
+            return []
+
+        async def list_templates(self) -> list[str]:
+            return []
+
+    class _FakeMemoryStoreManager:
+        def get_store_info(self) -> dict[str, object]:
+            return {
+                "is_lancedb": True,
+                "embedding_model_id": "test-model",
+                "similarity_threshold": 0.5,
+            }
+
+    call_order: list[str] = []
+
+    class _FakeSandboxManager:
+        async def _resolve_backend_probe(self) -> bool:
+            call_order.append("probe")
+            return True
+
+        async def cleanup(self) -> None:
+            call_order.append("cleanup")
+
+        async def warmup(self) -> None:
+            call_order.append("warmup")
+
+    class _FakeConn:
+        pass
+
+    monkeypatch.setenv("LANCEDB_AUTO_MIGRATE", "false")
+    # A genuine host-path conflict between SANDBOX_VOLUMES and the code
+    # mounts, same shape as test_sandbox_manager_readiness.py's
+    # test_readiness_raises_on_host_conflict.
+    monkeypatch.setenv("SANDBOX_VOLUMES", "/foo:/guest1:ro")
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.build_code_mount_volumes",
+        lambda: [("/foo", "/guest2", "ro")],
+    )
+    monkeypatch.setattr(web_app_module, "init_db", lambda: None)
+    monkeypatch.setattr(
+        web_app_module, "start_file_storage_startup_sync_task", lambda _app: None
+    )
+    monkeypatch.setattr(web_app_module, "_migration_task", None)
+    monkeypatch.setattr(
+        "xagent.skills.utils.create_skill_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.templates.utils.create_template_manager",
+        lambda: _FakeManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.dynamic_memory_store.get_memory_store_manager",
+        lambda: _FakeMemoryStoreManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.web.sandbox_manager.get_sandbox_manager",
+        lambda: _FakeSandboxManager(),
+    )
+    monkeypatch.setattr(
+        "xagent.providers.vector_store.lancedb.get_connection_from_env",
+        lambda: _FakeConn(),
+    )
+
+    async def _fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    monkeypatch.setattr(web_app_module.asyncio, "to_thread", _fake_to_thread)
+
+    with pytest.raises(SandboxRuntimeConflictError):
+        await web_app_module.startup_event()
+
+    assert call_order == ["probe"]
 
 
 @pytest.mark.asyncio

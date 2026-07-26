@@ -1,4 +1,4 @@
-"""PR-1b stage 2: the spec-reconciliation matrix in ``SandboxManager``.
+"""The spec-reconciliation matrix in ``SandboxManager`` (#296).
 
 Exercises the routing gate (``_resolve_backend_probe``), the reconciliation
 matrix cell by cell (absent / MATCH / UNVERIFIED with and without a store
@@ -12,11 +12,16 @@ end to end against the fake's small in-memory container/store model (see
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+import xagent.web.sandbox_manager as sandbox_manager_module
+import xagent.web.services.workspace_binding as workspace_binding_module
 from tests.web.sandbox_fakes import FakeSandboxService, _FakeReconcileContainer
+from xagent.core.execution_scope import ExecutionScope
 from xagent.sandbox.base import (
     ResolvedSandboxRuntimeSpec,
     SandboxAlreadyExistsError,
@@ -27,7 +32,9 @@ from xagent.sandbox.base import (
     SandboxRuntimeConflictError,
     SandboxTemplate,
 )
+from xagent.web.sandbox_keys import USER_LIFECYCLE_TYPE, make_user_lifecycle_id
 from xagent.web.sandbox_manager import SandboxManager
+from xagent.web.services.workspace_binding import build_chat_workspace_binding
 
 
 @pytest.fixture
@@ -299,7 +306,9 @@ class TestReconcileMatrixMismatch:
         )
 
         assert sandbox.name == "user::1"
-        service.stop_existing.assert_awaited_once_with("user::1")
+        service.stop_existing.assert_awaited_once_with(
+            "user::1", timeout=sandbox_manager_module._SANDBOX_STOP_TIMEOUT_SECONDS
+        )
         service.delete.assert_awaited_once_with("user::1")
         service.create.assert_awaited_once()
 
@@ -496,3 +505,95 @@ class TestWorkerReconcileDegradation:
         worker = await provider.get_worker_sandbox(0)
 
         assert worker is provider.primary_sandbox
+
+
+class TestGateCallSiteStructuralPin:
+    """Source-level pin for ``_assert_lifecycle_locked``'s runtime check:
+    ``_get_or_create_sandbox_locked`` and ``_create_lease_provider_locked``
+    may only be called from the lifecycle-locked entry points, never from
+    anywhere else. Mirrors ``tests/sandbox/test_docker_lock_infra.py``'s
+    ``TestSandboxControlSingleConstructionPoint`` pattern, but resolves each
+    call site's *enclosing method* via the AST instead of a raw substring
+    count, since both names also appear in prose inside docstrings."""
+
+    ALLOWED_CALLERS = {
+        "_get_or_create_sandbox_locked": {
+            "get_or_create_sandbox",
+            "_create_lease_provider_locked",
+        },
+        "_create_lease_provider_locked": {
+            "create_lease_provider",
+            "get_or_create_lease_provider",
+        },
+    }
+
+    def test_gate_helper_call_sites_are_structurally_pinned(self) -> None:
+        source = Path(sandbox_manager_module.__file__).read_text()
+        tree = ast.parse(source)
+        class_node = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ClassDef) and node.name == "SandboxManager"
+        )
+
+        callers: dict[str, set[str]] = {name: set() for name in self.ALLOWED_CALLERS}
+        for method in class_node.body:
+            if not isinstance(method, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            for node in ast.walk(method):
+                if (
+                    isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in self.ALLOWED_CALLERS
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "self"
+                ):
+                    callers[node.func.attr].add(method.name)
+
+        for callee, allowed in self.ALLOWED_CALLERS.items():
+            assert callers[callee] == allowed, (
+                f"{callee} must only be called from {sorted(allowed)}, "
+                f"found {sorted(callers[callee])}"
+            )
+
+
+class TestPrepareRootMkdir:
+    """``prepare_root`` (``ChatWorkspaceBinding.prepare_root``) must be the
+    on-host mkdir target on creation, not ``mount_intent.mount_root`` -- for
+    an isolate=False scoped task the two diverge: folding re-roots the
+    mount onto the shared, already-existing unscoped user root, but the
+    scope's own (deeper, not-yet-existing) subtree is where this task's
+    files actually live and must be created."""
+
+    @pytest.mark.asyncio
+    async def test_isolate_false_scoped_task_creates_scope_subtree(
+        self, _env, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setattr(
+            workspace_binding_module, "get_uploads_dir", lambda: tmp_path
+        )
+        monkeypatch.setattr(
+            workspace_binding_module, "get_external_upload_dirs", lambda: []
+        )
+        owner_id = 42
+        scope = ExecutionScope(
+            sandbox_key_suffix="tenantA", workspace_segments=("proj1",)
+        )
+        binding = build_chat_workspace_binding(owner_id, scope)
+        # The fixture this scenario relies on: folding re-roots onto the
+        # (already shared) unscoped ancestor, distinct from the scope's own
+        # subtree that must still be created on disk.
+        assert binding.prepare_root != binding.mount_intent.mount_root
+        assert not Path(binding.prepare_root).exists()
+
+        manager, _service = _make_manager()
+        lifecycle_id = make_user_lifecycle_id(owner_id, scope.sandbox_key_suffix)
+
+        await manager.get_or_create_lease_provider(
+            USER_LIFECYCLE_TYPE,
+            lifecycle_id,
+            mount_intent=binding.mount_intent,
+            prepare_root=binding.prepare_root,
+        )
+
+        assert Path(binding.prepare_root).is_dir()

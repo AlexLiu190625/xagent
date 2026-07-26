@@ -156,7 +156,9 @@ async def _run_build(manager: AgentServiceManager, task_id: int) -> _Build:
 
     fake_sandbox_manager = MagicMock()
 
-    async def _lease_provider(lifecycle_type, lifecycle_id, *, mount_intent=None):
+    async def _lease_provider(
+        lifecycle_type, lifecycle_id, *, mount_intent=None, prepare_root=None
+    ):
         build.sandbox_lifecycle = (lifecycle_type, lifecycle_id)
         build.sandbox_mount_intent = mount_intent
         return AsyncMock()
@@ -372,11 +374,19 @@ async def test_prefix_shared_mount_passes_config_equivalence_gate() -> None:
             volumes=[(str(mount_path), "/sandbox/workspace", "rw")],
         )
 
-    # Prefix mounts: independently derived from two distinct scopes, yet
-    # config-equivalent — so a second task reusing the lifecycle id is accepted.
+    # The actual fact under test: two distinct scopes (different Actor
+    # segments, eu-7 vs eu-8) independently compute the exact same mount
+    # root -- that's the shared-prefix fold, not a hand-picked identical
+    # input. Because the root is genuinely equal, the specs built from it
+    # are equal too, which is why the gate below accepts the reuse (contrast
+    # the full-segments specs, which never share a root and are rejected).
+    assert (
+        build_eu7.sandbox_mount_intent.mount_root
+        == build_eu8.sandbox_mount_intent.mount_root
+    )
     spec_eu7 = _spec_for(build_eu7.sandbox_mount_intent.mount_root)
     spec_eu8 = _spec_for(build_eu8.sandbox_mount_intent.mount_root)
-    assert SandboxManager._config_equivalent(spec_eu7, spec_eu8)
+    assert spec_eu7 == spec_eu8
     SandboxManager._ensure_config_equivalent(
         f"user::{lifecycle_id}", spec_eu7, spec_eu8
     )  # must not raise

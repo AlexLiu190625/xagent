@@ -17,6 +17,7 @@ from xagent.web.api.websocket import (
     _output_path_in_current_task_scope,
     _scope_segments_for_task,
 )
+from xagent.web.services.workspace_binding import _build_external_allowlist
 
 
 @pytest.fixture(autouse=True)
@@ -60,6 +61,46 @@ class TestAllowedExternalDirs:
         scope = ExecutionScope(isolate_external_dirs=True)
         dirs = _build_allowed_external_dirs(7, scope=scope)
         assert str(tmp_path / "user_7") in dirs
+
+
+class TestAllowedExternalDirsMatchesWorkspaceBinding:
+    """Two independent implementations of the same computation exist today:
+    ``chat._build_allowed_external_dirs`` (consumed by ``WebToolConfig``) and
+    ``workspace_binding._build_external_allowlist`` (consumed by
+    ``ChatWorkspaceBinding.policy`` and folded into the sandbox mount intent)
+    -- see the ``workspace_binding`` module docstring for why they are not
+    yet collapsed onto one. Pin them equivalent across scope shapes so a
+    change to one that silently diverges from the other is caught here
+    instead of only showing up as a runtime access-policy/mount mismatch.
+    """
+
+    @pytest.mark.parametrize(
+        "scope",
+        [
+            None,
+            ExecutionScope(workspace_segments=("tenant-a",)),
+            ExecutionScope(
+                workspace_segments=("tenant-a",), isolate_external_dirs=True
+            ),
+            ExecutionScope(isolate_external_dirs=True),
+            ExecutionScope(
+                sandbox_key_suffix="ca-1",
+                workspace_segments=("ca1", "actor7"),
+                sandbox_mount_segments=("ca1",),
+                isolate_external_dirs=True,
+            ),
+        ],
+    )
+    def test_equivalent_across_scope_shapes(self, monkeypatch, tmp_path, scope):
+        monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path))
+        # get_external_upload_dirs() only includes dirs that exist on disk.
+        external_dir = tmp_path.parent / f"{tmp_path.name}-shared-kb"
+        external_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("XAGENT_EXTERNAL_UPLOAD_DIRS", str(external_dir))
+
+        assert tuple(_build_allowed_external_dirs(7, scope=scope)) == (
+            _build_external_allowlist(7, scope)
+        )
 
 
 class TestScopeSegmentsForTask:

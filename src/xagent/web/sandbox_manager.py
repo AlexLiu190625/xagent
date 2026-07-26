@@ -45,6 +45,7 @@ from ..sandbox.base import (
     SandboxInfo,
     SandboxInspection,
     SandboxMountIntent,
+    SandboxNotFoundError,
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
     SandboxTemplate,
@@ -56,6 +57,12 @@ from .sandbox_keys import USER_LIFECYCLE_TYPE, parse_user_lifecycle_id
 logger = logging.getLogger(__name__)
 
 _WORKER_LIFECYCLE_MARKER = "::worker::"
+
+# Bound on the graceful-stop wait for a sandbox container the manager itself
+# stops (mismatch rebuild, quiesce): the same seconds budget for both call
+# sites, rather than each falling back to the backend's own (backend-specific,
+# potentially unbounded) default.
+_SANDBOX_STOP_TIMEOUT_SECONDS = 30
 
 
 class SandboxCapacityError(RuntimeError):
@@ -520,10 +527,12 @@ class SandboxManager:
         can only check that *some* task holds the lock right now, not that
         it is the caller (``asyncio.Lock`` has no owner concept), so it is a
         guard against the lock not being held at all, not a full runtime
-        proof. The structural pin is that the two callers of the functions
-        that assert this (``_get_or_create_sandbox_locked`` and
-        ``_create_lease_provider_locked``) are themselves only ever called
-        from inside a ``_lifecycle_locked`` block.
+        proof. The structural half of this contract — that
+        ``_get_or_create_sandbox_locked`` and ``_create_lease_provider_locked``
+        are themselves only ever called from inside a ``_lifecycle_locked``
+        block — is pinned at the source level by
+        ``test_sandbox_manager_reconcile.py``'s
+        ``test_gate_helper_call_sites_are_structurally_pinned``.
         """
         entry = self._lifecycle_locks.get(base_name)
         assert entry is not None and entry.lock.locked(), (
@@ -723,6 +732,8 @@ class SandboxManager:
         lifecycle_type: str,
         lifecycle_id: str,
         mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None = None,
     ) -> None:
         """Create on-host directories for a sandbox's workspace mount paths.
 
@@ -731,20 +742,35 @@ class SandboxManager:
         split as the historical base_dir(True)/allowed_external_dirs(False)
         behavior. Called explicitly right before a creation attempt (never
         on a cache hit or a plain reuse/start_existing), independent of
-        spec/volume-list construction — unlike before this spec migration,
-        this is no longer a side effect threaded through volume-list
-        building.
+        spec/volume-list construction: this is not a side effect threaded
+        through volume-list building.
+
+        ``prepare_root``, when given, overrides *only* the mount root's
+        creation target (see ``ChatWorkspaceBinding.prepare_root``): folding
+        can re-root ``mount_intent.mount_root`` onto a covering ancestor
+        shared by several scopes, but this task's own files live at the
+        deeper, pre-fold ``prepare_root`` — that is the directory that must
+        exist on disk, not necessarily the (possibly shallower) directory
+        actually bind-mounted. Extra/allowlist mounts are unaffected.
         """
         for backend_path, should_create in self._workspace_mount_paths(
             lifecycle_type, lifecycle_id, mount_intent
         ):
+            target = backend_path
+            if (
+                should_create
+                and prepare_root is not None
+                and mount_intent is not None
+                and str(backend_path) == mount_intent.mount_root
+            ):
+                target = Path(prepare_root)
             try:
-                if should_create or backend_path.exists():
-                    os.makedirs(backend_path, exist_ok=True)
+                if should_create or target.exists():
+                    os.makedirs(target, exist_ok=True)
             except OSError as exc:
                 logger.warning(
                     "Failed to prepare sandbox workspace mount %s: %s",
-                    backend_path,
+                    target,
                     exc,
                 )
 
@@ -931,6 +957,7 @@ class SandboxManager:
         lifecycle_id: str,
         *,
         mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Resolve (create/reuse/recover) the sandbox for one exact name.
 
@@ -951,6 +978,12 @@ class SandboxManager:
         full spec-reconciliation matrix when the backend supports it
         (``_reconcile_sandbox``), else the untouched legacy
         ``service.get_or_create()`` path (``_legacy_get_or_create``).
+
+        ``prepare_root``, when given, overrides the on-host mkdir target for
+        the mount root on a creation attempt (see
+        ``ChatWorkspaceBinding.prepare_root`` and ``_prepare_workspace_mounts``);
+        ``None`` keeps the historical behavior of creating
+        ``mount_intent.mount_root`` itself.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         self._assert_lifecycle_locked(base_name)
@@ -968,10 +1001,20 @@ class SandboxManager:
         probe = await self._resolve_backend_probe()
         if not probe:
             return await self._legacy_get_or_create(
-                lifecycle_type, lifecycle_id, sandbox_name, mount_intent=mount_intent
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
         return await self._reconcile_sandbox(
-            lifecycle_type, lifecycle_id, sandbox_name, base_name, desired, mount_intent
+            lifecycle_type,
+            lifecycle_id,
+            sandbox_name,
+            base_name,
+            desired,
+            mount_intent,
+            prepare_root=prepare_root,
         )
 
     async def _legacy_get_or_create(
@@ -981,6 +1024,7 @@ class SandboxManager:
         sandbox_name: str,
         *,
         mount_intent: SandboxMountIntent | None,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Untouched legacy path: adopts any existing container silently via
         ``service.get_or_create()``. Used only when
@@ -991,11 +1035,12 @@ class SandboxManager:
         ``_lifecycle_locked(base_name)`` and has already checked the spec
         cache for a hit; this only runs on that cache miss. Also acquires
         this exact name's ``_locks`` entry, mirroring the historical
-        per-name double-checked-locking structure byte for byte (now
-        provably uncontended, since the broader per-key gate the caller
-        holds already excludes any concurrent call for this same name —
-        kept anyway so this path's own structure, and ``_locks``' role in
-        it, stay exactly as they were before this migration).
+        per-name double-checked-locking structure byte for byte: the
+        broader per-key gate the caller holds already excludes any
+        concurrent call for this same name, so this inner lock is provably
+        uncontended and kept only so this path's own structure — and
+        ``_locks``' role in it — matches the legacy (non-reconciling)
+        backend byte for byte.
         """
         async with self._locks_guard:
             if sandbox_name not in self._locks:
@@ -1011,7 +1056,12 @@ class SandboxManager:
                 self._ensure_config_equivalent(sandbox_name, cached_spec, desired)
                 return self._cache[sandbox_name]
 
-            self._prepare_workspace_mounts(lifecycle_type, lifecycle_id, mount_intent)
+            self._prepare_workspace_mounts(
+                lifecycle_type,
+                lifecycle_id,
+                mount_intent,
+                prepare_root=prepare_root,
+            )
             desired = self._build_runtime_spec(
                 lifecycle_type, lifecycle_id, mount_intent=mount_intent
             )
@@ -1057,6 +1107,8 @@ class SandboxManager:
         base_name: str,
         desired: ResolvedSandboxRuntimeSpec,
         mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Reconciliation matrix entry point for one exact sandbox name.
 
@@ -1072,6 +1124,7 @@ class SandboxManager:
                 base_name,
                 desired,
                 mount_intent,
+                prepare_root=prepare_root,
                 retry_on_already_exists=True,
             )
         return await self._reconcile_existing(
@@ -1082,6 +1135,7 @@ class SandboxManager:
             desired,
             mount_intent,
             inspection,
+            prepare_root=prepare_root,
         )
 
     async def _reconcile_create(
@@ -1093,6 +1147,7 @@ class SandboxManager:
         desired: ResolvedSandboxRuntimeSpec,
         mount_intent: SandboxMountIntent | None,
         *,
+        prepare_root: str | None = None,
         retry_on_already_exists: bool,
     ) -> Sandbox:
         """Create a brand-new sandbox for the absent (or just-deleted) row.
@@ -1103,7 +1158,9 @@ class SandboxManager:
         fail-closed error — the alternative would spuriously reject a
         legitimate concurrent creator.
         """
-        self._prepare_workspace_mounts(lifecycle_type, lifecycle_id, mount_intent)
+        self._prepare_workspace_mounts(
+            lifecycle_type, lifecycle_id, mount_intent, prepare_root=prepare_root
+        )
         template, config = desired.to_backend_config()
 
         cap = get_sandbox_max_containers()
@@ -1128,6 +1185,7 @@ class SandboxManager:
                 desired,
                 mount_intent,
                 inspection,
+                prepare_root=prepare_root,
             )
 
         async with self._activity_guard:
@@ -1144,6 +1202,8 @@ class SandboxManager:
         desired: ResolvedSandboxRuntimeSpec,
         mount_intent: SandboxMountIntent | None,
         inspection: SandboxInspection,
+        *,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Dispatch on the matcher verdict plus store-row presence.
 
@@ -1161,12 +1221,28 @@ class SandboxManager:
         if verdict is SpecVerdict.MATCH:
             if stored is None:
                 await self._backfill_store_record(sandbox_name, desired, inspection)
-            return await self._reconcile_reuse(sandbox_name, desired)
+            return await self._reconcile_reuse(
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                base_name,
+                desired,
+                mount_intent,
+                prepare_root=prepare_root,
+            )
 
         if verdict is SpecVerdict.UNVERIFIED and stored is not None:
             recorded = self._spec_from_stored_info(stored)
             if recorded == desired:
-                return await self._reconcile_reuse(sandbox_name, desired)
+                return await self._reconcile_reuse(
+                    lifecycle_type,
+                    lifecycle_id,
+                    sandbox_name,
+                    base_name,
+                    desired,
+                    mount_intent,
+                    prepare_root=prepare_root,
+                )
 
         return await self._reconcile_mismatch(
             lifecycle_type,
@@ -1176,6 +1252,7 @@ class SandboxManager:
             desired,
             mount_intent,
             inspection,
+            prepare_root=prepare_root,
         )
 
     async def _backfill_store_record(
@@ -1210,21 +1287,94 @@ class SandboxManager:
             )
 
     async def _reconcile_reuse(
-        self, sandbox_name: str, desired: ResolvedSandboxRuntimeSpec
+        self,
+        lifecycle_type: str,
+        lifecycle_id: str,
+        sandbox_name: str,
+        base_name: str,
+        desired: ResolvedSandboxRuntimeSpec,
+        mount_intent: SandboxMountIntent | None,
+        *,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Publish a reused sandbox via the idempotent ``start_existing``.
 
         Works uniformly whether the container is currently running or
-        stopped. Safe against a concurrent capacity eviction targeting an
-        unrelated key: this whole call runs under the caller's
-        ``_lifecycle_locked(base_name)``, and ``_pick_eviction_victim``
-        already skips any base name whose lifecycle lock is held.
+        stopped. The publish itself runs under ``_capacity_gate`` exactly
+        like ``_reconcile_create``/``_legacy_get_or_create`` (only when a
+        cap is configured — with no cap there is no eviction to race in the
+        first place): capacity eviction's claim-then-delete of an unrelated
+        key also always runs under that same gate (see
+        ``_ensure_capacity_for``), so this reuse and that claim+delete can
+        never interleave against the sandbox service, only serialize. This
+        is the one case ``_pick_eviction_victim``'s lifecycle-lock skip does
+        not cover: this call's own ``base_name`` only starts holding
+        ``_lifecycle_locked`` once reuse is already underway, so an
+        eviction pass for a *different* key can pick this idle container as
+        its LRU victim before that lock is taken, then race this call's
+        ``start_existing`` against its own ``delete`` — the gate is what
+        forces one to fully finish before the other proceeds, instead of
+        the lock (which only protects same-key callers from each other).
+        If the evictor wins the gate first, ``start_existing`` raises
+        ``SandboxNotFoundError``; that is not surfaced to this call's
+        caller as a failure, it converges to the ordinary absent-\\>create
+        path instead, re-inspecting under the now-free gate and creating
+        the (confirmed-absent) sandbox fresh.
         """
-        sandbox = await self._service.start_existing(sandbox_name)
+        cap = get_sandbox_max_containers()
+        try:
+            if cap is None:
+                sandbox = await self._service.start_existing(sandbox_name)
+            else:
+                async with self._capacity_gate:
+                    sandbox = await self._service.start_existing(sandbox_name)
+        except SandboxNotFoundError:
+            inspection = await self._service.inspect(sandbox_name)
+            if inspection is not None:
+                return await self._reconcile_existing(
+                    lifecycle_type,
+                    lifecycle_id,
+                    sandbox_name,
+                    base_name,
+                    desired,
+                    mount_intent,
+                    inspection,
+                    prepare_root=prepare_root,
+                )
+            return await self._reconcile_create(
+                lifecycle_type,
+                lifecycle_id,
+                sandbox_name,
+                base_name,
+                desired,
+                mount_intent,
+                prepare_root=prepare_root,
+                retry_on_already_exists=True,
+            )
+
         async with self._activity_guard:
             self._cache[sandbox_name] = sandbox
             self._config_cache[sandbox_name] = desired
         return sandbox
+
+    async def _reject_if_now_active(self, base_name: str, sandbox_name: str) -> None:
+        """Re-validate the ref-count immediately before a destructive step.
+
+        ``_lifecycle_locked`` only excludes a concurrent *reconcile* for
+        this base name; ``attach``/``attach_provider`` never wait for it
+        (only ``_activity_guard``, see the class docstring), so a caller
+        holding an already-cached lease provider for this base name can
+        attach a new task while a mismatch rebuild is mid-flight here.
+        Re-reading right before each destructive action — not only once at
+        this function's entry — is what actually closes that window.
+        """
+        activity = self._activity.get(base_name)
+        if activity is not None and activity.ref_count > 0:
+            raise SandboxRuntimeConflictError(
+                f"Sandbox {sandbox_name!r} became active while a mismatch "
+                f"rebuild was in flight (lifecycle {base_name!r}); "
+                "rejecting instead of tearing down an in-use sandbox."
+            )
 
     async def _reconcile_mismatch(
         self,
@@ -1235,6 +1385,8 @@ class SandboxManager:
         desired: ResolvedSandboxRuntimeSpec,
         mount_intent: SandboxMountIntent | None,
         inspection: SandboxInspection,
+        *,
+        prepare_root: str | None = None,
     ) -> Sandbox:
         """Handle a MISMATCH verdict (or an UNVERIFIED verdict that a
         store-record comparison could not reconcile).
@@ -1245,20 +1397,17 @@ class SandboxManager:
         mismatch is stopped first (idempotent no-op if already stopped by
         the time this runs) and, once genuinely stopped, converges exactly
         like a stopped mismatch — delete + create, gated by the per-key
-        reconcile rebuild budget.
+        reconcile rebuild budget. The ref-count is re-read (see
+        ``_reject_if_now_active``) immediately before each destructive step,
+        not only here at entry, since attach can land in between.
         """
-        activity = self._activity.get(base_name)
-        if activity is not None and activity.ref_count > 0:
-            raise SandboxRuntimeConflictError(
-                f"Sandbox {sandbox_name!r} runtime configuration has drifted "
-                f"from the desired spec while still in use (lifecycle "
-                f"{base_name!r}); rejecting the new caller instead of "
-                "tearing down an in-use sandbox."
-            )
+        await self._reject_if_now_active(base_name, sandbox_name)
 
         if inspection.state == "running":
             try:
-                await self._service.stop_existing(sandbox_name)
+                await self._service.stop_existing(
+                    sandbox_name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+                )
             except Exception as exc:
                 raise SandboxRecoveryRequiredError(
                     f"Failed to stop mismatched sandbox {sandbox_name!r} for "
@@ -1286,6 +1435,7 @@ class SandboxManager:
             )
         self._reconcile_budget[base_name] = budget - 1
 
+        await self._reject_if_now_active(base_name, sandbox_name)
         await self._reconcile_delete(sandbox_name)
         return await self._reconcile_create(
             lifecycle_type,
@@ -1294,6 +1444,7 @@ class SandboxManager:
             base_name,
             desired,
             mount_intent,
+            prepare_root=prepare_root,
             retry_on_already_exists=True,
         )
 
@@ -1313,11 +1464,16 @@ class SandboxManager:
             await self._service.delete(sandbox_name)
             logger.debug("Sandbox deleted for rebuild: %s", sandbox_name)
         finally:
-            async with self._activity_guard:
-                self._cache.pop(sandbox_name, None)
-                self._config_cache.pop(sandbox_name, None)
-                self._lease_providers.pop(sandbox_name, None)
-                self._activity.pop(sandbox_name, None)
+            # Plain synchronous pops on purpose, same as
+            # ``_delete_sandbox_names``: each is a single dict operation with
+            # no compound invariant, and awaiting ``_activity_guard`` inside
+            # ``finally`` would risk skipping the eviction entirely if the
+            # task were cancelled at that await point (see the class
+            # docstring's ``_activity_guard`` rule).
+            self._cache.pop(sandbox_name, None)
+            self._config_cache.pop(sandbox_name, None)
+            self._lease_providers.pop(sandbox_name, None)
+            self._activity.pop(sandbox_name, None)
 
     async def create_lease_provider(
         self,
@@ -1346,6 +1502,7 @@ class SandboxManager:
         lifecycle_id: str,
         *,
         mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
     ) -> SandboxLeaseProvider:
         """Unlocked internal builder for a lease provider.
 
@@ -1358,6 +1515,7 @@ class SandboxManager:
             lifecycle_type,
             lifecycle_id,
             mount_intent=mount_intent,
+            prepare_root=prepare_root,
         )
         return SandboxLeaseProvider(
             manager=self,
@@ -1533,6 +1691,7 @@ class SandboxManager:
         lifecycle_id: str,
         *,
         mount_intent: SandboxMountIntent | None = None,
+        prepare_root: str | None = None,
     ) -> SandboxLeaseProvider:
         """Get the cached lease provider for a lifecycle key or create one.
 
@@ -1541,6 +1700,11 @@ class SandboxManager:
         workers are still being deleted. Holds ``_lifecycle_locked`` exactly
         once for the whole check-then-create sequence; the internal builder
         it calls on a cache miss takes no lock of its own.
+
+        ``prepare_root``, when given, is only consulted on that cache miss
+        (a fresh creation attempt) — see ``ChatWorkspaceBinding.prepare_root``
+        and ``_prepare_workspace_mounts``; a cache hit never creates
+        directories at all.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._lifecycle_locked(base_name):
@@ -1554,6 +1718,7 @@ class SandboxManager:
                 lifecycle_type,
                 lifecycle_id,
                 mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
 
             async with self._activity_guard:
@@ -1799,7 +1964,9 @@ class SandboxManager:
             if sb.state != "running":
                 continue
             try:
-                await self._service.stop_existing(sb.name)
+                await self._service.stop_existing(
+                    sb.name, timeout=_SANDBOX_STOP_TIMEOUT_SECONDS
+                )
                 logger.debug(f"Stopped sandbox: {sb.name}")
             except Exception as exc:
                 logger.error(f"Failed to stop sandbox {sb.name} during quiesce: {exc}")
@@ -1819,8 +1986,8 @@ class SandboxManager:
         with the correct settings next time.
 
         Used only when the backend does not support spec reconciliation
-        (Boxlite today) — unchanged from before this migration aside from
-        the ``mount_intent`` rename.
+        (Boxlite today): config-diff delete-guessing, as opposed to
+        ``_quiesce``'s stop-only behavior for backends that do.
 
         Note:
             If ``get_uploads_dir()`` (via ``XAGENT_UPLOADS_DIR`` env var) changes

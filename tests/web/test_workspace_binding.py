@@ -1,12 +1,13 @@
-"""Golden tests for the chat workspace projection split (PR-1b stage 1).
+"""Golden tests for the chat workspace projection (#296).
 
-``build_chat_workspace_binding`` is the single builder both of chat.py's
-inline ``sandbox_workspace_config`` dicts will collapse onto in a later
-stage; this stage only builds and pins it against a frozen reimplementation
-of *today's* computation (chat.py's ``_build_allowed_external_dirs`` +
-inline ``sandbox_workspace_config`` dicts, and
+``build_chat_workspace_binding`` is the sandbox mount intent's builder,
+called from ``chat.py``. This module pins its ``mount_intent``/
+``prepare_root`` output against a frozen reimplementation of the pre-folding
+physical mount set (chat's ``_build_allowed_external_dirs`` +
 ``SandboxManager._workspace_mount_paths``'s "mount base_dir + every
-allowed_external_dirs entry, deduplicated only by exact string" behavior).
+allowed_external_dirs entry, deduplicated only by exact string" behavior),
+so the folding this module applies stays a pinned, deliberate reduction of
+that raw set rather than a silent behavior drift.
 
 Six-row physical-set matrix (unscoped / scoped isolate=False / external CA
 scoped / internal scoped / two known-limitation shapes), plus an Actor-path

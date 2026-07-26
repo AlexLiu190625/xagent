@@ -141,7 +141,17 @@ class FakeSandboxService(SandboxService):
         return [
             SandboxInfo(
                 name=name,
-                state="stopped",
+                # Reconciliation-lifecycle containers (populated via
+                # create()/_start_existing_impl/_stop_existing_impl) report
+                # their real, current state; legacy-route names never
+                # tracked in ``_containers`` keep the historical "stopped"
+                # stub, since the legacy tests that rely on this fake never
+                # touch real container state either.
+                state=(
+                    self._containers[name].state
+                    if name in self._containers
+                    else "stopped"
+                ),
                 template=SandboxTemplate(type="image", image="img:v1"),
                 config=SandboxConfig(),
             )

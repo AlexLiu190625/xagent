@@ -1,21 +1,24 @@
 """Chat workspace binding: Actor-logical access policy + CA-physical mount intent.
 
-``chat.py`` currently builds two identical inline dicts (task creation and
-agent reconstruction) that conflate two different concerns under one
-``workspace_config`` mapping:
+Two different concerns share one conceptual workspace root, and this module
+is the single construction point for both:
 
 - what file tools are allowed to read/write (the *Actor*-logical view: the
   full workspace root under all ``ExecutionScope.workspace_segments``, plus
-  the external directory allowlist -- today's ``_build_allowed_external_dirs``
-  / ``WebToolConfig.workspace_config``);
+  the external directory allowlist -- ``WorkspaceAccessPolicy``, mirrored by
+  ``chat._build_allowed_external_dirs`` / ``WebToolConfig.workspace_config``,
+  which ``chat.py`` still builds independently rather than consuming
+  ``ChatWorkspaceBinding.policy`` directly; the two are pinned equivalent by
+  test, see ``tests/web/test_execution_scope_workspace_web.py``);
 - what the sandbox container actually gets bind-mounted (the *CA*-physical
-  view: one mount root plus any genuinely separate extra mounts).
+  view: one mount root plus any genuinely separate extra mounts --
+  ``ChatWorkspaceBinding.mount_intent``, which ``chat.py`` does consume
+  directly when creating/reusing the task's sandbox).
 
-:func:`build_chat_workspace_binding` is the single construction point for
-both. It returns the Actor policy untouched, and folds the CA mount
-candidates (the computed mount root plus every allowlist entry) through
-``SandboxMountIntent``'s covered/covering/disjoint classification so a
-redundant nested mount never becomes a second bind:
+:func:`build_chat_workspace_binding` returns the Actor policy untouched, and
+folds the CA mount candidates (the computed mount root plus every allowlist
+entry) through ``SandboxMountIntent``'s covered/covering/disjoint
+classification so a redundant nested mount never becomes a second bind:
 
 - an allowlist entry the mount root already covers (equal to or a
   descendant of it) is dropped -- nothing is lost, the root's bind already
@@ -30,13 +33,9 @@ dirs and narrows the mount to a prefix of ``workspace_segments`` (the
 per-Actor scopes), the Actor's own subtree is *covered by* the CA mount root
 and is dropped rather than surfacing as a second, Actor-specific bind. Two
 Actors under the same CA then compute byte-identical mount intents and can
-share one container -- keeping the Actor subtree as a separate bind (today's
-behavior) makes their desired configs diverge and is the root cause this
-projection exists to remove.
-
-Nothing in this module is wired into ``chat.py`` or the sandbox manager yet
-(follow-up stage); this stage only builds the projection and pins its
-behavior against today's inline computation.
+share one container -- keeping the Actor subtree as a separate bind would
+make their desired configs diverge and is the root cause (#296) this
+projection removes.
 """
 
 from __future__ import annotations
@@ -163,9 +162,9 @@ def build_chat_workspace_binding(
 ) -> ChatWorkspaceBinding:
     """Build the Actor-logical policy and CA-physical mount intent for a task.
 
-    Intended as the single construction point both ``chat.py`` inline
-    ``sandbox_workspace_config`` dicts collapse onto in a follow-up stage;
-    this stage only builds and pins it, nothing calls it yet.
+    Called from ``chat.py`` (task creation and agent reconstruction alike)
+    to build ``mount_intent`` for the task's sandbox lease provider; see the
+    module docstring for why ``.policy`` is not yet consumed the same way.
     """
     workspace_segments = scope.workspace_segments if scope is not None else ()
     mount_segments = scope.effective_mount_segments if scope is not None else ()
