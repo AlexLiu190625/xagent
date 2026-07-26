@@ -354,30 +354,53 @@ def _build_inspection(container: Container) -> SandboxInspection:
 def _check_no_conflicting_volumes(
     volumes: Optional[list[tuple[str, str, str]]],
 ) -> None:
-    """Reject desired volumes that share a host path but disagree downstream.
+    """Reject desired volumes that collide on either side of the mount.
 
-    ``_create_container`` builds its Docker ``volumes`` dict keyed by host
-    path, so two entries with the same host path but a different guest path
-    or mode would silently drop one of them. Exactly identical triples
-    (duplicates) are accepted and simply collapse; this only rejects a real
-    disagreement, canonicalizing paths first (via
-    ``canonical_sandbox_path``, the same owner the desired spec uses) so
-    equivalent-but-differently-spelled host paths are treated as the same
-    key.
+    Two failure modes share this check, the same way
+    ``_check_no_conflicting_ports`` covers both sides of a port mapping:
+
+    - Host-side: ``_create_container`` builds its Docker ``volumes`` dict
+      keyed by host path, so two entries with the same host path but a
+      different guest path or mode would silently drop one of them — a dict
+      collapsing entries with no error.
+    - Guest-side: two entries with different host sources on the same guest
+      path pass straight through to Docker, which rejects the pair at
+      container *create* time with a raw ``APIError``/400
+      ``Duplicate mount point``.
+
+    Both become the same pre-create, typed ``SandboxRuntimeConflictError``
+    instead of surfacing later as a silent drop or a raw daemon error.
+    Exactly identical triples (duplicates) are accepted and simply
+    collapse; this only rejects a real disagreement, canonicalizing paths
+    first (via ``canonical_sandbox_path``, the same owner the desired spec
+    uses) so equivalent-but-differently-spelled paths are treated as the
+    same key on both sides.
     """
     if not volumes:
         return
-    seen: dict[str, tuple[str, str]] = {}
+    seen_by_host: dict[str, tuple[str, str]] = {}
+    seen_by_guest: dict[str, tuple[str, str]] = {}
     for host_path, guest_path, mode in volumes:
-        key = (canonical_sandbox_path(guest_path), mode)
         normalized_host = canonical_sandbox_path(host_path)
-        prior = seen.get(normalized_host)
-        if prior is not None and prior != key:
+        normalized_guest = canonical_sandbox_path(guest_path)
+
+        host_key = (normalized_guest, mode)
+        prior_for_host = seen_by_host.get(normalized_host)
+        if prior_for_host is not None and prior_for_host != host_key:
             raise SandboxRuntimeConflictError(
                 f"Conflicting desired volume mounts for host path "
-                f"{normalized_host!r}: {prior} vs {key}"
+                f"{normalized_host!r}: {prior_for_host} vs {host_key}"
             )
-        seen[normalized_host] = key
+        seen_by_host[normalized_host] = host_key
+
+        guest_key = (normalized_host, mode)
+        prior_for_guest = seen_by_guest.get(normalized_guest)
+        if prior_for_guest is not None and prior_for_guest != guest_key:
+            raise SandboxRuntimeConflictError(
+                f"Conflicting desired volume mounts for guest path "
+                f"{normalized_guest!r}: {prior_for_guest} vs {guest_key}"
+            )
+        seen_by_guest[normalized_guest] = guest_key
 
 
 def _check_no_conflicting_ports(

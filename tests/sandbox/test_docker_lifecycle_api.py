@@ -168,12 +168,31 @@ class TestCheckNoConflictingPorts:
 
 
 class TestCheckNoConflictingVolumes:
+    """Pin both directions of _check_no_conflicting_volumes: a host-side
+    collision (silently dropped by _create_container's host-keyed dict) and a
+    guest-side collision (only ever caught by Docker at container create, as
+    a raw 400 'Duplicate mount point')."""
+
     def test_rejects_host_path_spelled_with_a_leading_double_slash(self):
         # Docker collapses the leading slash run, so both entries land on the
         # same host key and one guest path would be silently dropped.
         with pytest.raises(SandboxRuntimeConflictError, match="host path"):
             docker_sandbox_module._check_no_conflicting_volumes(
                 [("//data", "/guest/a", "rw"), ("/data", "/guest/b", "rw")]
+            )
+
+    def test_rejects_same_guest_path_for_different_host_sources(self):
+        with pytest.raises(SandboxRuntimeConflictError, match="guest path"):
+            docker_sandbox_module._check_no_conflicting_volumes(
+                [("/data/a", "/guest", "rw"), ("/data/b", "/guest", "rw")]
+            )
+
+    def test_rejects_guest_path_spelled_with_a_leading_double_slash(self):
+        # One mount point to the backend, so canonicalization has to file both
+        # entries under the same guest key for the conflict to be caught.
+        with pytest.raises(SandboxRuntimeConflictError, match="guest path"):
+            docker_sandbox_module._check_no_conflicting_volumes(
+                [("/data/a", "//guest", "rw"), ("/data/b", "/guest", "rw")]
             )
 
     def test_accepts_duplicate_triples_spelled_differently(self):
