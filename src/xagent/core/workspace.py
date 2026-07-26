@@ -1510,6 +1510,10 @@ class TaskWorkspace:
 
             if changed_files:
                 ordered_files = tuple(sorted(changed_files, key=str))
+                # Each file owns its metadata transaction and compensation so
+                # one failed artifact cannot roll back unrelated outputs. This
+                # deliberately trades batch Session/commit efficiency for
+                # per-file failure isolation.
                 for file_path in ordered_files:
                     try:
                         file_id = self.register_file(

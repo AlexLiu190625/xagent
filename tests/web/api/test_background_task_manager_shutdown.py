@@ -185,7 +185,7 @@ async def test_start_accepting_reopens_only_an_idle_manager() -> None:
 
 
 @pytest.mark.asyncio
-async def test_cleanup_child_can_release_completed_owner_registration() -> None:
+async def test_cleanup_child_can_release_pending_owner_registration() -> None:
     manager = BackgroundTaskManager()
     allow_owner_to_finish = asyncio.Event()
 
@@ -197,16 +197,18 @@ async def test_cleanup_child_can_release_completed_owner_registration() -> None:
     assert manager.reserve_resume(7)
     manager.register_reserved_resume(7, owner_task)
 
-    allow_owner_to_finish.set()
-    await owner_task
-
     async def cleanup_child() -> None:
         manager.cleanup_task(7, expected_task=owner_task)
 
-    await asyncio.create_task(cleanup_child())
+    try:
+        await asyncio.create_task(cleanup_child())
 
-    assert manager.running_tasks == {}
-    assert manager.resume_tasks == {}
+        assert not owner_task.done()
+        assert manager.running_tasks == {}
+        assert manager.resume_tasks == {}
+    finally:
+        allow_owner_to_finish.set()
+        await owner_task
     manager.start_accepting()
 
 

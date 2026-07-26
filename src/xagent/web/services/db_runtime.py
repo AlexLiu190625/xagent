@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Callable, TypeVar
+from contextlib import contextmanager
+from typing import Callable, Iterator, TypeVar
 
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
@@ -54,6 +55,28 @@ async def await_task_settlement(
                 raise cancellation from task_error
             raise
         return result, cancellation
+
+
+@contextmanager
+def propagate_deferred_cancellation(
+    cancellation: asyncio.CancelledError | None,
+) -> Iterator[None]:
+    """Restore captured caller cancellation on every scope exit.
+
+    Resource owners may need to finish durable work and best-effort follow-up
+    after :func:`await_task_settlement` records cancellation. Once that work
+    starts, neither an early return nor a later exception may silently replace
+    the caller's cancellation.
+    """
+
+    try:
+        yield
+    except BaseException as error:
+        if cancellation is not None:
+            raise cancellation from error
+        raise
+    if cancellation is not None:
+        raise cancellation
 
 
 async def run_db_io_cancellation_safe(operation: Callable[[], _T]) -> _T:

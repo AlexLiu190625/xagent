@@ -87,6 +87,7 @@ from ..services.db_runtime import (
     cancel_and_drain_async_task,
     drain_async_task_cancellation_safe,
     is_database_pool_timeout,
+    propagate_deferred_cancellation,
     run_db_io_cancellation_safe,
 )
 from ..services.file_reference_output_service import (
@@ -2364,7 +2365,6 @@ async def execute_task_background(
     from ..services.task_setup_snapshot import load_task_setup_snapshot_sync
 
     terminal_state_committed = False
-    finalization_cancellation: asyncio.CancelledError | None = None
     try:
         if resolved_execution_scope is EXECUTION_SCOPE_NOT_PROVIDED:
             execution_scope = await run_db_io_cancellation_safe(
@@ -2485,90 +2485,87 @@ async def execute_task_background(
         finalized, finalization_cancellation = await await_task_settlement(
             finalization_worker
         )
-        if finalized.late_result:
-            if finalization_cancellation is not None:
-                raise finalization_cancellation
-            return
+        with propagate_deferred_cancellation(finalization_cancellation):
+            if finalized.late_result:
+                return
 
-        normalized_outputs = finalized.normalized_outputs
-        if normalized_outputs:
-            result["file_outputs"] = normalized_outputs
-        ai_response = finalized.ai_response
-        chat_response = finalized.chat_response
-        waiting_for_control = finalized.waiting_for_control
-        terminal_state_committed = finalized.terminal_state_committed
-        final_control_snapshot = finalized.final_control_snapshot
-        final_task_status = finalized.final_task_status
-        broadcast_meta = finalized.broadcast_meta
-        broadcast_agent_meta = {
-            "agent_id": snapshot.task.agent_id,
-            "agent_name": snapshot.agent.name if snapshot.agent is not None else None,
-            "agent_logo_url": None,
-        }
+            normalized_outputs = finalized.normalized_outputs
+            if normalized_outputs:
+                result["file_outputs"] = normalized_outputs
+            ai_response = finalized.ai_response
+            chat_response = finalized.chat_response
+            waiting_for_control = finalized.waiting_for_control
+            terminal_state_committed = finalized.terminal_state_committed
+            final_control_snapshot = finalized.final_control_snapshot
+            final_task_status = finalized.final_task_status
+            broadcast_meta = finalized.broadcast_meta
+            broadcast_agent_meta = {
+                "agent_id": snapshot.task.agent_id,
+                "agent_name": (
+                    snapshot.agent.name if snapshot.agent is not None else None
+                ),
+                "agent_logo_url": None,
+            }
 
-        # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
+            # Note: trace_task_completion is handled by the agent execution logic (e.g., dag_plan_execute.py)
 
-        control_event_state = (
-            final_control_snapshot.as_dict()
-            if final_control_snapshot is not None
-            else {}
-        )
+            control_event_state = (
+                final_control_snapshot.as_dict()
+                if final_control_snapshot is not None
+                else {}
+            )
 
-        if waiting_for_control:
-            await manager.broadcast_to_task(
-                create_stream_event(
-                    "task_info",
+            if waiting_for_control:
+                await manager.broadcast_to_task(
+                    create_stream_event(
+                        "task_info",
+                        task_id,
+                        {
+                            "id": broadcast_meta["id"],
+                            "title": broadcast_meta["title"],
+                            "description": broadcast_meta["description"],
+                            "status": final_task_status,
+                            "execution_mode": broadcast_meta["execution_mode"],
+                            "agent_id": broadcast_agent_meta["agent_id"],
+                            "agent_name": broadcast_agent_meta["agent_name"],
+                            "agent_logo_url": broadcast_agent_meta["agent_logo_url"],
+                            **control_event_state,
+                        },
+                        broadcast_meta["updated_at"] or None,
+                    ),
                     task_id,
-                    {
+                )
+                logger.info(f"Background task {task_id} paused for v2 control")
+                return
+
+            # Send task completion event (includes agent response info)
+            await manager.broadcast_to_task(
+                {
+                    "type": "task_completed",
+                    "task": {
                         "id": broadcast_meta["id"],
                         "title": broadcast_meta["title"],
-                        "description": broadcast_meta["description"],
                         "status": final_task_status,
-                        "execution_mode": broadcast_meta["execution_mode"],
-                        "agent_id": broadcast_agent_meta["agent_id"],
-                        "agent_name": broadcast_agent_meta["agent_name"],
-                        "agent_logo_url": broadcast_agent_meta["agent_logo_url"],
-                        **control_event_state,
+                        "description": broadcast_meta["description"],
                     },
-                    broadcast_meta["updated_at"] or None,
-                ),
+                    "result": ai_response,
+                    "output": ai_response,
+                    "file_outputs": normalized_outputs,
+                    "success": result.get("success", False),
+                    # Machine-readable failure classification (e.g. "quota_exceeded")
+                    # plus its structured details, so the client can localise and
+                    # branch instead of parsing the message. Absent for normal turns.
+                    "error_code": result.get("error_code"),
+                    "error_details": result.get("error_details"),
+                    **control_event_state,
+                    "chat_response": chat_response
+                    if isinstance(chat_response, dict)
+                    else None,
+                    "timestamp": datetime.now(timezone.utc).timestamp(),
+                },
                 task_id,
             )
-            logger.info(f"Background task {task_id} paused for v2 control")
-            if finalization_cancellation is not None:
-                raise finalization_cancellation
-            return
-
-        # Send task completion event (includes agent response info)
-        await manager.broadcast_to_task(
-            {
-                "type": "task_completed",
-                "task": {
-                    "id": broadcast_meta["id"],
-                    "title": broadcast_meta["title"],
-                    "status": final_task_status,
-                    "description": broadcast_meta["description"],
-                },
-                "result": ai_response,
-                "output": ai_response,
-                "file_outputs": normalized_outputs,
-                "success": result.get("success", False),
-                # Machine-readable failure classification (e.g. "quota_exceeded")
-                # plus its structured details, so the client can localise and
-                # branch instead of parsing the message. Absent for normal turns.
-                "error_code": result.get("error_code"),
-                "error_details": result.get("error_details"),
-                **control_event_state,
-                "chat_response": chat_response
-                if isinstance(chat_response, dict)
-                else None,
-                "timestamp": datetime.now(timezone.utc).timestamp(),
-            },
-            task_id,
-        )
-        logger.info(f"Background task {task_id} execution completed")
-        if finalization_cancellation is not None:
-            raise finalization_cancellation
+            logger.info(f"Background task {task_id} execution completed")
 
     except Exception as e:
         # The outer try also spans the post-terminal steps -- assistant
@@ -2580,15 +2577,6 @@ async def execute_task_background(
         # execution failure. Otherwise a failed post-completion broadcast
         # would rewrite an already-COMPLETED task as FAILED and store the
         # broadcast error as the task's failure cause.
-        if finalization_cancellation is not None and terminal_state_committed:
-            logger.warning(
-                "Background task %s terminal result was committed but its "
-                "notification failed during cancellation: %s",
-                task_id,
-                e,
-                exc_info=True,
-            )
-            raise finalization_cancellation from e
         if task_lease is not None:
             if terminal_state_committed:
                 logger.warning(
