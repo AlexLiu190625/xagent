@@ -4,9 +4,11 @@ import { getApiUrl } from "@/lib/utils"
 import {
   AUTH_CACHE_KEY,
   AUTH_TOKEN_UPDATED_EVENT,
+  AuthSessionSnapshot,
   clearStoredAuth,
-  LEGACY_AUTH_TOKEN_KEY,
+  isAuthSessionCurrent,
   readAuthCache,
+  readAuthSessionSnapshot,
   writeAuthCache,
 } from "@/lib/auth-cache"
 
@@ -14,7 +16,7 @@ const AUTH_REFRESH_LOCK_NAME = "xagent-auth-refresh"
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
 
 export type AuthRefreshResult =
-  | { accessToken: string }
+  | { accessToken: string; session: AuthSessionSnapshot }
   | { accessToken: null; rejected: boolean }
 
 const refreshPromises = new Map<string, Promise<AuthRefreshResult>>()
@@ -77,30 +79,6 @@ async function fetchWithRetry(
   throw lastError || new Error('All retry attempts failed')
 }
 
-// Get current tokens
-function getCurrentTokens(): {
-  accessToken: string | null
-  refreshToken: string | null
-  userId: string | null
-} {
-  // Try new cache format first
-  const authCache = readAuthCache()
-  if (authCache) {
-    return {
-      accessToken: authCache.token || null,
-      refreshToken: authCache.refreshToken || null,
-      userId: authCache.user?.id ? String(authCache.user.id) : null,
-    }
-  }
-
-  // Fall back to old format
-  return {
-    accessToken: localStorage.getItem(LEGACY_AUTH_TOKEN_KEY),
-    refreshToken: null,
-    userId: null,
-  }
-}
-
 async function withAuthRefreshLock<T>(callback: () => Promise<T>): Promise<T> {
   if (typeof navigator !== "undefined" && navigator.locks) {
     return navigator.locks.request(AUTH_REFRESH_LOCK_NAME, callback)
@@ -117,25 +95,14 @@ function dispatchAuthTokenUpdated() {
 }
 
 async function performTokenRefresh(
-  expectedAccessToken: string | null,
-  expectedUserId: string | null
+  session: AuthSessionSnapshot
 ): Promise<AuthRefreshResult> {
   return withAuthRefreshLock(async () => {
-    // Another tab may have refreshed while this tab waited for the lock. Reuse
-    // that token instead of rotating its newly-issued refresh token again.
-    const currentTokens = getCurrentTokens()
-    if (currentTokens.userId !== expectedUserId) {
+    if (!isAuthSessionCurrent(session)) {
       return { accessToken: null, rejected: false }
     }
 
-    if (
-      currentTokens.accessToken &&
-      currentTokens.accessToken !== expectedAccessToken
-    ) {
-      return { accessToken: currentTokens.accessToken }
-    }
-
-    if (!currentTokens.refreshToken) {
+    if (!session.refreshToken) {
       return { accessToken: null, rejected: true }
     }
 
@@ -151,9 +118,13 @@ async function performTokenRefresh(
         headers: {
           "Content-Type": "application/json",
         },
-        body: JSON.stringify({ refresh_token: currentTokens.refreshToken }),
+        body: JSON.stringify({ refresh_token: session.refreshToken }),
         signal: abortController.signal,
       })
+
+      if (!isAuthSessionCurrent(session)) {
+        return { accessToken: null, rejected: false }
+      }
 
       if (!response.ok) {
         return {
@@ -163,47 +134,29 @@ async function performTokenRefresh(
       }
 
       const data = await response.json()
+      if (!isAuthSessionCurrent(session)) {
+        return { accessToken: null, rejected: false }
+      }
       if (!data.success || !data.access_token) {
         return { accessToken: null, rejected: true }
       }
 
       const authCache = readAuthCache()
-      if (!authCache) {
-        // The session was cleared while refresh was in flight. Do not let an
-        // older response recreate credentials after logout.
-        return { accessToken: null, rejected: true }
-      }
-
-      const authCacheUserId = authCache.user?.id
-        ? String(authCache.user.id)
-        : null
-      if (authCacheUserId !== expectedUserId) {
-        // A different user replaced the session while this request was in
-        // flight. Do not replay the original request with that user's token.
+      if (!authCache || !isAuthSessionCurrent(session)) {
         return { accessToken: null, rejected: false }
-      }
-
-      if (
-        authCache.refreshToken &&
-        authCache.refreshToken !== currentTokens.refreshToken
-      ) {
-        // A login may replace the session while an older refresh request is in
-        // flight. Never overwrite that newer session with the old response.
-        return authCache.token
-          ? { accessToken: authCache.token }
-          : { accessToken: null, rejected: true }
       }
 
       writeAuthCache(
         authCache.user,
         data.access_token,
-        data.refresh_token || authCache.refreshToken,
+        data.refresh_token || session.refreshToken,
         data.expires_in ? data.expires_in : undefined,
         data.refresh_expires_in ? data.refresh_expires_in : undefined
       )
 
+      const refreshedSession = readAuthSessionSnapshot()
       dispatchAuthTokenUpdated()
-      return { accessToken: data.access_token }
+      return { accessToken: data.access_token, session: refreshedSession }
     } catch (error) {
       console.error("Token refresh failed:", error)
       return { accessToken: null, rejected: false }
@@ -217,24 +170,30 @@ export function refreshStoredAccessToken(
   expectedAccessToken?: string | null,
   expectedUserId?: string | number | null
 ): Promise<AuthRefreshResult> {
-  const currentTokens = getCurrentTokens()
+  const session = readAuthSessionSnapshot()
   const requestedAccessToken = expectedAccessToken === undefined
-    ? currentTokens.accessToken
+    ? session.accessToken
     : expectedAccessToken
   const requestedUserId = expectedUserId === undefined
-    ? currentTokens.userId
+    ? session.userId
     : expectedUserId === null
       ? null
       : String(expectedUserId)
-  const refreshKey = `${requestedUserId}::${requestedAccessToken}`
+  if (
+    requestedAccessToken !== session.accessToken ||
+    requestedUserId !== session.userId
+  ) {
+    return Promise.resolve({ accessToken: null, rejected: false })
+  }
+
+  const refreshKey = `${session.userId}::${session.accessToken}::${session.refreshToken}`
   const pendingRefresh = refreshPromises.get(refreshKey)
   if (pendingRefresh) {
     return pendingRefresh
   }
 
   const refreshPromise = performTokenRefresh(
-    requestedAccessToken,
-    requestedUserId
+    session
   ).finally(() => {
     refreshPromises.delete(refreshKey)
   })
@@ -247,7 +206,8 @@ export async function apiRequest(
   url: string,
   options: RequestInit = {}
 ): Promise<Response> {
-  const { accessToken, userId } = getCurrentTokens()
+  const session = readAuthSessionSnapshot()
+  const { accessToken, userId } = session
 
   // If no token, request directly
   if (!accessToken) {
@@ -263,6 +223,10 @@ export async function apiRequest(
   // Fetch request with retry mechanism
   let response = await fetchWithRetry(url, { ...options, headers })
 
+  if (!isAuthSessionCurrent(session)) {
+    return response
+  }
+
   // If 401 error and not a refresh request, try to refresh token
   if (response.status === 401 && !shouldSkipRefresh(url)) {
     // Check if token is expired or invalid
@@ -271,19 +235,23 @@ export async function apiRequest(
 
     if (!isExpired) {
       // Explicitly invalid token, redirect to login page directly
-      clearStoredAuth()
-      window.location.href = "/login"
+      if (isAuthSessionCurrent(session)) {
+        clearStoredAuth()
+        window.location.href = "/login"
+      }
       return response
     }
     const refreshResult = await refreshStoredAccessToken(accessToken, userId)
 
     if (refreshResult.accessToken !== null) {
-      const retryHeaders = {
-        ...options.headers,
-        "Authorization": `Bearer ${refreshResult.accessToken}`,
+      if (isAuthSessionCurrent(refreshResult.session)) {
+        const retryHeaders = {
+          ...options.headers,
+          "Authorization": `Bearer ${refreshResult.accessToken}`,
+        }
+        response = await fetch(url, { ...options, headers: retryHeaders })
       }
-      response = await fetch(url, { ...options, headers: retryHeaders })
-    } else if (refreshResult.rejected) {
+    } else if (refreshResult.rejected && isAuthSessionCurrent(session)) {
       // Only a definitive refresh-token rejection should end the session.
       console.error("Refresh token was rejected, redirecting to login")
       clearStoredAuth()

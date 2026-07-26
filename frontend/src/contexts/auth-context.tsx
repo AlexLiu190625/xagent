@@ -10,9 +10,11 @@ import {
   AuthCache,
   AuthCacheUser,
   clearStoredAuth,
+  isAuthSessionCurrent,
   LEGACY_AUTH_TOKEN_KEY,
   LEGACY_AUTH_USER_KEY,
   readAuthCache,
+  readAuthSessionSnapshot,
   writeAuthCache,
 } from "@/lib/auth-cache"
 
@@ -43,7 +45,10 @@ interface AuthContextType {
   login: (username: string, password: string) => Promise<boolean>
   logout: () => void
   checkAuth: () => Promise<boolean>
-  refreshAccessToken: () => Promise<boolean>
+  refreshAccessToken: (
+    expectedAccessToken?: string | null,
+    expectedUserId?: string | null,
+  ) => Promise<boolean>
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
@@ -247,6 +252,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   const checkAuth = async (): Promise<boolean> => {
     if (!token || !user) return false
+    const session = readAuthSessionSnapshot()
 
     // Debounce: if interval since last check is too short, return true directly
     const now = Date.now()
@@ -273,18 +279,24 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
           if (isInvalid) {
             // Explicitly invalid token, clear state
-            logout()
-            return false
+            if (isAuthSessionCurrent(session)) {
+              logout()
+              return false
+            }
+            return true
           }
 
           // A rejected refresh clears the shared cache in apiRequest. A
           // temporary refresh outage leaves it intact so the next check can
           // retry without ejecting the user from the app.
           if (!readAuthCache()) {
-            setUser(null)
-            setToken(null)
-            setRefreshToken(null)
-            return false
+            const currentSession = readAuthSessionSnapshot()
+            if (!currentSession.accessToken && !currentSession.refreshToken) {
+              setUser(null)
+              setToken(null)
+              setRefreshToken(null)
+              return false
+            }
           }
           return true
         }
@@ -316,6 +328,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     expectedAccessToken?: string | null,
     expectedUserId?: string | null
   ): Promise<boolean> => {
+    const session = readAuthSessionSnapshot()
     const cache = readAuthCache()
     const result = await refreshStoredAccessToken(
       expectedAccessToken === undefined ? cache?.token || null : expectedAccessToken,
@@ -331,7 +344,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       return true
     }
 
-    if (result.rejected) {
+    if (result.rejected && isAuthSessionCurrent(session)) {
       logout()
     }
     return false

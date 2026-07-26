@@ -10,7 +10,7 @@ import React from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { AuthProvider, useAuth } from "@/contexts/auth-context"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
 import { AUTH_CACHE_KEY, clearStoredAuth, writeAuthCache } from "@/lib/auth-cache"
 
 vi.mock("@/lib/api-wrapper", () => ({
@@ -31,6 +31,22 @@ function AuthProbe() {
         void checkAuth().then(result => setCheckResult(String(result)))
       }}>
         Check auth
+      </button>
+    </>
+  )
+}
+
+function AuthRefreshProbe() {
+  const { refreshAccessToken, token } = useAuth()
+  const [refreshResult, setRefreshResult] = React.useState("pending")
+  return (
+    <>
+      <span data-testid="refresh-access-token">{token || "none"}</span>
+      <span data-testid="refresh-result">{refreshResult}</span>
+      <button onClick={() => {
+        void refreshAccessToken().then(result => setRefreshResult(String(result)))
+      }}>
+        Refresh access token
       </button>
     </>
   )
@@ -176,5 +192,96 @@ describe("AuthProvider storage synchronization", () => {
       expect(screen.getByTestId("check-result")).toHaveTextContent("false")
       expect(screen.getByTestId("access-token")).toHaveTextContent("none")
     })
+  })
+
+  it("does not log out a replacement session after an older refresh is rejected", async () => {
+    writeAuthCache(
+      { id: "1", username: "alice", email: null, is_admin: false },
+      "alice-access",
+      "alice-refresh",
+      120,
+      240
+    )
+    let resolveRefresh!: (value: { accessToken: null; rejected: true }) => void
+    const refreshPromise = new Promise<{ accessToken: null; rejected: true }>((resolve) => {
+      resolveRefresh = resolve
+    })
+    vi.mocked(refreshStoredAccessToken).mockReturnValue(refreshPromise)
+
+    render(
+      <AuthProvider>
+        <AuthRefreshProbe />
+      </AuthProvider>
+    )
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("alice-access")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+    await waitFor(() => {
+      expect(refreshStoredAccessToken).toHaveBeenCalledWith("alice-access", "1")
+    })
+
+    writeAuthCache(
+      { id: "2", username: "bob", email: null, is_admin: false },
+      "bob-access",
+      "bob-refresh",
+      120,
+      240
+    )
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", {
+        key: AUTH_CACHE_KEY,
+        newValue: localStorage.getItem(AUTH_CACHE_KEY),
+      }))
+    })
+    expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("bob-access")
+
+    await act(async () => {
+      resolveRefresh({ accessToken: null, rejected: true })
+      await refreshPromise
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-result")).toHaveTextContent("false")
+    })
+    expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("bob-access")
+    expect(JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "null")).toMatchObject({
+      token: "bob-access",
+      refreshToken: "bob-refresh",
+      user: { id: "2" },
+    })
+  })
+
+  it("logs out the current session after its own refresh is rejected", async () => {
+    writeAuthCache(
+      { id: "1", username: "alice", email: null, is_admin: false },
+      "alice-access",
+      "alice-refresh",
+      120,
+      240
+    )
+    vi.mocked(refreshStoredAccessToken).mockResolvedValue({
+      accessToken: null,
+      rejected: true,
+    })
+    vi.spyOn(console, "error").mockImplementation(() => {})
+
+    render(
+      <AuthProvider>
+        <AuthRefreshProbe />
+      </AuthProvider>
+    )
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("alice-access")
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId("refresh-result")).toHaveTextContent("false")
+      expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("none")
+    })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
   })
 })

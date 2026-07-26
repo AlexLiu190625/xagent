@@ -36,6 +36,12 @@ export interface AuthCache {
   refreshExpiresAt?: number
 }
 
+export interface AuthSessionSnapshot {
+  userId: string | null
+  accessToken: string | null
+  refreshToken: string | null
+}
+
 function isNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value)
 }
@@ -71,6 +77,53 @@ export function readAuthCache(now: number = Date.now()): AuthCache | null {
     localStorage.removeItem(AUTH_CACHE_KEY)
     return null
   }
+}
+
+function readLegacyAuthUserId(): string | null {
+  const rawUser = localStorage.getItem(LEGACY_AUTH_USER_KEY)
+  if (!rawUser) return null
+
+  try {
+    const user: unknown = JSON.parse(rawUser)
+    if (
+      typeof user === "object" &&
+      user !== null &&
+      "id" in user &&
+      (typeof user.id === "string" || typeof user.id === "number")
+    ) {
+      return String(user.id)
+    }
+  } catch {
+    // A legacy cache without a parseable user is still identified by its token.
+  }
+
+  return null
+}
+
+export function readAuthSessionSnapshot(): AuthSessionSnapshot {
+  const cache = readAuthCache()
+  if (cache) {
+    return {
+      userId: cache.user?.id ? String(cache.user.id) : null,
+      accessToken: cache.token || null,
+      refreshToken: cache.refreshToken || null,
+    }
+  }
+
+  return {
+    userId: readLegacyAuthUserId(),
+    accessToken: localStorage.getItem(LEGACY_AUTH_TOKEN_KEY),
+    refreshToken: null,
+  }
+}
+
+export function isAuthSessionCurrent(snapshot: AuthSessionSnapshot): boolean {
+  const current = readAuthSessionSnapshot()
+  return (
+    current.userId === snapshot.userId &&
+    current.accessToken === snapshot.accessToken &&
+    current.refreshToken === snapshot.refreshToken
+  )
 }
 
 export function syncLegacyAuthStorage(

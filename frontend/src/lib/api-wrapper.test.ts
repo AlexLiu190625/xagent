@@ -7,7 +7,12 @@ import {
   parseApiResponse,
   refreshStoredAccessToken,
 } from "@/lib/api-wrapper"
-import { clearStoredAuth, readAuthCache, writeAuthCache } from "@/lib/auth-cache"
+import {
+  AUTH_TOKEN_UPDATED_EVENT,
+  clearStoredAuth,
+  readAuthCache,
+  writeAuthCache,
+} from "@/lib/auth-cache"
 
 function mockNavigatorLocks(
   beforeCallback: () => void | Promise<void> = () => {}
@@ -24,6 +29,16 @@ function mockNavigatorLocks(
       }),
     },
   })
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
 }
 
 const MESSAGES = {
@@ -202,7 +217,7 @@ describe("api-wrapper auth refresh", () => {
     expect(readAuthCache()?.refreshToken).toBe("new-refresh")
   })
 
-  it("reuses a token refreshed by another tab while waiting for the lock", async () => {
+  it("does not reuse a changed session while waiting for the lock", async () => {
     writeAuthCache(user, "old-access", "old-refresh", 120, 240)
     const fetchMock = vi.spyOn(globalThis, "fetch")
 
@@ -212,11 +227,11 @@ describe("api-wrapper auth refresh", () => {
 
     const result = await refreshStoredAccessToken("old-access")
 
-    expect(result).toEqual({ accessToken: "other-tab-access" })
+    expect(result).toEqual({ accessToken: null, rejected: false })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it("reuses a token from another tab when the caller started without one", async () => {
+  it("does not reuse a changed session when the caller started without a token", async () => {
     writeAuthCache(user, null, "old-refresh", 120, 240)
     const fetchMock = vi.spyOn(globalThis, "fetch")
 
@@ -226,7 +241,7 @@ describe("api-wrapper auth refresh", () => {
 
     const result = await refreshStoredAccessToken(null)
 
-    expect(result).toEqual({ accessToken: "other-tab-access" })
+    expect(result).toEqual({ accessToken: null, rejected: false })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -243,7 +258,14 @@ describe("api-wrapper auth refresh", () => {
 
     const result = await refreshStoredAccessToken("old-access", 1)
 
-    expect(result).toEqual({ accessToken: "new-access" })
+    expect(result).toMatchObject({
+      accessToken: "new-access",
+      session: {
+        accessToken: "new-access",
+        refreshToken: "new-refresh",
+        userId: "1",
+      },
+    })
   })
 
   it("does not restore a session cleared while refresh was in flight", async () => {
@@ -263,7 +285,7 @@ describe("api-wrapper auth refresh", () => {
 
     const result = await refreshStoredAccessToken("old-access")
 
-    expect(result).toEqual({ accessToken: null, rejected: true })
+    expect(result).toEqual({ accessToken: null, rejected: false })
     expect(readAuthCache()).toBeNull()
   })
 
@@ -308,6 +330,206 @@ describe("api-wrapper auth refresh", () => {
       expect(readAuthCache()).toBeNull()
     }
   )
+
+  it.each([401, 403])(
+    "preserves a replacement session when an old refresh returns %i",
+    async (refreshStatus) => {
+      const replacementUser = {
+        id: "2",
+        username: "bob",
+        email: null,
+        is_admin: false,
+      }
+      writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+      vi.spyOn(console, "error").mockImplementation(() => {})
+      const refreshStarted = deferred<void>()
+      const refreshResponse = deferred<Response>()
+      const authorizationHeaders: Array<string | null> = []
+      vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+        if (String(input).endsWith("/api/auth/refresh")) {
+          refreshStarted.resolve()
+          return refreshResponse.promise
+        }
+        authorizationHeaders.push(
+          new Headers(options?.headers).get("Authorization"),
+        )
+        return new Response(null, {
+          status: 401,
+          headers: { "Error-Type": "TokenExpired" },
+        })
+      })
+
+      const request = apiRequest("http://api.local/protected")
+      await refreshStarted.promise
+      writeAuthCache(
+        replacementUser,
+        "replacement-access",
+        "replacement-refresh",
+        120,
+        240,
+      )
+      refreshResponse.resolve(new Response(null, { status: refreshStatus }))
+      const response = await request
+
+      expect(response.status).toBe(401)
+      expect(readAuthCache()).toMatchObject({
+        token: "replacement-access",
+        refreshToken: "replacement-refresh",
+        user: { id: "2" },
+      })
+      expect(authorizationHeaders).toEqual(["Bearer old-access"])
+    },
+  )
+
+  it("preserves a replacement session when an old refresh returns malformed success", async () => {
+    const replacementUser = {
+      id: "2",
+      username: "bob",
+      email: null,
+      is_admin: false,
+    }
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const refreshStarted = deferred<void>()
+    const refreshResponse = deferred<Response>()
+    const authorizationHeaders: Array<string | null> = []
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (String(input).endsWith("/api/auth/refresh")) {
+        refreshStarted.resolve()
+        return refreshResponse.promise
+      }
+      authorizationHeaders.push(new Headers(options?.headers).get("Authorization"))
+      return new Response(null, {
+        status: 401,
+        headers: { "Error-Type": "TokenExpired" },
+      })
+    })
+
+    const request = apiRequest("http://api.local/protected")
+    await refreshStarted.promise
+    writeAuthCache(
+      replacementUser,
+      "replacement-access",
+      "replacement-refresh",
+      120,
+      240,
+    )
+    refreshResponse.resolve(new Response(JSON.stringify({ success: false }), {
+      status: 200,
+      headers: { "Content-Type": "application/json" },
+    }))
+    const response = await request
+
+    expect(response.status).toBe(401)
+    expect(readAuthCache()).toMatchObject({
+      token: "replacement-access",
+      refreshToken: "replacement-refresh",
+      user: { id: "2" },
+    })
+    expect(authorizationHeaders).toEqual(["Bearer old-access"])
+  })
+
+  it("preserves a same-user replacement while an old response body is pending", async () => {
+    const replacementSessionUser = {
+      ...user,
+      username: "alice-relogin",
+    }
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    const responseBodyStarted = deferred<void>()
+    const responseBody = deferred<{ success: boolean }>()
+    const authorizationHeaders: Array<string | null> = []
+    const pendingBodyResponse = {
+      ok: true,
+      status: 200,
+      json: () => {
+        responseBodyStarted.resolve()
+        return responseBody.promise
+      },
+    } as Response
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (String(input).endsWith("/api/auth/refresh")) {
+        return pendingBodyResponse
+      }
+      authorizationHeaders.push(new Headers(options?.headers).get("Authorization"))
+      return new Response(null, {
+        status: 401,
+        headers: { "Error-Type": "TokenExpired" },
+      })
+    })
+
+    const request = apiRequest("http://api.local/protected")
+    await responseBodyStarted.promise
+    writeAuthCache(
+      replacementSessionUser,
+      "replacement-access",
+      "replacement-refresh",
+      120,
+      240,
+    )
+    responseBody.resolve({ success: false })
+    const response = await request
+
+    expect(response.status).toBe(401)
+    expect(readAuthCache()).toMatchObject({
+      token: "replacement-access",
+      refreshToken: "replacement-refresh",
+      user: { id: "1" },
+    })
+    expect(authorizationHeaders).toEqual(["Bearer old-access"])
+  })
+
+  it("does not retry under a replacement with the same access token", async () => {
+    const replacementUser = {
+      id: "2",
+      username: "bob",
+      email: null,
+      is_admin: false,
+    }
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    const authorizationHeaders: Array<string | null> = []
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (String(input).endsWith("/api/auth/refresh")) {
+        return new Response(JSON.stringify({
+          success: true,
+          access_token: "shared-access",
+          refresh_token: "refreshed-refresh",
+        }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      authorizationHeaders.push(new Headers(options?.headers).get("Authorization"))
+      return new Response(null, {
+        status: 401,
+        headers: { "Error-Type": "TokenExpired" },
+      })
+    })
+    const replaceAfterRefresh = () => {
+      writeAuthCache(
+        replacementUser,
+        "shared-access",
+        "replacement-refresh",
+        120,
+        240,
+      )
+    }
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, replaceAfterRefresh)
+
+    try {
+      const response = await apiRequest("http://api.local/protected")
+
+      expect(response.status).toBe(401)
+      expect(authorizationHeaders).toEqual(["Bearer old-access"])
+      expect(readAuthCache()).toMatchObject({
+        token: "shared-access",
+        refreshToken: "replacement-refresh",
+        user: { id: "2" },
+      })
+    } finally {
+      window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, replaceAfterRefresh)
+    }
+  })
 
   it("does not replay an old request under a replacement user", async () => {
     const replacementUser = {
