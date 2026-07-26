@@ -5,44 +5,24 @@ creations and deletions — no Docker-only assumptions.
 """
 
 import asyncio
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 import xagent.web.sandbox_manager as sandbox_manager_module
+from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.web.sandbox_manager import SandboxCapacityError, SandboxManager
 
 
-class _FakeService:
-    """In-memory sandbox service tracking existing container names."""
+class _FakeService(FakeSandboxService):
+    """In-memory sandbox service tracking existing container names.
 
-    def __init__(self, initial: tuple[str, ...] = ()) -> None:
-        self.containers: set[str] = set(initial)
-        self.peak = len(self.containers)
-        self.deleted: list[str] = []
-
-    async def list_sandboxes(self) -> list[SimpleNamespace]:
-        return [
-            SimpleNamespace(
-                name=name,
-                state="stopped",
-                template=SimpleNamespace(type="image", image="img:v1"),
-                config=SimpleNamespace(),
-            )
-            for name in sorted(self.containers)
-        ]
-
-    async def get_or_create(self, name, template=None, config=None):
-        self.containers.add(name)
-        self.peak = max(self.peak, len(self.containers))
-        sandbox = MagicMock()
-        sandbox.name = name
-        return sandbox
-
-    async def delete(self, name: str) -> None:
-        self.containers.discard(name)
-        self.deleted.append(name)
+    Inherits its container registry (containers/peak/deleted) and its
+    get_or_create/list_sandboxes/delete bodies from FakeSandboxService
+    unchanged; kept as a local subclass (rather than using
+    FakeSandboxService directly) only so the rest of this file's type hints
+    stay put.
+    """
 
 
 class _FakeClock:

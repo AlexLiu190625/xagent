@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.core.tools.adapters.vibe.sandboxed_tool.sandboxed_tool_wrapper import (
     build_code_mount_volumes,
 )
@@ -31,15 +32,12 @@ def _make_sb_info(
 
 
 @pytest.fixture
-def service() -> AsyncMock:
-    svc = AsyncMock()
-    svc.delete = AsyncMock()
-    svc.get_or_create = AsyncMock()
-    return svc
+def service() -> FakeSandboxService:
+    return FakeSandboxService()
 
 
 @pytest.fixture
-def manager(service: AsyncMock) -> SandboxManager:
+def manager(service: FakeSandboxService) -> SandboxManager:
     return SandboxManager(service)
 
 
@@ -234,7 +232,7 @@ def test_default_volumes_mount_workspace_owner_not_current_user(
 
 @pytest.mark.asyncio
 async def test_cleanup_deletes_on_image_change(
-    manager: SandboxManager, service: AsyncMock
+    manager: SandboxManager, service: FakeSandboxService
 ):
     """Sandbox with stale image should be deleted."""
     sb = _make_sb_info("user::1", image="old:v0")
@@ -253,7 +251,7 @@ async def test_cleanup_deletes_on_image_change(
 
 @pytest.mark.asyncio
 async def test_cleanup_deletes_on_cpus_change(
-    manager: SandboxManager, service: AsyncMock
+    manager: SandboxManager, service: FakeSandboxService
 ):
     """Sandbox with different cpus should be deleted."""
     sb = _make_sb_info("user::2", image="img:v1", cpus=1)
@@ -272,7 +270,7 @@ async def test_cleanup_deletes_on_cpus_change(
 
 @pytest.mark.asyncio
 async def test_cleanup_deletes_on_memory_change(
-    manager: SandboxManager, service: AsyncMock
+    manager: SandboxManager, service: FakeSandboxService
 ):
     """Sandbox with different memory should be deleted."""
     sb = _make_sb_info("user::3", image="img:v1", memory=512)
@@ -291,7 +289,7 @@ async def test_cleanup_deletes_on_memory_change(
 
 @pytest.mark.asyncio
 async def test_cleanup_deletes_on_volumes_change(
-    manager: SandboxManager, service: AsyncMock, tmp_path: Path
+    manager: SandboxManager, service: FakeSandboxService, tmp_path: Path
 ):
     """Sandbox with stale volume mount should be deleted."""
     old_path = "/old/uploads/user_5"
@@ -321,7 +319,7 @@ async def test_cleanup_deletes_on_volumes_change(
 
 @pytest.mark.asyncio
 async def test_cleanup_stops_when_config_matches(
-    manager: SandboxManager, service: AsyncMock, tmp_path: Path
+    manager: SandboxManager, service: FakeSandboxService, tmp_path: Path
 ):
     """Sandbox whose config matches should be stopped, not deleted."""
     uploads = tmp_path / "uploads"
@@ -359,7 +357,7 @@ async def test_cleanup_stops_when_config_matches(
 
 @pytest.mark.asyncio
 async def test_cleanup_stops_worker_when_base_user_config_matches(
-    manager: SandboxManager, service: AsyncMock, tmp_path: Path
+    manager: SandboxManager, service: FakeSandboxService, tmp_path: Path
 ):
     """Worker sandbox cleanup should compare against the owner workspace."""
     uploads = tmp_path / "uploads"
@@ -399,7 +397,7 @@ async def test_cleanup_stops_worker_when_base_user_config_matches(
 
 @pytest.mark.asyncio
 async def test_cleanup_deletes_on_multiple_changes(
-    manager: SandboxManager, service: AsyncMock
+    manager: SandboxManager, service: FakeSandboxService
 ):
     """Sandbox with image AND cpus changed should be deleted once."""
     sb = _make_sb_info("user::7", image="old:v0", cpus=1, memory=256)
@@ -418,7 +416,7 @@ async def test_cleanup_deletes_on_multiple_changes(
 
 @pytest.mark.asyncio
 async def test_cleanup_handles_non_managed_sandbox(
-    manager: SandboxManager, service: AsyncMock
+    manager: SandboxManager, service: FakeSandboxService
 ):
     """Sandbox with non-standard name should not crash cleanup."""
     sb = _make_sb_info("__warmup__", image="img:v1")

@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 import xagent.web.sandbox_manager as sandbox_manager_module
+from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.web.sandbox_manager import SandboxManager
 
 TTL = 100.0
@@ -41,7 +42,7 @@ def clock(monkeypatch) -> _FakeClock:
 
 
 def _make_manager(listed_names: list[str] | None = None) -> SandboxManager:
-    service = AsyncMock()
+    service = FakeSandboxService()
     service.list_sandboxes = AsyncMock(
         return_value=[_listed(name) for name in listed_names or []]
     )
