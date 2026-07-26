@@ -1,8 +1,9 @@
 """Best-effort workspace path guard for shell commands.
 
 This module deliberately provides a cooperative guard, not an operating-system
-security boundary. It rejects statically identifiable out-of-scope paths for a
-supported set of common file commands while leaving unknown commands unchanged.
+security boundary. For supported commands, it rejects out-of-scope paths and
+path-bearing arguments that cannot be resolved statically. Unknown commands
+remain unchanged.
 """
 
 from __future__ import annotations
@@ -11,17 +12,30 @@ import logging
 import os
 import re
 import stat
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Literal, Sequence, cast
+from typing import Any, Callable, Literal, Sequence, SupportsIndex, cast
 
 import bashlex
 
 from ...workspace import TaskWorkspace
-from .command_policy import CommandPathViolation, PathAccess
+from .command_policy import (
+    CommandPathViolation,
+    CommandPolicyViolation,
+    PathAccess,
+)
 
 logger = logging.getLogger(__name__)
 
 _MAX_INSPECTED_SCRIPT_BYTES = 1024 * 1024
+_MAX_INSPECTED_SCRIPT_DEPTH = 8
+_AWK_ALWAYS_UNSAFE_IO_PATTERN = re.compile(r"\bsystem\s*\(|\bgetline\b")
+_AWK_PRINT_PATTERN = re.compile(r"\b(?:print|printf)\b")
+_SED_ADDRESS_PATTERN = r"(?:\d+|\$|/(?:\\.|[^/\n])*/)"
+_SED_FILE_OR_EXEC_COMMAND_PATTERN = re.compile(
+    rf"(?:^|[;\n])\s*(?:{_SED_ADDRESS_PATTERN}"
+    rf"(?:\s*,\s*{_SED_ADDRESS_PATTERN})?\s*)?[rRwWe](?:\s|$)"
+)
 
 _READ_COMMANDS = {
     "cat",
@@ -35,6 +49,7 @@ _READ_COMMANDS = {
     "more",
     "sort",
     "stat",
+    "tac",
     "tail",
     "uniq",
     "wc",
@@ -51,12 +66,93 @@ _WRITE_COMMANDS = {
     "truncate",
 }
 _SHELL_COMMANDS = {"bash", "dash", "sh", "zsh"}
+_BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
 _SAFE_DEVICE_PATHS = {
     Path("/dev/null"),
     Path("/dev/stdin"),
     Path("/dev/stdout"),
     Path("/dev/stderr"),
 }
+
+
+class _CommandValue(str):
+    """A shell word plus whether bashlex proved it has no runtime expansion."""
+
+    is_static: bool
+
+    def __new__(cls, value: str, *, is_static: bool = True) -> _CommandValue:
+        instance = super().__new__(cls, value)
+        instance.is_static = is_static
+        return instance
+
+    def __getitem__(self, key: SupportsIndex | slice) -> str:
+        value = super().__getitem__(key)
+        if isinstance(key, slice):
+            return _CommandValue(value, is_static=self.is_static)
+        return value
+
+    def split(
+        self,
+        sep: str | None = None,
+        maxsplit: SupportsIndex = -1,
+    ) -> list[str]:
+        # Runtime values retain the marker while the public return type keeps
+        # this str subclass substitutable for normal parser code.
+        return [
+            _CommandValue(value, is_static=self.is_static)
+            for value in super().split(sep, maxsplit)
+        ]
+
+
+@dataclass(frozen=True)
+class _ShellState:
+    cwd: Path
+    directory_stack: tuple[Path, ...] = ()
+    previous_cwd: Path | None = None
+    script_depth: int = 0
+    cwd_is_conditional: bool = False
+
+
+@dataclass(frozen=True)
+class _FindExecClause:
+    marker: Literal["-exec", "-execdir"]
+    command: tuple[str, ...]
+
+
+TarMode = Literal[
+    "create",
+    "append",
+    "update",
+    "concatenate",
+    "delete",
+    "extract",
+    "list",
+    "compare",
+]
+TarEventKind = Literal[
+    "archive",
+    "directory",
+    "files_from",
+    "exclude_from",
+    "incremental",
+    "add_file",
+    "positional",
+    "dangerous",
+    "absolute_names",
+]
+
+
+@dataclass(frozen=True)
+class _TarEvent:
+    kind: TarEventKind
+    value: str | None = None
+
+
+@dataclass(frozen=True)
+class _TarInvocation:
+    mode: TarMode
+    events: tuple[_TarEvent, ...]
+    remove_files: bool = False
 
 
 class WorkspaceCommandPathGuard:
@@ -73,156 +169,223 @@ class WorkspaceCommandPathGuard:
         self._path_access_observer = _path_access_observer
 
     @staticmethod
-    def _parse_shell(command: str) -> list[Any] | None:
+    def _parse_shell(command: str) -> list[Any]:
         try:
             return cast(list[Any], bashlex.parse(command))
         except (bashlex.errors.ParsingError, NotImplementedError, ValueError) as exc:
-            logger.debug(
-                "Skipping command path guard for unparsed shell input: %s", exc
-            )
-            return None
+            logger.debug("Command path guard rejected unparsed shell input")
+            raise CommandPolicyViolation("cannot safely parse shell command") from exc
 
     def validate(self, command: str) -> None:
-        """Reject statically identifiable out-of-scope paths in ``command``.
-
-        Shell syntax that cannot be parsed or path operands containing runtime
-        expansion are intentionally left to the shell. This preserves existing
-        command behavior and keeps the contract honest: the guard reduces risk
-        for supported commands but is not a complete sandbox.
-        """
+        """Reject unsupported syntax and unsafe paths in ``command``."""
         nodes = self._parse_shell(command)
-        if nodes is None:
-            return
 
-        cwd = self._initial_cwd
+        state = _ShellState(cwd=self._initial_cwd)
         for node in nodes:
-            cwd = self._validate_node(node, cwd)
+            state = self._validate_node(node, state)
 
     def validate_argv(self, argv: Sequence[str]) -> None:
         """Reject out-of-policy paths in an argument-vector command."""
         if not argv:
             return
         command_name = os.path.basename(argv[0])
-        self._validate_command_values(command_name, argv[1:], self._initial_cwd)
+        self._validate_command_values(
+            command_name,
+            argv[1:],
+            _ShellState(cwd=self._initial_cwd),
+        )
 
-    def _validate_node(self, node: Any, cwd: Path) -> Path:
+    def _validate_node(self, node: Any, state: _ShellState) -> _ShellState:
         kind = getattr(node, "kind", None)
         if kind == "list":
-            current = cwd
+            current = state
+            state_changed = False
             for part in node.parts:
-                if getattr(part, "kind", None) in {"operator", "pipe"}:
+                part_kind = getattr(part, "kind", None)
+                if part_kind in {"operator", "pipe"}:
+                    operator = getattr(part, "op", None)
+                    if operator == "&&":
+                        if state_changed:
+                            current = replace(current, cwd_is_conditional=True)
+                    elif state_changed or current.cwd_is_conditional:
+                        raise CommandPolicyViolation(
+                            "cannot safely resolve directory state across shell operator"
+                        )
+                    state_changed = False
                     continue
-                current = self._validate_node(part, current)
+                next_state = self._validate_node(part, current)
+                state_changed = next_state != current
+                current = next_state
             return current
 
         if kind == "pipeline":
             for part in node.parts:
                 if getattr(part, "kind", None) != "pipe":
-                    self._validate_node(part, cwd)
-            return cwd
+                    self._validate_node(part, state)
+            return state
 
         if kind == "compound":
-            current = cwd
+            current = state
+            reserved_words = [
+                getattr(part, "word", None)
+                for part in getattr(node, "list", ())
+                if getattr(part, "kind", None) == "reservedword"
+            ]
             for part in getattr(node, "list", ()):
                 current = self._validate_node(part, current)
             for redirect in getattr(node, "redirects", ()):
-                self._validate_redirect(redirect, current)
-            # Propagating the resulting CWD is conservative for subshells and
-            # correct for brace groups.
-            return current
+                self._validate_redirect(redirect, current.cwd)
+            return state if reserved_words[:1] == ["("] else current
 
         if kind == "command":
-            return self._validate_command(node, cwd)
+            return self._validate_command(node, state)
 
-        self._validate_nested_nodes(node, cwd)
-        return cwd
+        self._validate_nested_nodes(node, state)
+        return state
 
-    def _validate_command(self, node: Any, cwd: Path) -> Path:
+    def _validate_command(self, node: Any, state: _ShellState) -> _ShellState:
         words: list[Any] = []
         for part in node.parts:
             kind = getattr(part, "kind", None)
             if kind == "redirect":
-                self._validate_redirect(part, cwd)
+                self._validate_redirect(part, state.cwd)
             elif kind == "word":
                 words.append(part)
-                self._validate_nested_nodes(part, cwd)
+                self._validate_nested_nodes(part, state)
             else:
-                self._validate_nested_nodes(part, cwd)
+                self._validate_nested_nodes(part, state)
 
         if not words:
-            return cwd
+            return state
 
         command_word = self._literal_word(words[0])
         if command_word is None:
-            return cwd
+            raise CommandPolicyViolation("cannot resolve dynamic command name")
         command_name = os.path.basename(command_word)
-        args = self._literal_values(words[1:])
+        args = self._command_values(words[1:])
 
-        return self._validate_command_values(command_name, args, cwd)
+        return self._validate_command_values(command_name, args, state)
 
     def _validate_command_values(
         self,
         command_name: str,
         args: Sequence[str],
-        cwd: Path,
-    ) -> Path:
-        if command_name in {"cd", "pushd"}:
-            target_word = self._first_operand(args)
-            if target_word is None:
-                return self._check_path(str(Path.home()), cwd, "read")
-            if target_word == "-":
-                raise CommandPathViolation(
-                    access="read",
-                    path=Path("<dynamic cd target>"),
-                )
-            return self._check_path(target_word, cwd, "read")
+        state: _ShellState,
+    ) -> _ShellState:
+        if command_name in {"cd", "pushd", "popd"}:
+            return self._change_directory(command_name, args, state)
 
         if command_name in _READ_COMMANDS:
-            self._check_read_command(command_name, args, cwd)
+            self._check_read_command(command_name, args, state.cwd)
         elif command_name in _WRITE_COMMANDS:
-            self._check_operands(args, cwd, "write")
+            self._check_operands(args, state.cwd, "write")
         elif command_name == "grep":
-            self._check_grep(args, cwd)
+            self._check_grep(args, state.cwd)
         elif command_name == "sed":
-            self._check_sed(args, cwd)
+            self._check_sed_values(args, state.cwd)
         elif command_name == "awk":
-            self._check_awk(args, cwd)
+            self._check_awk_values(args, state.cwd)
+        elif command_name == "base64":
+            self._check_base64(args, state.cwd)
+        elif command_name == "dd":
+            self._check_dd(args, state.cwd)
+        elif command_name == "tar":
+            self._check_tar(args, state.cwd)
         elif command_name == "cp":
-            self._check_copy(args, cwd)
+            self._check_copy(args, state.cwd)
         elif command_name in {"mv", "ln"}:
-            self._check_move_or_link(args, cwd)
+            self._check_move_or_link(args, state.cwd)
         elif command_name == "find":
-            self._check_find(args, cwd)
+            self._check_find(args, state.cwd)
         elif command_name in _SHELL_COMMANDS:
-            self._check_nested_shell(args, cwd)
+            self._check_nested_shell(command_name, args, state)
         elif command_name in {".", "source"}:
-            self._check_operands(args, cwd, "read")
+            return self._check_sourced_shell(args, state)
         elif command_name == "xargs":
-            self._check_xargs(args, cwd)
+            self._check_xargs(args, state.cwd)
 
-        return cwd
+        return state
 
     def _validate_redirect(self, node: Any, cwd: Path) -> None:
         redirect_type = getattr(node, "type", "")
         if redirect_type in {"<<", "<<<"}:
             return
         output = getattr(node, "output", None)
-        raw_path = self._literal_word(output)
-        if raw_path is None:
+        # bashlex emits descriptor-duplication targets such as 2>&1 as integers.
+        if output is None or getattr(output, "kind", None) != "word":
             return
+        raw_path = self._command_value(output)
         access: PathAccess = "read" if redirect_type == "<" else "write"
         self._check_path(raw_path, cwd, access)
+
+    def _change_directory(
+        self,
+        command_name: str,
+        values: Sequence[str],
+        state: _ShellState,
+    ) -> _ShellState:
+        operands = self._operands(values)
+        if command_name == "cd":
+            if len(operands) > 1:
+                raise CommandPolicyViolation("cannot safely resolve cd arguments")
+            target_word = operands[0] if operands else str(Path.home())
+            if target_word == "-":
+                if state.previous_cwd is None:
+                    raise CommandPolicyViolation(
+                        "cannot resolve cd - without a previous directory"
+                    )
+                target = state.previous_cwd
+            else:
+                target = self._check_path(target_word, state.cwd, "read")
+            return replace(state, cwd=target, previous_cwd=state.cwd)
+
+        if any(value.startswith("-") and value != "--" for value in values):
+            raise CommandPolicyViolation(
+                f"cannot safely resolve {command_name} options"
+            )
+
+        if command_name == "pushd":
+            if len(operands) > 1:
+                raise CommandPolicyViolation("cannot safely resolve pushd arguments")
+            if operands:
+                if operands[0] == "-":
+                    raise CommandPolicyViolation("cannot safely resolve pushd target")
+                target = self._check_path(operands[0], state.cwd, "read")
+                stack = (state.cwd, *state.directory_stack)
+            else:
+                if not state.directory_stack:
+                    raise CommandPolicyViolation(
+                        "cannot resolve pushd without a directory stack"
+                    )
+                target = state.directory_stack[0]
+                stack = (state.cwd, *state.directory_stack[1:])
+            return replace(
+                state,
+                cwd=target,
+                directory_stack=stack,
+                previous_cwd=state.cwd,
+            )
+
+        if operands:
+            raise CommandPolicyViolation("cannot safely resolve popd arguments")
+        if not state.directory_stack:
+            raise CommandPolicyViolation(
+                "cannot resolve popd without a directory stack"
+            )
+        return replace(
+            state,
+            cwd=state.directory_stack[0],
+            directory_stack=state.directory_stack[1:],
+            previous_cwd=state.cwd,
+        )
 
     def _check_operands(
         self,
         values: Sequence[str],
         cwd: Path,
         access: PathAccess,
-        *,
-        skip_leading: int = 0,
     ) -> None:
-        operands = self._operands(values)
-        for raw_path in operands[skip_leading:]:
+        for raw_path in self._operands(values):
             self._check_path(raw_path, cwd, access)
 
     def _check_read_command(
@@ -243,6 +406,9 @@ class WorkspaceCommandPathGuard:
         if command_name == "diff":
             self._check_diff(values, cwd)
             return
+        if command_name == "tac":
+            self._check_tac(values, cwd)
+            return
 
         if command_name == "file":
             values = self._check_read_path_options(
@@ -259,6 +425,31 @@ class WorkspaceCommandPathGuard:
                 long_options={"--files0-from"},
             )
         self._check_operands(values, cwd, "read")
+
+    def _check_tac(self, values: Sequence[str], cwd: Path) -> None:
+        self._reject_dynamic_values("tac arguments", values)
+        operands: list[str] = []
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value == "--":
+                operands.extend(values[index + 1 :])
+                break
+            if value in {"-s", "--separator"}:
+                index += 2
+                continue
+            if value.startswith("--separator=") or (
+                value.startswith("-s") and len(value) > 2
+            ):
+                index += 1
+                continue
+            if value.startswith("-") and value != "-":
+                index += 1
+                continue
+            operands.append(value)
+            index += 1
+        for raw_path in operands:
+            self._check_path(raw_path, cwd, "read")
 
     def _check_cut(self, values: Sequence[str], cwd: Path) -> None:
         options_with_value = {
@@ -413,10 +604,11 @@ class WorkspaceCommandPathGuard:
         long_options: set[str],
     ) -> list[str]:
         remaining: list[str] = []
+        path_options = short_options | long_options
         index = 0
         while index < len(values):
             value = values[index]
-            if value in short_options | long_options:
+            if value in path_options:
                 if index + 1 < len(values):
                     self._check_path(values[index + 1], cwd, "read")
                 index += 2
@@ -493,12 +685,6 @@ class WorkspaceCommandPathGuard:
         file_operands = positionals if explicit_pattern else positionals[1:]
         for raw_path in file_operands:
             self._check_path(raw_path, cwd, "read")
-
-    def _check_sed(self, values: Sequence[str], cwd: Path) -> None:
-        self._check_sed_values(values, cwd)
-
-    def _check_awk(self, values: Sequence[str], cwd: Path) -> None:
-        self._check_awk_values(values, cwd)
 
     def _check_sed_values(self, values: Sequence[str], cwd: Path) -> None:
         positionals: list[str] = []
@@ -620,15 +806,353 @@ class WorkspaceCommandPathGuard:
         for raw_path in file_operands:
             self._check_path(raw_path, cwd, "read")
 
+    def _check_base64(self, values: Sequence[str], cwd: Path) -> None:
+        self._reject_dynamic_values("base64 arguments", values)
+        inputs: list[str] = []
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value == "--":
+                inputs.extend(values[index + 1 :])
+                break
+            if value in {"--input", "--output"}:
+                if index + 1 < len(values):
+                    self._check_path(
+                        values[index + 1],
+                        cwd,
+                        "read" if value == "--input" else "write",
+                    )
+                index += 2
+                continue
+            if value.startswith(("--input=", "--output=")):
+                self._check_path(
+                    value.split("=", 1)[1],
+                    cwd,
+                    "read" if value.startswith("--input=") else "write",
+                )
+                index += 1
+                continue
+            if value in {"--break", "--wrap"}:
+                index += 2
+                continue
+            if value.startswith(("--break=", "--wrap=")):
+                index += 1
+                continue
+            if value.startswith("-") and not value.startswith("--") and value != "-":
+                index = self._check_base64_short_options(values, index, cwd)
+                continue
+            inputs.append(value)
+            index += 1
+        for raw_path in inputs:
+            self._check_path(raw_path, cwd, "read")
+
+    def _check_base64_short_options(
+        self,
+        values: Sequence[str],
+        index: int,
+        cwd: Path,
+    ) -> int:
+        value = values[index]
+        options = value[1:]
+        cursor = 0
+        while cursor < len(options):
+            option = options[cursor]
+            if option in {"i", "o", "b", "w"}:
+                attached = options[cursor + 1 :]
+                argument: str | None = None
+                next_index = index + 1
+                if attached:
+                    argument = self._derived_value(value, attached)
+                elif next_index < len(values):
+                    argument = values[next_index]
+                    next_index += 1
+                if argument is not None and option in {"i", "o"}:
+                    self._check_path(
+                        argument,
+                        cwd,
+                        "read" if option == "i" else "write",
+                    )
+                return next_index
+            cursor += 1
+        return index + 1
+
+    def _check_dd(self, values: Sequence[str], cwd: Path) -> None:
+        self._reject_dynamic_values("dd arguments", values)
+        for value in values:
+            if value.startswith("if="):
+                self._check_path(value.split("=", 1)[1], cwd, "read")
+            elif value.startswith("of="):
+                self._check_path(value.split("=", 1)[1], cwd, "write")
+
+    def _check_tar(self, values: Sequence[str], cwd: Path) -> None:
+        self._reject_dynamic_values("tar arguments", values)
+        invocation = self._parse_tar(values)
+        archive_access: PathAccess = (
+            "write"
+            if invocation.mode
+            in {"create", "append", "update", "concatenate", "delete"}
+            else "read"
+        )
+        source_access: PathAccess = "write" if invocation.remove_files else "read"
+        active_cwd = cwd
+
+        for event in invocation.events:
+            if event.kind == "dangerous":
+                raise CommandPolicyViolation(
+                    "tar command hooks cannot be inspected safely"
+                )
+            if event.kind == "absolute_names":
+                if invocation.mode == "extract":
+                    raise CommandPolicyViolation(
+                        "tar absolute extraction paths cannot be inspected safely"
+                    )
+                continue
+            if event.value is None:
+                continue
+
+            if event.kind == "archive":
+                self._check_tar_archive_path(event.value, cwd, archive_access)
+            elif event.kind == "directory":
+                active_cwd = self._check_path(
+                    event.value,
+                    active_cwd,
+                    "write" if invocation.mode == "extract" else "read",
+                )
+            elif event.kind == "files_from":
+                raise CommandPolicyViolation(
+                    "tar file lists cannot be inspected safely"
+                )
+            elif event.kind == "exclude_from":
+                self._check_path(event.value, cwd, "read")
+            elif event.kind == "incremental":
+                # Snapshot files can be updated even when the archive is read.
+                self._check_path(event.value, cwd, "write")
+            elif event.kind == "add_file":
+                self._check_path(event.value, active_cwd, source_access)
+            elif event.kind == "positional" and invocation.mode in {
+                "create",
+                "append",
+                "update",
+                "concatenate",
+                "compare",
+            }:
+                raw_path = (
+                    event.value[1:] if event.value.startswith("@") else event.value
+                )
+                self._check_path(raw_path, active_cwd, source_access)
+
+    def _parse_tar(self, values: Sequence[str]) -> _TarInvocation:
+        long_modes: dict[str, TarMode] = {
+            "--create": "create",
+            "--append": "append",
+            "--update": "update",
+            "--concatenate": "concatenate",
+            "--catenate": "concatenate",
+            "--delete": "delete",
+            "--extract": "extract",
+            "--get": "extract",
+            "--list": "list",
+            "--compare": "compare",
+            "--diff": "compare",
+        }
+        modes: list[TarMode] = []
+        events: list[_TarEvent] = []
+        remove_files = False
+        options_done = False
+        index = 0
+
+        # Traditional tar syntax omits the leading dash (for example, ``cf``).
+        if (
+            values
+            and re.fullmatch(r"[A-Za-z]+", values[0])
+            and any(option in "cruAxtd" for option in values[0])
+        ):
+            index, short_modes, short_events = self._parse_tar_short_events(
+                values,
+                0,
+                values[0],
+            )
+            modes.extend(short_modes)
+            events.extend(short_events)
+
+        while index < len(values):
+            value = values[index]
+            if not options_done and value == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not value.startswith("-") or value == "-":
+                events.append(_TarEvent("positional", value))
+                index += 1
+                continue
+            if value in long_modes:
+                modes.append(long_modes[value])
+                index += 1
+                continue
+            if value == "--remove-files":
+                remove_files = True
+                index += 1
+                continue
+            if value in {"--to-stdout", "-O"}:
+                index += 1
+                continue
+            if value in {"--absolute-names", "--absolute-paths"}:
+                events.append(_TarEvent("absolute_names"))
+                index += 1
+                continue
+            if value.startswith("--"):
+                index, event = self._parse_tar_long_event(values, index)
+                if event is not None:
+                    events.append(event)
+                continue
+
+            index, short_modes, short_events = self._parse_tar_short_events(
+                values,
+                index,
+                value[1:],
+            )
+            modes.extend(short_modes)
+            events.extend(short_events)
+
+        unique_modes = set(modes)
+        if len(unique_modes) != 1:
+            raise CommandPolicyViolation("cannot safely resolve tar operation")
+        return _TarInvocation(
+            mode=unique_modes.pop(),
+            events=tuple(events),
+            remove_files=remove_files,
+        )
+
+    def _parse_tar_long_event(
+        self,
+        values: Sequence[str],
+        index: int,
+    ) -> tuple[int, _TarEvent | None]:
+        value = values[index]
+        path_options: dict[str, TarEventKind] = {
+            "--file": "archive",
+            "--directory": "directory",
+            "--files-from": "files_from",
+            "--exclude-from": "exclude_from",
+            "--listed-incremental": "incremental",
+            "--add-file": "add_file",
+        }
+        dangerous_options = {
+            "--use-compress-program",
+            "--to-command",
+            "--checkpoint-action",
+            "--info-script",
+            "--new-volume-script",
+            "--rsh-command",
+        }
+        option, separator, attached = value.partition("=")
+        kind = path_options.get(option)
+        is_dangerous = option in dangerous_options
+        if kind is None and not is_dangerous:
+            return index + 1, None
+
+        if separator:
+            argument: str | None = self._derived_value(value, attached)
+            next_index = index + 1
+        elif index + 1 < len(values):
+            argument = values[index + 1]
+            next_index = index + 2
+        else:
+            raise CommandPolicyViolation(f"missing tar argument for {option}")
+
+        if is_dangerous:
+            return next_index, _TarEvent("dangerous", argument)
+        return next_index, _TarEvent(cast(TarEventKind, kind), argument)
+
+    def _parse_tar_short_events(
+        self,
+        values: Sequence[str],
+        index: int,
+        options: str,
+    ) -> tuple[int, list[TarMode], list[_TarEvent]]:
+        short_modes: dict[str, TarMode] = {
+            "c": "create",
+            "r": "append",
+            "u": "update",
+            "A": "concatenate",
+            "x": "extract",
+            "t": "list",
+            "d": "compare",
+        }
+        argument_events: dict[str, TarEventKind | None] = {
+            "f": "archive",
+            "C": "directory",
+            "T": "files_from",
+            "X": "exclude_from",
+            "g": "incremental",
+            "I": "dangerous",
+            "F": "dangerous",
+            "b": None,
+        }
+        modes: list[TarMode] = []
+        events: list[_TarEvent] = []
+        cursor = 0
+        next_index = index + 1
+
+        while cursor < len(options):
+            option = options[cursor]
+            if option in short_modes:
+                modes.append(short_modes[option])
+                cursor += 1
+                continue
+            if option == "P":
+                events.append(_TarEvent("absolute_names"))
+                cursor += 1
+                continue
+            if option == "O":
+                cursor += 1
+                continue
+            if option not in argument_events:
+                cursor += 1
+                continue
+
+            argument: str
+            attached = options[cursor + 1 :]
+            if attached:
+                argument = self._derived_value(values[index], attached)
+            elif next_index < len(values):
+                argument = values[next_index]
+                next_index += 1
+            else:
+                raise CommandPolicyViolation(f"missing tar argument for -{option}")
+            kind = argument_events[option]
+            if kind is not None:
+                events.append(_TarEvent(kind, argument))
+            break
+
+        return next_index, modes, events
+
+    def _check_tar_archive_path(
+        self,
+        raw_path: str,
+        cwd: Path,
+        access: PathAccess,
+    ) -> None:
+        if raw_path != "-" and ":" in raw_path:
+            raise CommandPolicyViolation(
+                "remote tar archives cannot be inspected safely"
+            )
+        self._check_path(raw_path, cwd, access)
+
     def _inspect_script_file(
         self,
         language: Literal["sed", "awk"],
         raw_path: str,
         cwd: Path,
     ) -> None:
+        script = self._read_policy_script(raw_path, cwd)
+        if script is not None:
+            self._reject_embedded_io(language, script)
+
+    def _read_policy_script(self, raw_path: str, cwd: Path) -> str | None:
         script_path = self._check_path(raw_path, cwd, "read")
         if self._path_access_observer is not None:
-            return
+            return None
 
         descriptor: int | None = None
         try:
@@ -654,17 +1178,32 @@ class WorkspaceCommandPathGuard:
         finally:
             if descriptor is not None:
                 os.close(descriptor)
-        self._reject_embedded_io(language, script)
+        return script
+
+    def _inspect_shell_script(
+        self,
+        raw_path: str,
+        state: _ShellState,
+        *,
+        propagate_state: bool,
+    ) -> _ShellState:
+        if state.script_depth >= _MAX_INSPECTED_SCRIPT_DEPTH:
+            raise CommandPolicyViolation("shell script inspection depth exceeded")
+        script = self._read_policy_script(raw_path, state.cwd)
+        if script is None:
+            return state
+        nested_state = replace(state, script_depth=state.script_depth + 1)
+        validated_state = self._validate_shell_text(script, nested_state)
+        if not propagate_state:
+            return state
+        return replace(validated_state, script_depth=state.script_depth)
 
     @staticmethod
     def _reject_embedded_io(language: Literal["sed", "awk"], script: str) -> None:
+        if isinstance(script, _CommandValue) and not script.is_static:
+            raise CommandPolicyViolation(f"cannot inspect dynamic {language} program")
         if language == "awk":
-            unsafe = bool(
-                re.search(r"\bsystem\s*\(", script)
-                or re.search(r"\bgetline\b", script)
-                or re.search(r">>?\s*[\"']", script)
-                or re.search(r"\|\s*[\"']", script)
-            )
+            unsafe = WorkspaceCommandPathGuard._awk_has_unsafe_io(script)
         else:
             unsafe = WorkspaceCommandPathGuard._sed_has_unsafe_io(script)
         if unsafe:
@@ -674,13 +1213,41 @@ class WorkspaceCommandPathGuard:
             )
 
     @staticmethod
+    def _awk_has_unsafe_io(script: str) -> bool:
+        if _AWK_ALWAYS_UNSAFE_IO_PATTERN.search(script):
+            return True
+
+        for match in _AWK_PRINT_PATTERN.finditer(script):
+            index = match.end()
+            depth = 0
+            quote: str | None = None
+            escaped = False
+            while index < len(script):
+                char = script[index]
+                index += 1
+                if quote is not None:
+                    if escaped:
+                        escaped = False
+                    elif char == "\\":
+                        escaped = True
+                    elif char == quote:
+                        quote = None
+                    continue
+                if char in {"'", '"'}:
+                    quote = char
+                elif char == "(":
+                    depth += 1
+                elif char == ")" and depth:
+                    depth -= 1
+                elif char in ";\n" and depth == 0:
+                    break
+                elif char in {">", "|"} and depth == 0:
+                    return True
+        return False
+
+    @staticmethod
     def _sed_has_unsafe_io(script: str) -> bool:
-        address = r"(?:\d+|\$|/(?:\\.|[^/\n])*/)"
-        file_or_exec_command = re.compile(
-            rf"(?:^|[;\n])\s*(?:{address}(?:\s*,\s*{address})?\s*)?"
-            r"[rRwWe](?:\s|$)"
-        )
-        if file_or_exec_command.search(script):
+        if _SED_FILE_OR_EXEC_COMMAND_PATTERN.search(script):
             return True
 
         # Parse substitution flags sufficiently to catch GNU sed's ``e`` and
@@ -760,30 +1327,33 @@ class WorkspaceCommandPathGuard:
         if not roots:
             roots = ["."]
         expression = literals[expression_start:]
-        exec_commands = self._parse_find_exec_commands(expression)
+        exec_clauses = self._parse_find_exec_commands(expression)
         access: PathAccess = (
             "write"
             if "-delete" in expression
             or any(
-                self._find_exec_command_writes(command, cwd)
-                for command in exec_commands
+                self._find_exec_command_writes(clause, cwd) for clause in exec_clauses
             )
             else "read"
         )
         for root in roots:
             self._check_path(root, cwd, access)
 
-        for command in exec_commands:
-            self._validate_nested_command_words(command, cwd)
+        for clause in exec_clauses:
+            self._validate_nested_command_words(
+                clause.command,
+                _ShellState(cwd=cwd),
+            )
 
     @staticmethod
     def _parse_find_exec_commands(
         expression: Sequence[str],
-    ) -> list[tuple[str, ...]]:
-        commands: list[tuple[str, ...]] = []
+    ) -> list[_FindExecClause]:
+        clauses: list[_FindExecClause] = []
         index = 0
         while index < len(expression):
-            if expression[index] not in {"-exec", "-execdir"}:
+            marker = expression[index]
+            if marker not in {"-exec", "-execdir"}:
                 index += 1
                 continue
             nested: list[str] = []
@@ -792,43 +1362,151 @@ class WorkspaceCommandPathGuard:
                 nested.append(expression[index])
                 index += 1
             if nested:
-                commands.append(tuple(nested))
+                clauses.append(
+                    _FindExecClause(
+                        marker=cast(Literal["-exec", "-execdir"], marker),
+                        command=tuple(nested),
+                    )
+                )
             index += 1
-        return commands
+        return clauses
 
     def _find_exec_command_writes(
         self,
-        command: Sequence[str],
+        clause: _FindExecClause,
         cwd: Path,
     ) -> bool:
+        command = clause.command
         if not command:
             return False
 
-        writes_placeholder = False
+        writes_from_find_root = False
 
         def observe_path(raw_path: str, access: PathAccess) -> None:
-            nonlocal writes_placeholder
-            if access == "write" and "{}" in raw_path:
-                writes_placeholder = True
+            nonlocal writes_from_find_root
+            if access != "write":
+                return
+            if "{}" in raw_path or (
+                clause.marker == "-execdir" and self._is_relative_file_operand(raw_path)
+            ):
+                writes_from_find_root = True
 
         probe = WorkspaceCommandPathGuard(
             self._workspace,
             _path_access_observer=observe_path,
         )
         try:
-            probe._validate_nested_command_words(command, cwd)
-        except CommandPathViolation:
+            probe._validate_nested_command_words(command, _ShellState(cwd=cwd))
+        except CommandPolicyViolation:
             # The regular validation pass reports statically unsafe embedded
             # programs. This probe only classifies placeholder path access.
             pass
-        return writes_placeholder
+        return writes_from_find_root
 
-    def _check_nested_shell(self, literals: Sequence[str], cwd: Path) -> None:
+    @staticmethod
+    def _is_relative_file_operand(raw_path: str) -> bool:
+        return raw_path not in {"", "-", "{}"} and not Path(raw_path).is_absolute()
+
+    def _check_nested_shell(
+        self,
+        command_name: str,
+        literals: Sequence[str],
+        state: _ShellState,
+    ) -> None:
+        command_option_index: int | None = None
         for index, value in enumerate(literals[:-1]):
-            if value.startswith("-") and "c" in value[1:]:
-                self._validate_shell_text(literals[index + 1], cwd)
-                return
-        self._check_operands(literals, cwd, "read")
+            if (
+                value.startswith("-")
+                and not value.startswith("--")
+                and "c" in value[1:]
+            ):
+                command_option_index = index
+                break
+
+        file_values = (
+            literals
+            if command_option_index is None
+            else literals[:command_option_index]
+        )
+        if command_name == "bash":
+            file_values, initialization_files = self._extract_bash_file_options(
+                file_values
+            )
+            for initialization_file in initialization_files:
+                self._inspect_shell_script(
+                    initialization_file,
+                    state,
+                    propagate_state=False,
+                )
+
+        if command_option_index is not None:
+            self._validate_shell_text(literals[command_option_index + 1], state)
+            return
+
+        script = self._shell_script_operand(file_values)
+        if script is None:
+            raise CommandPolicyViolation(
+                f"cannot inspect {command_name} input without command text or a script"
+            )
+        self._inspect_shell_script(script, state, propagate_state=False)
+
+    @staticmethod
+    def _extract_bash_file_options(
+        values: Sequence[str],
+    ) -> tuple[list[str], list[str]]:
+        remaining: list[str] = []
+        initialization_files: list[str] = []
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value in _BASH_FILE_OPTIONS:
+                if index + 1 < len(values):
+                    initialization_files.append(values[index + 1])
+                index += 2
+                continue
+            if any(value.startswith(f"{option}=") for option in _BASH_FILE_OPTIONS):
+                initialization_files.append(value.split("=", 1)[1])
+                index += 1
+                continue
+            remaining.append(value)
+            index += 1
+        return remaining, initialization_files
+
+    def _check_sourced_shell(
+        self,
+        values: Sequence[str],
+        state: _ShellState,
+    ) -> _ShellState:
+        operands = self._operands(values)
+        if not operands:
+            raise CommandPolicyViolation("cannot inspect source without a script")
+        return self._inspect_shell_script(
+            operands[0],
+            state,
+            propagate_state=True,
+        )
+
+    @staticmethod
+    def _shell_script_operand(values: Sequence[str]) -> str | None:
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value == "--":
+                return values[index + 1] if index + 1 < len(values) else None
+            if value in {"-o", "-O"}:
+                index += 2
+                continue
+            if value == "-s" or (
+                value.startswith("-")
+                and not value.startswith("--")
+                and "s" in value[1:]
+            ):
+                return None
+            if value.startswith("-") and value != "-":
+                index += 1
+                continue
+            return value
+        return None
 
     def _check_xargs(self, values: Sequence[str], cwd: Path) -> None:
         command_start = len(values)
@@ -881,13 +1559,22 @@ class WorkspaceCommandPathGuard:
             break
 
         if command_start < len(values):
-            self._validate_nested_command_words(values[command_start:], cwd)
+            self._validate_nested_command_words(
+                values[command_start:],
+                _ShellState(cwd=cwd),
+            )
 
-    def _validate_nested_command_words(self, words: Sequence[str], cwd: Path) -> None:
+    def _validate_nested_command_words(
+        self,
+        words: Sequence[str],
+        state: _ShellState,
+    ) -> None:
         if not words:
             return
+        if isinstance(words[0], _CommandValue) and not words[0].is_static:
+            raise CommandPolicyViolation("cannot resolve dynamic command name")
         command_name = os.path.basename(words[0])
-        self._validate_command_values(command_name, words[1:], cwd)
+        self._validate_command_values(command_name, words[1:], state)
 
     @staticmethod
     def _parse_target_directory(
@@ -919,23 +1606,28 @@ class WorkspaceCommandPathGuard:
             index += 1
         return target_dir, operands
 
-    def _validate_shell_text(self, command: str, cwd: Path) -> None:
+    def _validate_shell_text(
+        self,
+        command: str,
+        state: _ShellState,
+    ) -> _ShellState:
+        if isinstance(command, _CommandValue) and not command.is_static:
+            raise CommandPolicyViolation("cannot resolve dynamic shell command text")
         nodes = self._parse_shell(command)
-        if nodes is None:
-            return
-        current = cwd
+        current = state
         for node in nodes:
             current = self._validate_node(node, current)
+        return current
 
-    def _validate_nested_nodes(self, node: Any, cwd: Path) -> None:
+    def _validate_nested_nodes(self, node: Any, state: _ShellState) -> None:
         for attr_name in ("parts", "command", "list"):
             child = getattr(node, attr_name, None)
             if isinstance(child, list):
                 for item in child:
                     if getattr(item, "kind", None) is not None:
-                        self._validate_node(item, cwd)
+                        self._validate_node(item, state)
             elif getattr(child, "kind", None) is not None:
-                self._validate_node(child, cwd)
+                self._validate_node(child, state)
 
     @staticmethod
     def _literal_word(word: Any) -> str | None:
@@ -945,14 +1637,33 @@ class WorkspaceCommandPathGuard:
             return None
         return str(word.word)
 
-    def _literal_values(self, words: Sequence[Any]) -> list[str]:
-        return [
-            value for word in words if (value := self._literal_word(word)) is not None
-        ]
+    @staticmethod
+    def _command_value(word: Any) -> _CommandValue:
+        parts = getattr(word, "parts", ())
+        return _CommandValue(
+            str(word.word),
+            # Tilde expansion is deterministic at the policy boundary and is
+            # resolved by Path.expanduser(); other shell parts remain dynamic.
+            is_static=not parts
+            or all(getattr(part, "kind", None) == "tilde" for part in parts),
+        )
 
-    def _first_operand(self, values: Sequence[str]) -> str | None:
-        operands = self._operands(values)
-        return operands[0] if operands else None
+    def _command_values(self, words: Sequence[Any]) -> list[_CommandValue]:
+        return [self._command_value(word) for word in words]
+
+    @staticmethod
+    def _derived_value(source: str, value: str) -> _CommandValue:
+        return _CommandValue(
+            value,
+            is_static=(not isinstance(source, _CommandValue) or source.is_static),
+        )
+
+    @staticmethod
+    def _reject_dynamic_values(context: str, values: Sequence[str]) -> None:
+        if any(
+            isinstance(value, _CommandValue) and not value.is_static for value in values
+        ):
+            raise CommandPolicyViolation(f"cannot resolve dynamic {context}")
 
     @staticmethod
     def _operands(values: Sequence[str]) -> list[str]:
@@ -968,6 +1679,9 @@ class WorkspaceCommandPathGuard:
         return operands
 
     def _check_path(self, raw_path: str, cwd: Path, access: PathAccess) -> Path:
+        if isinstance(raw_path, _CommandValue) and not raw_path.is_static:
+            raise CommandPolicyViolation("cannot resolve dynamic path operand")
+
         if self._path_access_observer is not None:
             self._path_access_observer(raw_path, access)
             return cwd
