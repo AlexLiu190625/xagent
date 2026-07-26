@@ -18,7 +18,7 @@ import textwrap
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
-from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, cast
+from typing import TYPE_CHECKING, Any, AsyncIterator, Coroutine, Optional, cast
 
 from docker.errors import APIError, ImageNotFound, NotFound
 
@@ -380,24 +380,47 @@ def _check_no_conflicting_volumes(
 def _check_no_conflicting_ports(
     ports: Optional[list[tuple[int, int]]],
 ) -> None:
-    """Reject desired ports that share a guest port but disagree on host port.
+    """Reject desired ports that collide on either side of the mapping.
 
-    ``_create_container`` builds its Docker ``ports`` dict keyed by guest
-    port, so two entries with the same guest port but a different host port
-    would silently drop one of them. Exactly identical pairs (duplicates)
-    are accepted and simply collapse; this only rejects a real disagreement.
+    Two failure modes share this check:
+
+    - Guest-side: ``_create_container`` builds its Docker ``ports`` dict
+      keyed by guest port, so two entries with the same guest port but a
+      different host port would silently drop one of them — a dict
+      collapsing entries with no error.
+    - Host-side: two entries with different guest ports but the same
+      nonzero host port pass straight through to Docker, which only rejects
+      the overlap when the container *starts* (a raw ``APIError``/500), not
+      at create time.
+
+    Both are turned into the same pre-create, typed
+    ``SandboxRuntimeConflictError`` here instead of surfacing later as a
+    silent drop or a raw daemon error. Exactly identical pairs (duplicates)
+    are accepted and simply collapse; a host port of ``0`` (meaning "let
+    Docker assign an ephemeral port") is excluded from the host-side check
+    since many guest ports may legitimately share it.
     """
     if not ports:
         return
-    seen: dict[int, int] = {}
+    seen_by_guest: dict[int, int] = {}
+    seen_by_host: dict[int, int] = {}
     for host_port, guest_port in ports:
-        prior = seen.get(guest_port)
-        if prior is not None and prior != host_port:
+        prior_host = seen_by_guest.get(guest_port)
+        if prior_host is not None and prior_host != host_port:
             raise SandboxRuntimeConflictError(
                 f"Conflicting desired port mappings for guest port "
-                f"{guest_port}: host {prior} vs {host_port}"
+                f"{guest_port}: host {prior_host} vs {host_port}"
             )
-        seen[guest_port] = host_port
+        seen_by_guest[guest_port] = host_port
+
+        if host_port != 0:
+            prior_guest = seen_by_host.get(host_port)
+            if prior_guest is not None and prior_guest != guest_port:
+                raise SandboxRuntimeConflictError(
+                    f"Conflicting desired port mappings for host port "
+                    f"{host_port}: guest {prior_guest} vs {guest_port}"
+                )
+            seen_by_host[host_port] = guest_port
 
 
 def _find_publish_mismatches(
@@ -991,6 +1014,57 @@ class DockerSandboxService(SandboxService):
         if self._locks.get(name) is entry:
             self._locks.pop(name, None)
 
+    @staticmethod
+    async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
+        """Run ``coro`` to completion even under repeated cancellation.
+
+        Used by create() for its two compensating ``container.remove()``
+        calls, both of which execute inside ``_named_lock(name)``. That
+        lock's ``finally: entry.lock.release()`` runs as soon as a
+        ``CancelledError`` propagates out of the ``async with`` body, so a
+        bare ``await asyncio.to_thread(container.remove, ...)`` releases the
+        lock the instant a cancellation lands on it — while the remove is
+        still running in its background thread (``to_thread`` cancellation
+        stops waiting, it does not stop the thread). A same-name create()
+        that then acquires the freed lock can race that in-flight remove and
+        observe a transient "already exists" error from Docker.
+
+        Mirrors the shield-loop in
+        ``TaskTurnOrchestrator.begin_turn`` (web/services/task_orchestrator.py):
+        wrap the coroutine in its own task and await it under
+        ``asyncio.shield`` in a loop, so any number of cancellations delivered
+        to *this* await is absorbed without cancelling the underlying task.
+        Once the task settles, the original cancellation is re-raised
+        regardless of how the task itself settled (the task's own exception,
+        if any, is logged but not raised) so the caller's cancellation is
+        still honored; if no cancellation occurred, the task's result or
+        exception is returned/propagated unchanged.
+        """
+        task = asyncio.ensure_future(coro)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task_error = task.exception()
+                if task_error is not None:
+                    logger.error(
+                        "Compensating container operation failed while a"
+                        " cancelled caller was waiting for it to settle",
+                        exc_info=(
+                            type(task_error),
+                            task_error,
+                            task_error.__traceback__,
+                        ),
+                    )
+            raise
+
     def _get_control(self, name: str) -> _SandboxControl:
         """Get the shared runtime control object for a sandbox."""
         if name not in self._controls:
@@ -1207,9 +1281,18 @@ class DockerSandboxService(SandboxService):
                 # entry, so calling it here would self-deadlock. The
                 # original start failure (including a cancellation) is
                 # preserved as the raised exception regardless of whether
-                # the compensating remove itself succeeds.
+                # the compensating remove itself succeeds. The remove runs
+                # through _await_shielded so that a cancellation landing
+                # here (e.g. a second cancel on top of the one that failed
+                # start) cannot cut the remove short and let this method's
+                # `_named_lock(name)` release while it is still in flight —
+                # that would let a same-name create() race an in-flight
+                # remove. If such a cancellation occurs, it is re-raised
+                # once the remove settles, taking priority over start_exc.
                 try:
-                    await asyncio.to_thread(container.remove, force=True)
+                    await self._await_shielded(
+                        asyncio.to_thread(container.remove, force=True)
+                    )
                 except Exception as remove_exc:
                     raise start_exc from remove_exc
                 raise start_exc
@@ -1222,8 +1305,16 @@ class DockerSandboxService(SandboxService):
                 # asked for must never be published: remove it directly
                 # (never self.delete(), for the same self-deadlock reason as
                 # the start-failure path above) and fail loudly rather than
-                # let a lying label reach the store.
-                await asyncio.to_thread(container.remove, force=True)
+                # let a lying label reach the store. Routed through
+                # _await_shielded for the same reason as the start-failure
+                # compensation above: a cancellation here must not cut the
+                # remove short and release `_named_lock(name)` while it is
+                # still in flight. If a cancellation occurs, it is re-raised
+                # once the remove settles, taking priority over the
+                # SandboxRuntimeConflictError below.
+                await self._await_shielded(
+                    asyncio.to_thread(container.remove, force=True)
+                )
                 raise SandboxRuntimeConflictError(
                     f"Sandbox {name!r} failed publish verification; "
                     f"mismatched fields: {', '.join(mismatches)}"

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect as std_inspect
+import threading
 import uuid
 from contextlib import asynccontextmanager
 
@@ -148,6 +149,24 @@ class TestLabelConstants:
         assert docker_sandbox_module.LABEL_SPEC_VERSION == "xagent.sandbox.spec.version"
 
 
+class TestCheckNoConflictingPorts:
+    """Pin both directions of _check_no_conflicting_ports: a guest-side
+    collision (silently dropped by _create_container's guest-keyed dict) and
+    a host-side collision (only ever caught by Docker at container start, as
+    a raw 500)."""
+
+    def test_rejects_same_host_port_for_different_guest_ports(self):
+        with pytest.raises(SandboxRuntimeConflictError, match="host port"):
+            docker_sandbox_module._check_no_conflicting_ports(
+                [(18080, 80), (18080, 81)]
+            )
+
+    def test_accepts_multiple_ephemeral_host_ports_for_different_guests(self):
+        # host_port == 0 means "let Docker assign an ephemeral port"; many
+        # guest ports may legitimately share it.
+        docker_sandbox_module._check_no_conflicting_ports([(0, 80), (0, 81), (0, 82)])
+
+
 # --- supports_runtime_spec ---
 
 
@@ -201,6 +220,92 @@ class TestCreateStartFailureCompensation:
             )
 
         assert created.remove_calls == [True]
+
+
+class TestCreateCompensationHoldsLockUnderRepeatedCancellation:
+    """Pin the fix for _await_shielded: create()'s compensating remove()
+    must run to completion, and _named_lock(name) must stay held the whole
+    time, even if the caller's task is cancelled more than once while the
+    remove is in flight. Before this fix, a second cancellation landing on
+    the bare ``await asyncio.to_thread(container.remove, ...)`` would let
+    _named_lock's ``finally: entry.lock.release()`` run while the remove was
+    still executing in its worker thread, so a same-name create() started
+    right after could race that in-flight remove and see a transient
+    AlreadyExists error from Docker.
+    """
+
+    @pytest.mark.asyncio
+    async def test_lock_stays_held_until_slow_remove_settles_across_two_cancels(
+        self, monkeypatch
+    ):
+        remove_started = threading.Event()
+        release_remove = threading.Event()
+        remove_finished = threading.Event()
+
+        class _SlowRemoveContainer:
+            def __init__(self):
+                self.remove_calls: list[bool] = []
+
+            def start(self):
+                raise RuntimeError("start failed, forcing compensation")
+
+            def remove(self, force: bool = False):
+                remove_started.set()
+                release_remove.wait(timeout=5)
+                self.remove_calls.append(force)
+                remove_finished.set()
+
+        created = _SlowRemoveContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+
+        service = DockerSandboxService(MemDockerStore(), client=_FakeDockerClient())
+        name = "slow-remove-compensation"
+
+        task = asyncio.ensure_future(
+            service.create(
+                name,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                SandboxConfig(),
+            )
+        )
+
+        while not remove_started.is_set():
+            await asyncio.sleep(0.01)
+
+        # First cancellation lands while the compensating remove() is
+        # still blocked in its worker thread.
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert not remove_finished.is_set()
+        assert name in service._locks, (
+            "the name lock entry must not be evicted while remove() is still in flight"
+        )
+        assert service._locks[name].lock.locked(), (
+            "the name lock must still be held while remove() is still in flight"
+        )
+
+        # A second cancellation lands on top of the first, before remove()
+        # has settled.
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert not remove_finished.is_set()
+        assert service._locks[name].lock.locked()
+
+        # Only now let the compensating remove() actually finish.
+        release_remove.set()
+
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert remove_finished.is_set()
+        assert created.remove_calls == [True]
+        assert name not in service._locks
 
 
 class TestCreatePublishVerification:
