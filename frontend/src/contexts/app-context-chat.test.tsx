@@ -16,13 +16,27 @@ type TestWebSocketMessage = {
 
 const webSocketOptions = vi.hoisted(() => ({
   current: null as null | {
+    connection?: {
+      identity: string
+      url: string
+      protocols?: string[]
+      expectedProtocol?: string
+      taskId?: number
+      chatTaskIdMode: "required" | "omit"
+      credentialOwner: { kind: "external" }
+    } | null
+    deliveryGeneration?: number
+    onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: () => void
+    uploadFiles?: unknown
   },
 }))
 const sendChatMessageMock = vi.hoisted(() => vi.fn())
+const sendRawMessageMock = vi.hoisted(() => vi.fn())
 const wsHarness = vi.hoisted(() => ({ isConnected: true }))
 const apiRequestMock = vi.hoisted(() => vi.fn())
+const routerPushMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/lib/api-wrapper", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api-wrapper")>()
@@ -33,7 +47,7 @@ vi.mock("@/lib/api-wrapper", async (importOriginal) => {
 })
 
 vi.mock("next/navigation", () => ({
-  useRouter: () => ({ push: vi.fn(), replace: vi.fn(), refresh: vi.fn() }),
+  useRouter: () => ({ push: routerPushMock, replace: vi.fn(), refresh: vi.fn() }),
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
@@ -46,13 +60,26 @@ vi.mock("@/contexts/i18n-context", () => ({
 
 vi.mock("@/hooks/use-websocket", () => ({
   useWebSocket: (options: {
+    connection?: {
+      identity: string
+      url: string
+      protocols?: string[]
+      expectedProtocol?: string
+      taskId?: number
+      chatTaskIdMode: "required" | "omit"
+      credentialOwner: { kind: "external" }
+    } | null
+    deliveryGeneration?: number
+    onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: () => void
+    uploadFiles?: unknown
   }) => {
     webSocketOptions.current = options
     return {
       isConnected: wsHarness.isConnected,
       connectionError: null,
+      sendMessage: sendRawMessageMock,
       sendChatMessage: sendChatMessageMock,
       executeTask: vi.fn(),
       pauseTask: vi.fn(),
@@ -113,10 +140,128 @@ function StateProbe() {
         )}
       </div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="task-id">{state.taskId ?? ""}</div>
+      <div data-testid="steps-count">{state.steps.length}</div>
+      <div data-testid="history-loading">{String(state.isHistoryLoading)}</div>
+      <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
     </>
   )
 }
+
+function MessageContentProbe() {
+  const { state } = useApp()
+  return (
+    <div data-testid="message-content">
+      {state.messages.map(message => (
+        <React.Fragment key={message.id}>{message.content}</React.Fragment>
+      ))}
+    </div>
+  )
+}
+
+type SessionControls = ReturnType<typeof useApp> & {
+  startNewConversation: () => Promise<void>
+  isConversationResetPending: boolean
+  isMessageDeliveryPending: boolean
+}
+
+let sessionControls: SessionControls | null = null
+
+function SessionControlsProbe() {
+  sessionControls = useApp() as SessionControls
+  return (
+    <>
+      <div data-testid="reset-pending">
+        {String(sessionControls.isConversationResetPending)}
+      </div>
+      <div data-testid="message-delivery-pending">
+        {String(sessionControls.isMessageDeliveryPending)}
+      </div>
+    </>
+  )
+}
+
+function getSessionControls(): SessionControls {
+  if (!sessionControls) {
+    throw new Error("Session controls are not mounted")
+  }
+  return sessionControls
+}
+
+const makeSessionConnection = (identity = "session-one") => ({
+  identity,
+  url: `wss://au.cloud.xagent.co/v1/widget/sessions/${identity}/ws`,
+  protocols: ["xagent-session", `credential-${identity}`],
+  expectedProtocol: "xagent-session",
+  chatTaskIdMode: "omit" as const,
+  credentialOwner: { kind: "external" as const },
+})
+
+const makeSessionTransport = (
+  connection: ReturnType<typeof makeSessionConnection> | null = makeSessionConnection(),
+) => ({
+  uploadFiles: vi.fn(),
+  session: {
+    connection,
+    onConnectionClose: () => "handled" as const,
+    allowTasklessChat: true as const,
+    supportsConversationReset: true as const,
+    preserveConversationOnReconnect: true as const,
+    adoptTaskIdFromTaskInfo: true as const,
+    history: "none" as const,
+    files: "disabled" as const,
+  },
+})
+
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void
+  let reject!: (error: Error) => void
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise
+    reject = rejectPromise
+  })
+  return { promise, reject, resolve }
+}
+
+const taskInfoMessage = (
+  taskId: unknown,
+  overrides: Record<string, unknown> = {},
+): TestWebSocketMessage => ({
+  type: "trace_event",
+  timestamp: "2026-05-27T05:00:00Z",
+  data: {
+    event_id: `task-info-${String(taskId)}`,
+    event_type: "task_info",
+    data: {
+      id: taskId,
+      title: `Task ${String(taskId)}`,
+      status: "running",
+      description: "Session task",
+      created_at: "2026-05-27T05:00:00Z",
+      updated_at: "2026-05-27T05:00:00Z",
+      ...overrides,
+    },
+  },
+})
+
+const assistantMessage = (
+  content: string,
+  taskId?: number,
+): TestWebSocketMessage => ({
+  type: "trace_event",
+  timestamp: "2026-05-27T05:00:01Z",
+  ...(taskId === undefined ? {} : { task_id: taskId }),
+  data: {
+    event_id: `assistant-${content}`,
+    event_type: "agent_message",
+    data: {
+      message: content,
+      content,
+      role: "assistant",
+    },
+  },
+})
 
 function SeedRunningTask() {
   const { dispatch } = useApp()
@@ -214,8 +359,11 @@ describe("task control envelope parsing", () => {
 describe("AppProvider websocket message routing", () => {
   beforeEach(() => {
     webSocketOptions.current = null
+    sessionControls = null
     wsHarness.isConnected = true
     apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    sendRawMessageMock.mockReset()
     sendChatMessageMock.mockReset()
     sendChatMessageMock.mockResolvedValue({
       client_message_id: "turn-optimistic",
@@ -1162,5 +1310,757 @@ describe("AppProvider websocket message routing", () => {
         "Which file should I use?"
       )
     })
+  })
+
+  it("passes the persistent Session transport contract and sends the first taskless turn only through the socket", async () => {
+    const transport = makeSessionTransport()
+    const acknowledgement = deferred<{
+      client_message_id: string
+      turn_id: string
+    }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+
+    render(
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    expect(webSocketOptions.current?.connection).toEqual(
+      transport.session.connection
+    )
+    expect(webSocketOptions.current?.deliveryGeneration).toBe(0)
+    expect(webSocketOptions.current?.onConnectionClose).toBe(
+      transport.session.onConnectionClose
+    )
+    expect(webSocketOptions.current?.uploadFiles).toBeUndefined()
+
+    let delivery!: Promise<void>
+    act(() => {
+      delivery = getSessionControls().sendMessage("First Session turn", {
+        clientMessageId: "session-turn-1",
+      })
+    })
+
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(sendChatMessageMock).toHaveBeenCalledWith(
+      "First Session turn",
+      undefined,
+      undefined,
+      "session-turn-1"
+    )
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "First Session turn"
+    )
+
+    await act(async () => {
+      acknowledgement.resolve({
+        client_message_id: "session-turn-1",
+        turn_id: "session-turn-1",
+      })
+      await delivery
+    })
+
+    expect(screen.getByTestId("messages").textContent).toContain(
+      "First Session turn"
+    )
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("renders Session events live and adopts task_info without legacy navigation or conversation clearing", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => {
+      webSocketOptions.current?.onConnect?.()
+    })
+    expect(screen.getByTestId("history-loading").textContent).toBe("false")
+
+    act(() => {
+      const tasklessLiveEvent = assistantMessage("Live before task_info")
+      webSocketOptions.current?.onMessage?.({
+        ...tasklessLiveEvent,
+        task_id: undefined,
+        task: { id: undefined },
+        data: {
+          ...(tasklessLiveEvent.data as object),
+          task_id: undefined,
+          task: { id: undefined },
+        },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Live before task_info"
+      )
+    })
+
+    for (const invalidId of [0, -1, true, ""] as const) {
+      act(() => {
+        webSocketOptions.current?.onMessage?.(taskInfoMessage(invalidId))
+      })
+      expect(screen.getByTestId("task-id").textContent).toBe("")
+    }
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage("37"))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("37")
+    })
+    expect(screen.getByTestId("messages").textContent).toContain(
+      "Live before task_info"
+    )
+    expect(routerPushMock).not.toHaveBeenCalled()
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        ...assistantMessage("Null-bound frame"),
+        task_id: null,
+      } as unknown as TestWebSocketMessage)
+      webSocketOptions.current?.onMessage?.({
+        ...assistantMessage("Boolean-bound frame"),
+        task_id: true,
+      } as unknown as TestWebSocketMessage)
+      webSocketOptions.current?.onMessage?.({
+        ...assistantMessage("Conflicting-bound frame", 37),
+        data: {
+          ...(assistantMessage("Conflicting-bound frame", 37).data as object),
+          task_id: 38,
+        },
+      })
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Null-bound frame"
+    )
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Boolean-bound frame"
+    )
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Conflicting-bound frame"
+    )
+  })
+
+  it("preserves Session conversation on connection refresh and rejects callbacks from the replaced socket", async () => {
+    const firstTransport = makeSessionTransport(
+      makeSessionConnection("session-before-refresh")
+    )
+    const { rerender } = render(
+      <AppProvider token="token" transport={firstTransport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    const oldOnMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      oldOnMessage?.(taskInfoMessage(41))
+      oldOnMessage?.(assistantMessage("Preserved answer", 41))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("41")
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Preserved answer"
+      )
+    })
+
+    const refreshedTransport = makeSessionTransport(
+      makeSessionConnection("session-after-refresh")
+    )
+    rerender(
+      <AppProvider token="token" transport={refreshedTransport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onConnect?.()
+    })
+
+    expect(screen.getByTestId("task-id").textContent).toBe("41")
+    expect(screen.getByTestId("messages").textContent).toContain(
+      "Preserved answer"
+    )
+    expect(screen.getByTestId("history-loading").textContent).toBe("false")
+
+    act(() => {
+      oldOnMessage?.(assistantMessage("Stale socket answer", 41))
+      webSocketOptions.current?.onMessage?.(
+        assistantMessage("Current socket answer", 41)
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Current socket answer"
+      )
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Stale socket answer"
+    )
+  })
+
+  it("serializes Session reset, clears only on the owned acknowledgement, and gates the next task lineage", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const physicalOnMessage = webSocketOptions.current?.onMessage
+    expect(physicalOnMessage).toBeDefined()
+
+    act(() => {
+      physicalOnMessage?.(taskInfoMessage(51))
+      physicalOnMessage?.(
+        assistantMessage("Old conversation", 51)
+      )
+      getSessionControls().dispatch({
+        type: "SET_STEPS",
+        payload: [{
+          id: "old-step",
+          name: "Old step",
+          description: "Old step",
+          status: "running",
+          dependencies: [],
+        }],
+      })
+      getSessionControls().dispatch({
+        type: "SET_TRACE_EVENTS",
+        payload: [{
+          event_id: "old-trace",
+          event_type: "tool_call",
+          timestamp: "2026-05-27T05:00:02Z",
+          data: {},
+        }],
+      })
+      getSessionControls().dispatch({ type: "SET_PROCESSING", payload: true })
+      getSessionControls().dispatch({
+        type: "OPEN_FILE_PREVIEW",
+        payload: { fileId: "old-file", fileName: "old.pdf" },
+      })
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("51")
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+      expect(screen.getByTestId("preview-open").textContent).toBe("true")
+    })
+
+    let firstReset!: Promise<void>
+    let duplicateReset!: Promise<void>
+    act(() => {
+      firstReset = getSessionControls().startNewConversation()
+      duplicateReset = getSessionControls().startNewConversation()
+    })
+    expect(duplicateReset).toBe(firstReset)
+    expect(sendRawMessageMock).toHaveBeenCalledTimes(1)
+    expect(sendRawMessageMock).toHaveBeenCalledWith({
+      type: "new_conversation",
+    })
+    expect(screen.getByTestId("reset-pending").textContent).toBe("true")
+    expect(screen.getByTestId("messages").textContent).toContain(
+      "Old conversation"
+    )
+    await expect(
+      getSessionControls().sendMessage("Blocked during reset")
+    ).rejects.toThrow(/reset/i)
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      physicalOnMessage?.({
+        type: "conversation_reset",
+        timestamp: "2026-05-27T05:00:03Z",
+        data: {},
+      })
+      await firstReset
+    })
+
+    expect(screen.getByTestId("reset-pending").textContent).toBe("false")
+    expect(screen.getByTestId("task-id").textContent).toBe("")
+    expect(screen.getByTestId("messages").textContent).toBe("[]")
+    expect(screen.getByTestId("trace-events").textContent).toBe("[]")
+    expect(screen.getByTestId("steps-count").textContent).toBe("0")
+    expect(screen.getByTestId("preview-open").textContent).toBe("false")
+    expect(screen.getByTestId("processing").textContent).toBe("false")
+    expect(webSocketOptions.current?.deliveryGeneration).toBe(1)
+
+    act(() => {
+      physicalOnMessage?.(
+        assistantMessage("Retired task output", 51)
+      )
+      physicalOnMessage?.(taskInfoMessage(52))
+      physicalOnMessage?.(
+        assistantMessage("Premature new task output", 52)
+      )
+    })
+    expect(screen.getByTestId("task-id").textContent).toBe("")
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Retired task output"
+    )
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Premature new task output"
+    )
+
+    await act(async () => {
+      await getSessionControls().sendMessage("Start replacement conversation", {
+        clientMessageId: "session-turn-after-reset",
+      })
+    })
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(sendChatMessageMock).toHaveBeenLastCalledWith(
+      "Start replacement conversation",
+      undefined,
+      undefined,
+      "session-turn-after-reset"
+    )
+
+    act(() => {
+      physicalOnMessage?.(taskInfoMessage(52))
+      physicalOnMessage?.(
+        assistantMessage("Replacement answer", 52)
+      )
+      physicalOnMessage?.(
+        assistantMessage("Late retired answer", 51)
+      )
+      physicalOnMessage?.(
+        assistantMessage("Wrong task answer", 99)
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("52")
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Replacement answer"
+      )
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Late retired answer"
+    )
+    expect(screen.getByTestId("messages").textContent).not.toContain(
+      "Wrong task answer"
+    )
+  })
+
+  it("allows only one first replacement-conversation send until task_info adoption", async () => {
+    const firstAcknowledgement = deferred<{
+      client_message_id: string
+      turn_id: string
+    }>()
+    sendChatMessageMock
+      .mockReturnValueOnce(firstAcknowledgement.promise)
+      .mockImplementationOnce(() => (
+        firstAcknowledgement.promise.then(() => {
+          throw new Error("Later concurrent delivery failed")
+        })
+      ))
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const physicalOnMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      physicalOnMessage?.(taskInfoMessage(54))
+    })
+
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      physicalOnMessage?.({
+        type: "conversation_reset",
+        timestamp: "2026-05-27T05:00:03Z",
+        data: {},
+      })
+      await reset
+    })
+
+    const acceptedSend = getSessionControls().sendMessage(
+      "Accepted replacement turn",
+      { clientMessageId: "accepted-replacement-turn" },
+    )
+    const concurrentOutcome = getSessionControls().sendMessage(
+      "Concurrent replacement turn",
+      { clientMessageId: "concurrent-replacement-turn" },
+    ).then(
+      () => "resolved",
+      error => error instanceof Error ? error.message : String(error),
+    )
+
+    await act(async () => {
+      firstAcknowledgement.resolve({
+        client_message_id: "accepted-replacement-turn",
+        turn_id: "accepted-replacement-turn",
+      })
+      await acceptedSend
+      await concurrentOutcome
+    })
+
+    expect(sendChatMessageMock).toHaveBeenCalledTimes(1)
+    await expect(concurrentOutcome).resolves.toMatch(
+      /replacement|conversation|pending/i
+    )
+    expect(apiRequestMock).not.toHaveBeenCalled()
+
+    act(() => {
+      physicalOnMessage?.(taskInfoMessage(55))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("55")
+    })
+  })
+
+  it("rejects Session reset while a durable message delivery is pending", async () => {
+    const acknowledgement = deferred<{
+      client_message_id: string
+      turn_id: string
+    }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    let delivery!: Promise<void>
+    act(() => {
+      delivery = getSessionControls().sendMessage("Still delivering", {
+        clientMessageId: "pending-delivery",
+      })
+    })
+    expect(
+      screen.getByTestId("message-delivery-pending").textContent
+    ).toBe("true")
+    await expect(
+      getSessionControls().startNewConversation()
+    ).rejects.toThrow(/delivery|message/i)
+    expect(sendRawMessageMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      acknowledgement.resolve({
+        client_message_id: "pending-delivery",
+        turn_id: "pending-delivery",
+      })
+      await delivery
+    })
+    expect(
+      screen.getByTestId("message-delivery-pending").textContent
+    ).toBe("false")
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(58))
+    })
+
+    let reset!: Promise<void>
+    act(() => {
+      reset = getSessionControls().startNewConversation()
+    })
+    expect(sendRawMessageMock).toHaveBeenCalledWith({
+      type: "new_conversation",
+    })
+    await act(async () => {
+      webSocketOptions.current?.onMessage?.({
+        type: "conversation_reset",
+        timestamp: "2026-05-27T05:00:03Z",
+        data: {},
+      })
+      await reset
+    })
+  })
+
+  it("rejects reset before the Session has adopted an established task", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    let reset!: Promise<void>
+    act(() => {
+      reset = getSessionControls().startNewConversation()
+    })
+    const resetOutcome = reset.then(
+      () => "resolved",
+      error => error instanceof Error ? error.message : String(error),
+    )
+    await expect(Promise.race([
+      resetOutcome,
+      new Promise<string>(resolve => {
+        window.setTimeout(() => resolve("timeout"), 20)
+      }),
+    ])).resolves.toMatch(/established|task/i)
+  })
+
+  it("rejects an outstanding reset when AppProvider unmounts", async () => {
+    const { unmount } = render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(62))
+    })
+    const resetOutcome = getSessionControls()
+      .startNewConversation()
+      .then(() => "resolved", () => "rejected")
+
+    unmount()
+
+    await expect(Promise.race([
+      resetOutcome,
+      new Promise<string>(resolve => {
+        window.setTimeout(() => resolve("timeout"), 20)
+      }),
+    ])).resolves.toBe("rejected")
+  })
+
+  it("rejects the current reset when the same Session connection disconnects", async () => {
+    const transport = makeSessionTransport()
+    const sessionView = () => (
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const { rerender } = render(sessionView())
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(64))
+      webSocketOptions.current?.onMessage?.(
+        assistantMessage("Conversation survives disconnect", 64)
+      )
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("64")
+      expect(screen.getByTestId("messages").textContent).toContain(
+        "Conversation survives disconnect"
+      )
+    })
+
+    let reset!: Promise<void>
+    act(() => {
+      reset = getSessionControls().startNewConversation()
+    })
+    const resetOutcome = reset.then(
+      () => "resolved",
+      error => error instanceof Error ? error.message : String(error),
+    )
+    expect(screen.getByTestId("reset-pending").textContent).toBe("true")
+    expect(sendRawMessageMock).toHaveBeenCalledTimes(1)
+
+    act(() => {
+      wsHarness.isConnected = false
+      rerender(sessionView())
+    })
+
+    await expect(Promise.race([
+      resetOutcome,
+      new Promise<string>(resolve => {
+        window.setTimeout(() => resolve("timeout"), 20)
+      }),
+    ])).resolves.toMatch(/disconnect|connection/i)
+    expect(screen.getByTestId("reset-pending").textContent).toBe("false")
+    expect(screen.getByTestId("task-id").textContent).toBe("64")
+    expect(screen.getByTestId("messages").textContent).toContain(
+      "Conversation survives disconnect"
+    )
+  })
+
+  it("does not mutate AppProvider state when a pending Session delivery settles after unmount", async () => {
+    const acknowledgement = deferred<{
+      client_message_id: string
+      turn_id: string
+    }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    const consoleError = vi
+      .spyOn(console, "error")
+      .mockImplementation(() => {})
+    const { unmount } = render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const delivery = getSessionControls().sendMessage("Unmounted delivery", {
+      clientMessageId: "unmounted-delivery",
+    })
+
+    unmount()
+    acknowledgement.resolve({
+      client_message_id: "unmounted-delivery",
+      turn_id: "unmounted-delivery",
+    })
+    await delivery
+
+    expect(
+      consoleError.mock.calls.flat().join(" ")
+    ).not.toMatch(/state update.*unmounted|unmounted.*state update/i)
+    consoleError.mockRestore()
+  })
+
+  it("uses adopted task_info version as the Session state-ordering baseline", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.(
+        taskInfoMessage(63, {
+          run_id: "session-run",
+          state_version: 5,
+        })
+      )
+      webSocketOptions.current?.onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:01Z",
+        task_id: 63,
+        run_id: "session-run",
+        state_version: 4,
+        control_state: "paused",
+        status: "paused",
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("running")
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:02Z",
+        task_id: 63,
+        run_id: "session-run",
+        state_version: 6,
+        control_state: "paused",
+        status: "paused",
+      })
+    })
+    expect(screen.getByTestId("task-status").textContent).toBe("paused")
+  })
+
+  it("ignores stale and unsolicited Session reset acknowledgements", async () => {
+    const firstTransport = makeSessionTransport(
+      makeSessionConnection("session-reset-old")
+    )
+    const { rerender } = render(
+      <AppProvider token="token" transport={firstTransport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(61))
+      webSocketOptions.current?.onMessage?.(
+        assistantMessage("Keep on refresh", 61)
+      )
+    })
+    const oldOnMessage = webSocketOptions.current?.onMessage
+    const resetOutcome = getSessionControls()
+      .startNewConversation()
+      .then(() => "resolved", () => "rejected")
+
+    rerender(
+      <AppProvider
+        token="token"
+        transport={makeSessionTransport(
+          makeSessionConnection("session-reset-new")
+        )}
+      >
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      oldOnMessage?.({
+        type: "conversation_reset",
+        timestamp: "2026-05-27T05:00:04Z",
+        data: {},
+      })
+      webSocketOptions.current?.onMessage?.({
+        type: "conversation_reset",
+        timestamp: "2026-05-27T05:00:05Z",
+        data: {},
+      })
+    })
+
+    await expect(resetOutcome).resolves.toBe("rejected")
+    expect(screen.getByTestId("task-id").textContent).toBe("61")
+    expect(screen.getByTestId("messages").textContent).toContain(
+      "Keep on refresh"
+    )
+    expect(screen.getByTestId("reset-pending").textContent).toBe("false")
+  })
+
+  it("fails closed for every Session file entry point without issuing HTTP or socket egress", async () => {
+    const transport = makeSessionTransport()
+    render(
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+        <MessageContentProbe />
+      </AppProvider>
+    )
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+
+    await expect(
+      getSessionControls().sendMessage("Taskless file", undefined, [file])
+    ).rejects.toThrow(/files.*disabled|disabled.*files/i)
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(transport.uploadFiles).not.toHaveBeenCalled()
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(71))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("71")
+    })
+    await expect(
+      getSessionControls().sendMessage("Task file", undefined, [file])
+    ).rejects.toThrow(/files.*disabled|disabled.*files/i)
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(transport.uploadFiles).not.toHaveBeenCalled()
+
+    act(() => {
+      getSessionControls().openFilePreview("manual-file", "manual.pdf")
+    })
+    expect(screen.getByTestId("preview-open").textContent).toBe("false")
+    expect(() =>
+      getSessionControls().getFilePreviewUrl("manual-file")
+    ).toThrow(/files.*disabled|disabled.*files/i)
+    expect(() =>
+      getSessionControls().getFileDownloadUrl("manual-file")
+    ).toThrow(/files.*disabled|disabled.*files/i)
+
+    const previewEvents: Event[] = []
+    const previewListener = (event: Event) => previewEvents.push(event)
+    window.addEventListener("openFilePreview", previewListener)
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 71,
+        task: { id: 71, status: "completed" },
+        status: "completed",
+        file_outputs: [{
+          file_id: "generated-file",
+          filename: "generated.pdf",
+        }],
+      } as TestWebSocketMessage)
+    })
+    expect(screen.getByTestId("preview-open").textContent).toBe("false")
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "agent.logs.event.messages.previewLabel",
+      })
+    )
+    expect(previewEvents).toHaveLength(0)
+    expect(screen.getByTestId("preview-open").textContent).toBe("false")
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    window.removeEventListener("openFilePreview", previewListener)
   })
 })
