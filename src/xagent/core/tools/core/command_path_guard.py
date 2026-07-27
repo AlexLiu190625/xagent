@@ -12,6 +12,7 @@ import logging
 import os
 import re
 import stat
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable, Literal, Sequence, SupportsIndex, cast
@@ -29,6 +30,10 @@ logger = logging.getLogger(__name__)
 
 _MAX_INSPECTED_SCRIPT_BYTES = 1024 * 1024
 _MAX_INSPECTED_SCRIPT_DEPTH = 8
+_COMMAND_WRITTEN_PATHS: ContextVar[set[Path] | None] = ContextVar(
+    "command_written_paths",
+    default=None,
+)
 _AWK_ALWAYS_UNSAFE_IO_PATTERN = re.compile(r"\bsystem\s*\(|\bgetline\b")
 _AWK_PRINT_PATTERN = re.compile(r"\b(?:print|printf)\b")
 _SED_ADDRESS_PATTERN = r"(?:\d+|\$|/(?:\\.|[^/\n])*/)"
@@ -178,22 +183,30 @@ class WorkspaceCommandPathGuard:
 
     def validate(self, command: str) -> None:
         """Reject unsupported syntax and unsafe paths in ``command``."""
-        nodes = self._parse_shell(command)
+        token = _COMMAND_WRITTEN_PATHS.set(set())
+        try:
+            nodes = self._parse_shell(command)
 
-        state = _ShellState(cwd=self._initial_cwd)
-        for node in nodes:
-            state = self._validate_node(node, state)
+            state = _ShellState(cwd=self._initial_cwd)
+            for node in nodes:
+                state = self._validate_node(node, state)
+        finally:
+            _COMMAND_WRITTEN_PATHS.reset(token)
 
     def validate_argv(self, argv: Sequence[str]) -> None:
         """Reject out-of-policy paths in an argument-vector command."""
         if not argv:
             return
-        command_name = os.path.basename(argv[0])
-        self._validate_command_values(
-            command_name,
-            argv[1:],
-            _ShellState(cwd=self._initial_cwd),
-        )
+        token = _COMMAND_WRITTEN_PATHS.set(set())
+        try:
+            command_name = os.path.basename(argv[0])
+            self._validate_command_values(
+                command_name,
+                argv[1:],
+                _ShellState(cwd=self._initial_cwd),
+            )
+        finally:
+            _COMMAND_WRITTEN_PATHS.reset(token)
 
     def _validate_node(self, node: Any, state: _ShellState) -> _ShellState:
         kind = getattr(node, "kind", None)
@@ -1153,6 +1166,11 @@ class WorkspaceCommandPathGuard:
         script_path = self._check_path(raw_path, cwd, "read")
         if self._path_access_observer is not None:
             return None
+        written_paths = _COMMAND_WRITTEN_PATHS.get()
+        if written_paths is not None and script_path in written_paths:
+            raise CommandPolicyViolation(
+                "cannot inspect a script modified earlier in the same command"
+            )
 
         descriptor: int | None = None
         try:
@@ -1696,10 +1714,14 @@ class WorkspaceCommandPathGuard:
             return candidate
 
         try:
-            return self._workspace.resolve_authorized_path(
+            resolved = self._workspace.resolve_authorized_path(
                 candidate,
                 base_dir=cwd,
                 include_external_dirs=access == "read",
             )
         except ValueError as exc:
             raise CommandPathViolation(access=access, path=candidate) from exc
+        written_paths = _COMMAND_WRITTEN_PATHS.get()
+        if access == "write" and written_paths is not None:
+            written_paths.add(resolved)
+        return resolved

@@ -992,6 +992,66 @@ class TestScopedCommandPathGuard:
         assert not (workspace.output_dir / script_name).exists()
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
 
+    @pytest.mark.parametrize(
+        ("script_name", "safe_script", "unsafe_script", "invocation"),
+        [
+            (
+                "replace.sed",
+                "s/own/own/",
+                "w {path}",
+                "sed -f replace.sed own.txt",
+            ),
+            (
+                "replace.awk",
+                "{ print $0 }",
+                'BEGIN {{print "changed" > "{path}"}}',
+                "awk -f replace.awk own.txt",
+            ),
+        ],
+    )
+    def test_rejects_script_overwritten_before_sed_awk_inspection(
+        self,
+        scoped_command_workspace,
+        script_name,
+        safe_script,
+        unsafe_script,
+        invocation,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        script_path = workspace.output_dir / script_name
+        script_path.write_text(safe_script, encoding="utf-8")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+        replacement = unsafe_script.format(path=sibling_file)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"printf '%s\\n' {shlex.quote(replacement)} > {script_name} "
+                    f"&& {invocation}"
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert script_path.read_text(encoding="utf-8") == safe_script
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    def test_script_write_tracking_is_scoped_to_one_validation(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "safe.sed").write_text(
+            "s/own/safe/",
+            encoding="utf-8",
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("printf replacement > safe.sed")
+        guard.validate("sed -f safe.sed own.txt")
+
     @pytest.mark.parametrize("kind", ["device", "fifo"])
     def test_script_inspection_rejects_non_regular_files_without_reading(
         self, scoped_command_workspace, monkeypatch, kind
