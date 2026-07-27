@@ -142,24 +142,22 @@ async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
         files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
     )
 
-    writes_started = 0
-    both_writes_started = asyncio.Event()
+    original_reserve = files_api._reserve_and_copy_upload
+    workers_started = 0
+    workers_ready = threading.Barrier(2)
+    workers_lock = threading.Lock()
 
-    async def interleaved_write(upload, target_path):  # type: ignore[no-untyped-def]
-        nonlocal writes_started
-        writes_started += 1
-        if writes_started == 2:
-            both_writes_started.set()
-        await both_writes_started.wait()
-        payload = await upload.read()
-        target_path.write_bytes(payload)
-        return len(payload)
+    def synchronized_reserve(upload, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal workers_started
+        with workers_lock:
+            workers_started += 1
+        workers_ready.wait(timeout=2)
+        return original_reserve(upload, **kwargs)
 
     monkeypatch.setattr(
         files_api,
-        "_write_upload_with_size_limit",
-        interleaved_write,
-        raising=False,
+        "_reserve_and_copy_upload",
+        synchronized_reserve,
     )
     first = UploadFile(
         filename="same-name.txt",
@@ -192,6 +190,7 @@ async def test_concurrent_same_name_uploads_reserve_distinct_paths_and_contents(
     )
 
     staged = sorted((upload_root / f"user_{user_id}").glob("same-name*.txt"))
+    assert workers_started == 2
     assert len(staged) == 2
     assert {path.read_bytes() for path in staged} == {
         b"first exact contents",
