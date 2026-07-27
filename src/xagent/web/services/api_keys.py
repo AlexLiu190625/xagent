@@ -121,7 +121,8 @@ class AgentApiKeyService:
 
         Returns the staged ORM row and the one-shot plaintext key. The
         row's ``created_at`` is only populated after the caller commits
-        and refreshes.
+        and refreshes. ``runtime_key_receipt`` is replaced with the exact
+        staged transition after the flush succeeds.
         """
         self.runtime_key_receipt = None
         # Serialize legacy single-key rotations for this agent. Multi-key

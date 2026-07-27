@@ -1262,15 +1262,11 @@ async def generate_agent_api_key(
     Notes:
         - Transactional shape mirrors ``auth.setup_admin`` and
           ``custom_api.create_custom_api`` -- we collect all writes in the
-          session and commit once. There is no ``SELECT ... FOR UPDATE``:
-          an agent may hold multiple simultaneously-active keys (the
-          ``uq_agent_api_keys_agent_active`` partial unique index that
-          used to enforce "at most one" was dropped for multi-key
-          support), so two clients racing to POST this endpoint for the
-          same agent no longer conflict at the DB level -- each
-          independently revokes whatever was active and inserts its own
-          new row; both succeed, and whichever committed last leaves its
-          key as the sole non-revoked one.
+          session and commit once. Rotations serialize on the agent row so
+          each request snapshots and revokes a coherent set of active keys.
+          An agent may still hold multiple simultaneously-active keys through
+          the multi-key endpoints; two racing legacy rotations both succeed
+          sequentially, and the later rotation leaves its key active.
         - Logs include the ``key_prefix`` only -- never the ``full_key``,
           the secret half, or the bcrypt hash.
     """

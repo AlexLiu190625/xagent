@@ -601,6 +601,11 @@ class AgentManagementService:
         ``(user_id, name)`` unique constraint is ever added to agents,
         the conflict translation here must be split by source (agent ->
         duplicate-name 400, key -> 409).
+
+        Delivery contract: once a runtime-key receipt exists, an ambiguous
+        commit result or post-commit response failure is wrapped in
+        :class:`RuntimeKeyDeliveryError`. The runtime boundary is the sole
+        consumer and compensates the exact transition in a fresh Session.
         """
         self.runtime_key_receipt = None
         if self.store.agent_name_exists(user_id, name):
@@ -1028,7 +1033,8 @@ class AgentManagementRuntime:
                 spec=spec,
             )
         )
-        return cast("AgentCreateSnapshot", result)
+        assert result is not None
+        return result
 
     @staticmethod
     def _create_agent_with_retry_sync(
@@ -1170,13 +1176,12 @@ class AgentManagementRuntime:
         user_id: int,
         agent_id: int,
     ) -> RuntimeKeySnapshot | None:
-        result = await self._run_runtime_key_delivery(
+        return await self._run_runtime_key_delivery(
             lambda: self._rotate_agent_runtime_key_with_retry_sync(
                 user_id=user_id,
                 agent_id=agent_id,
             )
         )
-        return cast("RuntimeKeySnapshot | None", result)
 
     @staticmethod
     def _rotate_agent_runtime_key_with_retry_sync(
@@ -1274,6 +1279,7 @@ class AgentManagementRuntime:
                         AgentApiKey.revoked_at.is_(None),
                     )
                     .values(revoked_at=now, updated_at=now)
+                    .execution_options(synchronize_session=False)
                 ),
             )
             new_key_revoked = max(int(revoke_result.rowcount or 0), 0)
@@ -1293,6 +1299,7 @@ class AgentManagementRuntime:
                             AgentApiKey.revoked_at == receipt.rotation_timestamp,
                         )
                         .values(revoked_at=None, updated_at=now)
+                        .execution_options(synchronize_session=False)
                     ),
                 )
                 prior_keys_restored = max(int(restore_result.rowcount or 0), 0)
