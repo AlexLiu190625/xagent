@@ -91,6 +91,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+command-path-guard = ["bashlex>=0.18"]
+
 # In-process LLM routing for OpenRouter's "auto" model. xrouter-llm currently
 # does not declare its bundled predictor runtime deps, so keep them explicit
 # here until upstream does.
@@ -139,6 +141,7 @@ milvus = ["pymilvus>=2.6.9,<3.0.0"]
 # All optional extras (for users who want everything)
 # Note: List packages directly since optional-dependencies doesn't support include-group
 all = [
+  "bashlex>=0.18",
   "unstructured>=0.15.0",
   "numba>=0.64.0",
   "typer>=0.9.0",            # Required by spacy CLI, used by unstructured
@@ -191,6 +194,7 @@ dev = [
 
 # Testing dependencies
 test = [
+  "bashlex>=0.18",
   "pytest>=8.0",
   "pytest-mock>=3.14.1",
   "pytest-cov>=6.2.1",
@@ -272,6 +276,7 @@ explicit_package_bases = true
 [[tool.mypy.overrides]]
 module = [
   "asyncssh",
+  "bashlex",
   "docx",
   "pptx",
   "pptx.*",

@@ -336,23 +336,47 @@ class TestCommandPolicyFoundation:
         assert "internal parser detail" not in result["error"]
         mock_run.assert_not_called()
 
-    def test_injected_policy_rejects_execute_script_before_tempfile_creation(
+    def test_injected_policy_validates_bash_script_without_tempfile_creation(
         self,
+        mock_run,
         monkeypatch,
     ):
         guard = Mock(spec=CommandPolicyGuard)
         create_tempfile = Mock()
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
         monkeypatch.setattr(
             "xagent.core.tools.core.command_executor.tempfile.NamedTemporaryFile",
             create_tempfile,
         )
 
-        result = CommandExecutorCore(path_guard=guard).execute_script("echo unsafe")
+        result = CommandExecutorCore(path_guard=guard).execute_script("echo allowed")
+
+        guard.validate.assert_not_called()
+        guard.validate_argv.assert_called_once_with(["bash", "-c", "echo allowed"])
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == ["bash", "-c", "echo allowed"]
+        assert mock_run.call_args.kwargs["shell"] is False
+        assert result["success"] is True
+        create_tempfile.assert_not_called()
+
+    @pytest.mark.parametrize("interpreter", ["python", "bash -O extglob", "'"])
+    def test_injected_policy_rejects_noncanonical_script_interpreter(
+        self,
+        mock_run,
+        interpreter,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+
+        result = CommandExecutorCore(path_guard=guard).execute_script(
+            "echo unsafe",
+            interpreter=interpreter,
+        )
 
         assert result["success"] is False
         assert result["return_code"] == 126
-        assert "script execution is unavailable" in result["error"]
-        create_tempfile.assert_not_called()
+        guard.validate.assert_not_called()
+        guard.validate_argv.assert_not_called()
+        mock_run.assert_not_called()
 
     def test_injected_policy_allows_shell_command_execution(self, mock_run):
         guard = Mock(spec=CommandPolicyGuard)
@@ -365,7 +389,26 @@ class TestCommandPolicyFoundation:
         mock_run.assert_called_once()
         assert mock_run.call_args.args[0] == "printf allowed"
         assert mock_run.call_args.kwargs["shell"] is True
+        assert os.path.basename(mock_run.call_args.kwargs["executable"]) == "bash"
         assert result["success"] is True
+
+    def test_injected_policy_fails_closed_when_bash_is_unavailable(
+        self,
+        mock_run,
+        monkeypatch,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+        monkeypatch.setattr(
+            "xagent.core.tools.core.command_executor.shutil.which",
+            lambda _: None,
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_command("printf allowed")
+
+        guard.validate.assert_called_once_with("printf allowed")
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        mock_run.assert_not_called()
 
     def test_injected_policy_allows_argv_command_execution(self, mock_run):
         guard = Mock(spec=CommandPolicyGuard)

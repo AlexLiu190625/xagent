@@ -7,6 +7,8 @@ Execute shell commands and scripts with proper controls.
 import logging
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
@@ -29,6 +31,16 @@ TIMEOUT_EXIT_CODE = -999
 
 # Conventional shell exit code for a command found but not permitted to run.
 COMMAND_REJECTED_EXIT_CODE = 126
+
+
+def _resolve_policy_shell_executable() -> str:
+    """Return the Bash executable whose grammar is owned by the policy parser."""
+    executable = shutil.which("bash")
+    if executable is None:
+        raise CommandPolicyViolation(
+            "restricted command execution requires a Bash executable"
+        )
+    return executable
 
 
 def _command_rejected_result(reason: object) -> Dict[str, Any]:
@@ -235,14 +247,23 @@ class CommandExecutorCore:
                 f"CommandExecutor: Using working directory: {self.working_directory}"
             )
 
+        run_options: dict[str, Any] = {
+            "shell": shell,
+            "capture_output": capture_output,
+            "text": True,
+            "timeout": timeout,
+            "cwd": self.working_directory,
+        }
+        if self.path_guard is not None and shell:
+            try:
+                run_options["executable"] = _resolve_policy_shell_executable()
+            except CommandPolicyViolation as exc:
+                return _command_rejected_result(exc)
+
         try:
             result = subprocess.run(
                 command,
-                shell=shell,
-                capture_output=capture_output,
-                text=True,
-                timeout=timeout,
-                cwd=self.working_directory,  # Use cwd parameter instead of os.chdir()
+                **run_options,
             )
 
             output = result.stdout if capture_output else ""
@@ -304,8 +325,23 @@ class CommandExecutorCore:
         timeout = _validate_timeout(timeout, self.timeout)
 
         if self.path_guard is not None:
-            return _command_rejected_result(
-                "script execution is unavailable under an injected command policy"
+            try:
+                interpreter_argv = shlex.split(interpreter)
+            except ValueError:
+                return _command_rejected_result("invalid script interpreter")
+            if not interpreter_argv:
+                return _command_rejected_result("script interpreter is required")
+            if (
+                len(interpreter_argv) != 1
+                or os.path.basename(interpreter_argv[0]) != "bash"
+            ):
+                return _command_rejected_result(
+                    "restricted execute_script requires the Bash policy shell"
+                )
+            return self.execute_command(
+                [*interpreter_argv, "-c", script_content],
+                timeout=timeout,
+                shell=False,
             )
 
         try:
