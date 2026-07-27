@@ -583,7 +583,7 @@ async def test_cancelled_upload_cleans_partial_local_file_and_metadata(
             buffer.write(b"partial")
         write_started.set()
         assert allow_write.wait(timeout=2)
-        return target_path, 7
+        return target_path
 
     monkeypatch.setattr(files_api, "_reserve_and_copy_upload", delayed_copy)
     upload = UploadFile(
