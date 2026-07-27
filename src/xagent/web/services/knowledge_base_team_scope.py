@@ -57,7 +57,11 @@ def set_knowledge_base_team_hooks(
 def visible_team_knowledge_bases(
     db: Session | None, user_id: int
 ) -> list[KnowledgeBaseAccess]:
-    """Return visible team KBs; hooks must open a session when ``db`` is None."""
+    """Return visible team KBs through the application-owned hook.
+
+    Callers may invoke the hook from a worker thread. When ``db`` is ``None``,
+    the hook must create, use, and close its own thread-confined session.
+    """
     if _visibility_hook is None:
         return []
     return list(_visibility_hook(db, int(user_id)))

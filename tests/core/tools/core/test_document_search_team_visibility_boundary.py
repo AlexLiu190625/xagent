@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from collections.abc import Callable
 from contextlib import suppress
 
 import pytest
@@ -16,18 +17,30 @@ from xagent.core.tools.core.RAG_tools.core.schemas import (
     CollectionInfo,
     ListCollectionsResult,
 )
+from xagent.web.services import knowledge_base_team_scope as kb_scope
 from xagent.web.services.knowledge_base_team_scope import (
     KnowledgeBaseAccess,
-    set_knowledge_base_team_hooks,
+    KnowledgeBaseVisibilityHook,
 )
 
 
 @pytest.fixture(autouse=True)
-def _clear_team_knowledge_base_hooks():
-    """Keep process-global application hooks isolated between tests."""
-    set_knowledge_base_team_hooks()
-    yield
-    set_knowledge_base_team_hooks()
+def _isolate_team_knowledge_base_visibility_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep this suite from changing unrelated application hooks."""
+
+    monkeypatch.setattr(kb_scope, "_visibility_hook", None)
+
+
+@pytest.fixture()
+def install_visibility_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[KnowledgeBaseVisibilityHook], None]:
+    def install(hook: KnowledgeBaseVisibilityHook) -> None:
+        monkeypatch.setattr(kb_scope, "_visibility_hook", hook)
+
+    return install
 
 
 def _collections_result(*collections: CollectionInfo) -> ListCollectionsResult:
@@ -62,12 +75,14 @@ def _one_slot_engine():
         poolclass=QueuePool,
         pool_size=1,
         max_overflow=0,
-        pool_timeout=0.25,
+        pool_timeout=2.0,
     )
 
 
 async def _wait_for(event: threading.Event) -> None:
-    await asyncio.wait_for(asyncio.to_thread(event.wait), timeout=5)
+    completed = await asyncio.to_thread(event.wait, 5)
+    if not completed:
+        raise TimeoutError("thread event did not settle")
 
 
 async def _await_without_leaking(task: asyncio.Task[object]) -> None:
@@ -80,6 +95,7 @@ async def _await_without_leaking(task: asyncio.Task[object]) -> None:
 @pytest.mark.asyncio
 async def test_team_visibility_hook_waits_off_loop_and_releases_pool(
     monkeypatch: pytest.MonkeyPatch,
+    install_visibility_hook: Callable[[KnowledgeBaseVisibilityHook], None],
 ) -> None:
     """A blocked hook checkout must leave the loop responsive until release."""
     _install_collection_listing(monkeypatch)
@@ -109,7 +125,7 @@ async def test_team_visibility_hook_waits_off_loop_and_releases_pool(
         await asyncio.sleep(0)
         ticker_advanced.set()
 
-    set_knowledge_base_team_hooks(visibility=visibility_hook)
+    install_visibility_hook(visibility_hook)
     ticker = asyncio.create_task(tick_after_hook_starts())
     listing = asyncio.create_task(
         document_search._list_visible_collections(user_id=1, is_admin=False)
@@ -149,6 +165,7 @@ async def test_team_visibility_hook_waits_off_loop_and_releases_pool(
 @pytest.mark.asyncio
 async def test_cancellation_drains_team_visibility_session_before_propagating(
     monkeypatch: pytest.MonkeyPatch,
+    install_visibility_hook: Callable[[KnowledgeBaseVisibilityHook], None],
 ) -> None:
     """Cancellation must wait for the hook-owned Session to close."""
     _install_collection_listing(monkeypatch)
@@ -168,7 +185,7 @@ async def test_cancellation_drains_team_visibility_session_before_propagating(
             hook_closed.set()
         return []
 
-    set_knowledge_base_team_hooks(visibility=visibility_hook)
+    install_visibility_hook(visibility_hook)
     listing = asyncio.create_task(
         document_search._list_visible_collections(user_id=1, is_admin=False)
     )
@@ -195,6 +212,7 @@ async def test_cancellation_drains_team_visibility_session_before_propagating(
 @pytest.mark.asyncio
 async def test_team_visibility_hook_error_preserves_identity_and_closes_session(
     monkeypatch: pytest.MonkeyPatch,
+    install_visibility_hook: Callable[[KnowledgeBaseVisibilityHook], None],
 ) -> None:
     """The hook error is not wrapped and its worker-owned Session is released."""
     _install_collection_listing(monkeypatch)
@@ -212,7 +230,7 @@ async def test_team_visibility_hook_error_preserves_identity_and_closes_session(
         finally:
             hook_closed.set()
 
-    set_knowledge_base_team_hooks(visibility=visibility_hook)
+    install_visibility_hook(visibility_hook)
     try:
         with pytest.raises(RuntimeError) as raised:
             await document_search._list_visible_collections(user_id=1, is_admin=False)
@@ -235,6 +253,7 @@ async def test_team_visibility_hook_error_preserves_identity_and_closes_session(
 )
 async def test_visibility_bypasses_keep_personal_collections_unchanged(
     monkeypatch: pytest.MonkeyPatch,
+    install_visibility_hook: Callable[[KnowledgeBaseVisibilityHook], None],
     user_id: int | None,
     is_admin: bool,
     install_hook: bool,
@@ -250,7 +269,7 @@ async def test_visibility_bypasses_keep_personal_collections_unchanged(
         return [KnowledgeBaseAccess(name="shared", storage_user_id=2)]
 
     if install_hook:
-        set_knowledge_base_team_hooks(visibility=visibility_hook)
+        install_visibility_hook(visibility_hook)
 
     result = await document_search._list_visible_collections(
         user_id=user_id, is_admin=is_admin
@@ -259,3 +278,23 @@ async def test_visibility_bypasses_keep_personal_collections_unchanged(
     assert result.collections == [personal]
     assert result.total_count == 1
     assert hook_calls == []
+
+
+def test_visibility_test_installation_preserves_unrelated_hooks(
+    monkeypatch: pytest.MonkeyPatch,
+    install_visibility_hook: Callable[[KnowledgeBaseVisibilityHook], None],
+) -> None:
+    """The visibility fixture must not reset access or lifecycle hooks."""
+
+    def access_hook(*_args, **_kwargs):  # type: ignore[no-untyped-def]
+        return None
+
+    def visibility_hook(
+        _db: Session | None, _user_id: int
+    ) -> list[KnowledgeBaseAccess]:
+        return []
+
+    monkeypatch.setattr(kb_scope, "_access_hook", access_hook)
+    install_visibility_hook(visibility_hook)
+
+    assert kb_scope._access_hook is access_hook
