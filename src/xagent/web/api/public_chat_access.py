@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, TypeVar
 
 from fastapi import Depends, HTTPException, Query, UploadFile, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -17,7 +18,7 @@ from sqlalchemy.orm import Session
 
 from ..auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
-from ..models.database import get_db
+from ..models.database import get_db, get_session_local, release_db_connection_if_clean
 from ..models.deployment import DeploymentOwnerType
 from ..models.task import Task, TaskStatus
 from ..models.user import User
@@ -28,11 +29,13 @@ from ..services.connector_runtime import (
     bind_connector_runtime_selection_snapshot,
     prepare_connector_runtime_selection_snapshot,
 )
+from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
 from .websocket import (
+    WebSocketPrincipal,
     handle_chat_message,
     handle_execute_task,
     handle_intervention,
@@ -78,12 +81,41 @@ class PublicChatAccessContext:
 class ShareChatAccessContext:
     """Validated share-guest identity: exactly one of ``agent`` /
     ``workforce`` is set, depending on which kind of share token the guest
-    presented. ``user`` is always the owner the shared entity runs as."""
+    presented. ``user`` is always the owner the shared entity runs as.
+
+    ``guest_id`` is the per-guest isolation credential (#973): a share link is
+    public, so many anonymous visitors share the same owner + entity id, and
+    ``guest_id`` is the only thing distinguishing one visitor's tasks from
+    another's. It is server-minted at auth time and always non-empty here —
+    :func:`get_share_chat_user` rejects tokens that lack it, so downstream
+    equality checks never compare ``None == None``.
+    """
 
     user: User
     share_token: str
+    guest_id: str
     agent: Agent | None = None
     workforce: Workforce | None = None
+
+
+def mint_share_guest_id() -> str:
+    """Mint a server-owned, high-entropy guest id for a new share session.
+
+    Unlike the widget path (which signs a client-supplied ``guest_id``), share
+    links have no secondary credential such as an embed ticket or widget key,
+    so the guest id is the *sole* isolation credential. It must therefore be
+    generated server-side and never accepted from the client — otherwise a
+    visitor could impersonate another by choosing their id.
+    """
+    return secrets.token_urlsafe(32)
+
+
+class _ChatAccessContext(Protocol):
+    @property
+    def user(self) -> User: ...
+
+
+_ChatAccessContextT = TypeVar("_ChatAccessContextT", bound=_ChatAccessContext)
 
 
 def create_public_chat_access_token(data: dict[str, Any]) -> str:
@@ -318,12 +350,20 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         share_agent_id = payload.get("share_agent_id")
         share_workforce_id = payload.get("share_workforce_id")
         share_token = payload.get("share_token")
+        guest_id = payload.get("guest_id")
 
         if auth_mode != "share":
             raise ValueError("Invalid token payload")
         if not isinstance(user_id, int):
             raise ValueError("Invalid token payload")
         if not isinstance(share_token, str) or not share_token:
+            raise ValueError("Invalid share token payload")
+        # Fail closed on tokens minted before per-guest isolation (#973): they
+        # carry no guest_id, so they cannot be scoped to a single guest and are
+        # rejected rather than silently granted the old no-isolation behavior.
+        # A whitespace-only id is treated as absent (it could never match a
+        # server-minted token_urlsafe value and must not pass as a real guest).
+        if not isinstance(guest_id, str) or not guest_id.strip():
             raise ValueError("Invalid share token payload")
 
         user = db.query(User).filter(User.id == user_id).first()
@@ -338,7 +378,10 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
                 expected_share_token=share_token,
             )
             return ShareChatAccessContext(
-                user=user, share_token=share_token, workforce=workforce
+                user=user,
+                share_token=share_token,
+                guest_id=guest_id,
+                workforce=workforce,
             )
 
         if not isinstance(share_agent_id, int):
@@ -350,7 +393,9 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
             user_id,
             expected_share_token=share_token,
         )
-        return ShareChatAccessContext(user=user, share_token=share_token, agent=agent)
+        return ShareChatAccessContext(
+            user=user, share_token=share_token, guest_id=guest_id, agent=agent
+        )
     except Exception as exc:
         logger.error("Share chat token validation error: %s", exc)
         if isinstance(exc, HTTPException):
@@ -470,6 +515,23 @@ def get_task_for_public_context(
     return task
 
 
+def _require_share_guest_owns_task(
+    task: Task, access_context: ShareChatAccessContext
+) -> None:
+    """Per-guest isolation gate (#973), shared by both share branches.
+
+    The share-entity checks in each branch only pin a task to the shared
+    agent/workforce, which every guest of the link has in common. This binds
+    it to the specific guest that created it. ``access_context.guest_id`` is
+    guaranteed non-empty by :func:`get_share_chat_user`, so a task carrying no
+    guest_id (or a different one) fails this strict-inequality compare.
+
+    Precondition: callers validate ``task.agent_config`` is a dict first.
+    """
+    if task.agent_config.get("guest_id") != access_context.guest_id:
+        raise HTTPException(status_code=403, detail="Access denied for this guest")
+
+
 def _get_task_for_workforce_share_context(
     db: Session, task_id: int, access_context: ShareChatAccessContext
 ) -> Task:
@@ -499,6 +561,9 @@ def _get_task_for_workforce_share_context(
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     if int(task.agent_config.get("share_workforce_id") or 0) != workforce_id:
         raise HTTPException(status_code=403, detail="Share link is unavailable")
+    # A valid workforce-share JWT + a matching WorkforceRun is not enough:
+    # both hold for *any* guest of the same workforce (#973).
+    _require_share_guest_owns_task(task, access_context)
     workforce_run_id = task.agent_config.get("workforce_run_id")
     if not isinstance(workforce_run_id, int):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
@@ -543,6 +608,9 @@ def get_task_for_share_context(
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     if int(task.agent_config.get("share_agent_id") or 0) != int(agent.id):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
+    # The checks above only pin the task to the shared agent, which every
+    # guest of this link has in common (#973).
+    _require_share_guest_owns_task(task, access_context)
     return task
 
 
@@ -567,6 +635,7 @@ async def upload_public_chat_files(
     if not upload_items:
         raise HTTPException(status_code=422, detail="No files provided")
 
+    user_id = int(access_context.user.id)
     if not task_id:
         # A workforce widget session starts its first turn inside task
         # creation, so its opening-message attachments must be uploaded BEFORE
@@ -590,13 +659,17 @@ async def upload_public_chat_files(
                     f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
                 ),
             )
+        if not release_db_connection_if_clean(db):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload authorization could not be finalized",
+            )
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
             task_id=None,
             folder=folder,
-            user=access_context.user,
-            db=db,
+            user_id=user_id,
             single_file_mode=file is not None and (not files),
         )
 
@@ -605,14 +678,18 @@ async def upload_public_chat_files(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid task_id") from exc
     get_task_for_public_context(db, parsed_task_id, access_context)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail="Upload authorization could not be finalized",
+        )
 
     return await store_uploaded_files(
         upload_items=upload_items,
         task_type=task_type,
         task_id=task_id,
         folder=folder,
-        user=access_context.user,
-        db=db,
+        user_id=user_id,
         single_file_mode=file is not None and (not files),
     )
 
@@ -638,6 +715,7 @@ async def upload_share_chat_files(
     if not upload_items:
         raise HTTPException(status_code=422, detail="No files provided")
 
+    user_id = int(access_context.user.id)
     if not task_id:
         # A workforce share session starts its first turn inside task
         # creation, so its opening-message attachments must be uploaded
@@ -660,13 +738,17 @@ async def upload_share_chat_files(
                     f"(max {MAX_TASKLESS_SHARE_UPLOAD_FILES})"
                 ),
             )
+        if not release_db_connection_if_clean(db):
+            raise HTTPException(
+                status_code=503,
+                detail="Upload authorization could not be finalized",
+            )
         return await store_uploaded_files(
             upload_items=upload_items,
             task_type=task_type,
             task_id=None,
             folder=folder,
-            user=access_context.user,
-            db=db,
+            user_id=user_id,
             single_file_mode=file is not None and (not files),
         )
 
@@ -675,14 +757,18 @@ async def upload_share_chat_files(
     except ValueError as exc:
         raise HTTPException(status_code=422, detail="Invalid task_id") from exc
     get_task_for_share_context(db, parsed_task_id, access_context)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=503,
+            detail="Upload authorization could not be finalized",
+        )
 
     return await store_uploaded_files(
         upload_items=upload_items,
         task_type=task_type,
         task_id=task_id,
         folder=folder,
-        user=access_context.user,
-        db=db,
+        user_id=user_id,
         single_file_mode=file is not None and (not files),
     )
 
@@ -857,6 +943,11 @@ async def _create_workforce_share_chat_task(
         extra_agent_config={
             "auth_mode": "share",
             "share_workforce_id": int(workforce.id),
+            # Per-guest isolation (#973). extra_agent_config is overlaid under
+            # the snapshot-built config, which never sets guest_id, so this is
+            # preserved; the run-critical workforce_run_id is added by the
+            # snapshot config and still wins on any collision.
+            "guest_id": access_context.guest_id,
         },
     )
     task = result.task
@@ -895,10 +986,13 @@ async def create_share_chat_task(
     elif agent_id != share_agent_id:
         raise HTTPException(status_code=403, detail="Share link is unavailable")
 
+    # Server keys are assigned AFTER copying the client dict so they win on
+    # collision — a client-supplied guest_id can never override the
+    # server-minted one carried on the validated access context (#973).
     agent_config = dict(request.agent_config or {})
-    agent_config.pop("guest_id", None)
     agent_config["auth_mode"] = "share"
     agent_config["share_agent_id"] = share_agent_id
+    agent_config["guest_id"] = access_context.guest_id
 
     task_title = request.title or task_description or "Untitled Task"
     if task_title and len(task_title) > 50:
@@ -939,6 +1033,73 @@ async def create_share_chat_task(
     )
 
 
+def _authorize_chat_websocket_sync(
+    *,
+    load_access_context: Callable[[Session], _ChatAccessContextT],
+    authorize_task: Callable[[Session, _ChatAccessContextT], object],
+) -> WebSocketPrincipal:
+    """Authorize one public WebSocket operation in a worker-owned Session."""
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        access_context = load_access_context(db)
+        authorize_task(db, access_context)
+        user_id = access_context.user.id
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="Invalid user")
+        return WebSocketPrincipal(
+            id=int(user_id),
+            is_admin=bool(access_context.user.is_admin),
+        )
+
+
+async def _authorize_public_chat_websocket(
+    *,
+    token: str,
+    task_id: int,
+    expected_auth_mode: str,
+) -> WebSocketPrincipal:
+    """Validate widget access without blocking the asyncio event loop."""
+
+    def load_access_context(db: Session) -> PublicChatAccessContext:
+        return get_public_chat_user(
+            token,
+            db,
+            expected_auth_mode=expected_auth_mode,
+        )
+
+    def authorize_task(db: Session, context: PublicChatAccessContext) -> object:
+        return get_task_for_public_context(db, task_id, context)
+
+    return await run_db_io_cancellation_safe(
+        lambda: _authorize_chat_websocket_sync(
+            load_access_context=load_access_context,
+            authorize_task=authorize_task,
+        )
+    )
+
+
+async def _authorize_share_chat_websocket(
+    *,
+    token: str,
+    task_id: int,
+) -> WebSocketPrincipal:
+    """Validate share-link access without blocking the asyncio event loop."""
+
+    def load_access_context(db: Session) -> ShareChatAccessContext:
+        return get_share_chat_user(token, db)
+
+    def authorize_task(db: Session, context: ShareChatAccessContext) -> object:
+        return get_task_for_share_context(db, task_id, context)
+
+    return await run_db_io_cancellation_safe(
+        lambda: _authorize_chat_websocket_sync(
+            load_access_context=load_access_context,
+            authorize_task=authorize_task,
+        )
+    )
+
+
 async def public_chat_websocket_endpoint(
     *,
     websocket: WebSocket,
@@ -948,11 +1109,11 @@ async def public_chat_websocket_endpoint(
 ) -> None:
     """Serve widget/share websocket chat with per-message revalidation."""
     try:
-        with db_session_context() as db:
-            access_context = get_public_chat_user(
-                token, db, expected_auth_mode=expected_auth_mode
-            )
-            get_task_for_public_context(db, task_id, access_context)
+        principal = await _authorize_public_chat_websocket(
+            token=token,
+            task_id=task_id,
+            expected_auth_mode=expected_auth_mode,
+        )
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
@@ -960,26 +1121,24 @@ async def public_chat_websocket_endpoint(
     await manager.connect(websocket, task_id)
 
     try:
-        await handle_status_request(websocket, task_id, access_context.user)
+        await handle_status_request(websocket, task_id, principal)
 
         while True:
             data = await websocket.receive_text()
             message_data = json.loads(data)
 
             try:
-                with db_session_context() as validation_db:
-                    current_access_context = get_public_chat_user(
-                        token, validation_db, expected_auth_mode=expected_auth_mode
-                    )
-                    get_task_for_public_context(
-                        validation_db, task_id, current_access_context
-                    )
+                current_principal = await _authorize_public_chat_websocket(
+                    token=token,
+                    task_id=task_id,
+                    expected_auth_mode=expected_auth_mode,
+                )
             except HTTPException as exc:
                 await websocket.close(code=4003, reason=exc.detail)
                 return
 
-            message_data["user_id"] = access_context.user.id
-            message_data["user"] = access_context.user
+            message_data["user_id"] = current_principal.id
+            message_data["user"] = current_principal
 
             if message_data.get("type") == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
@@ -1005,35 +1164,50 @@ async def share_chat_websocket_endpoint(
     token: str = Query(..., description="Authentication token"),
 ) -> None:
     """Serve share websocket chat with per-message revalidation."""
+    # Accept the handshake *before* the auth/access checks. uvicorn only
+    # preserves a close code + reason on the wire for a *post-accept* close: a
+    # pre-accept ``websocket.close()`` is collapsed into a bare HTTP 403 with an
+    # empty body, so the browser sees a rejected Upgrade (onerror + onclose
+    # code=1006, reason="") and the code/reason never arrive. Accepting first
+    # makes the 4003 below a real close whose reason reaches the client — the
+    # same post-accept behavior the per-message revalidation loop already relies
+    # on — so the frontend can tell an access denial (e.g. a returning guest
+    # whose persisted task belongs to another guest, or a pre-#973 legacy task)
+    # apart from a transport failure and recover (#973).
+    await websocket.accept()
     try:
-        with db_session_context() as db:
-            access_context = get_share_chat_user(token, db)
-            get_task_for_share_context(db, task_id, access_context)
+        principal = await _authorize_share_chat_websocket(
+            token=token,
+            task_id=task_id,
+        )
+    except HTTPException as exc:
+        await websocket.close(code=4003, reason=exc.detail)
+        return
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, task_id)
+    # Already accepted above; register the live socket without re-accepting.
+    manager.register_connection(websocket, task_id)
 
     try:
-        await handle_status_request(websocket, task_id, access_context.user)
+        await handle_status_request(websocket, task_id, principal)
 
         while True:
             data = await websocket.receive_text()
             message_data = json.loads(data)
 
             try:
-                with db_session_context() as validation_db:
-                    current_access_context = get_share_chat_user(token, validation_db)
-                    get_task_for_share_context(
-                        validation_db, task_id, current_access_context
-                    )
+                current_principal = await _authorize_share_chat_websocket(
+                    token=token,
+                    task_id=task_id,
+                )
             except HTTPException as exc:
                 await websocket.close(code=4003, reason=exc.detail)
                 return
 
-            message_data["user_id"] = access_context.user.id
-            message_data["user"] = access_context.user
+            message_data["user_id"] = current_principal.id
+            message_data["user"] = current_principal
 
             if message_data.get("type") == "chat":
                 await handle_chat_message(websocket, task_id, message_data)

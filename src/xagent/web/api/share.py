@@ -28,6 +28,7 @@ from .public_chat_access import (
     build_share_chat_dependency,
     create_public_chat_access_token,
     create_share_chat_task,
+    mint_share_guest_id,
     share_chat_websocket_endpoint,
     upload_share_chat_files,
 )
@@ -72,6 +73,9 @@ async def authenticate_share_link(
             "auth_mode": "share",
             "share_agent_id": int(agent.id),
             "share_token": agent.share_token,
+            # Server-minted per-guest isolation credential (#973); never
+            # accepted from the client, so this request carries no guest_id.
+            "guest_id": mint_share_guest_id(),
         }
     )
     return PublicChatAuthResponse(
@@ -112,6 +116,9 @@ def _authenticate_workforce_share_link(
             "auth_mode": "share",
             "share_workforce_id": int(workforce.id),
             "share_token": deployment.share_token,
+            # Server-minted per-guest isolation credential (#973); never
+            # accepted from the client, so this request carries no guest_id.
+            "guest_id": mint_share_guest_id(),
         }
     )
     return PublicChatAuthResponse(

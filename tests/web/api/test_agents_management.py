@@ -39,7 +39,9 @@ from xagent.web.services.workforce_lifecycle import discard_draft_workforce
 from .conftest import (
     _admin_headers,
     _direct_db_session,
+    _install_one_slot_queue_pool,
     _register_second_user,
+    _share_guest_id,
     client,
 )
 
@@ -76,6 +78,87 @@ def _create_agent(headers: dict[str, str], name: str = "Test Agent") -> int:
     )
     assert resp.status_code == 200, resp.text
     return resp.json()["id"]
+
+
+def test_create_from_template_releases_request_session_before_async_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy wrapper must enter template I/O with no request pool slot held."""
+
+    headers = _admin_headers()
+    engine = _install_one_slot_queue_pool(monkeypatch)
+    checked_out_during_template_load: list[int] = []
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            checked_out_during_template_load.append(engine.pool.checkedout())
+            return {
+                "id": template_id,
+                "name": "Detached legacy template",
+                "descriptions": {"en": "Created through the shared runtime"},
+                "agent_config": {
+                    "instructions": "Use the worker-owned management runtime.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        TemplateManagerStub(),
+        raising=False,
+    )
+
+    try:
+        response = client.post(
+            "/api/agents/from-template",
+            headers=headers,
+            json={"template_id": "detached-legacy-template"},
+        )
+        assert response.status_code == 200, response.text
+        assert checked_out_during_template_load == [0]
+        assert response.json()["name"] == "Detached legacy template"
+        assert response.json()["visibility"] == "team"
+    finally:
+        engine.dispose()
+
+
+def test_create_from_template_fails_closed_when_request_session_is_not_clean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The legacy wrapper must not cross an await with pending request DB state."""
+
+    headers = _admin_headers()
+    template_calls: list[str] = []
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            template_calls.append(template_id)
+            return {}
+
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        TemplateManagerStub(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        agents_api,
+        "release_db_connection_if_clean",
+        lambda _db: False,
+    )
+
+    response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "must-not-load"},
+    )
+
+    assert response.status_code == 500
+    assert response.json()["detail"] == (
+        "Agent creation requires a clean request database transaction"
+    )
+    assert template_calls == []
 
 
 def _create_agent_row(
@@ -172,6 +255,7 @@ def _create_public_task_file(
     *,
     owner_id: int,
     agent_id: int,
+    guest_id: str,
     filename: str = "shared-note.txt",
     content: bytes = b"hello from public task",
 ) -> str:
@@ -193,6 +277,9 @@ def _create_public_task_file(
             agent_config={
                 "auth_mode": "share",
                 "share_agent_id": agent_id,
+                # Per-guest isolation (#973): the task must carry the accessing
+                # guest's id or get_task_for_share_context rejects it.
+                "guest_id": guest_id,
             },
         )
         db.add(task)
@@ -1624,16 +1711,17 @@ def test_share_public_file_preview_requires_valid_share_token() -> None:
         share_enabled=True,
         share_token=share_token,
     )
+    guest_headers = _authenticate_share_guest(share_token)
+    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
+        guest_id=_share_guest_id(access_token),
     )
 
     preview_without_token = client.get(f"/api/files/public/preview/{file_id}")
     assert preview_without_token.status_code == 403, preview_without_token.text
 
-    guest_headers = _authenticate_share_guest(share_token)
-    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
     preview_with_token = client.get(
         f"/api/files/public/preview/{file_id}",
         params={"token": access_token},
@@ -1665,14 +1753,14 @@ def test_share_public_file_download_requires_valid_share_token() -> None:
         share_enabled=True,
         share_token=share_token,
     )
+    guest_headers = _authenticate_share_guest(share_token)
+    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
+        guest_id=_share_guest_id(access_token),
         filename="download-note.txt",
     )
-
-    guest_headers = _authenticate_share_guest(share_token)
-    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
 
     download_with_token = client.get(
         f"/api/files/public/download/{file_id}",
