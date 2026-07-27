@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 
 import pytest
@@ -298,3 +299,44 @@ def test_visibility_test_installation_preserves_unrelated_hooks(
     install_visibility_hook(visibility_hook)
 
     assert kb_scope._access_hook is access_hook
+
+
+def test_no_visibility_hook_bypasses_saturated_default_executor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Standalone collection listing must not queue guaranteed-empty work."""
+
+    personal = _install_collection_listing(monkeypatch)
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def occupy_default_executor() -> None:
+        worker_started.set()
+        release_worker.wait()
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            loop.set_default_executor(executor)
+            occupied = loop.run_in_executor(None, occupy_default_executor)
+            while not worker_started.is_set():
+                await asyncio.sleep(0)
+
+            listing = asyncio.create_task(
+                document_search._list_visible_collections(
+                    user_id=1,
+                    is_admin=False,
+                )
+            )
+            try:
+                done, _pending = await asyncio.wait({listing}, timeout=1.0)
+                assert listing in done
+                result = listing.result()
+                assert result.collections == [personal]
+                assert result.total_count == 1
+            finally:
+                release_worker.set()
+                await occupied
+                await _await_without_leaking(listing)
+
+    asyncio.run(scenario())

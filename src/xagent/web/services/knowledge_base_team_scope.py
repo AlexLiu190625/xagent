@@ -54,6 +54,12 @@ def set_knowledge_base_team_hooks(
     _deleted_hook = deleted
 
 
+def has_knowledge_base_visibility_hook() -> bool:
+    """Return whether the application installed a team visibility hook."""
+
+    return _visibility_hook is not None
+
+
 def visible_team_knowledge_bases(
     db: Session | None, user_id: int
 ) -> list[KnowledgeBaseAccess]:

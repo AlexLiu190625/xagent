@@ -32,8 +32,12 @@ async def _list_visible_collections(
 
     from ....web.services.db_runtime import run_db_io_cancellation_safe
     from ....web.services.knowledge_base_team_scope import (
+        has_knowledge_base_visibility_hook,
         visible_team_knowledge_bases,
     )
+
+    if not has_knowledge_base_visibility_hook():
+        return result
 
     collections_by_name = {
         collection.name: collection for collection in result.collections
