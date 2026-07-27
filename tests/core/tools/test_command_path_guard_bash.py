@@ -882,6 +882,24 @@ class TestScopedCommandPathGuardBash:
         assert result["return_code"] == 126
         assert "sibling secret" not in result["output"]
 
+    @pytest.mark.parametrize("shebang", ["#!", "#!   "])
+    def test_rejects_direct_script_without_shebang_interpreter(
+        self,
+        scoped_command_workspace,
+        shebang,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script = workspace.output_dir / "malformed-shebang"
+        script.write_text(f"{shebang}\nprintf safe\n", encoding="utf-8")
+        script.chmod(0o755)
+        executor = _guarded_executor(workspace)
+
+        result = executor.execute_command(["./malformed-shebang"], shell=False)
+
+        assert result["return_code"] == 126
+        assert "command denied by policy" in result["error"]
+        assert "command validation failed" not in result["error"]
+
     @pytest.mark.parametrize(
         "command",
         [

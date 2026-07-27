@@ -1016,9 +1016,11 @@ class WorkspaceCommandPathGuard:
 
         first_line = script.splitlines()[0] if script.splitlines() else ""
         if first_line.startswith("#!"):
-            interpreter = os.path.basename(first_line[2:].strip().split()[0])
+            interpreter_parts = first_line[2:].strip().split()
+            interpreter = (
+                os.path.basename(interpreter_parts[0]) if interpreter_parts else ""
+            )
             if interpreter == "env":
-                interpreter_parts = first_line[2:].strip().split()
                 interpreter = (
                     os.path.basename(interpreter_parts[1])
                     if len(interpreter_parts) > 1
