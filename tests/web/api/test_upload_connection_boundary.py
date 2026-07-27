@@ -357,6 +357,52 @@ def test_reserve_and_copy_propagates_open_error_without_creating_an_artifact(
     assert not list(tmp_path.rglob("open-error*"))
 
 
+@pytest.mark.parametrize(
+    "control_error",
+    [SystemExit("stop"), KeyboardInterrupt()],
+    ids=["system-exit", "keyboard-interrupt"],
+)
+def test_delete_staged_upload_preserves_process_control(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    control_error: BaseException,
+) -> None:
+    """Best-effort cleanup must not suppress process-control exceptions."""
+
+    def interrupting_unlink(
+        _path: Path,
+        *,
+        missing_ok: bool = False,
+    ) -> None:
+        del missing_ok
+        raise control_error
+
+    monkeypatch.setattr(Path, "unlink", interrupting_unlink)
+    with pytest.raises(BaseException) as raised:
+        files_api._delete_staged_upload(tmp_path / "staged.txt")
+    assert raised.value is control_error
+
+
+def test_delete_staged_upload_suppresses_operational_unlink_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unlink failure is logged without replacing the staging failure."""
+
+    def failing_unlink(
+        _path: Path,
+        *,
+        missing_ok: bool = False,
+    ) -> None:
+        del missing_ok
+        raise OSError("unlink failed")
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+    files_api._delete_staged_upload(tmp_path / "staged.txt")
+    assert "Failed to clean up local upload" in caplog.text
+
+
 @pytest.mark.asyncio
 async def test_store_uploaded_files_preserves_source_value_error_and_cleans_candidate(
     monkeypatch: pytest.MonkeyPatch,

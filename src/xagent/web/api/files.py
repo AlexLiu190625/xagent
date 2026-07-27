@@ -301,7 +301,7 @@ def _delete_staged_upload(path: Path) -> None:
 
     try:
         path.unlink(missing_ok=True)
-    except BaseException:
+    except OSError:
         logger.warning("Failed to clean up local upload: %s", path)
 
 
