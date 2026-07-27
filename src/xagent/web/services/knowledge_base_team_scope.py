@@ -60,7 +60,8 @@ def visible_team_knowledge_bases(
     """Return visible team KBs through the application-owned hook.
 
     Callers may invoke the hook from a worker thread. When ``db`` is ``None``,
-    the hook must create, use, and close its own thread-confined session.
+    the hook must create, use, and close its own thread-confined session and
+    must not depend on event-loop thread-local state.
     """
     if _visibility_hook is None:
         return []
