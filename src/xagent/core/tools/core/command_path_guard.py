@@ -14,6 +14,7 @@ import os
 import re
 import shutil
 import stat
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (
@@ -43,6 +44,14 @@ _MAX_INSPECTED_SCRIPT_DEPTH = 8
 _MAX_COMMAND_WRAPPER_DEPTH = 32
 _MAX_COMMAND_POLICY_INPUT_CHARS = 64 * 1024
 _MAX_POSSIBLE_SHELL_STATES = 16
+_COMMAND_WRITTEN_PATHS: ContextVar[set[Path] | None] = ContextVar(
+    "command_written_paths",
+    default=None,
+)
+_COMMAND_ENVIRONMENT: ContextVar[Mapping[str, str] | None] = ContextVar(
+    "command_environment",
+    default=None,
+)
 _AWK_ALWAYS_UNSAFE_IO_PATTERN = re.compile(r"\bsystem\s*\(|\bgetline\b")
 _AWK_PRINT_PATTERN = re.compile(r"\b(?:print|printf)\b")
 
@@ -548,22 +557,30 @@ class WorkspaceCommandPathGuard:
         _mark_unmodeled_expansions(nodes, policy_source)
         return nodes
 
-    def validate(self, command: str) -> None:
+    def validate(
+        self,
+        command: str,
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
         """Reject unsupported syntax and unsafe paths in ``command``."""
-        active_environment = next(
-            (name for name in _IMPLICIT_SHELL_ENVIRONMENT if os.environ.get(name)),
-            None,
-        )
-        if active_environment is not None:
-            raise CommandPolicyViolation(
-                "cannot safely inspect implicit shell initialization via "
-                f"{active_environment}"
-            )
-        nodes = self._parse_shell(command)
-
-        states: tuple[_ShellState, ...] = (_ShellState(cwd=self._initial_cwd),)
-        for node in nodes:
-            states = self._validate_node_states(node, states)
+        write_token = _COMMAND_WRITTEN_PATHS.set(set())
+        effective_environment = environment if environment is not None else os.environ
+        environment_token = _COMMAND_ENVIRONMENT.set(effective_environment)
+        try:
+            active_environment = self._active_implicit_shell_environment()
+            if active_environment is not None:
+                raise CommandPolicyViolation(
+                    "cannot safely inspect implicit shell initialization via "
+                    f"{active_environment}"
+                )
+            nodes = self._parse_shell(command)
+            states: tuple[_ShellState, ...] = (_ShellState(cwd=self._initial_cwd),)
+            for node in nodes:
+                states = self._validate_node_states(node, states)
+        finally:
+            _COMMAND_ENVIRONMENT.reset(environment_token)
+            _COMMAND_WRITTEN_PATHS.reset(write_token)
 
     def _validate_node_states(
         self,
@@ -625,18 +642,30 @@ class WorkspaceCommandPathGuard:
             raise CommandPolicyViolation("too many possible shell directory states")
         return unique
 
-    def validate_argv(self, argv: Sequence[str]) -> None:
+    def validate_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        environment: Mapping[str, str] | None = None,
+    ) -> None:
         """Reject out-of-policy paths in literal, pre-tokenized arguments.
 
         No shell interprets this form, so shell expansion syntax remains literal.
         """
         if not argv:
             return
-        self._validate_command_values(
-            argv[0],
-            argv[1:],
-            _ShellState(cwd=self._initial_cwd),
-        )
+        write_token = _COMMAND_WRITTEN_PATHS.set(set())
+        effective_environment = environment if environment is not None else os.environ
+        environment_token = _COMMAND_ENVIRONMENT.set(effective_environment)
+        try:
+            self._validate_command_values(
+                argv[0],
+                argv[1:],
+                _ShellState(cwd=self._initial_cwd),
+            )
+        finally:
+            _COMMAND_ENVIRONMENT.reset(environment_token)
+            _COMMAND_WRITTEN_PATHS.reset(write_token)
 
     def _validate_node(self, node: Any, state: _ShellState) -> _ShellState:
         kind = getattr(node, "kind", None)
@@ -797,6 +826,28 @@ class WorkspaceCommandPathGuard:
         access: PathAccess = "read" if redirect_type == "<" else "write"
         self._check_path(raw_path, state.cwd, access)
 
+    @staticmethod
+    def _active_implicit_shell_environment() -> str | None:
+        environment = _COMMAND_ENVIRONMENT.get()
+        if environment is None:
+            environment = os.environ
+        return next(
+            (name for name in _IMPLICIT_SHELL_ENVIRONMENT if environment.get(name)),
+            None,
+        )
+
+    @staticmethod
+    def _policy_home_directory() -> str:
+        environment = _COMMAND_ENVIRONMENT.get()
+        if environment is None:
+            environment = os.environ
+        home = environment.get("HOME")
+        if not home:
+            raise CommandPolicyViolation(
+                "cannot resolve bare cd without HOME in the execution environment"
+            )
+        return home
+
     def _change_directory(
         self,
         command_name: str,
@@ -807,7 +858,7 @@ class WorkspaceCommandPathGuard:
         if command_name == "cd":
             if len(operands) > 1:
                 raise CommandPolicyViolation("cannot safely resolve cd arguments")
-            target_word = operands[0] if operands else str(Path.home())
+            target_word = operands[0] if operands else self._policy_home_directory()
             if target_word == "-":
                 if state.previous_cwd is None:
                     raise CommandPolicyViolation(
@@ -1907,20 +1958,24 @@ class WorkspaceCommandPathGuard:
         script_path = self._check_path(raw_path, cwd, "read")
         if self._path_access_observer is not None:
             return None
+        written_paths = _COMMAND_WRITTEN_PATHS.get()
+        if written_paths is not None and script_path in written_paths:
+            raise CommandPolicyViolation(
+                "cannot inspect a script modified earlier in the same command"
+            )
 
         descriptor: int | None = None
         try:
-            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
             descriptor = os.open(script_path, flags)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
+            ):
+                raise CommandPathViolation(access="read", path=script_path)
             with os.fdopen(descriptor, "rb") as script_file:
                 descriptor = None
-                metadata = os.fstat(script_file.fileno())
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
-                ):
-                    raise CommandPathViolation(access="read", path=script_path)
                 raw_script = script_file.read(_MAX_INSPECTED_SCRIPT_BYTES + 1)
             if len(raw_script) > _MAX_INSPECTED_SCRIPT_BYTES:
                 raise CommandPathViolation(access="read", path=script_path)
@@ -3040,10 +3095,7 @@ class WorkspaceCommandPathGuard:
         literals: Sequence[str],
         state: _ShellState,
     ) -> None:
-        active_environment = next(
-            (name for name in _IMPLICIT_SHELL_ENVIRONMENT if os.environ.get(name)),
-            None,
-        )
+        active_environment = self._active_implicit_shell_environment()
         if active_environment is not None:
             raise CommandPolicyViolation(
                 "cannot safely inspect implicit shell initialization via "
@@ -3369,10 +3421,14 @@ class WorkspaceCommandPathGuard:
             return candidate
 
         try:
-            return self._workspace.resolve_authorized_path(
+            resolved = self._workspace.resolve_authorized_path(
                 candidate,
                 base_dir=cwd,
                 include_external_dirs=include_external_dirs,
             )
         except ValueError as exc:
             raise CommandPathViolation(access=access, path=candidate) from exc
+        written_paths = _COMMAND_WRITTEN_PATHS.get()
+        if access == "write" and written_paths is not None:
+            written_paths.add(resolved)
+        return resolved

@@ -9,6 +9,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from xagent.core.execution_scope import ExecutionScope
 from xagent.core.tools.adapters.vibe.command_executor import (
     CommandExecutorArgs,
     CommandExecutorResult,
@@ -19,6 +20,7 @@ from xagent.core.tools.core.command_executor import (
     CommandExecutorCore,
     execute_command,
     execute_script,
+    execution_scope_restricts_command_paths,
 )
 from xagent.core.tools.core.command_path_guard import (
     CommandPathViolation,
@@ -85,7 +87,7 @@ class TestCommandExecutorTool:
         assert "Only search for files when no usable path was provided" in description
         assert "Do not run broad recursive searches from `/`" in description
 
-    def test_restricted_description_states_guard_boundary(self, tmp_path):
+    def test_restricted_description_matches_foundation_capabilities(self, tmp_path):
         workspace = Mock()
         workspace.resolve_path.return_value = tmp_path
         tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
@@ -94,10 +96,12 @@ class TestCommandExecutorTool:
 
         assert "best-effort" in description
         assert "not an operating-system security boundary" in description
-        assert "unknown commands" in description
+        assert "unknown commands are not classified" in description
         assert "xargs" in description
         assert "active globs" in description
         assert "./deploy.sh" not in description
+        assert "sh, dash, and zsh subprocess dialects are rejected" not in description
+        assert "unparsable for/case forms" not in description
 
     def test_execution_scope_factory_projects_command_path_policy(self, tmp_path):
         from xagent.core.execution_scope import ExecutionScope
@@ -114,6 +118,16 @@ class TestCommandExecutorTool:
 
         assert result["return_code"] == 126
         assert "secret" not in result["output"]
+
+    @pytest.mark.parametrize(
+        "tool_type",
+        [CommandExecutorTool, CommandExecutorToolForBasic],
+    )
+    def test_restrict_paths_is_keyword_only(self, tool_type, tmp_path):
+        workspace = TaskWorkspace("task", str(tmp_path))
+
+        with pytest.raises(TypeError):
+            tool_type(workspace, True)
 
     def test_simple_echo_command(self, command_executor):
         """Test simple echo command"""
@@ -1587,7 +1601,7 @@ class TestScopedCommandPathGuard:
         assert result["return_code"] == 126
         assert "sibling secret" not in result["output"]
 
-    def test_rejects_ambient_shell_initialization_file(
+    def test_scrubs_ambient_shell_initialization_file(
         self,
         scoped_command_workspace,
         monkeypatch,
@@ -1603,8 +1617,9 @@ class TestScopedCommandPathGuard:
 
         result = tool.run_json_sync({"command": "printf safe"})
 
-        assert result["success"] is False
-        assert result["return_code"] == 126
+        assert result["success"] is True
+        assert result["return_code"] == 0
+        assert result["output"] == "safe"
         assert "sibling secret" not in result["output"]
 
     def test_rejects_ambient_cdpath_that_changes_directory_resolution(
@@ -2246,6 +2261,66 @@ class TestScopedCommandPathGuard:
         assert not (workspace.output_dir / script_name).exists()
         assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
 
+    @pytest.mark.parametrize(
+        ("script_name", "safe_script", "unsafe_script", "invocation"),
+        [
+            (
+                "replace.sed",
+                "s/own/own/",
+                "w {path}",
+                "sed -f replace.sed own.txt",
+            ),
+            (
+                "replace.awk",
+                "{ print $0 }",
+                'BEGIN {{print "changed" > "{path}"}}',
+                "awk -f replace.awk own.txt",
+            ),
+        ],
+    )
+    def test_rejects_script_overwritten_before_sed_awk_inspection(
+        self,
+        scoped_command_workspace,
+        script_name,
+        safe_script,
+        unsafe_script,
+        invocation,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        script_path = workspace.output_dir / script_name
+        script_path.write_text(safe_script, encoding="utf-8")
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+        replacement = unsafe_script.format(path=sibling_file)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"printf '%s\\n' {shlex.quote(replacement)} > {script_name} "
+                    f"&& {invocation}"
+                )
+            }
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert script_path.read_text(encoding="utf-8") == safe_script
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    def test_script_write_tracking_is_scoped_to_one_validation(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "safe.sed").write_text(
+            "s/own/safe/",
+            encoding="utf-8",
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("printf replacement > safe.sed")
+        guard.validate("sed -f safe.sed own.txt")
+
     @pytest.mark.parametrize("kind", ["device", "fifo"])
     def test_script_inspection_rejects_non_regular_files_without_reading(
         self, scoped_command_workspace, monkeypatch, kind
@@ -2259,19 +2334,20 @@ class TestScopedCommandPathGuard:
         else:
             os.mkfifo(script_path)
 
-        read_paths = []
+        read_attempted = False
 
-        def record_read(path, *args, **kwargs):
-            read_paths.append(path)
-            return ""
+        def record_read(*args, **kwargs):
+            nonlocal read_attempted
+            read_attempted = True
+            raise AssertionError("non-regular script content must not be read")
 
-        monkeypatch.setattr(type(script_path), "read_text", record_read)
+        monkeypatch.setattr(os, "fdopen", record_read)
         guard = WorkspaceCommandPathGuard(workspace)
 
         with pytest.raises(CommandPathViolation):
             guard._inspect_script_file("sed", str(script_path), workspace.output_dir)
 
-        assert read_paths == []
+        assert read_attempted is False
 
     def test_script_inspection_rejects_oversized_regular_file(
         self, scoped_command_workspace
@@ -2366,6 +2442,20 @@ class TestScopedCommandPathGuard:
         assert result["success"] is False
         assert result["return_code"] == 126
 
+    def test_policy_rejection_does_not_expose_absolute_path(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": f"cat {shlex.quote(str(sibling_file))}"}
+        )
+
+        assert result["return_code"] == 126
+        assert "outside allowed read paths" in result["error"]
+        assert str(sibling_file) not in result["error"]
+
     def test_rejects_bare_cd_before_relative_file_access(
         self, scoped_command_workspace, monkeypatch
     ):
@@ -2380,6 +2470,22 @@ class TestScopedCommandPathGuard:
 
         assert result["success"] is False
         assert result["return_code"] == 126
+
+    def test_guard_resolves_bare_cd_from_supplied_execution_environment(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        own_file = workspace.output_dir / "own.txt"
+        own_file.write_text("own", encoding="utf-8")
+        outside_home = workspace.base_dir.parent / "outside-home"
+        outside_home.mkdir()
+        monkeypatch.setenv("HOME", str(outside_home))
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            "cd; cat own.txt",
+            environment={"HOME": str(workspace.output_dir)},
+        )
 
     def test_find_exec_write_treats_read_only_root_as_write_target(
         self, scoped_command_workspace
@@ -2840,6 +2946,70 @@ class TestCommandExecutorCore:
         # With shell=False
         result = executor.execute_command(["echo", "test"], shell=False)
         assert result["success"] is True
+
+    def test_scope_policy_switch_fails_loudly_for_wrong_scope_shape(self):
+        assert (
+            execution_scope_restricts_command_paths(
+                ExecutionScope(restrict_command_paths=True)
+            )
+            is True
+        )
+
+        with pytest.raises(AttributeError):
+            execution_scope_restricts_command_paths(Mock(spec=[]))
+
+    def test_missing_policy_bash_returns_stable_rejection(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        monkeypatch.setenv("PATH", "")
+        executor = CommandExecutorCore.for_workspace(workspace, restrict_paths=True)
+
+        result = executor.execute_command("printf allowed")
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert result["error"] == (
+            "Command rejected by workspace path policy: "
+            "restricted command execution requires a Bash executable"
+        )
+
+    def test_guarded_shell_ignores_bash_environment_hooks(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        bash_env = workspace.output_dir / "bash-env"
+        bash_env.write_text("printf injected", encoding="utf-8")
+        monkeypatch.setenv("BASH_ENV", str(bash_env))
+        monkeypatch.setenv("BASH_FUNC_probe%%", "() { :; }")
+        executor = CommandExecutorCore.for_workspace(workspace, restrict_paths=True)
+
+        result = executor.execute_command("true")
+
+        assert result["success"] is True
+        assert result["output"] == ""
+
+    def test_missing_parser_dependency_has_actionable_error(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        real_import = __import__
+
+        def reject_guard_import(name, *args, **kwargs):
+            if name.endswith("command_path_guard"):
+                raise ModuleNotFoundError(
+                    "No module named 'bashlex'",
+                    name="bashlex",
+                )
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", reject_guard_import)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"restricted command execution requires bashlex>=0\.18",
+        ):
+            CommandExecutorCore.for_workspace(workspace, restrict_paths=True)
 
 
 class TestConvenienceFunctions:
