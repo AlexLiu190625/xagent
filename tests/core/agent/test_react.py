@@ -2996,6 +2996,12 @@ async def test_react_pattern_reserves_control_tool_names_in_schema() -> None:
         in final_answer_schema["description"]
     )
     assert "response_language" in final_answer_schema["parameters"]["required"]
+    assert "outcome" in final_answer_schema["parameters"]["required"]
+    assert final_answer_schema["parameters"]["properties"]["outcome"]["enum"] == [
+        "completed",
+        "partial",
+        "blocked",
+    ]
     response_language_schema = final_answer_schema["parameters"]["properties"][
         "response_language"
     ]
@@ -3163,6 +3169,7 @@ async def test_react_pattern_accepts_plain_text_response() -> None:
         "output": "Direct answer",
         "response": "Direct answer",
         "status": "completed",
+        "completion_outcome": "completed",
     }
     assert context.messages[-1].content == "Direct answer"
 
@@ -3459,9 +3466,7 @@ async def test_react_pattern_resume_waiting_after_user_response_continues() -> N
 
 
 @pytest.mark.asyncio
-async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool() -> (
-    None
-):
+async def test_react_pattern_replans_after_waiting_control_tool() -> None:
     llm = FakeLLM(
         responses=[
             {
@@ -3493,14 +3498,29 @@ async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool(
     first = await pattern.run(context=context, tools=[tool], llm=llm)
 
     assert first["status"] == "waiting_for_user"
-    assert pattern.pending_tool_calls == [
-        {"id": "call_calc", "name": "calculator", "args": {"expression": "5+5"}}
-    ]
+    assert pattern.pending_tool_calls == []
+    assert pattern.tool_ledger["call_calc"].status == "cancelled"
+    assert tool.calls == []
 
     context.add_user_message("B")
     resumed_pattern = ReActPattern(max_iterations=4)
     resumed_pattern.load_state(pattern.get_state())
-    resumed_llm = FakeLLM([{"content": "The result is 10.", "done": True}])
+    resumed_llm = FakeLLM(
+        [
+            {
+                "tool_calls": [
+                    {
+                        "id": "call_calc_replanned",
+                        "function": {
+                            "name": "calculator",
+                            "arguments": '{"expression":"5+5"}',
+                        },
+                    }
+                ]
+            },
+            {"content": "The result is 10.", "done": True},
+        ]
+    )
 
     resumed = await resumed_pattern.run(
         context=context,
@@ -3510,19 +3530,16 @@ async def test_react_pattern_preserves_pending_calls_after_waiting_control_tool(
 
     assert resumed["success"] is True
     assert tool.calls == [{"expression": "5+5"}]
-    assert context.get_messages_by_role("tool")[-1].tool_call_id == "call_calc"
+    assert context.get_messages_by_role("tool")[-1].tool_call_id == (
+        "call_calc_replanned"
+    )
     resumed_messages = resumed_llm.calls[0]["messages"]
-    resumed_tool_result = next(
+    cancelled_tool_result = next(
         message
         for message in resumed_messages
         if message.get("role") == "tool" and message.get("tool_call_id") == "call_calc"
     )
-    resumed_tool_envelope_index = resumed_messages.index(resumed_tool_result) - 1
-    assert resumed_messages[resumed_tool_envelope_index]["role"] == "assistant"
-    assert resumed_messages[resumed_tool_envelope_index]["tool_calls"][0]["id"] == (
-        "call_calc"
-    )
-    assert "Tool calculator returned" in resumed_tool_result["content"]
+    assert "cancelled" in cancelled_tool_result["content"]
 
 
 @pytest.mark.asyncio
@@ -4422,3 +4439,533 @@ async def test_react_pattern_skips_store_memory_tool_in_single_call_mode() -> No
     assert result["success"] is True
     assert "store_memory" not in _tool_names_from_llm_call(llm.calls[0])
     assert memory_store.added == []
+
+
+@pytest.mark.asyncio
+async def test_tool_result_can_pause_and_resume_with_user_response() -> None:
+    class ResumableTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="approval_gate",
+                description="Run an action after the user responds.",
+            )
+            self.resume_calls: list[dict[str, str]] = []
+            self.user_response: str | None = None
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        def resume_user_interaction(
+            self,
+            *,
+            interaction_id: str,
+            response: str,
+        ) -> None:
+            self.resume_calls.append(
+                {"interaction_id": interaction_id, "response": response}
+            )
+            self.user_response = response
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            if self.user_response is None:
+                return {
+                    "success": False,
+                    "status": "waiting_for_user",
+                    "interaction_id": "interaction-1",
+                    "message": "Should the action continue?",
+                    "message_type": "confirmation",
+                    "interactions": [
+                        {
+                            "type": "select_one",
+                            "field": "decision",
+                            "label": "Decision",
+                            "options": [
+                                {"label": "Continue", "value": "continue"},
+                                {"label": "Stop", "value": "stop"},
+                            ],
+                        }
+                    ],
+                }
+            response = self.user_response
+            self.user_response = None
+            return {
+                "success": True,
+                "expression": args["expression"],
+                "user_response": response,
+            }
+
+    class MutationTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="mutation",
+                description="Mutate state.",
+            )
+            self.calls: list[dict[str, Any]] = []
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            return {"success": True}
+
+    first_tool = ResumableTool()
+    first_mutation = MutationTool()
+    context = ExecutionContext(execution_id="interaction-task")
+    context.add_user_message("Run the gated action.")
+    tracer = TraceEventRecorder()
+    runtime = PatternRuntime(execution_id="interaction-task", tracer=tracer)
+    pattern = ReActPattern(max_iterations=4)
+    waiting = await pattern.run(
+        context=context,
+        tools=[first_tool, first_mutation],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        },
+                        {
+                            "id": "stale-mutation",
+                            "function": {
+                                "name": "mutation",
+                                "arguments": '{"expression":"99"}',
+                            },
+                        },
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert waiting["status"] == "waiting_for_user"
+    assert waiting["message"] == "Should the action continue?"
+    assert pattern.tool_ledger["wait-call"].status == "waiting_for_user"
+    assert pattern.tool_ledger["stale-mutation"].status == "cancelled"
+    assert pattern.pending_tool_calls == []
+    assert first_mutation.calls == []
+    assert runtime.outbound_messages[0]["expect_response"] is True
+    assert any(
+        event["event_type"] == "action_end_tool"
+        and event["data"]["status"] == "waiting_for_user"
+        for event in tracer.events
+    )
+    assert not any(
+        event["event_type"] == "action_error_tool" for event in tracer.events
+    )
+
+    context.add_user_message("Continue")
+    resumed_tool = ResumableTool()
+    resumed_mutation = MutationTool()
+    resumed_pattern = ReActPattern(max_iterations=4)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[resumed_tool, resumed_mutation],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "resume-call",
+                            "function": {
+                                "name": "approval_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                },
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-call",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"The action completed.",'
+                                    '"outcome":"completed"}'
+                                ),
+                            },
+                        }
+                    ]
+                },
+            ]
+        ),
+    )
+
+    assert resumed["success"] is True
+    assert resumed["completion_outcome"] == "completed"
+    assert resumed_tool.resume_calls == [
+        {"interaction_id": "interaction-1", "response": "Continue"}
+    ]
+    assert resumed_mutation.calls == []
+    assert resumed_pattern.pending_tool_interaction_responses == []
+    response_metadata = next(
+        message.metadata
+        for message in context.messages
+        if message.role == "user" and message.content == "Continue"
+    )
+    assert response_metadata["response_to_waiting_for_user"]["question"] == (
+        "Should the action continue?"
+    )
+
+
+@pytest.mark.parametrize("waiting_request", [None, [], "malformed"])
+def test_tool_interaction_response_queue_ignores_malformed_requests(
+    waiting_request: Any,
+) -> None:
+    pattern = ReActPattern()
+
+    pattern._queue_tool_interaction_responses(
+        waiting_request=waiting_request,
+        response="Continue",
+        tools=[],
+    )
+
+    assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_callback_less_tool_interaction_resumes_by_replanning() -> None:
+    class CallbackLessTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="clarification_gate",
+                description="Ask for clarification without retaining server state.",
+            )
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": "interaction-1",
+                "message": "Which value should be used?",
+                "message_type": "question",
+                "interactions": [
+                    {
+                        "type": "text_input",
+                        "field": "value",
+                        "label": "Value",
+                    }
+                ],
+            }
+
+    tool = CallbackLessTool()
+    context = ExecutionContext(execution_id="callback-less-interaction")
+    context.add_user_message("Use the requested value.")
+    pattern = ReActPattern(max_iterations=2)
+    waiting = await pattern.run(
+        context=context,
+        tools=[tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "wait-call",
+                            "function": {
+                                "name": "clarification_gate",
+                                "arguments": '{"expression":"2+2"}',
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert waiting["status"] == "waiting_for_user"
+
+    context.add_user_message("Use 42")
+    resumed_pattern = ReActPattern(max_iterations=2)
+    resumed_pattern.load_state(pattern.get_state())
+    resumed = await resumed_pattern.run(
+        context=context,
+        tools=[tool],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-call",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"Using 42.",'
+                                    '"outcome":"completed"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert resumed["success"] is True
+    assert resumed["completion_outcome"] == "completed"
+    assert resumed_pattern.pending_tool_interaction_responses == []
+    response_message = next(
+        message
+        for message in context.messages
+        if message.role == "user" and message.content == "Use 42"
+    )
+    waiting_metadata = response_message.metadata["response_to_waiting_for_user"]
+    assert waiting_metadata["requests"][0]["tool_name"] == "clarification_gate"
+
+
+@pytest.mark.asyncio
+async def test_pending_interaction_delivery_is_exact_and_retryable() -> None:
+    class ResumableTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="approval_gate",
+                description="Resume exact interactions.",
+            )
+            self.calls: list[dict[str, str]] = []
+            self.fail_interaction_id = "interaction-2"
+
+        def resume_user_interaction(
+            self,
+            *,
+            interaction_id: str,
+            response: str,
+        ) -> None:
+            self.calls.append({"interaction_id": interaction_id, "response": response})
+            if interaction_id == self.fail_interaction_id:
+                raise RuntimeError("delivery failed")
+
+    pending = [
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-1",
+            "interaction_id": "interaction-1",
+            "response": "Approve first",
+        },
+        {
+            "tool_name": "approval_gate",
+            "tool_call_id": "call-2",
+            "interaction_id": "interaction-2",
+            "response": "Reject second",
+        },
+    ]
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = list(pending)
+    tool = ResumableTool()
+    context = ExecutionContext(execution_id="interaction-delivery")
+    runtime = PatternRuntime(execution_id="interaction-delivery")
+
+    with pytest.raises(RuntimeError, match="delivery failed"):
+        await pattern._deliver_pending_tool_interaction_responses(
+            tools=[tool],
+            context=context,
+            runtime=runtime,
+        )
+
+    assert tool.calls == [
+        {"interaction_id": "interaction-1", "response": "Approve first"},
+        {"interaction_id": "interaction-2", "response": "Reject second"},
+    ]
+    assert pattern.pending_tool_interaction_responses == [pending[1]]
+
+    tool.fail_interaction_id = ""
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[tool],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert tool.calls[-1] == {
+        "interaction_id": "interaction-2",
+        "response": "Reject second",
+    }
+    assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_pending_interaction_without_resume_callback_is_skipped() -> None:
+    class CallbackLessTool:
+        metadata = SimpleNamespace(
+            name="clarification_gate",
+            description="No resume callback.",
+        )
+
+    pending = {
+        "tool_name": "clarification_gate",
+        "tool_call_id": "call-1",
+        "interaction_id": "interaction-1",
+        "response": "Use 42",
+    }
+    pattern = ReActPattern()
+    pattern.pending_tool_interaction_responses = [pending]
+    context = ExecutionContext(execution_id="callback-less-delivery")
+    runtime = PatternRuntime(execution_id="callback-less-delivery")
+
+    await pattern._deliver_pending_tool_interaction_responses(
+        tools=[CallbackLessTool()],
+        context=context,
+        runtime=runtime,
+    )
+
+    assert pattern.pending_tool_interaction_responses == []
+
+
+@pytest.mark.asyncio
+async def test_concurrent_tool_interactions_pause_in_one_deterministic_message() -> (
+    None
+):
+    class ConcurrentWaitingTool:
+        def __init__(self, name: str, message: str) -> None:
+            self.metadata = SimpleNamespace(
+                name=name,
+                description=f"Wait for {name} input.",
+                concurrency_safe=True,
+            )
+            self.message = message
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            return {
+                "success": False,
+                "status": "waiting_for_user",
+                "interaction_id": f"{self.metadata.name}-interaction",
+                "message": self.message,
+                "interactions": [
+                    {
+                        "type": "text",
+                        "field": "decision",
+                        "label": self.metadata.name,
+                    }
+                ],
+            }
+
+    class MutationTool:
+        def __init__(self) -> None:
+            self.metadata = SimpleNamespace(
+                name="mutation",
+                description="Mutate state.",
+                concurrency_safe=False,
+            )
+            self.calls: list[dict[str, Any]] = []
+
+        def args_type(self) -> type[BaseModel]:
+            return CalculatorArgs
+
+        async def run_json_async(self, args: dict[str, Any]) -> Any:
+            self.calls.append(args)
+            return {"success": True}
+
+    mutation_tool = MutationTool()
+    tools = [
+        ConcurrentWaitingTool("first_gate", "Answer the first question."),
+        ConcurrentWaitingTool("second_gate", "Answer the second question."),
+        mutation_tool,
+    ]
+    pattern = ReActPattern(
+        max_iterations=2,
+        tool_parallel_enabled=True,
+        tool_max_concurrency=2,
+    )
+    runtime = PatternRuntime(execution_id="concurrent-interactions")
+    context = ExecutionContext(execution_id="concurrent-interactions")
+    context.add_user_message("Run both checks.")
+
+    result = await pattern.run(
+        context=context,
+        tools=tools,
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "first-call",
+                            "function": {
+                                "name": "first_gate",
+                                "arguments": '{"expression":"1"}',
+                            },
+                        },
+                        {
+                            "id": "second-call",
+                            "function": {
+                                "name": "second_gate",
+                                "arguments": '{"expression":"2"}',
+                            },
+                        },
+                        {
+                            "id": "stale-mutation",
+                            "function": {
+                                "name": "mutation",
+                                "arguments": '{"expression":"3"}',
+                            },
+                        },
+                    ]
+                }
+            ]
+        ),
+        runtime=runtime,
+    )
+
+    assert result["status"] == "waiting_for_user"
+    assert result["message"].startswith("Multiple tools need your input")
+    assert [item["field"] for item in result["interactions"]] == [
+        "decision",
+        "decision_2",
+    ]
+    assert [
+        request["interactions"][0]["field"]
+        for request in pattern.waiting_for_user_request["requests"]
+    ] == ["decision", "decision_2"]
+    assert len(runtime.outbound_messages) == 1
+    assert pattern.tool_ledger["first-call"].status == "waiting_for_user"
+    assert pattern.tool_ledger["second-call"].status == "waiting_for_user"
+    assert pattern.tool_ledger["stale-mutation"].status == "cancelled"
+    assert pattern.pending_tool_calls == []
+    assert mutation_tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_final_answer_preserves_semantic_completion_outcome() -> None:
+    pattern = ReActPattern(max_iterations=1)
+    context = ExecutionContext()
+    context.add_user_message("Complete everything if possible.")
+
+    result = await pattern.run(
+        context=context,
+        tools=[],
+        llm=FakeLLM(
+            [
+                {
+                    "tool_calls": [
+                        {
+                            "id": "final-partial",
+                            "function": {
+                                "name": "final_answer",
+                                "arguments": (
+                                    '{"response_language":"English",'
+                                    '"answer":"One item remains.",'
+                                    '"outcome":"partial"}'
+                                ),
+                            },
+                        }
+                    ]
+                }
+            ]
+        ),
+    )
+
+    assert result["success"] is True
+    assert result["status"] == "completed"
+    assert result["completion_outcome"] == "partial"
