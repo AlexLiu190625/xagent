@@ -96,7 +96,12 @@ class _FakeCreatedContainer:
         self.remove_calls: list[bool] = []
         self.start_calls = 0
         self.reload_calls = 0
-        self.attrs: dict = {"Config": {"WorkingDir": "/home"}}
+        self.name = "fake-container"
+        self.attrs: dict = {
+            "Config": {"WorkingDir": "/home"},
+            "State": {"Status": "running"},
+            "Created": "2026-01-01T00:00:00Z",
+        }
         self.labels: dict = {}
 
     def start(self):
@@ -448,6 +453,124 @@ class TestCreatePublishVerification:
         assert service._store.get_info("publish-mismatch-remove-fails") is None, (
             "a container that failed verification must never reach the store"
         )
+
+
+class TestCreatePersistsCanonicalDesiredState:
+    """Pin that the store row, the created container and the fingerprint
+    label all come from one canonical source.
+
+    If the row kept the caller's raw spelling instead, the row and the label
+    would be two different spellings of one spec, and every future reader
+    would have to re-normalize the row through ``from_parts`` before
+    comparing it -- an obligation nothing can enforce.
+    """
+
+    @pytest.mark.asyncio
+    async def test_row_matches_the_canonical_spec_the_label_attests(self, monkeypatch):
+        created = _FakeCreatedContainer()
+        captured: dict = {}
+
+        async def fake_create_container(
+            client, name, image, template, config, extra_labels=None
+        ):
+            captured["template"] = template
+            captured["config"] = config
+            captured["extra_labels"] = dict(extra_labels or {})
+            return created
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+
+        # Non-canonical spellings that from_parts() normalizes: a trailing
+        # slash on working_dir, and a host source carrying both a reserved
+        # POSIX '//' prefix and a '.' segment.
+        raw_config = SandboxConfig(
+            working_dir="/home/",
+            volumes=[("//data/./sub/", "/mnt/x/", "rw")],
+        )
+        canonical_volumes = (("/data/sub", "/mnt/x", "rw"),)
+
+        monkeypatch.setattr(
+            docker_sandbox_module,
+            "_build_inspection",
+            lambda container: _observed_inspection(
+                volumes=canonical_volumes, working_dir="/home"
+            ),
+        )
+
+        service = DockerSandboxService(MemDockerStore(), client=_FakeDockerClient())
+        await service.create(
+            "canonical-row",
+            SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+            raw_config,
+        )
+
+        row = service._store.get_info("canonical-row")
+        assert row is not None
+
+        # The row is the canonical form, not what the caller typed.
+        assert raw_config.working_dir == "/home/", "test input must be non-canonical"
+        assert row.config.working_dir == "/home"
+        assert row.config.volumes == [tuple(v) for v in canonical_volumes]
+
+        # Same objects the container itself was built from.
+        assert row.template == captured["template"]
+        assert row.config == captured["config"]
+
+        # And the row reproduces the fingerprint that was stamped on the
+        # container, so a reader comparing the row against the label needs no
+        # renormalization step to get a MATCH.
+        spec_from_row = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type=row.template.type,
+            image=row.template.image,
+            snapshot_id=row.template.snapshot_id,
+            working_dir=row.config.working_dir,
+            cpus=row.config.cpus,
+            memory=row.config.memory,
+            env=row.config.env,
+            volumes=row.config.volumes,
+            network_isolated=bool(row.config.network_isolated),
+            ports=row.config.ports,
+        )
+        assert (
+            spec_from_row.fingerprint()
+            == captured["extra_labels"][docker_sandbox_module.LABEL_SPEC_FINGERPRINT]
+        )
+        assert spec_from_row.to_backend_config() == (row.template, row.config), (
+            "the row must already be a fixed point of canonicalization"
+        )
+
+    @pytest.mark.asyncio
+    async def test_legacy_get_or_create_still_persists_the_raw_request(
+        self, monkeypatch
+    ):
+        """The canonical-row contract belongs to create(), not to the legacy path.
+
+        ``get_or_create()`` writes no attestation label, so its row has no
+        label to agree with and it keeps recording the caller's request
+        verbatim. Pinned so the two paths' rows are not assumed identical.
+        """
+        created = _FakeCreatedContainer()
+
+        async def fake_create_container(*args, **kwargs):
+            return created
+
+        monkeypatch.setattr(
+            docker_sandbox_module, "_create_container", fake_create_container
+        )
+
+        service = DockerSandboxService(MemDockerStore(), client=_FakeDockerClient())
+        raw_config = SandboxConfig(working_dir="/home/")
+        await service.get_or_create(
+            "legacy-row",
+            template=SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+            config=raw_config,
+        )
+
+        row = service._store.get_info("legacy-row")
+        assert row is not None
+        assert row.config.working_dir == "/home/"
 
 
 def _observed_facts(**overrides):

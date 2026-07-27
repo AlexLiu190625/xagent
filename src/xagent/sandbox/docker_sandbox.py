@@ -714,12 +714,22 @@ class DockerSandbox(Sandbox):
         info: SandboxInfo,
         store: DockerStore,
         control: _SandboxControl,
+        locks: KeyedLockRegistry,
     ) -> None:
+        """Bind a handle to one container plus the registries that guard it.
+
+        ``locks`` is the owning service's per-name lifecycle registry, passed
+        in so ``stop()`` can take the *same* mutex the service's own lifecycle
+        methods take (see ``stop()``). It is the registry object itself rather
+        than the service, so this handle keeps no reverse dependency on
+        ``DockerSandboxService``.
+        """
         self._container = container
         self._name = sandbox_name
         self._info = info
         self._store = store
         self._control = control
+        self._locks = locks
 
     @property
     def name(self) -> str:
@@ -777,11 +787,33 @@ class DockerSandbox(Sandbox):
         )
 
     async def stop(self) -> None:
-        """Stop the sandbox container while preserving filesystem state."""
-        async with self._control.exclusive_access(mark_deleted=False):
-            container = await self._require_container()
-            await asyncio.to_thread(container.stop)
-            self._store.update_info_state(self._name, "stopped")
+        """Stop the sandbox container while preserving filesystem state.
+
+        Takes two guards, in the same order every lifecycle method on
+        ``DockerSandboxService`` takes them: first the owning service's
+        per-container-name lock, then this sandbox's own
+        ``exclusive_access`` barrier. Acquiring the named lock is what makes
+        a stop mutually exclusive with ``start_existing``/``stop_existing``/
+        ``delete``/``create_snapshot`` for the same name -- the
+        ``exclusive_access`` barrier alone cannot do that, because it drains
+        in-flight ``operation()`` work and tracks no exclusive holder, and
+        neither ``container.stop()`` nor ``container.start()`` registers as
+        an ``operation()``. Because every holder of a named lock that also
+        takes ``exclusive_access`` acquires them in this order, the two can
+        never deadlock against each other.
+
+        The named lock is not reentrant, so no code already holding
+        ``name``'s entry may call this method: that is why
+        ``stop_existing()`` stops its container through the raw
+        ``Container.stop`` API instead of routing through a handle, the same
+        rule that keeps ``create()``'s compensating cleanup on raw
+        ``container.remove()`` rather than ``self.delete()``.
+        """
+        async with self._locks.locked(self._name):
+            async with self._control.exclusive_access(mark_deleted=False):
+                container = await self._require_container()
+                await asyncio.to_thread(container.stop)
+                self._store.update_info_state(self._name, "stopped")
 
     async def info(self) -> SandboxInfo:
         """Return current sandbox metadata derived from Docker inspect."""
@@ -1183,7 +1215,9 @@ class DockerSandboxService(SandboxService):
                 runtime_info = _parse_container_config(container)
                 info = _merge_info(runtime_info, self._store.get_info(name))
                 self._store.update_info_state(name, "running")
-                return DockerSandbox(name, container, info, self._store, control)
+                return DockerSandbox(
+                    name, container, info, self._store, control, self._locks
+                )
 
             template = template or SandboxTemplate(
                 type="image", image=DEFAULT_SANDBOX_IMAGE
@@ -1221,7 +1255,9 @@ class DockerSandboxService(SandboxService):
             )
             info = _merge_info(runtime_info, stored_info)
             self._store.add_info(name, info)
-            return DockerSandbox(name, container, info, self._store, control)
+            return DockerSandbox(
+                name, container, info, self._store, control, self._locks
+            )
 
     # --- Spec-based reconciliation lifecycle ---
     #
@@ -1421,8 +1457,26 @@ class DockerSandboxService(SandboxService):
             stored_info = SandboxInfo(
                 name=name,
                 state=runtime_info.state,
-                template=template,
-                config=config,
+                # The row records the *canonical* desired state, not the
+                # caller's raw input: `backend_template`/`backend_config` are
+                # the same `desired.to_backend_config()` products the
+                # container was built from and the fingerprint label attests.
+                # Persisting the raw input instead would make the row and the
+                # label two different spellings of one spec, leaving every
+                # future reader obliged to re-normalize the row through
+                # `from_parts` before comparing it to anything -- an
+                # obligation nothing in the type system can enforce, and one
+                # that a reconciler falling back to a desired-state
+                # comparison on UNVERIFIED (see `spec_matches_inspection`)
+                # would silently violate. One canonical source for the
+                # container, the label and the row removes that class of bug
+                # instead of documenting it. The conversion drops no
+                # information: `SandboxTemplate` is exactly
+                # (type, image, snapshot_id) and `SandboxConfig` exactly the
+                # seven fields the spec carries, so the only difference is
+                # canonical spelling.
+                template=backend_template,
+                config=backend_config,
                 created_at=runtime_info.created_at,
             )
             info = _merge_info(runtime_info, stored_info)
@@ -1430,20 +1484,12 @@ class DockerSandboxService(SandboxService):
             # not roll back the container — it is left running with a
             # verified label and no store row, which the next reconcile pass
             # converges by observing running+MATCH and recreating the row.
-            #
-            # The row deliberately records the caller's original
-            # template/config, not the canonicalized `desired`. The store is a
-            # record of what was asked for; canonicalization is owned by
-            # `ResolvedSandboxRuntimeSpec.from_parts`, which every consumer
-            # that compares a row against a desired spec runs the row back
-            # through. Both sides of such a comparison are therefore
-            # canonicalized by the same owner, so persisting the pre-canonical
-            # form cannot produce a spurious mismatch, and persisting the
-            # canonical form would instead lose the original request.
             self._store.add_info(name, info)
 
             control = self._get_live_control(name)
-            return DockerSandbox(name, container, info, self._store, control)
+            return DockerSandbox(
+                name, container, info, self._store, control, self._locks
+            )
 
     async def start_existing(self, name: str) -> DockerSandbox:
         """Start a previously-created sandbox, idempotent if already running.
@@ -1457,10 +1503,11 @@ class DockerSandboxService(SandboxService):
         Like every method on this service, this is also reference-count-blind
         (see ``create()``).
 
-        Mutual exclusion is per container name and is not shared with
-        ``Sandbox.stop()``, which takes only the sandbox's own
-        ``exclusive_access`` barrier and no named lock. A caller that can
-        issue both concurrently for one name must serialize them itself.
+        Mutual exclusion is per container name and *is* shared with
+        ``DockerSandbox.stop()``: that method acquires this same keyed lock
+        entry before its own ``exclusive_access`` barrier, so a caller may
+        issue a stop and a lifecycle transition for one name concurrently
+        without serializing them itself.
         """
         async with self._named_lock(name):
             container = await self._find_container(name)
@@ -1479,13 +1526,21 @@ class DockerSandboxService(SandboxService):
                 runtime_info = _parse_container_config(container)
                 info = _merge_info(runtime_info, self._store.get_info(name))
                 self._store.update_info_state(name, "running")
-                return DockerSandbox(name, container, info, self._store, control)
+                return DockerSandbox(
+                    name, container, info, self._store, control, self._locks
+                )
 
     async def stop_existing(self, name: str) -> None:
         """Stop an existing sandbox, idempotent if already stopped.
 
         Reference-count-blind (see ``create()``) and, like
-        ``start_existing()``, not mutually exclusive with ``Sandbox.stop()``.
+        ``start_existing()``, mutually exclusive with ``DockerSandbox.stop()``
+        through the shared per-name lock.
+
+        Stops the container through the raw ``Container.stop`` API rather than
+        through a ``DockerSandbox`` handle on purpose: the handle's ``stop()``
+        acquires this same non-reentrant lock entry, so delegating to it from
+        inside this critical section would self-deadlock.
         """
         async with self._named_lock(name):
             container = await self._find_container(name)

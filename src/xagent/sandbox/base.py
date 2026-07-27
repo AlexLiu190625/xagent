@@ -975,7 +975,10 @@ class SandboxService(abc.ABC):
         start fails, (6) verify the started container's observed facts
         against the desired spec before publishing, removing the container
         and raising if verification fails, (7) persist the store record only
-        after verification passes, and (8) return a live Sandbox handle.
+        after verification passes, recording the same canonical desired state
+        the container was built from and the fingerprint label attests rather
+        than the caller's raw input, so a reader never has to re-normalize the
+        row before comparing it, and (8) return a live Sandbox handle.
 
         Not idempotent: an existing container in any state (created,
         running, or stopped) raises SandboxAlreadyExistsError rather than

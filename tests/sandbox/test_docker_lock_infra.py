@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import threading
+import time
 from pathlib import Path
 
 import pytest
 
 import xagent.sandbox.docker_sandbox as docker_sandbox_module
 from xagent.sandbox.docker_sandbox import (
+    LABEL_SANDBOX_NAME,
     DockerSandboxService,
     MemDockerStore,
     _SandboxControl,
@@ -39,6 +42,166 @@ class _FakeDockerClient:
 
 def _make_service() -> DockerSandboxService:
     return DockerSandboxService(MemDockerStore(), client=_FakeDockerClient())
+
+
+class _StoppableContainer:
+    """Container stub whose ``stop()`` can be held open from the test.
+
+    ``stop()`` runs on a worker thread (both callers reach it through
+    ``asyncio.to_thread``), so the occupancy counter is guarded by a real
+    ``threading.Lock`` and the gate is a ``threading.Event``.
+    """
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.labels = {LABEL_SANDBOX_NAME: name}
+        self.attrs: dict = {
+            "Config": {"Image": "busybox:latest", "WorkingDir": "/home"},
+            "HostConfig": {},
+            "State": {"Status": "running"},
+            "NetworkSettings": {"Networks": {"bridge": {}}},
+            "Created": "2026-01-01T00:00:00Z",
+        }
+        self.stop_calls = 0
+        self.start_calls = 0
+        self.max_concurrent_stops = 0
+        self.stop_entered = threading.Event()
+        self.release_stop = threading.Event()
+        self._occupancy = 0
+        self._guard = threading.Lock()
+
+    def reload(self):
+        return None
+
+    def start(self):
+        self.start_calls += 1
+
+    def stop(self):
+        with self._guard:
+            self.stop_calls += 1
+            self._occupancy += 1
+            self.max_concurrent_stops = max(self.max_concurrent_stops, self._occupancy)
+        self.stop_entered.set()
+        if not self.release_stop.wait(timeout=10):
+            raise AssertionError("stop() gate was never released")
+        with self._guard:
+            self._occupancy -= 1
+
+
+class _FakeClientWithContainer:
+    """Docker client stub that always resolves one managed container."""
+
+    def __init__(self, container: _StoppableContainer) -> None:
+        self.containers = _SingleContainerCollection(container)
+
+    def ping(self):
+        return True
+
+
+class _SingleContainerCollection:
+    def __init__(self, container: _StoppableContainer) -> None:
+        self._container = container
+
+    def list(self, *args, **kwargs):
+        return [self._container]
+
+
+async def _await_flag(flag: threading.Event, timeout: float = 5.0) -> None:
+    """Await a thread-set flag from the event loop without blocking it."""
+    deadline = time.monotonic() + timeout
+    while not flag.is_set():
+        if time.monotonic() > deadline:
+            raise AssertionError("timed out waiting for the worker thread")
+        await asyncio.sleep(0.01)
+
+
+class TestHandleStopSharesTheServiceLifecycleLock:
+    """Pin that ``DockerSandbox.stop()`` and the service's own lifecycle
+    methods are mutually exclusive for one container name.
+
+    ``stop()`` used to take only the sandbox's own ``exclusive_access``
+    barrier, which drains in-flight ``operation()`` work and tracks no
+    exclusive holder -- and neither ``container.stop()`` nor
+    ``container.start()`` registers as an ``operation()``, so a stop could
+    interleave with ``stop_existing``/``start_existing``/``delete``/
+    ``create_snapshot`` for the same name.
+    """
+
+    @pytest.mark.asyncio
+    async def test_handles_are_built_with_the_services_lock_registry(self):
+        container = _StoppableContainer("wired")
+        service = DockerSandboxService(
+            MemDockerStore(), client=_FakeClientWithContainer(container)
+        )
+
+        from_start_existing = await service.start_existing("wired")
+        from_get_or_create = await service.get_or_create("wired")
+
+        # Same registry object, not a private copy: sharing the registry is
+        # the whole mechanism behind the mutual exclusion below.
+        assert from_start_existing._locks is service._locks
+        assert from_get_or_create._locks is service._locks
+
+    @pytest.mark.asyncio
+    async def test_stop_and_stop_existing_cannot_overlap_for_one_name(self):
+        name = "contended"
+        container = _StoppableContainer(name)
+        service = DockerSandboxService(
+            MemDockerStore(), client=_FakeClientWithContainer(container)
+        )
+        handle = await service.start_existing(name)
+
+        # The handle's stop() enters container.stop() and parks there.
+        stop_task = asyncio.create_task(handle.stop())
+        await _await_flag(container.stop_entered)
+        assert service._locks[name].lock.locked()
+        assert service._locks[name].waiters == 1
+
+        # A concurrent lifecycle transition for the same name must queue on
+        # the *same* lock entry rather than proceeding in parallel.
+        stop_existing_task = asyncio.create_task(service.stop_existing(name))
+        for _ in range(5):
+            await asyncio.sleep(0)
+        assert service._locks[name].waiters == 2, (
+            "stop_existing() must queue on the same keyed lock entry stop() holds"
+        )
+        assert not stop_existing_task.done()
+        assert container.stop_calls == 1, (
+            "stop_existing() must not reach container.stop() while stop() holds the lock"
+        )
+
+        container.release_stop.set()
+        await asyncio.wait_for(stop_task, timeout=5)
+        await asyncio.wait_for(stop_existing_task, timeout=5)
+
+        assert container.stop_calls == 2
+        assert container.max_concurrent_stops == 1, (
+            "the two stop paths overlapped inside the critical section"
+        )
+        assert name not in service._locks
+
+    @pytest.mark.asyncio
+    async def test_lock_holding_paths_do_not_self_deadlock(self):
+        """Regression pin for the fix's own failure mode.
+
+        The keyed lock is not reentrant, so a lock-holding path that reached
+        ``DockerSandbox.stop()`` would deadlock on itself. ``stop_existing()``
+        stops its container through the raw ``Container.stop`` API for exactly
+        that reason; this asserts the real call completes rather than hanging.
+        """
+        name = "no-deadlock"
+        container = _StoppableContainer(name)
+        container.release_stop.set()
+        service = DockerSandboxService(
+            MemDockerStore(), client=_FakeClientWithContainer(container)
+        )
+
+        handle = await service.start_existing(name)
+        await asyncio.wait_for(service.stop_existing(name), timeout=5)
+        await asyncio.wait_for(handle.stop(), timeout=5)
+
+        assert container.stop_calls == 2
+        assert name not in service._locks
 
 
 class TestNamedLockIdentityAndMutualExclusion:
