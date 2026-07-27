@@ -311,7 +311,7 @@ def _reserve_and_copy_upload(
     task_id: str | None,
     folder: str | None,
     user_id: int,
-) -> tuple[Path, int]:
+) -> Path:
     """Reserve one local upload path and copy bytes through its descriptor.
 
     This synchronous worker owns path construction, exclusive reservation, and
@@ -357,7 +357,7 @@ def _reserve_and_copy_upload(
         except BaseException:
             _delete_staged_upload(candidate)
             raise
-        return candidate, total_size
+        return candidate
 
 
 async def _stage_uploaded_file(
@@ -367,8 +367,8 @@ async def _stage_uploaded_file(
     folder: str | None,
     user_id: int,
     written_paths: list[Path],
-) -> tuple[Path, int]:
-    """Run local staging off-loop and drain exact cleanup on cancellation."""
+) -> Path:
+    """Run local staging off-loop and publish its path to request cleanup."""
 
     worker = asyncio.create_task(
         asyncio.to_thread(
@@ -379,17 +379,13 @@ async def _stage_uploaded_file(
             user_id=user_id,
         )
     )
-    (target_path, file_size), cancellation = await await_task_settlement(worker)
+    target_path, cancellation = await await_task_settlement(worker)
     # The request cleanup owner knows this exact path before any subsequent
     # preview, registration, or cancellation-cleanup await point.
     written_paths.append(target_path)
     if cancellation is not None:
-        cleanup_worker = asyncio.create_task(
-            asyncio.to_thread(_delete_staged_upload, target_path)
-        )
-        await drain_async_task_cancellation_safe(cleanup_worker)
         raise cancellation
-    return target_path, file_size
+    return target_path
 
 
 async def store_uploaded_files(
@@ -428,7 +424,7 @@ async def store_uploaded_files(
                 )
 
             try:
-                target_path, _file_size = await _stage_uploaded_file(
+                target_path = await _stage_uploaded_file(
                     uploaded,
                     task_id=task_id,
                     folder=folder,
@@ -526,13 +522,7 @@ async def store_uploaded_files(
 
                     def _delete_local_paths() -> None:
                         for path in written_paths:
-                            try:
-                                path.unlink(missing_ok=True)
-                            except OSError:
-                                logger.warning(
-                                    "Failed to clean up local upload: %s",
-                                    path,
-                                )
+                            _delete_staged_upload(path)
 
                     cleanup_worker = asyncio.create_task(
                         asyncio.to_thread(_delete_local_paths)

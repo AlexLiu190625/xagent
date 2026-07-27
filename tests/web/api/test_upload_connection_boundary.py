@@ -96,7 +96,6 @@ class _SlowTrackingSource(io.BytesIO):
 
     def __init__(self, payload: bytes, delay_seconds: float) -> None:
         super().__init__(payload)
-        self._rolled = False
         self.delay_seconds = delay_seconds
         self.read_threads: list[int] = []
 
@@ -121,6 +120,7 @@ class _BlockingSource(io.BytesIO):
 
 
 def _admin_user_id() -> int:
+    # The helper also creates the admin record when the test database is empty.
     _admin_headers()
     db = _direct_db_session()
     try:
@@ -211,7 +211,7 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
         files_api, "get_upload_path", _stage_path_in(upload_root, user_id)
     )
     engine = _install_one_slot_queue_pool(monkeypatch)
-    source = _SlowTrackingSource(b"bounded-copy", delay_seconds=0.05)
+    source = _SlowTrackingSource(b"bounded-copy", delay_seconds=0.2)
     upload = UploadFile(
         filename="off-loop.txt",
         file=source,
@@ -231,7 +231,7 @@ async def test_staging_copy_reads_off_loop_with_no_database_checkout(
     )
     try:
         await asyncio.sleep(0.01)
-        assert asyncio.get_running_loop().time() - started_at < 0.04
+        assert asyncio.get_running_loop().time() - started_at < 0.1
         assert engine.pool.checkedout() == 0
         await task
         assert source.read_threads
@@ -245,20 +245,19 @@ def test_reserve_and_copy_enforces_max_size_and_cleans_partial_file(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The worker returns an exact size and removes MAX+1 partial output."""
+    """The worker returns the path and removes MAX+1 partial output."""
 
     monkeypatch.setattr(files_api, "MAX_FILE_SIZE", 4)
     monkeypatch.setattr(files_api, "MAX_FILE_SIZE_LABEL", "4B")
     user_id = 7
     monkeypatch.setattr(files_api, "get_upload_path", _stage_path_in(tmp_path, user_id))
 
-    exact_path, exact_size = files_api._reserve_and_copy_upload(
+    exact_path = files_api._reserve_and_copy_upload(
         UploadFile(filename="exact.txt", file=io.BytesIO(b"1234")),
         task_id=None,
         folder=None,
         user_id=user_id,
     )
-    assert exact_size == 4
     assert exact_path.read_bytes() == b"1234"
 
     with pytest.raises(HTTPException, match="maximum limit"):
@@ -342,8 +341,12 @@ def test_reserve_and_copy_propagates_open_error_without_creating_an_artifact(
     user_id = 7
     monkeypatch.setattr(files_api, "get_upload_path", _stage_path_in(tmp_path, user_id))
 
-    def failing_open(*_args, **_kwargs) -> None:  # type: ignore[no-untyped-def]
-        raise PermissionError("open denied")
+    original_open = builtins.open
+
+    def failing_open(path, mode="r", *args, **kwargs):  # type: ignore[no-untyped-def]
+        if "x" in mode:
+            raise PermissionError("open denied")
+        return original_open(path, mode, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "open", failing_open)
     with pytest.raises(PermissionError, match="open denied"):
@@ -400,6 +403,45 @@ def test_delete_staged_upload_suppresses_operational_unlink_failure(
     monkeypatch.setattr(Path, "unlink", failing_unlink)
     files_api._delete_staged_upload(tmp_path / "staged.txt")
     assert "Failed to clean up local upload" in caplog.text
+
+
+def test_delete_staged_upload_does_not_hide_programming_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only operational unlink failures are best-effort."""
+
+    def invalid_unlink(
+        _path: Path,
+        *,
+        missing_ok: bool = False,
+    ) -> None:
+        del missing_ok
+        raise ValueError("invalid cleanup call")
+
+    monkeypatch.setattr(Path, "unlink", invalid_unlink)
+    with pytest.raises(ValueError, match="invalid cleanup call"):
+        files_api._delete_staged_upload(tmp_path / "staged.txt")
+
+
+def test_reserve_and_copy_uses_real_upload_path_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The worker remains compatible with the production path builder."""
+
+    from xagent.web import config as web_config
+
+    monkeypatch.setattr(web_config, "get_uploads_dir", lambda: tmp_path)
+    target = files_api._reserve_and_copy_upload(
+        UploadFile(filename="../real-path.txt", file=io.BytesIO(b"payload")),
+        task_id="42",
+        folder="documents",
+        user_id=7,
+    )
+
+    assert target == tmp_path / "user_7" / "task_42" / "documents" / "real-path.txt"
+    assert target.read_bytes() == b"payload"
 
 
 @pytest.mark.asyncio
@@ -513,23 +555,32 @@ async def test_store_uploaded_files_maps_path_validation_error_to_422(
 
 
 @pytest.mark.asyncio
-async def test_cancelled_staging_worker_deletes_its_exact_late_result(
+async def test_cancelled_store_cleans_its_exact_late_result_once(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Cancellation drains copy, deletes its returned path, then propagates."""
+    """The request cleanup owner deletes a drained staging result exactly once."""
 
     user_id = 7
     monkeypatch.setattr(files_api, "get_upload_path", _stage_path_in(tmp_path, user_id))
     source = _BlockingSource(b"late worker result")
-    written_paths: list[Path] = []
+    target = tmp_path / f"user_{user_id}" / "cancelled.txt"
+    unlink_calls: list[Path] = []
+    original_unlink = Path.unlink
+
+    def recording_unlink(path: Path, *, missing_ok: bool = False) -> None:
+        unlink_calls.append(path)
+        original_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
     task = asyncio.create_task(
-        files_api._stage_uploaded_file(
-            UploadFile(filename="cancelled.txt", file=source),
+        files_api.store_uploaded_files(
+            upload_items=[UploadFile(filename="cancelled.txt", file=source)],
+            task_type="general",
             task_id=None,
             folder=None,
             user_id=user_id,
-            written_paths=written_paths,
+            single_file_mode=True,
         )
     )
     assert await asyncio.to_thread(source.started.wait, 2)
@@ -538,8 +589,47 @@ async def test_cancelled_staging_worker_deletes_its_exact_late_result(
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    assert written_paths == [tmp_path / f"user_{user_id}" / "cancelled.txt"]
-    assert not written_paths[0].exists()
+    assert unlink_calls.count(target) == 1
+    assert not target.exists()
+
+
+@pytest.mark.asyncio
+async def test_failed_store_reuses_shared_staged_cleanup_helper(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Request cleanup delegates operational error handling to one helper."""
+
+    user_id = 7
+    target = tmp_path / f"user_{user_id}" / "cleanup.txt"
+    monkeypatch.setattr(files_api, "get_upload_path", _stage_path_in(tmp_path, user_id))
+    cleanup_calls: list[Path] = []
+    original_delete = files_api._delete_staged_upload
+
+    def recording_delete(path: Path) -> None:
+        cleanup_calls.append(path)
+        original_delete(path)
+
+    def fail_registration(_registrations) -> None:  # type: ignore[no-untyped-def]
+        raise RuntimeError("registration failed")
+
+    monkeypatch.setattr(files_api, "_delete_staged_upload", recording_delete)
+    monkeypatch.setattr(files_api, "register_local_uploads_sync", fail_registration)
+
+    with pytest.raises(RuntimeError, match="registration failed"):
+        await files_api.store_uploaded_files(
+            upload_items=[
+                UploadFile(filename="cleanup.txt", file=io.BytesIO(b"payload"))
+            ],
+            task_type="general",
+            task_id=None,
+            folder=None,
+            user_id=user_id,
+            single_file_mode=True,
+        )
+
+    assert cleanup_calls == [target]
+    assert not target.exists()
 
 
 def test_jwt_upload_releases_auth_session_before_durable_io(
