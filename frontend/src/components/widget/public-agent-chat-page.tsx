@@ -57,9 +57,12 @@ interface PublicConversationContentProps {
 // disabled the link, unpublished the agent/workforce, or the channel
 // mismatches, so treating it as recoverable would trigger a pointless clear +
 // re-auth round-trip that still lands on the terminal error.
-//   - "Access denied for this guest": the per-guest isolation denial — a
+//   - "Task not found or access denied": the per-guest isolation denial — a
 //     returning visitor's persisted taskId belongs to another (or a pre-#973)
-//     guest. Backend HTTPException.detail surfaced as event.reason on a 4003.
+//     guest — or a deleted task; both recover the same way. The backend
+//     deliberately reuses its not-found detail for guest mismatches so task
+//     ids can't be enumerated (see _require_share_guest_owns_task). Backend
+//     HTTPException.detail surfaced as event.reason on a 4003.
 //   - "Access denied": use-websocket.ts's fallback when a 4003 carries no
 //     reason.
 //   - "Invalid share token": the persisted guest JWT no longer validates
@@ -70,7 +73,7 @@ interface PublicConversationContentProps {
 //     the first send hits a task-create 401, which then re-auths. Without this,
 //     the WS-resume path would strand the visitor with no send to trigger that.
 const SHARE_ACCESS_DENIED_REASONS = new Set([
-  "Access denied for this guest",
+  "Task not found or access denied",
   "Access denied",
   "Invalid share token",
 ])

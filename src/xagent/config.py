@@ -107,6 +107,17 @@ TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
 TRIGGER_CALLBACK_IP_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT"
 TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
 TRUSTED_PROXY_HOPS = "XAGENT_TRUSTED_PROXY_HOPS"
+# Public share-channel abuse controls (#973). Each is a rate string in the
+# ``limits`` notation, e.g. "60/minute" or "500/day".
+SHARE_AUTH_RATE_LIMIT = "XAGENT_SHARE_AUTH_RATE_LIMIT"
+SHARE_AUTH_IP_RATE_LIMIT = "XAGENT_SHARE_AUTH_IP_RATE_LIMIT"
+SHARE_TASK_CREATE_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_RATE_LIMIT"
+SHARE_TASK_CREATE_TOKEN_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT"
+SHARE_WS_TURN_RATE_LIMIT = "XAGENT_SHARE_WS_TURN_RATE_LIMIT"
+SHARE_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT"
+SHARE_UPLOAD_RATE_LIMIT = "XAGENT_SHARE_UPLOAD_RATE_LIMIT"
+SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
+SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
 GMAIL_PUBSUB_TOPIC_PREFIX = "XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX"
 GMAIL_PUBSUB_SUBSCRIPTION_PREFIX = "XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX"
@@ -696,6 +707,93 @@ def get_trigger_crud_rate_limit() -> str:
     """
     value = (os.getenv(TRIGGER_CRUD_RATE_LIMIT) or "").strip()
     return value or "60/minute"
+
+
+def _get_rate_limit(env_var: str, default: str) -> str:
+    """Read a ``limits``-notation rate string with an env override.
+
+    Priority: the given ``XAGENT_*`` env var, else ``default``. The value is
+    validated (and defaulted) at parse time by the rate limiter, so this only
+    trims and falls back on an empty/unset var.
+    """
+    return (os.getenv(env_var) or "").strip() or default
+
+
+def get_share_auth_rate_limit() -> str:
+    """Per-share-token limit on ``POST /api/share/auth`` (#973).
+
+    No ``guest_id`` exists before auth, so this bounds one share link's token
+    minting; the per-IP ceiling below bounds a single client across links.
+    """
+    return _get_rate_limit(SHARE_AUTH_RATE_LIMIT, "60/minute")
+
+
+def get_share_auth_ip_rate_limit() -> str:
+    """Per-IP ceiling on ``POST /api/share/auth`` across all share links."""
+    return _get_rate_limit(SHARE_AUTH_IP_RATE_LIMIT, "300/minute")
+
+
+def get_share_task_create_rate_limit() -> str:
+    """Per-guest limit on public share task creation (#973).
+
+    Task creation is the costly surface (each spawns an owner-billed run), so
+    this is the tighter of the two task-create buckets.
+    """
+    return _get_rate_limit(SHARE_TASK_CREATE_RATE_LIMIT, "30/minute")
+
+
+def get_share_task_create_token_rate_limit() -> str:
+    """Per-share-token ceiling on public share task creation.
+
+    Stops a client rotating fresh ``guest_id`` tokens (one auth each) from
+    bypassing the per-guest bucket on one share link.
+    """
+    return _get_rate_limit(SHARE_TASK_CREATE_TOKEN_RATE_LIMIT, "120/minute")
+
+
+def get_share_ws_turn_rate_limit() -> str:
+    """Per-guest limit on share websocket turns (#973).
+
+    Follow-up turns bypass task-create and each starts an owner-billed run;
+    this caps the burst rate before a turn is enqueued.
+    """
+    return _get_rate_limit(SHARE_WS_TURN_RATE_LIMIT, "60/minute")
+
+
+def get_share_ws_connect_ip_rate_limit() -> str:
+    """Per-IP limit on share websocket connection attempts (#973).
+
+    The share websocket accepts the handshake before auth so denial reasons
+    reach the client, which means even a garbage token completes a full 101
+    upgrade before rejection. This caps how many of those handshakes one IP
+    can open; over-limit attempts are refused pre-accept (no upgrade cost).
+    """
+    return _get_rate_limit(SHARE_WS_CONNECT_IP_RATE_LIMIT, "120/minute")
+
+
+def get_share_upload_rate_limit() -> str:
+    """Per-guest limit on public share file uploads (#973)."""
+    return _get_rate_limit(SHARE_UPLOAD_RATE_LIMIT, "60/minute")
+
+
+def get_share_run_quota() -> str:
+    """Per-share rolling run quota (#973).
+
+    Bounds the owner-billed runs one share link can start per window so a
+    single popular/abused link cannot exhaust the owner's whole team quota.
+    Rolling (not cumulative) so a legitimately busy link self-clears rather
+    than being permanently bricked.
+    """
+    return _get_rate_limit(SHARE_RUN_QUOTA, "500/day")
+
+
+def get_share_run_guest_quota() -> str:
+    """Per-guest rolling run quota within a share link (#973).
+
+    Shorter window than the per-share quota: bounds a single visitor's burst
+    of runs so one guest cannot consume the whole link's budget.
+    """
+    return _get_rate_limit(SHARE_RUN_GUEST_QUOTA, "60/hour")
 
 
 def get_trusted_proxy_hops() -> int:

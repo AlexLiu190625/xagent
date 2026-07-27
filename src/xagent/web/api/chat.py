@@ -836,6 +836,30 @@ def _load_task_run_gate_user_id_isolated(task_id: int) -> int | None:
         return int(user_id) if user_id is not None else None
 
 
+def _load_task_share_quota_config_isolated(task_id: int) -> dict[str, Any] | None:
+    """Load the share-quota markers (#973) in a worker-owned short Session.
+
+    Returns the task's ``agent_config`` only when it marks a share task
+    (``auth_mode == "share"``); ``None`` skips the share quota gate. Kept
+    separate from :func:`_load_task_run_gate_user_id_isolated` so the owner
+    gate's return contract (an ``int | None`` that tests monkeypatch) stays
+    untouched.
+    """
+    from ..models.database import get_session_local
+
+    SessionLocal = get_session_local()
+    with SessionLocal() as share_db:
+        agent_config = (
+            share_db.query(Task.agent_config).filter(Task.id == task_id).scalar()
+        )
+        if (
+            isinstance(agent_config, Mapping)
+            and agent_config.get("auth_mode") == "share"
+        ):
+            return dict(agent_config)
+        return None
+
+
 def _check_task_run_gate_on_event_loop(
     user_id: int | None,
 ) -> str | dict[str, Any] | None:
@@ -2636,6 +2660,59 @@ class AgentServiceManager:
                     )
                     raise
                 logger.warning("Quota gate check failed open", exc_info=True)
+
+        # Per-share run quota (#973): the run gate above bounds the OWNER's
+        # team quota, but every anonymous share run bills the owner, so one
+        # public link could still drain the whole team quota. This adds a
+        # per-link + per-guest rolling ceiling on top, keyed off the share
+        # markers PR1 stamped into agent_config. Only share tasks are gated;
+        # fails open (availability) like the run gate above, with the same
+        # pool-timeout escalation so a stalled pool doesn't cascade.
+        if tracker_task_id:
+            try:
+                share_config = await run_db_io_cancellation_safe(
+                    lambda: _load_task_share_quota_config_isolated(int(tracker_task_id))
+                )
+                if share_config is not None:
+                    guest_id = share_config.get("guest_id")
+                    workforce_id = share_config.get("share_workforce_id")
+                    agent_share_id = share_config.get("share_agent_id")
+                    if workforce_id is not None:
+                        share_key = f"workforce:{int(workforce_id)}"
+                    elif agent_share_id is not None:
+                        share_key = f"agent:{int(agent_share_id)}"
+                    else:
+                        share_key = None
+                    if share_key and isinstance(guest_id, str) and guest_id:
+                        from ..services.share_rate_limit import (
+                            get_share_rate_limiter,
+                        )
+
+                        if not get_share_rate_limiter().allow_run(share_key, guest_id):
+                            reason_message = (
+                                "This shared link has reached its usage limit. "
+                                "Please try again later."
+                            )
+                            return {
+                                "success": False,
+                                "status": "quota_exceeded",
+                                "output": reason_message,
+                                "error": reason_message,
+                                "error_code": "share_run_quota_exceeded",
+                                "error_details": None,
+                            }
+            except Exception as exc:
+                if is_database_pool_timeout(exc):
+                    logger.error(
+                        "task_id=%s component=share-quota-gate database pool "
+                        "checkout timed out; terminating before further runtime "
+                        "database work: %s",
+                        tracker_task_id,
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
+                logger.warning("Share run quota check failed open", exc_info=True)
 
         if manage_task_lease and tracker_task_id:
             from ..services.task_execution_controller import (

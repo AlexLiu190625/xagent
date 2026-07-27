@@ -179,9 +179,11 @@ def _reset_trigger_rate_limiter() -> Iterator[None]:
     moving window; without a reset, fast suites reusing the same user id
     would eventually trip the CRUD limit across unrelated tests.
     """
+    from xagent.web.services.share_rate_limit import reset_share_rate_limiter
     from xagent.web.services.trigger_rate_limit import reset_trigger_rate_limiter
 
     reset_trigger_rate_limiter()
+    reset_share_rate_limiter()
     yield
 
 

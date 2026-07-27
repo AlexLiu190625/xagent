@@ -1598,6 +1598,65 @@ class TestTriggerRateLimitConfig:
         assert get_trigger_crud_rate_limit() == "5/minute"
 
 
+class TestShareRateLimitConfig:
+    """Config for public share-channel rate limits and run quotas (#973)."""
+
+    _CASES = [
+        ("get_share_auth_rate_limit", "XAGENT_SHARE_AUTH_RATE_LIMIT", "60/minute"),
+        (
+            "get_share_auth_ip_rate_limit",
+            "XAGENT_SHARE_AUTH_IP_RATE_LIMIT",
+            "300/minute",
+        ),
+        (
+            "get_share_task_create_rate_limit",
+            "XAGENT_SHARE_TASK_CREATE_RATE_LIMIT",
+            "30/minute",
+        ),
+        (
+            "get_share_task_create_token_rate_limit",
+            "XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT",
+            "120/minute",
+        ),
+        (
+            "get_share_ws_turn_rate_limit",
+            "XAGENT_SHARE_WS_TURN_RATE_LIMIT",
+            "60/minute",
+        ),
+        (
+            "get_share_ws_connect_ip_rate_limit",
+            "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT",
+            "120/minute",
+        ),
+        ("get_share_upload_rate_limit", "XAGENT_SHARE_UPLOAD_RATE_LIMIT", "60/minute"),
+        ("get_share_run_quota", "XAGENT_SHARE_RUN_QUOTA", "500/day"),
+        ("get_share_run_guest_quota", "XAGENT_SHARE_RUN_GUEST_QUOTA", "60/hour"),
+    ]
+
+    @pytest.mark.parametrize("func_name,env_var,default", _CASES)
+    def test_default(self, monkeypatch, func_name, env_var, default):
+        import xagent.config as config
+
+        monkeypatch.delenv(env_var, raising=False)
+        assert getattr(config, func_name)() == default
+
+    @pytest.mark.parametrize("func_name,env_var,default", _CASES)
+    def test_env_override(self, monkeypatch, func_name, env_var, default):
+        import xagent.config as config
+
+        monkeypatch.setenv(env_var, "7/second")
+        assert getattr(config, func_name)() == "7/second"
+
+    @pytest.mark.parametrize("func_name,env_var,default", _CASES)
+    def test_blank_env_falls_back_to_default(
+        self, monkeypatch, func_name, env_var, default
+    ):
+        import xagent.config as config
+
+        monkeypatch.setenv(env_var, "   ")
+        assert getattr(config, func_name)() == default
+
+
 class TestGmailPubSubProvisioningConfig:
     """Config for per-mailbox Gmail Pub/Sub provisioning."""
 
