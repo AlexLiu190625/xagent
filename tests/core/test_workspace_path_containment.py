@@ -326,6 +326,69 @@ def test_resolve_authorized_path_normalizes_resolution_failures(
         )
 
 
+def test_resolve_authorized_path_workspace_match_ignores_broken_external_root(
+    tmp_path,
+):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = TaskWorkspace(
+        "task7",
+        str(tmp_path / "workspace"),
+        allowed_external_dirs=[str(external)],
+    )
+    external.rmdir()
+    external.symlink_to(external.name)
+    target = workspace.output_dir / "report.txt"
+
+    assert (
+        workspace.resolve_authorized_path(
+            target,
+            base_dir=workspace.output_dir,
+        )
+        == target.resolve()
+    )
+
+
+def test_resolve_authorized_path_broken_external_root_stays_fail_closed(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = TaskWorkspace(
+        "task8",
+        str(tmp_path / "workspace"),
+        allowed_external_dirs=[str(external)],
+    )
+    external.rmdir()
+    external.symlink_to(external.name)
+
+    with pytest.raises(ValueError, match="Failed to resolve path"):
+        workspace.resolve_authorized_path(
+            tmp_path / "outside" / "report.txt",
+            base_dir=workspace.output_dir,
+        )
+
+
+def test_resolve_authorized_path_normalizes_user_expansion_failures(
+    workspace, monkeypatch
+):
+    file_path = Path("~/report.txt")
+    original_expanduser = Path.expanduser
+
+    def fail_expansion(path):
+        if path == file_path:
+            raise RuntimeError("user home is unavailable")
+        return original_expanduser(path)
+
+    monkeypatch.setattr(Path, "expanduser", fail_expansion)
+
+    with pytest.raises(ValueError, match="Failed to resolve path") as exc_info:
+        workspace.resolve_authorized_path(
+            file_path,
+            base_dir=workspace.output_dir,
+        )
+
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
+
+
 # --------------------------------------------------------------------------
 # SITE 2 — WorkspaceFileOperations._resolve_path (separate implementation;
 # it ignores allowed_external_dirs and confines strictly to workspace_dir)
