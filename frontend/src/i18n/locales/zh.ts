@@ -488,6 +488,8 @@ const zh = {
     startNewConversation: "开始新对话",
     resetting: "正在开始...",
     resetFailed: "无法开始新对话，请重试。",
+    startMessageFailed: "无法发送消息，请重试。",
+    reloadRequired: "此对话状态未知。请刷新页面后再继续。",
     expiryWarning: "此聊天会话即将过期，请刷新页面以继续。",
     expired: {
       title: "聊天会话已过期",
@@ -1575,6 +1577,7 @@ const zh = {
       loggedIn: "已登录",
       notLoggedIn: "未登录",
       logoutTitle: "退出登录",
+      logoutFailed: "无法退出登录，请重试。",
       defaultName: "用户",
     },
   },

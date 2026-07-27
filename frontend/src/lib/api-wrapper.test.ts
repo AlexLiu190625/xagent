@@ -8,11 +8,33 @@ import {
   refreshStoredAccessToken,
 } from "@/lib/api-wrapper"
 import {
+  AUTH_CACHE_KEY,
   AUTH_TOKEN_UPDATED_EVENT,
   clearStoredAuth,
+  createAuthSession,
   readAuthCache,
-  writeAuthCache,
+  readAuthSessionSnapshot,
 } from "@/lib/auth-cache"
+
+function writeAuthCache(
+  user: { id: string; username: string; email?: string | null; is_admin?: boolean } | null,
+  token: string | null,
+  refreshToken: string | null = null,
+  expiresIn?: number,
+  refreshExpiresIn?: number,
+) {
+  if (!user || !token) {
+    localStorage.removeItem(AUTH_CACHE_KEY)
+    return
+  }
+  const now = Date.now()
+  localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+    schemaVersion: 2, sessionId: `test-${Math.random()}`, credentialRevision: 0, profileRevision: 0,
+    user, token, refreshToken, timestamp: now,
+    expiresAt: expiresIn ? now + expiresIn * 1000 : undefined,
+    refreshExpiresAt: refreshExpiresIn ? now + refreshExpiresIn * 1000 : undefined,
+  }))
+}
 
 function mockNavigatorLocks(
   beforeCallback: () => void | Promise<void> = () => {}
@@ -172,6 +194,33 @@ describe("api-wrapper auth refresh", () => {
     mockNavigatorLocks()
   })
 
+  it("replays once when the profile advances after the refreshed credential is committed", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    const updateProfileAfterRefresh = () => {
+      const raw = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
+      if (raw.token !== "new-access") return
+      raw.profileRevision += 1
+      raw.user.email = "fresh-profile@example.com"
+      localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(raw))
+    }
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, updateProfileAfterRefresh)
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
+      if (String(input).endsWith("/api/auth/refresh")) {
+        return new Response(JSON.stringify({ success: true, access_token: "new-access", refresh_token: "new-refresh" }), {
+          headers: { "Content-Type": "application/json" },
+        })
+      }
+      return new Response(null, {
+        status: new Headers(options?.headers).get("Authorization") === "Bearer old-access" ? 401 : 200,
+        headers: { "Error-Type": "TokenExpired" },
+      })
+    })
+
+    await expect(apiRequest("http://api.local/protected")).resolves.toMatchObject({ status: 200 })
+    expect(fetchMock.mock.calls.map(([, options]) => new Headers(options?.headers).get("Authorization"))).toContain("Bearer new-access")
+    window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, updateProfileAfterRefresh)
+  })
+
   it("coalesces concurrent refreshes and retries every waiting request", async () => {
     writeAuthCache(user, "old-access", "old-refresh", 120, 240)
 
@@ -225,7 +274,7 @@ describe("api-wrapper auth refresh", () => {
       writeAuthCache(user, "other-tab-access", "other-tab-refresh", 120, 240)
     })
 
-    const result = await refreshStoredAccessToken("old-access")
+    const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
     expect(result).toEqual({ accessToken: null, rejected: false })
     expect(fetchMock).not.toHaveBeenCalled()
@@ -239,7 +288,7 @@ describe("api-wrapper auth refresh", () => {
       writeAuthCache(user, "other-tab-access", "other-tab-refresh", 120, 240)
     })
 
-    const result = await refreshStoredAccessToken(null)
+    const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
     expect(result).toEqual({ accessToken: null, rejected: false })
     expect(fetchMock).not.toHaveBeenCalled()
@@ -256,7 +305,7 @@ describe("api-wrapper auth refresh", () => {
       headers: { "Content-Type": "application/json" },
     }))
 
-    const result = await refreshStoredAccessToken("old-access", 1)
+    const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
     expect(result).toMatchObject({
       accessToken: "new-access",
@@ -283,7 +332,7 @@ describe("api-wrapper auth refresh", () => {
       })
     })
 
-    const result = await refreshStoredAccessToken("old-access")
+    const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
     expect(result).toEqual({ accessToken: null, rejected: false })
     expect(readAuthCache()).toBeNull()
@@ -506,6 +555,7 @@ describe("api-wrapper auth refresh", () => {
       })
     })
     const replaceAfterRefresh = () => {
+      window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, replaceAfterRefresh)
       writeAuthCache(
         replacementUser,
         "shared-access",
@@ -591,7 +641,7 @@ describe("api-wrapper auth refresh", () => {
         })
       )
 
-      const resultPromise = refreshStoredAccessToken("old-access")
+      const resultPromise = refreshStoredAccessToken(readAuthSessionSnapshot())
       await vi.advanceTimersByTimeAsync(15_000)
 
       await expect(resultPromise).resolves.toEqual({

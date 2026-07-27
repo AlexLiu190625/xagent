@@ -26,6 +26,10 @@ import {
   projectFilesDisabledToolResultOutput,
   serializeFilesDisabledValue,
 } from "@/components/ui/markdown-renderer";
+import {
+  projectFilesDisabledPresentation,
+  sanitizeFilesDisabledPresentationText,
+} from "@/lib/files-disabled-presentation";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
 import { InlineFilePreview } from '@/components/file/inline-file-preview';
@@ -879,18 +883,18 @@ const ToolArtifactsDisplay = ({
   onFileClick?: (filePath: string, fileName: string) => void;
   t: Translate;
 }) => {
-  const displayArtifacts = (artifacts || []).filter(
-    artifact => artifact && (artifact.preview_url || artifact.file_id) && (artifact.display === undefined || artifact.display === 'inline')
-  );
-
-  if (displayArtifacts.length === 0) return null;
-
   if (filesDisabled) {
+    const safeArtifacts = (artifacts || []).filter(
+      artifact => artifact && (artifact.display === undefined || artifact.display === 'inline'),
+    );
+
+    if (safeArtifacts.length === 0) return null;
+
     return (
       <div className="mt-4 grid gap-2">
-        {displayArtifacts.map((artifact, index) => (
+        {safeArtifacts.map((artifact, index) => (
           <span
-            key={`${artifact.file_id || artifact.preview_url || index}`}
+            key={`${artifact.filename || artifact.type || index}`}
             className="text-xs text-muted-foreground break-all"
           >
             {artifact.filename || artifact.type || t('traceEventRenderer.filePrefix')}
@@ -899,6 +903,12 @@ const ToolArtifactsDisplay = ({
       </div>
     );
   }
+
+  const displayArtifacts = (artifacts || []).filter(
+    artifact => artifact && (artifact.preview_url || artifact.file_id) && (artifact.display === undefined || artifact.display === 'inline')
+  );
+
+  if (displayArtifacts.length === 0) return null;
 
   return (
     <div className="mt-4 grid gap-3">
@@ -936,9 +946,11 @@ const ToolOutputDisplay = ({
   onFileClick?: (filePath: string, fileName: string) => void,
   onAgentClick?: (agentId: string, agentName: string) => void,
 }) => {
-  const displayOutput = filesDisabled && action.data.rawResult !== undefined
-    ? projectFilesDisabledToolResultOutput(action.data.rawResult)
-    : action.data.output;
+  const displayOutput = useMemo(() => (
+    filesDisabled && action.data.rawResult !== undefined
+      ? projectFilesDisabledToolResultOutput(action.data.rawResult)
+      : action.data.output
+  ), [action.data.output, action.data.rawResult, filesDisabled]);
 
   return (
     <>
@@ -1003,7 +1015,9 @@ const ToolErrorDisplay = ({
 };
 
 const PythonToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
-  const code = action.data.code;
+  const code = filesDisabled
+    ? formatActionContent(action.data.code, true)
+    : action.data.code;
   const filePath = action.data.args?.file_path;
   const fileLabel = filesDisabled
     ? getFilesDisabledFileLabel(action.data.args)
@@ -1038,11 +1052,9 @@ const PythonToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, 
 };
 
 const BashToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t, onFileClick, onAgentClick }: any) => {
-  const command = action.data.args?.command || (
-    filesDisabled
-      ? serializeFilesDisabledValue(action.data.args)
-      : JSON.stringify(action.data.args)
-  );
+  const command = filesDisabled
+    ? formatActionContent(action.data.args?.command ?? action.data.args, true)
+    : action.data.args?.command || JSON.stringify(action.data.args);
   return (
     <div className="pt-2">
       {command !== undefined && (
@@ -1063,11 +1075,9 @@ const BashToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t,
 };
 
 const SearchToolRenderer = ({ action, filesDisabled, isRunning, t, onFileClick, onAgentClick }: any) => {
-  const query = action.data.args?.query || (
-    filesDisabled
-      ? serializeFilesDisabledValue(action.data.args)
-      : JSON.stringify(action.data.args)
-  );
+  const query = filesDisabled
+    ? formatActionContent(action.data.args?.query ?? action.data.args, true)
+    : action.data.args?.query || JSON.stringify(action.data.args);
   return (
     <div className="pt-2">
       <div className="flex flex-col gap-1.5">
@@ -1091,7 +1101,10 @@ const FileToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t,
   const fileLabel = filesDisabled
     ? getFilesDisabledFileLabel(args)
     : filePath;
-  const content = args?.content || args?.text || args?.code;
+  const rawContent = args?.content || args?.text || args?.code;
+  const content = filesDisabled
+    ? formatActionContent(rawContent, true)
+    : rawContent;
   const fallbackText = !content
     ? (filesDisabled ? serializeFilesDisabledValue(args) : JSON.stringify(args, null, 2))
     : undefined;
@@ -1204,6 +1217,12 @@ function StepActionItem({
   onAgentClick,
 }: StepActionItemProps) {
   const { t } = useI18n();
+  const displayAction = useMemo(
+    () => filesDisabled
+      ? projectFilesDisabledPresentation(action) as StepAction
+      : action,
+    [action, filesDisabled],
+  );
   const scrollRef = useRef<HTMLDivElement>(null);
   const [isExpanded, setIsExpanded] = useState(false);
   const [userToggled, setUserToggled] = useState(false);
@@ -1212,50 +1231,50 @@ function StepActionItem({
   useEffect(() => {
     if (userToggled) return;
 
-    if (action.status === 'running') {
+    if (displayAction.status === 'running') {
       setIsExpanded(true);
-    } else if (action.status === 'completed' || action.status === 'failed') {
+    } else if (displayAction.status === 'completed' || displayAction.status === 'failed') {
       setIsExpanded(false);
     }
-  }, [action.status, userToggled]);
+  }, [displayAction.status, userToggled]);
 
   // Auto-scroll logic
   useEffect(() => {
-    if (action.status === 'running' && isExpanded && scrollRef.current) {
+    if (displayAction.status === 'running' && isExpanded && scrollRef.current) {
       const scrollElement = scrollRef.current.querySelector('[data-radix-scroll-area-viewport]') ||
         scrollRef.current.querySelector('[data-slot="scroll-area-viewport"]');
       if (scrollElement) {
         scrollElement.scrollTop = scrollElement.scrollHeight;
       }
     }
-  }, [action.data, action.status, isExpanded]); // Re-run when data updates
+  }, [displayAction.data, displayAction.status, isExpanded]); // Re-run when data updates
 
   const handleToggle = () => {
     setIsExpanded(!isExpanded);
     setUserToggled(true);
   };
 
-  const isRunning = action.status === 'running';
-  const isFailed = action.status === 'failed';
-  const isCompleted = action.status === 'completed';
+  const isRunning = displayAction.status === 'running';
+  const isFailed = displayAction.status === 'failed';
+  const isCompleted = displayAction.status === 'completed';
   const summaryMetaRef = useRef<HTMLDivElement>(null);
   const fixedMetaRef = useRef<HTMLDivElement>(null);
   const summaryMeasureRef = useRef<HTMLSpanElement>(null);
   const [hideToolSummary, setHideToolSummary] = useState(false);
 
   const summary = useMemo(() => {
-    if (action.type === 'llm') {
-      if (action.data.reasoning) {
+    if (displayAction.type === 'llm') {
+      if (displayAction.data.reasoning) {
         const clean = formatActionContent(
-          action.data.reasoning,
+          displayAction.data.reasoning,
           filesDisabled,
         ).replace(/[\n\r\s]+/g, ' ').trim();
         return clean.length > 50 ? clean.slice(0, 50) + '...' : clean;
       }
       return null;
     }
-    if (action.type === 'tool') {
-      const { tool, args, code } = action.data;
+    if (displayAction.type === 'tool') {
+      const { tool, args, code } = displayAction.data;
 
       if (tool === 'python_executor' && code) {
         return `Python: ${code.slice(0, 50).replace(/[\n\r\s]+/g, ' ').trim()}...`;
@@ -1291,15 +1310,15 @@ function StepActionItem({
         } catch (e) { return null; }
       }
     }
-    if (action.type === 'info' && action.data.output) {
-      const clean = formatActionContent(action.data.output, filesDisabled).replace(/[\n\r\s]+/g, ' ').trim();
+    if (displayAction.type === 'info' && displayAction.data.output) {
+      const clean = formatActionContent(displayAction.data.output, filesDisabled).replace(/[\n\r\s]+/g, ' ').trim();
       return clean.length > 50 ? clean.slice(0, 50) + '...' : clean;
     }
     return null;
-  }, [action.type, action.data, filesDisabled, t]);
+  }, [displayAction, filesDisabled, t]);
 
   const updateToolSummaryVisibility = useCallback(() => {
-    if (action.type !== 'tool' || !summary) {
+    if (displayAction.type !== 'tool' || !summary) {
       setHideToolSummary(false);
       return;
     }
@@ -1321,7 +1340,7 @@ function StepActionItem({
     const fixedWidth = fixed?.offsetWidth ?? 0;
     const availableWidth = container.clientWidth - fixedWidth - 8;
     setHideToolSummary(availableWidth <= 0 || measure.scrollWidth > availableWidth);
-  }, [action.type, summary]);
+  }, [displayAction.type, summary]);
 
   useEffect(() => {
     updateToolSummaryVisibility();
@@ -1339,11 +1358,11 @@ function StepActionItem({
     };
   }, [updateToolSummaryVisibility]);
 
-  if (action.type === 'info' && action.data.inline) {
+  if (displayAction.type === 'info' && displayAction.data.inline) {
     return (
       <div className="px-3 py-1.5">
         <MarkdownRenderer
-          content={formatActionContent(action.data.output, filesDisabled)}
+          content={formatActionContent(displayAction.data.output, filesDisabled)}
           filesDisabled={filesDisabled}
           onFileClick={onFileClick}
           className="text-sm leading-relaxed text-foreground prose-neutral dark:prose-invert max-w-none [&>p]:mb-1.5 [&>p:last-child]:mb-0"
@@ -1352,13 +1371,13 @@ function StepActionItem({
     );
   }
 
-  if (action.type === 'llm') {
+  if (displayAction.type === 'llm') {
     return (
       <div className="group transition-all duration-300">
-        {action.data.reasoning && (
+        {displayAction.data.reasoning && (
           <MarkdownRenderer
             content={formatActionContent(
-              action.data.reasoning,
+              displayAction.data.reasoning,
               filesDisabled,
             )}
             filesDisabled={filesDisabled}
@@ -1370,10 +1389,10 @@ function StepActionItem({
               "
           />
         )}
-        {action.status === 'failed' && action.data.error && (
+        {displayAction.status === 'failed' && displayAction.data.error && (
           <div className="text-red-400 text-sm mt-1 whitespace-pre-wrap">
             {t('traceEventRenderer.errorLabel')}{formatActionContent(
-              action.data.error,
+              displayAction.data.error,
               filesDisabled,
             )}
           </div>
@@ -1396,17 +1415,17 @@ function StepActionItem({
         <div className="flex flex-1 items-start gap-2 min-w-0">
           <div className="flex items-start gap-2 min-w-0">
             <span className="flex-shrink-0 flex items-center">
-              {action.type === 'tool' && <Wrench className="w-3.5 h-3.5" />}
-              {action.type === 'error' && <Info className="w-3.5 h-3.5 text-red-500" />}
-              {action.type === 'info' && <MessageSquare className="w-3.5 h-3.5" />}
+              {displayAction.type === 'tool' && <Wrench className="w-3.5 h-3.5" />}
+              {displayAction.type === 'error' && <Info className="w-3.5 h-3.5 text-red-500" />}
+              {displayAction.type === 'info' && <MessageSquare className="w-3.5 h-3.5" />}
             </span>
 
-            <span className="font-medium break-words [overflow-wrap:anywhere]">{action.title}</span>
+            <span className="font-medium break-words [overflow-wrap:anywhere]">{displayAction.title}</span>
           </div>
 
           <div ref={summaryMetaRef} className="relative flex items-center gap-1 min-w-0 flex-1 overflow-hidden">
             <div ref={fixedMetaRef} className="flex items-center gap-1 shrink-0">
-              {action.data.sandboxed && (
+              {displayAction.data.sandboxed && (
                 <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded text-[10px] font-medium bg-green-500/10 text-green-600 dark:text-green-400 border border-green-500/20 whitespace-nowrap flex-shrink-0">
                   <Shield className="w-3 h-3" />
                   {t('traceEventRenderer.sandboxedExecution')}
@@ -1416,12 +1435,12 @@ function StepActionItem({
               {isRunning && <Loader2 className="w-3 h-3 animate-spin ml-1 flex-shrink-0" />}
             </div>
 
-            {summary && (action.type !== 'tool' || !hideToolSummary) && (
+            {summary && (displayAction.type !== 'tool' || !hideToolSummary) && (
               <span className="text-muted-foreground/50 font-normal ml-1 hidden sm:block min-w-0 truncate">
                 - {summary}
               </span>
             )}
-            {summary && action.type === 'tool' && (
+            {summary && displayAction.type === 'tool' && (
               <span
                 ref={summaryMeasureRef}
                 aria-hidden="true"
@@ -1434,7 +1453,7 @@ function StepActionItem({
         </div>
         <div className="flex items-center gap-2 flex-shrink-0">
           <span className="text-[10px] opacity-0 group-hover:opacity-100 transition-opacity text-muted-foreground/50">
-            {new Date(action.timestamp).toLocaleString([], {
+            {new Date(displayAction.timestamp).toLocaleString([], {
               month: 'numeric',
               day: 'numeric',
               hour: '2-digit',
@@ -1461,11 +1480,11 @@ function StepActionItem({
                   "p-3 space-y-2 font-mono text-xs",
                   !filesDisabled && "cursor-pointer hover:bg-muted/50 transition-colors",
                 )}
-                onClick={filesDisabled ? undefined : () => onViewDetail(action)}
+                onClick={filesDisabled ? undefined : () => onViewDetail(displayAction)}
               >
-                {action.type === 'tool' && (
+                {displayAction.type === 'tool' && (
                   <ToolDetailsRenderer
-                    action={action}
+                    action={displayAction}
                     filesDisabled={filesDisabled}
                     onOpenTerminal={onOpenTerminal}
                     isRunning={isRunning}
@@ -1475,18 +1494,18 @@ function StepActionItem({
                   />
                 )}
 
-                {action.type === 'error' && (
+                {displayAction.type === 'error' && (
                   <div className="text-red-400 whitespace-pre-wrap">
                     {formatActionContent(
-                      action.data.error,
+                      displayAction.data.error,
                       filesDisabled,
                     )}
                   </div>
                 )}
 
-                {action.type === 'info' && (
+                {displayAction.type === 'info' && (
                   <MarkdownRenderer
-                    content={formatActionContent(action.data.output, filesDisabled)}
+                    content={formatActionContent(displayAction.data.output, filesDisabled)}
                     filesDisabled={filesDisabled}
                     onFileClick={onFileClick}
                     className="text-sm leading-relaxed prose-neutral dark:prose-invert max-w-none"
@@ -1531,7 +1550,9 @@ function StepItem({
   const isPaused = step.status === 'paused' || step.status === 'waiting_for_user';
   const [isExpanded, setIsExpanded] = useState(() => defaultExpanded || !isCompleted);
   const wasCompletedRef = useRef(isCompleted);
-  const rawTitle = step.description || step.stepName;
+  const rawTitle = filesDisabled
+    ? sanitizeFilesDisabledPresentationText(step.description || step.stepName)
+    : step.description || step.stepName;
   const displayTitle =
     isCompleted && step.stepName === t('traceEventRenderer.taskExecution') && !step.description
       ? t('traceEventRenderer.thoughtProcess')
@@ -1669,6 +1690,7 @@ function StepItem({
 // Main TraceEventRenderer Component
 export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, onAgentExecutionClick, defaultExpandSteps = false }: TraceEventRendererProps) {
   const { t } = useI18n();
+  const { filesDisabled, openFilePreview, dispatch } = useApp();
   const sanitizedEvents = useMemo(() => sanitizeTraceEvents(events), [events]);
   const processStatus = resolveTraceProcessStatus({
     taskStatus,
@@ -1677,7 +1699,6 @@ export function TraceEventRenderer({ events, taskStatus, onOpenExecutionPlan, on
   const steps = useProcessedSteps(sanitizedEvents, processStatus);
   const router = useRouter();
 
-  const { filesDisabled, openFilePreview, dispatch } = useApp();
 
   const handleAgentClick = useCallback((agentId: string, agentName: string) => {
     router.push(`/agent/${agentId}`);

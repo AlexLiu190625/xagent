@@ -169,4 +169,18 @@ describe("useFileMention", () => {
     expect(screen.getByTestId("key-handled")).toHaveTextContent("false")
     expect(createFileChipHTMLMock).not.toHaveBeenCalled()
   })
+
+  it("cancels a live mention surface when the file capability changes to disabled", async () => {
+    const { rerender } = render(<HookHarness />)
+    fireEvent.click(screen.getByText("force-picker"))
+    expect(screen.getByTestId("picker-visible")).toHaveTextContent("true")
+
+    rerender(<HookHarness filesDisabled />)
+    await act(async () => {
+      await Promise.resolve()
+    })
+
+    expect(screen.getByTestId("picker-visible")).toHaveTextContent("false")
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
 })

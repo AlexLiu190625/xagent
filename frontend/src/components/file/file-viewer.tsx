@@ -5,14 +5,11 @@ import { ExcelPreviewRenderer } from "@/components/file/excel-preview-renderer"
 import { PptxPreviewRenderer } from "@/components/file/pptx-preview-renderer"
 import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { useI18n } from "@/contexts/i18n-context"
+import { useFileAccess } from "@/contexts/file-access-context"
 import {
-  getApiUrl,
-  getFilePublicPreviewUrl,
-  getFileRelativePreviewUrl,
   isHtmlFile,
   isMarkdownFile,
   isCsvFile,
-  withPublicAccessToken,
 } from "@/lib/utils"
 
 const VIDEO_EXTENSION_MIME_TYPES: Record<string, string> = {
@@ -167,6 +164,7 @@ export function FileViewer({
   viewMode
 }: FileViewerProps) {
   const { t } = useI18n()
+  const fileAccess = useFileAccess()
   const videoMimeType = getVideoMimeType(fileName, mimeType)
   const audioMimeType = getAudioMimeType(fileName, mimeType, content)
   const base64Content = getBase64Payload(content)
@@ -208,21 +206,20 @@ export function FileViewer({
   const processHtmlContent = (htmlContent: string, fileId: string) => {
     if (!htmlContent || !fileId) return htmlContent
 
-    const apiUrl = getApiUrl()
-
     return htmlContent.replace(
       /(src|href)=["']([^"']+)["']/g,
       (match, attr, path) => {
         if (path.match(/^(https?:\/|data:|\/\/|#)/)) return match
         if (path.startsWith("file:")) {
           const fileRef = path.replace(/^file:/, "")
-          return `${attr}="${getFilePublicPreviewUrl(fileRef, apiUrl)}"`
+          return `${attr}="${fileAccess.inlinePreviewUrl(fileRef)}"`
         }
         if (path.startsWith("/api/files/public/preview/")) {
-          return `${attr}="${withPublicAccessToken(`${apiUrl}${path}`)}"`
+          const requestedFileId = path.slice("/api/files/public/preview/".length)
+          return `${attr}="${fileAccess.inlinePreviewUrl(requestedFileId)}"`
         }
 
-        return `${attr}="${getFileRelativePreviewUrl(fileId, path, apiUrl)}"`
+        return `${attr}="${fileAccess.relativePreviewUrl(fileId, path)}"`
       }
     )
   }

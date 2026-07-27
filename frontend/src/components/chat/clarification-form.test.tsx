@@ -12,12 +12,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 const appContextMock = vi.hoisted(() => ({
   dispatch: vi.fn(),
   filesDisabled: false,
+  providerAvailable: true,
   sendMessage: vi.fn(),
 }))
 const toastErrorMock = vi.hoisted(() => vi.fn())
 
 vi.mock("@/contexts/app-context-chat", () => ({
-  useApp: () => appContextMock,
+  useApp: () => {
+    if (!appContextMock.providerAvailable) {
+      throw new Error("App provider is unavailable")
+    }
+    return appContextMock
+  },
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
@@ -38,6 +44,7 @@ describe("ClarificationForm Session file capability", () => {
   beforeEach(() => {
     appContextMock.dispatch.mockReset()
     appContextMock.filesDisabled = false
+    appContextMock.providerAvailable = true
     appContextMock.sendMessage.mockReset()
     toastErrorMock.mockReset()
   })
@@ -192,5 +199,30 @@ describe("ClarificationForm Session file capability", () => {
         {},
       )
     })
+  })
+
+  it("fails closed for file uploads when no app provider or override is available", () => {
+    appContextMock.providerAvailable = false
+    const { container } = render(
+      <ClarificationForm
+        interactions={[{ type: "file_upload", field: "evidence", label: "Evidence" }]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(container.querySelector('input[type="file"]')).toBeNull()
+  })
+
+  it("allows builder callers to explicitly enable file uploads without an app provider", () => {
+    appContextMock.providerAvailable = false
+    const { container } = render(
+      <ClarificationForm
+        filesDisabled={false}
+        interactions={[{ type: "file_upload", field: "evidence", label: "Evidence" }]}
+        onSend={vi.fn()}
+      />,
+    )
+
+    expect(container.querySelector('input[type="file"]')).not.toBeNull()
   })
 })

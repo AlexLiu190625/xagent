@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useState } from "react"
+import React, { useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { getApiUrl } from "@/lib/utils"
@@ -22,7 +22,7 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useSetupStatus } from "@/hooks/use-setup-status"
 import { AuthPageShell } from "@/components/auth/auth-page-shell"
 import { AuthFormCard } from "@/components/auth/auth-form-card"
-import { storeAuthTokenPayload } from "@/lib/auth-cache"
+import { claimAuthLoginIntent, claimOidcAuthLoginIntent, createAuthSession } from "@/lib/auth-cache"
 
 export function LoginPage() {
   const branding = getBrandingFromEnv()
@@ -75,6 +75,11 @@ export function LoginPage() {
     setIsLoading(true)
 
     try {
+      const claimed = await claimAuthLoginIntent()
+      if (claimed.status !== "claimed") {
+        setError(t("login.alerts.auth_failed"))
+        return
+      }
       const response = await apiRequest(`${getApiUrl()}/api/auth/login`, {
         method: "POST",
         headers: {
@@ -85,7 +90,11 @@ export function LoginPage() {
 
       if (response.ok) {
         const data = await response.json()
-        storeAuthTokenPayload(data)
+        const created = await createAuthSession(data, claimed.intent)
+        if (created.status !== "created") {
+          setError(t("login.alerts.auth_failed"))
+          return
+        }
 
         // Redirect to home on success
         window.location.href = "/"
@@ -109,7 +118,15 @@ export function LoginPage() {
     if (error) setError("")
   }
 
-  const handleGoogleLogin = () => {
+  const handleGoogleLogin = async () => {
+    setError("")
+    setIsLoading(true)
+    const claimed = await claimOidcAuthLoginIntent()
+    if (claimed.status !== "claimed") {
+      setError(t("login.alerts.auth_failed"))
+      setIsLoading(false)
+      return
+    }
     window.location.href = `${getApiUrl()}/api/auth/oidc/google/login`
   }
 
@@ -260,7 +277,7 @@ export function LoginPage() {
               type="button"
               variant="outline"
               onClick={handleGoogleLogin}
-              disabled={!isGoogleConfigured}
+              disabled={!isGoogleConfigured || isLoading}
               className="h-12 w-full gap-2 rounded-[14px] border-[#E2E8F3] bg-white text-[#171A2F] hover:bg-[#F7F9FC] disabled:opacity-60"
             >
               <span className="grid h-4 w-4 place-items-center text-sm font-semibold">

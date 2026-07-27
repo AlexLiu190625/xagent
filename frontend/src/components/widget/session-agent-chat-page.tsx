@@ -20,12 +20,22 @@ import {
 } from "./use-widget-session"
 
 const SESSION_PROTOCOL = "xagent-session-v1"
-const EXPIRED_TERMINAL_CODES = new Set([
-  "session_expired",
-  "reconnect_invalid",
-  "identity_mismatch",
-  "ws_4408",
-])
+type SessionTerminalPresentation = "expired" | "unavailable"
+
+const SESSION_TERMINAL_PRESENTATION: Readonly<Record<string, SessionTerminalPresentation>> = {
+  session_expired: "expired",
+  grant_expired: "expired",
+  grant_already_used: "expired",
+  reconnect_invalid: "unavailable",
+  identity_mismatch: "unavailable",
+  ws_4408: "expired",
+  ws_4403: "unavailable",
+  unexpected_error: "unavailable",
+}
+
+const getSessionTerminalPresentation = (code: string | null): SessionTerminalPresentation => (
+  code ? SESSION_TERMINAL_PRESENTATION[code] ?? "unavailable" : "unavailable"
+)
 
 interface SessionConversationContentProps {
   status: WidgetSessionStatus
@@ -49,15 +59,26 @@ function SessionConversationContent({
     startNewConversation,
     isConversationResetPending,
     isMessageDeliveryPending,
+    isSessionInteractionLocked,
+    sessionConversationState,
   } = useApp()
   const { t } = useI18n()
   const [resetError, setResetError] = useState(false)
+  const [startMessageError, setStartMessageError] = useState(false)
 
-  const handleStartMessage = useCallback((
+  const handleStartMessage = useCallback(async (
     message: string,
     files: File[],
     config?: Record<string, unknown>,
-  ) => sendMessage(message, config, files), [sendMessage])
+  ) => {
+    setStartMessageError(false)
+    try {
+      await sendMessage(message, config, files)
+    } catch (error) {
+      setStartMessageError(true)
+      throw error
+    }
+  }, [sendMessage])
 
   const handleStartNewConversation = useCallback(async () => {
     setResetError(false)
@@ -82,8 +103,7 @@ function SessionConversationContent({
   }
 
   if (status === "terminal" || !agent) {
-    const isExpired = terminalCode !== null
-      && EXPIRED_TERMINAL_CODES.has(terminalCode)
+    const isExpired = getSessionTerminalPresentation(terminalCode) === "expired"
     return (
       <div className="flex h-screen items-center justify-center bg-background p-6">
         <div className="max-w-md text-center">
@@ -103,8 +123,9 @@ function SessionConversationContent({
   }
 
   const hasEstablishedConversation = state.taskId !== null
+  const reloadRequired = isSessionInteractionLocked
   const resetDisabled =
-    isConversationResetPending || isMessageDeliveryPending
+    reloadRequired || isConversationResetPending || isMessageDeliveryPending
 
   return (
     <div className="flex h-screen flex-col bg-background">
@@ -156,9 +177,19 @@ function SessionConversationContent({
             {t("widgetSession.expiryWarning")}
           </p>
         ) : null}
-        {resetError ? (
+        {resetError && !reloadRequired ? (
           <p className="mt-2 text-xs text-destructive" role="alert">
             {t("widgetSession.resetFailed")}
+          </p>
+        ) : null}
+        {startMessageError && !reloadRequired ? (
+          <p className="mt-2 text-xs text-destructive" role="alert">
+            {t("widgetSession.startMessageFailed")}
+          </p>
+        ) : null}
+        {reloadRequired ? (
+          <p className="mt-2 text-xs text-destructive" role="alert">
+            {t("widgetSession.reloadRequired")}
           </p>
         ) : null}
       </header>
@@ -188,6 +219,7 @@ function SessionConversationContent({
                   state.isProcessing
                   || isConversationResetPending
                   || isMessageDeliveryPending
+                  || reloadRequired
                 }
                 files={[]}
                 onFilesChange={() => undefined}
@@ -232,18 +264,19 @@ export function SessionAgentChatPage() {
       connection,
       onConnectionClose: bridge.handleConnectionClose,
       onConnectionFailure: bridge.handleConnectionFailure,
+      onConnectionOpen: bridge.handleConnectionOpen,
       allowTasklessChat: true,
       supportsConversationReset: true,
-      preserveConversationOnReconnect: true,
-      adoptTaskIdFromTaskInfo: true,
       history: "none",
       files: "disabled",
+      agentCards: "disabled",
       voice: "disabled",
       taskControls: "disabled",
     },
   }), [
     bridge.handleConnectionClose,
     bridge.handleConnectionFailure,
+    bridge.handleConnectionOpen,
     connection,
   ])
 

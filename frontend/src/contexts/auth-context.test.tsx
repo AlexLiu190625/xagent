@@ -7,18 +7,38 @@ import {
   waitFor,
 } from "@testing-library/react"
 import React from "react"
+import { renderToString } from "react-dom/server"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
-import { AuthProvider, useAuth } from "@/contexts/auth-context"
+import { AnonymousAuthProvider, AuthProvider, useAuth } from "@/contexts/auth-context"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
-import { AUTH_CACHE_KEY, clearStoredAuth, writeAuthCache } from "@/lib/auth-cache"
+import { AUTH_CACHE_KEY, clearStoredAuth } from "@/lib/auth-cache"
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: vi.fn(async () => new Response(null, { status: 404 })),
   refreshStoredAccessToken: vi.fn(),
 }))
 
-afterEach(cleanup)
+afterEach(() => {
+  cleanup()
+  vi.unstubAllGlobals()
+})
+
+function writeAuthCache(
+  user: { id: string; username: string; email?: string | null; is_admin?: boolean },
+  token: string,
+  refreshToken: string | null = null,
+  expiresIn?: number,
+  refreshExpiresIn?: number,
+) {
+  const now = Date.now()
+  localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+    schemaVersion: 2, sessionId: `test-${Math.random()}`, credentialRevision: 0, profileRevision: 0,
+    user, token, refreshToken, timestamp: now,
+    expiresAt: expiresIn ? now + expiresIn * 1000 : undefined,
+    refreshExpiresAt: refreshExpiresIn ? now + refreshExpiresIn * 1000 : undefined,
+  }))
+}
 
 function AuthProbe() {
   const { checkAuth, token } = useAuth()
@@ -52,13 +72,106 @@ function AuthRefreshProbe() {
   )
 }
 
+function AuthLogoutProbe() {
+  const { logout, token } = useAuth()
+  const [result, setResult] = React.useState("pending")
+  return <>
+    <span data-testid="logout-token">{token || "none"}</span>
+    <span data-testid="logout-result">{result}</span>
+    <button onClick={() => { void logout().then(value => setResult(String(value))) }}>Logout</button>
+  </>
+}
+
+function AuthSsrProbe() {
+  const { isLoading, session } = useAuth()
+  return <span>{`${isLoading}:${session.accessToken || "none"}`}</span>
+}
+
+function AnonymousAuthProbe() {
+  const auth = useAuth()
+  const [results, setResults] = React.useState<boolean[] | null>(null)
+  const projection = {
+    user: auth.user,
+    isAuthenticated: auth.isAuthenticated,
+    token: auth.token,
+    refreshToken: auth.refreshToken,
+    session: auth.session,
+    isLoading: auth.isLoading,
+    inTeam: auth.inTeam,
+    teamRole: auth.teamRole,
+  }
+  return <>
+    <span data-testid="anonymous-auth-projection">{JSON.stringify(projection)}</span>
+    <span data-testid="anonymous-auth-results">{JSON.stringify(results)}</span>
+    <button onClick={() => {
+      void Promise.all([
+        auth.login("ignored", "ignored"),
+        auth.logout(),
+        auth.checkAuth(),
+        auth.refreshAccessToken(),
+      ]).then(setResults)
+    }}>
+      Exercise anonymous auth
+    </button>
+  </>
+}
+
 describe("AuthProvider storage synchronization", () => {
   beforeEach(() => {
     localStorage.clear()
     vi.restoreAllMocks()
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request: vi.fn(async (_name: string, callback: () => Promise<unknown>) => callback()) },
+    })
     vi.mocked(apiRequest).mockImplementation(
       async () => new Response(null, { status: 404 })
     )
+  })
+
+  it("server-renders an empty loading projection when browser storage is unavailable", () => {
+    vi.stubGlobal("localStorage", {})
+    expect(() => renderToString(<AuthProvider><AuthSsrProbe /></AuthProvider>)).not.toThrow()
+    expect(renderToString(<AuthProvider><AuthSsrProbe /></AuthProvider>)).toContain("true:none")
+  })
+
+  it("keeps anonymous routes neutral without auth storage or API side effects", async () => {
+    const cacheBefore = JSON.stringify({
+      schemaVersion: 2, sessionId: "personal-session", credentialRevision: 0, profileRevision: 0,
+      user: { id: "1", username: "alice" }, token: "personal-access", refreshToken: "personal-refresh",
+      timestamp: Date.now(),
+    })
+    localStorage.setItem(AUTH_CACHE_KEY, cacheBefore)
+    vi.mocked(apiRequest).mockClear()
+    vi.mocked(refreshStoredAccessToken).mockClear()
+    const lockRequest = vi.mocked(navigator.locks.request)
+    lockRequest.mockClear()
+
+    render(<AnonymousAuthProvider><AnonymousAuthProbe /></AnonymousAuthProvider>)
+
+    expect(JSON.parse(screen.getByTestId("anonymous-auth-projection").textContent || "null")).toEqual({
+      user: null,
+      isAuthenticated: false,
+      token: null,
+      refreshToken: null,
+      session: {
+        sessionId: null, credentialRevision: null, profileRevision: null,
+        userId: null, accessToken: null, refreshToken: null, profileFingerprint: null,
+      },
+      isLoading: false,
+      inTeam: false,
+      teamRole: null,
+    })
+
+    fireEvent.click(screen.getByRole("button", { name: "Exercise anonymous auth" }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId("anonymous-auth-results")).toHaveTextContent("[false,false,false,false]")
+    })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(cacheBefore)
+    expect(apiRequest).not.toHaveBeenCalled()
+    expect(refreshStoredAccessToken).not.toHaveBeenCalled()
+    expect(lockRequest).not.toHaveBeenCalled()
   })
 
   it("ignores non-object auth cache payloads without a runtime error", async () => {
@@ -219,7 +332,10 @@ describe("AuthProvider storage synchronization", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
     await waitFor(() => {
-      expect(refreshStoredAccessToken).toHaveBeenCalledWith("alice-access", "1")
+      expect(refreshStoredAccessToken).toHaveBeenCalledWith(expect.objectContaining({
+        accessToken: "alice-access",
+        userId: "1",
+      }))
     })
 
     writeAuthCache(
@@ -283,5 +399,40 @@ describe("AuthProvider storage synchronization", () => {
       expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("none")
     })
     expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
+  })
+
+  it("does not reuse the old check debounce after credentials advance in storage", async () => {
+    writeAuthCache(
+      { id: "1", username: "alice", email: null, is_admin: false },
+      "old-access", "old-refresh", 120, 240,
+    )
+    render(<AuthProvider><AuthProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("access-token")).toHaveTextContent("old-access"))
+    const raw = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
+    raw.token = "new-access"
+    raw.credentialRevision += 1
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(raw))
+
+    fireEvent.click(screen.getByRole("button", { name: "Check auth" }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId("check-result")).toHaveTextContent("true")
+      expect(screen.getByTestId("access-token")).toHaveTextContent("new-access")
+    })
+    expect(vi.mocked(apiRequest).mock.calls.filter(([url]) => String(url).endsWith("/api/auth/verify"))).toHaveLength(0)
+  })
+
+  it("keeps the Provider projection when logout cannot acquire the storage lock", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: { request: vi.fn(async () => { throw new Error("lock unavailable") }) },
+    })
+    render(<AuthProvider><AuthLogoutProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("logout-token")).toHaveTextContent("access"))
+    fireEvent.click(screen.getByRole("button", { name: "Logout" }))
+    await waitFor(() => expect(screen.getByTestId("logout-result")).toHaveTextContent("false"))
+    expect(screen.getByTestId("logout-token")).toHaveTextContent("access")
+    expect(JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "null")).toMatchObject({ token: "access" })
   })
 })

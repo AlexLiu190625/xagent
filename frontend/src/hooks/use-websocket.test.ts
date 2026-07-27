@@ -7,18 +7,22 @@ import {
   useWebSocket,
 } from "./use-websocket"
 import { refreshStoredAccessToken } from "@/lib/api-wrapper"
-import { readAuthCache, writeAuthCache } from "@/lib/auth-cache"
+import { AUTH_CACHE_KEY, readAuthCache, readAuthSessionSnapshot, type AuthSessionSnapshot } from "@/lib/auth-cache"
 
 const authState = vi.hoisted(() => ({
   user: { id: "user-1" } as { id: string } | null,
   token: "token" as string | null,
   refreshToken: "refresh-token" as string | null,
-  refreshAccessToken: vi.fn<
-    (
-      expectedAccessToken?: string | null,
-      expectedUserId?: string | null,
-    ) => Promise<boolean>
-  >(),
+  session: {
+    sessionId: "test-lineage",
+    credentialRevision: 0,
+    profileRevision: 0,
+    userId: "user-1",
+    accessToken: "token",
+    refreshToken: "refresh-token",
+    profileFingerprint: '[null,null,null]',
+  } as AuthSessionSnapshot,
+  refreshAccessToken: vi.fn<(expectedSession?: AuthSessionSnapshot) => Promise<boolean>>(),
 }))
 vi.mock("@/contexts/auth-context", () => ({
   useAuth: () => authState,
@@ -91,6 +95,26 @@ const deferred = <T,>() => {
   return { promise, reject, resolve }
 }
 
+function writeAuthCache(
+  user: { id: string; username: string; email?: string | null; is_admin?: boolean } | null,
+  token: string | null,
+  refreshToken: string | null = null,
+  expiresIn?: number,
+  refreshExpiresIn?: number,
+) {
+  if (!user || !token) {
+    localStorage.removeItem(AUTH_CACHE_KEY)
+    return
+  }
+  const now = Date.now()
+  localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+    schemaVersion: 2, sessionId: `test-${Math.random()}`, credentialRevision: 0, profileRevision: 0,
+    user, token, refreshToken, timestamp: now,
+    expiresAt: expiresIn ? now + expiresIn * 1000 : undefined,
+    refreshExpiresAt: refreshExpiresIn ? now + refreshExpiresIn * 1000 : undefined,
+  }))
+}
+
 describe("useWebSocket message delivery", () => {
   beforeEach(() => {
     MockWebSocket.instances = []
@@ -99,6 +123,15 @@ describe("useWebSocket message delivery", () => {
     authState.user = { id: "user-1" }
     authState.token = "token"
     authState.refreshToken = "refresh-token"
+    authState.session = {
+      sessionId: "test-lineage",
+      credentialRevision: 0,
+      profileRevision: 0,
+      userId: "user-1",
+      accessToken: "token",
+      refreshToken: "refresh-token",
+      profileFingerprint: '[null,null,null]',
+    }
     authState.refreshAccessToken.mockReset()
     vi.stubGlobal("WebSocket", MockWebSocket)
   })
@@ -373,6 +406,15 @@ describe("useWebSocket normalized connections", () => {
     authState.user = { id: "user-1" }
     authState.token = "token"
     authState.refreshToken = "refresh-token"
+    authState.session = {
+      sessionId: "test-lineage",
+      credentialRevision: 0,
+      profileRevision: 0,
+      userId: "user-1",
+      accessToken: "token",
+      refreshToken: "refresh-token",
+      profileFingerprint: '[null,null,null]',
+    }
     authState.refreshAccessToken.mockReset()
     vi.stubGlobal("WebSocket", MockWebSocket)
   })
@@ -467,7 +509,6 @@ describe("useWebSocket normalized connections", () => {
     await waitFor(() => expect(result.current.connectionError).not.toBeNull())
     expect(onError).toHaveBeenCalledOnce()
     expect(onConnectionFailure).toHaveBeenCalledWith({
-      code: "creation_failed",
       recoverable: false,
       error: result.current.connectionError,
     })
@@ -501,7 +542,6 @@ describe("useWebSocket normalized connections", () => {
     expect(onConnect).not.toHaveBeenCalled()
     expect(onError).toHaveBeenCalledOnce()
     expect(onConnectionFailure).toHaveBeenCalledWith({
-      code: "protocol_mismatch",
       recoverable: false,
       error: result.current.connectionError,
     })
@@ -566,7 +606,6 @@ describe("useWebSocket normalized connections", () => {
     expect(result.current.isConnected).toBe(false)
     expect(onError).toHaveBeenCalledOnce()
     expect(onConnectionFailure).toHaveBeenCalledWith({
-      code: "transport_error",
       recoverable: true,
       error: result.current.connectionError,
     })
@@ -624,7 +663,7 @@ describe("useWebSocket normalized connections", () => {
         onError,
       }))
       await act(async () => {
-        await vi.runOnlyPendingTimersAsync()
+        await vi.advanceTimersByTimeAsync(0)
       })
       const socket = MockWebSocket.instances[0]
       socket.protocol = "xagent-session-v1"
@@ -691,7 +730,6 @@ describe("useWebSocket normalized connections", () => {
     expect(result.current.connectionError).not.toBeNull()
     expect(onError).toHaveBeenCalledOnce()
     expect(onConnectionFailure).toHaveBeenCalledWith({
-      code: "unknown",
       recoverable: false,
       error: result.current.connectionError,
     })
@@ -732,7 +770,9 @@ describe("useWebSocket normalized connections", () => {
 
     act(() => first.triggerClose(4001))
     expect(authState.refreshAccessToken).toHaveBeenCalledOnce()
-    expect(authState.refreshAccessToken).toHaveBeenCalledWith("token", "user-1")
+    expect(authState.refreshAccessToken).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "test-lineage", credentialRevision: 0, accessToken: "token", userId: "user-1",
+    }))
 
     const retryHook = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -779,7 +819,9 @@ describe("useWebSocket normalized connections", () => {
 
       act(() => oldSocket.triggerClose(4001))
       expect(authState.refreshAccessToken).toHaveBeenCalledOnce()
-      expect(authState.refreshAccessToken).toHaveBeenCalledWith("token", "user-1")
+      expect(authState.refreshAccessToken).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: "test-lineage", credentialRevision: 0, accessToken: "token", userId: "user-1",
+      }))
 
       let expectedSocketCount = 1
       if (lifecycle === "unmount") {
@@ -838,7 +880,7 @@ describe("useWebSocket normalized connections", () => {
       const onError = vi.fn()
       const hook = renderHook(() => useWebSocket({ ...options, onError }))
       await act(async () => {
-        await vi.runOnlyPendingTimersAsync()
+        await vi.advanceTimersByTimeAsync(0)
       })
       const socket = MockWebSocket.instances[0]
       expect(socket.url).toBe(expectedUrl)
@@ -861,6 +903,10 @@ describe("useWebSocket normalized connections", () => {
   it("reconnects an auth-owned descriptor with the refreshed token only once", async () => {
     const refresh = deferred<boolean>()
     authState.token = "old-auth-token"
+    authState.session = {
+      ...authState.session,
+      accessToken: "old-auth-token",
+    }
     authState.refreshAccessToken.mockReturnValue(refresh.promise)
     const hook = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -873,10 +919,9 @@ describe("useWebSocket normalized connections", () => {
     vi.useFakeTimers()
 
     act(() => oldSocket.triggerClose(4001))
-    expect(authState.refreshAccessToken).toHaveBeenCalledWith(
-      "old-auth-token",
-      "user-1",
-    )
+    expect(authState.refreshAccessToken).toHaveBeenCalledWith(expect.objectContaining({
+      accessToken: "old-auth-token", userId: "user-1",
+    }))
     authState.token = "new-auth-token"
     hook.rerender()
     expect(MockWebSocket.instances).toHaveLength(2)
@@ -908,14 +953,13 @@ describe("useWebSocket normalized connections", () => {
       is_admin: false,
     }
     writeAuthCache(aliceUser, "user-a-token", "user-a-refresh", 120, 240)
+    authState.session = readAuthSessionSnapshot()
     authState.user = { id: aliceUser.id }
     authState.token = "user-a-token"
     authState.refreshAccessToken.mockImplementation(
-      async (expectedAccessToken, expectedUserId) => {
-        const result = await refreshStoredAccessToken(
-          expectedAccessToken,
-          expectedUserId,
-        )
+      async (expectedSession) => {
+        if (!expectedSession) return false
+        const result = await refreshStoredAccessToken(expectedSession)
         return result.accessToken !== null
       },
     )
@@ -937,10 +981,9 @@ describe("useWebSocket normalized connections", () => {
       await vi.advanceTimersByTimeAsync(1000)
     })
 
-    expect(authState.refreshAccessToken).toHaveBeenCalledWith(
-      "user-a-token",
-      "user-a",
-    )
+    expect(authState.refreshAccessToken).toHaveBeenCalledWith(expect.objectContaining({
+      accessToken: "user-a-token", userId: "user-a",
+    }))
     expect(readAuthCache()).toMatchObject({
       token: "user-b-token",
       user: { id: "user-b" },
@@ -1097,7 +1140,9 @@ describe("useWebSocket normalized connections", () => {
 
       act(() => oldSocket.triggerClose(4001))
       expect(authState.refreshAccessToken).toHaveBeenCalledOnce()
-      expect(authState.refreshAccessToken).toHaveBeenCalledWith("token", "user-1")
+      expect(authState.refreshAccessToken).toHaveBeenCalledWith(expect.objectContaining({
+        sessionId: "test-lineage", credentialRevision: 0, accessToken: "token", userId: "user-1",
+      }))
       act(() => hook.result.current.connect())
       expect(MockWebSocket.instances).toHaveLength(2)
       const currentSocket = MockWebSocket.instances[1]
@@ -1302,6 +1347,518 @@ describe("useWebSocket normalized connections", () => {
 
     hook.rerender({ connection: sessionConnection() })
     expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  it("retires a stalled handshake before reporting its structured transport failure", async () => {
+    vi.useFakeTimers()
+    const onConnectionFailure = vi.fn()
+    const { result } = renderHook(() => useWebSocket({
+      connection: sessionConnection(),
+      onConnectionFailure,
+    }))
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0)
+    })
+    expect(MockWebSocket.instances).toHaveLength(1)
+    const socket = MockWebSocket.instances[0]
+
+    act(() => vi.advanceTimersByTime(10_000))
+
+    expect(socket.close).toHaveBeenCalled()
+    expect(result.current.isConnected).toBe(false)
+    expect(onConnectionFailure).toHaveBeenCalledWith(expect.objectContaining({
+      recoverable: true,
+    }))
+  })
+
+  it("retires an errored owner before its failure callback can synchronously retry", async () => {
+    let retry!: () => void
+    const onConnectionFailure = vi.fn(() => retry())
+    const { result } = renderHook(() => {
+      const webSocket = useWebSocket({
+        connection: sessionConnection(),
+        onConnectionFailure,
+      })
+      retry = webSocket.connect
+      return webSocket
+    })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+
+    act(() => MockWebSocket.instances[0].triggerError())
+
+    expect(onConnectionFailure).toHaveBeenCalledOnce()
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(result.current.isConnected).toBe(false)
+  })
+
+  it("forwards the owning Session identity with close and transport-failure callbacks", async () => {
+    const onSessionConnectionClose = vi.fn(() => "handled" as const)
+    const onSessionConnectionFailure = vi.fn()
+    const connection = sessionConnection({ identity: "widget-session:owner-a" })
+    const closeHook = renderHook(() => useWebSocket({
+      connection,
+      onSessionConnectionClose,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const closeSocket = MockWebSocket.instances[0]
+    closeSocket.protocol = "xagent-session-v1"
+    act(() => closeSocket.open())
+    act(() => closeSocket.triggerClose(1006))
+    expect(onSessionConnectionClose).toHaveBeenCalledWith(
+      expect.objectContaining({ code: 1006 }),
+      "widget-session:owner-a",
+    )
+    closeHook.unmount()
+
+    MockWebSocket.instances = []
+    const failureHook = renderHook(() => useWebSocket({
+      connection,
+      onSessionConnectionFailure,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].triggerError())
+    expect(onSessionConnectionFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ recoverable: true }),
+      "widget-session:owner-a",
+    )
+    failureHook.unmount()
+  })
+
+  it("bounds 4001 refresh retries across socket opens without resetting on open", async () => {
+    authState.refreshAccessToken.mockResolvedValue(true)
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+
+    for (let index = 0; index < 3; index += 1) {
+      const socket = MockWebSocket.instances[index]
+      act(() => socket.open())
+      act(() => socket.triggerClose(4001))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+    }
+
+    expect(MockWebSocket.instances).toHaveLength(4)
+    const exhaustedSocket = MockWebSocket.instances[3]
+    act(() => exhaustedSocket.open())
+    act(() => exhaustedSocket.triggerClose(4001))
+    await act(async () => {
+      await Promise.resolve()
+      await vi.runOnlyPendingTimersAsync()
+    })
+    expect(MockWebSocket.instances).toHaveLength(4)
+
+    hook.unmount()
+  })
+
+  it("keeps an exhausted 4001 retry budget across an auth credential revision", async () => {
+    authState.refreshAccessToken.mockResolvedValue(true)
+    const onError = vi.fn()
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, onError }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+
+    for (let index = 0; index < 3; index += 1) {
+      const socket = MockWebSocket.instances[index]
+      act(() => socket.open())
+      act(() => socket.triggerClose(4001))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+    }
+
+    authState.token = "advanced-token"
+    authState.session = {
+      ...authState.session,
+      accessToken: "advanced-token",
+      credentialRevision: 1,
+    }
+    hook.rerender()
+    expect(MockWebSocket.instances).toHaveLength(5)
+    const revisedSocket = MockWebSocket.instances[4]
+    act(() => revisedSocket.open())
+    act(() => revisedSocket.triggerClose(4001))
+
+    expect(authState.refreshAccessToken).toHaveBeenCalledTimes(3)
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      message: "Authentication failed after token refresh retries",
+    }))
+    hook.unmount()
+  })
+
+  it("keeps an exhausted 4001 retry budget across a null connection gap for the same auth session", async () => {
+    authState.refreshAccessToken.mockResolvedValue(true)
+    const onError = vi.fn()
+    const hook = renderHook(
+      ({ connection }: { connection: WebSocketConnection | null | undefined }) => useWebSocket({
+        url: "ws://localhost",
+        taskId: 1,
+        connection,
+        onError,
+      }),
+      { initialProps: { connection: undefined } as { connection: WebSocketConnection | null | undefined } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+
+    for (let index = 0; index < 3; index += 1) {
+      const socket = MockWebSocket.instances[index]
+      act(() => socket.open())
+      act(() => socket.triggerClose(4001))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+    }
+
+    hook.rerender({ connection: null })
+    hook.rerender({ connection: undefined })
+    expect(MockWebSocket.instances).toHaveLength(5)
+    const sameSessionSocket = MockWebSocket.instances[4]
+    act(() => sameSessionSocket.open())
+    act(() => sameSessionSocket.triggerClose(4001))
+
+    expect(authState.refreshAccessToken).toHaveBeenCalledTimes(3)
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      message: "Authentication failed after token refresh retries",
+    }))
+    hook.unmount()
+  })
+
+  it("does not replenish an exhausted auth retry budget from external socket activity", async () => {
+    authState.refreshAccessToken.mockResolvedValue(true)
+    const onError = vi.fn()
+    const hook = renderHook(
+      ({ connection }: { connection: WebSocketConnection | undefined }) => useWebSocket({
+        url: "ws://localhost",
+        taskId: 1,
+        connection,
+        onError,
+      }),
+      { initialProps: { connection: undefined } as { connection: WebSocketConnection | undefined } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+
+    for (let index = 0; index < 3; index += 1) {
+      const socket = MockWebSocket.instances[index]
+      act(() => socket.open())
+      act(() => socket.triggerClose(4001))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+    }
+
+    hook.rerender({ connection: sessionConnection() })
+    expect(MockWebSocket.instances).toHaveLength(5)
+    const externalSocket = MockWebSocket.instances[4]
+    externalSocket.protocol = "xagent-session-v1"
+    act(() => {
+      externalSocket.open()
+      externalSocket.receive({ type: "task_info", task_id: 1 })
+    })
+    hook.rerender({ connection: undefined })
+    expect(MockWebSocket.instances).toHaveLength(6)
+    const sameSessionSocket = MockWebSocket.instances[5]
+    act(() => sameSessionSocket.open())
+    act(() => sameSessionSocket.triggerClose(4001))
+
+    expect(authState.refreshAccessToken).toHaveBeenCalledTimes(3)
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({
+      message: "Authentication failed after token refresh retries",
+    }))
+    hook.unmount()
+  })
+
+  it("resets an exhausted 4001 retry budget for a new auth session lineage", async () => {
+    authState.refreshAccessToken.mockResolvedValue(true)
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+
+    for (let index = 0; index < 3; index += 1) {
+      const socket = MockWebSocket.instances[index]
+      act(() => socket.open())
+      act(() => socket.triggerClose(4001))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+    }
+
+    authState.token = "replacement-token"
+    authState.session = {
+      ...authState.session,
+      sessionId: "replacement-lineage",
+      accessToken: "replacement-token",
+      credentialRevision: 0,
+    }
+    hook.rerender()
+    expect(MockWebSocket.instances).toHaveLength(5)
+    const replacementSocket = MockWebSocket.instances[4]
+    act(() => replacementSocket.open())
+    act(() => replacementSocket.triggerClose(4001))
+    await act(async () => {
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+
+    expect(authState.refreshAccessToken).toHaveBeenCalledTimes(4)
+    expect(MockWebSocket.instances).toHaveLength(6)
+    hook.unmount()
+  })
+
+  it("keeps a stale auth refresh result from affecting a replacement session lineage", async () => {
+    const refresh = deferred<boolean>()
+    authState.refreshAccessToken.mockReturnValue(refresh.promise)
+    const onError = vi.fn()
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1, onError }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const oldSocket = MockWebSocket.instances[0]
+    act(() => oldSocket.open())
+    vi.useFakeTimers()
+
+    act(() => oldSocket.triggerClose(4001))
+    expect(authState.refreshAccessToken).toHaveBeenCalledWith(expect.objectContaining({
+      sessionId: "test-lineage",
+    }))
+
+    authState.token = "replacement-token"
+    authState.session = {
+      ...authState.session,
+      sessionId: "replacement-lineage",
+      accessToken: "replacement-token",
+      credentialRevision: 0,
+    }
+    hook.rerender()
+    expect(MockWebSocket.instances).toHaveLength(2)
+    act(() => MockWebSocket.instances[1].open())
+
+    await act(async () => {
+      refresh.resolve(true)
+      await Promise.resolve()
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(onError).not.toHaveBeenCalled()
+    hook.unmount()
+  })
+
+  it("resets the 4001 retry budget only after valid socket activity", async () => {
+    authState.refreshAccessToken.mockResolvedValue(true)
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+
+    for (let index = 0; index < 2; index += 1) {
+      const socket = MockWebSocket.instances[index]
+      act(() => socket.open())
+      act(() => socket.triggerClose(4001))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+    }
+
+    const activitySocket = MockWebSocket.instances[2]
+    act(() => {
+      activitySocket.open()
+      activitySocket.receive({ type: "task_info", task_id: 1 })
+    })
+    for (let index = 2; index < 5; index += 1) {
+      const socket = MockWebSocket.instances[index]
+      act(() => socket.triggerClose(4001))
+      await act(async () => {
+        await Promise.resolve()
+        await vi.advanceTimersByTimeAsync(1_000)
+      })
+      if (index < 4) act(() => MockWebSocket.instances[index + 1].open())
+    }
+
+    expect(MockWebSocket.instances).toHaveLength(6)
+    hook.unmount()
+  })
+
+  it.each([
+    ["authorization expired", "authorization expired"],
+    ["", "Access denied"],
+  ])("reports 4003 close reason %j or the access-denied fallback", async (reason, expectedMessage) => {
+    const onError = vi.fn()
+    const { result } = renderHook(() => useWebSocket({
+      connection: sessionConnection(),
+      onError,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    socket.protocol = "xagent-session-v1"
+    act(() => socket.open())
+    act(() => socket.triggerClose(4003, reason))
+
+    expect(result.current.connectionError?.message).toBe(expectedMessage)
+    expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expectedMessage }))
+  })
+
+  it("does not suppress a retry for an arbitrary close reason", async () => {
+    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    act(() => socket.triggerClose(1011, "Component unmounting"))
+    await act(async () => vi.advanceTimersByTimeAsync(1_000))
+
+    expect(MockWebSocket.instances).toHaveLength(2)
+    hook.unmount()
+  })
+
+  it("replaces the socket when an auth-owned credential changes", async () => {
+    const secret = "xagent-session-token.st_descriptor_secret"
+    const first = sessionConnection({
+      credentialOwner: {
+        kind: "auth-context",
+        accessToken: "first-access-token",
+        userId: "user-1",
+      },
+      protocols: ["xagent-session-v1", secret],
+    })
+    const { rerender } = renderHook(
+      ({ connection }) => useWebSocket({ connection }),
+      { initialProps: { connection: first } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+
+    rerender({ connection: {
+      ...first,
+      credentialOwner: {
+        kind: "auth-context",
+        accessToken: "second-access-token",
+        userId: "user-1",
+      },
+    } })
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+  })
+
+  it("keeps a socket across a profile-only auth revision", async () => {
+    const first = sessionConnection({ credentialOwner: {
+      kind: "auth-context", accessToken: "access", userId: "user-1",
+      session: { ...authState.session, profileRevision: 0 },
+    } })
+    const firstOwner = first.credentialOwner
+    if (firstOwner.kind !== "auth-context") throw new Error("expected auth owner")
+    const { rerender } = renderHook(({ connection }) => useWebSocket({ connection }), { initialProps: { connection: first } })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    rerender({ connection: { ...first, credentialOwner: {
+      ...firstOwner, session: { ...authState.session, profileRevision: 1, profileFingerprint: '["alice",null,null]' },
+    } } })
+    await Promise.resolve()
+    expect(MockWebSocket.instances).toHaveLength(1)
+  })
+
+  it("replaces a socket when its auth credential revision changes", async () => {
+    const first = sessionConnection({ credentialOwner: {
+      kind: "auth-context", accessToken: "access", userId: "user-1",
+      session: { ...authState.session, credentialRevision: 0 },
+    } })
+    const firstOwner = first.credentialOwner
+    if (firstOwner.kind !== "auth-context") throw new Error("expected auth owner")
+    const { rerender } = renderHook(({ connection }) => useWebSocket({ connection }), { initialProps: { connection: first } })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    rerender({ connection: { ...first, credentialOwner: {
+      ...firstOwner, accessToken: "new-access", session: { ...authState.session, accessToken: "new-access", credentialRevision: 1 },
+    } } })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+  })
+
+  it("replaces a socket for the known former descriptor-hash collision pair", async () => {
+    const first = sessionConnection({
+      protocols: ["xagent-session-v1", "xagent-session-token.st_collision_0073zx"],
+    })
+    const { rerender } = renderHook(
+      ({ connection }) => useWebSocket({ connection }),
+      { initialProps: { connection: first } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+
+    rerender({
+      connection: {
+        ...first,
+        protocols: ["xagent-session-v1", "xagent-session-token.st_collision_00apad"],
+      },
+    })
+
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+  })
+
+  it("replaces sockets for every connection field without exposing descriptor material", async () => {
+    const secretQuery = "bearer-query-secret"
+    const secretProtocol = "xagent-session-token.st_fingerprint_secret"
+    const connection: WebSocketConnection = {
+      identity: "identity-1",
+      url: `wss://embed.example/ws?token=${secretQuery}`,
+      protocols: ["xagent-session-v1", secretProtocol],
+      expectedProtocol: "xagent-session-v1",
+      taskId: 1,
+      chatTaskIdMode: "required",
+      credentialOwner: {
+        kind: "auth-context",
+        accessToken: "access-token-1",
+        userId: "user-1",
+      },
+    }
+    const variants: WebSocketConnection[] = [
+      { ...connection, identity: "identity-2" },
+      { ...connection, url: "wss://embed.example/ws?token=changed-query-secret" },
+      { ...connection, protocols: ["xagent-session-v1", "xagent-session-token.changed"] },
+      { ...connection, expectedProtocol: "xagent-session-v2" },
+      { ...connection, taskId: 2 },
+      { ...connection, chatTaskIdMode: "omit" },
+      { ...connection, credentialOwner: { kind: "external" } },
+      { ...connection, credentialOwner: { kind: "auth-context", accessToken: "access-token-2", userId: "user-1" } },
+      { ...connection, credentialOwner: { kind: "auth-context", accessToken: "access-token-1", userId: "user-2" } },
+    ]
+
+    for (const currentConnection of variants) {
+      MockWebSocket.instances = []
+      const hook = renderHook(
+        ({ descriptor }) => useWebSocket({ connection: descriptor }),
+        { initialProps: { descriptor: connection } },
+      )
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+
+      hook.rerender({ descriptor: currentConnection })
+      await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
+
+      const exposed = JSON.stringify(hook.result.current)
+      expect(exposed).not.toContain(secretQuery)
+      expect(exposed).not.toContain(secretProtocol)
+      expect(exposed).not.toContain("access-token-1")
+      hook.unmount()
+    }
+  })
+
+  it("keeps the callback snapshot that owned a socket attempt", async () => {
+    const firstFailure = vi.fn()
+    const replacementFailure = vi.fn()
+    const hook = renderHook(
+      ({ onConnectionFailure }) => useWebSocket({
+        connection: sessionConnection(),
+        onConnectionFailure,
+      }),
+      { initialProps: { onConnectionFailure: firstFailure } },
+    )
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    hook.rerender({ onConnectionFailure: replacementFailure })
+
+    act(() => MockWebSocket.instances[0].triggerError())
+
+    expect(firstFailure).toHaveBeenCalledOnce()
+    expect(replacementFailure).not.toHaveBeenCalled()
   })
 
   it("makes stale open, message, error, and close callbacks inert after replacement", async () => {

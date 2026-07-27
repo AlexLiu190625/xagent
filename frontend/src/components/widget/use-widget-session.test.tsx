@@ -1,6 +1,6 @@
 import { act, renderHook } from "@testing-library/react"
 import { StrictMode } from "react"
-import { afterEach, describe, expect, it, vi } from "vitest"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import {
   buildWidgetSessionWebSocketUrl,
@@ -8,6 +8,10 @@ import {
 } from "./use-widget-session"
 
 const PARENT_ORIGIN = "https://embed.example"
+const EMBEDDED_PARENT = {
+  postMessage: (...args: Parameters<Window["postMessage"]>) => window.postMessage(...args),
+}
+const originalParentDescriptor = Object.getOwnPropertyDescriptor(window, "parent")
 
 function updateMessage(overrides: Record<string, unknown> = {}) {
   const now = Date.now()
@@ -29,13 +33,25 @@ function updateMessage(overrides: Record<string, unknown> = {}) {
   }
 }
 
-function dispatchFromParent(data: Record<string, unknown>, origin = PARENT_ORIGIN, source: MessageEventSource | null = window) {
+function dispatchFromParent(
+  data: Record<string, unknown>,
+  origin = PARENT_ORIGIN,
+  source: MessageEventSource | null = EMBEDDED_PARENT as unknown as MessageEventSource,
+) {
   act(() => {
     window.dispatchEvent(new MessageEvent("message", { data, origin, source }))
   })
 }
 
+beforeEach(() => {
+  Object.defineProperty(window, "parent", {
+    configurable: true,
+    value: EMBEDDED_PARENT,
+  })
+})
+
 afterEach(() => {
+  if (originalParentDescriptor) Object.defineProperty(window, "parent", originalParentDescriptor)
   vi.useRealTimers()
   vi.restoreAllMocks()
 })
@@ -52,7 +68,7 @@ describe("useWidgetSession", () => {
     )
   })
 
-  it("pins the first valid parent origin and rejects messages from another origin", () => {
+  it("pins the first valid parent origin internally and rejects messages from another origin", () => {
     const { result } = renderHook(() => useWidgetSession())
 
     dispatchFromParent(updateMessage(), PARENT_ORIGIN, null)
@@ -64,7 +80,20 @@ describe("useWidgetSession", () => {
     )
 
     expect(result.current.status).toBe("active")
-    expect(result.current.parentOrigin).toBe(PARENT_ORIGIN)
+    expect(result.current).not.toHaveProperty("parentOrigin")
+  })
+
+  it("fails closed in a top-level window without self-handshaking", () => {
+    Object.defineProperty(window, "parent", {
+      configurable: true,
+      value: window,
+    })
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("unexpected_error")
+    expect(postMessage).not.toHaveBeenCalled()
   })
 
   it("sends an exact-origin reconnect request once and removes the usable token", () => {
@@ -94,7 +123,6 @@ describe("useWidgetSession", () => {
 
     act(() => {
       result.current.handleConnectionFailure({
-        code: "transport_error",
         recoverable: true,
         error: new Error("physical transport failed"),
       })
@@ -102,7 +130,6 @@ describe("useWidgetSession", () => {
         new CloseEvent("close", { code: 1006 }),
       )
       result.current.handleConnectionFailure({
-        code: "transport_error",
         recoverable: true,
         error: new Error("duplicate physical transport failure"),
       })
@@ -121,9 +148,9 @@ describe("useWidgetSession", () => {
     ])
   })
 
-  it.each(["creation_failed", "protocol_mismatch", "unknown"] as const)(
-    "fails terminal and wipes Session credentials for %s connection failure",
-    (code) => {
+  it(
+    "fails terminal and wipes Session credentials for an unrecoverable connection failure",
+    () => {
       const postMessage = vi.spyOn(window, "postMessage")
       const { result } = renderHook(() => useWidgetSession())
       dispatchFromParent(updateMessage())
@@ -131,7 +158,6 @@ describe("useWidgetSession", () => {
 
       act(() => {
         result.current.handleConnectionFailure({
-          code,
           recoverable: false,
           error: new Error("sanitized failure"),
         })
@@ -197,7 +223,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it("owns a normal WebSocket close without reconnecting or changing bridge state", () => {
+  it("terminalizes a current-owner normal WebSocket close without reconnecting", () => {
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
@@ -211,8 +237,9 @@ describe("useWidgetSession", () => {
     })
 
     expect(disposition).toBe("handled")
-    expect(result.current.status).toBe("active")
-    expect(result.current.session?.token).toBe("st_session_token")
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("unexpected_error")
+    expect(result.current.session).toBeNull()
     expect(postMessage).not.toHaveBeenCalled()
   })
 
@@ -264,6 +291,27 @@ describe("useWidgetSession", () => {
     expect(result.current.session).toBeNull()
   })
 
+  it("accepts nullable optional agent metadata without terminalizing the Session", () => {
+    const { result } = renderHook(() => useWidgetSession())
+
+    dispatchFromParent(updateMessage({
+      agent: {
+        id: 42,
+        name: "Support Agent",
+        description: null,
+        logo_url: null,
+        suggested_prompts: [],
+      },
+    }))
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.agent).toEqual({
+      id: 42,
+      name: "Support Agent",
+      suggestedPrompts: [],
+    })
+  })
+
   it("requests one refresh instead of exposing a token with less than one minute remaining", () => {
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
@@ -275,6 +323,148 @@ describe("useWidgetSession", () => {
       { xagent: true, v: 1, type: "reconnect_request", reason: "token_expired" },
       PARENT_ORIGIN,
     )
+  })
+
+  it("advances recovery after each near-expiry parent reply instead of leaving the bridge latched", () => {
+    vi.useFakeTimers()
+    const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+    const { result } = renderHook(() => useWidgetSession())
+
+    dispatchFromParent(updateMessage({
+      session_token_expires_at: new Date(Date.now() + 59_000).toISOString(),
+    }))
+    dispatchFromParent(updateMessage({
+      session_token_expires_at: new Date(Date.now() + 59_000).toISOString(),
+    }))
+    act(() => vi.advanceTimersByTime(1_000))
+    dispatchFromParent(updateMessage({
+      session_token_expires_at: new Date(Date.now() + 59_000).toISOString(),
+    }))
+    act(() => vi.advanceTimersByTime(2_000))
+    dispatchFromParent(updateMessage({
+      session_token_expires_at: new Date(Date.now() + 59_000).toISOString(),
+    }))
+
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("network_unavailable")
+  })
+
+  it("fails terminal after bounded parent response deadlines and backoff", () => {
+    vi.useFakeTimers()
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    act(() => {
+      result.current.requestReconnect("ws_closed")
+      vi.advanceTimersByTime(10_000 + 1_000 + 10_000 + 2_000 + 10_000)
+    })
+
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("network_unavailable")
+  })
+
+  it("does not reset the recovery budget when session updates arrive without an open socket", () => {
+    vi.useFakeTimers()
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.requestReconnect("ws_closed"))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+    dispatchFromParent(updateMessage())
+    act(() => vi.advanceTimersByTime(15_000))
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("network_unavailable")
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(3)
+  })
+
+  it("starts the stability window from the validated socket open for the active generation", () => {
+    vi.useFakeTimers()
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.requestReconnect("ws_closed"))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+    dispatchFromParent(updateMessage())
+
+    act(() => vi.advanceTimersByTime(10_000))
+    act(() => result.current.handleConnectionOpen("widget-session:3"))
+    act(() => vi.advanceTimersByTime(15_000))
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.terminalCode).toBeNull()
+  })
+
+  it("does not reset the recovery budget when the socket closes before its stability window", () => {
+    vi.useFakeTimers()
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.requestReconnect("ws_closed"))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.handleConnectionOpen("widget-session:3"))
+    act(() => vi.advanceTimersByTime(14_999))
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("network_unavailable")
+  })
+
+  it("ignores a stale socket close or failure after accepting a newer Session generation", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.handleConnectionClose(
+      new CloseEvent("close", { code: 1006 }),
+      "widget-session:1",
+    ))
+    act(() => result.current.handleConnectionFailure(
+      {
+        recoverable: true,
+        error: new Error("stale socket failure"),
+      },
+      "widget-session:1",
+    ))
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.generation).toBe(2)
+    expect(result.current.terminalCode).toBeNull()
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(0)
+  })
+
+  it("cancels the stability window when a current owner cleanly closes", () => {
+    vi.useFakeTimers()
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.requestReconnect("ws_closed"))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+    dispatchFromParent(updateMessage())
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1000 })))
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("unexpected_error")
+    act(() => vi.advanceTimersByTime(15_000))
+    act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
+
+    expect(result.current.status).toBe("terminal")
+    expect(result.current.terminalCode).toBe("unexpected_error")
   })
 
   it("fails terminal when absolute expiry is expired", () => {

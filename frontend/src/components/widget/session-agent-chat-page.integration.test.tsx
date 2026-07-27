@@ -47,6 +47,10 @@ import { SessionAgentChatPage } from "./session-agent-chat-page"
 
 const PARENT_ORIGIN = "https://shiftcare.example"
 const SESSION_TOKEN = "st_integration_secret"
+const EMBEDDED_PARENT = {
+  postMessage: (...args: Parameters<Window["postMessage"]>) => window.postMessage(...args),
+}
+const originalParentDescriptor = Object.getOwnPropertyDescriptor(window, "parent")
 
 class MockWebSocket {
   static OPEN = 1
@@ -116,7 +120,7 @@ const dispatchSession = () => {
     window.dispatchEvent(new MessageEvent("message", {
       data: sessionUpdate(),
       origin: PARENT_ORIGIN,
-      source: window,
+      source: EMBEDDED_PARENT as unknown as MessageEventSource,
     }))
   })
 }
@@ -129,12 +133,17 @@ describe("SessionAgentChatPage connection failure integration", () => {
     localStorage.clear()
     sessionStorage.clear()
     vi.stubGlobal("WebSocket", MockWebSocket)
+    Object.defineProperty(window, "parent", {
+      configurable: true,
+      value: EMBEDDED_PARENT,
+    })
   })
 
   afterEach(() => {
     cleanup()
     vi.unstubAllGlobals()
     vi.restoreAllMocks()
+    if (originalParentDescriptor) Object.defineProperty(window, "parent", originalParentDescriptor)
   })
 
   it.each([

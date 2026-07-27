@@ -28,14 +28,26 @@ const webSocketOptions = vi.hoisted(() => ({
     deliveryGeneration?: number
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
-      code: "creation_failed" | "protocol_mismatch" | "transport_error" | "unknown"
       recoverable: boolean
       error: Error
     }) => void
+    onSessionConnectionClose?: (
+      event: CloseEvent,
+      connectionIdentity: string,
+    ) => "handled" | "default"
+    onSessionConnectionFailure?: (failure: {
+      recoverable: boolean
+      error: Error
+    }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: () => void
     uploadFiles?: unknown
+    token?: string
   },
+  all: [] as Array<{
+    onMessage?: (message: TestWebSocketMessage) => void
+    token?: string
+  }>,
 }))
 const sendChatMessageMock = vi.hoisted(() => vi.fn())
 const sendRawMessageMock = vi.hoisted(() => vi.fn())
@@ -53,6 +65,7 @@ vi.mock("@/lib/api-wrapper", async (importOriginal) => {
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: routerPushMock, replace: vi.fn(), refresh: vi.fn() }),
+  usePathname: () => "/",
 }))
 
 vi.mock("@/contexts/auth-context", () => ({
@@ -77,15 +90,24 @@ vi.mock("@/hooks/use-websocket", () => ({
     deliveryGeneration?: number
     onConnectionClose?: (event: CloseEvent) => "handled" | "default"
     onConnectionFailure?: (failure: {
-      code: "creation_failed" | "protocol_mismatch" | "transport_error" | "unknown"
       recoverable: boolean
       error: Error
     }) => void
+    onSessionConnectionClose?: (
+      event: CloseEvent,
+      connectionIdentity: string,
+    ) => "handled" | "default"
+    onSessionConnectionFailure?: (failure: {
+      recoverable: boolean
+      error: Error
+    }, connectionIdentity: string) => void
     onMessage?: (message: TestWebSocketMessage) => void
     onConnect?: () => void
     uploadFiles?: unknown
+    token?: string
   }) => {
     webSocketOptions.current = options
+    webSocketOptions.all.push(options)
     return {
       isConnected: wsHarness.isConnected,
       connectionError: null,
@@ -114,6 +136,8 @@ import {
   extractTaskControlEnvelope,
   useApp,
 } from "./app-context-chat"
+import { ChatStartScreen } from "@/components/chat/ChatStartScreen"
+import { MarkdownRenderer } from "@/components/ui/markdown-renderer"
 import { TASK_ERROR_EVENT, type TaskErrorEventDetail } from "@/lib/task-error-events"
 
 type TaskControlMessage = Parameters<typeof extractTaskControlEnvelope>[0]
@@ -170,10 +194,16 @@ function MessageContentProbe() {
   )
 }
 
+function ScopedMessagesProbe({ testId }: { testId: string }) {
+  const { state } = useApp()
+  return <div data-testid={testId}>{JSON.stringify(state.messages.map(message => message.content))}</div>
+}
+
 type SessionControls = ReturnType<typeof useApp> & {
   startNewConversation: () => Promise<void>
   isConversationResetPending: boolean
   isMessageDeliveryPending: boolean
+  sessionConversationState: string
 }
 
 let sessionControls: SessionControls | null = null
@@ -188,16 +218,35 @@ function SessionControlsProbe() {
       <div data-testid="message-delivery-pending">
         {String(sessionControls.isMessageDeliveryPending)}
       </div>
+      <div data-testid="session-conversation-state">
+        {sessionControls.sessionConversationState}
+      </div>
       <div data-testid="files-disabled">
         {String(sessionControls.filesDisabled)}
       </div>
       <div data-testid="voice-input-enabled">
         {String(sessionControls.voiceInputEnabled)}
       </div>
+      <div data-testid="agent-cards-enabled">
+        {String(sessionControls.agentCardsEnabled)}
+      </div>
       <div data-testid="task-controls-enabled">
         {String(sessionControls.taskControlsEnabled)}
       </div>
     </>
+  )
+}
+
+function TransportCapabilityConsumerProbe() {
+  const { filesDisabled, voiceInputEnabled } = useApp()
+  return (
+    <ChatStartScreen
+      title="Public support"
+      onSend={vi.fn()}
+      hideConfig
+      filesDisabled={filesDisabled}
+      voiceInputEnabled={voiceInputEnabled}
+    />
   )
 }
 
@@ -225,12 +274,12 @@ const makeSessionTransport = (
     connection,
     onConnectionClose: () => "handled" as const,
     onConnectionFailure: vi.fn(),
+    onConnectionOpen: vi.fn(),
     allowTasklessChat: true as const,
     supportsConversationReset: true as const,
-    preserveConversationOnReconnect: true as const,
-    adoptTaskIdFromTaskInfo: true as const,
     history: "none" as const,
     files: "disabled" as const,
+    agentCards: "disabled" as const,
     voice: "disabled" as const,
     taskControls: "disabled" as const,
   },
@@ -381,6 +430,7 @@ describe("task control envelope parsing", () => {
 describe("AppProvider websocket message routing", () => {
   beforeEach(() => {
     webSocketOptions.current = null
+    webSocketOptions.all = []
     sessionControls = null
     wsHarness.isConnected = true
     apiRequestMock.mockReset()
@@ -391,12 +441,14 @@ describe("AppProvider websocket message routing", () => {
       client_message_id: "turn-optimistic",
       turn_id: "turn-optimistic",
     })
+    localStorage.clear()
     ;(window as typeof window & { clearDuplicateMessageCache?: () => void })
       .clearDuplicateMessageCache?.()
   })
 
   afterEach(() => {
     cleanup()
+    localStorage.clear()
   })
 
   it("routes historical assistant transcript rows to chat and progress events to trace", async () => {
@@ -1353,11 +1405,15 @@ describe("AppProvider websocket message routing", () => {
       transport.session.connection
     )
     expect(webSocketOptions.current?.deliveryGeneration).toBe(0)
-    expect(webSocketOptions.current?.onConnectionClose).toBe(
+    expect(webSocketOptions.current?.onSessionConnectionClose).toBe(
       transport.session.onConnectionClose
     )
-    expect(webSocketOptions.current?.onConnectionFailure).toBe(
+    expect(webSocketOptions.current?.onSessionConnectionFailure).toBe(
       transport.session.onConnectionFailure
+    )
+    act(() => webSocketOptions.current?.onConnect?.())
+    expect(transport.session.onConnectionOpen).toHaveBeenCalledWith(
+      transport.session.connection?.identity,
     )
     expect(webSocketOptions.current?.uploadFiles).toBeUndefined()
 
@@ -1391,6 +1447,54 @@ describe("AppProvider websocket message routing", () => {
       "First Session turn"
     )
     expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
+  it("applies explicit public transport capabilities without disabling public files", () => {
+    const ambientAuthCache = JSON.stringify({
+      schemaVersion: 2,
+      sessionId: "personal-session",
+      credentialRevision: 0,
+      profileRevision: 0,
+      user: { id: "personal-user", username: "personal" },
+      token: "personal-access-token",
+      refreshToken: "personal-refresh-token",
+      timestamp: Date.now(),
+    })
+    localStorage.setItem("auth_cache", ambientAuthCache)
+
+    render(
+      <AppProvider
+        token="public-token"
+        transport={{
+          capabilities: {
+            agentCards: "disabled",
+            voice: "disabled",
+          },
+          fileAccess: {
+            previewUrl: (fileId) => `/api/widget/files/preview/${fileId}`,
+            downloadUrl: (fileId) => `/api/widget/files/download/${fileId}`,
+            inlinePreviewUrl: (fileId) => `/api/widget/files/public/preview/${fileId}`,
+            inlineDownloadUrl: (fileId) => `/api/widget/files/public/download/${fileId}`,
+            relativePreviewUrl: (fileId, relativePath) =>
+              `/api/widget/files/public/preview/${fileId}?relative_path=${encodeURIComponent(relativePath)}`,
+            request: vi.fn(),
+          },
+          uploadFiles: vi.fn(),
+        }}
+      >
+        <SessionControlsProbe />
+        <TransportCapabilityConsumerProbe />
+        <MarkdownRenderer content="[Specialist](agent://42)" />
+      </AppProvider>
+    )
+
+    expect(screen.getByTestId("files-disabled")).toHaveTextContent("false")
+    expect(screen.getByTestId("voice-input-enabled")).toHaveTextContent("false")
+    expect(screen.getByTestId("agent-cards-enabled")).toHaveTextContent("false")
+    expect(screen.getByText("Specialist")).not.toHaveAttribute("data-agent-id")
+    expect(screen.queryByLabelText("voiceInput.start")).not.toBeInTheDocument()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(localStorage.getItem("auth_cache")).toBe(ambientAuthCache)
   })
 
   it("renders Session events live and adopts task_info without legacy navigation or conversation clearing", async () => {
@@ -1529,6 +1633,36 @@ describe("AppProvider websocket message routing", () => {
     )
   })
 
+  it("rebinds a bound Session to a refreshed connection before a later reset", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("rebind-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(83)))
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(null)}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("rebind-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      webSocketOptions.current?.onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    await getSessionControls().sendMessage("Replacement", { clientMessageId: "rebind-replacement" })
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(84)))
+    await waitFor(() => expect(screen.getByTestId("task-id").textContent).toBe("84"))
+  })
+
   it("serializes Session reset, clears only on the owned acknowledgement, and gates the next task lineage", async () => {
     render(
       <AppProvider token="token" transport={makeSessionTransport()}>
@@ -1577,6 +1711,7 @@ describe("AppProvider websocket message routing", () => {
 
     let firstReset!: Promise<void>
     let duplicateReset!: Promise<void>
+    const preResetState = getSessionControls().state
     act(() => {
       firstReset = getSessionControls().startNewConversation()
       duplicateReset = getSessionControls().startNewConversation()
@@ -1611,6 +1746,12 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("steps-count").textContent).toBe("0")
     expect(screen.getByTestId("preview-open").textContent).toBe("false")
     expect(screen.getByTestId("processing").textContent).toBe("false")
+    expect(getSessionControls().state.messages).not.toBe(preResetState.messages)
+    expect(getSessionControls().state.traceEvents).not.toBe(preResetState.traceEvents)
+    expect(getSessionControls().state.filePreview).not.toBe(preResetState.filePreview)
+    expect(getSessionControls().state.filePreview.availableFiles).not.toBe(
+      preResetState.filePreview.availableFiles,
+    )
     expect(webSocketOptions.current?.deliveryGeneration).toBe(1)
 
     act(() => {
@@ -1737,6 +1878,53 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("ignores a late replacement acceptance after its connection owner changes", async () => {
+    const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("late-owner-old"))}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(86)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      webSocketOptions.current?.onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    const replacement = getSessionControls().sendMessage("Late acceptance")
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("late-owner-new"))}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    await act(async () => {
+      acknowledgement.resolve({ client_message_id: "late", turn_id: "late" })
+      await replacement
+    })
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+  })
+
+  it("does not reopen replacement state when a late replacement rejection settles after unmount", async () => {
+    const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    const { unmount } = render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(87)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      webSocketOptions.current?.onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    const replacement = getSessionControls().sendMessage("Late rejection")
+    unmount()
+    acknowledgement.reject(new Error("late rejection"))
+    await expect(replacement).rejects.toThrow("late rejection")
+  })
+
   it("rejects Session reset while a durable message delivery is pending", async () => {
     const acknowledgement = deferred<{
       client_message_id: string
@@ -1817,6 +2005,21 @@ describe("AppProvider websocket message routing", () => {
         window.setTimeout(() => resolve("timeout"), 20)
       }),
     ])).resolves.toMatch(/established|task/i)
+  })
+
+  it("fails closed when the reset command throws synchronously instead of stranding controls", async () => {
+    sendRawMessageMock.mockImplementationOnce(() => {
+      throw new Error("socket write failed")
+    })
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(85)))
+    await expect(getSessionControls().startNewConversation()).rejects.toThrow("socket write failed")
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    await expect(getSessionControls().startNewConversation()).rejects.toThrow(/reload required/i)
   })
 
   it("rejects an outstanding reset when AppProvider unmounts", async () => {
@@ -2019,6 +2222,235 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("reset-pending").textContent).toBe("false")
   })
 
+  it("fails closed with reload-required when the reset acknowledgement deadline expires", async () => {
+    vi.useFakeTimers()
+    try {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+          <StateProbe />
+        </AppProvider>
+      )
+      act(() => {
+        webSocketOptions.current?.onMessage?.(taskInfoMessage(73))
+      })
+
+      let outcome = "pending"
+      act(() => {
+        void getSessionControls().startNewConversation().then(
+          () => { outcome = "resolved" },
+          error => { outcome = error instanceof Error ? error.message : String(error) },
+        )
+      })
+      await act(async () => {
+        vi.advanceTimersByTime(30_001)
+        await Promise.resolve()
+      })
+
+      expect(outcome).toMatch(/reload|required|unknown/i)
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+      expect(screen.getByTestId("task-id").textContent).toBe("73")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("fails closed rather than carrying a reset acknowledgement across a connection refresh", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("reset-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(74))
+    })
+    const reset = getSessionControls().startNewConversation()
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("reset-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+
+    await expect(reset).rejects.toThrow(/reload|required|unknown/i)
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    expect(screen.getByTestId("task-id").textContent).toBe("74")
+  })
+
+  it("buffers ordered frames only after a replacement send is accepted and flushes them after task_info", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.(taskInfoMessage(75))
+    })
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+
+    act(() => {
+      onMessage?.(assistantMessage("Before acceptance", 76))
+    })
+    await getSessionControls().sendMessage("Replacement", { clientMessageId: "replacement-buffer" })
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_awaiting_task")
+
+    act(() => {
+      onMessage?.(assistantMessage("Buffered first", 76))
+      onMessage?.(assistantMessage("Buffered second", 76))
+      onMessage?.(taskInfoMessage(76))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("76")
+      expect(screen.getByTestId("messages").textContent).toContain("Buffered first")
+      expect(screen.getByTestId("messages").textContent).toContain("Buffered second")
+    })
+    expect(screen.getByTestId("messages").textContent).not.toContain("Before acceptance")
+  })
+
+  it("enters reload-required when the post-acceptance frame buffer overflows", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(77)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    await getSessionControls().sendMessage("Replacement", { clientMessageId: "replacement-overflow" })
+    act(() => {
+      for (let index = 0; index < 65; index += 1) {
+        onMessage?.(assistantMessage(`Buffered ${index}`, 78))
+      }
+    })
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+  })
+
+  it("enters reload-required when one buffered frame exceeds the serialized byte cap", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(80)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    await getSessionControls().sendMessage("Replacement", { clientMessageId: "replacement-byte-cap" })
+    act(() => {
+      onMessage?.(assistantMessage("x".repeat(256 * 1024), 81))
+    })
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+  })
+
+  it("expires an accepted replacement awaiting task_info instead of guessing after its deadline", async () => {
+    vi.useFakeTimers()
+    try {
+      render(
+        <AppProvider token="token" transport={makeSessionTransport()}>
+          <SessionControlsProbe />
+        </AppProvider>
+      )
+      const onMessage = webSocketOptions.current?.onMessage
+      act(() => onMessage?.(taskInfoMessage(82)))
+      const reset = getSessionControls().startNewConversation()
+      await act(async () => {
+        onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+        await reset
+      })
+      await getSessionControls().sendMessage("Replacement", { clientMessageId: "replacement-deadline" })
+      await act(async () => {
+        vi.advanceTimersByTime(30_001)
+        await Promise.resolve()
+      })
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it("does not share Session message dedupe state between provider instances", async () => {
+    render(
+      <>
+        <AppProvider token="first" transport={makeSessionTransport(makeSessionConnection("provider-one"))}>
+          <ScopedMessagesProbe testId="provider-one-messages" />
+        </AppProvider>
+        <AppProvider token="second" transport={makeSessionTransport(makeSessionConnection("provider-two"))}>
+          <ScopedMessagesProbe testId="provider-two-messages" />
+        </AppProvider>
+      </>
+    )
+    const [first, second] = webSocketOptions.all
+    act(() => {
+      first?.onMessage?.(assistantMessage("Same content, separate provider"))
+      second?.onMessage?.(assistantMessage("Same content, separate provider"))
+    })
+    await waitFor(() => {
+      expect(screen.getByTestId("provider-one-messages").textContent).toContain("Same content, separate provider")
+      expect(screen.getByTestId("provider-two-messages").textContent).toContain("Same content, separate provider")
+    })
+  })
+
+  it("runs delayed historical replay only for the provider that received completion", async () => {
+    vi.useFakeTimers()
+    try {
+      const first = { current: null as null | ReturnType<typeof useApp> }
+      const second = { current: null as null | ReturnType<typeof useApp> }
+      function Capture({ target }: { target: typeof first }) {
+        target.current = useApp()
+        return null
+      }
+      render(<><AppProvider token="replay-one"><Capture target={first} /></AppProvider><AppProvider token="replay-two"><Capture target={second} /></AppProvider></>)
+      act(() => {
+        first.current?.dispatch({ type: "START_REPLAY", payload: { taskId: 1, events: [] } })
+        first.current?.dispatch({ type: "ADD_TO_REPLAY_CACHE", payload: assistantMessage("first replay") as never })
+      })
+      act(() => {
+        second.current?.dispatch({ type: "SET_HISTORY_LOADING", payload: false })
+      })
+      expect(webSocketOptions.all.at(-1)?.token).toBe("replay-two")
+      const firstHandler = webSocketOptions.all.filter(option => option.token === "replay-one").at(-1)?.onMessage
+      act(() => firstHandler?.({ type: "historical_data_complete", timestamp: "2026-05-27T05:00:00Z" }))
+      act(() => vi.advanceTimersByTime(500))
+      expect(first.current?.state.replayScheduler).not.toBeNull()
+      expect(second.current?.state.replayScheduler).toBeNull()
+    } finally { vi.useRealTimers() }
+  })
+
+  it("stops a replay scheduler before publishing the fresh replacement state", async () => {
+    const replayScheduler = { stop: vi.fn() }
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => {
+      onMessage?.(taskInfoMessage(79))
+      getSessionControls().dispatch({ type: "SET_REPLAY_SCHEDULER", payload: replayScheduler as never })
+    })
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    expect(replayScheduler.stop).toHaveBeenCalledOnce()
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_ready")
+  })
+
   it("fails closed for every Session file entry point without issuing HTTP or socket egress", async () => {
     const transport = makeSessionTransport()
     render(
@@ -2090,5 +2522,22 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("preview-open").textContent).toBe("false")
     expect(apiRequestMock).not.toHaveBeenCalled()
     window.removeEventListener("openFilePreview", previewListener)
+  })
+
+  it("fails closed for agent cards when a malformed Session transport omits the capability", () => {
+    const malformedTransport = makeSessionTransport() as unknown as {
+      session: Record<string, unknown>
+    }
+    delete malformedTransport.session.agentCards
+
+    const { container } = render(
+      <AppProvider token="token" transport={malformedTransport as never}>
+        <MarkdownRenderer content="[Specialist](agent://42)" />
+      </AppProvider>,
+    )
+
+    expect(screen.getByText("Specialist")).not.toHaveAttribute("data-agent-id")
+    expect(container.querySelector("[data-agent-card-wrapper]")).toBeNull()
+    expect(apiRequestMock).not.toHaveBeenCalled()
   })
 })

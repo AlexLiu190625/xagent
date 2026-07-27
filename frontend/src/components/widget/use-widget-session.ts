@@ -5,6 +5,16 @@ import type { WebSocketConnectionFailure } from "@/hooks/use-websocket"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
+const PARENT_RESPONSE_DEADLINE_MS = 10_000
+const SESSION_STABILITY_WINDOW_MS = 15_000
+const MAX_CONSECUTIVE_RECOVERY_ATTEMPTS = 3
+
+interface RecoveryState {
+  attempts: number
+  reason: WidgetSessionReconnectReason
+  responseTimer: ReturnType<typeof setTimeout> | null
+  retryTimer: ReturnType<typeof setTimeout> | null
+}
 
 export type WidgetSessionStatus = "waiting" | "active" | "refreshing" | "terminal"
 export type WidgetSessionReconnectReason = "ws_closed" | "token_expired"
@@ -60,8 +70,8 @@ const parseAgent = (value: unknown): WidgetSessionAgent | null => {
   if (!isRecord(value)) return null
   if (!Number.isInteger(value.id) || (value.id as number) <= 0) return null
   if (typeof value.name !== "string" || !value.name.trim()) return null
-  if (value.description !== undefined && typeof value.description !== "string") return null
-  if (value.logo_url !== undefined && typeof value.logo_url !== "string") return null
+  if (value.description !== undefined && value.description !== null && typeof value.description !== "string") return null
+  if (value.logo_url !== undefined && value.logo_url !== null && typeof value.logo_url !== "string") return null
   if (!Array.isArray(value.suggested_prompts) || !value.suggested_prompts.every((item) => typeof item === "string")) {
     return null
   }
@@ -99,13 +109,17 @@ export function buildWidgetSessionWebSocketUrl(origin: string): string {
 
 export function useWidgetSession() {
   const [state, setState] = useState<WidgetSessionBridgeState>(initialState)
-  const [parentOrigin, setParentOrigin] = useState<string | null>(null)
   const mountedRef = useRef(false)
-  const parentOriginRef = useRef<string | null>(null)
-  const reconnectRequestedRef = useRef(false)
+  const targetOriginRef = useRef<string | null>(null)
+  const recoveryRef = useRef<RecoveryState | null>(null)
+  const consecutiveRecoveryAttemptsRef = useRef(0)
   const terminalRef = useRef(false)
   const generationRef = useRef(0)
+  const activeSessionGenerationRef = useRef<number | null>(null)
   const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const stabilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const stabilityConnectionIdentityRef = useRef<string | null>(null)
+  const issueReconnectRequestRef = useRef<(reason: WidgetSessionReconnectReason) => void>(() => undefined)
 
   const clearWarningTimer = useCallback(() => {
     if (warningTimerRef.current) {
@@ -114,10 +128,30 @@ export function useWidgetSession() {
     }
   }, [])
 
+  const clearStabilityTimer = useCallback(() => {
+    if (stabilityTimerRef.current) {
+      clearTimeout(stabilityTimerRef.current)
+      stabilityTimerRef.current = null
+    }
+    stabilityConnectionIdentityRef.current = null
+  }, [])
+
+  const clearRecoveryTimers = useCallback(() => {
+    const recovery = recoveryRef.current
+    if (!recovery) return
+    if (recovery.responseTimer) clearTimeout(recovery.responseTimer)
+    if (recovery.retryTimer) clearTimeout(recovery.retryTimer)
+    recovery.responseTimer = null
+    recovery.retryTimer = null
+  }, [])
+
   const transitionTerminal = useCallback((code: string) => {
     if (terminalRef.current) return
     terminalRef.current = true
-    reconnectRequestedRef.current = false
+    activeSessionGenerationRef.current = null
+    clearRecoveryTimers()
+    recoveryRef.current = null
+    clearStabilityTimer()
     clearWarningTimer()
     setState({
       status: "terminal",
@@ -126,13 +160,28 @@ export function useWidgetSession() {
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
-  }, [clearWarningTimer])
+  }, [clearRecoveryTimers, clearStabilityTimer, clearWarningTimer])
 
-  const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
-    const targetOrigin = parentOriginRef.current
-    if (!mountedRef.current || !targetOrigin || terminalRef.current || reconnectRequestedRef.current) return
+  const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
+    const targetOrigin = targetOriginRef.current
+    if (!mountedRef.current || !targetOrigin || terminalRef.current) return
 
-    reconnectRequestedRef.current = true
+    const recovery = recoveryRef.current ?? {
+      attempts: consecutiveRecoveryAttemptsRef.current,
+      reason,
+      responseTimer: null,
+      retryTimer: null,
+    }
+    recoveryRef.current = recovery
+    if (recovery.responseTimer || recovery.retryTimer) return
+    if (recovery.attempts >= MAX_CONSECUTIVE_RECOVERY_ATTEMPTS) {
+      transitionTerminal("network_unavailable")
+      return
+    }
+
+    recovery.attempts += 1
+    recovery.reason = reason
+    consecutiveRecoveryAttemptsRef.current = recovery.attempts
     clearWarningTimer()
     setState((current) => ({
       status: "refreshing",
@@ -142,10 +191,100 @@ export function useWidgetSession() {
       isAbsoluteExpiryWarningVisible: false,
     }))
     window.parent.postMessage({ xagent: true, v: 1, type: "reconnect_request", reason }, targetOrigin)
-  }, [clearWarningTimer])
+    recovery.responseTimer = setTimeout(() => {
+      if (recoveryRef.current !== recovery || terminalRef.current) return
+      recovery.responseTimer = null
+      if (recovery.attempts >= MAX_CONSECUTIVE_RECOVERY_ATTEMPTS) {
+        transitionTerminal("network_unavailable")
+        return
+      }
+      const delay = recovery.attempts === 1 ? 1_000 : 2_000
+      recovery.retryTimer = setTimeout(() => {
+        if (recoveryRef.current !== recovery || terminalRef.current) return
+        recovery.retryTimer = null
+        issueReconnectRequestRef.current(recovery.reason)
+      }, delay)
+    }, PARENT_RESPONSE_DEADLINE_MS)
+  }, [clearWarningTimer, transitionTerminal])
 
-  const handleConnectionClose = useCallback((event: CloseEvent): "handled" => {
-    if (event.code === 1000) return "handled"
+  issueReconnectRequestRef.current = issueReconnectRequest
+
+  const advanceRecovery = useCallback((reason: WidgetSessionReconnectReason) => {
+    const recovery = recoveryRef.current
+    if (!recovery) {
+      issueReconnectRequest(reason)
+      return
+    }
+    if (recovery.responseTimer) {
+      clearTimeout(recovery.responseTimer)
+      recovery.responseTimer = null
+    }
+    if (recovery.retryTimer) return
+    if (recovery.attempts >= MAX_CONSECUTIVE_RECOVERY_ATTEMPTS) {
+      transitionTerminal("network_unavailable")
+      return
+    }
+    recovery.reason = reason
+    const delay = recovery.attempts === 1 ? 1_000 : 2_000
+    recovery.retryTimer = setTimeout(() => {
+      if (recoveryRef.current !== recovery || terminalRef.current) return
+      recovery.retryTimer = null
+      issueReconnectRequestRef.current(recovery.reason)
+    }, delay)
+  }, [issueReconnectRequest, transitionTerminal])
+
+  const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
+    if (!mountedRef.current || terminalRef.current || recoveryRef.current) return
+    clearStabilityTimer()
+    activeSessionGenerationRef.current = null
+    issueReconnectRequest(reason)
+  }, [clearStabilityTimer, issueReconnectRequest])
+
+  const armStabilityWindow = useCallback((connectionIdentity: string) => {
+    clearStabilityTimer()
+    stabilityConnectionIdentityRef.current = connectionIdentity
+    stabilityTimerRef.current = setTimeout(() => {
+      if (
+        terminalRef.current
+        || recoveryRef.current
+        || stabilityConnectionIdentityRef.current !== connectionIdentity
+      ) return
+      stabilityTimerRef.current = null
+      stabilityConnectionIdentityRef.current = null
+      consecutiveRecoveryAttemptsRef.current = 0
+    }, SESSION_STABILITY_WINDOW_MS)
+  }, [clearStabilityTimer])
+
+  const handleConnectionOpen = useCallback((connectionIdentity: string) => {
+    const activeGeneration = activeSessionGenerationRef.current
+    if (
+      !mountedRef.current
+      || terminalRef.current
+      || recoveryRef.current
+      || activeGeneration === null
+      || connectionIdentity !== `widget-session:${activeGeneration}`
+    ) return
+    armStabilityWindow(connectionIdentity)
+  }, [armStabilityWindow])
+
+  const isActiveConnection = useCallback((connectionIdentity?: string) => {
+    const activeGeneration = activeSessionGenerationRef.current
+    return connectionIdentity === undefined || (
+      activeGeneration !== null
+      && connectionIdentity === `widget-session:${activeGeneration}`
+    )
+  }, [])
+
+  const handleConnectionClose = useCallback((
+    event: CloseEvent,
+    connectionIdentity?: string,
+  ): "handled" => {
+    if (!isActiveConnection(connectionIdentity)) return "handled"
+    clearStabilityTimer()
+    if (event.code === 1000) {
+      transitionTerminal("unexpected_error")
+      return "handled"
+    }
 
     if (event.code === 4403) {
       transitionTerminal("ws_4403")
@@ -159,17 +298,20 @@ export function useWidgetSession() {
 
     requestReconnect("ws_closed")
     return "handled"
-  }, [requestReconnect, transitionTerminal])
+  }, [clearStabilityTimer, isActiveConnection, requestReconnect, transitionTerminal])
 
   const handleConnectionFailure = useCallback((
     failure: WebSocketConnectionFailure,
+    connectionIdentity?: string,
   ) => {
-    if (failure.code === "transport_error" && failure.recoverable) {
+    if (!isActiveConnection(connectionIdentity)) return
+    clearStabilityTimer()
+    if (failure.recoverable) {
       requestReconnect("ws_closed")
       return
     }
     transitionTerminal("unexpected_error")
-  }, [requestReconnect, transitionTerminal])
+  }, [clearStabilityTimer, isActiveConnection, requestReconnect, transitionTerminal])
 
   const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
     clearWarningTimer()
@@ -183,15 +325,18 @@ export function useWidgetSession() {
   }, [clearWarningTimer])
 
   useEffect(() => {
+    if (window.parent === window) {
+      transitionTerminal("unexpected_error")
+      return
+    }
     mountedRef.current = true
 
     const onMessage = (event: MessageEvent<unknown>) => {
       if (event.source !== window.parent || !isProtocolMessage(event.data)) return
-      if (parentOriginRef.current && event.origin !== parentOriginRef.current) return
+      if (targetOriginRef.current && event.origin !== targetOriginRef.current) return
 
-      if (!parentOriginRef.current) {
-        parentOriginRef.current = event.origin
-        setParentOrigin(event.origin)
+      if (!targetOriginRef.current) {
+        targetOriginRef.current = event.origin
       }
 
       if (terminalRef.current) return
@@ -219,11 +364,17 @@ export function useWidgetSession() {
       }
 
       if (tokenExpiresAt - now < TOKEN_REFRESH_THRESHOLD_MS) {
-        requestReconnect("token_expired")
+        if (recoveryRef.current) {
+          advanceRecovery("token_expired")
+        } else {
+          requestReconnect("token_expired")
+        }
         return
       }
 
-      reconnectRequestedRef.current = false
+      clearRecoveryTimers()
+      recoveryRef.current = null
+      clearStabilityTimer()
       generationRef.current += 1
       const session: WidgetSession = {
         token,
@@ -232,6 +383,7 @@ export function useWidgetSession() {
         agent,
         generation: generationRef.current,
       }
+      activeSessionGenerationRef.current = session.generation
       setState({
         status: "active",
         session,
@@ -247,15 +399,22 @@ export function useWidgetSession() {
 
     return () => {
       mountedRef.current = false
+      activeSessionGenerationRef.current = null
       window.removeEventListener("message", onMessage)
+      clearRecoveryTimers()
+      recoveryRef.current = null
+      clearStabilityTimer()
       clearWarningTimer()
     }
-  }, [clearWarningTimer, requestReconnect, scheduleExpiryWarning, transitionTerminal])
+    // The bridge owns timers for its mounted lifetime; callback behavior reads
+    // refs so a render must not retire an in-flight recovery attempt.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   return {
     ...state,
-    parentOrigin,
     requestReconnect,
+    handleConnectionOpen,
     handleConnectionClose,
     handleConnectionFailure,
   }

@@ -18,6 +18,7 @@ interface ClarificationFormProps {
   interactions: Interaction[]
   messageId?: string
   active?: boolean
+  filesDisabled?: boolean
   onSend?: (message: string, files?: File[], metadata?: any) => Promise<void> | void
 }
 
@@ -43,17 +44,24 @@ const isFileActionSelection = (
   ? isFileActionOption(option)
   : isFileActionValue(value)
 
-export function ClarificationForm({ interactions, messageId, active = true, onSend }: ClarificationFormProps) {
+export function ClarificationForm({
+  interactions,
+  messageId,
+  active = true,
+  filesDisabled: filesDisabledOverride,
+  onSend,
+}: ClarificationFormProps) {
   // If onSend is provided, use it (e.g., from builder chat), otherwise use useApp
-  let sendMessage: any, dispatch: any, filesDisabled = false;
+  let sendMessage: any, dispatch: any, contextFilesDisabled: boolean | undefined;
   try {
     const appCtx = useApp();
     sendMessage = appCtx.sendMessage;
     dispatch = appCtx.dispatch;
-    filesDisabled = appCtx.filesDisabled;
+    contextFilesDisabled = appCtx.filesDisabled;
   } catch {
     // We might not be in the app context (e.g., agent builder chat)
   }
+  const filesDisabled = filesDisabledOverride ?? contextFilesDisabled ?? true
 
   const { t } = useI18n()
   const [formState, setFormState] = useState<Record<string, any>>({})

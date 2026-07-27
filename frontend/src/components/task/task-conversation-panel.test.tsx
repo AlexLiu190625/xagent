@@ -9,7 +9,7 @@ const appState = vi.hoisted(() => ({
   isProcessing: false,
   isHistoryLoading: false,
   taskId: 42,
-  filePreview: { isOpen: false, fileName: "", viewMode: "preview" },
+  filePreview: { isOpen: false, fileId: "", fileName: "", viewMode: "preview" },
   dagExecution: null,
   steps: [],
 }))
@@ -17,12 +17,15 @@ const openFilePreviewMock = vi.hoisted(() => vi.fn())
 const sendMessageMock = vi.hoisted(() => vi.fn())
 const pauseTaskMock = vi.hoisted(() => vi.fn())
 const resumeTaskMock = vi.hoisted(() => vi.fn())
+const getFileDownloadUrlMock = vi.hoisted(() => vi.fn())
+const fileAccessRequestMock = vi.hoisted(() => vi.fn())
 const appControls = vi.hoisted(() => ({
   filesDisabled: false,
   voiceInputEnabled: true,
   taskControlsEnabled: true,
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
+  isSessionInteractionLocked: false,
 }))
 const chatInputProps = vi.hoisted(() => ({
   current: null as null | {
@@ -51,14 +54,19 @@ vi.mock("@/contexts/app-context-chat", () => ({
     closeFilePreview: vi.fn(),
     requestStatus: vi.fn(),
     dispatch: vi.fn(),
-    getFileDownloadUrl: vi.fn(),
+    getFileDownloadUrl: getFileDownloadUrlMock,
     isConversationResetPending: appControls.isConversationResetPending,
     isMessageDeliveryPending: appControls.isMessageDeliveryPending,
+    isSessionInteractionLocked: appControls.isSessionInteractionLocked,
   }),
 }))
 
 vi.mock("@/contexts/i18n-context", () => ({
   useI18n: () => ({ t: (key: string) => key }),
+}))
+
+vi.mock("@/contexts/file-access-context", () => ({
+  useFileAccess: () => ({ request: fileAccessRequestMock }),
 }))
 
 vi.mock("dagre", () => {
@@ -143,6 +151,7 @@ vi.mock("@/components/chat/ChatInput", () => ({
       <div data-testid="chat-input">
         <button
           type="button"
+          disabled={props.isLoading}
           onClick={() => props.onFilesChange?.([
             new File(["draft"], "draft.txt", { type: "text/plain" }),
           ])}
@@ -151,6 +160,7 @@ vi.mock("@/components/chat/ChatInput", () => ({
         </button>
         <button
           type="button"
+          disabled={props.isLoading}
           onClick={() => void props.onSend("send draft", { mode: "balanced" })}
         >
           send draft
@@ -175,13 +185,17 @@ vi.mock("@/components/file/file-preview-content", () => ({
 }))
 
 vi.mock("@/components/file/file-preview-action-buttons", () => ({
-  FilePreviewActionButtons: () => (
-    <div data-testid="file-preview-actions" />
+  FilePreviewActionButtons: ({ onDownload }: { onDownload: () => void }) => (
+    <button type="button" data-testid="file-preview-actions" onClick={onDownload}>
+      download
+    </button>
   ),
 }))
 
 vi.mock("@/components/preview-sheet", () => ({
-  PreviewSheet: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  PreviewSheet: ({ children, actions }: { children: React.ReactNode; actions?: React.ReactNode }) => (
+    <>{actions}{children}</>
+  ),
 }))
 
 vi.mock("@/components/layout/center-panel", () => ({
@@ -210,9 +224,12 @@ describe("TaskConversationPanel", () => {
     sendMessageMock.mockResolvedValue(undefined)
     pauseTaskMock.mockReset()
     resumeTaskMock.mockReset()
+    getFileDownloadUrlMock.mockReset()
+    fileAccessRequestMock.mockReset()
     chatInputProps.current = null
     appControls.isConversationResetPending = false
     appControls.isMessageDeliveryPending = false
+    appControls.isSessionInteractionLocked = false
     appControls.filesDisabled = false
     appControls.voiceInputEnabled = true
     appControls.taskControlsEnabled = true
@@ -226,12 +243,13 @@ describe("TaskConversationPanel", () => {
     appState.currentTask = null
     appState.isProcessing = false
     appState.isHistoryLoading = false
-    appState.filePreview = { isOpen: false, fileName: "", viewMode: "preview" }
+    appState.filePreview = { isOpen: false, fileId: "", fileName: "", viewMode: "preview" }
   })
 
   it("disables every file surface and drops staged files when the capability is disabled", async () => {
     appState.filePreview = {
       isOpen: true,
+      fileId: "secret-file",
       fileName: "secret.txt",
       viewMode: "preview",
     }
@@ -281,6 +299,31 @@ describe("TaskConversationPanel", () => {
     )
   })
 
+  it("downloads through the provider-scoped file request policy", async () => {
+    appState.filePreview = {
+      isOpen: true,
+      fileId: "public-file-id",
+      fileName: "report.pdf",
+      viewMode: "preview",
+    }
+    getFileDownloadUrlMock.mockReturnValue(
+      "/api/files/public/download/public-file-id?token=guest-token",
+    )
+    fileAccessRequestMock.mockResolvedValue({
+      ok: true,
+      blob: async () => new Blob(["file"]),
+    })
+
+    render(<TaskConversationPanel mode="page" />)
+    fireEvent.click(screen.getByTestId("file-preview-actions"))
+
+    await Promise.resolve()
+    expect(getFileDownloadUrlMock).toHaveBeenCalledWith("public-file-id")
+    expect(fileAccessRequestMock).toHaveBeenCalledWith(
+      "/api/files/public/download/public-file-id?token=guest-token",
+    )
+  })
+
   it("passes the transport voice capability through to ChatInput", () => {
     const { rerender } = render(<TaskConversationPanel mode="page" />)
 
@@ -323,6 +366,15 @@ describe("TaskConversationPanel", () => {
     appControls.isMessageDeliveryPending = false
     rerender(<TaskConversationPanel mode="page" />)
     expect(chatInputProps.current?.isLoading).toBe(false)
+  })
+
+  it("blocks the established-conversation composer when the Session outcome requires reload", () => {
+    appControls.isSessionInteractionLocked = true
+    render(<TaskConversationPanel mode="page" />)
+
+    expect(screen.getByRole("button", { name: "send draft" })).toBeDisabled()
+    fireEvent.click(screen.getByRole("button", { name: "send draft" }))
+    expect(sendMessageMock).not.toHaveBeenCalled()
   })
 
   it("renders waiting-for-user prompts from normal task state", () => {

@@ -142,9 +142,11 @@ describe("ChatInput", () => {
 
     expect(container.querySelector('input[type="file"]')).toBeNull()
     expect(container.querySelector(".file-chip-preview")).toBeNull()
-    expect(screen.queryByText("secret.txt")).not.toBeInTheDocument()
-
     const editor = screen.getByRole("textbox")
+    expect(editor).toHaveTextContent("secret.txt")
+    expect(editor).not.toHaveTextContent("file-secret")
+    expect(editor.innerHTML).not.toContain("file-secret")
+
     editor.innerHTML = '<span class="file-chip-preview" data-file-path="file-secret">secret</span>'
     fireEvent.click(editor.querySelector(".file-chip-preview") as HTMLElement)
 
@@ -193,6 +195,50 @@ describe("ChatInput", () => {
       "file-report",
       [{ fileName: "file-report", fileId: "file-report" }],
     )
+  })
+
+  it("restores a draft file chip without displaying its canonical id and preserves that id on send", async () => {
+    const onSend = vi.fn()
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="[report.txt](file:canonical-file-id)"
+        onInputChange={vi.fn()}
+        onSend={onSend}
+        readOnlyConfig
+      />
+    )
+
+    expect(screen.getByText("report.txt")).toBeInTheDocument()
+    expect(screen.queryByText("canonical-file-id")).not.toBeInTheDocument()
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+
+    await waitFor(() => {
+      expect(onSend).toHaveBeenCalledWith(
+        "[report.txt](file:canonical-file-id)",
+        expect.any(Object),
+      )
+    })
+  })
+
+  it("keeps a controlled first-message draft after an async send rejection", async () => {
+    const onInputChange = vi.fn()
+    const onSend = vi.fn().mockRejectedValue(new Error("delivery failed"))
+    const { container } = render(
+      <ChatInput
+        hideConfig
+        hideFileUpload
+        inputValue="retry this"
+        onInputChange={onInputChange}
+        onSend={onSend}
+        readOnlyConfig
+      />,
+    )
+
+    fireEvent.submit(container.querySelector("form") as HTMLFormElement)
+    await waitFor(() => expect(onSend).toHaveBeenCalled())
+    expect(onInputChange).not.toHaveBeenCalledWith("")
   })
 
   it("allows selected agent submissions without a local model", async () => {

@@ -188,6 +188,17 @@ describe("widget session mode", () => {
     }))
   })
 
+  it("consumes the response body returned by the session exchange", async () => {
+    const response = jsonResponse(200, exchangeBody())
+    fetchMock.mockResolvedValueOnce(response)
+
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.waitFor(() => {
+      expect(response.bodyUsed).toBe(true)
+    })
+  })
+
   it("sends the opaque grant value verbatim after checking that it is not blank", () => {
     const rawGrant = `  ${GRANT}\n`
     fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))

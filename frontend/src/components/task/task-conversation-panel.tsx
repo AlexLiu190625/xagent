@@ -16,8 +16,8 @@ import { CenterPanel } from "@/components/layout/center-panel"
 import { PreviewSheet } from "@/components/preview-sheet"
 import { Button } from "@/components/ui/button"
 import { useApp } from "@/contexts/app-context-chat"
+import { useFileAccess } from "@/contexts/file-access-context"
 import { useI18n } from "@/contexts/i18n-context"
-import { apiRequest } from "@/lib/api-wrapper"
 import { isStreamingFinalAnswerMessage } from "@/lib/streaming-final-answer"
 import { getProcessGroupIndex, getUserTimelineAnchors } from "@/lib/task-timeline"
 import { resolveTraceProcessStatus } from "@/lib/trace-process-status"
@@ -205,7 +205,9 @@ export function TaskConversationPanel({
     getFileDownloadUrl,
     isConversationResetPending,
     isMessageDeliveryPending,
+    isSessionInteractionLocked,
   } = useApp()
+  const fileAccess = useFileAccess()
   const { t } = useI18n()
   const [files, setFiles] = useState<File[]>([])
   const [dagPreviewOpen, setDagPreviewOpen] = useState(false)
@@ -506,7 +508,7 @@ export function TaskConversationPanel({
 
     try {
       if (!state.filePreview.fileId) return
-      const response = await apiRequest(getFileDownloadUrl(state.filePreview.fileId))
+      const response = await fileAccess.request(getFileDownloadUrl(state.filePreview.fileId))
       if (!response.ok) {
         throw new Error(`Download failed: ${response.statusText}`)
       }
@@ -799,6 +801,7 @@ export function TaskConversationPanel({
                 state.isProcessing
                 || isConversationResetPending
                 || isMessageDeliveryPending
+                || isSessionInteractionLocked
               }
               files={filesDisabled ? [] : files}
               onFilesChange={filesDisabled ? undefined : setFiles}

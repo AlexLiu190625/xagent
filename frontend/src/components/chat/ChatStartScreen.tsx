@@ -39,7 +39,7 @@ interface ChatStartScreenProps {
   onAgentClick?: (agent: AgentCard) => void;
   selectedAgents?: AgentCard[];
   onRemoveSelectedAgent?: (agentId: number | string) => void;
-  onSend: (message: string, files: File[], config?: any) => void;
+  onSend: (message: string, files: File[], config?: any) => void | Promise<void>;
   isSending?: boolean;
   inputValue?: string;
   onInputChange?: (value: string) => void;

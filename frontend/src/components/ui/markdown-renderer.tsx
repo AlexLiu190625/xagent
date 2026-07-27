@@ -16,6 +16,15 @@ import {
   type PreviewableInlineFileKind,
 } from '@/components/file/inline-file-preview-utils'
 import { getApiUrl } from '@/lib/utils'
+import { AgentCardPresentationCapability } from '@/contexts/presentation-capabilities'
+import {
+  getFilesDisabledPresentationFileLabel,
+  isManagedFileUrl,
+  projectFilesDisabledPresentation,
+  projectFilesDisabledToolResultPresentation,
+  sanitizeFilesDisabledPresentationText,
+  serializeFilesDisabledPresentation,
+} from '@/lib/files-disabled-presentation'
 
 
 interface AgentInfo {
@@ -43,241 +52,12 @@ const isLikelyMarkdown = (s: string): boolean => {
   )
 }
 
-const FILE_NAME_KEYS = new Set(['filename', 'file_name', 'name'])
-const FILE_DESCRIPTOR_KEYS = new Set(['mime_type', 'type'])
-const GENERIC_IDENTITY_AND_LOCATION_KEYS = new Set(['id', 'url', 'href', 'uri'])
-const FILE_RECORD_COLLECTION_KEYS = new Set(['artifacts', 'documents', 'files'])
-const KNOWN_FILE_DESCRIPTOR_VALUES = new Set([
-  'audio',
-  'document',
-  'file',
-  'image',
-  'presentation',
-  'spreadsheet',
-  'video',
-])
-const LOCAL_FILE_LOCATION_KEYS = new Set([
-  // Backend artifacts.LOCAL_PATH_KEYS.
-  'absolute_path',
-  'file_path',
-  'image_path',
-  'local_path',
-  'output_dir',
-  'output_path',
-  // Additional local locations emitted by current tool-result producers.
-  'audio_path',
-  'backup_path',
-  'base_dir',
-  'current_path',
-  'full_path',
-  'json_path',
-  'marked_image_path',
-  'relative_path',
-  'source_path',
-  'storage_path',
-  'transcription_path',
-  'translation_path',
-  'uploads_directory',
-  'video_path',
-  'workspace_dir',
-])
-const AMBIGUOUS_FILE_LOCATION_KEYS = new Set(['path', 'directory'])
-const FILE_MARKDOWN_REFERENCE_RE = /!?\[([^\]]*)\]\(\s*file:(?:\/\/)?[^)]*\)/g
-const BACKTICK_FILE_PATH_RE = /`([^`\n]*[\\/][^`\n]*)`/g
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null && !Array.isArray(value)
-}
-
-function normalizeFileMetadataKey(key: string): string {
-  return key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase()
-}
-
-function isFileIdKey(key: string): boolean {
-  const normalized = normalizeFileMetadataKey(key)
-  return normalized === 'file_id' || normalized.endsWith('_file_id')
-}
-
-function isFileAccessKey(key: string): boolean {
-  const normalized = normalizeFileMetadataKey(key)
-  return /(^|_)(preview|download|signed|file)_url$/.test(normalized)
-}
-
-function hasStrongFileIdentity(value: Record<string, unknown>): boolean {
-  const entries = Object.entries(value)
-  const keys = entries.map(([key]) => normalizeFileMetadataKey(key))
-  if (keys.some(isFileIdKey)) {
-    return true
-  }
-  if (keys.some((key) => key === 'filename' || key === 'file_name')) {
-    return true
-  }
-
-  const hasName = keys.some((key) => FILE_NAME_KEYS.has(key))
-  const descriptor = entries.find(([key]) => (
-    FILE_DESCRIPTOR_KEYS.has(normalizeFileMetadataKey(key))
-  ))?.[1]
-  return (
-    hasName
-    && typeof descriptor === 'string'
-    && (
-      descriptor.includes('/')
-      || KNOWN_FILE_DESCRIPTOR_VALUES.has(descriptor.toLowerCase())
-    )
-  )
-}
-
-function hasFileCopyEvidence(value: Record<string, unknown>): boolean {
-  const keys = new Set(Object.keys(value).map(normalizeFileMetadataKey))
-  return (
-    keys.has('source')
-    && keys.has('destination')
-    && typeof value.extracted === 'boolean'
-  )
-}
-
-function isLocalFileLocationKey(
-  key: string,
-  owner: Record<string, unknown>,
-  fileRecordContext = false,
-): boolean {
-  const normalized = normalizeFileMetadataKey(key)
-  if (LOCAL_FILE_LOCATION_KEYS.has(normalized)) {
-    return true
-  }
-  if (AMBIGUOUS_FILE_LOCATION_KEYS.has(normalized)) {
-    return fileRecordContext || hasStrongFileIdentity(owner)
-  }
-  if (normalized === 'html_src') {
-    return hasStrongFileIdentity(owner)
-  }
-  if (normalized === 'source' || normalized === 'destination') {
-    return hasFileCopyEvidence(owner)
-  }
-  return false
-}
-
-function basename(value: string): string | null {
-  const parts = value.split(/[\\/]/).filter(Boolean)
-  return parts.at(-1) || null
-}
-
-function rawFileLabel(value: Record<string, unknown>): string | null {
-  for (const key of ['filename', 'file_name', 'fileName', 'name']) {
-    const candidate = value[key]
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return basename(candidate) || candidate
-    }
-  }
-  return null
-}
-
-function collectKnownLocalPaths(value: unknown): Map<string, string> {
-  const paths = new Map<string, string>()
-
-  const visit = (item: unknown, fileRecordContext = false): void => {
-    if (Array.isArray(item)) {
-      item.forEach((child) => visit(child, fileRecordContext))
-      return
-    }
-    if (!isRecord(item)) {
-      return
-    }
-
-    const label = rawFileLabel(item)
-    Object.entries(item).forEach(([key, child]) => {
-      if (
-        isLocalFileLocationKey(key, item, fileRecordContext)
-        && typeof child === 'string'
-        && child.trim()
-      ) {
-        const fallback = basename(child)
-        if (label || fallback) {
-          paths.set(child, label ?? fallback ?? child)
-        }
-      }
-      visit(
-        child,
-        fileRecordContext
-        || FILE_RECORD_COLLECTION_KEYS.has(normalizeFileMetadataKey(key)),
-      )
-    })
-  }
-
-  visit(value)
-  return paths
-}
-
-function replaceKnownLocalPaths(
-  value: string,
-  knownPaths: Map<string, string>,
-): string {
-  return [...knownPaths.entries()]
-    .sort(([left], [right]) => right.length - left.length)
-    .reduce(
-      (result, [path, replacement]) => result.split(path).join(replacement),
-      value,
-    )
-}
-
-function projectFilesDisabledValueWithPaths(
-  value: unknown,
-  knownPaths: Map<string, string>,
-  fileRecordContext = false,
-): unknown {
-  if (typeof value === 'string') {
-    return sanitizeFilesDisabledText(replaceKnownLocalPaths(value, knownPaths))
-  }
-
-  if (Array.isArray(value)) {
-    return value.map((item) => (
-      projectFilesDisabledValueWithPaths(item, knownPaths, fileRecordContext)
-    ))
-  }
-
-  if (!isRecord(value)) {
-    return value
-  }
-
-  const strongFileIdentity = hasStrongFileIdentity(value)
-  return Object.fromEntries(
-    Object.entries(value).flatMap(([key, child]) => {
-      const normalizedKey = normalizeFileMetadataKey(key)
-      if (
-        isFileIdKey(normalizedKey)
-        || isFileAccessKey(normalizedKey)
-        || isLocalFileLocationKey(normalizedKey, value, fileRecordContext)
-      ) {
-        return []
-      }
-      if (
-        strongFileIdentity
-        && GENERIC_IDENTITY_AND_LOCATION_KEYS.has(normalizedKey)
-      ) {
-        return []
-      }
-      return [[
-        key,
-        projectFilesDisabledValueWithPaths(
-          child,
-          knownPaths,
-          fileRecordContext || FILE_RECORD_COLLECTION_KEYS.has(normalizedKey),
-        ),
-      ]]
-    }),
-  )
-}
+const isRecord = (value: unknown): value is Record<string, unknown> => (
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+)
 
 export function sanitizeFilesDisabledText(value: string): string {
-  return value
-    .replace(FILE_MARKDOWN_REFERENCE_RE, (_match, label: string) => label)
-    .replace(BACKTICK_FILE_PATH_RE, (match, path: string) => {
-      const scheme = /^([a-z][a-z0-9+.-]*):\/\//i.exec(path.trim())
-      if (scheme && scheme[1].toLowerCase() !== 'file') {
-        return match
-      }
-      return path.split(/[\\/]/).pop() || path
-    })
+  return sanitizeFilesDisabledPresentationText(value)
 }
 
 /**
@@ -287,73 +67,26 @@ export function sanitizeFilesDisabledText(value: string): string {
  * identity; unrelated business records retain those fields.
  */
 export function projectFilesDisabledValue(value: unknown): unknown {
-  return projectFilesDisabledValueWithPaths(value, collectKnownLocalPaths(value))
+  return projectFilesDisabledPresentation(value)
 }
 
 export function projectFilesDisabledToolResultOutput(value: unknown): unknown {
-  const projected = projectFilesDisabledValue(value)
-  if (isRecord(projected)) {
-    if ('output' in projected) {
-      return projected.output
-    }
-    if ('message' in projected) {
-      return projected.message
-    }
-  }
-  return projected
+  return projectFilesDisabledToolResultPresentation(value)
 }
 
 export function getFilesDisabledFileLabel(value: unknown): string | null {
-  if (isRecord(value)) {
-    const label = rawFileLabel(value)
-    if (label) {
-      return label
-    }
-    for (const [key, child] of Object.entries(value)) {
-      if (isLocalFileLocationKey(key, value, true) && typeof child === 'string') {
-        const pathLabel = basename(child)
-        if (pathLabel) {
-          return pathLabel
-        }
-      }
-    }
-  }
-
-  const projected = projectFilesDisabledValue(value)
-  if (!isRecord(projected)) {
-    return null
-  }
-
-  for (const key of ['filename', 'file_name', 'fileName', 'name']) {
-    const candidate = projected[key]
-    if (typeof candidate === 'string' && candidate.trim()) {
-      return candidate
-    }
-  }
-  return null
+  return getFilesDisabledPresentationFileLabel(value)
 }
 
 export function serializeFilesDisabledValue(value: unknown): string {
-  if (typeof value === 'string') {
-    try {
-      return JSON.stringify(projectFilesDisabledValue(JSON.parse(value)), null, 2)
-    } catch {
-      return sanitizeFilesDisabledText(value)
-    }
-  }
-
-  try {
-    const serialized = JSON.stringify(projectFilesDisabledValue(value), null, 2)
-    return serialized ?? String(value)
-  } catch {
-    return String(value)
-  }
+  return serializeFilesDisabledPresentation(value)
 }
 
 interface MarkdownRendererProps {
   content: string
   className?: string
   filesDisabled?: boolean
+  agentCardsEnabled?: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
 }
@@ -552,6 +285,7 @@ function containsPreviewFileLinkNode(node: any): boolean {
 
 type MarkdownRendererContextValue = {
   filesDisabled: boolean
+  agentCardsEnabled: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
   openLabel: string
@@ -600,23 +334,30 @@ function MarkdownLink({
 }: MarkdownComponentProps<'a'>) {
   const {
     filesDisabled,
+    agentCardsEnabled,
     onFileClick,
     onAgentClick,
     openLabel,
     loadErrorText,
   } =
     useMarkdownRendererContext()
+  const linkText = (node ? hastText(node) : nodeText(children)).trim()
+  const presentationChildren = filesDisabled
+    ? sanitizeFilesDisabledPresentationText(linkText)
+    : children
+  const presentationTitle = filesDisabled && title
+    ? sanitizeFilesDisabledPresentationText(title)
+    : title
 
   if (href && href.startsWith('file:')) {
     const filePath = href.replace(/^file:/, '')
     const fileNameFromPath = filePath.split('/').pop() || filePath
-    const linkText = (node ? hastText(node) : nodeText(children)).trim()
     const fileName = title || linkText || fileNameFromPath
     const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
     const fileId = resolveInlineFileId(filePath)
 
     if (filesDisabled) {
-      return <span>{children}</span>
+      return <span>{presentationChildren}</span>
     }
 
     if (preview) {
@@ -662,6 +403,10 @@ function MarkdownLink({
     const agentNameFromLink =
       (node ? hastText(node) : nodeText(children)).trim() || `Agent ${agentId}`
 
+    if (!agentCardsEnabled) {
+      return <span>{presentationChildren}</span>
+    }
+
     return React.createElement('div', {
       className: 'my-2',
       key: `agent-${agentId}-wrapper`,
@@ -674,9 +419,20 @@ function MarkdownLink({
     }))
   }
 
+  if (
+    filesDisabled
+    && href
+    && (
+      isManagedFileUrl(href)
+      || sanitizeFilesDisabledPresentationText(href) !== href
+    )
+  ) {
+    return <span>{presentationChildren}</span>
+  }
+
   return (
-    <a href={href || undefined} title={title || undefined} {...props}>
-      {children}
+    <a href={href || undefined} title={presentationTitle || undefined} {...props}>
+      {presentationChildren}
     </a>
   )
 }
@@ -691,6 +447,12 @@ function MarkdownImage({
   const { filesDisabled, onFileClick, openLabel, loadErrorText } =
     useMarkdownRendererContext()
   const resolvedSrc = src || ''
+  const presentationAlt = filesDisabled
+    ? sanitizeFilesDisabledPresentationText(alt || '')
+    : alt || ''
+  const presentationTitle = filesDisabled && title
+    ? sanitizeFilesDisabledPresentationText(title)
+    : title
 
   if (resolvedSrc.startsWith('file:')) {
     const filePath = resolvedSrc.replace(/^file:/, '')
@@ -699,7 +461,7 @@ function MarkdownImage({
     const preview = resolvePreviewableFileLink({ fileNameFromPath, fileName })
     const previewKind = preview?.previewKind ?? 'image'
     if (filesDisabled) {
-      return <span>{fileName}</span>
+      return <span>{presentationTitle || presentationAlt || sanitizeFilesDisabledPresentationText(fileName)}</span>
     }
 
     return (
@@ -718,7 +480,24 @@ function MarkdownImage({
     )
   }
 
-  return <img src={resolvedSrc} alt={alt || ''} title={title || alt || ''} {...props} />
+  if (
+    filesDisabled
+    && (
+      isManagedFileUrl(resolvedSrc)
+      || sanitizeFilesDisabledPresentationText(resolvedSrc) !== resolvedSrc
+    )
+  ) {
+    return <span>{presentationTitle || presentationAlt}</span>
+  }
+
+  return (
+    <img
+      src={resolvedSrc}
+      alt={presentationAlt}
+      title={presentationTitle || presentationAlt}
+      {...props}
+    />
+  )
 }
 
 // Keep these component identities stable across chat/trace updates. Replacing
@@ -734,20 +513,27 @@ export function MarkdownRenderer({
   content,
   className = '',
   filesDisabled = false,
+  agentCardsEnabled,
   onFileClick,
   onAgentClick,
 }: MarkdownRendererProps) {
   const { t } = useI18n()
+  const inheritedAgentCardsEnabled = React.useContext(AgentCardPresentationCapability)
+  const resolvedAgentCardsEnabled = agentCardsEnabled ?? inheritedAgentCardsEnabled
   const contextValue = React.useMemo<MarkdownRendererContextValue>(
     () => ({
       filesDisabled,
+      agentCardsEnabled: resolvedAgentCardsEnabled,
       onFileClick,
       onAgentClick,
       openLabel: t('files.previewDialog.buttons.open'),
       loadErrorText: t('files.previewDialog.errors.loadFailed'),
     }),
-    [filesDisabled, onFileClick, onAgentClick, t]
+    [filesDisabled, onFileClick, onAgentClick, resolvedAgentCardsEnabled, t]
   )
+  const displayContent = filesDisabled
+    ? sanitizeFilesDisabledPresentationText(content)
+    : content
 
   return (
     <MarkdownRendererContext.Provider value={contextValue}>
@@ -758,7 +544,7 @@ export function MarkdownRenderer({
           components={markdownComponents}
           urlTransform={safeUrlTransform}
         >
-          {content}
+          {displayContent}
         </ReactMarkdown>
       </div>
     </MarkdownRendererContext.Provider>
@@ -769,6 +555,7 @@ interface JsonRendererProps {
   data: any
   className?: string
   filesDisabled?: boolean
+  agentCardsEnabled?: boolean
   onFileClick?: (filePath: string, fileName: string) => void
   onAgentClick?: (agentId: string, agentName: string) => void
 }
@@ -777,6 +564,7 @@ export function JsonRenderer({
   data,
   className = '',
   filesDisabled = false,
+  agentCardsEnabled,
   onFileClick,
   onAgentClick,
 }: JsonRendererProps) {
@@ -791,6 +579,7 @@ export function JsonRenderer({
           data={parsed}
           className={className}
           filesDisabled={filesDisabled}
+          agentCardsEnabled={agentCardsEnabled}
           onFileClick={onFileClick}
           onAgentClick={onAgentClick}
         />
@@ -804,6 +593,7 @@ export function JsonRenderer({
             content={displayText}
             className={className}
             filesDisabled={filesDisabled}
+            agentCardsEnabled={agentCardsEnabled}
             onFileClick={onFileClick}
             onAgentClick={onAgentClick}
           />
@@ -840,6 +630,7 @@ export function JsonRenderer({
             <MarkdownRenderer
               content={displayData.output}
               filesDisabled={filesDisabled}
+              agentCardsEnabled={agentCardsEnabled}
               onFileClick={onFileClick}
               onAgentClick={onAgentClick}
             />

@@ -253,6 +253,14 @@ describe("TraceEventRenderer", () => {
         type: "application/pdf",
         text: "[open trace output](file:trace-output-id)",
       }],
+      message: "Open (/private/tenant/secret.txt) with path=/private/tenant/config.json and output/report.pdf",
+      summary: "Summary /private/tenant/summary.txt",
+      detail: "Detail /tmp/tenant/detail.txt",
+      note: "Note /workspace/tenant/note.txt",
+      stdout: "stdout: /sandbox/tenant/stdout.log",
+      stderr: "stderr: /data/tenant/stderr.log",
+      runtimePaths: "Runtime /app/src, /opt/xagent, /var/tmp, /srv/app, and /etc/passwd",
+      routes: "Keep /v1/openapi.json and /care/export.csv",
       taskUrl: "https://api.example/tasks/42",
     }
 
@@ -290,12 +298,28 @@ describe("TraceEventRenderer", () => {
 
     expect(container).toHaveTextContent("trace-output.pdf")
     expect(container).toHaveTextContent("open trace output")
+    expect(container).toHaveTextContent("Open (secret.txt) with path=config.json and report.pdf")
+    expect(container).toHaveTextContent("Summary summary.txt")
+    expect(container).toHaveTextContent("Detail detail.txt")
+    expect(container).toHaveTextContent("Note note.txt")
+    expect(container).toHaveTextContent("stdout: stdout.log")
+    expect(container).toHaveTextContent("stderr: stderr.log")
+    expect(container).toHaveTextContent("Runtime src, xagent, tmp, app, and passwd")
+    expect(container).toHaveTextContent("Keep /v1/openapi.json and /care/export.csv")
     expect(container).toHaveTextContent("https://api.example/tasks/42")
     expect(container.innerHTML).not.toContain("trace-output-id")
     expect(container.innerHTML).not.toContain("/private/trace-output.pdf")
     expect(container.innerHTML).not.toContain("https://files.example/preview/trace-output")
     expect(container.innerHTML).not.toContain("https://files.example/signed/trace-output")
     expect(container.innerHTML).not.toContain("https://files.example/generic-trace-output-url")
+    expect(container.innerHTML).not.toContain("/private/tenant/secret.txt")
+    expect(container.innerHTML).not.toContain("/private/tenant/config.json")
+    expect(container.innerHTML).not.toContain("output/report.pdf")
+    expect(container.innerHTML).not.toContain("/app/src")
+    expect(container.innerHTML).not.toContain("/opt/xagent")
+    expect(container.innerHTML).not.toContain("/var/tmp")
+    expect(container.innerHTML).not.toContain("/srv/app")
+    expect(container.innerHTML).not.toContain("/etc/passwd")
 
     const copyButtons = screen.getAllByTitle("traceEventRenderer.copy")
     fireEvent.click(copyButtons[copyButtons.length - 1])
@@ -306,12 +330,28 @@ describe("TraceEventRenderer", () => {
     expect(copied).not.toContain("https://files.example/preview/trace-output")
     expect(copied).not.toContain("https://files.example/signed/trace-output")
     expect(copied).not.toContain("https://files.example/generic-trace-output-url")
+    expect(copied).not.toContain("/private/tenant/secret.txt")
+    expect(copied).not.toContain("/private/tenant/config.json")
+    expect(copied).not.toContain("output/report.pdf")
+    expect(copied).not.toContain("/app/src")
+    expect(copied).not.toContain("/opt/xagent")
+    expect(copied).not.toContain("/var/tmp")
+    expect(copied).not.toContain("/srv/app")
+    expect(copied).not.toContain("/etc/passwd")
     expect(JSON.parse(copied)).toEqual({
       artifacts: [{
         fileName: "trace-output.pdf",
         type: "application/pdf",
         text: "open trace output",
       }],
+      message: "Open (secret.txt) with path=config.json and report.pdf",
+      summary: "Summary summary.txt",
+      detail: "Detail detail.txt",
+      note: "Note note.txt",
+      stdout: "stdout: stdout.log",
+      stderr: "stderr: stderr.log",
+      runtimePaths: "Runtime src, xagent, tmp, app, and passwd",
+      routes: "Keep /v1/openapi.json and /care/export.csv",
       taskUrl: "https://api.example/tasks/42",
     })
   })
@@ -544,6 +584,31 @@ describe("TraceEventRenderer", () => {
     expect(container.innerHTML).not.toContain("/private/python/report.py")
     expect(container.innerHTML).not.toContain("/private/files/report.txt")
     expect(container.innerHTML).not.toContain("/private/files/alternate.txt")
+  })
+
+  it("projects whole specialized tool actions before rendering code, commands, queries, and file content", () => {
+    appContextMock.filesDisabled = true
+    const { container } = render(
+      <TraceEventRenderer
+        events={[
+          { event_id: "python-step", event_type: "react_task_start", step_id: "python", timestamp: 1, data: { step_name: "Python", description: "Read /private/shared/report.txt" } },
+          { event_id: "python-tool", event_type: "tool_execution_start", step_id: "python", timestamp: 2, data: { tool_name: "python_executor", tool_args: { file_path: "/private/shared/report.txt", filename: "report.txt", code: "open('/private/shared/report.txt')" } } },
+          { event_id: "bash-step", event_type: "react_task_start", step_id: "bash", timestamp: 3, data: { step_name: "Bash", description: "Bash" } },
+          { event_id: "bash-tool", event_type: "tool_execution_start", step_id: "bash", timestamp: 4, data: { tool_name: "bash", tool_args: { output_dir: "/private/shared", filename: "report.txt", command: "cat /private/shared/report.txt" } } },
+          { event_id: "search-step", event_type: "react_task_start", step_id: "search", timestamp: 5, data: { step_name: "Search", description: "Search" } },
+          { event_id: "search-tool", event_type: "tool_execution_start", step_id: "search", timestamp: 6, data: { tool_name: "web_search", tool_args: { source_path: "/private/shared", filename: "report.txt", query: "find /private/shared/report.txt" } } },
+          { event_id: "file-step", event_type: "react_task_start", step_id: "file", timestamp: 7, data: { step_name: "File", description: "File" } },
+          { event_id: "file-tool", event_type: "tool_execution_start", step_id: "file", timestamp: 8, data: { tool_name: "file_writer", tool_args: { file_path: "/private/shared/report.txt", filename: "report.txt", content: "write /private/shared/report.txt" } } },
+        ]}
+      />,
+    )
+
+    for (const button of screen.getAllByRole("button", { name: /traceEventRenderer.executeTool/ })) {
+      fireEvent.click(button)
+    }
+
+    expect(container.innerHTML).not.toContain("/private/shared")
+    expect(container).toHaveTextContent("report.txt")
   })
 
   it("uses the shared safe representation for reasoning and failure trace DOM", () => {

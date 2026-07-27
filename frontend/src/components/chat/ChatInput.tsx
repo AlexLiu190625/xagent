@@ -8,6 +8,7 @@ import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ConfigDialog } from "@/components/config-dialog";
 import { apiRequest, getUploadErrorMessage, isJsonRecord, parseApiResponse, UPLOAD_ERROR_MESSAGES } from "@/lib/api-wrapper";
+import { sanitizeFilesDisabledPresentationText } from "@/lib/files-disabled-presentation";
 import { isPausableTaskStatus, isStoppedTaskStatus, normalizeTaskStatus, type TaskStatus } from "@/lib/task-status";
 import { useFileMention, FileItem } from "@/hooks/use-file-mention";
 import { FileMentionDropdown } from "./FileMentionDropdown";
@@ -777,7 +778,7 @@ export function ChatInput({
     } else if (document.activeElement !== editor) {
       if (filesDisabled) {
         let html = applyPromptHighlights(
-          escapeHtml(message),
+          escapeHtml(sanitizeFilesDisabledPresentationText(message)),
           promptHighlightTerms,
         );
         html = html.replace(/\n/g, "<br>");
@@ -816,7 +817,7 @@ export function ChatInput({
         className={cn("relative", selectedAgents.length > 0 && "pt-9")}
         ref={containerRef}
       >
-        {!filesDisabled && (
+        {fileMention.fileMentionsEnabled && (
           <FileMentionDropdown
             show={fileMention.showFilePicker}
             isLoading={fileMention.isLoadingFiles}

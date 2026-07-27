@@ -1,151 +1,301 @@
-import { beforeEach, describe, expect, it, vi } from "vitest"
-
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
-  AUTH_CACHE_KEY,
-  clearAuthTokenPayload,
-  clearStoredAuth,
-  LEGACY_AUTH_TOKEN_KEY,
-  LEGACY_AUTH_USER_KEY,
-  readAuthCache,
-  storeAuthTokenPayload,
-  syncLegacyAuthStorage,
-  writeAuthCache,
+  AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
+  advanceAuthSession, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession, createAuthSession,
+  inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, refreshAuthSession, updateAuthSessionUser, type AuthTokenPayload,
+  takeOidcAuthLoginIntent,
 } from "@/lib/auth-cache"
 
 const user = { id: "1", username: "alice", email: null, is_admin: false }
+function installLock(before: () => void | Promise<void> = () => {}) {
+  Object.defineProperty(navigator, "locks", { configurable: true, value: { request: vi.fn(async (_: string, action: () => Promise<unknown>) => { await before(); return action() }) } })
+}
+async function created(payload: AuthTokenPayload = { user, access_token: "access", refresh_token: "refresh" }) {
+  const claim = await claimAuthLoginIntent()
+  expect(claim.status).toBe("claimed")
+  if (claim.status !== "claimed") throw new Error("expected login intent")
+  const result = await createAuthSession(payload, claim.intent)
+  expect(result.status).toBe("created")
+  if (result.status !== "created") throw new Error("expected creation")
+  return result.projection.snapshot
+}
+function current() {
+  const inspection = inspectAuthSession()
+  expect(inspection.status).toBe("valid")
+  if (inspection.status !== "valid") throw new Error("expected session")
+  return inspection.projection
+}
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise })
+  return { promise, resolve }
+}
 
-describe("auth cache helpers", () => {
-  beforeEach(() => {
-    localStorage.clear()
-    vi.restoreAllMocks()
-    vi.useRealTimers()
+describe("auth cache lineage", () => {
+  beforeEach(() => { localStorage.clear(); vi.restoreAllMocks(); installLock() })
+  afterEach(() => vi.unstubAllGlobals())
+  it.each([
+    undefined,
+    {},
+    {
+      getItem: () => { throw new Error("storage blocked") },
+      setItem: () => { throw new Error("storage blocked") },
+      removeItem: () => { throw new Error("storage blocked") },
+    },
+  ])("treats unavailable or malformed browser storage as absent and fails mutations safely", async storage => {
+    vi.stubGlobal("localStorage", storage)
+    expect(inspectAuthSession()).toEqual({ status: "absent", projection: null })
+    await expect(migrateLegacyAuthSession()).resolves.toEqual({ status: "unavailable" })
+    expect(["superseded", "unavailable"]).toContain((await createAuthSession({ user, access_token: "access" })).status)
+    await expect(clearStoredAuth()).resolves.toEqual({ status: "unavailable" })
   })
-
-  it("stores the same token payload shape used by password login", () => {
-    const dispatch = vi.spyOn(window, "dispatchEvent")
-
-    storeAuthTokenPayload({
-      user: { id: 42, username: "person@example.com", is_admin: false },
-      access_token: "access-token",
-      refresh_token: "refresh-token",
-      expires_in: 120,
-      refresh_expires_in: 240,
-    })
-
-    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBe("access-token")
-    expect(JSON.parse(localStorage.getItem(LEGACY_AUTH_USER_KEY) || "{}")).toEqual({
-      id: "42",
-      username: "person@example.com",
-      is_admin: false,
-    })
-
-    const cache = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
-    expect(cache.user.username).toBe("person@example.com")
-    expect(cache.token).toBe("access-token")
-    expect(cache.refreshToken).toBe("refresh-token")
-    expect(dispatch).toHaveBeenCalled()
+  it("does not create a bearer session without the login intent that authorized it", async () => {
+    expect(await createAuthSession({ user, access_token: "late-access" })).toEqual({ status: "superseded" })
+    expect(inspectAuthSession().status).toBe("absent")
   })
+  it("consumes a claimed intent so its response cannot be committed twice", async () => {
+    const claim = await claimAuthLoginIntent()
+    expect(claim.status).toBe("claimed")
+    if (claim.status !== "claimed") throw new Error("expected login intent")
+    await expect(createAuthSession({ user, access_token: "first-access" }, claim.intent)).resolves.toMatchObject({ status: "created" })
+    await expect(createAuthSession({ user, access_token: "replayed-access" }, claim.intent)).resolves.toEqual({ status: "superseded" })
+    expect(current().snapshot.accessToken).toBe("first-access")
+  })
+  it("returns the exact OIDC intent claimed before a same-tab redirect", async () => {
+    const claim = await claimOidcAuthLoginIntent()
+    expect(claim.status).toBe("claimed")
+    if (claim.status !== "claimed") throw new Error("expected OIDC intent")
+    expect(takeOidcAuthLoginIntent()).toEqual(claim.intent)
+    expect(takeOidcAuthLoginIntent()).toBeNull()
+  })
+  it("rejects a pending password response after explicit logout supersedes its intent", async () => {
+    const claim = await claimAuthLoginIntent()
+    expect(claim.status).toBe("claimed")
+    if (claim.status !== "claimed") throw new Error("expected login intent")
+    await expect(clearStoredAuth()).resolves.toEqual({ status: "cleared" })
 
-  it("clears legacy and current auth cache keys", () => {
-    localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "access-token")
-    localStorage.setItem(LEGACY_AUTH_USER_KEY, "{}")
-    localStorage.setItem(AUTH_CACHE_KEY, "{}")
+    expect(await createAuthSession({ user, access_token: "late-access" }, claim.intent)).toEqual({ status: "superseded" })
+    expect(inspectAuthSession().status).toBe("absent")
+  })
+  it("keeps the newer password session when an older login response arrives later", async () => {
+    const older = await claimAuthLoginIntent()
+    expect(older.status).toBe("claimed")
+    if (older.status !== "claimed") throw new Error("expected older login intent")
+    const newer = await claimAuthLoginIntent()
+    expect(newer.status).toBe("claimed")
+    if (newer.status !== "claimed") throw new Error("expected newer login intent")
 
-    clearAuthTokenPayload()
+    await expect(createAuthSession({ user, access_token: "new-access" }, newer.intent)).resolves.toMatchObject({ status: "created" })
+    await expect(createAuthSession({ user, access_token: "old-access" }, older.intent)).resolves.toEqual({ status: "superseded" })
+    expect(current().snapshot.accessToken).toBe("new-access")
+  })
+  it("validates a cross-tab replacement intent from storage inside the commit lock", async () => {
+    const claim = await claimAuthLoginIntent()
+    expect(claim.status).toBe("claimed")
+    if (claim.status !== "claimed") throw new Error("expected login intent")
+    localStorage.setItem(AUTH_LOGIN_INTENT_KEY, JSON.stringify({ schemaVersion: 1, id: "claimed-in-another-tab" }))
 
+    expect(await createAuthSession({ user, access_token: "stale-access" }, claim.intent)).toEqual({ status: "superseded" })
+    expect(inspectAuthSession().status).toBe("absent")
+  })
+  it("rejects an OIDC response after a later password login supersedes its originating intent", async () => {
+    const oidc = await claimAuthLoginIntent()
+    expect(oidc.status).toBe("claimed")
+    if (oidc.status !== "claimed") throw new Error("expected OIDC intent")
+    const password = await claimAuthLoginIntent()
+    expect(password.status).toBe("claimed")
+    if (password.status !== "claimed") throw new Error("expected password intent")
+
+    await expect(createAuthSession({ user, access_token: "password-access" }, password.intent)).resolves.toMatchObject({ status: "created" })
+    await expect(createAuthSession({ user, access_token: "oidc-access" }, oidc.intent)).resolves.toEqual({ status: "superseded" })
+    expect(current().snapshot.accessToken).toBe("password-access")
+  })
+  it("creates a distinct lineage for the same user", async () => {
+    const first = await created({ user, access_token: "old", refresh_token: "old-refresh" })
+    const replacement = await created({ user, access_token: "new", refresh_token: "new-refresh" })
+    expect(replacement.sessionId).not.toBe(first.sessionId)
+    expect(compareAuthSession(first).status).toBe("replaced")
+  })
+  it("keeps expired or corrupt inspection pure", () => {
+    const now = Date.now()
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({ schemaVersion: 2, sessionId: "x", credentialRevision: 0, profileRevision: 0, user, token: "a", refreshToken: "r", timestamp: now - 130 * 60_000, refreshExpiresAt: now - 1 }))
+    const before = localStorage.getItem(AUTH_CACHE_KEY)
+    expect(inspectAuthSession(now).status).toBe("expired")
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
+  })
+  it("rejects unsafe persisted absolute deadlines", () => {
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+      schemaVersion: 2, sessionId: "x", credentialRevision: 0, profileRevision: 0,
+      user, token: "a", refreshToken: "r", timestamp: Date.now(), expiresAt: Number.MAX_VALUE,
+    }))
+    expect(inspectAuthSession().status).toBe("invalid")
+  })
+  it("migrates legacy data exactly once under the coordinator", async () => {
+    localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "legacy"); localStorage.setItem(LEGACY_AUTH_USER_KEY, JSON.stringify(user))
+    const first = await migrateLegacyAuthSession(); const second = await migrateLegacyAuthSession()
+    expect(first).toMatchObject({ status: "migrated", projection: { snapshot: { accessToken: "legacy" } } })
+    expect(second.status).toBe("advanced")
+    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBeNull()
+  })
+  it("upgrades a usable v1 canonical cache without losing its opaque credentials or expiry", async () => {
+    const now = Date.now()
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({
+      user, token: "opaque access ", refreshToken: "opaque refresh ", timestamp: now - 50,
+      expiresAt: now + 60_000, refreshExpiresAt: now + 120_000,
+    }))
+    localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "shadow-token")
+    localStorage.setItem(LEGACY_AUTH_USER_KEY, JSON.stringify({ ...user, username: "shadow" }))
+
+    const migrated = await migrateLegacyAuthSession()
+
+    expect(migrated).toMatchObject({ status: "migrated", projection: { cache: {
+      schemaVersion: 2, credentialRevision: 0, profileRevision: 0,
+      token: "opaque access ", refreshToken: "opaque refresh ", timestamp: now - 50,
+      expiresAt: now + 60_000, refreshExpiresAt: now + 120_000,
+    } } })
+    expect(migrated.status === "migrated" && migrated.projection.snapshot.sessionId).toBeTruthy()
     expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBeNull()
     expect(localStorage.getItem(LEGACY_AUTH_USER_KEY)).toBeNull()
-    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
   })
-
-  it("keeps an old cache when the refresh token is still valid", () => {
-    const now = Date.now()
-    localStorage.setItem(
-      AUTH_CACHE_KEY,
-      JSON.stringify({
-        user,
-        token: "expired-access",
-        refreshToken: "valid-refresh",
-        timestamp: now - 130 * 60 * 1000,
-        expiresAt: now - 10 * 1000,
-        refreshExpiresAt: now + 6 * 24 * 60 * 60 * 1000,
-      })
-    )
-
-    const cache = readAuthCache(now)
-
-    expect(cache?.token).toBe("expired-access")
-    expect(cache?.refreshToken).toBe("valid-refresh")
+  it("does not let a queued v1 migration overwrite a concurrent login", async () => {
+    let tail: Promise<void> = Promise.resolve()
+    Object.defineProperty(navigator, "locks", { configurable: true, value: { request: vi.fn((_name: string, action: () => Promise<unknown>) => {
+      const next = tail.then(action)
+      tail = next.then(() => undefined, () => undefined)
+      return next
+    }) } })
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify({ user, token: "v1", refreshToken: "v1-refresh", timestamp: Date.now() }))
+    const migration = migrateLegacyAuthSession()
+    const login = created({ user, access_token: "new-login", refresh_token: "new-refresh" })
+    await expect(migration).resolves.toMatchObject({ status: "migrated" })
+    await expect(login).resolves.toMatchObject({ accessToken: "new-login" })
+    expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { cache: { token: "new-login", refreshToken: "new-refresh" } } })
   })
-
-  it("removes the cache after the refresh token expires", () => {
-    const now = Date.now()
-    localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "expired-access")
-    localStorage.setItem(LEGACY_AUTH_USER_KEY, JSON.stringify(user))
-    localStorage.setItem(
-      AUTH_CACHE_KEY,
-      JSON.stringify({
-        user,
-        token: "expired-access",
-        refreshToken: "expired-refresh",
-        timestamp: now - 130 * 60 * 1000,
-        expiresAt: now - 10 * 1000,
-        refreshExpiresAt: now - 10 * 1000,
-      })
-    )
-
-    expect(readAuthCache(now)).toBeNull()
-    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
-    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBeNull()
-    expect(localStorage.getItem(LEGACY_AUTH_USER_KEY)).toBeNull()
+  it("does not resurrect legacy data when canonical storage is invalid", async () => {
+    localStorage.setItem(AUTH_CACHE_KEY, "broken"); localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "legacy"); localStorage.setItem(LEGACY_AUTH_USER_KEY, JSON.stringify(user))
+    expect((await migrateLegacyAuthSession()).status).toBe("invalid")
+    expect(inspectAuthSession().status).toBe("invalid")
   })
-
-  it("expires legacy caches that do not have refresh tokens", () => {
-    const now = Date.now()
-    localStorage.setItem(
-      AUTH_CACHE_KEY,
-      JSON.stringify({
-        user,
-        token: "old-access",
-        refreshToken: null,
-        timestamp: now - 130 * 60 * 1000,
-      })
-    )
-
-    expect(readAuthCache(now)).toBeNull()
+  it("preserves a profile update when credentials advance", async () => {
+    const captured = await created({ user, access_token: "old", refresh_token: "refresh" })
+    await updateAuthSessionUser(captured, { ...user, email: "profile@example.com" })
+    await advanceAuthSession(captured, { access_token: "new", refresh_token: "new-refresh" })
+    expect(current().cache).toMatchObject({ token: "new", user: { email: "profile@example.com" }, credentialRevision: 1, profileRevision: 1 })
   })
-
-  it("removes corrupted auth cache while preserving legacy fallback data", () => {
-    localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "legacy-access")
-    localStorage.setItem(LEGACY_AUTH_USER_KEY, JSON.stringify(user))
-    localStorage.setItem(AUTH_CACHE_KEY, "{not-json")
-
-    expect(readAuthCache()).toBeNull()
-    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
-    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBe("legacy-access")
-    expect(JSON.parse(localStorage.getItem(LEGACY_AUTH_USER_KEY) || "{}")).toEqual(user)
+  it("preserves credential advance when profile updates afterwards", async () => {
+    const captured = await created({ user, access_token: "old", refresh_token: "refresh" })
+    await advanceAuthSession(captured, { access_token: "new", refresh_token: "new-refresh" })
+    await updateAuthSessionUser(captured, { ...user, email: "profile@example.com" })
+    expect(current().cache).toMatchObject({ token: "new", user: { email: "profile@example.com" }, credentialRevision: 1, profileRevision: 1 })
   })
-
-  it("can update only the legacy access token during refresh", () => {
-    localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "old-access")
-    localStorage.setItem(LEGACY_AUTH_USER_KEY, JSON.stringify(user))
-
-    syncLegacyAuthStorage(undefined, "new-access")
-
-    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBe("new-access")
-    expect(JSON.parse(localStorage.getItem(LEGACY_AUTH_USER_KEY) || "{}")).toEqual(user)
+  it("rejects profile identity changes while accepting numeric zero and nullable metadata", async () => {
+    const zero = await created({ user: { id: 0, username: "zero", email: null, is_admin: false }, access_token: "token" })
+    expect(zero.userId).toBe("0")
+    expect((await updateAuthSessionUser(zero, { id: "other", username: "other" })).status).toBe("invalid")
+    expect((await updateAuthSessionUser(zero, { id: 0, username: "zero-2", email: null, is_admin: true })).status).toBe("updated")
   })
+  it("fails conditional operations and login commits closed without locks", async () => {
+    const captured = await created()
+    const claim = await claimAuthLoginIntent()
+    expect(claim.status).toBe("claimed")
+    if (claim.status !== "claimed") throw new Error("expected login intent")
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    expect((await advanceAuthSession(captured, { access_token: "new" })).status).toBe("unavailable")
+    expect((await createAuthSession({ user, access_token: "late" }, claim.intent)).status).toBe("unavailable")
+    expect(current().snapshot.accessToken).toBe("access")
+  })
+  it("does not let old same-user lineage clear a replacement", async () => {
+    const old = await created({ user, access_token: "old", refresh_token: "r" })
+    const replacement = await created({ user, access_token: "new", refresh_token: "r2" })
+    expect(await clearAuthSessionIfCurrent(old)).toBe(false)
+    expect(readAuthSessionSnapshot().sessionId).toBe(replacement.sessionId)
+  })
+  it("fails closed on lock rejection", async () => {
+    Object.defineProperty(navigator, "locks", { configurable: true, value: { request: vi.fn(async () => { throw new Error("lock failed") }) } })
+    expect(await claimAuthLoginIntent()).toEqual({ status: "unavailable" })
+  })
+  it("rejects malformed login and refresh payloads without writing", async () => {
+    const invalid = await createAuthSession({ user: { id: "", username: "alice" }, access_token: "access" })
+    expect(invalid.status).toBe("invalid")
+    expect(inspectAuthSession().status).toBe("absent")
+    const malformedExpiry = await createAuthSession({ user, access_token: "access", expires_in: 0 })
+    expect(malformedExpiry.status).toBe("invalid")
+  })
+  it("rejects blank or unsafe credential expiry values without changing opaque tokens", async () => {
+    expect((await createAuthSession({ user, access_token: "   " })).status).toBe("invalid")
+    expect((await createAuthSession({ user, access_token: "opaque token ", expires_in: Number.MAX_VALUE })).status).toBe("invalid")
+    const opaqueCreated = await created({ user, access_token: "opaque token ", expires_in: 60 })
+    expect(opaqueCreated).toMatchObject({ accessToken: "opaque token " })
+  })
+  it("marks same credential revision with changed token as invalid", async () => {
+    const captured = await created()
+    const raw = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
+    raw.token = "tampered"
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(raw))
+    expect(compareAuthSession(captured).status).toBe("invalid")
+  })
+  it("rejects revision regressions and same-revision profile metadata tampering", async () => {
+    const captured = await created()
+    const advanced = await advanceAuthSession(captured, { access_token: "new", refresh_token: "new-refresh" })
+    if (advanced.status !== "updated") throw new Error("expected credential advance")
+    const regressed = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
+    regressed.credentialRevision = 0
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(regressed))
+    expect(compareAuthSession(advanced.projection.snapshot).status).toBe("invalid")
 
-  it("keeps legacy token storage in sync when writing the cache", () => {
-    writeAuthCache(user, "access", "refresh", 120, 7 * 24 * 60 * 60)
+    const fresh = await created()
+    const tampered = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
+    tampered.user.email = "tampered@example.com"
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(tampered))
+    expect(compareAuthSession(fresh).status).toBe("invalid")
+  })
+  it("rejects credential and profile advancement at the maximum revision without writing", async () => {
+    const captured = await created()
+    const raw = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
+    raw.credentialRevision = Number.MAX_SAFE_INTEGER
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(raw))
+    const credentialSnapshot = { ...captured, credentialRevision: Number.MAX_SAFE_INTEGER }
+    const beforeCredential = localStorage.getItem(AUTH_CACHE_KEY)
+    expect((await advanceAuthSession(credentialSnapshot, { access_token: "new", refresh_token: "new-refresh" })).status).toBe("invalid")
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(beforeCredential)
 
-    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBe("access")
-    expect(JSON.parse(localStorage.getItem(LEGACY_AUTH_USER_KEY) || "{}")).toEqual(user)
-
-    clearStoredAuth()
-
-    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
-    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBeNull()
-    expect(localStorage.getItem(LEGACY_AUTH_USER_KEY)).toBeNull()
+    raw.credentialRevision = 0
+    raw.profileRevision = Number.MAX_SAFE_INTEGER
+    localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(raw))
+    const profileSnapshot = { ...captured, profileRevision: Number.MAX_SAFE_INTEGER }
+    const beforeProfile = localStorage.getItem(AUTH_CACHE_KEY)
+    expect((await updateAuthSessionUser(profileSnapshot, { ...user, email: "new@example.com" })).status).toBe("invalid")
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(beforeProfile)
+  })
+  it("does not clear storage when the logout lock is rejected", async () => {
+    await created()
+    Object.defineProperty(navigator, "locks", { configurable: true, value: { request: vi.fn(async () => { throw new Error("lock failed") }) } })
+    await expect(clearStoredAuth()).resolves.toEqual({ status: "unavailable" })
+    expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { snapshot: { accessToken: "access" } } })
+  })
+  it("allows explicit logout without Web Locks", async () => {
+    await created()
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    await expect(clearStoredAuth()).resolves.toEqual({ status: "cleared" })
+    expect(inspectAuthSession().status).toBe("absent")
+  })
+  it("serializes explicit logout behind an in-flight refresh without resurrecting its session", async () => {
+    let tail: Promise<void> = Promise.resolve()
+    Object.defineProperty(navigator, "locks", { configurable: true, value: {
+      request: vi.fn((_name: string, action: () => Promise<unknown>) => {
+        const next = tail.then(action)
+        tail = next.then(() => undefined, () => undefined)
+        return next
+      }),
+    } })
+    const captured = await created()
+    const response = deferred<{ ok: boolean; rejected: boolean; payload: { access_token: string; refresh_token: string } }>()
+    const refresh = refreshAuthSession(captured, async () => response.promise)
+    await Promise.resolve()
+    const logout = clearStoredAuth()
+    response.resolve({ ok: true, rejected: false, payload: { access_token: "late", refresh_token: "late-refresh" } })
+    await expect(refresh).resolves.toMatchObject({ status: "updated" })
+    await expect(logout).resolves.toEqual({ status: "cleared" })
+    expect(inspectAuthSession().status).toBe("absent")
   })
 })

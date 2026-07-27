@@ -58,6 +58,7 @@ import {
   projectFilesDisabledValue,
   sanitizeFilesDisabledText,
 } from '../markdown-renderer'
+import { AgentCardPresentationCapability } from '@/contexts/presentation-capabilities'
 
 describe('MarkdownRenderer', () => {
   beforeEach(() => {
@@ -280,6 +281,211 @@ describe('MarkdownRenderer', () => {
     fireEvent.click(screen.getByText('report.docx'))
     fireEvent.click(screen.getByText('generated image'))
     expect(handleFileClick).not.toHaveBeenCalled()
+  })
+
+  it('keeps managed app URLs inert and avoids agent-card REST calls when their capabilities are disabled', () => {
+    const { container } = render(
+      <AgentCardPresentationCapability.Provider value={false}>
+        <MarkdownRenderer
+          filesDisabled
+          content={[
+            '[preview](/api/files/public/preview/secret-file)',
+            '![download](https://app.example/api/files/download/secret-file)',
+            '[encoded preview](/api/files/public/%70review/encoded-secret)',
+            '![encoded download](https://app.example/api/files/%64ownload/encoded-secret)',
+            '[encoded slash](/api/files/preview%2Fslash-secret)',
+            '![double encoded](https://app.example/api/files/%2570review/double-secret)',
+            '[encoded api](/%61pi/files/public/preview/api-secret)',
+            '![encoded files](https://app.example/api/%66iles/public/preview/files-secret)',
+            '[encoded boundary](/api/files%2Fdownload/boundary-secret)',
+            '![double encoded api](/%2561pi/files/public/preview/double-api-secret)',
+            '[encoded leading slash](/%2Fapi%2Ffiles%2Fpublic%2Fpreview%2Fslash-api-secret)',
+            '[malformed](/api/files/%E0%A4%A)',
+            '[local target](/private/tenant/local-secret.txt)',
+            '![relative target](workspace/tenant/relative-secret.png)',
+            '[Specialist](agent://42)',
+          ].join('\n\n')}
+        />
+      </AgentCardPresentationCapability.Provider>,
+    )
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+    expect(screen.getByText('Specialist')).not.toHaveAttribute('data-agent-id')
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(container.innerHTML).not.toContain('secret-file')
+    expect(container.innerHTML).not.toContain('encoded-secret')
+    expect(container.innerHTML).not.toContain('slash-secret')
+    expect(container.innerHTML).not.toContain('double-secret')
+    expect(container.innerHTML).not.toContain('api-secret')
+    expect(container.innerHTML).not.toContain('files-secret')
+    expect(container.innerHTML).not.toContain('boundary-secret')
+    expect(container.innerHTML).not.toContain('double-api-secret')
+    expect(container.innerHTML).not.toContain('slash-api-secret')
+    expect(container.innerHTML).not.toContain('local-secret')
+    expect(container.innerHTML).not.toContain('relative-secret')
+    expect(container.innerHTML).not.toContain('%E0%A4%A')
+  })
+
+  it('sanitizes Markdown labels and titles while preserving safe external targets', () => {
+    const { container } = render(
+      <MarkdownRenderer
+        filesDisabled
+        content={[
+          '[/private/labels/report.txt](https://example.com/report "/tmp/titles/report.txt")',
+          '![/workspace/images/chart.png](https://example.com/chart.png "/sandbox/titles/chart.png")',
+        ].join('\n\n')}
+      />,
+    )
+
+    expect(screen.getByRole('link', { name: 'report.txt' })).toHaveAttribute('href', 'https://example.com/report')
+    expect(screen.getByRole('link', { name: 'report.txt' })).toHaveAttribute('title', 'report.txt')
+    expect(screen.getByRole('img', { name: 'chart.png' })).toHaveAttribute('src', 'https://example.com/chart.png')
+    expect(screen.getByRole('img', { name: 'chart.png' })).toHaveAttribute('title', 'chart.png')
+    expect(container.innerHTML).not.toContain('/private/labels')
+    expect(container.innerHTML).not.toContain('/tmp/titles')
+    expect(container.innerHTML).not.toContain('/workspace/images')
+    expect(container.innerHTML).not.toContain('/sandbox/titles')
+  })
+
+  it('preserves free-text and Markdown business routes when files are disabled', () => {
+    render(
+      <MarkdownRenderer
+        filesDisabled
+        content={'Call /v1/shifts, /v1/openapi.json, /care/shift/42, or /care/export.csv.\n\n[Shift API](https://api.example/v1/shifts)'}
+      />,
+    )
+
+    expect(screen.getByText(/Call \/v1\/shifts, \/v1\/openapi\.json, \/care\/shift\/42, or \/care\/export\.csv/)).toBeInTheDocument()
+    expect(screen.getByRole('link', { name: 'Shift API' })).toHaveAttribute(
+      'href',
+      'https://api.example/v1/shifts',
+    )
+  })
+
+  it('projects files-disabled root Markdown before parsing and keeps ordinary slash text intact', () => {
+    const { container } = render(
+      <MarkdownRenderer
+        filesDisabled
+        content={'Assistant wrote /private/reports/secret.txt from /app/src, /opt/xagent, /var/tmp, /srv/app, and /etc/passwd; keep `and/or`.\n\n[managed](file:secret-id)'}
+      />,
+    )
+
+    expect(container).toHaveTextContent('Assistant wrote secret.txt from src, xagent, tmp, app, and passwd; keep and/or.')
+    expect(container.innerHTML).not.toContain('/private/reports/secret.txt')
+    expect(container.innerHTML).not.toContain('/app/src')
+    expect(container.innerHTML).not.toContain('/opt/xagent')
+    expect(container.innerHTML).not.toContain('/var/tmp')
+    expect(container.innerHTML).not.toContain('/srv/app')
+    expect(container.innerHTML).not.toContain('/etc/passwd')
+    expect(container.innerHTML).not.toContain('secret-id')
+  })
+
+  it('renders parser-valid file reference variants as inert labels without identifiers', () => {
+    const { container } = render(
+      <MarkdownRenderer
+        filesDisabled
+        content={[
+          '[reference label][artifact]',
+          '',
+          '[artifact]: file:reference-secret',
+          '',
+          '[nested **safe** label](file:nested-secret)',
+          '',
+          '[balanced](file:tenant(private)/balanced-secret)',
+          '',
+          'Bare file:bare(secret)/secret-id, file:bare-secret, and <file:autolink-secret>.',
+        ].join('\n')}
+      />,
+    )
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+    expect(container).toHaveTextContent('reference label')
+    expect(container).toHaveTextContent('nested safe label')
+    expect(container).toHaveTextContent('balanced')
+    expect(container).toHaveTextContent('Bare file, file, and file.')
+    expect(container.innerHTML).not.toContain('reference-secret')
+    expect(container.innerHTML).not.toContain('nested-secret')
+    expect(container.innerHTML).not.toContain('balanced-secret')
+    expect(container.innerHTML).not.toContain('bare-secret')
+    expect(container.innerHTML).not.toContain('secret-id')
+    expect(container.innerHTML).not.toContain('autolink-secret')
+  })
+
+  it('keeps entity-encoded text and percent-encoded local targets inside the same inert boundary', () => {
+    const { container } = render(
+      <MarkdownRenderer
+        filesDisabled
+        content={[
+          'Saved /private&#47;tenant&#47;entity-secret.txt and file&#58;entity-file-secret.',
+          '',
+          '[encoded root](/%70rivate/tenant/link-secret.txt)',
+          '',
+          '![encoded slash](/private%2Ftenant%2Fimage-secret.png)',
+          '',
+          '[malformed encoded root](/%70rivate/%E0%A4%A/malformed-secret.txt)',
+          '',
+          '![invalid encoded root](/%70rivate/%ZZ/invalid-secret.png)',
+        ].join('\n')}
+      />,
+    )
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+    expect(container).toHaveTextContent('Saved entity-secret.txt and file.')
+    expect(container).toHaveTextContent('encoded root')
+    expect(container).toHaveTextContent('encoded slash')
+    expect(container).toHaveTextContent('malformed encoded root')
+    expect(container).toHaveTextContent('invalid encoded root')
+    expect(container.innerHTML).not.toContain('/private')
+    expect(container.innerHTML).not.toContain('entity-file-secret')
+    expect(container.innerHTML).not.toContain('link-secret')
+    expect(container.innerHTML).not.toContain('image-secret')
+    expect(container.innerHTML).not.toContain('malformed-secret')
+    expect(container.innerHTML).not.toContain('invalid-secret')
+  })
+
+  it('keeps entity-decoded code delimiters from activating links or images', () => {
+    const { container } = render(
+      <MarkdownRenderer
+        filesDisabled
+        content={[
+          '`/private/inline-secret.txt &#96; ![track](https://evil.example/pixel)`',
+          '',
+          '```text',
+          '/private/fenced-secret.txt &#96;&#96;&#96;',
+          '![track](https://evil.example/fenced-pixel)',
+          '```',
+        ].join('\n')}
+      />,
+    )
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+    expect(container.innerHTML).not.toContain('/private/')
+    expect(container).toHaveTextContent('inline-secret.txt')
+    expect(container).toHaveTextContent('fenced-secret.txt')
+  })
+
+  it('keeps custom trailing-root file targets inert in structured presentation', () => {
+    const { container } = render(
+      <JsonRenderer
+        filesDisabled
+        data={{
+          files: [{ file_name: 'report.pdf', output_dir: '/custom/output/' }],
+          message: [
+            '[open](/custom/output/nested/tenant-secret.pdf)',
+            '![image](/custom/output/nested/tenant-secret.png)',
+          ].join(' '),
+        }}
+      />,
+    )
+
+    expect(screen.queryByRole('link')).not.toBeInTheDocument()
+    expect(screen.queryByRole('img')).not.toBeInTheDocument()
+    expect(container).toHaveTextContent('open image')
+    expect(container.innerHTML).not.toContain('tenant-secret')
+    expect(container.innerHTML).not.toContain('/custom/output')
   })
 
   it('keeps nested JSON markdown file metadata inert when files are disabled', () => {

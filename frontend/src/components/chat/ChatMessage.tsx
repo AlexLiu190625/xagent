@@ -464,7 +464,12 @@ export function ChatMessage({
               )}
               {!isUser && interactions && interactions.length > 0 && (
                 <div className="mt-4 border-t pt-4">
-                  <ClarificationForm interactions={interactions} active={interactionsActive} onSend={onSendInteraction} />
+                  <ClarificationForm
+                    interactions={interactions}
+                    active={interactionsActive}
+                    filesDisabled={filesDisabled}
+                    onSend={onSendInteraction}
+                  />
                 </div>
               )}
             </div>

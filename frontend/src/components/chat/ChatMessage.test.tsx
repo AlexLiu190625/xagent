@@ -9,6 +9,7 @@ const appContextMock = vi.hoisted(() => ({
   filesDisabled: false,
   openFilePreview: vi.fn(),
 }))
+const clarificationFormMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/navigation", () => ({
   useRouter: () => ({ push: vi.fn() }),
@@ -47,12 +48,20 @@ vi.mock("./TraceEventRenderer", () => ({
   TraceEventRenderer: () => <div data-testid="trace-renderer" />,
 }))
 
+vi.mock("./clarification-form", () => ({
+  ClarificationForm: (props: unknown) => {
+    clarificationFormMock(props)
+    return null
+  },
+}))
+
 import { ChatMessage } from "./ChatMessage"
 
 describe("ChatMessage Session file capability", () => {
   beforeEach(() => {
     appContextMock.filesDisabled = false
     appContextMock.openFilePreview.mockReset()
+    clarificationFormMock.mockReset()
     apiRequestMock.mockReset()
     clipboardWriteTextMock.mockReset()
     Object.defineProperty(navigator, "clipboard", {
@@ -101,6 +110,100 @@ describe("ChatMessage Session file capability", () => {
     fireEvent.click(screen.getByText("assistant report.docx"))
     fireEvent.click(screen.getByText("assistant image"))
     expect(appContextMock.openFilePreview).not.toHaveBeenCalled()
+  })
+
+  it("passes the resolved file capability to clarification interactions", () => {
+    appContextMock.filesDisabled = true
+
+    render(
+      <ChatMessage
+        role="assistant"
+        content="Clarification required"
+        interactions={[{ type: "file_upload", field: "evidence", label: "Evidence" }]}
+      />,
+    )
+
+    expect(clarificationFormMock).toHaveBeenCalledWith(
+      expect.objectContaining({ filesDisabled: true }),
+    )
+  })
+
+  it("uses the same safe projection for normal assistant DOM and copied content", () => {
+    appContextMock.filesDisabled = true
+    const { container } = render(
+      <ChatMessage
+        role="assistant"
+        content="Saved /private/reports/secret.txt from /app/src, /opt/xagent, /var/tmp, /srv/app, and /etc/passwd; keep /v1/openapi.json and /care/export.csv."
+      />,
+    )
+
+    expect(container).toHaveTextContent(
+      "Saved secret.txt from src, xagent, tmp, app, and passwd; keep /v1/openapi.json and /care/export.csv.",
+    )
+    expect(container.innerHTML).not.toContain("/private/reports/secret.txt")
+    expect(container.innerHTML).not.toContain("/app/src")
+    expect(container.innerHTML).not.toContain("/opt/xagent")
+    expect(container.innerHTML).not.toContain("/var/tmp")
+    expect(container.innerHTML).not.toContain("/srv/app")
+    expect(container.innerHTML).not.toContain("/etc/passwd")
+    fireEvent.click(screen.getByTitle("common.copy"))
+    expect(clipboardWriteTextMock).toHaveBeenLastCalledWith(
+      "Saved secret.txt from src, xagent, tmp, app, and passwd; keep /v1/openapi.json and /care/export.csv.",
+    )
+  })
+
+  it("uses the parser-complete file projection for assistant DOM and clipboard", () => {
+    appContextMock.filesDisabled = true
+    const content = [
+      "[reference label][artifact]",
+      "",
+      "[artifact]: file:clipboard-reference-secret",
+      "",
+      "[balanced](file:tenant(private)/clipboard-balanced-secret)",
+      "",
+      "Bare file:clipboard-bare(secret)/clipboard-secret-id, file:clipboard-bare-secret, and <file:clipboard-autolink-secret>.",
+    ].join("\n")
+    const { container } = render(<ChatMessage role="assistant" content={content} />)
+
+    expect(screen.queryByRole("link")).not.toBeInTheDocument()
+    expect(container).toHaveTextContent("reference label")
+    expect(container).toHaveTextContent("balanced")
+    expect(container).toHaveTextContent("Bare file, file, and file.")
+    expect(container.innerHTML).not.toContain("clipboard-reference-secret")
+    expect(container.innerHTML).not.toContain("clipboard-balanced-secret")
+    expect(container.innerHTML).not.toContain("clipboard-bare-secret")
+    expect(container.innerHTML).not.toContain("clipboard-secret-id")
+    expect(container.innerHTML).not.toContain("clipboard-autolink-secret")
+
+    fireEvent.click(screen.getByTitle("common.copy"))
+    const copied = clipboardWriteTextMock.mock.calls.at(-1)?.[0]
+    expect(copied).toContain("reference label")
+    expect(copied).toContain("balanced")
+    expect(copied).toContain("Bare file, file, and file.")
+    expect(copied).not.toContain("clipboard-reference-secret")
+    expect(copied).not.toContain("clipboard-balanced-secret")
+    expect(copied).not.toContain("clipboard-bare-secret")
+    expect(copied).not.toContain("clipboard-secret-id")
+    expect(copied).not.toContain("clipboard-autolink-secret")
+  })
+
+  it("uses semantic Markdown text for entity-encoded DOM and clipboard projection", () => {
+    appContextMock.filesDisabled = true
+    const { container } = render(
+      <ChatMessage
+        role="assistant"
+        content="Saved /private&#47;tenant&#47;entity-secret.txt and file&#58;entity-file-secret."
+      />,
+    )
+
+    expect(container).toHaveTextContent("Saved entity-secret.txt and file.")
+    expect(container.innerHTML).not.toContain("/private")
+    expect(container.innerHTML).not.toContain("entity-file-secret")
+
+    fireEvent.click(screen.getByTitle("common.copy"))
+    expect(clipboardWriteTextMock).toHaveBeenLastCalledWith(
+      "Saved entity-secret.txt and file.",
+    )
   })
 
   it("renders user file-chip syntax as plain non-clickable text when files are disabled", () => {

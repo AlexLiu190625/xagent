@@ -1,5 +1,5 @@
 import React from "react"
-import { cleanup, fireEvent, render, screen } from "@testing-library/react"
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { AppProviderTransportConfig } from "@/contexts/app-context-chat"
 import type { WidgetSession } from "./use-widget-session"
@@ -11,7 +11,6 @@ const bridge = vi.hoisted(() => ({
     agent: null as WidgetSession["agent"] | null,
     terminalCode: null as string | null,
     isAbsoluteExpiryWarningVisible: false,
-    parentOrigin: null as string | null,
     requestReconnect: vi.fn(),
     handleConnectionClose: vi.fn(() => "handled" as const),
     handleConnectionFailure: vi.fn(),
@@ -37,6 +36,8 @@ const app = vi.hoisted(() => ({
   voiceInputEnabled: false,
   isConversationResetPending: false,
   isMessageDeliveryPending: false,
+  sessionConversationState: "unbound",
+  isSessionInteractionLocked: false,
 }))
 
 vi.mock("./use-widget-session", () => ({
@@ -73,6 +74,8 @@ vi.mock("@/contexts/app-context-chat", () => ({
     startNewConversation: app.startNewConversation,
     isConversationResetPending: app.isConversationResetPending,
     isMessageDeliveryPending: app.isMessageDeliveryPending,
+    sessionConversationState: app.sessionConversationState,
+    isSessionInteractionLocked: app.isSessionInteractionLocked,
   }),
 }))
 
@@ -83,12 +86,12 @@ vi.mock("@/components/chat/ChatStartScreen", () => ({
       message: string,
       files: File[],
       config?: Record<string, unknown>,
-    ) => void
+    ) => Promise<void>
     return (
       <button
         type="button"
         data-files-disabled={String(props.filesDisabled)}
-        onClick={() => onSend("hello", [], { mode: "balanced" })}
+        onClick={() => { void onSend("hello", [], { mode: "balanced" }).catch(() => undefined) }}
       >
         start:{String(props.title)}
       </button>
@@ -166,6 +169,8 @@ describe("SessionAgentChatPage", () => {
     app.isConnected = false
     app.isConversationResetPending = false
     app.isMessageDeliveryPending = false
+    app.sessionConversationState = "unbound"
+    app.isSessionInteractionLocked = false
     localStorage.clear()
     sessionStorage.clear()
     vi.stubGlobal("fetch", vi.fn())
@@ -188,10 +193,9 @@ describe("SessionAgentChatPage", () => {
       onConnectionFailure: bridge.value.handleConnectionFailure,
       allowTasklessChat: true,
       supportsConversationReset: true,
-      preserveConversationOnReconnect: true,
-      adoptTaskIdFromTaskInfo: true,
       history: "none",
       files: "disabled",
+      agentCards: "disabled",
       voice: "disabled",
       taskControls: "disabled",
     })
@@ -226,6 +230,42 @@ describe("SessionAgentChatPage", () => {
     expect(document.documentElement.innerHTML).not.toContain(SESSION_TOKEN)
     expect(storageSet).not.toHaveBeenCalled()
     expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it("shows a reload-required outcome and disables reset and composer actions", () => {
+    setBridge("active", activeSession())
+    app.isConnected = true
+    app.state.taskId = 91
+    app.sessionConversationState = "reload_required"
+    app.isSessionInteractionLocked = true
+
+    render(<SessionAgentChatPage />)
+
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
+    expect(screen.getByRole("button", {
+      name: "widgetSession.startNewConversation",
+    })).toBeDisabled()
+    expect(app.startProps).toBeNull()
+
+    app.state.taskId = null
+    render(<SessionAgentChatPage />)
+    expect(app.startProps?.isSending).toBe(true)
+  })
+
+  it("shows only the reload instruction when a reset rejection is followed by reload-required", async () => {
+    setBridge("active", activeSession())
+    app.isConnected = true
+    app.state.taskId = 92
+    app.startNewConversation.mockRejectedValueOnce(new Error("timeout"))
+    const { rerender } = render(<SessionAgentChatPage />)
+    fireEvent.click(screen.getByRole("button", { name: "widgetSession.startNewConversation" }))
+    await screen.findByText("widgetSession.resetFailed")
+
+    app.sessionConversationState = "reload_required"
+    app.isSessionInteractionLocked = true
+    rerender(<SessionAgentChatPage />)
+    expect(screen.getAllByRole("alert")).toHaveLength(1)
+    expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.reloadRequired")
   })
 
   it("renders allowlisted Agent metadata and a taskless, file-disabled start screen", () => {
@@ -302,6 +342,18 @@ describe("SessionAgentChatPage", () => {
     expect(screen.getByText("widgetSession.expiryWarning")).toBeInTheDocument()
   })
 
+  it("keeps the start-message promise contract and surfaces a delivery failure", async () => {
+    setBridge("active", activeSession())
+    app.sendMessage.mockRejectedValueOnce(new Error("delivery failed"))
+
+    render(<SessionAgentChatPage />)
+    fireEvent.click(screen.getByRole("button", { name: "start:Support Agent" }))
+
+    await waitFor(() => {
+      expect(screen.getByRole("alert")).toHaveTextContent("widgetSession.startMessageFailed")
+    })
+  })
+
   it("preserves validated Agent metadata and the conversation while refreshing", () => {
     setBridge("active", activeSession())
     app.state.taskId = 71
@@ -325,11 +377,14 @@ describe("SessionAgentChatPage", () => {
 
   it.each([
     ["session_expired", "widgetSession.expired.title", "widgetSession.expired.description"],
-    ["reconnect_invalid", "widgetSession.expired.title", "widgetSession.expired.description"],
-    ["identity_mismatch", "widgetSession.expired.title", "widgetSession.expired.description"],
+    ["grant_expired", "widgetSession.expired.title", "widgetSession.expired.description"],
+    ["grant_already_used", "widgetSession.expired.title", "widgetSession.expired.description"],
     ["ws_4408", "widgetSession.expired.title", "widgetSession.expired.description"],
+    ["reconnect_invalid", "widgetSession.unavailable.title", "widgetSession.unavailable.description"],
+    ["identity_mismatch", "widgetSession.unavailable.title", "widgetSession.unavailable.description"],
     ["ws_4403", "widgetSession.unavailable.title", "widgetSession.unavailable.description"],
     ["unexpected_error", "widgetSession.unavailable.title", "widgetSession.unavailable.description"],
+    ["unknown_catalog_failure", "widgetSession.unavailable.title", "widgetSession.unavailable.description"],
   ])(
     "maps terminal code %s to localized UI while keeping the provider fail closed",
     (terminalCode, title, description) => {
