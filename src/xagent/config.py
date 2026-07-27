@@ -114,6 +114,7 @@ GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT = "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT"
 GMAIL_PUBSUB_TRANSPORT = "XAGENT_GMAIL_PUBSUB_TRANSPORT"
 GMAIL_REGISTRATION_TIMEOUT_SECONDS = "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
 PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
+TRIGGER_CALLBACK_BASE_URL = "XAGENT_TRIGGER_CALLBACK_BASE_URL"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
@@ -795,10 +796,30 @@ def get_public_api_base_url() -> str | None:
 
     Deliberately separate from XAGENT_APP_BASE_URL (the frontend URL used in
     e.g. password-reset emails): externally advertised API and provider callback
-    URLs should normally use the public backend origin.
+    URLs should normally use the public backend origin. Inbound trigger
+    callbacks can override this via XAGENT_TRIGGER_CALLBACK_BASE_URL
+    (see get_trigger_callback_base_url).
     """
     value = (os.getenv(PUBLIC_API_BASE_URL) or "").strip()
     return value.rstrip("/") or None
+
+
+def get_trigger_callback_base_url() -> str | None:
+    """Base URL for inbound trigger callbacks (Gmail Pub/Sub push, webhooks).
+
+    Priority:
+        1. XAGENT_TRIGGER_CALLBACK_BASE_URL environment variable
+        2. get_public_api_base_url() (backward compatible fallback)
+
+    Only used when building inbound trigger callback endpoints; MCP and A2A
+    keep using XAGENT_PUBLIC_API_BASE_URL. Set this when server-to-server
+    callbacks must reach a different host than the advertised public API
+    origin (e.g. a dedicated ingress).
+    """
+    cleaned = (os.getenv(TRIGGER_CALLBACK_BASE_URL) or "").strip().rstrip("/")
+    if cleaned:
+        return cleaned
+    return get_public_api_base_url()
 
 
 def get_gmail_watch_enabled() -> bool:

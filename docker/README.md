@@ -45,9 +45,14 @@ POSTGRES_PASSWORD="xagent_password"
 Optional Gmail incoming-email trigger provisioning:
 
 ```bash
-# Backend public API base URL used for Pub/Sub push endpoints and OIDC audience.
-# Do not use the frontend APP_BASE_URL here.
+# Backend public API base URL. Pub/Sub push endpoints and OIDC audience use
+# XAGENT_TRIGGER_CALLBACK_BASE_URL when set, and fall back to this value
+# otherwise. Do not use the frontend APP_BASE_URL here.
 XAGENT_PUBLIC_API_BASE_URL="https://api.example.com"
+
+# Optional: dedicated host for inbound trigger callbacks (Gmail Pub/Sub push).
+# Falls back to XAGENT_PUBLIC_API_BASE_URL when unset. MCP and A2A are unaffected.
+XAGENT_TRIGGER_CALLBACK_BASE_URL="https://callbacks.example.com"
 
 # Google Cloud project and deterministic per-mailbox resource prefixes.
 XAGENT_GMAIL_PUBSUB_PROJECT_ID="your-gcp-project"
@@ -62,8 +67,10 @@ GOOGLE_APPLICATION_CREDENTIALS="/run/secrets/google-application-credentials.json
 ```
 
 The backend uses Google Application Default Credentials. Grant the backend
-service account permission to create/delete Pub/Sub topics and subscriptions
-in `XAGENT_GMAIL_PUBSUB_PROJECT_ID`, and allow
+service account `roles/pubsub.editor` on `XAGENT_GMAIL_PUBSUB_PROJECT_ID`
+(create/delete topics and subscriptions, and update subscription push config);
+provisioning also reads subscription config to skip redundant updates, but
+degrades to re-applying it when that read is unavailable. Allow
 `gmail-api-push@system.gserviceaccount.com` to publish to each per-mailbox
 topic. Xagent grants the Gmail publisher IAM binding during provisioning when
 the credentials have permission to update topic IAM policy.

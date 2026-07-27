@@ -75,6 +75,7 @@ from xagent.config import (
     TASK_LEASE_RECOVERY_BATCH_SIZE,
     TASK_LEASE_RECOVERY_INTERVAL_SECONDS,
     TASK_LEASE_TTL_SECONDS,
+    TRIGGER_CALLBACK_BASE_URL,
     TRIGGER_DISPATCHER_BATCH_SIZE,
     TRIGGER_DISPATCHER_ENABLED,
     TRIGGER_DISPATCHER_INTERVAL_SECONDS,
@@ -157,6 +158,7 @@ from xagent.config import (
     get_storage_root,
     get_task_lease_recovery_batch_size,
     get_task_lease_recovery_interval_seconds,
+    get_trigger_callback_base_url,
     get_trigger_dispatcher_batch_size,
     get_trigger_dispatcher_enabled,
     get_trigger_dispatcher_interval_seconds,
@@ -1667,6 +1669,49 @@ class TestGmailPubSubProvisioningConfig:
         assert get_gmail_pubsub_transport() == "rest"
         monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TRANSPORT", "carrier-pigeon")
         assert get_gmail_pubsub_transport() == "grpc"
+
+
+class TestTriggerCallbackBaseUrlConfig:
+    """Dedicated base URL for inbound trigger callbacks (issue #1009)."""
+
+    def test_env_var_name(self):
+        assert TRIGGER_CALLBACK_BASE_URL == "XAGENT_TRIGGER_CALLBACK_BASE_URL"
+
+    def test_env_set_strips_whitespace_and_trailing_slash(self, monkeypatch):
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL", " https://callbacks.example.com/ "
+        )
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+        assert get_trigger_callback_base_url() == "https://callbacks.example.com"
+
+    def test_unset_falls_back_to_public_api_base_url(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com/")
+        assert get_trigger_callback_base_url() == "https://api.example.com"
+
+    @pytest.mark.parametrize("raw_value", ["   ", " /// "])
+    def test_empty_after_cleaning_falls_back_to_public_api_base_url(
+        self, monkeypatch, raw_value
+    ):
+        # "   " exercises .strip(); " /// " exercises .rstrip("/"). Either way
+        # the cleaned value is empty and must fall back rather than return "".
+        monkeypatch.setenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raw_value)
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+        assert get_trigger_callback_base_url() == "https://api.example.com"
+
+    def test_both_unset_returns_none(self, monkeypatch):
+        monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
+        monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
+        assert get_trigger_callback_base_url() is None
+
+    def test_override_does_not_affect_public_api_base_url(self, monkeypatch):
+        # The isolation between the two getters is the whole reason MCP and A2A
+        # (which read get_public_api_base_url) are unaffected by the override.
+        monkeypatch.setenv(
+            "XAGENT_TRIGGER_CALLBACK_BASE_URL", "https://callbacks.example.com"
+        )
+        monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com")
+        assert get_public_api_base_url() == "https://api.example.com"
 
 
 class TestTrustedProxyHopsConfig:

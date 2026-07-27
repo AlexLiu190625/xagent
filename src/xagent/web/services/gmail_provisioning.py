@@ -31,7 +31,7 @@ from ...config import (
     get_gmail_pubsub_topic_prefix,
     get_gmail_pubsub_transport,
     get_gmail_registration_timeout_seconds,
-    get_public_api_base_url,
+    get_trigger_callback_base_url,
 )
 from ..models.gmail_watch import GmailWatchState
 from ..models.trigger import (
@@ -127,16 +127,17 @@ def _is_not_found(exc: Exception) -> bool:
 
 
 def _validate_provisioning_config() -> tuple[str, str, str]:
-    """Return (project_id, public_base_url, push_service_account) or raise."""
+    """Return (project_id, callback_base_url, push_service_account) or raise."""
     project_id = get_gmail_pubsub_project_id()
     if not project_id:
         raise GmailProvisioningError(
             "XAGENT_GMAIL_PUBSUB_PROJECT_ID is required for Gmail provisioning"
         )
-    base_url = get_public_api_base_url()
+    base_url = get_trigger_callback_base_url()
     if not base_url:
         raise GmailProvisioningError(
-            "XAGENT_PUBLIC_API_BASE_URL is required for Gmail push registration"
+            "XAGENT_PUBLIC_API_BASE_URL (or XAGENT_TRIGGER_CALLBACK_BASE_URL to "
+            "override it) is required for Gmail push registration"
         )
     push_service_account = get_gmail_pubsub_push_service_account()
     if not push_service_account:
@@ -246,34 +247,68 @@ def _ensure_push_subscription(
             raise
         # The deterministic name survives config changes; make sure an
         # existing subscription still pushes to the current audience
-        # (e.g. after XAGENT_PUBLIC_API_BASE_URL was changed).
-        _sync_push_endpoint(
+        # (e.g. after XAGENT_TRIGGER_CALLBACK_BASE_URL or
+        # XAGENT_PUBLIC_API_BASE_URL was changed).
+        _sync_push_config(
             subscriber,
             subscription_path=subscription_path,
             push_config=push_config,
         )
 
 
-def _sync_push_endpoint(
+def _sync_push_config(
     subscriber: Any,
     *,
     subscription_path: str,
     push_config: dict[str, Any],
 ) -> None:
+    """Reconcile an existing subscription's push config with the desired one.
+
+    Inspecting the live subscription is only an optimization to skip a
+    redundant patch: on a successful read the full
+    ``(push_endpoint, service_account_email, audience)`` tuple is compared
+    against ``push_config`` and the patch is skipped when they already match.
+    A read failure (e.g. a narrower IAM role without
+    ``pubsub.subscriptions.get``, or a transient blip) is logged and falls
+    through to an unconditional, idempotent ``modify_push_config`` rather than
+    aborting.
+
+    The patch itself is never swallowed. The caller persists the new audience
+    and marks the watch ``ACTIVE`` on return, so a swallowed patch failure
+    would record success on a subscription that was never updated. Letting it
+    propagate lands the watch in ``FAILED`` for the retry sweep instead.
+    """
     try:
         existing = subscriber.get_subscription(
             request={"subscription": subscription_path}
         )
     except Exception as exc:
         logger.warning(
-            "Could not inspect existing subscription %s: %s", subscription_path, exc
+            "Could not inspect existing subscription %s; re-applying push "
+            "config unconditionally: %s",
+            subscription_path,
+            exc,
         )
-        return
-    current_endpoint = str(
-        getattr(getattr(existing, "push_config", None), "push_endpoint", "") or ""
-    )
-    if current_endpoint == push_config["push_endpoint"]:
-        return
+    else:
+        existing_push = getattr(existing, "push_config", None)
+        existing_oidc = getattr(existing_push, "oidc_token", None)
+        current = (
+            str(getattr(existing_push, "push_endpoint", "") or ""),
+            str(getattr(existing_oidc, "service_account_email", "") or ""),
+            str(getattr(existing_oidc, "audience", "") or ""),
+        )
+        desired_oidc = push_config.get("oidc_token", {})
+        desired = (
+            str(push_config.get("push_endpoint", "")),
+            str(desired_oidc.get("service_account_email", "")),
+            str(desired_oidc.get("audience", "")),
+        )
+        # Compare the full push config, not just the endpoint: the OIDC service
+        # account can change (e.g. XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT)
+        # while the endpoint/audience stay the same, and it still needs
+        # re-syncing.
+        if current == desired:
+            return
     subscriber.modify_push_config(
         request={
             "subscription": subscription_path,
