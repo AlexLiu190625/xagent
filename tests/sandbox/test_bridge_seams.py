@@ -160,3 +160,126 @@ class TestBridgeSeams:
                 await service.delete(name)
             except Exception:
                 pass
+
+
+@requires_docker
+class TestSnapshotDoesNotLaunderAttestation:
+    """A snapshot must not carry its source sandbox's attestation forward.
+
+    Docker copies a container's labels into the image produced by
+    ``commit()``, and then merges an image's labels into any container
+    created from it for every key the create request does not specify. So
+    ``create(A, spec_A)`` -> ``create_snapshot(A)`` -> a container built from
+    that snapshot would inherit ``spec_A``'s fingerprint and present it as
+    its own attestation -- reporting MISMATCH where it owes UNVERIFIED, or a
+    false MATCH when the specs happen to agree, on a container that never
+    went through the verified create() path at all.
+
+    ``_create_container`` closes this by always writing both attestation keys
+    itself, blank when there is nothing to attest.
+    """
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_legacy_container_from_a_snapshot_is_unverified(self, docker_service):
+        service = docker_service
+        source = _unique_name("snap-src")
+        derived = _unique_name("snap-derived")
+        snapshot_id = _unique_name("snapid")
+        config = SandboxConfig(cpus=1, memory=256)
+        try:
+            # 1. A verified sandbox: its container carries a real fingerprint.
+            await service.create(
+                source,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config,
+            )
+            source_inspection = await service.inspect(source)
+            assert source_inspection is not None
+            assert source_inspection.fingerprint_label, (
+                "the source sandbox must actually be attested for this test to "
+                "be meaningful"
+            )
+
+            # 2. Snapshot it. The committed image inherits those labels.
+            await service.create_snapshot(source, snapshot_id)
+
+            # 3. Build a container from that snapshot via the legacy path,
+            #    which makes no attestation of its own.
+            await service.get_or_create(
+                derived,
+                template=SandboxTemplate(type="snapshot", snapshot_id=snapshot_id),
+                config=config,
+            )
+
+            derived_inspection = await service.inspect(derived)
+            assert derived_inspection is not None
+            assert derived_inspection.fingerprint_label is None, (
+                "a legacy container built from a snapshot must present no "
+                "attestation, not the source sandbox's inherited fingerprint"
+            )
+
+            # The verdict, which is what reconciliation actually consumes.
+            assert (
+                spec_matches_inspection(_spec_for(config), derived_inspection)
+                is SpecVerdict.UNVERIFIED
+            ), (
+                "an unattested container must be UNVERIFIED: MATCH would be a "
+                "forged attestation and MISMATCH would force a needless rebuild"
+            )
+        finally:
+            for name in (derived, source):
+                try:
+                    await service.delete(name)
+                except Exception:
+                    pass
+            try:
+                await service.delete_snapshot(snapshot_id)
+            except Exception:
+                pass
+
+    @pytest.mark.asyncio(loop_scope="module")
+    async def test_snapshot_derived_container_with_the_same_spec_is_not_a_false_match(
+        self, docker_service
+    ):
+        """The dangerous direction: identical specs must still not report MATCH.
+
+        With an inherited fingerprint this would compare equal and pass the
+        live cpus/memory re-check, so the container would be adopted as
+        verified without ever having been verified.
+        """
+        service = docker_service
+        source = _unique_name("snap-fm-src")
+        derived = _unique_name("snap-fm-derived")
+        snapshot_id = _unique_name("snapid-fm")
+        config = SandboxConfig(cpus=1, memory=256)
+        try:
+            await service.create(
+                source,
+                SandboxTemplate(type="image", image=DEFAULT_SANDBOX_IMAGE),
+                config,
+            )
+            await service.create_snapshot(source, snapshot_id)
+            await service.get_or_create(
+                derived,
+                template=SandboxTemplate(type="snapshot", snapshot_id=snapshot_id),
+                config=config,
+            )
+
+            derived_inspection = await service.inspect(derived)
+            assert derived_inspection is not None
+            verdict = spec_matches_inspection(_spec_for(config), derived_inspection)
+            assert verdict is not SpecVerdict.MATCH, (
+                "an unverified container must never report MATCH even when the "
+                "desired spec is identical to the snapshot source's"
+            )
+            assert verdict is SpecVerdict.UNVERIFIED
+        finally:
+            for name in (derived, source):
+                try:
+                    await service.delete(name)
+                except Exception:
+                    pass
+            try:
+                await service.delete_snapshot(snapshot_id)
+            except Exception:
+                pass

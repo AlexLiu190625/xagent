@@ -21,7 +21,6 @@ from xagent.sandbox.base import (
     SandboxConfig,
     SandboxContractError,
     SandboxInspection,
-    SandboxLeaseSpec,
     SandboxReconcileUnsupportedError,
     SandboxRecoveryRequiredError,
     SandboxRuntimeConflictError,
@@ -113,6 +112,102 @@ class TestSpecFieldSensitivity:
         perturbed = _make_spec(image="python:3.11-slim")
         assert perturbed != baseline
         assert perturbed.fingerprint() != baseline.fingerprint()
+
+    def test_template_type_and_snapshot_id_are_covered(self):
+        """The two remaining fingerprint fields, which the matrix above cannot
+        perturb because ``__post_init__`` constrains them against each other."""
+        image_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="python:3.12-slim", working_dir="/home"
+        )
+        snapshot_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="snapshot", snapshot_id="snap-1", working_dir="/home"
+        )
+        assert image_spec != snapshot_spec
+        assert image_spec.fingerprint() != snapshot_spec.fingerprint()
+
+        other_snapshot = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="snapshot", snapshot_id="snap-2", working_dir="/home"
+        )
+        assert other_snapshot != snapshot_spec
+        assert other_snapshot.fingerprint() != snapshot_spec.fingerprint()
+
+    def test_every_spec_field_is_covered_by_the_fingerprint(self):
+        """Guard against a new field arriving without fingerprint coverage.
+
+        A field that does not move the fingerprint is a field two different
+        desired states can silently share one attestation for.
+        """
+        covered = {
+            "template_type",
+            "snapshot_id",
+            "image",
+            "working_dir",
+            "cpus",
+            "memory",
+            "env",
+            "volumes",
+            "network_isolated",
+            "ports",
+        }
+        actual = {f.name for f in dataclasses.fields(ResolvedSandboxRuntimeSpec)}
+        assert actual == covered, (
+            "a spec field was added or removed; fingerprint() and the "
+            "field-sensitivity tests above must be updated to match"
+        )
+
+
+class TestSpecRejectsUnrealizableValues:
+    """The spec's constructible domain must equal what the backend can realize.
+
+    ``SandboxConfig`` constrains ``cpus`` (ge=1) and ``memory`` (ge=128), so a
+    spec outside those bounds used to construct fine and then fail pydantic
+    validation later inside ``create()`` -- surfacing at the backend boundary
+    rather than at the desired-state boundary that owns the value.
+    """
+
+    @pytest.mark.parametrize("memory", [1, 64, 127])
+    def test_memory_below_the_backend_minimum_is_rejected(self, memory):
+        with pytest.raises(ValueError, match="memory must be >= 128"):
+            _make_spec(memory=memory)
+
+    @pytest.mark.parametrize("cpus", [-1, -8])
+    def test_cpus_below_the_backend_minimum_is_rejected(self, cpus):
+        with pytest.raises(ValueError, match="cpus must be >= 1"):
+            _make_spec(cpus=cpus)
+
+    def test_the_boundary_values_are_accepted(self):
+        spec = _make_spec(cpus=1, memory=128)
+        assert (spec.cpus, spec.memory) == (1, 128)
+
+    @pytest.mark.parametrize("unset", [None, 0])
+    def test_unset_falls_back_to_the_backend_defaults(self, unset):
+        """``from_parts`` treats both ``None`` and ``0`` as "not specified",
+        matching the backend's own ``cpus or 1`` / ``memory or 512``, so
+        neither reaches the bounds check as an out-of-range value."""
+        spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="python:3.12-slim", cpus=unset, memory=unset
+        )
+        assert (spec.cpus, spec.memory) == (1, 512)
+
+    def test_anything_constructible_converts_to_a_backend_config(self):
+        """The property the bounds exist to guarantee."""
+        _make_spec(cpus=1, memory=128).to_backend_config()
+
+    def test_direct_construction_is_validated_too(self):
+        """``__post_init__`` covers the constructor, not only ``from_parts``."""
+        with pytest.raises(ValueError, match="memory must be >= 128"):
+            ResolvedSandboxRuntimeSpec(
+                template_type="image",
+                image="python:3.12-slim",
+                snapshot_id=None,
+                working_dir="/home",
+                cpus=1,
+                memory=64,
+                env=(),
+                volumes=(),
+                network_isolated=False,
+                ports=(),
+            )
 
 
 # --- ResolvedSandboxRuntimeSpec: order insensitivity ---
@@ -349,22 +444,6 @@ class TestToBackendConfig:
         assert template.type == "snapshot"
         assert template.snapshot_id == "snap-1"
         assert template.image is None
-
-
-# --- SandboxLeaseSpec ---
-
-
-class TestSandboxLeaseSpec:
-    def test_holds_runtime_and_max_concurrency(self):
-        runtime = _make_spec()
-        lease = SandboxLeaseSpec(runtime=runtime, max_concurrency=3)
-        assert lease.runtime == runtime
-        assert lease.max_concurrency == 3
-
-    def test_is_frozen(self):
-        lease = SandboxLeaseSpec(runtime=_make_spec(), max_concurrency=1)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            lease.max_concurrency = 5
 
 
 # --- Exceptions: never RuntimeError ---

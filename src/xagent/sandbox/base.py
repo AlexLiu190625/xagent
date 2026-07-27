@@ -198,6 +198,13 @@ class ExecResult(BaseModel):
 # it does not change any existing fingerprint value.
 SPEC_CONTRACT_VERSION = 1
 
+# Realizable bounds for a resolved spec, mirroring the `ge=` constraints
+# SandboxConfig declares for the same two fields. Kept here so an
+# unrealizable desired state fails at spec construction rather than later,
+# inside the backend conversion.
+_MIN_SPEC_CPUS = 1
+_MIN_SPEC_MEMORY_MB = 128
+
 
 def canonical_sandbox_path(path: str) -> str:
     """Canonicalize one sandbox-domain path for desired-state comparison.
@@ -279,6 +286,23 @@ class ResolvedSandboxRuntimeSpec:
                 )
         else:
             raise ValueError(f"unknown template_type: {self.template_type!r}")
+
+        # Keep this type's constructible domain identical to the domain
+        # to_backend_config() can actually realize. SandboxConfig declares
+        # cpus ge=1 and memory ge=128, so a spec outside those bounds used to
+        # construct fine and then fail pydantic validation later, inside
+        # create(). Since this type is the canonical desired-state
+        # expression, an unrealizable desired state must be rejected at its
+        # own boundary rather than at the backend conversion.
+        if self.cpus < _MIN_SPEC_CPUS:
+            raise ValueError(
+                f"cpus must be >= {_MIN_SPEC_CPUS} to be realizable, got {self.cpus!r}"
+            )
+        if self.memory < _MIN_SPEC_MEMORY_MB:
+            raise ValueError(
+                f"memory must be >= {_MIN_SPEC_MEMORY_MB} MB to be realizable, "
+                f"got {self.memory!r}"
+            )
 
     @classmethod
     def from_parts(
@@ -393,14 +417,6 @@ class ResolvedSandboxRuntimeSpec:
         )
 
 
-@dataclass(frozen=True)
-class SandboxLeaseSpec:
-    """A resolved runtime spec paired with its lease concurrency limit."""
-
-    runtime: ResolvedSandboxRuntimeSpec
-    max_concurrency: int
-
-
 @dataclass(eq=False)
 class ObservedRuntimeFacts:
     """Raw facts read back from a live backend for a single sandbox.
@@ -445,12 +461,34 @@ class SandboxInspection:
     ``eq=False`` for the same reason as ``ObservedRuntimeFacts``: this is a
     point-in-time observation, not a desired-state value, so two instances
     compare by identity rather than structurally.
+
+    ``state`` is a deliberate two-value reduction for the reconcile
+    decision, which only ever branches on "is it running or not". It cannot
+    express the difference between ``created`` (never started),  ``exited``,
+    ``dead`` and ``restarting`` — all four reduce to ``"stopped"``. A caller
+    that needs to treat a never-started container specially must read
+    ``facts.raw_status``, which carries the backend's own status string
+    unreduced for exactly that purpose.
     """
 
     state: Literal["running", "stopped"]
     facts: ObservedRuntimeFacts
     fingerprint_label: Optional[str]
     version_label: Optional[str]
+
+
+def _require_absolute_mount_path(path: str, field: str) -> None:
+    """Reject a mount path that lexical prefix comparison cannot classify.
+
+    ``SandboxMountIntent``'s covered/covering/disjoint split is a pure
+    string-prefix operation, so only absolute POSIX paths are comparable.
+    An empty or relative value would normalize to something like ``"."`` and
+    then read as disjoint from every absolute path.
+    """
+    if not path or not path.startswith("/"):
+        raise ValueError(
+            f"{field} must be a non-empty absolute POSIX path, got {path!r}"
+        )
 
 
 def _is_root_or_descendant(path: str, root: str) -> bool:
@@ -465,9 +503,16 @@ def _is_root_or_descendant(path: str, root: str) -> bool:
 class SandboxMountIntent:
     """A desired mount root plus a set of independently-declared extra mounts.
 
-    Construction never raises (aside from type errors on non-string input):
-    inputs are canonicalized with ``canonical_sandbox_path``, sorted, and
-    exactly deduplicated, but nothing is dropped or rejected here.
+    Inputs are canonicalized with ``canonical_sandbox_path``, sorted, and
+    exactly deduplicated. Every path must be absolute: the three
+    classification properties below are pure lexical prefix comparisons, so
+    a relative path silently classifies as ``disjoint`` against every
+    absolute extra. Because that verdict feeds callers' allow-list
+    decisions, and "disjoint" is the direction that grants a separate mount
+    rather than folding it into an already-approved root, a non-absolute
+    input is rejected here instead of being normalized into a wrong answer.
+    (``canonical_sandbox_path("")`` is ``"."``, which is exactly such a
+    silently-wrong root.)
 
     Classification into ``covered_extras`` / ``covering_extras`` /
     ``disjoint_extras`` is purely lexical string comparison over the
@@ -484,6 +529,10 @@ class SandboxMountIntent:
     extra_mounts: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
+        if self.mount_root is not None:
+            _require_absolute_mount_path(self.mount_root, "mount_root")
+        for path in self.extra_mounts:
+            _require_absolute_mount_path(path, "extra_mounts entry")
         normalized_root = (
             canonical_sandbox_path(self.mount_root)
             if self.mount_root is not None

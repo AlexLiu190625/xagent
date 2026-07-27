@@ -18,7 +18,15 @@ import textwrap
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from hashlib import sha1
-from typing import TYPE_CHECKING, Any, AsyncIterator, Coroutine, Optional, cast
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncContextManager,
+    AsyncIterator,
+    Coroutine,
+    Optional,
+    cast,
+)
 
 from docker.errors import APIError, ImageNotFound, NotFound
 
@@ -43,6 +51,7 @@ from .base import (
     SandboxTemplate,
     canonical_sandbox_path,
 )
+from .keyed_lock import KeyedLockRegistry
 
 if TYPE_CHECKING:
     from docker.models.containers import Container
@@ -346,9 +355,29 @@ def _build_inspection(container: Container) -> SandboxInspection:
     return SandboxInspection(
         state="running" if _get_state(raw_status) == "running" else "stopped",
         facts=facts,
-        fingerprint_label=labels.get(LABEL_SPEC_FINGERPRINT),
-        version_label=labels.get(LABEL_SPEC_VERSION),
+        fingerprint_label=_attestation_label(labels.get(LABEL_SPEC_FINGERPRINT)),
+        version_label=_attestation_label(labels.get(LABEL_SPEC_VERSION)),
     )
+
+
+def _attestation_label(value: Optional[str]) -> Optional[str]:
+    """Read one spec-attestation label, mapping a blank value to ``None``.
+
+    ``None`` is the contract's "no attestation" value, which
+    ``spec_matches_inspection`` answers with ``UNVERIFIED``. A blank string
+    means the same thing and must not be treated as a fingerprint that simply
+    fails to match, which would report ``MISMATCH`` and make a reconciler
+    rebuild a container it should have adopted.
+
+    Blank is a value this code writes on purpose: ``_create_container``
+    stamps both keys blank when it has no attestation to make, so that a
+    container never silently presents a fingerprint inherited from its base
+    image. Docker has no way to remove an inherited label, only to overwrite
+    it, so blank is the only available "absent" form on the wire.
+    """
+    if value is None:
+        return None
+    return value or None
 
 
 def _check_no_conflicting_volumes(
@@ -471,6 +500,30 @@ def _find_publish_mismatches(
     later: this is the first opportunity to catch e.g. Docker silently
     clamping an out-of-range request, before the container is ever
     published.
+
+    Failure policy: any single mismatch fails the whole publish and the
+    container is destroyed. This is deliberate and cannot be softened into a
+    per-field "hard-fail on security-relevant fields, log-and-degrade on
+    cosmetic ones" policy, because the fingerprint attestation is
+    all-or-nothing and immutable. ``create()`` stamps
+    ``LABEL_SPEC_FINGERPRINT`` over the *entire* desired spec before the
+    container starts -- it has to, since Docker offers no way to add or
+    change a label on an existing container -- and ``spec_matches_inspection``
+    trusts that one label for every field except cpus/memory, which it
+    re-reads live. Publishing a container whose ``working_dir`` was quietly
+    accepted as different would therefore leave a label positively attesting
+    a spec the container does not implement, and every later reconcile would
+    read that as MATCH. A lying attestation is a worse failure than a refused
+    create, so the tiering has to live upstream of the label: fields whose
+    exact value cannot be guaranteed must be constrained where the desired
+    spec is built, not waived after the fact.
+
+    Two such constraints already exist upstream, which is what keeps this
+    exact-equality check from being brittle in practice: paths pass through
+    ``canonical_sandbox_path`` so a desired path is spelled the way the
+    backend echoes it, and ``get_sandbox_volumes()`` clamps every volume mode
+    to exactly ``ro``/``rw``, so a mode string the daemon would rewrite (an
+    SELinux ``rw,z``, say) cannot reach this comparison from configuration.
     """
     mismatches: list[str] = []
     facts = inspection.facts
@@ -586,14 +639,6 @@ def _archive_path_exists(container: Container, remote_path: str) -> bool:
         return True
     except NotFound:
         return False
-
-
-@dataclass
-class _NamedLockEntry:
-    """Per-sandbox-name lifecycle lock with holder/waiter tracking for safe eviction."""
-
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    waiters: int = 0
 
 
 @dataclass
@@ -914,12 +959,26 @@ async def _create_container(
 ) -> Container:
     """Create a managed Docker container from sandbox template and config.
 
-    ``extra_labels``, when given, is merged into the container's labels.
-    With no extra labels the label set is exactly
-    managed/name/template-type(/snapshot-id). This parameter exists so the
-    ``create()`` lifecycle method can attach the spec fingerprint/version
-    attestation labels without this shared helper (also used by the legacy
-    ``get_or_create()`` path) needing to know anything about that contract.
+    ``extra_labels``, when given, is merged into the container's labels. This
+    parameter exists so the ``create()`` lifecycle method can attach the spec
+    fingerprint/version attestation labels without this shared helper (also
+    used by the legacy ``get_or_create()`` path) needing to know anything
+    about that contract.
+
+    Both spec-attestation label keys are always written, blank when no
+    attestation was supplied, because Docker merges an *image's* labels into
+    a new container's label set for every key the create request does not
+    itself specify. Committing a sandbox to a snapshot image copies that
+    container's labels into the image (verified on Docker 29.4.0), so a
+    container created from a snapshot of a ``create()``-made sandbox would
+    otherwise inherit that sandbox's fingerprint and present it as its own
+    attestation. Writing the keys unconditionally makes this function the
+    single owner of their value for every container it creates, regardless of
+    what the base image carries. A blank value is the wire form of "no
+    attestation": Docker offers no way to *remove* an inherited label (both
+    an empty ``labels`` value and a commit-time ``LABEL key=`` land on the
+    empty string, also verified on 29.4.0), which is why ``_build_inspection``
+    reads blank as absent rather than as a fingerprint that cannot match.
     """
     await _ensure_image(client, image)
 
@@ -938,6 +997,10 @@ async def _create_container(
         LABEL_MANAGED: "true",
         LABEL_SANDBOX_NAME: name,
         LABEL_TEMPLATE_TYPE: template.type or "image",
+        # Shadow any spec attestation inherited from the base image; see the
+        # docstring. Overwritten below when the caller supplies a real one.
+        LABEL_SPEC_FINGERPRINT: "",
+        LABEL_SPEC_VERSION: "",
     }
     if template.type == "snapshot" and template.snapshot_id:
         labels[LABEL_SNAPSHOT_ID] = template.snapshot_id
@@ -980,65 +1043,30 @@ class DockerSandboxService(SandboxService):
         self._client = client or _create_docker_client()
         self._client.ping()
         self._store = store
-        # Per-name lifecycle lock entries, one per sandbox name currently held
-        # or waited on.
-        self._locks: dict[str, _NamedLockEntry] = {}
+        # Per-name lifecycle locks, one entry per sandbox name currently held
+        # or waited on. The registry evicts unreferenced entries so it does
+        # not grow with every sandbox name ever seen (names such as
+        # ``ssh::{task_id}`` come from an unbounded namespace).
+        self._locks = KeyedLockRegistry()
         # Sandbox shared runtime control
         self._controls: dict[str, _SandboxControl] = {}
 
-    @asynccontextmanager
-    async def _named_lock(self, name: str) -> AsyncIterator[None]:
+    def _named_lock(self, name: str) -> AsyncContextManager[None]:
         """Serialize lifecycle operations (create/delete/snapshot) for one name.
 
-        Entries are dropped once no holder or waiter remains, so the dict
-        does not grow with every sandbox name ever seen (names such as
-        ``ssh::{task_id}`` come from an unbounded namespace).
+        Thin alias for the shared ``KeyedLockRegistry`` primitive, which owns
+        the waiter counting and identity-checked eviction; see
+        ``sandbox/keyed_lock.py`` for why that bookkeeping is deliberately
+        synchronous and unguarded.
 
-        Waiter bookkeeping is deliberately synchronous and unguarded,
-        mirroring ``SandboxManager._lifecycle_locked`` in
-        ``web/sandbox_manager.py``: every step here is a single dict
-        get/set/pop or int increment/decrement with no ``await`` in between,
-        so nothing else can interleave on this single-threaded event loop,
-        and a guarding lock would only add an extra await point that a
-        cancellation could land on mid-rollback. If the acquire is
-        cancelled, the waiter count is rolled back in the same
-        ``except BaseException`` step so a cancelled waiter never leaks
-        either the count or a now-unreferenced entry.
+        This lock is per *container name* and is private to this service. It
+        does not span a caller's inspect->create sequence: a caller needing
+        get-or-create semantics must hold its own critical section over the
+        whole sequence, keyed by whatever identity it owns (``SandboxManager``
+        does this with its per-lifecycle-key lock, which is a coarser key than
+        a container name).
         """
-        entry = self._locks.get(name)
-        if entry is None:
-            entry = _NamedLockEntry()
-            self._locks[name] = entry
-        entry.waiters += 1
-
-        try:
-            await entry.lock.acquire()
-        except BaseException:
-            entry.waiters -= 1
-            self._drop_named_lock_if_unused(name, entry)
-            raise
-
-        try:
-            yield
-        finally:
-            entry.lock.release()
-            entry.waiters -= 1
-            self._drop_named_lock_if_unused(name, entry)
-
-    def _drop_named_lock_if_unused(self, name: str, entry: _NamedLockEntry) -> None:
-        """Evict ``name``'s lock entry once it has no holder and no waiter left.
-
-        Called only from the synchronous bookkeeping steps in
-        ``_named_lock``, with no ``await`` between the waiter-count update
-        and this call, so nothing else can interleave and observe an
-        inconsistent count. Identity-checked against ``entry`` so a
-        concurrent waiter that already installed a fresh entry for the same
-        name is never evicted out from under it.
-        """
-        if entry.waiters > 0:
-            return
-        if self._locks.get(name) is entry:
-            self._locks.pop(name, None)
+        return self._locks.locked(name)
 
     @staticmethod
     async def _await_shielded(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -1200,8 +1228,18 @@ class DockerSandboxService(SandboxService):
     # supports_runtime_spec/inspect/create/start_existing/stop_existing do
     # not touch the get_or_create()/list_sandboxes()/delete()/
     # create_snapshot() code paths above, aside from sharing
-    # `_create_container`'s optional `extra_labels` parameter and the
+    # `_create_container` (which owns the spec-attestation label keys for
+    # every container either path creates, blanking them when there is no
+    # attestation to make -- see its docstring) and the
     # `_named_lock`/`_get_live_control` infrastructure.
+    #
+    # All of it assumes a single process is the sole owner of the containers
+    # it manages. `_named_lock` and `_get_live_control` are in-process
+    # registries with no cross-process counterpart, and create()'s
+    # check-then-create sequence is only atomic against other tasks in this
+    # event loop. Two processes pointed at one Docker daemon with an
+    # overlapping name space would race each other; the guard against that is
+    # deployment topology, not this code.
 
     async def supports_runtime_spec(self) -> bool:
         """Docker backs the explicit spec-reconciliation lifecycle."""
@@ -1237,6 +1275,19 @@ class DockerSandboxService(SandboxService):
         validation, labeled container creation, start with raw-remove
         compensation on failure, publish-before-verify against the desired
         spec, store persistence, and returning a live handle.
+
+        Reference-count-blind, like the rest of this service: it knows nothing
+        about how many actors hold a sandbox and enforces no lease. The
+        existence check makes it refuse to overwrite a container that is
+        already there, but a caller that shares sandboxes between actors owns
+        the reference counting and must not route a destructive decision
+        through this service on the assumption that it will second-guess one.
+
+        ``_named_lock(name)`` is held for the whole method, so create() is
+        atomic against another create/delete/snapshot *for the same name* in
+        this process. It does not extend to a caller's own
+        inspect-then-create sequence: that window belongs to the caller's
+        critical section (see ``_named_lock``).
         """
         async with self._named_lock(name):
             existing = await self._find_container(name)
@@ -1338,9 +1389,29 @@ class DockerSandboxService(SandboxService):
                 # still in flight. If a cancellation occurs, it is re-raised
                 # once the remove settles, taking priority over the
                 # SandboxRuntimeConflictError below.
-                await self._await_shielded(
-                    asyncio.to_thread(container.remove, force=True)
-                )
+                #
+                # A failure of the remove itself is logged and swallowed so
+                # the caller still gets SandboxRuntimeConflictError naming the
+                # mismatched fields, rather than a raw docker APIError that
+                # says nothing about why the sandbox was rejected. The
+                # verification verdict is the caller-actionable fact; the
+                # leaked container is an operator-actionable one, so it goes
+                # to the log. `except Exception` deliberately excludes
+                # CancelledError, which must keep propagating.
+                try:
+                    await self._await_shielded(
+                        asyncio.to_thread(container.remove, force=True)
+                    )
+                except Exception as remove_exc:
+                    logger.error(
+                        "Failed to remove sandbox %r after it failed publish "
+                        "verification (mismatched fields: %s); the container "
+                        "is left on the host and must be removed manually. "
+                        "error=%s",
+                        name,
+                        ", ".join(mismatches),
+                        remove_exc,
+                    )
                 raise SandboxRuntimeConflictError(
                     f"Sandbox {name!r} failed publish verification; "
                     f"mismatched fields: {', '.join(mismatches)}"
@@ -1359,19 +1430,47 @@ class DockerSandboxService(SandboxService):
             # not roll back the container — it is left running with a
             # verified label and no store row, which the next reconcile pass
             # converges by observing running+MATCH and recreating the row.
+            #
+            # The row deliberately records the caller's original
+            # template/config, not the canonicalized `desired`. The store is a
+            # record of what was asked for; canonicalization is owned by
+            # `ResolvedSandboxRuntimeSpec.from_parts`, which every consumer
+            # that compares a row against a desired spec runs the row back
+            # through. Both sides of such a comparison are therefore
+            # canonicalized by the same owner, so persisting the pre-canonical
+            # form cannot produce a spurious mismatch, and persisting the
+            # canonical form would instead lose the original request.
             self._store.add_info(name, info)
 
             control = self._get_live_control(name)
             return DockerSandbox(name, container, info, self._store, control)
 
     async def start_existing(self, name: str) -> DockerSandbox:
-        """Start a previously-created sandbox, idempotent if already running."""
+        """Start a previously-created sandbox, idempotent if already running.
+
+        Adopts whatever container currently answers to ``name``: this method
+        performs no spec verification of any kind, and neither reads nor
+        writes the fingerprint attestation. A caller that cares whether the
+        running container still matches a desired spec must call ``inspect()``
+        and ``spec_matches_inspection()`` itself before adopting the result.
+
+        Like every method on this service, this is also reference-count-blind
+        (see ``create()``).
+
+        Mutual exclusion is per container name and is not shared with
+        ``Sandbox.stop()``, which takes only the sandbox's own
+        ``exclusive_access`` barrier and no named lock. A caller that can
+        issue both concurrently for one name must serialize them itself.
+        """
         async with self._named_lock(name):
+            container = await self._find_container(name)
+            if container is None:
+                # Resolved before _get_live_control so that probing a name
+                # with no container does not install a control entry that
+                # nothing would ever evict.
+                raise SandboxNotFoundError(f"Sandbox not found: {name}")
             control = self._get_live_control(name)
             async with control.exclusive_access(mark_deleted=False):
-                container = await self._find_container(name)
-                if container is None:
-                    raise SandboxNotFoundError(f"Sandbox not found: {name}")
                 await asyncio.to_thread(container.reload)
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state != "running":
@@ -1383,13 +1482,19 @@ class DockerSandboxService(SandboxService):
                 return DockerSandbox(name, container, info, self._store, control)
 
     async def stop_existing(self, name: str) -> None:
-        """Stop an existing sandbox, idempotent if already stopped."""
+        """Stop an existing sandbox, idempotent if already stopped.
+
+        Reference-count-blind (see ``create()``) and, like
+        ``start_existing()``, not mutually exclusive with ``Sandbox.stop()``.
+        """
         async with self._named_lock(name):
+            container = await self._find_container(name)
+            if container is None:
+                # Resolved before _get_live_control for the same reason as in
+                # start_existing().
+                raise SandboxNotFoundError(f"Sandbox not found: {name}")
             control = self._get_live_control(name)
             async with control.exclusive_access(mark_deleted=False):
-                container = await self._find_container(name)
-                if container is None:
-                    raise SandboxNotFoundError(f"Sandbox not found: {name}")
                 await asyncio.to_thread(container.reload)
                 state = _get_state(str(container.attrs.get("State", {}).get("Status")))
                 if state == "running":

@@ -6,6 +6,7 @@ against a minimal fake Docker client; no Docker daemon required.
 
 from __future__ import annotations
 
+import ast
 import asyncio
 from pathlib import Path
 
@@ -184,13 +185,19 @@ class TestNamedLockCancellationSafety:
         assert "cancel-me" not in service._locks
 
     @pytest.mark.asyncio
-    async def test_double_cancel_while_waiting_rolls_back_cleanly(self):
-        # Waiter bookkeeping in _named_lock is fully synchronous: the
-        # rollback path in the `except BaseException` branch has no `await`
-        # in it, so a second cancel() delivered on top of the first, before
-        # the waiter task gets a chance to run its own cancellation
-        # handling, must still leave the waiter count and entry correctly
-        # recovered.
+    async def test_repeated_cancel_of_a_queued_waiter_rolls_back_cleanly(self):
+        # Cancelling a queued waiter must roll back its waiter count and, once
+        # the holder leaves, evict the entry. Calling cancel() a second time
+        # before the task is resumed must not double-decrement the count.
+        #
+        # Note what this can and cannot reach: the rollback in _named_lock's
+        # `except BaseException` branch contains no `await`, so a second
+        # cancellation cannot interleave *inside* it -- asyncio delivers at
+        # most one CancelledError to a task that has not resumed yet, and the
+        # synchronous rollback is indivisible on this event loop. The case of
+        # a cancellation arriving while an in-flight operation still holds the
+        # lock is a different mechanism (_await_shielded) and is covered in
+        # test_docker_lifecycle_api.py's repeated-cancellation test.
         service = _make_service()
         entered_holder = asyncio.Event()
         release_holder = asyncio.Event()
@@ -297,5 +304,26 @@ class TestSandboxControlSingleConstructionPoint:
     """
 
     def test_sandbox_control_constructed_in_exactly_two_places(self):
+        """Resolved over the AST, not raw text.
+
+        A substring count also matches occurrences in comments and
+        docstrings and breaks on reformatting, neither of which has anything
+        to do with the contract. What matters is which *functions* contain a
+        real call to the constructor.
+        """
         source = Path(docker_sandbox_module.__file__).read_text()
-        assert source.count("_SandboxControl(") == 2
+        tree = ast.parse(source)
+
+        constructing_functions: list[str] = []
+        for node in ast.walk(tree):
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for inner in ast.walk(node):
+                if (
+                    isinstance(inner, ast.Call)
+                    and isinstance(inner.func, ast.Name)
+                    and inner.func.id == "_SandboxControl"
+                ):
+                    constructing_functions.append(node.name)
+
+        assert sorted(constructing_functions) == ["_get_control", "_get_live_control"]

@@ -3,11 +3,13 @@ Unit tests for ``SandboxMountIntent``.
 
 Classification is purely lexical: it compares already-normalized path
 strings and never touches the filesystem. These tests pin that behavior,
-including the never-raises contract and the exact descendant/ancestor/
-disjoint split.
+including the absolute-path precondition and the exact descendant/
+ancestor/disjoint split.
 """
 
 from __future__ import annotations
+
+import pytest
 
 from xagent.sandbox.base import SandboxMountIntent
 
@@ -49,22 +51,46 @@ class TestMountIntentNormalization:
         assert intent.disjoint_extras == ()
 
 
-class TestMountIntentNeverRaises:
+class TestMountIntentRejectsUncomparablePaths:
+    """Only absolute paths are lexically comparable, so nothing else is accepted.
+
+    A relative or empty path normalizes to something like ``"."``, which then
+    reads as *disjoint* from every absolute extra mount. Disjoint is the
+    dangerous direction: it grants a path its own mount instead of folding it
+    into an already-approved root, so this classification feeds allow-list
+    decisions and must never be silently wrong.
+    """
+
     def test_empty_intent_does_not_raise(self):
         intent = SandboxMountIntent(mount_root=None, extra_mounts=())
         assert intent.mount_root is None
         assert intent.extra_mounts == ()
 
-    def test_relative_paths_do_not_raise(self):
-        # Malformed input relative to contract (paths should be absolute) but
-        # construction itself must not raise.
-        intent = SandboxMountIntent(mount_root="relative/root", extra_mounts=("x/y",))
-        assert intent.mount_root == "relative/root"
-        assert intent.extra_mounts == ("x/y",)
-
     def test_root_equal_to_slash_does_not_raise(self):
         intent = SandboxMountIntent(mount_root="/", extra_mounts=("/etc",))
         assert intent.mount_root == "/"
+
+    def test_relative_mount_root_is_rejected(self):
+        with pytest.raises(ValueError, match="mount_root must be"):
+            SandboxMountIntent(mount_root="relative/root", extra_mounts=())
+
+    def test_empty_mount_root_is_rejected(self):
+        """``canonical_sandbox_path("")`` is ``"."`` -- a silently wrong root."""
+        with pytest.raises(ValueError, match="mount_root must be"):
+            SandboxMountIntent(mount_root="", extra_mounts=("/data/x",))
+
+    def test_relative_extra_mount_is_rejected(self):
+        with pytest.raises(ValueError, match="extra_mounts entry must be"):
+            SandboxMountIntent(mount_root="/data", extra_mounts=("x/y",))
+
+    def test_empty_extra_mount_is_rejected(self):
+        with pytest.raises(ValueError, match="extra_mounts entry must be"):
+            SandboxMountIntent(mount_root="/data", extra_mounts=("",))
+
+    def test_rejection_precedes_any_classification(self):
+        """The bad value must never reach a covered/disjoint verdict at all."""
+        with pytest.raises(ValueError):
+            SandboxMountIntent(mount_root="", extra_mounts=("/data/x",))
 
 
 class TestMountIntentClassification:

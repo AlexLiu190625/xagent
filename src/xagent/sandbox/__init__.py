@@ -15,7 +15,6 @@ from .base import (
     SandboxContractError,
     SandboxInfo,
     SandboxInspection,
-    SandboxLeaseSpec,
     SandboxMountIntent,
     SandboxNotFoundError,
     SandboxReconcileUnsupportedError,
@@ -26,6 +25,7 @@ from .base import (
     SandboxTemplate,
     SpecVerdict,
     TemplateType,
+    canonical_sandbox_path,
     spec_matches_inspection,
 )
 
@@ -51,12 +51,12 @@ __all__ = [
     "SandboxRecoveryRequiredError",
     "SandboxReconcileUnsupportedError",
     "ResolvedSandboxRuntimeSpec",
-    "SandboxLeaseSpec",
     "ObservedRuntimeFacts",
     "SandboxInspection",
     "SandboxMountIntent",
     "SpecVerdict",
     "spec_matches_inspection",
+    "canonical_sandbox_path",
     "SPEC_CONTRACT_VERSION",
 ]
 
