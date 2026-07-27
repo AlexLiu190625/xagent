@@ -11,6 +11,9 @@ on:
       - 'src/xagent/db/**'
       - 'src/xagent/web/services/gmail_provisioning.py'
       - 'tests/web/services/test_gmail_provisioning.py'
+      - 'src/xagent/web/services/agent_management.py'
+      - 'src/xagent/web/services/api_keys.py'
+      - 'tests/web/services/test_runtime_key_transition_postgres.py'
   pull_request:
     branches: [main]
   # Required by the merge queue: without this the two required contexts below
@@ -53,6 +56,9 @@ jobs:
             src/xagent/db
             src/xagent/web/services/gmail_provisioning.py
             tests/web/services/test_gmail_provisioning.py
+            src/xagent/web/services/agent_management.py
+            src/xagent/web/services/api_keys.py
+            tests/web/services/test_runtime_key_transition_postgres.py
           )
 
           case "$EVENT_NAME" in
@@ -202,6 +208,13 @@ jobs:
         run: |
           pip install pytest-asyncio
           pytest tests/web/services/test_gmail_provisioning.py -k contend -q
+        env:
+          XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
+
+      - name: Test runtime-key transition fencing (Postgres-only)
+        if: needs.detect-migration-changes.outputs.should-test == 'true'
+        run: |
+          pytest tests/web/services/test_runtime_key_transition_postgres.py -q
         env:
           XAGENT_TEST_POSTGRES_URL: postgresql://xagent:xagent@localhost:5432/xagent_test
 
