@@ -10,6 +10,10 @@ from xagent.core.tools.adapters.vibe.command_executor import (
     CommandExecutorToolForBasic,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
+from xagent.core.tools.adapters.vibe.sandboxed_tool.sandbox_config import (
+    SandboxConfig,
+    get_sandbox_config,
+)
 from xagent.core.workspace import TaskWorkspace
 
 
@@ -183,3 +187,21 @@ async def test_sandbox_wrap_failure_keeps_command_path_guard(monkeypatch, tmp_pa
     assert wrapped == [tool]
     assert result["success"] is False
     assert result["return_code"] == 126
+
+
+def test_command_tool_layers_policy_dependency_on_declared_sandbox_config(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(
+        CommandExecutorToolForBasic,
+        "__sandbox_config__",
+        SandboxConfig(packages=("base-package",), env_vars=("TOKEN",)),
+    )
+    workspace = TaskWorkspace("task", str(tmp_path))
+
+    tool = CommandExecutorToolForBasic(workspace=workspace, restrict_paths=True)
+
+    assert get_sandbox_config(tool) == SandboxConfig(
+        packages=("base-package", "bashlex>=0.18"),
+        env_vars=("TOKEN",),
+    )
