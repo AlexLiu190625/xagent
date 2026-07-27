@@ -43,6 +43,7 @@ from ..models.task import Task
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..services.db_runtime import (
+    await_task_settlement,
     drain_async_task_cancellation_safe,
     run_db_io_cancellation_safe,
 )
@@ -288,35 +289,103 @@ def _accel_redirect_response(
     )
 
 
-async def _write_upload_with_size_limit(uploaded: UploadFile, target_path: Path) -> int:
-    """Persist an uploaded file while enforcing the configured size limit."""
-    total_size = 0
-    read_buffer_size = 1024 * 1024  # 1MB chunks keep memory bounded for large files.
+_UPLOAD_COPY_BUFFER_SIZE = 1024 * 1024
+
+
+class _InvalidUploadPathError(ValueError):
+    """Path-construction validation failure for a request upload."""
+
+
+def _delete_staged_upload(path: Path) -> None:
+    """Best-effort removal which never replaces the staging failure."""
 
     try:
-        with open(target_path, "wb") as buffer:
-            while True:
-                chunk = await uploaded.read(read_buffer_size)
-                if not chunk:
-                    break
-                total_size += len(chunk)
-                if total_size > MAX_FILE_SIZE:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=(
-                            f"File size exceeds maximum limit of {MAX_FILE_SIZE_LABEL}"
-                        ),
-                    )
-                buffer.write(chunk)
-    except BaseException:
-        try:
-            if target_path.exists():
-                target_path.unlink()
-        except OSError:
-            pass
-        raise
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Failed to clean up local upload: %s", path)
 
-    return total_size
+
+def _reserve_and_copy_upload(
+    uploaded: UploadFile,
+    *,
+    task_id: str | None,
+    folder: str | None,
+    user_id: int,
+) -> Path:
+    """Reserve one local upload path and copy bytes through its descriptor.
+
+    This synchronous worker owns path construction, exclusive reservation, and
+    bounded source reads. A collision is only a ``FileExistsError`` raised by
+    the exclusive create itself; errors from source reads or destination writes
+    remain I/O failures and clean the exact reserved candidate.
+    """
+
+    try:
+        path = get_upload_path(uploaded.filename or "", task_id, folder, user_id)
+    except ValueError as exc:
+        raise _InvalidUploadPathError(str(exc)) from exc
+    stem = path.stem
+    suffix = path.suffix
+    candidate = path
+    suffix_index = 1
+
+    while True:
+        try:
+            destination = open(candidate, "xb")
+        except FileExistsError:
+            candidate = path.parent / f"{stem}_{suffix_index}{suffix}"
+            suffix_index += 1
+            continue
+
+        total_size = 0
+        try:
+            with destination:
+                while True:
+                    chunk = uploaded.file.read(_UPLOAD_COPY_BUFFER_SIZE)
+                    if not chunk:
+                        break
+                    total_size += len(chunk)
+                    if total_size > MAX_FILE_SIZE:
+                        raise HTTPException(
+                            status_code=413,
+                            detail=(
+                                f"File size exceeds maximum limit of "
+                                f"{MAX_FILE_SIZE_LABEL}"
+                            ),
+                        )
+                    destination.write(chunk)
+        except BaseException:
+            _delete_staged_upload(candidate)
+            raise
+        return candidate
+
+
+async def _stage_uploaded_file(
+    uploaded: UploadFile,
+    *,
+    task_id: str | None,
+    folder: str | None,
+    user_id: int,
+    written_paths: list[Path],
+) -> Path:
+    """Run local staging off-loop and publish its path to request cleanup."""
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _reserve_and_copy_upload,
+            uploaded,
+            task_id=task_id,
+            folder=folder,
+            user_id=user_id,
+        )
+    )
+    target_path, cancellation = await await_task_settlement(worker)
+    # The request cleanup owner knows this exact path before any subsequent
+    # preview, registration, or cancellation-cleanup await point.
+    written_paths.append(target_path)
+    if cancellation is not None:
+        raise cancellation
+    return target_path
 
 
 async def store_uploaded_files(
@@ -355,18 +424,20 @@ async def store_uploaded_files(
                 )
 
             try:
-                target_path = _build_unique_file_path(
-                    get_upload_path(uploaded.filename, task_id, folder, user_id)
+                target_path = await _stage_uploaded_file(
+                    uploaded,
+                    task_id=task_id,
+                    folder=folder,
+                    user_id=user_id,
+                    written_paths=written_paths,
                 )
-            except ValueError as e:
+            except _InvalidUploadPathError as e:
                 logger.warning(f"Invalid folder name rejected: {folder!r} - {e}")
                 raise HTTPException(
                     status_code=422, detail=f"Invalid folder name: {str(e)}"
                 ) from e
 
-            written_paths.append(target_path)
             file_id = str(uuid4())
-            await _write_upload_with_size_limit(uploaded, target_path)
 
             content_preview = ""
             file_extension = Path(uploaded.filename).suffix.lower()
@@ -451,13 +522,7 @@ async def store_uploaded_files(
 
                     def _delete_local_paths() -> None:
                         for path in written_paths:
-                            try:
-                                path.unlink(missing_ok=True)
-                            except OSError:
-                                logger.warning(
-                                    "Failed to clean up local upload: %s",
-                                    path,
-                                )
+                            _delete_staged_upload(path)
 
                     cleanup_worker = asyncio.create_task(
                         asyncio.to_thread(_delete_local_paths)
@@ -513,20 +578,6 @@ def _parse_task_id(task_id: Optional[str]) -> Optional[int]:
         return int(task_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail="Invalid task_id") from exc
-
-
-def _build_unique_file_path(path: Path) -> Path:
-    if not path.exists():
-        return path
-    stem = path.stem
-    suffix = path.suffix
-    parent = path.parent
-    i = 1
-    while True:
-        candidate = parent / f"{stem}_{i}{suffix}"
-        if not candidate.exists():
-            return candidate
-        i += 1
 
 
 def _ensure_under_uploads(path: Path, user_id: int) -> None:
