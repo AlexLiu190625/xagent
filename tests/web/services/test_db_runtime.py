@@ -8,10 +8,6 @@ import threading
 import pytest
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 
-from xagent.web.services.agent_management import (
-    AgentManagementRuntime,
-    _RuntimeKeyDeliveryOutcome,
-)
 from xagent.web.services.db_runtime import (
     await_task_settlement,
     drain_async_task_cancellation_safe,
@@ -211,71 +207,6 @@ async def test_await_task_settlement_preserves_child_process_control_after_calle
 
     with pytest.raises(WorkerShutdown) as exc_info:
         await asyncio.wait_for(waiter, timeout=1)
-
-    assert exc_info.value is shutdown
-
-
-@pytest.mark.asyncio
-async def test_runtime_key_delivery_keeps_worker_error_as_caller_cancellation_cause() -> (
-    None
-):
-    started = threading.Event()
-    release = threading.Event()
-    worker_error = RuntimeError("post-commit mapper failed")
-
-    def operation() -> _RuntimeKeyDeliveryOutcome:
-        started.set()
-        assert release.wait(timeout=2)
-        return _RuntimeKeyDeliveryOutcome(
-            result=None,
-            receipt=None,
-            error=worker_error,
-            traceback=worker_error.__traceback__,
-        )
-
-    caller = asyncio.create_task(
-        AgentManagementRuntime()._run_runtime_key_delivery(operation)
-    )
-    await _wait_for_thread_event(started)
-    caller.cancel()
-    release.set()
-
-    with pytest.raises(asyncio.CancelledError) as exc_info:
-        await asyncio.wait_for(caller, timeout=1)
-
-    assert exc_info.value.__cause__ is worker_error
-
-
-@pytest.mark.asyncio
-async def test_runtime_key_delivery_keeps_worker_process_control_over_caller_cancel() -> (
-    None
-):
-    class WorkerShutdown(BaseException):
-        pass
-
-    started = threading.Event()
-    release = threading.Event()
-    shutdown = WorkerShutdown("controlled worker shutdown")
-
-    def operation() -> _RuntimeKeyDeliveryOutcome:
-        started.set()
-        assert release.wait(timeout=2)
-        return _RuntimeKeyDeliveryOutcome(
-            result=None,
-            receipt=None,
-            error=shutdown,
-            traceback=shutdown.__traceback__,
-        )
-
-    caller = asyncio.create_task(
-        AgentManagementRuntime()._run_runtime_key_delivery(operation)
-    )
-    await _wait_for_thread_event(started)
-    caller.cancel()
-    release.set()
-
-    with pytest.raises(WorkerShutdown) as exc_info:
-        await asyncio.wait_for(caller, timeout=1)
 
     assert exc_info.value is shutdown
 

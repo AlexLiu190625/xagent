@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 
 import pytest
@@ -15,6 +16,10 @@ from xagent.web.models.user import User
 from xagent.web.services.agent_management import (
     AgentCreateSpec,
     AgentManagementRuntime,
+    _RuntimeKeyDeliveryOutcome,
+)
+from xagent.web.services.api_keys import (
+    RuntimeKeyReceipt,
 )
 
 from ..conftest import (
@@ -384,8 +389,30 @@ async def test_cancel_after_committed_rotation_revokes_the_undelivered_exact_key
     target = await runtime.create_agent(
         user_id=user_id,
         is_admin=is_admin,
-        spec=_create_spec("cancel committed rotation", generate_runtime_key=False),
+        spec=_create_spec("cancel committed rotation"),
     )
+    db = _direct_db_session()
+    try:
+        db.add(
+            AgentApiKey(
+                agent_id=target.agent.id,
+                key_prefix="SECOND",
+                key_hash="second-active-key-hash",
+            )
+        )
+        db.commit()
+        previous_keys = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == target.agent.id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .all()
+        )
+        previous_key_ids = {int(row.id) for row in previous_keys}
+        assert len(previous_key_ids) == 2
+    finally:
+        db.close()
     committed = threading.Event()
     release = threading.Event()
     captured: dict[str, str] = {}
@@ -411,68 +438,83 @@ async def test_cancel_after_committed_rotation_revokes_the_undelivered_exact_key
 
     db = _direct_db_session()
     try:
-        row = (
-            db.query(AgentApiKey)
-            .filter(
-                AgentApiKey.agent_id == target.agent.id,
-                AgentApiKey.key_prefix == captured["prefix"],
-            )
-            .one()
+        rows = {
+            int(row.id): row
+            for row in db.query(AgentApiKey)
+            .filter(AgentApiKey.agent_id == target.agent.id)
+            .all()
+        }
+        assert all(rows[key_id].revoked_at is None for key_id in previous_key_ids)
+        undelivered = next(
+            row for row in rows.values() if row.key_prefix == captured["prefix"]
         )
-        assert row.revoked_at is not None
+        assert undelivered.revoked_at is not None
     finally:
         db.close()
 
 
 @pytest.mark.asyncio
-async def test_exact_compensation_does_not_revoke_a_later_concurrent_key(
+async def test_later_rotation_fence_prevents_stale_compensation_from_restoring_old_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from xagent.web.services import agent_management
 
     user_id, is_admin = _admin_identity()
+    runtime = AgentManagementRuntime()
+    target = await runtime.create_agent(
+        user_id=user_id,
+        is_admin=is_admin,
+        spec=_create_spec("later rotation fence"),
+    )
+    db = _direct_db_session()
+    try:
+        original_key = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == target.agent.id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .one()
+        )
+        original_key_id = int(original_key.id)
+    finally:
+        db.close()
+
     committed = threading.Event()
     release = threading.Event()
-    captured: dict[str, int | str] = {}
-    original_create = (
-        agent_management.AgentManagementService.create_agent_with_optional_key
-    )
+    captured: dict[str, str] = {}
+    original_rotate = agent_management.AgentManagementService.generate_agent_runtime_key
+    rotate_calls = 0
 
-    def pause_after_commit(service, *args, **kwargs):  # type: ignore[no-untyped-def]
-        agent, response = original_create(service, *args, **kwargs)
+    def pause_first_after_commit(service, *args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal rotate_calls
+        rotate_calls += 1
+        response = original_rotate(service, *args, **kwargs)
         assert response is not None
-        captured["agent_id"] = int(agent.id)
-        captured["prefix"] = response.key_prefix
-        committed.set()
-        assert release.wait(timeout=2)
-        return agent, response
+        if rotate_calls == 1:
+            captured["first_prefix"] = response.key_prefix
+            committed.set()
+            assert release.wait(timeout=2)
+        return response
 
     monkeypatch.setattr(
         agent_management.AgentManagementService,
-        "create_agent_with_optional_key",
-        pause_after_commit,
+        "generate_agent_runtime_key",
+        pause_first_after_commit,
     )
     operation: asyncio.Task[object] = asyncio.create_task(
-        AgentManagementRuntime().create_agent(
+        runtime.rotate_agent_runtime_key(
             user_id=user_id,
-            is_admin=is_admin,
-            spec=_create_spec("exact later key"),
+            agent_id=target.agent.id,
         )
     )
     assert await asyncio.to_thread(committed.wait, 2)
 
-    db = _direct_db_session()
-    try:
-        db.add(
-            AgentApiKey(
-                agent_id=int(captured["agent_id"]),
-                key_prefix="LATER1",
-                key_hash="later-key-hash",
-            )
-        )
-        db.commit()
-    finally:
-        db.close()
+    later = await AgentManagementRuntime().rotate_agent_runtime_key(
+        user_id=user_id,
+        agent_id=target.agent.id,
+    )
+    assert later is not None
 
     operation.cancel()
     release.set()
@@ -484,13 +526,212 @@ async def test_exact_compensation_does_not_revoke_a_later_concurrent_key(
         rows = {
             row.key_prefix: row
             for row in db.query(AgentApiKey)
-            .filter(AgentApiKey.agent_id == captured["agent_id"])
+            .filter(AgentApiKey.agent_id == target.agent.id)
             .all()
         }
-        assert rows[str(captured["prefix"])].revoked_at is not None
-        assert rows["LATER1"].revoked_at is None
+        original = next(row for row in rows.values() if int(row.id) == original_key_id)
+        assert original.revoked_at is not None
+        assert rows[captured["first_prefix"]].revoked_at is not None
+        assert rows[later.key_prefix].revoked_at is None
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_rotation_mapping_failure_restores_the_previous_active_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A post-commit worker failure leaves the last delivered key usable."""
+
+    from xagent.web.services import agent_management
+
+    user_id, is_admin = _admin_identity()
+    runtime = AgentManagementRuntime()
+    target = await runtime.create_agent(
+        user_id=user_id,
+        is_admin=is_admin,
+        spec=_create_spec("rotation mapping restore"),
+    )
+    db = _direct_db_session()
+    try:
+        previous_key = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == target.agent.id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .one()
+        )
+        previous_key_id = int(previous_key.id)
+    finally:
+        db.close()
+
+    mapping_error = RuntimeError("runtime key mapping failed")
+    monkeypatch.setattr(
+        agent_management,
+        "_runtime_key_snapshot",
+        lambda _response: (_ for _ in ()).throw(mapping_error),
+    )
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await runtime.rotate_agent_runtime_key(
+            user_id=user_id,
+            agent_id=target.agent.id,
+        )
+    assert exc_info.value is mapping_error
+
+    db = _direct_db_session()
+    try:
+        rows = (
+            db.query(AgentApiKey)
+            .filter(AgentApiKey.agent_id == target.agent.id)
+            .order_by(AgentApiKey.id)
+            .all()
+        )
+        assert len(rows) == 2
+        assert (
+            next(row for row in rows if int(row.id) == previous_key_id).revoked_at
+            is None
+        )
+        assert (
+            next(row for row in rows if int(row.id) != previous_key_id).revoked_at
+            is not None
+        )
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_compensation_cancellation_is_not_swallowed_after_worker_settles(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = AgentManagementRuntime()
+    started = threading.Event()
+    release = threading.Event()
+
+    def delayed_compensation(_receipt: RuntimeKeyReceipt) -> None:
+        started.set()
+        assert release.wait(timeout=2)
+
+    monkeypatch.setattr(runtime, "_compensate_runtime_key_sync", delayed_compensation)
+    compensation = asyncio.create_task(
+        runtime._compensate_runtime_key(
+            RuntimeKeyReceipt(key_id=1, agent_id=2, key_prefix="ABC123")
+        )
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    compensation.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await asyncio.wait_for(compensation, timeout=2)
+
+
+@pytest.mark.asyncio
+async def test_delivery_error_keeps_its_existing_cause_when_compensation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = AgentManagementRuntime()
+    upstream_error = ValueError("response mapper root cause")
+    delivery_error = RuntimeError("response mapping failed")
+    delivery_error.__cause__ = upstream_error
+    compensation_error = RuntimeError("compensation database unavailable")
+    receipt = RuntimeKeyReceipt(key_id=1, agent_id=2, key_prefix="ABC123")
+
+    async def fail_compensation(_receipt: RuntimeKeyReceipt) -> BaseException:
+        return compensation_error
+
+    monkeypatch.setattr(runtime, "_compensate_runtime_key", fail_compensation)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await runtime._run_runtime_key_delivery(
+            lambda: _RuntimeKeyDeliveryOutcome(
+                result=None,
+                receipt=receipt,
+                error=delivery_error,
+                traceback=delivery_error.__traceback__,
+            )
+        )
+
+    assert exc_info.value is delivery_error
+    assert exc_info.value.__cause__ is upstream_error
+    assert any(
+        "compensation database unavailable" in note for note in exc_info.value.__notes__
+    )
+
+
+@pytest.mark.asyncio
+async def test_runtime_key_delivery_keeps_worker_error_as_cancellation_cause() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    worker_error = RuntimeError("post-commit mapper failed")
+
+    def operation() -> _RuntimeKeyDeliveryOutcome[object]:
+        started.set()
+        assert release.wait(timeout=2)
+        return _RuntimeKeyDeliveryOutcome(
+            result=None,
+            receipt=None,
+            error=worker_error,
+            traceback=worker_error.__traceback__,
+        )
+
+    caller = asyncio.create_task(
+        AgentManagementRuntime()._run_runtime_key_delivery(operation)
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    caller.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError) as exc_info:
+        await asyncio.wait_for(caller, timeout=1)
+
+    assert exc_info.value.__cause__ is worker_error
+
+
+@pytest.mark.asyncio
+async def test_runtime_key_delivery_keeps_process_control_over_cancellation() -> None:
+    class WorkerShutdown(BaseException):
+        pass
+
+    started = threading.Event()
+    release = threading.Event()
+    shutdown = WorkerShutdown("controlled worker shutdown")
+
+    def operation() -> _RuntimeKeyDeliveryOutcome[object]:
+        started.set()
+        assert release.wait(timeout=2)
+        return _RuntimeKeyDeliveryOutcome(
+            result=None,
+            receipt=None,
+            error=shutdown,
+            traceback=shutdown.__traceback__,
+        )
+
+    caller = asyncio.create_task(
+        AgentManagementRuntime()._run_runtime_key_delivery(operation)
+    )
+    assert await asyncio.to_thread(started.wait, 2)
+    caller.cancel()
+    release.set()
+
+    with pytest.raises(WorkerShutdown) as exc_info:
+        await asyncio.wait_for(caller, timeout=1)
+
+    assert exc_info.value is shutdown
+
+
+def test_already_revoked_runtime_key_compensation_is_an_audited_noop(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger="xagent.web.services.agent_management")
+    result = AgentManagementRuntime._compensate_runtime_key_sync(
+        RuntimeKeyReceipt(key_id=999999, agent_id=2, key_prefix="ABC123")
+    )
+
+    assert result.new_key_revoked == 0
+    assert result.prior_keys_restored == 0
+    assert "new_key_revoked=0" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -850,7 +1091,7 @@ async def test_cancellation_stays_primary_when_runtime_key_compensation_fails(
     )
     monkeypatch.setattr(
         runtime,
-        "_revoke_runtime_key_sync",
+        "_compensate_runtime_key_sync",
         lambda _receipt: (_ for _ in ()).throw(compensation_error),
     )
     operation: asyncio.Task[object] = asyncio.create_task(
@@ -901,7 +1142,7 @@ async def test_compensation_process_control_wins_over_caller_cancellation(
     )
     monkeypatch.setattr(
         runtime,
-        "_revoke_runtime_key_sync",
+        "_compensate_runtime_key_sync",
         lambda _receipt: (_ for _ in ()).throw(shutdown),
     )
     operation: asyncio.Task[object] = asyncio.create_task(
