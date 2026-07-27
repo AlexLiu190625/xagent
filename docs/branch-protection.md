@@ -13,7 +13,11 @@ blocks something urgent.
 > with it. See "The cost: merging is no longer admin-only" below -- that
 > trade-off is the most important thing on this page.
 >
-> Still pending: `CI Summary` as a required status check, and `enforce_admins`.
+> The required contexts are `Migrations Summary` and `CI Summary`. Both are
+> summary jobs rather than individual job names, for a reason worth reading:
+> see "Required contexts must be summary jobs" below.
+>
+> Still pending: `enforce_admins`.
 
 ## What is being protected against
 
@@ -38,11 +42,20 @@ the merge is clean. Only the graph check sees the problem.
 | --- | --- | --- |
 | `alembic-check` pre-commit hook | multiple heads, duplicate revision IDs, unresolvable `down_revision` | locally on commit, and on every PR via the `pre-commit` job |
 | Merge queue | the same defects, evaluated against the tree that will actually land | at merge time |
-| `Test SQLite/PostgreSQL Migrations` | a real `alembic upgrade head` on both backends | required status check |
+| `Test SQLite/PostgreSQL Migrations` | a real `alembic upgrade head` on both backends | reported via the required `Migrations Summary` context |
 | `ci.yml` on `push: main` | post-merge detection if something slipped through | red build on `main`, emailed to the pusher |
 
 `scripts/check_alembic_heads.sh` is the single implementation of the graph
-check. Its regression coverage lives in
+check. It became the single implementation when
+`.github/scripts/refresh_migration_prs.py` was removed: that script existed to
+merge `main` into open migration PRs while `strict` was on, and along the way it
+hand-parsed `down_revision` out of the source with `ast` and re-derived the head
+graph without going through Alembic. A second implementation that can disagree
+with the authoritative one, while posting a status that looks just as official,
+is not extra protection -- it is a second answer that can quietly contradict the
+real one.
+
+Its regression coverage lives in
 `tests/migrations/test_check_alembic_heads.py`, which injects each defect into a
 throwaway Alembic environment and asserts the script rejects it. Those negative
 tests exist because a check that cannot fail is worse than no check: it reads as
@@ -143,7 +156,7 @@ What still holds `main`:
 | | |
 | --- | --- |
 | `required_pull_request_reviews` | no change to `main` outside a PR; 1 approval, conversations resolved |
-| required status checks | `Test SQLite/PostgreSQL Migrations` |
+| required status checks | `Migrations Summary`, `CI Summary` |
 | merge queue | validates the combined tree before it lands |
 | `allow_force_pushes: false` | history cannot be rewritten |
 | `allow_deletions: false` | `main` cannot be deleted |
@@ -156,6 +169,58 @@ If narrowing merge permission back to a named set ever becomes necessary, the
 lever is `restrictions`, and restoring it means giving up the queue. `strict` is
 not that lever -- it governs whether a PR must be up to date, not who may merge
 or whether a PR is required at all.
+
+## Required contexts must be summary jobs
+
+**GitHub reports a skipped job to branch protection as a success.** Successful
+check statuses are `success`, `skipped` and `neutral`. GitHub's
+"Troubleshooting required status checks" spells out both ways a job gets there:
+skipped by a conditional -- "the job reports 'Success'"; skipped because a job in
+its `needs` failed -- "the dependent job is skipped and may not block merging",
+with the documented fix being to use `always()`.
+
+So requiring an individual job name is not fail-closed. If whatever the
+migration jobs depend on fails, they are skipped, their contexts go green, and
+the merge lands with no migration test having run. Only a workflow that never
+triggers at all stays pending and blocks -- which is a different case, and the
+reason a missing `merge_group:` trigger stalls the queue instead of waving it
+through.
+
+The required contexts are therefore the two summary jobs:
+
+| context | job | covers |
+| --- | --- | --- |
+| `Migrations Summary` | `test-migrations.yml` | `detect-migration-changes`, `Test SQLite Migrations`, `Test PostgreSQL Migrations` |
+| `CI Summary` | `ci.yml` | `pre-commit`, `pytest-fast`, `pytest-fast-deepdoc`, `pytest-slow`, `e2e`, `frontend-build`, `prepare-deepdoc-cache` |
+
+Both declare `if: always()` and fail unless every job they gather reports
+`success` -- a gathered job that is `skipped`, `failure` or `cancelled` fails
+the summary. **`always()` is load-bearing.** Removing it looks harmless and
+silently restores the hole, which is why it carries a comment in the workflow
+saying so.
+
+### Gate at the step, not at the job
+
+Failing on `skipped` only works because **no gathered job is ever skipped**.
+`Test SQLite Migrations` and `Test PostgreSQL Migrations` carry no job-level
+`if:` at all. When `detect-migration-changes` reports `should-test=false`, the
+jobs still run; it is their *steps* that are gated, and the job reports
+`success` in a few seconds. A PR that touches no migration still gets a green
+`Migrations Summary` -- this page's own PR is an example.
+
+That is a deliberate property and an easy one to destroy. Moving the condition
+up to the job level looks like an optimisation -- same outcome, one less job
+started -- but it turns every non-migration PR into a skipped required job,
+which reports success, which is the exact hole the summary exists to close.
+**If a job must be conditional, gate its steps.**
+
+Adding a job to either workflow does not automatically gate on it. It has to be
+added to that summary's `needs` and to its `check_job` list, or it is advisory
+only.
+
+This is also why `CI Summary` had to become required at all: before it did, only
+the migration checks gated, and a PR with red `pytest`, `e2e` or `pre-commit`
+was mergeable. Three open PRs were in exactly that state when it was switched on.
 
 ## Gotchas worth knowing
 
