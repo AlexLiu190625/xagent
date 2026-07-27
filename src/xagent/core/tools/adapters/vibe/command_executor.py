@@ -5,10 +5,12 @@ Framework wrapper around the pure command executor tool
 
 import asyncio
 import logging
+from dataclasses import replace
 from typing import Any, Mapping, Optional, Type
 
 from pydantic import BaseModel, Field
 
+from ....execution_scope import ExecutionScope
 from ....workspace import TaskWorkspace
 from ...core.command_executor import (
     CommandExecutorCore,
@@ -17,6 +19,7 @@ from ...core.command_executor import (
 from .base import AbstractBaseTool, ToolCategory, ToolVisibility
 from .sandboxed_tool.sandbox_config import (
     SandboxConfig,
+    get_sandbox_config,
     sandbox_config,
     set_instance_sandbox_config,
 )
@@ -44,6 +47,7 @@ class CommandExecutorTool(AbstractBaseTool):
     def __init__(
         self,
         workspace: Optional[TaskWorkspace] = None,
+        *,
         restrict_paths: bool = False,
     ) -> None:
         self._visibility = ToolVisibility.PUBLIC
@@ -54,7 +58,7 @@ class CommandExecutorTool(AbstractBaseTool):
     def from_execution_scope(
         cls,
         workspace: TaskWorkspace,
-        execution_scope: Any | None,
+        execution_scope: ExecutionScope | None,
     ) -> "CommandExecutorTool":
         """Build a workspace tool with the scope-owned command path policy."""
         return cls(
@@ -88,14 +92,11 @@ class CommandExecutorTool(AbstractBaseTool):
                 "workspace; external allowed directories are read-only. This is "
                 "a cooperative, best-effort check, not an operating-system "
                 "security boundary; unknown commands are not classified. "
-                "Restricted commands use Bash syntax; sh, dash, and zsh "
-                "subprocess dialects are rejected. "
-                "Runtime-generated file arguments (for example xargs), active "
-                "globs, implicit shell initialization, unsupported control "
-                "structures such as unparsable for/case forms, and scripts "
-                "that cannot be inspected are rejected. Enumerate concrete "
-                "paths, split unsupported control flow into separate tool "
-                "calls, and use recognized commands when path checks matter."
+                "This initial policy recognizes only statically parsed Bash "
+                "syntax and a documented set of command operands; runtime "
+                "expansion, unsupported syntax, implicit shell inputs, and "
+                "unknown commands may remain unclassified. Enumerate concrete "
+                "paths and use recognized commands when path checks matter."
             )
         lines.extend(
             [
@@ -169,14 +170,17 @@ class CommandExecutorToolForBasic(CommandExecutorTool):
     def __init__(
         self,
         workspace: Optional[TaskWorkspace] = None,
+        *,
         restrict_paths: bool = False,
     ) -> None:
         super().__init__(workspace=workspace, restrict_paths=restrict_paths)
+        base_config = get_sandbox_config(self) or SandboxConfig()
+        packages = base_config.packages
+        if restrict_paths and "bashlex>=0.18" not in packages:
+            packages = (*packages, "bashlex>=0.18")
         set_instance_sandbox_config(
             self,
-            SandboxConfig(
-                packages=("bashlex>=0.18",) if restrict_paths else (),
-            ),
+            replace(base_config, packages=packages),
         )
 
     @property

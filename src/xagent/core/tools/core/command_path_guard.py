@@ -1156,17 +1156,16 @@ class WorkspaceCommandPathGuard:
 
         descriptor: int | None = None
         try:
-            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
             descriptor = os.open(script_path, flags)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
+            ):
+                raise CommandPathViolation(access="read", path=script_path)
             with os.fdopen(descriptor, "rb") as script_file:
                 descriptor = None
-                metadata = os.fstat(script_file.fileno())
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
-                ):
-                    raise CommandPathViolation(access="read", path=script_path)
                 raw_script = script_file.read(_MAX_INSPECTED_SCRIPT_BYTES + 1)
             if len(raw_script) > _MAX_INSPECTED_SCRIPT_BYTES:
                 raise CommandPathViolation(access="read", path=script_path)
