@@ -41,6 +41,7 @@ from .conftest import (
     _direct_db_session,
     _install_one_slot_queue_pool,
     _register_second_user,
+    _share_guest_id,
     client,
 )
 
@@ -254,6 +255,7 @@ def _create_public_task_file(
     *,
     owner_id: int,
     agent_id: int,
+    guest_id: str,
     filename: str = "shared-note.txt",
     content: bytes = b"hello from public task",
 ) -> str:
@@ -275,6 +277,9 @@ def _create_public_task_file(
             agent_config={
                 "auth_mode": "share",
                 "share_agent_id": agent_id,
+                # Per-guest isolation (#973): the task must carry the accessing
+                # guest's id or get_task_for_share_context rejects it.
+                "guest_id": guest_id,
             },
         )
         db.add(task)
@@ -1706,16 +1711,17 @@ def test_share_public_file_preview_requires_valid_share_token() -> None:
         share_enabled=True,
         share_token=share_token,
     )
+    guest_headers = _authenticate_share_guest(share_token)
+    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
+        guest_id=_share_guest_id(access_token),
     )
 
     preview_without_token = client.get(f"/api/files/public/preview/{file_id}")
     assert preview_without_token.status_code == 403, preview_without_token.text
 
-    guest_headers = _authenticate_share_guest(share_token)
-    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
     preview_with_token = client.get(
         f"/api/files/public/preview/{file_id}",
         params={"token": access_token},
@@ -1747,14 +1753,14 @@ def test_share_public_file_download_requires_valid_share_token() -> None:
         share_enabled=True,
         share_token=share_token,
     )
+    guest_headers = _authenticate_share_guest(share_token)
+    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
     file_id = _create_public_task_file(
         owner_id=owner_id,
         agent_id=agent_id,
+        guest_id=_share_guest_id(access_token),
         filename="download-note.txt",
     )
-
-    guest_headers = _authenticate_share_guest(share_token)
-    access_token = guest_headers["Authorization"].replace("Bearer ", "", 1)
 
     download_with_token = client.get(
         f"/api/files/public/download/{file_id}",

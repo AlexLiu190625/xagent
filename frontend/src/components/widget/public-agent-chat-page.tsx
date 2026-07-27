@@ -46,6 +46,82 @@ interface PublicConversationContentProps {
   agentLogo: string | null
   agentDescription: string | null
   suggestedPrompts: string[]
+  onAuthInvalidated?: () => void
+}
+
+// WS-close reasons that mean "this session isn't usable as-is" rather than a
+// transport failure — used to distinguish a recoverable auth/isolation denial
+// (recoverable by dropping the stale task/token and starting fresh) from a
+// generic connection drop (must not wipe the session). #973. NOT the
+// non-recoverable causes: "Share link is unavailable" is emitted when the owner
+// disabled the link, unpublished the agent/workforce, or the channel
+// mismatches, so treating it as recoverable would trigger a pointless clear +
+// re-auth round-trip that still lands on the terminal error.
+//   - "Access denied for this guest": the per-guest isolation denial — a
+//     returning visitor's persisted taskId belongs to another (or a pre-#973)
+//     guest. Backend HTTPException.detail surfaced as event.reason on a 4003.
+//   - "Access denied": use-websocket.ts's fallback when a 4003 carries no
+//     reason.
+//   - "Invalid share token": the persisted guest JWT no longer validates
+//     server-side (e.g. a mid-session secret rotation; plain expiry is already
+//     caught proactively at mount by isShareTokenExpired). Recovery here drops
+//     only the stale *task-id* key and lands the visitor on the start screen;
+//     the token/auth-blob key is cleared separately by onAuthInvalidated when
+//     the first send hits a task-create 401, which then re-auths. Without this,
+//     the WS-resume path would strand the visitor with no send to trigger that.
+const SHARE_ACCESS_DENIED_REASONS = new Set([
+  "Access denied for this guest",
+  "Access denied",
+  "Invalid share token",
+])
+
+// localStorage.removeItem can throw in restricted contexts (private mode /
+// sandboxed iframe). Every share-recovery path that clears a key must survive
+// that so the in-memory session reset still proceeds. #973.
+const safeRemoveItem = (key: string) => {
+  try {
+    localStorage.removeItem(key)
+  } catch {
+    // Non-fatal: the caller's state reset recovers the session regardless.
+  }
+}
+
+// Decode a JWT's payload segment WITHOUT verifying its signature — a read-only
+// liveness/identity pre-filter for client-side routing only. Every security
+// decision (signature, expiry-on-use, isolation) stays server-side. Returns
+// null on any malformed input so callers fall back to their safe default. #973.
+const decodeJwtClaims = (token: string): Record<string, unknown> | null => {
+  try {
+    const payload = token.split(".")[1]
+    if (!payload) {
+      return null
+    }
+    const claims = JSON.parse(atob(payload.replace(/-/g, "+").replace(/_/g, "/")))
+    return typeof claims === "object" && claims !== null ? claims : null
+  } catch {
+    return null
+  }
+}
+
+// A persisted guest JWT past its exp (30-day TTL) is dead on arrival: reusing
+// it fails every request, and over the WS-resume path it strands the visitor on
+// a session that can never re-auth on its own. Treat an expired token as absent
+// so the mount re-auths fresh, instead of relying on a failed connect to
+// recover. Any parse failure falls through to the server (which fails closed).
+const isShareTokenExpired = (token: string): boolean => {
+  const exp = decodeJwtClaims(token)?.exp
+  return typeof exp === "number" && exp * 1000 <= Date.now()
+}
+
+// The server-minted guest_id (#973) that scopes every piece of per-guest client
+// state. It lives only inside the signed guest JWT, so derive it here to scope
+// the persisted task-id key: a task-id minted under guest A can then never be
+// read back under guest B's token (two-tab race, post-expiry re-auth, or a
+// pre-#973 legacy token), which would otherwise leave that task permanently
+// unreachable. Falls back to a stable bucket on any decode failure.
+const shareGuestIdFromToken = (token: string): string => {
+  const guestId = decodeJwtClaims(token)?.guest_id
+  return typeof guestId === "string" && guestId ? guestId : "anonymous"
 }
 
 type PublicMessageConfig = Record<string, unknown>
@@ -61,8 +137,9 @@ function PublicConversationContent({
   agentLogo,
   agentDescription,
   suggestedPrompts,
+  onAuthInvalidated,
 }: PublicConversationContentProps) {
-  const { state, dispatch, sendMessage, setTaskId } = useApp()
+  const { state, dispatch, sendMessage, setTaskId, connectionError } = useApp()
   const { t } = useI18n()
   const [createTaskError, setCreateTaskError] = useState<string | null>(null)
   const [draftMessage, setDraftMessage] = useState("")
@@ -70,7 +147,11 @@ function PublicConversationContent({
   const [isBootstrappingTask, setIsBootstrappingTask] = useState(false)
   const [hasResolvedStoredTask, setHasResolvedStoredTask] = useState(false)
   const storageKey = authMode === "share"
-    ? `${authMode}_task_${routeToken}_${agentId ?? "anonymous"}`
+    // Scope the persisted task-id by guest_id (decoded from the guest JWT) so a
+    // task minted under one guest is never read back under another's token — a
+    // two-tab race, a post-expiry re-auth, or a pre-#973 legacy token would
+    // otherwise leave that task permanently unreachable. #973.
+    ? `${authMode}_task_${routeToken}_${agentId ?? "anonymous"}_${shareGuestIdFromToken(accessToken)}`
     // Include the owner id so two different widgets embedded on the same site
     // (which share a guest id) don't collide on one stored task. A workforce
     // widget has no agentId, so fall back to its workforceId.
@@ -107,8 +188,29 @@ function PublicConversationContent({
       return
     }
 
-    localStorage.removeItem(storageKey)
+    safeRemoveItem(storageKey)
   }, [hasResolvedStoredTask, state.taskId, storageKey])
+
+  // Backstop recovery for a share session the server rejects mid-flight. The
+  // guest-scoped storageKey above already makes a *foreign* taskId structurally
+  // unreadable, so this covers the residual case where an otherwise-valid
+  // session is denied at the WS layer — e.g. "Invalid share token" from a
+  // mid-session secret rotation. The backend accepts the socket before its
+  // auth check, so this close arrives as a real 4003 with its reason intact
+  // (a pre-accept close would collapse to a bare 403 the browser reports as
+  // code 1006). Drop the stale taskId and fall back to the start screen instead
+  // of stranding the visitor on an error. Scoped to access-denied reasons so a
+  // transient transport drop never wipes a live session. #973.
+  useEffect(() => {
+    if (authMode !== "share" || !connectionError || !state.taskId) {
+      return
+    }
+    if (!SHARE_ACCESS_DENIED_REASONS.has(connectionError.message)) {
+      return
+    }
+    safeRemoveItem(storageKey)
+    setTaskId(null, { navigate: false })
+  }, [authMode, connectionError, state.taskId, storageKey, setTaskId])
 
   const handleSend = useCallback(async (
     message: string,
@@ -165,6 +267,14 @@ function PublicConversationContent({
       })
 
       if (!response.ok) {
+        // A share task-create carries no task id, so 401/403 here means the
+        // guest token itself is no longer valid (rotated/disabled link, or a
+        // legacy token rejected post-#973). Drop the persisted token and force
+        // a fresh auth rather than leaving the visitor on a dead session.
+        if (authMode === "share" && (response.status === 401 || response.status === 403)) {
+          safeRemoveItem(storageKey)
+          onAuthInvalidated?.()
+        }
         const errorData = await response.json().catch(() => null)
         const errorMessage = errorData?.detail || t("widgetChat.messages.error_init")
         setCreateTaskError(errorMessage)
@@ -209,7 +319,7 @@ function PublicConversationContent({
       setIsBootstrappingTask(false)
       throw error
     }
-  }, [accessToken, agentId, agentLogo, agentName, dispatch, publicApiPrefix, sendMessage, setTaskId, state.taskId, t, workforceId])
+  }, [accessToken, agentId, agentLogo, agentName, authMode, dispatch, onAuthInvalidated, publicApiPrefix, sendMessage, setTaskId, state.taskId, storageKey, t, workforceId])
 
   useEffect(() => {
     if (state.taskId || createTaskError) {
@@ -312,10 +422,89 @@ export function PublicAgentChatPage({
   const [isInitializing, setIsInitializing] = useState(true)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const [authResult, setAuthResult] = useState<PublicAuthResult | null>(null)
+  // Bumped to force a fresh /api/share/auth when a persisted guest token turns
+  // out to be invalid (see onAuthInvalidated below).
+  const [reauthNonce, setReauthNonce] = useState(0)
+
+  // The guest token is minted server-side and carries the per-guest isolation
+  // credential (#973). Persist it per share link and REUSE it across reloads
+  // instead of re-authing every mount: re-authing would mint a new guest_id
+  // each time, so a returning visitor's own tasks would fail the per-guest
+  // check. Widget keeps its old behavior (its guest_id is client-supplied).
+  const shareAuthStorageKey = authMode === "share" ? `share_auth_${routeToken}` : null
+
+  const onAuthInvalidated = useCallback(() => {
+    if (shareAuthStorageKey) {
+      safeRemoveItem(shareAuthStorageKey)
+    }
+    setAuthResult(null)
+    setPublicAccessToken(null)
+    setIsInitializing(true)
+    setReauthNonce((n) => n + 1)
+  }, [shareAuthStorageKey])
 
   useEffect(() => {
+    const persistShareAuth = (data: PublicAuthResult) => {
+      if (!shareAuthStorageKey) {
+        return
+      }
+      try {
+        localStorage.setItem(shareAuthStorageKey, JSON.stringify(data))
+      } catch {
+        // Non-fatal: without persistence the visitor simply re-auths (and gets
+        // a new guest session) on the next reload.
+      }
+    }
+
+    const readPersistedShareAuth = (): PublicAuthResult | null => {
+      if (!shareAuthStorageKey) {
+        return null
+      }
+      try {
+        const raw = localStorage.getItem(shareAuthStorageKey)
+        if (!raw) {
+          return null
+        }
+        const parsed: unknown = JSON.parse(raw)
+        // Reject anything that isn't a well-shaped auth blob so a corrupt or
+        // cross-version localStorage entry falls back to a clean re-auth rather
+        // than flowing malformed values downstream. agent_id/workforce_id are
+        // display/routing hints (never the isolation credential — that lives in
+        // the signed guest JWT), but keep their optional-number contract intact.
+        const isNullableNumber = (value: unknown) =>
+          value === undefined || value === null || typeof value === "number"
+        if (
+          !parsed
+          || typeof parsed !== "object"
+          || typeof (parsed as PublicAuthResult).access_token !== "string"
+          || !(parsed as PublicAuthResult).access_token
+          || !isNullableNumber((parsed as PublicAuthResult).agent_id)
+          || !isNullableNumber((parsed as PublicAuthResult).workforce_id)
+        ) {
+          return null
+        }
+        // Drop an expired token here so the mount re-auths fresh instead of
+        // reusing a dead credential (which the WS-resume path can't recover
+        // from on its own). #973.
+        if (isShareTokenExpired((parsed as PublicAuthResult).access_token)) {
+          return null
+        }
+        return parsed as PublicAuthResult
+      } catch {
+        return null
+      }
+    }
+
     const initPublicChat = async () => {
       try {
+        const persisted = readPersistedShareAuth()
+        if (persisted) {
+          setAuthResult(persisted)
+          setPublicAccessToken(persisted.access_token ?? null)
+          setErrorMessage(null)
+          return
+        }
+
         const authPath = authMode === "share" ? "/api/share/auth" : "/api/widget/auth"
         const authPayload = authMode === "share"
           ? { share_token: routeToken }
@@ -340,6 +529,7 @@ export function PublicAgentChatPage({
         }
 
         const authData = await authResponse.json()
+        persistShareAuth(authData)
         setAuthResult(authData)
         setPublicAccessToken(authData.access_token ?? null)
         setErrorMessage(null)
@@ -354,7 +544,7 @@ export function PublicAgentChatPage({
 
     initPublicChat()
     return () => setPublicAccessToken(null)
-  }, [authMode, embedTicket, widgetKey, normalizedGuestId, routeToken, searchAgentId, t])
+  }, [authMode, embedTicket, widgetKey, normalizedGuestId, routeToken, searchAgentId, shareAuthStorageKey, reauthNonce, t])
 
   const publicAccessToken = authResult?.access_token ?? ""
 
@@ -411,6 +601,7 @@ export function PublicAgentChatPage({
         agentLogo={resolvedAuthResult.agent_logo ?? null}
         agentDescription={resolvedAuthResult.agent_description ?? null}
         suggestedPrompts={resolvedAuthResult.suggested_prompts ?? []}
+        onAuthInvalidated={onAuthInvalidated}
       />
     </AppProvider>
   )

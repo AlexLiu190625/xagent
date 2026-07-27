@@ -31,6 +31,7 @@ from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
+from jose import jwt
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
@@ -50,6 +51,7 @@ from xagent.web.api.v1 import v1_router
 from xagent.web.api.v1.errors import V1ApiError, v1_api_error_handler
 from xagent.web.api.widget import widget_router
 from xagent.web.api.workforces import router as workforces_router
+from xagent.web.auth_config import JWT_ALGORITHM, JWT_SECRET_KEY
 from xagent.web.models.database import Base, get_db, get_engine
 from xagent.web.services.a2a_protocol import (
     A2AApiError,
@@ -282,6 +284,24 @@ def _direct_db_session() -> Session:
     non-NULL after DELETE). Always close the session in a try/finally.
     """
     return next(get_db())
+
+
+def _share_guest_id(token: str) -> str:
+    """Decode a share guest JWT and return its server-minted ``guest_id`` (#973).
+
+    Uses ``jose`` (a declared dependency) to match production, not PyJWT (only a
+    transitive one). Accepts either a raw access token or a full
+    ``Authorization: Bearer <token>`` header value, so callers holding either
+    shape reuse one decode path. Asserts the id is a non-empty string, letting
+    tests compare against *this guest's* minted id rather than merely checking
+    one is present.
+    """
+    payload = jwt.decode(
+        token.removeprefix("Bearer "), JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM]
+    )
+    guest_id = payload["guest_id"]
+    assert isinstance(guest_id, str) and guest_id.strip()
+    return guest_id
 
 
 def _install_one_slot_queue_pool(

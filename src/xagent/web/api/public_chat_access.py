@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -80,12 +81,33 @@ class PublicChatAccessContext:
 class ShareChatAccessContext:
     """Validated share-guest identity: exactly one of ``agent`` /
     ``workforce`` is set, depending on which kind of share token the guest
-    presented. ``user`` is always the owner the shared entity runs as."""
+    presented. ``user`` is always the owner the shared entity runs as.
+
+    ``guest_id`` is the per-guest isolation credential (#973): a share link is
+    public, so many anonymous visitors share the same owner + entity id, and
+    ``guest_id`` is the only thing distinguishing one visitor's tasks from
+    another's. It is server-minted at auth time and always non-empty here —
+    :func:`get_share_chat_user` rejects tokens that lack it, so downstream
+    equality checks never compare ``None == None``.
+    """
 
     user: User
     share_token: str
+    guest_id: str
     agent: Agent | None = None
     workforce: Workforce | None = None
+
+
+def mint_share_guest_id() -> str:
+    """Mint a server-owned, high-entropy guest id for a new share session.
+
+    Unlike the widget path (which signs a client-supplied ``guest_id``), share
+    links have no secondary credential such as an embed ticket or widget key,
+    so the guest id is the *sole* isolation credential. It must therefore be
+    generated server-side and never accepted from the client — otherwise a
+    visitor could impersonate another by choosing their id.
+    """
+    return secrets.token_urlsafe(32)
 
 
 class _ChatAccessContext(Protocol):
@@ -328,12 +350,20 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         share_agent_id = payload.get("share_agent_id")
         share_workforce_id = payload.get("share_workforce_id")
         share_token = payload.get("share_token")
+        guest_id = payload.get("guest_id")
 
         if auth_mode != "share":
             raise ValueError("Invalid token payload")
         if not isinstance(user_id, int):
             raise ValueError("Invalid token payload")
         if not isinstance(share_token, str) or not share_token:
+            raise ValueError("Invalid share token payload")
+        # Fail closed on tokens minted before per-guest isolation (#973): they
+        # carry no guest_id, so they cannot be scoped to a single guest and are
+        # rejected rather than silently granted the old no-isolation behavior.
+        # A whitespace-only id is treated as absent (it could never match a
+        # server-minted token_urlsafe value and must not pass as a real guest).
+        if not isinstance(guest_id, str) or not guest_id.strip():
             raise ValueError("Invalid share token payload")
 
         user = db.query(User).filter(User.id == user_id).first()
@@ -348,7 +378,10 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
                 expected_share_token=share_token,
             )
             return ShareChatAccessContext(
-                user=user, share_token=share_token, workforce=workforce
+                user=user,
+                share_token=share_token,
+                guest_id=guest_id,
+                workforce=workforce,
             )
 
         if not isinstance(share_agent_id, int):
@@ -360,7 +393,9 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
             user_id,
             expected_share_token=share_token,
         )
-        return ShareChatAccessContext(user=user, share_token=share_token, agent=agent)
+        return ShareChatAccessContext(
+            user=user, share_token=share_token, guest_id=guest_id, agent=agent
+        )
     except Exception as exc:
         logger.error("Share chat token validation error: %s", exc)
         if isinstance(exc, HTTPException):
@@ -480,6 +515,23 @@ def get_task_for_public_context(
     return task
 
 
+def _require_share_guest_owns_task(
+    task: Task, access_context: ShareChatAccessContext
+) -> None:
+    """Per-guest isolation gate (#973), shared by both share branches.
+
+    The share-entity checks in each branch only pin a task to the shared
+    agent/workforce, which every guest of the link has in common. This binds
+    it to the specific guest that created it. ``access_context.guest_id`` is
+    guaranteed non-empty by :func:`get_share_chat_user`, so a task carrying no
+    guest_id (or a different one) fails this strict-inequality compare.
+
+    Precondition: callers validate ``task.agent_config`` is a dict first.
+    """
+    if task.agent_config.get("guest_id") != access_context.guest_id:
+        raise HTTPException(status_code=403, detail="Access denied for this guest")
+
+
 def _get_task_for_workforce_share_context(
     db: Session, task_id: int, access_context: ShareChatAccessContext
 ) -> Task:
@@ -509,6 +561,9 @@ def _get_task_for_workforce_share_context(
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     if int(task.agent_config.get("share_workforce_id") or 0) != workforce_id:
         raise HTTPException(status_code=403, detail="Share link is unavailable")
+    # A valid workforce-share JWT + a matching WorkforceRun is not enough:
+    # both hold for *any* guest of the same workforce (#973).
+    _require_share_guest_owns_task(task, access_context)
     workforce_run_id = task.agent_config.get("workforce_run_id")
     if not isinstance(workforce_run_id, int):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
@@ -553,6 +608,9 @@ def get_task_for_share_context(
         raise HTTPException(status_code=403, detail="Share link is unavailable")
     if int(task.agent_config.get("share_agent_id") or 0) != int(agent.id):
         raise HTTPException(status_code=403, detail="Share link is unavailable")
+    # The checks above only pin the task to the shared agent, which every
+    # guest of this link has in common (#973).
+    _require_share_guest_owns_task(task, access_context)
     return task
 
 
@@ -885,6 +943,11 @@ async def _create_workforce_share_chat_task(
         extra_agent_config={
             "auth_mode": "share",
             "share_workforce_id": int(workforce.id),
+            # Per-guest isolation (#973). extra_agent_config is overlaid under
+            # the snapshot-built config, which never sets guest_id, so this is
+            # preserved; the run-critical workforce_run_id is added by the
+            # snapshot config and still wins on any collision.
+            "guest_id": access_context.guest_id,
         },
     )
     task = result.task
@@ -923,10 +986,13 @@ async def create_share_chat_task(
     elif agent_id != share_agent_id:
         raise HTTPException(status_code=403, detail="Share link is unavailable")
 
+    # Server keys are assigned AFTER copying the client dict so they win on
+    # collision — a client-supplied guest_id can never override the
+    # server-minted one carried on the validated access context (#973).
     agent_config = dict(request.agent_config or {})
-    agent_config.pop("guest_id", None)
     agent_config["auth_mode"] = "share"
     agent_config["share_agent_id"] = share_agent_id
+    agent_config["guest_id"] = access_context.guest_id
 
     task_title = request.title or task_description or "Untitled Task"
     if task_title and len(task_title) > 50:
@@ -1098,16 +1164,31 @@ async def share_chat_websocket_endpoint(
     token: str = Query(..., description="Authentication token"),
 ) -> None:
     """Serve share websocket chat with per-message revalidation."""
+    # Accept the handshake *before* the auth/access checks. uvicorn only
+    # preserves a close code + reason on the wire for a *post-accept* close: a
+    # pre-accept ``websocket.close()`` is collapsed into a bare HTTP 403 with an
+    # empty body, so the browser sees a rejected Upgrade (onerror + onclose
+    # code=1006, reason="") and the code/reason never arrive. Accepting first
+    # makes the 4003 below a real close whose reason reaches the client — the
+    # same post-accept behavior the per-message revalidation loop already relies
+    # on — so the frontend can tell an access denial (e.g. a returning guest
+    # whose persisted task belongs to another guest, or a pre-#973 legacy task)
+    # apart from a transport failure and recover (#973).
+    await websocket.accept()
     try:
         principal = await _authorize_share_chat_websocket(
             token=token,
             task_id=task_id,
         )
+    except HTTPException as exc:
+        await websocket.close(code=4003, reason=exc.detail)
+        return
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
         return
 
-    await manager.connect(websocket, task_id)
+    # Already accepted above; register the live socket without re-accepting.
+    manager.register_connection(websocket, task_id)
 
     try:
         await handle_status_request(websocket, task_id, principal)

@@ -17,6 +17,9 @@ class _SingleMessageWebSocket:
     def __init__(self, message: dict[str, object]) -> None:
         self._message = json.dumps(message)
         self._received = False
+        # The share endpoint accepts the handshake before its auth check (#973),
+        # so a post-accept close preserves the code/reason on the wire.
+        self.accept = AsyncMock()
         self.close = AsyncMock()
 
     async def receive_text(self) -> str:
@@ -298,9 +301,18 @@ async def test_public_access_websocket_initial_auth_failure_stays_4001(
             token="share-token",
         )
 
-    websocket.close.assert_awaited_once_with(
-        code=4001,
-        reason="Authentication required",
-    )
+    if endpoint_kind == "public":
+        websocket.close.assert_awaited_once_with(
+            code=4001,
+            reason="Authentication required",
+        )
+    else:
+        # The share endpoint accepts before auth and maps an auth-time
+        # HTTPException to a 4003 close carrying the real reason, so the frontend
+        # recovery flow can act on it (#973). Only non-HTTP failures stay 4001.
+        websocket.close.assert_awaited_once_with(
+            code=4003,
+            reason="Invalid token",
+        )
     connection_manager.connect.assert_not_awaited()
     connection_manager.disconnect.assert_not_called()

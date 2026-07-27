@@ -144,6 +144,7 @@ async def test_share_upload_releases_access_session_before_durable_io(
         context = ShareChatAccessContext(
             user=user,
             share_token="share",
+            guest_id="guest-upload",
             workforce=object(),  # type: ignore[arg-type]
         )
         response = await upload_share_chat_files(
