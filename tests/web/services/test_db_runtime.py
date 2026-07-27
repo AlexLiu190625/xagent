@@ -188,6 +188,30 @@ async def test_await_task_settlement_returns_late_result_and_cancellation() -> N
 
 
 @pytest.mark.asyncio
+async def test_await_task_settlement_preserves_child_process_control_after_caller_cancelled() -> (
+    None
+):
+    """A raw child control signal must not be rewritten as caller cancellation."""
+
+    class WorkerShutdown(BaseException):
+        pass
+
+    child: asyncio.Future[None] = asyncio.get_running_loop().create_future()
+    waiter = asyncio.create_task(await_task_settlement(child))  # type: ignore[arg-type]
+    await asyncio.sleep(0)
+    waiter.cancel()
+    await asyncio.sleep(0)
+
+    shutdown = WorkerShutdown("controlled test shutdown")
+    child.set_exception(shutdown)
+
+    with pytest.raises(WorkerShutdown) as exc_info:
+        await asyncio.wait_for(waiter, timeout=1)
+
+    assert exc_info.value is shutdown
+
+
+@pytest.mark.asyncio
 async def test_drain_async_task_propagates_cancellation_after_child_settles() -> None:
     release = asyncio.Event()
     finished = asyncio.Event()
