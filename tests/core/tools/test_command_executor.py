@@ -9,15 +9,18 @@ from unittest.mock import Mock
 
 import pytest
 
+from xagent.core.execution_scope import ExecutionScope
 from xagent.core.tools.adapters.vibe.command_executor import (
     CommandExecutorArgs,
     CommandExecutorResult,
     CommandExecutorTool,
+    CommandExecutorToolForBasic,
 )
 from xagent.core.tools.core.command_executor import (
     CommandExecutorCore,
     execute_command,
     execute_script,
+    execution_scope_restricts_command_paths,
 )
 from xagent.core.tools.core.command_path_guard import (
     CommandPathViolation,
@@ -82,6 +85,28 @@ class TestCommandExecutorTool:
         assert "Use concrete paths" in description
         assert "Only search for files when no usable path was provided" in description
         assert "Do not run broad recursive searches from `/`" in description
+
+    def test_restricted_description_matches_foundation_capabilities(self, tmp_path):
+        workspace = Mock()
+        workspace.resolve_path.return_value = tmp_path
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        description = tool.description
+
+        assert "unknown commands are not classified" in description
+        assert "sh, dash, and zsh subprocess dialects are rejected" not in description
+        assert "unparsable for/case forms" not in description
+        assert "scripts that cannot be inspected are rejected" not in description
+
+    @pytest.mark.parametrize(
+        "tool_type",
+        [CommandExecutorTool, CommandExecutorToolForBasic],
+    )
+    def test_restrict_paths_is_keyword_only(self, tool_type, tmp_path):
+        workspace = TaskWorkspace("task", str(tmp_path))
+
+        with pytest.raises(TypeError):
+            tool_type(workspace, True)
 
     def test_simple_echo_command(self, command_executor):
         """Test simple echo command"""
@@ -580,19 +605,20 @@ class TestScopedCommandPathGuard:
         else:
             os.mkfifo(script_path)
 
-        read_paths = []
+        read_attempted = False
 
-        def record_read(path, *args, **kwargs):
-            read_paths.append(path)
-            return ""
+        def record_read(*args, **kwargs):
+            nonlocal read_attempted
+            read_attempted = True
+            raise AssertionError("non-regular script content must not be read")
 
-        monkeypatch.setattr(type(script_path), "read_text", record_read)
+        monkeypatch.setattr(os, "fdopen", record_read)
         guard = WorkspaceCommandPathGuard(workspace)
 
         with pytest.raises(CommandPathViolation):
             guard._inspect_script_file("sed", str(script_path), workspace.output_dir)
 
-        assert read_paths == []
+        assert read_attempted is False
 
     def test_script_inspection_rejects_oversized_regular_file(
         self, scoped_command_workspace
@@ -654,6 +680,20 @@ class TestScopedCommandPathGuard:
 
         assert result["success"] is False
         assert result["return_code"] == 126
+
+    def test_policy_rejection_does_not_expose_absolute_path(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        tool = CommandExecutorTool(workspace=workspace, restrict_paths=True)
+
+        result = tool.run_json_sync(
+            {"command": f"cat {shlex.quote(str(sibling_file))}"}
+        )
+
+        assert result["return_code"] == 126
+        assert "outside allowed read paths" in result["error"]
+        assert str(sibling_file) not in result["error"]
 
     def test_rejects_bare_cd_before_relative_file_access(
         self, scoped_command_workspace, monkeypatch
@@ -806,6 +846,70 @@ class TestCommandExecutorCore:
         # With shell=False
         result = executor.execute_command(["echo", "test"], shell=False)
         assert result["success"] is True
+
+    def test_scope_policy_switch_fails_loudly_for_wrong_scope_shape(self):
+        assert (
+            execution_scope_restricts_command_paths(
+                ExecutionScope(restrict_command_paths=True)
+            )
+            is True
+        )
+
+        with pytest.raises(AttributeError):
+            execution_scope_restricts_command_paths(Mock(spec=[]))
+
+    def test_missing_policy_bash_returns_stable_rejection(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        monkeypatch.setenv("PATH", "")
+        executor = CommandExecutorCore.for_workspace(workspace, restrict_paths=True)
+
+        result = executor.execute_command("printf allowed")
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert result["error"] == (
+            "Command rejected by workspace path policy: "
+            "restricted command execution requires a Bash executable"
+        )
+
+    def test_guarded_shell_ignores_bash_environment_hooks(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        bash_env = workspace.output_dir / "bash-env"
+        bash_env.write_text("printf injected", encoding="utf-8")
+        monkeypatch.setenv("BASH_ENV", str(bash_env))
+        monkeypatch.setenv("BASH_FUNC_probe%%", "() { :; }")
+        executor = CommandExecutorCore.for_workspace(workspace, restrict_paths=True)
+
+        result = executor.execute_command("true")
+
+        assert result["success"] is True
+        assert result["output"] == ""
+
+    def test_missing_parser_dependency_has_actionable_error(
+        self, scoped_command_workspace, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        real_import = __import__
+
+        def reject_guard_import(name, *args, **kwargs):
+            if name.endswith("command_path_guard"):
+                raise ModuleNotFoundError(
+                    "No module named 'bashlex'",
+                    name="bashlex",
+                )
+            return real_import(name, *args, **kwargs)
+
+        monkeypatch.setattr("builtins.__import__", reject_guard_import)
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"restricted command execution requires bashlex>=0\.18",
+        ):
+            CommandExecutorCore.for_workspace(workspace, restrict_paths=True)
 
 
 class TestConvenienceFunctions:

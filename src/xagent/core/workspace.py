@@ -782,11 +782,11 @@ class TaskWorkspace:
         except (OSError, RuntimeError) as exc:
             raise ValueError(f"Failed to resolve path {file_path}") from exc
 
-        if abs_path == workspace_abs or abs_path.is_relative_to(workspace_abs):
+        if abs_path.is_relative_to(workspace_abs):
             return abs_path
 
         for allowed_abs in allowed_external_abs:
-            if abs_path == allowed_abs or abs_path.is_relative_to(allowed_abs):
+            if abs_path.is_relative_to(allowed_abs):
                 logger.debug(
                     f"Accessing external file via allowed directory: {abs_path}"
                 )
