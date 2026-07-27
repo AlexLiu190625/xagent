@@ -35,6 +35,7 @@ from .api_keys import (
     KeyRotationConflict,
     RuntimeKeyDeliveryError,
     RuntimeKeyReceipt,
+    acquire_runtime_key_transition_fence,
 )
 from .db_runtime import (
     await_task_settlement,
@@ -937,7 +938,7 @@ class AgentManagementRuntime:
     def _run_runtime_key_session_operation(
         operation: Callable[
             [AgentManagementService],
-            _RuntimeKeyDeliveryOutcome[_RuntimeKeyResultT],
+            _RuntimeKeyResultT | None,
         ],
     ) -> _RuntimeKeyDeliveryOutcome[_RuntimeKeyResultT]:
         """Detach runtime-key outcomes before closing their worker Session.
@@ -956,7 +957,13 @@ class AgentManagementRuntime:
             db = SessionLocal()
             service = AgentManagementService(db)
             try:
-                outcome = operation(service)
+                result = operation(service)
+                outcome = _RuntimeKeyDeliveryOutcome(
+                    result=result,
+                    receipt=service.runtime_key_receipt,
+                    error=None,
+                    traceback=None,
+                )
             except RuntimeKeyDeliveryError as exc:
                 outcome = _RuntimeKeyDeliveryOutcome(
                     result=None,
@@ -1055,7 +1062,7 @@ class AgentManagementRuntime:
             def create_attempt(
                 service: AgentManagementService,
                 candidate: ApiKeyCandidate | None = candidate,
-            ) -> _RuntimeKeyDeliveryOutcome[AgentCreateSnapshot]:
+            ) -> AgentCreateSnapshot:
                 agent, key_response = service.create_agent_with_optional_key(
                     user_id=user_id,
                     name=spec.name,
@@ -1073,14 +1080,9 @@ class AgentManagementRuntime:
                 agent_snapshot = _agent_response_snapshot(
                     service.store.agent_to_response_dict(agent)
                 )
-                return _RuntimeKeyDeliveryOutcome(
-                    result=AgentCreateSnapshot(
-                        agent=agent_snapshot,
-                        api_key=_runtime_key_snapshot(key_response),
-                    ),
-                    receipt=service.runtime_key_receipt,
-                    error=None,
-                    traceback=None,
+                return AgentCreateSnapshot(
+                    agent=agent_snapshot,
+                    api_key=_runtime_key_snapshot(key_response),
                 )
 
             outcome = AgentManagementRuntime._run_runtime_key_session_operation(
@@ -1195,18 +1197,13 @@ class AgentManagementRuntime:
             def rotate_attempt(
                 service: AgentManagementService,
                 candidate: ApiKeyCandidate = candidate,
-            ) -> _RuntimeKeyDeliveryOutcome[RuntimeKeySnapshot]:
+            ) -> RuntimeKeySnapshot | None:
                 response = service.generate_agent_runtime_key(
                     user_id=user_id,
                     agent_id=agent_id,
                     runtime_key_candidate=candidate,
                 )
-                return _RuntimeKeyDeliveryOutcome(
-                    result=_runtime_key_snapshot(response),
-                    receipt=service.runtime_key_receipt,
-                    error=None,
-                    traceback=None,
-                )
+                return _runtime_key_snapshot(response)
 
             outcome = AgentManagementRuntime._run_runtime_key_session_operation(
                 rotate_attempt
@@ -1268,41 +1265,51 @@ class AgentManagementRuntime:
         SessionLocal = get_session_local()
         with SessionLocal() as db:
             now = datetime.now(timezone.utc)
-            revoke_result = cast(
-                "CursorResult[Any]",
-                db.execute(
-                    update(AgentApiKey)
-                    .where(
-                        AgentApiKey.id == receipt.key_id,
-                        AgentApiKey.agent_id == receipt.agent_id,
-                        AgentApiKey.key_prefix == receipt.key_prefix,
-                        AgentApiKey.revoked_at.is_(None),
-                    )
-                    .values(revoked_at=now, updated_at=now)
-                    .execution_options(synchronize_session=False)
-                ),
+            agent_exists = acquire_runtime_key_transition_fence(
+                db,
+                receipt.agent_id,
             )
-            new_key_revoked = max(int(revoke_result.rowcount or 0), 0)
+            new_key_revoked = 0
             prior_keys_restored = 0
-            if (
-                new_key_revoked == 1
-                and receipt.replaced_key_ids
-                and receipt.rotation_timestamp is not None
-            ):
-                restore_result = cast(
+            if agent_exists:
+                revoke_result = cast(
                     "CursorResult[Any]",
                     db.execute(
                         update(AgentApiKey)
                         .where(
+                            AgentApiKey.id == receipt.key_id,
                             AgentApiKey.agent_id == receipt.agent_id,
-                            AgentApiKey.id.in_(receipt.replaced_key_ids),
-                            AgentApiKey.revoked_at == receipt.rotation_timestamp,
+                            AgentApiKey.key_prefix == receipt.key_prefix,
+                            AgentApiKey.revoked_at.is_(None),
+                            AgentApiKey.paused_at.is_(None),
                         )
-                        .values(revoked_at=None, updated_at=now)
+                        .values(revoked_at=now, updated_at=now)
                         .execution_options(synchronize_session=False)
                     ),
                 )
-                prior_keys_restored = max(int(restore_result.rowcount or 0), 0)
+                new_key_revoked = max(int(revoke_result.rowcount or 0), 0)
+                if (
+                    new_key_revoked == 1
+                    and receipt.replaced_key_ids
+                    and receipt.rotation_timestamp is not None
+                ):
+                    restore_result = cast(
+                        "CursorResult[Any]",
+                        db.execute(
+                            update(AgentApiKey)
+                            .where(
+                                AgentApiKey.agent_id == receipt.agent_id,
+                                AgentApiKey.id.in_(receipt.replaced_key_ids),
+                                AgentApiKey.revoked_at == receipt.rotation_timestamp,
+                            )
+                            .values(revoked_at=None, updated_at=now)
+                            .execution_options(synchronize_session=False)
+                        ),
+                    )
+                    prior_keys_restored = max(
+                        int(restore_result.rowcount or 0),
+                        0,
+                    )
             db.commit()
 
         result = _RuntimeKeyCompensationResult(

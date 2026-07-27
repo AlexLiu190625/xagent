@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from datetime import datetime, timezone
 
 import pytest
 from sqlalchemy import event, text
@@ -19,6 +20,7 @@ from xagent.web.services.agent_management import (
     _RuntimeKeyDeliveryOutcome,
 )
 from xagent.web.services.api_keys import (
+    AgentApiKeyService,
     RuntimeKeyReceipt,
 )
 
@@ -535,6 +537,136 @@ async def test_later_rotation_fence_prevents_stale_compensation_from_restoring_o
         assert rows[later.key_prefix].revoked_at is None
     finally:
         db.close()
+
+
+@pytest.mark.asyncio
+async def test_sqlite_runtime_key_transition_fence_serializes_transactions() -> None:
+    """The transition fence must serialize writers before either snapshots keys."""
+
+    from xagent.web.models.database import get_session_local
+    from xagent.web.services.api_keys import acquire_runtime_key_transition_fence
+
+    user_id, is_admin = _admin_identity()
+    target = await AgentManagementRuntime().create_agent(
+        user_id=user_id,
+        is_admin=is_admin,
+        spec=_create_spec("sqlite transition fence", generate_runtime_key=False),
+    )
+    observer = _direct_db_session()
+    try:
+        original_updated_at = observer.get(Agent, target.agent.id).updated_at
+    finally:
+        observer.close()
+    SessionLocal = get_session_local()
+    first_acquired = threading.Event()
+    release_first = threading.Event()
+    second_started = threading.Event()
+    second_acquired = threading.Event()
+
+    def hold_first_fence() -> None:
+        with SessionLocal() as db:
+            assert acquire_runtime_key_transition_fence(db, target.agent.id)
+            first_acquired.set()
+            assert release_first.wait(timeout=2)
+            db.commit()
+
+    def acquire_second_fence() -> None:
+        assert first_acquired.wait(timeout=2)
+        with SessionLocal() as db:
+            second_started.set()
+            assert acquire_runtime_key_transition_fence(db, target.agent.id)
+            second_acquired.set()
+            db.commit()
+
+    first = asyncio.create_task(asyncio.to_thread(hold_first_fence))
+    assert await asyncio.to_thread(first_acquired.wait, 2)
+    second = asyncio.create_task(asyncio.to_thread(acquire_second_fence))
+    assert await asyncio.to_thread(second_started.wait, 2)
+    try:
+        assert not await asyncio.to_thread(second_acquired.wait, 0.1)
+    finally:
+        release_first.set()
+
+    await asyncio.wait_for(first, timeout=2)
+    await asyncio.wait_for(second, timeout=2)
+    assert second_acquired.is_set()
+    observer = _direct_db_session()
+    try:
+        assert observer.get(Agent, target.agent.id).updated_at == original_updated_at
+    finally:
+        observer.close()
+
+
+@pytest.mark.asyncio
+async def test_paused_later_state_blocks_runtime_key_compensation() -> None:
+    """Compensation must not replace an operator's later pause decision."""
+
+    user_id, is_admin = _admin_identity()
+    target = await AgentManagementRuntime().create_agent(
+        user_id=user_id,
+        is_admin=is_admin,
+        spec=_create_spec("paused compensation fence"),
+    )
+
+    db = _direct_db_session()
+    try:
+        previous_key = (
+            db.query(AgentApiKey)
+            .filter(
+                AgentApiKey.agent_id == target.agent.id,
+                AgentApiKey.revoked_at.is_(None),
+            )
+            .one()
+        )
+        previous_key_id = int(previous_key.id)
+        key_service = AgentApiKeyService(db)
+        key_service.rotate_key_for_runtime_delivery(
+            target.agent.id,
+            candidate=("xag_PAUSED_" + "p" * 32, "PAUSED", "paused-hash"),
+        )
+        receipt = key_service.runtime_key_receipt
+        assert receipt is not None
+        paused_at = datetime.now(timezone.utc)
+        new_key = db.get(AgentApiKey, receipt.key_id)
+        assert new_key is not None
+        new_key.paused_at = paused_at
+        db.commit()
+    finally:
+        db.close()
+
+    result = AgentManagementRuntime._compensate_runtime_key_sync(receipt)
+
+    assert result.new_key_revoked == 0
+    assert result.prior_keys_restored == 0
+    db = _direct_db_session()
+    try:
+        previous_key = db.get(AgentApiKey, previous_key_id)
+        new_key = db.get(AgentApiKey, receipt.key_id)
+        assert previous_key is not None
+        assert new_key is not None
+        assert previous_key.revoked_at is not None
+        assert new_key.revoked_at is None
+        assert new_key.paused_at is not None
+    finally:
+        db.close()
+
+
+def test_runtime_key_session_operation_wraps_success_with_service_receipt() -> None:
+    """The Session boundary owns the common detached success envelope."""
+
+    expected = object()
+    receipt = RuntimeKeyReceipt(key_id=1, agent_id=2, key_prefix="ABC123")
+
+    def operation(service) -> object:  # type: ignore[no-untyped-def]
+        service.runtime_key_receipt = receipt
+        return expected
+
+    outcome = AgentManagementRuntime._run_runtime_key_session_operation(operation)
+
+    assert outcome.result is expected
+    assert outcome.receipt is receipt
+    assert outcome.error is None
+    assert outcome.traceback is None
 
 
 @pytest.mark.asyncio

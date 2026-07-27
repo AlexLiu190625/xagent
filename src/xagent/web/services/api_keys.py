@@ -8,8 +8,8 @@ from datetime import datetime, timezone
 from types import TracebackType
 from typing import Any, Callable, NamedTuple, TypeVar
 
-from sqlalchemy import func, or_, select
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func, or_, select, text
+from sqlalchemy.exc import IntegrityError, NoResultFound
 from sqlalchemy.orm import Session, joinedload
 
 from ...core.utils.api_key import ApiKeyKind, generate_api_key
@@ -85,6 +85,29 @@ class KeyRotationConflict(RuntimeError):
     """A key-prefix conflict that was rolled back before delivery."""
 
 
+def acquire_runtime_key_transition_fence(db: Session, agent_id: int) -> bool:
+    """Serialize runtime-key transitions for one agent in every database.
+
+    PostgreSQL and MySQL use a row-level ``FOR UPDATE`` lock. SQLite ignores
+    that clause, so it instead uses a no-op write to acquire its write lock
+    before callers snapshot key rows. The raw SQLite statement deliberately
+    bypasses the ``Agent.updated_at`` ORM ``onupdate`` handler.
+
+    Returns ``False`` when the agent no longer exists.
+    """
+
+    normalized_agent_id = int(agent_id)
+    agent_row = select(Agent.id).where(Agent.id == normalized_agent_id)
+    if db.get_bind().dialect.name == "sqlite":
+        db.execute(
+            text("UPDATE agents SET id = id WHERE id = :agent_id"),
+            {"agent_id": normalized_agent_id},
+        )
+    else:
+        agent_row = agent_row.with_for_update()
+    return db.execute(agent_row).scalar_one_or_none() is not None
+
+
 def _key_status(row: AgentApiKey) -> str:
     if row.revoked_at is not None:
         return "revoked"
@@ -125,12 +148,11 @@ class AgentApiKeyService:
         staged transition after the flush succeeds.
         """
         self.runtime_key_receipt = None
-        # Serialize legacy single-key rotations for this agent. Multi-key
-        # additions that commit after this snapshot are later state and must
-        # not be revoked or restored by this transition.
-        self.db.execute(
-            select(Agent.id).where(Agent.id == int(agent_id)).with_for_update()
-        ).scalar_one()
+        # Serialize legacy single-key rotations for this agent before taking
+        # the active-key snapshot. Multi-key additions that commit after this
+        # fence are later state and must not be revoked by this transition.
+        if not acquire_runtime_key_transition_fence(self.db, agent_id):
+            raise NoResultFound(f"Agent {int(agent_id)} does not exist.")
         replaced_key_ids = tuple(
             int(row_id)
             for (row_id,) in (
