@@ -54,10 +54,21 @@ def set_knowledge_base_team_hooks(
     _deleted_hook = deleted
 
 
+def has_knowledge_base_visibility_hook() -> bool:
+    """Return whether the application installed a team visibility hook."""
+
+    return _visibility_hook is not None
+
+
 def visible_team_knowledge_bases(
     db: Session | None, user_id: int
 ) -> list[KnowledgeBaseAccess]:
-    """Return visible team KBs; hooks must open a session when ``db`` is None."""
+    """Return visible team KBs through the application-owned hook.
+
+    Callers may invoke the hook from a worker thread. When ``db`` is ``None``,
+    the hook must create, use, and close its own thread-confined session and
+    must not depend on event-loop thread-local state.
+    """
     if _visibility_hook is None:
         return []
     return list(_visibility_hook(db, int(user_id)))

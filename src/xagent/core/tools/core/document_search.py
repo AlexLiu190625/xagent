@@ -30,15 +30,23 @@ async def _list_visible_collections(
     if user_id is None or is_admin:
         return result
 
+    from ....web.services.db_runtime import run_db_io_cancellation_safe
     from ....web.services.knowledge_base_team_scope import (
+        has_knowledge_base_visibility_hook,
         visible_team_knowledge_bases,
     )
+
+    if not has_knowledge_base_visibility_hook():
+        return result
 
     collections_by_name = {
         collection.name: collection for collection in result.collections
     }
     refs_by_owner: dict[int, list] = {}
-    for ref in visible_team_knowledge_bases(None, int(user_id)):
+    team_refs = await run_db_io_cancellation_safe(
+        lambda: visible_team_knowledge_bases(None, int(user_id))
+    )
+    for ref in team_refs:
         refs_by_owner.setdefault(ref.storage_user_id, []).append(ref)
     for storage_user_id, refs in refs_by_owner.items():
         owner_result = await list_collections(user_id=storage_user_id, is_admin=False)
