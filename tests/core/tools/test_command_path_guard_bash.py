@@ -183,6 +183,27 @@ class TestScopedCommandPathGuardBash:
         assert result["success"] is True
         assert result["output"] == "$HOME `printf not-executed`\n"
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cat <<'EOF'\r\nbody\r\nEOF\r\nprintf AFTER\r\n",
+            "cat <<'EOF'\nbody\r\nEOF\r\nprintf AFTER\n",
+        ],
+    )
+    def test_crlf_heredoc_syntax_fails_closed(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot safely parse shell command",
+        ):
+            guard.validate(command)
+
     def test_quoted_heredoc_normalization_does_not_mask_later_commands(
         self,
         scoped_command_workspace,
@@ -895,6 +916,26 @@ class TestScopedCommandPathGuardBash:
         executor = _guarded_executor(workspace)
 
         result = executor.execute_command(["./malformed-shebang"], shell=False)
+
+        assert result["return_code"] == 126
+        assert "command denied by policy" in result["error"]
+        assert "command validation failed" not in result["error"]
+
+    @pytest.mark.parametrize("missing_flag", ["O_NONBLOCK", "O_NOFOLLOW"])
+    def test_direct_script_inspection_requires_secure_open_flags(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+        missing_flag,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script = workspace.output_dir / "direct-script"
+        script.write_text("#!/usr/bin/env bash\nprintf safe\n", encoding="utf-8")
+        script.chmod(0o755)
+        monkeypatch.delattr(os, missing_flag)
+        executor = _guarded_executor(workspace)
+
+        result = executor.execute_command(["./direct-script"], shell=False)
 
         assert result["return_code"] == 126
         assert "command denied by policy" in result["error"]

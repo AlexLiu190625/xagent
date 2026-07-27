@@ -84,6 +84,17 @@ _TIME_KEYWORD_PATTERN = re.compile(
 _POLICY_TIME_WRAPPER = "__t_"
 
 
+def _secure_script_open_flags() -> int:
+    """Return mandatory flags for race-resistant, non-blocking script reads."""
+    nonblocking = getattr(os, "O_NONBLOCK", None)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if not isinstance(nonblocking, int) or not isinstance(nofollow, int):
+        raise CommandPolicyViolation(
+            "secure direct-script inspection is unavailable on this platform"
+        )
+    return os.O_RDONLY | nonblocking | nofollow
+
+
 def _is_unquoted_on_current_line(source: str, position: int) -> bool:
     """Return whether ``position`` is outside quotes on its physical line."""
     line_start = source.rfind("\n", 0, position) + 1
@@ -932,8 +943,7 @@ class WorkspaceCommandPathGuard:
 
         descriptor: int | None = None
         try:
-            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
-            descriptor = os.open(script_path, flags)
+            descriptor = os.open(script_path, _secure_script_open_flags())
             metadata = os.fstat(descriptor)
             if (
                 not stat.S_ISREG(metadata.st_mode)
