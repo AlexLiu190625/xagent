@@ -40,6 +40,9 @@ def _command_rejected_result(reason: object) -> Dict[str, Any]:
             reason.path,
         )
         public_reason = f"path is outside allowed {reason.access} paths"
+    elif isinstance(reason, CommandPolicyViolation):
+        logger.warning("CommandExecutor: Rejected command: %s", reason)
+        public_reason = "command denied by policy"
     else:
         logger.warning("CommandExecutor: Rejected command: %s", reason)
         public_reason = str(reason)

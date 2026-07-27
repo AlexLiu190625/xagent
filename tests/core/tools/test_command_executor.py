@@ -24,6 +24,7 @@ from xagent.core.tools.core.command_executor import (
 from xagent.core.tools.core.command_policy import (
     CommandPathViolation,
     CommandPolicyGuard,
+    CommandPolicyViolation,
 )
 
 
@@ -301,6 +302,30 @@ class TestCommandPolicyFoundation:
         assert "/private/sibling" not in result["error"]
         run.assert_not_called()
 
+    def test_generic_policy_rejection_redacts_internal_reason(
+        self,
+        monkeypatch,
+        caplog,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+        guard.validate.side_effect = CommandPolicyViolation(
+            "parser rejected /private/sibling/secret.txt"
+        )
+        run = Mock()
+        monkeypatch.setattr(
+            "xagent.core.tools.core.command_executor.subprocess.run",
+            run,
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_command("true")
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert result["error"].endswith("command denied by policy")
+        assert "/private/sibling" not in result["error"]
+        assert "/private/sibling/secret.txt" in caplog.text
+        run.assert_not_called()
+
     def test_unexpected_policy_failure_is_fail_closed(self, monkeypatch):
         guard = Mock(spec=CommandPolicyGuard)
         guard.validate.side_effect = RuntimeError("internal parser detail")
@@ -335,6 +360,46 @@ class TestCommandPolicyFoundation:
         assert result["return_code"] == 126
         assert "script execution is unavailable" in result["error"]
         create_tempfile.assert_not_called()
+
+    def test_injected_policy_allows_shell_command_execution(self, monkeypatch):
+        guard = Mock(spec=CommandPolicyGuard)
+        completed = Mock(stdout="allowed", stderr="", returncode=0)
+        run = Mock(return_value=completed)
+        monkeypatch.setattr(
+            "xagent.core.tools.core.command_executor.subprocess.run",
+            run,
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_command("printf allowed")
+
+        guard.validate.assert_called_once_with("printf allowed")
+        guard.validate_argv.assert_not_called()
+        run.assert_called_once()
+        assert run.call_args.args[0] == "printf allowed"
+        assert run.call_args.kwargs["shell"] is True
+        assert result["success"] is True
+
+    def test_injected_policy_allows_argv_command_execution(self, monkeypatch):
+        guard = Mock(spec=CommandPolicyGuard)
+        completed = Mock(stdout="allowed", stderr="", returncode=0)
+        run = Mock(return_value=completed)
+        monkeypatch.setattr(
+            "xagent.core.tools.core.command_executor.subprocess.run",
+            run,
+        )
+        command = ["printf", "allowed"]
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        guard.validate.assert_not_called()
+        guard.validate_argv.assert_called_once_with(command)
+        run.assert_called_once()
+        assert run.call_args.args[0] == command
+        assert run.call_args.kwargs["shell"] is False
+        assert result["success"] is True
 
 
 class TestCommandExecutorCore:

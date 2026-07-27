@@ -266,6 +266,14 @@ def test_resolve_authorized_path_uses_explicit_base(workspace, monkeypatch, tmp_
     assert resolved == target.resolve()
 
 
+def test_resolve_authorized_path_rejects_relative_base(workspace):
+    with pytest.raises(ValueError, match="base_dir must be absolute"):
+        workspace.resolve_authorized_path(
+            "report.txt",
+            base_dir="relative/output",
+        )
+
+
 def test_resolve_authorized_path_can_exclude_external_roots(tmp_path):
     external = tmp_path / "external"
     external.mkdir()
@@ -367,26 +375,15 @@ def test_resolve_authorized_path_broken_external_root_stays_fail_closed(tmp_path
         )
 
 
-def test_resolve_authorized_path_normalizes_user_expansion_failures(
-    workspace, monkeypatch
-):
-    file_path = Path("~/report.txt")
-    original_expanduser = Path.expanduser
+def test_resolve_authorized_path_does_not_expand_user_home(workspace, monkeypatch):
+    monkeypatch.setenv("HOME", str(workspace.base_dir / "other-home"))
 
-    def fail_expansion(path):
-        if path == file_path:
-            raise RuntimeError("user home is unavailable")
-        return original_expanduser(path)
+    resolved = workspace.resolve_authorized_path(
+        "~/report.txt",
+        base_dir=workspace.output_dir,
+    )
 
-    monkeypatch.setattr(Path, "expanduser", fail_expansion)
-
-    with pytest.raises(ValueError, match="Failed to resolve path") as exc_info:
-        workspace.resolve_authorized_path(
-            file_path,
-            base_dir=workspace.output_dir,
-        )
-
-    assert isinstance(exc_info.value.__cause__, RuntimeError)
+    assert resolved == (workspace.output_dir / "~" / "report.txt").resolve()
 
 
 # --------------------------------------------------------------------------

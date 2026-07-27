@@ -1095,11 +1095,15 @@ class TaskWorkspace:
 
         Unlike :meth:`resolve_path`, this method never consults the Python
         process CWD. Callers must provide the filesystem base whose semantics
-        they own.
+        they own. Shell-specific expansion, including ``~``, is caller-owned.
         """
+        base_path = Path(base_dir)
+        if not base_path.is_absolute():
+            raise ValueError("base_dir must be absolute")
+
         try:
-            path = Path(file_path).expanduser()
-            candidate = path if path.is_absolute() else Path(base_dir) / path
+            path = Path(file_path)
+            candidate = path if path.is_absolute() else base_path / path
             abs_path = candidate.resolve()
             workspace_abs = self.workspace_dir.resolve()
 
