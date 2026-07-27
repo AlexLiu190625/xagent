@@ -9,6 +9,8 @@ independent implementations (``TaskWorkspace`` and ``WorkspaceFileOperations``,
 which do not delegate to one another).
 """
 
+from pathlib import Path
+
 import pytest
 
 from xagent.core.tools.core.workspace_file_tool import WorkspaceFileOperations
@@ -250,6 +252,138 @@ def test_resolve_path_accepts_traversal_into_allowed_external_dir(tmp_path):
     resolved = workspace.resolve_path("../../external/shared.txt", default_dir="output")
 
     assert resolved == target.resolve()
+
+
+def test_resolve_authorized_path_uses_explicit_base(workspace, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    target = workspace.output_dir / "report.txt"
+
+    resolved = workspace.resolve_authorized_path(
+        "report.txt",
+        base_dir=workspace.output_dir,
+    )
+
+    assert resolved == target.resolve()
+
+
+def test_resolve_authorized_path_rejects_relative_base(workspace):
+    with pytest.raises(ValueError, match="base_dir must be absolute"):
+        workspace.resolve_authorized_path(
+            "report.txt",
+            base_dir="relative/output",
+        )
+
+
+def test_resolve_authorized_path_can_exclude_external_roots(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = TaskWorkspace(
+        "task7",
+        str(tmp_path / "workspace"),
+        allowed_external_dirs=[str(external)],
+    )
+
+    assert (
+        workspace.resolve_authorized_path(
+            external / "reference.txt",
+            base_dir=workspace.output_dir,
+            include_external_dirs=True,
+        )
+        == (external / "reference.txt").resolve()
+    )
+    with pytest.raises(ValueError):
+        workspace.resolve_authorized_path(
+            external / "reference.txt",
+            base_dir=workspace.output_dir,
+            include_external_dirs=False,
+        )
+
+
+def test_resolve_authorized_path_rejects_symlink_escape(workspace, tmp_path):
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret", encoding="utf-8")
+    link = workspace.output_dir / "outside-link"
+    link.symlink_to(outside)
+
+    with pytest.raises(ValueError):
+        workspace.resolve_authorized_path(
+            link,
+            base_dir=workspace.output_dir,
+            include_external_dirs=False,
+        )
+
+
+@pytest.mark.parametrize("error_type", [OSError, RuntimeError])
+def test_resolve_authorized_path_normalizes_resolution_failures(
+    workspace, monkeypatch, error_type
+):
+    candidate = workspace.output_dir / "unresolvable"
+    original_resolve = Path.resolve
+
+    def fail_candidate(path, *args, **kwargs):
+        if path == candidate:
+            raise error_type("resolution failed")
+        return original_resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", fail_candidate)
+
+    with pytest.raises(ValueError, match="Failed to resolve path"):
+        workspace.resolve_authorized_path(
+            candidate,
+            base_dir=workspace.output_dir,
+        )
+
+
+def test_resolve_authorized_path_workspace_match_ignores_broken_external_root(
+    tmp_path,
+):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = TaskWorkspace(
+        "task7",
+        str(tmp_path / "workspace"),
+        allowed_external_dirs=[str(external)],
+    )
+    external.rmdir()
+    external.symlink_to(external.name)
+    target = workspace.output_dir / "report.txt"
+
+    assert (
+        workspace.resolve_authorized_path(
+            target,
+            base_dir=workspace.output_dir,
+        )
+        == target.resolve()
+    )
+
+
+def test_resolve_authorized_path_broken_external_root_stays_fail_closed(tmp_path):
+    external = tmp_path / "external"
+    external.mkdir()
+    workspace = TaskWorkspace(
+        "task8",
+        str(tmp_path / "workspace"),
+        allowed_external_dirs=[str(external)],
+    )
+    external.rmdir()
+    external.symlink_to(external.name)
+
+    with pytest.raises(ValueError, match="Failed to resolve path"):
+        workspace.resolve_authorized_path(
+            tmp_path / "outside" / "report.txt",
+            base_dir=workspace.output_dir,
+        )
+
+
+def test_resolve_authorized_path_does_not_expand_user_home(workspace, monkeypatch):
+    monkeypatch.setenv("HOME", str(workspace.base_dir / "other-home"))
+
+    resolved = workspace.resolve_authorized_path(
+        "~/report.txt",
+        base_dir=workspace.output_dir,
+    )
+
+    assert resolved == (workspace.output_dir / "~" / "report.txt").resolve()
 
 
 # --------------------------------------------------------------------------

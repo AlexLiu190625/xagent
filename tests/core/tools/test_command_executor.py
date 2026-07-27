@@ -5,6 +5,8 @@ Tests for CommandExecutor tool
 import os
 import shlex
 import sys
+from pathlib import Path
+from typing import Sequence
 from unittest.mock import Mock
 
 import pytest
@@ -19,6 +21,11 @@ from xagent.core.tools.core.command_executor import (
     execute_command,
     execute_script,
 )
+from xagent.core.tools.core.command_policy import (
+    CommandPathViolation,
+    CommandPolicyGuard,
+    CommandPolicyViolation,
+)
 
 
 @pytest.fixture
@@ -31,6 +38,14 @@ def command_executor():
 def temp_dir(tmp_path):
     """Create a temporary directory for file operations"""
     return str(tmp_path)
+
+
+@pytest.fixture
+def mock_run(monkeypatch):
+    run = Mock()
+    target = "xagent.core.tools.core.command_executor.subprocess.run"
+    monkeypatch.setattr(target, run)
+    return run
 
 
 class TestCommandExecutorTool:
@@ -245,6 +260,129 @@ class TestCommandExecutorTool:
         assert result.output == ""
         assert result.error == "Some error"
         assert result.return_code == 1
+
+
+class TestCommandPolicyFoundation:
+    @pytest.mark.parametrize(
+        ("command", "shell"),
+        [
+            ("cat sibling.txt", True),
+            (["cat", "sibling.txt"], False),
+        ],
+    )
+    def test_injected_policy_rejects_before_process_spawn(
+        self,
+        mock_run,
+        command,
+        shell,
+    ):
+        class RejectingGuard:
+            def validate(self, command: str) -> None:
+                raise CommandPathViolation(
+                    access="read",
+                    path=Path("/private/sibling/secret.txt"),
+                )
+
+            def validate_argv(self, argv: Sequence[str]) -> None:
+                raise CommandPathViolation(
+                    access="read",
+                    path=Path("/private/sibling/secret.txt"),
+                )
+
+        guard: CommandPolicyGuard = RejectingGuard()
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=shell,
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert result["error"] == (
+            "Command rejected by workspace path policy: "
+            "path is outside allowed read paths"
+        )
+        assert "/private/sibling" not in result["error"]
+        mock_run.assert_not_called()
+
+    def test_generic_policy_rejection_redacts_internal_reason(
+        self,
+        mock_run,
+        caplog,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+        guard.validate.side_effect = CommandPolicyViolation(
+            "parser rejected /private/sibling/secret.txt"
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_command("true")
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert result["error"].endswith("command denied by policy")
+        assert "/private/sibling" not in result["error"]
+        assert "/private/sibling/secret.txt" in caplog.text
+        mock_run.assert_not_called()
+
+    def test_unexpected_policy_failure_is_fail_closed(self, mock_run):
+        guard = Mock(spec=CommandPolicyGuard)
+        guard.validate.side_effect = RuntimeError("internal parser detail")
+
+        result = CommandExecutorCore(path_guard=guard).execute_command("true")
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert result["error"].endswith("command validation failed")
+        assert "internal parser detail" not in result["error"]
+        mock_run.assert_not_called()
+
+    def test_injected_policy_rejects_execute_script_before_tempfile_creation(
+        self,
+        monkeypatch,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+        create_tempfile = Mock()
+        monkeypatch.setattr(
+            "xagent.core.tools.core.command_executor.tempfile.NamedTemporaryFile",
+            create_tempfile,
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_script("echo unsafe")
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "script execution is unavailable" in result["error"]
+        create_tempfile.assert_not_called()
+
+    def test_injected_policy_allows_shell_command_execution(self, mock_run):
+        guard = Mock(spec=CommandPolicyGuard)
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+
+        result = CommandExecutorCore(path_guard=guard).execute_command("printf allowed")
+
+        guard.validate.assert_called_once_with("printf allowed")
+        guard.validate_argv.assert_not_called()
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == "printf allowed"
+        assert mock_run.call_args.kwargs["shell"] is True
+        assert result["success"] is True
+
+    def test_injected_policy_allows_argv_command_execution(self, mock_run):
+        guard = Mock(spec=CommandPolicyGuard)
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+        command = ["printf", "allowed"]
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        guard.validate.assert_not_called()
+        guard.validate_argv.assert_called_once_with(command)
+        mock_run.assert_called_once()
+        assert mock_run.call_args.args[0] == command
+        assert mock_run.call_args.kwargs["shell"] is False
+        assert result["success"] is True
 
 
 class TestCommandExecutorCore:

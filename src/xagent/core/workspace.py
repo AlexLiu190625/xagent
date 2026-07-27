@@ -1078,24 +1078,59 @@ class TaskWorkspace:
 
     def _resolve_allowed_absolute_path(self, path: Path) -> Path:
         """Resolve an absolute path after checking workspace allowlists."""
-        abs_path = path.resolve()
-        workspace_abs = self.workspace_dir.resolve()
-        if abs_path == workspace_abs or abs_path.is_relative_to(workspace_abs):
-            return abs_path
+        return self.resolve_authorized_path(
+            path,
+            base_dir=self.workspace_dir,
+            include_external_dirs=True,
+        )
 
-        for allowed_dir in self.allowed_external_dirs:
-            allowed_abs = allowed_dir.resolve()
-            if abs_path == allowed_abs or abs_path.is_relative_to(allowed_abs):
-                logger.debug(
-                    f"Accessing external file via allowed directory: {abs_path}"
-                )
+    def resolve_authorized_path(
+        self,
+        file_path: str | Path,
+        *,
+        base_dir: str | Path,
+        include_external_dirs: bool = True,
+    ) -> Path:
+        """Resolve one path against an explicit base and workspace allowlists.
+
+        Unlike :meth:`resolve_path`, this method never consults the Python
+        process CWD. Callers must provide the filesystem base whose semantics
+        they own. Shell-specific expansion, including ``~``, is caller-owned.
+        """
+        base_path = Path(base_dir)
+        if not base_path.is_absolute():
+            raise ValueError("base_dir must be absolute")
+
+        try:
+            path = Path(file_path)
+            candidate = path if path.is_absolute() else base_path / path
+            abs_path = candidate.resolve()
+            workspace_abs = self.workspace_dir.resolve()
+
+            if abs_path.is_relative_to(workspace_abs):
                 return abs_path
 
+            if include_external_dirs:
+                for allowed_dir in self.allowed_external_dirs:
+                    allowed_abs = allowed_dir.resolve()
+                    if abs_path.is_relative_to(allowed_abs):
+                        logger.debug(
+                            f"Accessing external file via allowed directory: {abs_path}"
+                        )
+                        return abs_path
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"Failed to resolve path {file_path}") from exc
+
         allowed_dirs_str = ", ".join(
-            [str(self.workspace_dir)] + [str(d) for d in self.allowed_external_dirs]
+            [str(self.workspace_dir)]
+            + (
+                [str(d) for d in self.allowed_external_dirs]
+                if include_external_dirs
+                else []
+            )
         )
         raise ValueError(
-            f"Path {path} is outside allowed directories: {allowed_dirs_str}"
+            f"Path {file_path} is outside allowed directories: {allowed_dirs_str}"
         )
 
     def _resolve_existing_cwd_relative_path(self, path: Path) -> Optional[Path]:

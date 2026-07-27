@@ -10,7 +10,13 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, cast
+
+from .command_policy import (
+    CommandPathViolation,
+    CommandPolicyGuard,
+    CommandPolicyViolation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +26,32 @@ MAX_OUTPUT_SIZE = 10 * 1024 * 1024
 
 # Timeout return code constant
 TIMEOUT_EXIT_CODE = -999
+
+# Conventional shell exit code for a command found but not permitted to run.
+COMMAND_REJECTED_EXIT_CODE = 126
+
+
+def _command_rejected_result(reason: object) -> Dict[str, Any]:
+    """Return the stable public contract for a pre-execution policy rejection."""
+    if isinstance(reason, CommandPathViolation):
+        logger.warning(
+            "CommandExecutor: Rejected %s path: %s",
+            reason.access,
+            reason.path,
+        )
+        public_reason = f"path is outside allowed {reason.access} paths"
+    elif isinstance(reason, CommandPolicyViolation):
+        logger.warning("CommandExecutor: Rejected command: %s", reason)
+        public_reason = "command denied by policy"
+    else:
+        logger.warning("CommandExecutor: Rejected command: %s", reason)
+        public_reason = str(reason)
+    return {
+        "success": False,
+        "output": "",
+        "error": f"Command rejected by workspace path policy: {public_reason}",
+        "return_code": COMMAND_REJECTED_EXIT_CODE,
+    }
 
 
 def _validate_timeout(timeout: Optional[int], default_timeout: int) -> int:
@@ -129,19 +161,26 @@ def _sanitize_interpreter_suffix(interpreter: str) -> str:
 class CommandExecutorCore:
     """Shell command executor with execution controls"""
 
-    def __init__(self, working_directory: Optional[str] = None):
+    def __init__(
+        self,
+        working_directory: Optional[str] = None,
+        *,
+        path_guard: Optional[CommandPolicyGuard] = None,
+    ):
         """
         Initialize the command executor.
 
         Args:
             working_directory: Directory to use as working directory during execution
+            path_guard: Optional policy implementation invoked before process creation
         """
         self.working_directory = working_directory
+        self.path_guard = path_guard
         self.timeout = 300  # 5 minutes default
 
     def execute_command(
         self,
-        command: str,
+        command: str | list[str],
         timeout: Optional[int] = None,
         capture_output: bool = True,
         shell: bool = True,
@@ -150,7 +189,7 @@ class CommandExecutorCore:
         Execute shell command and return result.
 
         Args:
-            command: Shell command to execute
+            command: Shell command text, or an argument vector when shell=False
             timeout: Execution timeout in seconds (default: 300)
             capture_output: Whether to capture stdout/stderr
             shell: Whether to use shell (allows pipes, redirects, etc.)
@@ -166,6 +205,26 @@ class CommandExecutorCore:
         """
         timeout = _validate_timeout(timeout, self.timeout)
         _validate_working_directory(self.working_directory)
+
+        if shell and not isinstance(command, str):
+            return _command_rejected_result("shell=True requires a string command")
+
+        if self.path_guard is not None:
+            try:
+                if shell:
+                    self.path_guard.validate(cast(str, command))
+                else:
+                    argv = [command] if isinstance(command, str) else list(command)
+                    self.path_guard.validate_argv(argv)
+                    command = argv
+            except CommandPolicyViolation as exc:
+                return _command_rejected_result(exc)
+            except Exception:
+                logger.error(
+                    "CommandExecutor: Command policy validation failed",
+                    exc_info=True,
+                )
+                return _command_rejected_result("command validation failed")
 
         # Sanitize command for logging
         safe_command = _sanitize_command_for_logging(command)
@@ -243,6 +302,11 @@ class CommandExecutorCore:
             ValueError: If timeout is invalid
         """
         timeout = _validate_timeout(timeout, self.timeout)
+
+        if self.path_guard is not None:
+            return _command_rejected_result(
+                "script execution is unavailable under an injected command policy"
+            )
 
         try:
             logger.info(
