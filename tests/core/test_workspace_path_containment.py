@@ -266,7 +266,7 @@ def test_resolve_authorized_path_uses_explicit_base(workspace, monkeypatch, tmp_
     assert resolved == target.resolve()
 
 
-def test_resolve_authorized_path_can_exclude_external_write_roots(tmp_path):
+def test_resolve_authorized_path_can_exclude_external_roots(tmp_path):
     external = tmp_path / "external"
     external.mkdir()
     workspace = TaskWorkspace(

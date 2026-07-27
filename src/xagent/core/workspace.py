@@ -1094,8 +1094,8 @@ class TaskWorkspace:
         """Resolve one path against an explicit base and workspace allowlists.
 
         Unlike :meth:`resolve_path`, this method never consults the Python
-        process CWD. Command tools use it because their shell CWD is explicit
-        and may differ from the tool runner's own CWD.
+        process CWD. Callers must provide the filesystem base whose semantics
+        they own.
         """
         path = Path(file_path).expanduser()
         candidate = path if path.is_absolute() else Path(base_dir) / path

@@ -29,7 +29,6 @@ SCOPE = ExecutionScope(
     sandbox_key_suffix="tenant-a",
     workspace_segments=("tenant-a",),
     memory_dimensions={"tenant": "a"},
-    restrict_command_paths=True,
 )
 
 

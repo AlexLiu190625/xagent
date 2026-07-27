@@ -10,9 +10,8 @@ another principal.
 Scope fields are consumed **independently** by each subsystem: a consumer
 reads exactly the field(s) it needs (``sandbox_key_suffix``,
 ``workspace_segments``, ``memory_dimensions``, ``strict_memory_isolation``,
-``isolate_external_dirs``, ``restrict_command_paths``) and must never gate on
-"a scope is active" as an all-or-nothing switch — a scope may set any subset
-of its fields.
+``isolate_external_dirs``) and must never gate on "a scope is active" as an
+all-or-nothing switch — a scope may set any subset of its fields.
 
 Two activation mechanisms:
 
@@ -113,19 +112,19 @@ class ExecutionScope:
             then produce an identical mount and can share one container, while
             their deeper ``workspace_segments`` place them in distinct subtrees
             of that shared mount. **Security note:** those subtrees are *not*
-            an isolation boundary. The mount is read-write and unrestricted
-            code execution can access a co-mounted sibling's subtree.
-            ``restrict_command_paths`` adds only a cooperative, best-effort
-            shell guard; it does not constrain Python/JavaScript or unknown and
-            dynamic command forms. This field therefore cannot itself justify
-            treating co-mounted scopes as isolated. An embedding that co-mounts
-            different principals must add its own controls, explicitly accept
-            the remaining bypasses, and must not describe the result as a hard
-            sandbox boundary. Must be a prefix of ``workspace_segments``.
-            ``None`` (the default) means the mount covers the full
-            ``workspace_segments`` — byte-identical to pre-existing behavior.
-            Consumed only by the sandbox-mount composition; workspace paths and
-            storage keys always use the full ``workspace_segments``.
+            an isolation boundary. The mount is read-write and the
+            code-execution tools (shell/python executors) run directly in the
+            sandbox with no ``scoped_user_root`` path check, so code in one
+            scope's task can read and write a co-mounted sibling's subtree.
+            Only the orchestrator-side file/workspace API enforces
+            ``scoped_user_root``. Therefore this field must only group scopes
+            that are already the **same trust principal**; never use it to
+            co-mount scopes belonging to different end users. Must be a prefix
+            of ``workspace_segments``. ``None`` (the default) means the mount
+            covers the full ``workspace_segments`` — byte-identical to
+            pre-existing behavior. Consumed only by the sandbox-mount
+            composition; workspace paths and storage keys always use the full
+            ``workspace_segments``.
         memory_dimensions: Extra metadata stamped on memory notes on add and
             filtered on scoped search.
         strict_memory_isolation: When True, unscoped searches also exclude
@@ -135,8 +134,6 @@ class ExecutionScope:
             is empty.
         isolate_external_dirs: When True, KB/upload external dirs become
             scope-local instead of shared across the user's scopes.
-        restrict_command_paths: When True, workspace-bound command tools apply
-            the cooperative shell path guard before executing a command.
     """
 
     sandbox_key_suffix: Optional[str] = None
@@ -145,7 +142,6 @@ class ExecutionScope:
     memory_dimensions: Mapping[str, str] = field(default_factory=dict)
     strict_memory_isolation: bool = False
     isolate_external_dirs: bool = False
-    restrict_command_paths: bool = False
 
     @property
     def effective_mount_segments(self) -> tuple[str, ...]:
@@ -192,7 +188,6 @@ class ExecutionScope:
             "memory_dimensions": dict(self.memory_dimensions),
             "strict_memory_isolation": self.strict_memory_isolation,
             "isolate_external_dirs": self.isolate_external_dirs,
-            "restrict_command_paths": self.restrict_command_paths,
         }
 
     @classmethod
@@ -206,7 +201,6 @@ class ExecutionScope:
             memory_dimensions=dict(data.get("memory_dimensions") or {}),
             strict_memory_isolation=bool(data.get("strict_memory_isolation", False)),
             isolate_external_dirs=bool(data.get("isolate_external_dirs", False)),
-            restrict_command_paths=bool(data.get("restrict_command_paths", False)),
         )
 
     def __post_init__(self) -> None:
@@ -328,13 +322,9 @@ def metadata_carries_scope_dimensions(metadata: Mapping[str, Any]) -> bool:
 
 # Hashable identity of a scope's namespace-affecting fields:
 # (sandbox_key_suffix, workspace_segments, effective_mount_segments,
-#  sorted memory_dimensions items, restrict_command_paths).
+#  sorted memory_dimensions items).
 ScopeFingerprint = tuple[
-    Optional[str],
-    tuple[str, ...],
-    tuple[str, ...],
-    tuple[tuple[str, str], ...],
-    bool,
+    Optional[str], tuple[str, ...], tuple[str, ...], tuple[tuple[str, str], ...]
 ]
 
 
@@ -342,8 +332,8 @@ def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerpr
     """Hashable fingerprint of the namespaces a scope selects.
 
     Per-task caches that bake scope-derived state in at build time (sandbox
-    keys, workspace paths, sandbox mount root, memory dimensions, command path
-    policy) key their eviction checks on this. The mount root is captured via
+    keys, workspace paths, sandbox mount root, memory dimensions) key their
+    eviction checks on this. The mount root is captured via
     ``effective_mount_segments`` so a changed mount prefix invalidates the
     cache instead of silently reusing a stale ``base_dir`` (which a later
     rebuild would then reject in ``SandboxManager._ensure_config_equivalent``).
@@ -357,7 +347,6 @@ def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerpr
         scope.workspace_segments,
         scope.effective_mount_segments,
         tuple(sorted(scope.memory_dimensions.items())),
-        scope.restrict_command_paths,
     )
 
 
