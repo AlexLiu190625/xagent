@@ -13,6 +13,7 @@ import logging
 import os
 import re
 import stat
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import (
@@ -42,6 +43,10 @@ _MAX_INSPECTED_SCRIPT_DEPTH = 8
 _MAX_COMMAND_WRAPPER_DEPTH = 32
 _MAX_COMMAND_POLICY_INPUT_CHARS = 64 * 1024
 _MAX_POSSIBLE_SHELL_STATES = 16
+_COMMAND_WRITTEN_PATHS: ContextVar[set[Path] | None] = ContextVar(
+    "command_written_paths",
+    default=None,
+)
 _AWK_ALWAYS_UNSAFE_IO_PATTERN = re.compile(r"\bsystem\s*\(|\bgetline\b")
 _AWK_PRINT_PATTERN = re.compile(r"\b(?:print|printf)\b")
 
@@ -423,11 +428,14 @@ class WorkspaceCommandPathGuard:
 
     def validate(self, command: str) -> None:
         """Reject unsupported syntax and unsafe paths in ``command``."""
-        nodes = self._parse_shell(command)
-
-        states: tuple[_ShellState, ...] = (_ShellState(cwd=self._initial_cwd),)
-        for node in nodes:
-            states = self._validate_node_states(node, states)
+        token = _COMMAND_WRITTEN_PATHS.set(set())
+        try:
+            nodes = self._parse_shell(command)
+            states: tuple[_ShellState, ...] = (_ShellState(cwd=self._initial_cwd),)
+            for node in nodes:
+                states = self._validate_node_states(node, states)
+        finally:
+            _COMMAND_WRITTEN_PATHS.reset(token)
 
     def _validate_node_states(
         self,
@@ -495,11 +503,15 @@ class WorkspaceCommandPathGuard:
         """
         if not argv:
             return
-        self._validate_command_values(
-            argv[0],
-            argv[1:],
-            _ShellState(cwd=self._initial_cwd),
-        )
+        token = _COMMAND_WRITTEN_PATHS.set(set())
+        try:
+            self._validate_command_values(
+                argv[0],
+                argv[1:],
+                _ShellState(cwd=self._initial_cwd),
+            )
+        finally:
+            _COMMAND_WRITTEN_PATHS.reset(token)
 
     def _validate_node(self, node: Any, state: _ShellState) -> _ShellState:
         kind = getattr(node, "kind", None)
@@ -1744,20 +1756,24 @@ class WorkspaceCommandPathGuard:
         script_path = self._check_path(raw_path, cwd, "read")
         if self._path_access_observer is not None:
             return None
+        written_paths = _COMMAND_WRITTEN_PATHS.get()
+        if written_paths is not None and script_path in written_paths:
+            raise CommandPolicyViolation(
+                "cannot inspect a script modified earlier in the same command"
+            )
 
         descriptor: int | None = None
         try:
-            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
-            flags |= getattr(os, "O_NOFOLLOW", 0)
+            flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW
             descriptor = os.open(script_path, flags)
+            metadata = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
+            ):
+                raise CommandPathViolation(access="read", path=script_path)
             with os.fdopen(descriptor, "rb") as script_file:
                 descriptor = None
-                metadata = os.fstat(script_file.fileno())
-                if (
-                    not stat.S_ISREG(metadata.st_mode)
-                    or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
-                ):
-                    raise CommandPathViolation(access="read", path=script_path)
                 raw_script = script_file.read(_MAX_INSPECTED_SCRIPT_BYTES + 1)
             if len(raw_script) > _MAX_INSPECTED_SCRIPT_BYTES:
                 raise CommandPathViolation(access="read", path=script_path)
@@ -2597,13 +2613,17 @@ class WorkspaceCommandPathGuard:
             return candidate
 
         try:
-            return self._workspace.resolve_authorized_path(
+            resolved = self._workspace.resolve_authorized_path(
                 candidate,
                 base_dir=cwd,
                 include_external_dirs=access == "read",
             )
         except ValueError as exc:
             raise CommandPathViolation(access=access, path=candidate) from exc
+        written_paths = _COMMAND_WRITTEN_PATHS.get()
+        if access == "write" and written_paths is not None:
+            written_paths.add(resolved)
+        return resolved
 
     def _check_workspace_path(
         self,
