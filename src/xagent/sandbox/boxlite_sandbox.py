@@ -495,6 +495,17 @@ class BoxliteSandboxService(SandboxService):
     async def supports_snapshots(self) -> bool:
         return False
 
+    async def supports_runtime_spec(self) -> bool:
+        """Boxlite has no label carrier, hardcodes reuse_existing=True (a
+        fail-open get-or-create), cannot retrieve env/volumes/ports back
+        from a running box, and has no control/name-lock infrastructure of
+        its own. The four spec-reconciliation lifecycle methods are left
+        unimplemented (inherited from SandboxService's default, which raises
+        SandboxReconcileUnsupportedError); this probe is how callers detect
+        that up front instead of hitting that exception.
+        """
+        return False
+
     async def create_snapshot(self, name: str, snapshot_id: str) -> SandboxSnapshot:
         raise NotImplementedError("Unsupported")
 
