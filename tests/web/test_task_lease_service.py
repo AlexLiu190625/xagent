@@ -1,6 +1,7 @@
 """Tests for task execution leases."""
 
 import asyncio
+import logging
 import threading
 from datetime import timedelta
 
@@ -16,6 +17,7 @@ from xagent.web.models.database import Base, get_db, get_engine, init_db
 from xagent.web.models.task import ExecutionMode, Task, TaskStatus, TraceEvent
 from xagent.web.models.user import User
 from xagent.web.services import task_lease_service
+from xagent.web.services.db_runtime import drain_async_task_cancellation_safe
 from xagent.web.services.task_lease_recovery import (
     recover_task_lease_candidate_isolated,
 )
@@ -829,7 +831,9 @@ async def test_old_batch_result_does_not_contaminate_replacement_registration(
 
 
 @pytest.mark.asyncio
-async def test_stop_heartbeat_reports_shared_batch_pool_timeout(monkeypatch) -> None:
+async def test_stop_heartbeat_reports_shared_batch_pool_timeout(
+    monkeypatch, caplog
+) -> None:
     refresh_attempted = threading.Event()
     allow_timeout = threading.Event()
     heartbeat_timeout = SQLAlchemyTimeoutError("pool checkout timed out")
@@ -852,28 +856,96 @@ async def test_stop_heartbeat_reports_shared_batch_pool_timeout(monkeypatch) -> 
         lambda: 0.001,
     )
 
-    stop_event = asyncio.Event()
-    heartbeat_task = asyncio.create_task(
-        run_task_lease_heartbeat(
-            TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
-            stop_event,
+    first_stop_event = asyncio.Event()
+    second_stop_event = asyncio.Event()
+    first_heartbeat_task = None
+    second_heartbeat_task = None
+    first_stopping = None
+    second_stopping = None
+
+    async def stop_and_drain_heartbeat(
+        stopping,
+        heartbeat_task,
+        stop_event,
+    ) -> None:
+        stop_event.set()
+        if heartbeat_task is None:
+            return
+        if stopping is None:
+            stopping = asyncio.create_task(
+                stop_task_lease_heartbeat(heartbeat_task, stop_event)
+            )
+        try:
+            await drain_async_task_cancellation_safe(stopping)
+        finally:
+            await drain_async_task_cancellation_safe(heartbeat_task)
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            first_heartbeat_task = asyncio.create_task(
+                run_task_lease_heartbeat(
+                    TaskLease(task_id=1, runner_id="runner-a", run_id="run-a"),
+                    first_stop_event,
+                )
+            )
+            second_heartbeat_task = asyncio.create_task(
+                run_task_lease_heartbeat(
+                    TaskLease(task_id=2, runner_id="runner-b", run_id="run-b"),
+                    second_stop_event,
+                )
+            )
+            await asyncio.wait_for(
+                asyncio.to_thread(refresh_attempted.wait, 1), timeout=1
+            )
+
+            first_stopping = asyncio.create_task(
+                stop_task_lease_heartbeat(first_heartbeat_task, first_stop_event)
+            )
+            second_stopping = asyncio.create_task(
+                stop_task_lease_heartbeat(second_heartbeat_task, second_stop_event)
+            )
+            await asyncio.sleep(0.02)
+            assert not first_stopping.done()
+            assert not second_stopping.done()
+
+            allow_timeout.set()
+            first_outcome, second_outcome = await asyncio.wait_for(
+                asyncio.gather(first_stopping, second_stopping),
+                timeout=1,
+            )
+
+        heartbeat_warnings = [
+            record
+            for record in caplog.records
+            if record.levelno == logging.WARNING
+            and "component=lease-heartbeat" in record.getMessage()
+        ]
+        assert len(heartbeat_warnings) == 1
+        assert heartbeat_warnings[0].getMessage() == (
+            "component=lease-heartbeat task_ids=[1,2] active_lease_count=2 "
+            "database pool checkout timed out: pool checkout timed out"
         )
-    )
-    await asyncio.wait_for(asyncio.to_thread(refresh_attempted.wait, 1), timeout=1)
-
-    stopping = asyncio.create_task(
-        stop_task_lease_heartbeat(heartbeat_task, stop_event)
-    )
-    await asyncio.sleep(0.02)
-    assert not stopping.done()
-
-    allow_timeout.set()
-    outcome = await asyncio.wait_for(stopping, timeout=1)
-    await task_lease_service.wait_for_heartbeat_manager_idle()
-
-    assert outcome.pool_timeout is heartbeat_timeout
-    assert outcome.lease_lost is False
-    assert outcome.requires_ttl_recovery is True
+        for outcome in (first_outcome, second_outcome):
+            assert outcome.pool_timeout is heartbeat_timeout
+            assert outcome.lease_lost is False
+            assert outcome.requires_ttl_recovery is True
+    finally:
+        allow_timeout.set()
+        try:
+            await stop_and_drain_heartbeat(
+                first_stopping,
+                first_heartbeat_task,
+                first_stop_event,
+            )
+        finally:
+            try:
+                await stop_and_drain_heartbeat(
+                    second_stopping,
+                    second_heartbeat_task,
+                    second_stop_event,
+                )
+            finally:
+                await task_lease_service.wait_for_heartbeat_manager_idle()
 
 
 @pytest.mark.asyncio
