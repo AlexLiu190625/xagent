@@ -96,6 +96,72 @@ describe("useWidgetSession", () => {
     expect(postMessage).not.toHaveBeenCalled()
   })
 
+  it("keeps a recoverable parent failure open for a later session update", () => {
+    const { result } = renderHook(() => useWidgetSession())
+
+    dispatchFromParent({
+      xagent: true,
+      v: 1,
+      type: "session_degraded",
+      code: "network_unavailable",
+    })
+
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.session).toBeNull()
+    expect(result.current.agent).toBeNull()
+    expect(result.current.terminalCode).toBeNull()
+
+    dispatchFromParent(updateMessage())
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.token).toBe("st_session_token")
+  })
+
+  it.each([undefined, "future_recovery_code"])(
+    "fails closed on an invalid session_degraded code %s",
+    (code) => {
+      const { result } = renderHook(() => useWidgetSession())
+
+      dispatchFromParent({
+        xagent: true,
+        v: 1,
+        type: "session_degraded",
+        ...(code === undefined ? {} : { code }),
+      })
+
+      expect(result.current.status).toBe("terminal")
+      expect(result.current.terminalCode).toBe("unexpected_error")
+    },
+  )
+
+  it("hands recovery ownership to the parent on session_degraded", () => {
+    vi.useFakeTimers()
+    const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage())
+
+    act(() => result.current.requestReconnect("ws_closed"))
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
+
+    dispatchFromParent({
+      xagent: true,
+      v: 1,
+      type: "session_degraded",
+      code: "rate_limited",
+    })
+    act(() => vi.advanceTimersByTime(60_000))
+
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.session).toBeNull()
+    expect(result.current.agent?.name).toBe("Support Agent")
+    expect(result.current.terminalCode).toBeNull()
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
+
+    dispatchFromParent(updateMessage({ session_token: "st_recovered" }))
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.token).toBe("st_recovered")
+  })
+
   it("sends an exact-origin reconnect request once and removes the usable token", () => {
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())

@@ -8,6 +8,7 @@ const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
 const PARENT_RESPONSE_DEADLINE_MS = 10_000
 const SESSION_STABILITY_WINDOW_MS = 15_000
 const MAX_CONSECUTIVE_RECOVERY_ATTEMPTS = 3
+const PARENT_RECOVERABLE_CODES = new Set(["network_unavailable", "rate_limited"])
 
 interface RecoveryState {
   attempts: number
@@ -46,7 +47,7 @@ interface WidgetSessionBridgeState {
 interface ProtocolMessage extends Record<string, unknown> {
   xagent: true
   v: 1
-  type: "session_update" | "session_terminal"
+  type: "session_update" | "session_degraded" | "session_terminal"
 }
 
 const initialState: WidgetSessionBridgeState = {
@@ -89,7 +90,11 @@ const isProtocolMessage = (value: unknown): value is ProtocolMessage => {
   if (!isRecord(value)) return false
   return value.xagent === true
     && value.v === 1
-    && (value.type === "session_update" || value.type === "session_terminal")
+    && (
+      value.type === "session_update"
+      || value.type === "session_degraded"
+      || value.type === "session_terminal"
+    )
 }
 
 export function buildWidgetSessionWebSocketUrl(origin: string): string {
@@ -160,6 +165,22 @@ export function useWidgetSession() {
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
+  }, [clearRecoveryTimers, clearStabilityTimer, clearWarningTimer])
+
+  const transitionDegraded = useCallback(() => {
+    if (terminalRef.current) return
+    activeSessionGenerationRef.current = null
+    clearRecoveryTimers()
+    recoveryRef.current = null
+    clearStabilityTimer()
+    clearWarningTimer()
+    setState((current) => ({
+      status: "refreshing",
+      session: null,
+      agent: current.agent,
+      terminalCode: null,
+      isAbsoluteExpiryWarningVisible: false,
+    }))
   }, [clearRecoveryTimers, clearStabilityTimer, clearWarningTimer])
 
   const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
@@ -345,6 +366,18 @@ export function useWidgetSession() {
         transitionTerminal(typeof event.data.code === "string" && event.data.code
           ? event.data.code
           : "unexpected_error")
+        return
+      }
+
+      if (event.data.type === "session_degraded") {
+        if (
+          typeof event.data.code !== "string"
+          || !PARENT_RECOVERABLE_CODES.has(event.data.code)
+        ) {
+          transitionTerminal("unexpected_error")
+          return
+        }
+        transitionDegraded()
         return
       }
 
