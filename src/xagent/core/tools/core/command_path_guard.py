@@ -182,6 +182,11 @@ _NO_FILESYSTEM_EFFECT_COMMANDS = {
     "declare",
     "typeset",
 }
+# Options that consume a following token as their value, per classified command,
+# so the value is not misread as a path operand (e.g. `mkdir -m 0755 dir`).
+_COMMAND_VALUE_OPTIONS = {
+    "mkdir": frozenset({"-m", "--mode"}),
+}
 _BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
 _BASH_LONG_FLAG_OPTIONS = {
     "--debug",
@@ -966,7 +971,12 @@ class WorkspaceCommandPathGuard:
         if command_name in _READ_COMMANDS:
             self._check_operands(args, state.cwd, "read")
         elif command_name in _WRITE_COMMANDS:
-            self._check_operands(args, state.cwd, "write")
+            self._check_operands(
+                args,
+                state.cwd,
+                "write",
+                value_options=_COMMAND_VALUE_OPTIONS.get(command_name, frozenset()),
+            )
         elif command_name in _SHELL_COMMANDS:
             self._check_nested_shell(command_name, args, state)
         elif command_name in _UNSUPPORTED_SHELL_COMMANDS:
@@ -1268,8 +1278,10 @@ class WorkspaceCommandPathGuard:
         values: Sequence[str],
         cwd: Path,
         access: PathAccess,
+        *,
+        value_options: frozenset[str] = frozenset(),
     ) -> None:
-        for raw_path in self._operands(values):
+        for raw_path in self._operands(values, value_options=value_options):
             self._check_path(raw_path, cwd, access)
 
     def _read_policy_script(self, raw_path: str, cwd: Path) -> str:
@@ -1664,14 +1676,29 @@ class WorkspaceCommandPathGuard:
             raise CommandPolicyViolation(f"cannot resolve dynamic {context}")
 
     @staticmethod
-    def _operands(values: Sequence[str]) -> list[str]:
+    def _operands(
+        values: Sequence[str],
+        *,
+        value_options: frozenset[str] = frozenset(),
+    ) -> list[str]:
         operands: list[str] = []
         options_done = False
+        skip_next_value = False
         for value in values:
+            if skip_next_value:
+                # Separated value of a preceding value-consuming option.
+                skip_next_value = False
+                continue
             if not options_done and value == "--":
                 options_done = True
                 continue
             if not options_done and value.startswith("-") and value != "-":
+                # An option that consumes a following token must not let that
+                # value be misread as a path operand. Attached forms (`-m0755`,
+                # `--mode=0755`) are already dropped whole; only a separated
+                # value needs to be skipped explicitly.
+                if value in value_options:
+                    skip_next_value = True
                 continue
             operands.append(value)
         return operands

@@ -2073,6 +2073,37 @@ class TestNoEffectCommandClassification:
         with pytest.raises(CommandPathViolation):
             guard.validate(f"mkdir {shlex.quote(str(sibling_file.parent / 'x'))}")
 
+    @pytest.mark.parametrize(
+        "mkdir_command",
+        [
+            "mkdir -m ../../../../../../etc newdir",
+            "mkdir --mode ../../../../../../etc newdir",
+            "mkdir -m0755 newdir",
+            "mkdir --mode=0755 newdir",
+        ],
+    )
+    def test_mkdir_mode_value_is_not_treated_as_a_path(
+        self, scoped_command_workspace, mkdir_command
+    ):
+        # The `-m`/`--mode` value is consumed as the mode, not validated as a
+        # path operand, so an out-of-workspace-looking mode token does not cause
+        # a spurious rejection. Only the real directory operand is checked.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(mkdir_command)
+
+    def test_mkdir_real_directory_outside_workspace_still_rejected_with_mode(
+        self, scoped_command_workspace
+    ):
+        # Skipping the mode value must not skip the real path operand.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        target = shlex.quote(str(sibling_file.parent / "x"))
+        with pytest.raises(CommandPathViolation):
+            guard.validate(f"mkdir -m 0755 {target}")
+
     def test_redirect_write_from_no_effect_command_still_blocks_inspection(
         self, scoped_command_workspace
     ):
