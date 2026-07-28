@@ -283,6 +283,7 @@ class ToolFactory:
         failure remains primary if ordinary cleanup also fails.
         """
         prepare_factory_runtime = getattr(type(config), "prepare_factory_runtime", None)
+        handoff_factory_runtime = getattr(type(config), "handoff_factory_runtime", None)
         release_factory_runtime = getattr(
             type(config), "release_prepared_factory_runtime", None
         )
@@ -298,14 +299,24 @@ class ToolFactory:
             primary_error = exc
             raise
         finally:
-            if callable(release_factory_runtime):
+            finalizer = (
+                handoff_factory_runtime
+                if callable(handoff_factory_runtime)
+                else release_factory_runtime
+            )
+            finalizer_error_message = (
+                "Failed to hand off tool-factory runtime"
+                if callable(handoff_factory_runtime)
+                else "Failed to release prepared tool-factory runtime"
+            )
+            if callable(finalizer):
                 try:
-                    release_factory_runtime(config)
+                    finalizer(config)
                 except Exception:
                     if primary_error is None:
                         raise
                     logger.warning(
-                        "Failed to release prepared tool-factory runtime",
+                        finalizer_error_message,
                         exc_info=True,
                     )
 

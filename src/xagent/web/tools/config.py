@@ -5,6 +5,7 @@ Provides web-specific configuration classes that load from database
 and other web-specific sources.
 """
 
+import copy
 import inspect
 import logging
 import os
@@ -34,6 +35,7 @@ from ...core.tools.adapters.vibe.config import (
     MCPConfigLoadError,
     MCPFailurePolicy,
     MCPToolLoadSummary,
+    ToolFactoryRuntimeSessionBoundaryError,
     normalize_tool_allowlist,
 )
 from ...core.tools.adapters.vibe.connector_runtime import (
@@ -172,6 +174,46 @@ def _oauth_token_resolver_registration_matches(
     return (
         current_resolver is resolver and current_generation == registration_generation
     )
+
+
+def _refresh_delegated_mcp_connection_from_snapshot(
+    *,
+    session_factory: Any,
+    task_id: int | None,
+    turn_id: str | None,
+    user_id: int | None,
+    server_id: int,
+    connection_snapshot: Mapping[str, Any],
+    runtime_bindings: Any,
+    allow_delegated_authorization: bool,
+) -> dict[str, Any] | None:
+    """Refresh delegated MCP headers without retaining construction objects."""
+    if task_id is None or user_id is None:
+        return None
+
+    from ..services.connector_runtime import load_connector_runtime_view
+
+    with session_factory() as db:
+        runtime_view = load_connector_runtime_view(
+            db=db,
+            task_id=task_id,
+            turn_id=turn_id,
+            user_id=user_id,
+        )
+    runtime_values = runtime_view.get(f"mcp:{server_id}")
+    runtime_headers = WebToolConfig._runtime_transport_headers(
+        runtime_values=runtime_values if isinstance(runtime_values, dict) else None,
+        runtime_bindings=runtime_bindings,
+        allow_delegated_authorization=allow_delegated_authorization,
+    )
+    if not runtime_headers:
+        return None
+
+    connection = copy.deepcopy(dict(connection_snapshot))
+    connection["headers"] = dict(connection.get("headers") or {})
+    connection["headers"].update(runtime_headers)
+    connection.pop("auth", None)
+    return connection
 
 
 async def _maybe_await_oauth_token_resolver_result(result: object) -> object:
@@ -1390,8 +1432,8 @@ class WebToolConfig(BaseToolConfig):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
     def _runtime_transport_headers(
-        self,
         *,
         runtime_values: Optional[Dict[str, Any]],
         runtime_bindings: Any,
@@ -1477,19 +1519,27 @@ class WebToolConfig(BaseToolConfig):
             server=server, runtime_headers=runtime_headers
         )
 
-    def _refresh_delegated_mcp_connection(
+    def _build_delegated_mcp_refresh_callback(
         self,
         *,
         server: Any,
         runtime_bindings: Any,
         allow_delegated_authorization: bool,
-    ) -> dict[str, Any] | None:
-        self._connector_runtime_view = None
-        runtime_values = self._get_connector_runtime_for("mcp", int(server.id))
-        return self._delegated_mcp_connection(
+    ) -> Callable[[], dict[str, Any] | None]:
+        """Return a refresh callback containing only scalar and copied values."""
+        connection_snapshot = self._mcp_connection_with_runtime_headers(
             server=server,
-            runtime_values=runtime_values,
-            runtime_bindings=runtime_bindings,
+            runtime_headers={},
+        )
+        return partial(
+            _refresh_delegated_mcp_connection_from_snapshot,
+            session_factory=self.get_session_factory(),
+            task_id=self._parse_numeric_task_id(),
+            turn_id=self._connector_runtime_turn_id,
+            user_id=self._user_id,
+            server_id=int(server.id),
+            connection_snapshot=connection_snapshot,
+            runtime_bindings=copy.deepcopy(runtime_bindings),
             allow_delegated_authorization=allow_delegated_authorization,
         )
 
@@ -1748,14 +1798,80 @@ class WebToolConfig(BaseToolConfig):
         )
         self._apply_factory_runtime_snapshot(snapshot)
 
-    def release_prepared_factory_runtime(self) -> None:
-        """Discard construction-only detached state after a factory build."""
+    def discard_prepared_factory_runtime(self) -> None:
+        """Discard construction-only snapshots without changing DB ownership."""
         self._factory_runtime_snapshot = None
         self._pending_runtime_policy = None
 
+    def release_prepared_factory_runtime(self) -> None:
+        """Compatibility alias for configs that only discard snapshots."""
+        self.discard_prepared_factory_runtime()
+
+    @staticmethod
+    def _terminally_close_owned_lazy_db(lazy_db: Any) -> bool:
+        """Close or invalidate an owned Session without losing retry ownership."""
+        try:
+            lazy_db.close()
+            return True
+        except Exception:
+            try:
+                lazy_db.invalidate()
+                return True
+            except Exception:
+                logger.warning(
+                    "Failed to invalidate lazy tool-factory database session",
+                    exc_info=True,
+                )
+                return False
+
+    def handoff_factory_runtime(self) -> None:
+        """Verify and detach construction-only database resources.
+
+        The request session remains caller-owned: a failed clean-release leaves
+        it, the request, and its ORM user untouched. A lazily-created session is
+        owned by this config and is therefore terminally closed on every path.
+        """
+        from sqlalchemy.orm import Session
+
+        from ..models.database import release_db_connection_if_clean
+
+        live_db = self._live_db
+        lazy_db = self._lazy_db
+        if self._db_factory is None and isinstance(live_db, Session):
+            self._db_factory = self.get_session_factory()
+
+        live_released = (
+            release_db_connection_if_clean(live_db) if live_db is not None else True
+        )
+        lazy_released = (
+            release_db_connection_if_clean(lazy_db) if lazy_db is not None else True
+        )
+
+        if lazy_db is not None:
+            if not lazy_released:
+                try:
+                    lazy_db.rollback()
+                except Exception:
+                    logger.warning(
+                        "Failed to roll back lazy tool-factory database session",
+                        exc_info=True,
+                    )
+            if self._terminally_close_owned_lazy_db(lazy_db):
+                self._lazy_db = None
+            else:
+                lazy_released = False
+
+        if not live_released or not lazy_released:
+            raise ToolFactoryRuntimeSessionBoundaryError()
+
+        self.discard_prepared_factory_runtime()
+        self._live_db = None
+        self.request = None
+        self._user = None
+
     async def refresh_runtime_policy(self) -> None:
         """Refresh only detached per-turn policy before signature comparison."""
-        self.release_prepared_factory_runtime()
+        self.discard_prepared_factory_runtime()
         if self._user_id is None or not has_user_tool_policy_hooks():
             policy_snapshot = _ToolRuntimePolicySnapshot()
         else:
@@ -1872,10 +1988,13 @@ class WebToolConfig(BaseToolConfig):
 
     def close(self) -> None:
         """Close the lazily-opened factory session, if any."""
-        self.release_prepared_factory_runtime()
-        if self._lazy_db is not None:
-            self._lazy_db.close()
-            self._lazy_db = None
+        self.discard_prepared_factory_runtime()
+        lazy_db = self._lazy_db
+        if lazy_db is not None:
+            if self._terminally_close_owned_lazy_db(lazy_db):
+                self._lazy_db = None
+            else:
+                raise ToolFactoryRuntimeSessionBoundaryError()
 
     def release_db_connection(self) -> None:
         """Return the pooled connection held by this config's session(s).
@@ -2869,11 +2988,12 @@ class WebToolConfig(BaseToolConfig):
                     allow_delegated_authorization=allow_delegated_authorization,
                 )
                 if delegated_connection:
-                    delegated_connection["_connector_runtime_refresh"] = partial(
-                        self._refresh_delegated_mcp_connection,
-                        server=server,
-                        runtime_bindings=runtime_bindings,
-                        allow_delegated_authorization=allow_delegated_authorization,
+                    delegated_connection["_connector_runtime_refresh"] = (
+                        self._build_delegated_mcp_refresh_callback(
+                            server=server,
+                            runtime_bindings=runtime_bindings,
+                            allow_delegated_authorization=allow_delegated_authorization,
+                        )
                     )
                     transport_config.update(
                         connection_to_transport_config(delegated_connection)

@@ -1,21 +1,29 @@
 import asyncio
+import functools
 import logging
 import threading
 from types import SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, event
+from sqlalchemy import inspect as sqlalchemy_inspect
+from sqlalchemy import select
 from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm.state import InstanceState
 from sqlalchemy.pool import QueuePool
 
-from xagent.core.tools.adapters.vibe.config import MCPConfigLoadError
+from xagent.core.tools.adapters.vibe.config import (
+    MCPConfigLoadError,
+    ToolFactoryRuntimeSessionBoundaryError,
+)
 from xagent.core.tools.adapters.vibe.connector_runtime import (
     ERROR_CONNECTOR_RUNTIME_UNAVAILABLE,
     ConnectorRuntimeError,
 )
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
 from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+from xagent.web.models.mcp import MCPServer
 from xagent.web.models.tool_config import ToolConfig
 from xagent.web.models.user import User
 from xagent.web.services.tool_credentials import (
@@ -417,14 +425,395 @@ async def test_tool_factory_releases_live_read_session_before_worker_checkout(
 
         assert await ToolFactory.create_all_tools(cfg) == []
         assert engine.pool.checkedout() == 0
+        assert cfg._live_db is None
 
         assert live_db.query(ToolConfig).all() == []
         assert engine.pool.checkedout() == 1
-        cfg.release_db_connection()
+        live_db.rollback()
         assert engine.pool.checkedout() == 0
     finally:
         live_db.close()
         cfg.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("factory_owned", [False, True])
+def test_verified_factory_handoff_detaches_clean_sessions(factory_owned, tmp_path):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'verified-handoff.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=None if factory_owned else factory(),
+        db_factory=factory if factory_owned else None,
+        request=request,
+        user=request.user,
+        user_id=1,
+    )
+    try:
+        cfg.db.query(ToolConfig).all()
+        assert engine.pool.checkedout() == 1
+
+        cfg.handoff_factory_runtime()
+
+        assert engine.pool.checkedout() == 0
+        assert cfg._live_db is None
+        assert cfg._lazy_db is None
+        assert cfg.request is None
+        assert cfg._user is None
+    finally:
+        cfg.close()
+        engine.dispose()
+
+
+def test_verified_factory_handoff_preserves_pending_caller_state(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'pending-handoff.db'}")
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    live_db = factory()
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=live_db,
+        request=request,
+        user=request.user,
+        user_id=1,
+    )
+    try:
+        live_db.add(
+            User(
+                username="pending-handoff-user",
+                password_hash="hash",
+                is_admin=False,
+            )
+        )
+
+        with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+            cfg.handoff_factory_runtime()
+
+        assert cfg._live_db is live_db
+        assert cfg.request is request
+        assert cfg._user is request.user
+        assert list(live_db.new)
+    finally:
+        live_db.rollback()
+        live_db.close()
+        cfg.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("rollback_fails", [False, True])
+def test_verified_factory_handoff_terminally_closes_failed_lazy_session(
+    rollback_fails,
+):
+    class FailingLazySession:
+        new = (object(),)
+        dirty = ()
+        deleted = ()
+        info = {}
+
+        def __init__(self, rollback_fails: bool) -> None:
+            self.rollback_calls = 0
+            self.close_calls = 0
+            self.invalidate_calls = 0
+            self.rollback_fails = rollback_fails
+
+        def in_transaction(self) -> bool:
+            return True
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+            if self.rollback_fails:
+                raise RuntimeError("rollback failed")
+
+        def close(self) -> None:
+            self.close_calls += 1
+            raise RuntimeError("close failed")
+
+        def invalidate(self) -> None:
+            self.invalidate_calls += 1
+
+    lazy_db = FailingLazySession(rollback_fails)
+    cfg = WebToolConfig(db=None, db_factory=lambda: lazy_db, request=None, user_id=1)
+    assert cfg.db is lazy_db
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+        cfg.handoff_factory_runtime()
+
+    assert lazy_db.rollback_calls == 1
+    assert lazy_db.close_calls == 1
+    assert lazy_db.invalidate_calls == 1
+    assert cfg._lazy_db is None
+
+
+def test_dual_lazy_cleanup_failure_retains_retry_ownership():
+    class RetryableLazySession:
+        new = (object(),)
+        dirty = ()
+        deleted = ()
+        info = {}
+
+        def __init__(self) -> None:
+            self.close_failures_remaining = 1
+            self.invalidate_failures_remaining = 1
+
+        def in_transaction(self) -> bool:
+            return True
+
+        def rollback(self) -> None:
+            return None
+
+        def close(self) -> None:
+            if self.close_failures_remaining:
+                self.close_failures_remaining -= 1
+                raise RuntimeError("close failed")
+
+        def invalidate(self) -> None:
+            if self.invalidate_failures_remaining:
+                self.invalidate_failures_remaining -= 1
+                raise RuntimeError("invalidate failed")
+
+    lazy_db = RetryableLazySession()
+    cfg = WebToolConfig(db=None, db_factory=lambda: lazy_db, request=None, user_id=1)
+    assert cfg.db is lazy_db
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+        cfg.handoff_factory_runtime()
+
+    assert cfg._lazy_db is lazy_db
+
+    cfg.close()
+
+    assert cfg._lazy_db is None
+
+
+def test_dual_lazy_cleanup_failure_retains_real_pool_owner_until_retry(
+    monkeypatch, tmp_path
+):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'dual-lazy-cleanup.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    lazy_db = factory()
+    lazy_db.query(ToolConfig).all()
+    assert engine.pool.checkedout() == 1
+    real_close = lazy_db.close
+    real_invalidate = lazy_db.invalidate
+
+    def fail_close():
+        raise RuntimeError("close failed")
+
+    def fail_invalidate():
+        raise RuntimeError("invalidate failed")
+
+    monkeypatch.setattr(
+        "xagent.web.models.database.release_db_connection_if_clean",
+        lambda _db: False,
+    )
+    monkeypatch.setattr(lazy_db, "close", fail_close)
+    monkeypatch.setattr(lazy_db, "invalidate", fail_invalidate)
+    cfg = WebToolConfig(db=None, db_factory=lambda: lazy_db, request=None, user_id=1)
+    cfg._lazy_db = lazy_db
+    try:
+        with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+            cfg.handoff_factory_runtime()
+
+        assert cfg._lazy_db is lazy_db
+        lazy_db.connection()
+        assert engine.pool.checkedout() == 1
+
+        monkeypatch.setattr(lazy_db, "close", real_close)
+        monkeypatch.setattr(lazy_db, "invalidate", real_invalidate)
+        cfg.close()
+
+        assert cfg._lazy_db is None
+        assert engine.pool.checkedout() == 0
+    finally:
+        lazy_db.close()
+        engine.dispose()
+
+
+def test_verified_factory_handoff_preserves_live_state_while_cleaning_lazy_failure():
+    class PendingSession:
+        new = (object(),)
+        dirty = ()
+        deleted = ()
+        info = {}
+
+        def __init__(self, *, close_fails: bool = False) -> None:
+            self.rollback_calls = 0
+            self.close_calls = 0
+            self.invalidate_calls = 0
+            self.close_fails = close_fails
+
+        def in_transaction(self) -> bool:
+            return True
+
+        def rollback(self) -> None:
+            self.rollback_calls += 1
+
+        def close(self) -> None:
+            self.close_calls += 1
+            if self.close_fails:
+                raise RuntimeError("close failed")
+
+        def invalidate(self) -> None:
+            self.invalidate_calls += 1
+
+    live_db = PendingSession()
+    lazy_db = PendingSession(close_fails=True)
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=live_db,
+        db_factory=lambda: lazy_db,
+        request=request,
+        user=request.user,
+        user_id=1,
+    )
+    cfg._lazy_db = lazy_db
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+        cfg.handoff_factory_runtime()
+
+    assert live_db.rollback_calls == 0
+    assert live_db.close_calls == 0
+    assert cfg._live_db is live_db
+    assert cfg.request is request
+    assert cfg._user is request.user
+    assert lazy_db.rollback_calls == 1
+    assert lazy_db.close_calls == 1
+    assert lazy_db.invalidate_calls == 1
+    assert cfg._lazy_db is None
+
+
+def _contains_orm_instance(value, seen=None):
+    if seen is None:
+        seen = set()
+    value_id = id(value)
+    if value_id in seen:
+        return False
+    seen.add(value_id)
+
+    if isinstance(sqlalchemy_inspect(value, raiseerr=False), InstanceState):
+        return True
+    if isinstance(value, dict):
+        return any(
+            _contains_orm_instance(item, seen)
+            for pair in value.items()
+            for item in pair
+        )
+    if isinstance(value, (list, tuple, set, frozenset)):
+        return any(_contains_orm_instance(item, seen) for item in value)
+    if isinstance(value, functools.partial):
+        return (
+            _contains_orm_instance(value.func, seen)
+            or _contains_orm_instance(value.args, seen)
+            or _contains_orm_instance(value.keywords or {}, seen)
+        )
+    closure = getattr(value, "__closure__", None)
+    if closure:
+        return any(_contains_orm_instance(cell.cell_contents, seen) for cell in closure)
+    return False
+
+
+def test_orm_capture_walker_detects_partial_function_closure():
+    server = MCPServer(
+        name="walker-negative-control",
+        managed="external",
+        transport="streamable_http",
+    )
+
+    def captures_mapped_server():
+        return server
+
+    assert _contains_orm_instance(functools.partial(captures_mapped_server))
+
+
+def test_delegated_mcp_refresh_callback_detaches_real_orm_and_closes_its_session(
+    monkeypatch, tmp_path
+):
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'delegated-refresh.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    MCPServer.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    with factory() as seed_db:
+        seed_db.add(
+            MCPServer(
+                name="detached-refresh-server",
+                managed="external",
+                transport="streamable_http",
+                url="https://mcp.example.test",
+            )
+        )
+        seed_db.commit()
+    construction_db = factory()
+    server = construction_db.scalar(
+        select(MCPServer).where(MCPServer.name == "detached-refresh-server")
+    )
+    assert server is not None
+    server_id = int(server.id)
+    assert engine.pool.checkedout() == 1
+    cfg = WebToolConfig(
+        db=construction_db,
+        db_factory=factory,
+        request=None,
+        user_id=7,
+        task_id="42",
+        connector_runtime_turn_id="turn-1",
+    )
+    bindings = [
+        {
+            "source": {"input_type": "secrets", "key": "authorization"},
+            "target": {"target_type": "transport_headers", "key": "Authorization"},
+        }
+    ]
+    operation_sessions = []
+
+    def load_runtime_view(*, db, **_kwargs):
+        operation_sessions.append(db)
+        assert db is not construction_db
+        assert db.scalar(select(MCPServer.id)) is not None
+        return {f"mcp:{server_id}": {"secrets": {"authorization": "fresh"}}}
+
+    monkeypatch.setattr(
+        "xagent.web.services.connector_runtime.load_connector_runtime_view",
+        load_runtime_view,
+    )
+    try:
+        refresh = cfg._build_delegated_mcp_refresh_callback(
+            server=server,
+            runtime_bindings=bindings,
+            allow_delegated_authorization=True,
+        )
+        assert isinstance(refresh, functools.partial)
+        assert not _contains_orm_instance(refresh)
+
+        construction_db.expire(server)
+        construction_db.expunge(server)
+        construction_db.close()
+        refreshed = refresh()
+
+        assert refreshed["headers"]["Authorization"] == "fresh"
+        assert len(operation_sessions) == 1
+        assert engine.pool.checkedout() == 0
+    finally:
+        cfg.close()
+        construction_db.close()
         engine.dispose()
 
 

@@ -22,6 +22,10 @@ class MCPFailurePolicy(str, Enum):
     STRICT = "strict"
 
 
+class ToolFactoryRuntimeSessionBoundaryError(RuntimeError):
+    """Tool construction cannot safely detach its database resources."""
+
+
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
     {
         "adapter_construction",
