@@ -98,9 +98,31 @@ class TestAllowedExternalDirsMatchesWorkspaceBinding:
         external_dir.mkdir(parents=True, exist_ok=True)
         monkeypatch.setenv("XAGENT_EXTERNAL_UPLOAD_DIRS", str(external_dir))
 
-        assert tuple(_build_allowed_external_dirs(7, scope=scope)) == (
-            _build_external_allowlist(7, scope)
+        assert tuple(_build_allowed_external_dirs(7, scope=scope)) == tuple(
+            candidate.path for candidate in _build_external_allowlist(7, scope)
         )
+
+    def test_provenance_marks_only_the_user_upload_dir_as_scope_derived(
+        self, monkeypatch, tmp_path
+    ):
+        """The folding input additionally carries each entry's provenance,
+        which is what decides whether an unfoldable candidate may become its
+        own bind. Only the scope-narrowed user upload dir is workspace
+        derived; deployment external dirs are operator-declared mounts."""
+        monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(tmp_path))
+        external_dir = tmp_path.parent / f"{tmp_path.name}-shared-kb"
+        external_dir.mkdir(parents=True, exist_ok=True)
+        monkeypatch.setenv("XAGENT_EXTERNAL_UPLOAD_DIRS", str(external_dir))
+
+        scope = ExecutionScope(
+            workspace_segments=("tenant-a",), isolate_external_dirs=True
+        )
+        candidates = _build_external_allowlist(7, scope)
+
+        assert [(c.path, c.origin) for c in candidates] == [
+            (str(tmp_path / "user_7" / "tenant-a"), "scope"),
+            (str(external_dir), "deployment"),
+        ]
 
 
 class TestScopeSegmentsForTask:

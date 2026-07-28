@@ -11,7 +11,10 @@ that raw set rather than a silent behavior drift.
 
 Six-row physical-set matrix (unscoped / scoped isolate=False / external CA
 scoped / internal scoped / two known-limitation shapes), plus an Actor-path
-invariant and an external-dir ancestor/descendant boundary check.
+invariant, an external-dir ancestor/descendant boundary check, and the
+provenance split that decides what an unfoldable candidate means (a
+deployment-configured dir keeps its own bind; a workspace path that escapes
+the mount root covering it fails the build).
 """
 
 from __future__ import annotations
@@ -25,6 +28,7 @@ import pytest
 import xagent.web.services.workspace_binding as workspace_binding
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.workspace import scoped_user_root
+from xagent.sandbox import SandboxContractError, SandboxMountEscapeError
 from xagent.web.services.workspace_binding import (
     ChatWorkspaceBinding,
     build_chat_workspace_binding,
@@ -212,20 +216,161 @@ class TestExternalCAScopedRow:
         )
         assert binding.prepare_root == binding.mount_intent.mount_root
 
+    def _sibling_scope(self, actor: str = "actor9") -> ExecutionScope:
+        return ExecutionScope(
+            sandbox_key_suffix="ca-1",
+            workspace_segments=("ca1", actor),
+            sandbox_mount_segments=("ca1",),
+            isolate_external_dirs=True,
+        )
+
     def test_two_actors_under_same_ca_fold_to_identical_intent(self, _uploads_dir):
         """The multi-Actor collision #296 is about: same CA, different Actor
         subtrees must fold to a byte-identical intent to share one container.
         """
-        scope_a = self._scope()
-        scope_b = ExecutionScope(
+        binding_a = build_chat_workspace_binding(OWNER_ID, self._scope())
+        binding_b = build_chat_workspace_binding(OWNER_ID, self._sibling_scope())
+        assert binding_a.mount_intent == binding_b.mount_intent
+
+    def test_identical_intent_holds_with_real_actor_dirs_on_disk(self, _uploads_dir):
+        """Same invariant with the Actor subtrees actually materialized, so
+        the resolved view has real directories to answer with rather than
+        falling back to the lexical spelling of a missing path."""
+        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        (ca_root / "actor7").mkdir(parents=True)
+        (ca_root / "actor9").mkdir(parents=True)
+
+        binding_a = build_chat_workspace_binding(OWNER_ID, self._scope())
+        binding_b = build_chat_workspace_binding(OWNER_ID, self._sibling_scope())
+        assert binding_a.mount_intent == binding_b.mount_intent
+        assert binding_a.mount_intent.mount_root == str(ca_root)
+        assert str(ca_root / "actor7") not in binding_a.mount_intent.extra_mounts
+
+    def test_identical_intent_holds_when_one_actor_dir_is_an_inside_symlink(
+        self, _uploads_dir
+    ):
+        """An Actor subtree that is a symlink resolving back inside the CA
+        root is still genuinely covered by the CA bind, so it must fold away
+        exactly like a real directory -- otherwise the shared container
+        splits again."""
+        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        (ca_root / "actor7").mkdir(parents=True)
+        (ca_root / "real-actor9").mkdir()
+        (ca_root / "actor9").symlink_to(
+            ca_root / "real-actor9", target_is_directory=True
+        )
+
+        binding_a = build_chat_workspace_binding(OWNER_ID, self._scope())
+        binding_b = build_chat_workspace_binding(OWNER_ID, self._sibling_scope())
+        assert binding_a.mount_intent == binding_b.mount_intent
+
+
+class TestScopeDerivedEscapeFailsClosed:
+    """A workspace path that escapes the mount root covering it is rejected.
+
+    The scope-derived candidate's containment in the mount root is a
+    precondition of this projection (the CA root is chosen to cover it), the
+    tree it names is workspace-controlled, and its spelling varies per Actor.
+    So an escape may not be demoted to a separate bind: that would hand the
+    backend a writable mount of the symlink's target and give this Actor an
+    intent no sibling Actor under the same CA produces, defeating #296's
+    shared container. It fails the build instead.
+    """
+
+    def _ca_scope(self, actor: str) -> ExecutionScope:
+        return ExecutionScope(
             sandbox_key_suffix="ca-1",
-            workspace_segments=("ca1", "actor9"),
+            workspace_segments=("ca1", actor),
             sandbox_mount_segments=("ca1",),
             isolate_external_dirs=True,
         )
-        binding_a = build_chat_workspace_binding(OWNER_ID, scope_a)
-        binding_b = build_chat_workspace_binding(OWNER_ID, scope_b)
-        assert binding_a.mount_intent == binding_b.mount_intent
+
+    def test_actor_subtree_escaping_the_ca_root_is_rejected(
+        self, _uploads_dir, tmp_path
+    ):
+        """Covered direction: lexically under the CA root, resolving out."""
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-actor"
+        outside.mkdir()
+        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        ca_root.mkdir(parents=True)
+        (ca_root / "actor7").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(SandboxMountEscapeError) as excinfo:
+            build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+        assert str(outside) in str(excinfo.value)
+
+    def test_escape_never_produces_an_actor_specific_intent(
+        self, _uploads_dir, tmp_path
+    ):
+        """The invariant the rejection protects: no pair of Actors under one
+        CA can reach the sandbox with unequal intents. The escaping Actor
+        fails, and its sibling's intent is untouched."""
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-actor"
+        outside.mkdir()
+        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        (ca_root / "actor9").mkdir(parents=True)
+        (ca_root / "actor7").symlink_to(outside, target_is_directory=True)
+
+        sibling = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor9"))
+        assert sibling.mount_intent.mount_root == str(ca_root)
+        assert str(outside) not in sibling.mount_intent.extra_mounts
+
+        with pytest.raises(SandboxMountEscapeError):
+            build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+
+    def test_mount_root_escaping_the_user_root_is_rejected(
+        self, _uploads_dir, tmp_path
+    ):
+        """Covering direction: with isolate_external_dirs=False the candidate
+        is the unscoped user root, which must contain the narrower mount root
+        it is about to absorb. A symlinked mount root pointing outside the
+        user tree breaks that, so the promotion is rejected rather than
+        binding both the alias and its parent."""
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-proj"
+        outside.mkdir()
+        user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
+        user_root.mkdir(parents=True)
+        (user_root / "proj1").symlink_to(outside, target_is_directory=True)
+
+        scope = ExecutionScope(
+            sandbox_key_suffix="tenantA", workspace_segments=("proj1",)
+        )
+        with pytest.raises(SandboxMountEscapeError):
+            build_chat_workspace_binding(OWNER_ID, scope)
+
+    def test_error_is_a_sandbox_contract_error(self, _uploads_dir, tmp_path):
+        """chat.py classifies ``SandboxContractError`` as fail-closed: the
+        task fails instead of silently running unsandboxed on the host."""
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-actor"
+        outside.mkdir()
+        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        ca_root.mkdir(parents=True)
+        (ca_root / "actor7").symlink_to(outside, target_is_directory=True)
+
+        with pytest.raises(SandboxContractError):
+            build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+
+    def test_same_shape_from_a_deployment_dir_still_gets_its_own_mount(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        """Provenance is the whole difference: an operator-configured
+        external dir with the identical escaping-symlink shape is an
+        independently declared mount, identical for every Actor, so it keeps
+        its own bind instead of failing the build."""
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-kb"
+        outside.mkdir()
+        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        (ca_root / "actor7").mkdir(parents=True)
+        link = ca_root / "shared-kb"
+        link.symlink_to(outside, target_is_directory=True)
+        monkeypatch.setattr(
+            workspace_binding, "get_external_upload_dirs", lambda: [link]
+        )
+
+        binding = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+
+        assert binding.mount_intent.mount_root == str(ca_root)
+        assert binding.mount_intent.extra_mounts == (str(link),)
 
 
 class TestInternalScopedRow:
@@ -420,6 +565,31 @@ class TestExternalDirBoundary:
 
         assert binding.mount_intent.mount_root == str(scoped_root)
         assert binding.mount_intent.extra_mounts == ()
+
+
+class TestExtraMountNormalizationIsIntentOwned:
+    """The folding step hands over the surviving candidates as selected;
+    ``SandboxMountIntent`` is the single owner of their canonicalization,
+    deduplication and ordering, so the builder does not re-implement it.
+    """
+
+    def test_intent_canonicalizes_dedupes_and_sorts_the_survivors(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        first = tmp_path.parent / f"{tmp_path.name}-kb-a"
+        second = tmp_path.parent / f"{tmp_path.name}-kb-b"
+        for path in (first, second):
+            path.mkdir()
+        # Reverse-sorted, duplicated, and non-canonical spellings.
+        monkeypatch.setattr(
+            workspace_binding,
+            "get_external_upload_dirs",
+            lambda: [second, Path(f"{first}/."), first],
+        )
+
+        binding = build_chat_workspace_binding(OWNER_ID, None)
+
+        assert binding.mount_intent.extra_mounts == (str(first), str(second))
 
 
 class TestBackendPathDomain:

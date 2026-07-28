@@ -36,24 +36,26 @@ and is dropped rather than surfacing as a second, Actor-specific bind. Two
 Actors under the same CA then compute byte-identical mount intents and can
 share one container -- keeping the Actor subtree as a separate bind would
 make their desired configs diverge and is the root cause (#296) this
-projection removes.
+projection removes. That is a hard invariant rather than a best effort: an
+Actor subtree that cannot fold into the CA root fails the build instead of
+becoming an Actor-specific bind.
 
 Because that classification is lexical, every candidate is absolutized and
-symlink-resolved in the backend path domain first, and a candidate whose
-lexical and resolved verdicts disagree is never folded away -- see
-:func:`_fold_mount_paths`.
+symlink-resolved in the backend path domain first, and what a disagreement
+between the two views means depends on where the candidate came from --
+its :class:`_MountCandidate` provenance, see :func:`_fold_mount_paths`.
 """
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Optional, Sequence
+from typing import Literal, Optional, Sequence
 
 from ...config import get_external_upload_dirs, get_uploads_dir
 from ...core.execution_scope import ExecutionScope
 from ...core.workspace import scoped_user_root
-from ...sandbox import SandboxMountIntent
+from ...sandbox import SandboxMountEscapeError, SandboxMountIntent
 from ..sandbox_manager import absolute_backend_mount_path, resolve_backend_mount_path
 
 logger = logging.getLogger(__name__)
@@ -91,9 +93,32 @@ def _warn_once(kind: str, message: str, *args: object) -> None:
     logger.warning(message, *args)
 
 
+@dataclass(frozen=True)
+class _MountCandidate:
+    """One fold candidate plus the provenance that decides its fold policy.
+
+    ``"scope"`` -- derived from this owner's workspace root at the scope's
+    segments. Its containment in the mount root is a *precondition*, not an
+    observation: the CA root is chosen so it covers this path, the directory
+    tree it names is workspace-controlled, and its spelling varies per Actor.
+    A per-Actor survivor in the folded set would break the #296 invariant
+    that every Actor under one CA folds to a byte-identical intent, so this
+    candidate must fold away (or absorb the root) or the build fails closed.
+
+    ``"deployment"`` -- an operator-configured external directory
+    (``XAGENT_EXTERNAL_UPLOAD_DIRS``). It is an independently declared mount
+    in its own right, identical for every Actor in the process, so keeping
+    its own bind neither breaks intent equality nor exposes anything the
+    deployment did not name explicitly.
+    """
+
+    path: str
+    origin: Literal["scope", "deployment"]
+
+
 def _build_external_allowlist(
     owner_id: int, scope: Optional[ExecutionScope]
-) -> tuple[str, ...]:
+) -> tuple[_MountCandidate, ...]:
     """Mirror ``chat._build_allowed_external_dirs`` (``only_existing=False``).
 
     The user's upload dir is scope-narrowed only when
@@ -101,10 +126,12 @@ def _build_external_allowlist(
     (``XAGENT_EXTERNAL_UPLOAD_DIRS``) are never user-root derived and are
     always included.
 
-    Entries keep chat's exact spelling -- this mirrors an Actor-logical
-    allowlist that is pinned equivalent to chat's own by test. Backend-domain
-    absolutization belongs to :func:`_fold_mount_paths`, which is where these
-    values stop being an allowlist and become mount candidates.
+    ``path`` entries keep chat's exact spelling and order -- this mirrors an
+    Actor-logical allowlist that is pinned equivalent to chat's own by test.
+    Backend-domain absolutization belongs to :func:`_fold_mount_paths`, which
+    is where these values stop being an allowlist and become mount
+    candidates; the ``origin`` each one carries is what lets that folding
+    tell the two trust levels apart.
     """
     segments = (
         scope.workspace_segments
@@ -112,9 +139,10 @@ def _build_external_allowlist(
         else ()
     )
     user_upload_dir = scoped_user_root(get_uploads_dir(), owner_id, segments)
-    dirs = [str(user_upload_dir)]
-    dirs.extend(str(d) for d in get_external_upload_dirs())
-    return tuple(dirs)
+    return (
+        _MountCandidate(str(user_upload_dir), "scope"),
+        *(_MountCandidate(str(d), "deployment") for d in get_external_upload_dirs()),
+    )
 
 
 def _lexical_relation(root: str, path: str) -> str:
@@ -143,8 +171,11 @@ def _fold_relation(root: str, resolved_root: str, path: str, resolved_path: str)
       old root at the old root's path. A symlink that only *resolves* to an
       ancestor does not contain the old root at all.
 
-    So a disagreement demotes the candidate to disjoint: it keeps its own
-    bind, which is exactly the unfolded behavior and can never lose access.
+    So a disagreement demotes the candidate to disjoint -- the verdict that
+    grants a separate bind. What that means is provenance-dependent, and
+    :func:`_fold_mount_paths` owns the decision: for a deployment-configured
+    candidate a separate bind is exactly the unfolded behavior and loses
+    nothing, while for a scope-derived one it is a rejected build.
     """
     lexical = _lexical_relation(root, path)
     if lexical != _lexical_relation(resolved_root, resolved_path):
@@ -153,15 +184,16 @@ def _fold_relation(root: str, resolved_root: str, path: str, resolved_path: str)
 
 
 def _fold_mount_paths(
-    mount_root: str, candidates: Sequence[str]
+    mount_root: str, candidates: Sequence[_MountCandidate]
 ) -> tuple[str, tuple[str, ...]]:
     """Collapse a mount root and allowlist candidates into one physical set.
 
-    Root and candidates are first absolutized in the backend path domain
-    (``absolute_backend_mount_path``): they come from raw configuration
-    (``XAGENT_UPLOADS_DIR``, ``XAGENT_EXTERNAL_UPLOAD_DIRS``) and may be
-    relative or ``~``-prefixed, which the mount-path contract rejects and
-    which the pre-projection path mapper used to absolutize for them.
+    Root and candidate paths are first absolutized in the backend path
+    domain (``absolute_backend_mount_path``): they come from raw
+    configuration (``XAGENT_UPLOADS_DIR``, ``XAGENT_EXTERNAL_UPLOAD_DIRS``)
+    and may be relative or ``~``-prefixed, which the mount-path contract
+    rejects and which the pre-projection path mapper used to absolutize for
+    them.
 
     Then, repeatedly, each candidate is classified against the current root
     by :func:`_fold_relation`:
@@ -174,27 +206,58 @@ def _fold_mount_paths(
       lexical chain -- all are prefixes of the same root, hence prefixes of
       each other -- so promoting the shortest one is unambiguous and a
       single promotion reclassifies everything else against the new root.
-    - anything left over is disjoint and kept as its own mount.
+    - anything left over is disjoint, and provenance decides its fate: a
+      deployment-configured candidate keeps its own mount, a scope-derived
+      one fails the build closed.
 
-    Returns the final root and the deduplicated, sorted disjoint extras,
-    each in its absolutized (never symlink-resolved) spelling.
+    A scope-derived candidate is always lexically the root, its descendant
+    or its ancestor -- ``scoped_user_root`` composes both from the same user
+    root, and ``ExecutionScope`` enforces that ``sandbox_mount_segments`` is
+    a prefix of ``workspace_segments`` -- so the only way it reaches a
+    disjoint verdict is a symlink inside the workspace tree that moves it
+    out of the root it is required to share. Granting that its own bind
+    would hand the backend a writable mount of whatever the symlink points
+    at and give this Actor an intent no sibling Actor under the same CA
+    produces, so it raises ``SandboxMountEscapeError`` instead.
+
+    Returns the final root and the surviving candidates in candidate order,
+    each in its absolutized (never symlink-resolved) spelling;
+    ``SandboxMountIntent`` owns their canonicalization, deduplication and
+    ordering.
     """
     root = str(absolute_backend_mount_path(mount_root))
-    remaining = tuple(str(absolute_backend_mount_path(p)) for p in candidates)
-    resolved = {p: resolve_backend_mount_path(p) for p in remaining}
+    remaining = tuple(
+        _MountCandidate(str(absolute_backend_mount_path(c.path)), c.origin)
+        for c in candidates
+    )
+    resolved = {c.path: resolve_backend_mount_path(c.path) for c in remaining}
     resolved_root = resolve_backend_mount_path(root)
 
     while True:
-        verdicts = {
-            p: _fold_relation(root, resolved_root, p, resolved[p]) for p in remaining
-        }
-        covering = [p for p in remaining if verdicts[p] == "covering"]
+        verdicts = [
+            (c, _fold_relation(root, resolved_root, c.path, resolved[c.path]))
+            for c in remaining
+        ]
+        covering = [c for c, verdict in verdicts if verdict == "covering"]
         if not covering:
-            disjoint = tuple(sorted({p for p in remaining if verdicts[p] != "covered"}))
-            return root, disjoint
-        new_root = min(covering, key=len)
-        remaining = tuple(p for p in remaining if p != new_root)
-        root, resolved_root = new_root, resolved[new_root]
+            # Judged only once the root has stopped moving: an earlier
+            # promotion can widen the root enough to cover a candidate that
+            # was disjoint from the narrower one.
+            for candidate, verdict in verdicts:
+                if verdict == "disjoint" and candidate.origin == "scope":
+                    raise SandboxMountEscapeError(
+                        f"Workspace path {candidate.path!r} (resolving to "
+                        f"{resolved[candidate.path]!r}) is neither inside nor "
+                        f"a parent of sandbox mount root {root!r} (resolving "
+                        f"to {resolved_root!r}); refusing to bind it as a "
+                        "separate mount"
+                    )
+            return root, tuple(
+                c.path for c, verdict in verdicts if verdict != "covered"
+            )
+        new_root = min(covering, key=lambda c: len(c.path))
+        remaining = tuple(c for c in remaining if c.path != new_root.path)
+        root, resolved_root = new_root.path, resolved[new_root.path]
 
 
 def build_chat_workspace_binding(
@@ -205,6 +268,13 @@ def build_chat_workspace_binding(
     Called from ``chat.py`` (task creation and agent reconstruction alike)
     to build ``mount_intent`` for the task's sandbox lease provider; the
     Actor-logical allowlist stays chat-owned, see the module docstring.
+
+    Raises:
+        SandboxMountEscapeError: This owner's workspace path escapes the
+            mount root that has to cover it (see
+            :func:`_fold_mount_paths`). A ``SandboxContractError``, so
+            chat's task path fails the task instead of downgrading it to
+            unsandboxed local execution.
     """
     mount_segments = scope.effective_mount_segments if scope is not None else ()
 

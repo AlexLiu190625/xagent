@@ -62,6 +62,27 @@ class SandboxRuntimeConflictError(SandboxContractError):
     """
 
 
+class SandboxMountEscapeError(SandboxContractError):
+    """Raised when a mount candidate escapes the root that must contain it.
+
+    ``SandboxMountIntent``'s covered/covering/disjoint split is lexical, so
+    a caller that needs a candidate to be *physically* inside (or to
+    physically contain) the mount root owns the resolved view as well. When
+    such a candidate's lexical containment and its ``realpath`` containment
+    disagree, no fold verdict is safe: dropping it loses access to a path
+    the surviving bind does not expose, promoting it re-roots onto a
+    directory that does not contain the old root, and granting it a separate
+    bind exposes whatever the symlink points at.
+
+    Callers raise this for candidates whose containment is a precondition
+    rather than an observation -- a path derived from a workspace root that
+    the mount root is required to cover. A candidate that is an
+    independently declared mount in its own right (an operator-configured
+    external directory) has no such precondition and keeps its own bind
+    instead.
+    """
+
+
 class SandboxRecoveryRequiredError(SandboxContractError):
     """Raised when a sandbox is in a state that needs recovery before use.
 
