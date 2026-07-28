@@ -11,7 +11,6 @@ from __future__ import annotations
 import errno
 import logging
 import os
-import re
 import shutil
 import stat
 from contextlib import contextmanager
@@ -38,10 +37,10 @@ from .command_policy import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_INSPECTED_SCRIPT_BYTES = 1024 * 1024
+_MAX_COMMAND_POLICY_INPUT_CHARS = 64 * 1024
+_MAX_INSPECTED_SCRIPT_BYTES = _MAX_COMMAND_POLICY_INPUT_CHARS
 _MAX_INSPECTED_SCRIPT_DEPTH = 8
 _MAX_COMMAND_WRAPPER_DEPTH = 32
-_MAX_COMMAND_POLICY_INPUT_CHARS = 64 * 1024
 _MAX_POSSIBLE_SHELL_STATES = 16
 _MAX_POLICY_PARSE_ATTEMPTS = 64
 _MAX_POLICY_SOURCE_CHARS = 1024 * 1024
@@ -147,7 +146,27 @@ _READ_COMMANDS = {"cat"}
 _WRITE_COMMANDS = {"rm"}
 _SHELL_COMMANDS = {"bash"}
 _UNSUPPORTED_SHELL_COMMANDS = {"dash", "sh", "zsh"}
+_UNSUPPORTED_PRIVILEGE_COMMANDS = {"sudo"}
 _BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
+_BASH_LONG_FLAG_OPTIONS = {
+    "--debug",
+    "--debugger",
+    "--dump-po-strings",
+    "--dump-strings",
+    "--help",
+    "--login",
+    "--noediting",
+    "--noprofile",
+    "--norc",
+    "--posix",
+    "--pretty-print",
+    "--protected",
+    "--restricted",
+    "--verbose",
+    "--version",
+    "--wordexp",
+}
+_BASH_SHORT_FLAG_OPTIONS = frozenset("abefhiklmnprstuvxBCDHP")
 _IMPLICIT_SHELL_ENVIRONMENT = {"BASH_ENV", "CDPATH", "ENV", "ZDOTDIR"}
 _REJECTED_SHELL_ASSIGNMENTS = {
     *_IMPLICIT_SHELL_ENVIRONMENT,
@@ -170,14 +189,6 @@ _TRUSTED_EXECUTABLE_ROOTS = tuple(
         Path("/opt/homebrew/bin"),
     )
 )
-_QUOTED_HEREDOC_PATTERN = re.compile(
-    r"(?m)(?P<operator><<-?)(?P<space>[ \t]*)(?P<quote>['\"])"
-    r"(?P<delimiter>[A-Za-z_][A-Za-z0-9_]*)(?P=quote)(?=[ \t]*$)"
-)
-_TIME_KEYWORD_PATTERN = re.compile(
-    r"(?m)(?P<prefix>^|(?<=[;\n])|(?<=&&)|(?<=\|\|))"
-    r"(?P<space>[ \t]*)time(?=[ \t]+)"
-)
 _POLICY_TIME_WRAPPER = "__t_"
 
 
@@ -192,23 +203,105 @@ def _secure_script_open_flags() -> int:
     return os.O_RDONLY | nonblocking | nofollow
 
 
-def _is_unquoted_on_current_line(source: str, position: int) -> bool:
-    """Return whether ``position`` is outside quotes on its physical line."""
-    line_start = source.rfind("\n", 0, position) + 1
-    in_single_quote = False
-    in_double_quote = False
-    escaped = False
-    for character in source[line_start:position]:
-        if escaped:
-            escaped = False
-            continue
-        if character == "\\" and not in_single_quote:
-            escaped = True
-        elif character == "'" and not in_double_quote:
-            in_single_quote = not in_single_quote
-        elif character == '"' and not in_single_quote:
-            in_double_quote = not in_double_quote
-    return not in_single_quote and not in_double_quote and not escaped
+@dataclass(frozen=True)
+class _HeredocDeclaration:
+    delimiter: str
+    strip_tabs: bool
+    quoted: bool
+
+
+def _is_time_keyword_position(source: str, position: int) -> bool:
+    if not source.startswith("time", position):
+        return False
+    after = position + len("time")
+    if after >= len(source) or source[after] not in " \t":
+        return False
+    cursor = position - 1
+    while cursor >= 0 and source[cursor] in " \t":
+        cursor -= 1
+    if cursor < 0 or source[cursor] in ";\n":
+        return True
+    return source[max(0, cursor - 1) : cursor + 1] in {"&&", "||"}
+
+
+def _parse_heredoc_delimiter(
+    source: str,
+    start: int,
+    normalized: list[str],
+) -> tuple[_HeredocDeclaration | None, int]:
+    cursor = start
+    while cursor < len(source) and source[cursor] in " \t":
+        cursor += 1
+    if cursor >= len(source) or source[cursor] in "\r\n;|&()<>":
+        return None, cursor
+
+    token_start = cursor
+    delimiter: list[str] = []
+    quote: str | None = None
+    quoted = False
+    while cursor < len(source):
+        character = source[cursor]
+        if quote is None and character in " \t\r\n;|&()<>":
+            break
+        if quote is None and character in {"'", '"'}:
+            quote = character
+            quoted = True
+            normalized[cursor] = " "
+        elif quote == character:
+            quote = None
+            normalized[cursor] = " "
+        elif quote is None and character == "\\":
+            quoted = True
+            normalized[cursor] = " "
+            cursor += 1
+            if cursor >= len(source):
+                return None, cursor
+            delimiter.append(source[cursor])
+        else:
+            delimiter.append(character)
+        cursor += 1
+
+    if quote is not None or not delimiter:
+        return None, cursor
+    delimiter_value = "".join(delimiter)
+    if quoted:
+        normalized[token_start:cursor] = delimiter_value.ljust(cursor - token_start)
+    return (
+        _HeredocDeclaration(
+            delimiter=delimiter_value,
+            strip_tabs=False,
+            quoted=quoted,
+        ),
+        cursor,
+    )
+
+
+def _consume_heredoc_bodies(
+    source: str,
+    start: int,
+    declarations: Sequence[_HeredocDeclaration],
+    normalized: list[str],
+) -> int:
+    cursor = start
+    for declaration in declarations:
+        while cursor <= len(source):
+            line_end = source.find("\n", cursor)
+            if line_end < 0:
+                line_end = len(source)
+            line = source[cursor:line_end]
+            comparable = line.lstrip("\t") if declaration.strip_tabs else line
+            if comparable == declaration.delimiter:
+                cursor = line_end + (line_end < len(source))
+                break
+            if declaration.quoted:
+                for index in range(cursor, line_end):
+                    normalized[index] = "x"
+            if line_end == len(source):
+                raise CommandPolicyViolation("cannot safely parse shell command")
+            cursor = line_end + 1
+        else:
+            raise CommandPolicyViolation("cannot safely parse shell command")
+    return cursor
 
 
 def _has_active_unmodeled_expansion(raw_word: str) -> bool:
@@ -298,42 +391,80 @@ def _normalize_policy_shell_source(command: str) -> str:
     expansion or nested commands.
     """
     normalized = list(command)
-    for match in _QUOTED_HEREDOC_PATTERN.finditer(command):
-        if not _is_unquoted_on_current_line(command, match.start()):
-            continue
-        quote_start = match.start("quote")
-        quote_end = match.end("delimiter")
-        normalized[quote_start] = " "
-        normalized[quote_end] = " "
+    declarations: list[_HeredocDeclaration] = []
+    in_single_quote = False
+    in_double_quote = False
+    escaped = False
+    in_comment = False
+    cursor = 0
 
-        body_start = command.find("\n", match.end())
-        if body_start < 0:
+    while cursor < len(command):
+        character = command[cursor]
+        if in_comment:
+            if character == "\n":
+                in_comment = False
+            else:
+                cursor += 1
+                continue
+        if escaped:
+            escaped = False
+            cursor += 1
             continue
-        body_start += 1
-        delimiter = match.group("delimiter")
-        strip_tabs = match.group("operator") == "<<-"
-        cursor = body_start
-        while cursor <= len(command):
-            line_end = command.find("\n", cursor)
-            if line_end < 0:
-                line_end = len(command)
-            line = command[cursor:line_end]
-            comparable = line.lstrip("\t") if strip_tabs else line
-            if comparable == delimiter:
-                break
-            for index in range(cursor, line_end):
-                normalized[index] = "x"
-            if line_end == len(command):
-                break
-            cursor = line_end + 1
+        if character == "\\" and not in_single_quote:
+            escaped = True
+            cursor += 1
+            continue
+        if character == "'" and not in_double_quote:
+            in_single_quote = not in_single_quote
+            cursor += 1
+            continue
+        if character == '"' and not in_single_quote:
+            in_double_quote = not in_double_quote
+            cursor += 1
+            continue
+        if in_single_quote or in_double_quote:
+            cursor += 1
+            continue
 
-    source = "".join(normalized)
-    return _TIME_KEYWORD_PATTERN.sub(
-        lambda match: (
-            f"{match.group('prefix')}{match.group('space')}{_POLICY_TIME_WRAPPER}"
-        ),
-        source,
-    )
+        if character == "#" and (cursor == 0 or command[cursor - 1] in " \t\r\n;|&()"):
+            in_comment = True
+            cursor += 1
+            continue
+        if _is_time_keyword_position(command, cursor):
+            normalized[cursor : cursor + len("time")] = _POLICY_TIME_WRAPPER
+            cursor += len("time")
+            continue
+        if (
+            command.startswith("<<", cursor)
+            and not command.startswith("<<<", cursor)
+            and (cursor == 0 or command[cursor - 1] != "<")
+        ):
+            strip_tabs = command.startswith("<<-", cursor)
+            delimiter_start = cursor + (3 if strip_tabs else 2)
+            declaration, delimiter_end = _parse_heredoc_delimiter(
+                command,
+                delimiter_start,
+                normalized,
+            )
+            if declaration is None:
+                raise CommandPolicyViolation("cannot safely parse shell command")
+            declarations.append(replace(declaration, strip_tabs=strip_tabs))
+            cursor = delimiter_end
+            continue
+        if character == "\n" and declarations:
+            cursor = _consume_heredoc_bodies(
+                command,
+                cursor + 1,
+                declarations,
+                normalized,
+            )
+            declarations.clear()
+            continue
+        cursor += 1
+
+    if declarations or in_single_quote or in_double_quote or escaped:
+        raise CommandPolicyViolation("cannot safely parse shell command")
+    return "".join(normalized)
 
 
 class _CommandValue(str):
@@ -379,12 +510,19 @@ class _CommandWrapperGrammar:
     flag_options: frozenset[str] = frozenset()
     value_options: frozenset[str] = frozenset()
     attached_short_value_options: frozenset[str] = frozenset()
-    leading_scalars: int = 0
+    consumes_leading_scalar: bool = False
     allows_assignments: bool = False
     cwd_options: frozenset[str] = frozenset()
     terminal_options: frozenset[str] = frozenset()
     rejected_options: frozenset[str] = frozenset()
     propagates_state: bool = False
+
+
+@dataclass(frozen=True)
+class _BashInvocation:
+    initialization_files: tuple[str, ...]
+    command_text: str | None = None
+    script: str | None = None
 
 
 _COMMAND_WRAPPER_GRAMMARS = {
@@ -463,73 +601,6 @@ _COMMAND_WRAPPER_GRAMMARS = {
         attached_short_value_options=frozenset({"-e", "-i", "-o"}),
         terminal_options=frozenset({"--help", "--version"}),
     ),
-    "sudo": _CommandWrapperGrammar(
-        flag_options=frozenset(
-            {
-                "-A",
-                "--askpass",
-                "-b",
-                "--background",
-                "-E",
-                "--preserve-env",
-                "-H",
-                "--set-home",
-                "-K",
-                "--remove-timestamp",
-                "-k",
-                "--reset-timestamp",
-                "-n",
-                "--non-interactive",
-                "-P",
-                "--preserve-groups",
-                "-S",
-                "--stdin",
-            }
-        ),
-        value_options=frozenset(
-            {
-                "-C",
-                "--close-from",
-                "-D",
-                "--chdir",
-                "-g",
-                "--group",
-                "-h",
-                "--host",
-                "-p",
-                "--prompt",
-                "-R",
-                "--chroot",
-                "-r",
-                "--role",
-                "-T",
-                "--command-timeout",
-                "-t",
-                "--type",
-                "-u",
-                "--user",
-            }
-        ),
-        attached_short_value_options=frozenset(
-            {"-C", "-D", "-g", "-h", "-p", "-R", "-r", "-T", "-t", "-u"}
-        ),
-        cwd_options=frozenset({"-D", "--chdir"}),
-        terminal_options=frozenset({"-V", "--version", "-v", "--validate"}),
-        rejected_options=frozenset(
-            {
-                "-e",
-                "--edit",
-                "-i",
-                "--login",
-                "-l",
-                "--list",
-                "-R",
-                "--chroot",
-                "-s",
-                "--shell",
-            }
-        ),
-    ),
     "time": _CommandWrapperGrammar(
         flag_options=frozenset(
             {"-a", "--append", "-p", "--portability", "-v", "--verbose"}
@@ -545,7 +616,7 @@ _COMMAND_WRAPPER_GRAMMARS = {
         ),
         value_options=frozenset({"-k", "--kill-after", "-s", "--signal"}),
         attached_short_value_options=frozenset({"-k", "-s"}),
-        leading_scalars=1,
+        consumes_leading_scalar=True,
         terminal_options=frozenset({"--help", "--version"}),
     ),
 }
@@ -555,6 +626,7 @@ _CLASSIFIED_EXECUTABLE_COMMANDS = {
     *_WRITE_COMMANDS,
     *_SHELL_COMMANDS,
     *_UNSUPPORTED_SHELL_COMMANDS,
+    *_UNSUPPORTED_PRIVILEGE_COMMANDS,
     "chroot",
     "xargs",
     *(
@@ -797,6 +869,10 @@ class WorkspaceCommandPathGuard:
         if charge_argv:
             _active_validation_session().charge_argv_tokens(1 + len(args))
         command_name = os.path.basename(command_word)
+        if command_name in _UNSUPPORTED_PRIVILEGE_COMMANDS:
+            raise CommandPolicyViolation(
+                f"cannot safely inspect privilege escalation via {command_name}"
+            )
         if self._is_direct_command_path(command_word):
             if not self._is_trusted_system_command(command_word, command_name):
                 self._inspect_direct_shell_script(command_word, state)
@@ -985,7 +1061,7 @@ class WorkspaceCommandPathGuard:
             terminal_mode = terminal_mode or option in grammar.terminal_options
             index += consumed
 
-        for _ in range(grammar.leading_scalars):
+        if grammar.consumes_leading_scalar:
             if index >= len(values):
                 return state
             index += 1
@@ -1082,17 +1158,22 @@ class WorkspaceCommandPathGuard:
         try:
             descriptor = os.open(script_path, _secure_script_open_flags())
             metadata = os.fstat(descriptor)
-            if (
-                not stat.S_ISREG(metadata.st_mode)
-                or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
-            ):
+            if not stat.S_ISREG(metadata.st_mode):
                 raise CommandPathViolation(access="read", path=script_path)
+            if metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES:
+                raise CommandPolicyViolation(
+                    "shell policy script exceeds the "
+                    f"{_MAX_INSPECTED_SCRIPT_BYTES}-byte inspection limit"
+                )
             session.charge_script_bytes(metadata.st_size)
             with os.fdopen(descriptor, "rb") as script_file:
                 descriptor = None
                 raw_script = script_file.read(_MAX_INSPECTED_SCRIPT_BYTES + 1)
             if len(raw_script) > _MAX_INSPECTED_SCRIPT_BYTES:
-                raise CommandPathViolation(access="read", path=script_path)
+                raise CommandPolicyViolation(
+                    "shell policy script exceeds the "
+                    f"{_MAX_INSPECTED_SCRIPT_BYTES}-byte inspection limit"
+                )
             script = raw_script.decode("utf-8")
         except OSError as exc:
             # A missing script may be created earlier in the same shell string;
@@ -1203,69 +1284,120 @@ class WorkspaceCommandPathGuard:
                 "cannot safely inspect implicit shell initialization via "
                 f"{active_environment}"
             )
-        command_option_index: int | None = None
-        for index, value in enumerate(literals[:-1]):
-            if value == "--":
-                break
-            if (
-                value.startswith("-")
-                and not value.startswith("--")
-                and "c" in value[1:]
-            ):
-                command_option_index = index
-                break
-
-        file_values = (
-            literals
-            if command_option_index is None
-            else literals[:command_option_index]
-        )
-        if command_name == "bash":
-            file_values, initialization_files = self._extract_bash_file_options(
-                file_values
+        invocation = self._parse_bash_invocation(literals)
+        for initialization_file in invocation.initialization_files:
+            self._inspect_shell_script(
+                initialization_file,
+                state,
+                propagate_state=False,
             )
-            for initialization_file in initialization_files:
-                self._inspect_shell_script(
-                    initialization_file,
-                    state,
-                    propagate_state=False,
-                )
-
-        if command_option_index is not None:
-            self._validate_shell_states(literals[command_option_index + 1], state)
+        if invocation.command_text is not None:
+            self._validate_shell_states(invocation.command_text, state)
             return
-
-        script = self._shell_script_operand(file_values)
-        if script is None:
+        if invocation.script is None:
             raise CommandPolicyViolation(
                 f"cannot inspect {command_name} input without command text or a script"
             )
-        self._inspect_shell_script(script, state, propagate_state=False)
+        self._inspect_shell_script(invocation.script, state, propagate_state=False)
 
     @staticmethod
-    def _extract_bash_file_options(
+    def _parse_bash_invocation(
         values: Sequence[str],
-    ) -> tuple[list[str], list[str]]:
-        remaining: list[str] = []
+    ) -> _BashInvocation:
         initialization_files: list[str] = []
         index = 0
         while index < len(values):
             value = values[index]
+            if isinstance(value, _CommandValue) and not value.is_static:
+                raise CommandPolicyViolation(
+                    "cannot safely inspect dynamic bash option region"
+                )
             if value == "--":
-                remaining.extend(values[index:])
-                break
+                index += 1
+                return _BashInvocation(
+                    initialization_files=tuple(initialization_files),
+                    script=values[index] if index < len(values) else None,
+                )
             if value in _BASH_FILE_OPTIONS:
-                if index + 1 < len(values):
-                    initialization_files.append(values[index + 1])
-                index += 2
-                continue
-            if any(value.startswith(f"{option}=") for option in _BASH_FILE_OPTIONS):
-                initialization_files.append(value.split("=", 1)[1])
+                index += 1
+                if index >= len(values):
+                    raise CommandPolicyViolation(f"missing bash argument for {value}")
+                argument = values[index]
+                if isinstance(argument, _CommandValue) and not argument.is_static:
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect dynamic bash option region"
+                    )
+                initialization_files.append(argument)
                 index += 1
                 continue
-            remaining.append(value)
-            index += 1
-        return remaining, initialization_files
+            if any(value.startswith(f"{option}=") for option in _BASH_FILE_OPTIONS):
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect bash option {value}"
+                )
+            if value in _BASH_LONG_FLAG_OPTIONS:
+                index += 1
+                continue
+            if value.startswith("--"):
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect bash option {value}"
+                )
+            if value == "-":
+                return _BashInvocation(initialization_files=tuple(initialization_files))
+            if value.startswith(("-", "+")) and len(value) > 1:
+                named_option_count = 0
+                has_command_text = False
+                stdin_mode = False
+                for option in value[1:]:
+                    if option in {"o", "O"}:
+                        named_option_count += 1
+                    elif option == "c":
+                        has_command_text = True
+                    elif option == "s":
+                        stdin_mode = True
+                    elif option not in _BASH_SHORT_FLAG_OPTIONS:
+                        raise CommandPolicyViolation(
+                            f"cannot safely inspect bash option {value}"
+                        )
+
+                index += 1
+                for _ in range(named_option_count):
+                    if index >= len(values):
+                        raise CommandPolicyViolation(
+                            f"missing bash argument for {value}"
+                        )
+                    argument = values[index]
+                    if isinstance(argument, _CommandValue) and not argument.is_static:
+                        raise CommandPolicyViolation(
+                            "cannot safely inspect dynamic bash option region"
+                        )
+                    index += 1
+                if has_command_text:
+                    if index >= len(values):
+                        raise CommandPolicyViolation(
+                            f"missing bash argument for {value}"
+                        )
+                    command_text = values[index]
+                    if (
+                        isinstance(command_text, _CommandValue)
+                        and not command_text.is_static
+                    ):
+                        raise CommandPolicyViolation(
+                            "cannot safely inspect dynamic bash option region"
+                        )
+                    return _BashInvocation(
+                        initialization_files=tuple(initialization_files),
+                        command_text=command_text,
+                    )
+                if stdin_mode:
+                    return _BashInvocation(
+                        initialization_files=tuple(initialization_files)
+                    )
+                continue
+            return _BashInvocation(
+                initialization_files=tuple(initialization_files),
+                script=value,
+            )
+        return _BashInvocation(initialization_files=tuple(initialization_files))
 
     def _check_sourced_shell(
         self,
@@ -1280,28 +1412,6 @@ class WorkspaceCommandPathGuard:
             state,
             propagate_state=True,
         )
-
-    @staticmethod
-    def _shell_script_operand(values: Sequence[str]) -> str | None:
-        index = 0
-        while index < len(values):
-            value = values[index]
-            if value == "--":
-                return values[index + 1] if index + 1 < len(values) else None
-            if value in {"-o", "-O"}:
-                index += 2
-                continue
-            if value == "-s" or (
-                value.startswith("-")
-                and not value.startswith("--")
-                and "s" in value[1:]
-            ):
-                return None
-            if value.startswith("-") and value != "-":
-                index += 1
-                continue
-            return value
-        return None
 
     def _check_xargs(self, values: Sequence[str], state: _ShellState) -> None:
         command_start = len(values)

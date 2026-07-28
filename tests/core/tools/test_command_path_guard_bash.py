@@ -2,6 +2,7 @@
 
 import os
 import shlex
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -58,6 +59,11 @@ class _GuardedCommandTool:
 
 def _guarded_tool(workspace):
     return _GuardedCommandTool(workspace)
+
+
+def _write_comment_script_bytes(path, size):
+    prefix = b"#"
+    path.write_bytes(prefix + (b"x" * (size - len(prefix))))
 
 
 class TestScopedCommandPathGuardBash:
@@ -217,6 +223,41 @@ class TestScopedCommandPathGuardBash:
             guard.validate(
                 f"printf %s \"<<'EOF'\"\ncat {shlex.quote(str(sibling_file))}\nEOF\n"
             )
+
+    def test_nested_quoted_heredoc_body_is_masked_once(self):
+        source = "cat <<'OUTER'\nreport <<'INNER'\nOUTER\nINNER\nprintf live\n"
+
+        normalized = command_path_guard_module._normalize_policy_shell_source(source)
+
+        assert len(normalized) == len(source)
+        assert normalized.splitlines()[2] == "OUTER"
+        assert normalized.endswith("printf live\n")
+
+    def test_multiple_quoted_heredocs_are_consumed_in_declaration_order(self):
+        source = (
+            "cat <<'FIRST' <<-'SECOND'\n"
+            "first <<'NESTED'\n"
+            "FIRST\n"
+            "\tsecond time\n"
+            "\tSECOND\n"
+            "printf live\n"
+        )
+
+        normalized = command_path_guard_module._normalize_policy_shell_source(source)
+
+        assert len(normalized) == len(source)
+        assert normalized.splitlines()[2] == "FIRST"
+        assert normalized.splitlines()[4] == "\tSECOND"
+        assert normalized.endswith("printf live\n")
+
+    def test_time_keyword_normalization_ignores_multiline_quoted_literal(self):
+        source = 'printf "%s" "literal\ntime cat own.txt"\ntime cat own.txt\n'
+
+        normalized = command_path_guard_module._normalize_policy_shell_source(source)
+
+        assert normalized == (
+            'printf "%s" "literal\ntime cat own.txt"\n__t_ cat own.txt\n'
+        )
 
     def test_allows_time_keyword_with_validated_nested_command(
         self,
@@ -433,7 +474,6 @@ class TestScopedCommandPathGuardBash:
             "command -p cat {path}",
             "setsid -f cat {path}",
             "ionice -c 2 -n 7 cat {path}",
-            "sudo -n cat {path}",
             "/usr/bin/time -p cat {path}",
         ],
     )
@@ -464,7 +504,6 @@ class TestScopedCommandPathGuardBash:
             "command -p cat own.txt",
             "setsid -f cat own.txt",
             "ionice -c 2 -n 7 cat own.txt",
-            "sudo -n cat own.txt",
             "/usr/bin/time -p cat own.txt",
         ],
     )
@@ -475,6 +514,65 @@ class TestScopedCommandPathGuardBash:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sudo -n cat own.txt",
+            "env sudo -n cat own.txt",
+            "command sudo -n cat own.txt",
+        ],
+    )
+    def test_rejects_sudo_privilege_wrapper(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot safely inspect privilege escalation via sudo",
+        ):
+            guard.validate(command)
+
+    def test_rejects_trusted_absolute_sudo_path_when_available(
+        self,
+        scoped_command_workspace,
+    ):
+        sudo = shutil.which("sudo")
+        if sudo is None:
+            pytest.skip("sudo is unavailable")
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot safely inspect privilege escalation via sudo",
+        ):
+            guard.validate(f"{shlex.quote(sudo)} -n cat own.txt")
+
+    def test_rejects_path_shadowed_sudo_before_script_inspection(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        fake_sudo = workspace.output_dir / "sudo"
+        fake_sudo.write_text("#!/usr/bin/env bash\n:\n", encoding="utf-8")
+        fake_sudo.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            f"{workspace.output_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot safely inspect privilege escalation via sudo",
+        ):
+            guard.validate("sudo -n cat own.txt")
 
     @pytest.mark.parametrize(
         "command",
@@ -583,7 +681,6 @@ class TestScopedCommandPathGuardBash:
         "command_template",
         [
             "bash --rcfile {path} -i",
-            "bash --rcfile={path} -i",
             "bash --init-file {path} -i -c exit",
             "bash --rcfile {path} -i -c exit",
         ],
@@ -596,6 +693,129 @@ class TestScopedCommandPathGuardBash:
 
         with pytest.raises(CommandPathViolation):
             guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    @pytest.mark.parametrize("option", ["--rcfile", "--init-file"])
+    def test_bash_file_option_consumes_dash_prefixed_argument(
+        self,
+        scoped_command_workspace,
+        option,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(f"bash {option} -c 'printf safe'")
+
+    @pytest.mark.parametrize("option", ["--rcfile", "--init-file"])
+    def test_rejects_attached_bash_long_file_option(
+        self,
+        scoped_command_workspace,
+        option,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        init_file = workspace.output_dir / "safe.rc"
+        init_file.write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot safely inspect bash option",
+        ):
+            guard.validate(f"bash {option}={shlex.quote(str(init_file))} -c exit")
+
+    @pytest.mark.parametrize("option", ["-o", "+o", "-O", "+O"])
+    def test_bash_named_option_consumes_required_value(
+        self,
+        scoped_command_workspace,
+        option,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        option_value = "posix" if option in {"-o", "+o"} else "extglob"
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"bash {option} {option_value} -c 'printf safe'")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash --rcfile",
+            "bash --init-file",
+            "bash -o",
+            "bash +o",
+            "bash -O",
+            "bash +O",
+            "bash -c",
+        ],
+    )
+    def test_rejects_missing_bash_option_argument(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="missing bash argument"):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "bash $BASH_OPTIONS -c 'printf safe'",
+            "bash -o $BASH_OPTION -c 'printf safe'",
+            "bash --norc $BASH_OPTIONS -c 'printf safe'",
+        ],
+    )
+    def test_rejects_dynamic_bash_option_region(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot safely inspect dynamic bash option region",
+        ):
+            guard.validate(command)
+
+    @pytest.mark.parametrize("cluster", ["-xc", "-cx", "-sc", "-cs"])
+    def test_bash_short_clusters_consume_command_text(
+        self,
+        scoped_command_workspace,
+        cluster,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"bash {cluster} 'printf %s \"$1\"' ignored "
+            f"{shlex.quote(str(sibling_file))}"
+        )
+
+    @pytest.mark.parametrize("command", ["bash", "bash -s", "bash --", "bash -"])
+    def test_rejects_stdin_fed_or_missing_bash_input(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation, match="without command text or a script"
+        ):
+            guard.validate(command)
+
+    def test_dynamic_bash_command_positionals_are_not_option_region(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("bash -c 'printf safe' ignored \"$DYNAMIC_POSITIONAL\"")
 
     def test_shell_c_positional_arguments_are_not_treated_as_file_paths(
         self, scoped_command_workspace
@@ -1381,6 +1601,69 @@ class TestScopedCommandPathGuardBash:
             match="command policy script byte budget exceeded",
         ):
             guard.validate("bash one.sh; bash two.sh")
+
+    @pytest.mark.parametrize("invocation", ["bash {script}", "source {script}"])
+    @pytest.mark.parametrize("offset", [-1, 0, 1])
+    def test_policy_script_byte_limit_boundary(
+        self,
+        scoped_command_workspace,
+        invocation,
+        offset,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        limit = command_path_guard_module._MAX_INSPECTED_SCRIPT_BYTES
+        script = workspace.output_dir / f"boundary-{offset}.sh"
+        _write_comment_script_bytes(script, limit + offset)
+        guard = WorkspaceCommandPathGuard(workspace)
+        command = invocation.format(script=shlex.quote(str(script)))
+
+        if offset <= 0:
+            guard.validate(command)
+        else:
+            with pytest.raises(
+                CommandPolicyViolation,
+                match=rf"shell policy script exceeds the {limit}-byte inspection limit",
+            ):
+                guard.validate(command)
+
+    @pytest.mark.parametrize("offset", [0, 1])
+    def test_policy_script_byte_limit_counts_multibyte_utf8(
+        self,
+        scoped_command_workspace,
+        offset,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        limit = command_path_guard_module._MAX_INSPECTED_SCRIPT_BYTES
+        script = workspace.output_dir / f"multibyte-{offset}.sh"
+        payload = b"#" + ("é".encode("utf-8") * ((limit - 1) // 2))
+        payload += b"x" * (limit + offset - len(payload))
+        script.write_bytes(payload)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        if offset == 0:
+            guard.validate(f"bash {shlex.quote(str(script))}")
+        else:
+            with pytest.raises(
+                CommandPolicyViolation,
+                match=rf"shell policy script exceeds the {limit}-byte inspection limit",
+            ):
+                guard.validate(f"bash {shlex.quote(str(script))}")
+
+    def test_script_size_rejection_keeps_executor_generic_error(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        limit = command_path_guard_module._MAX_INSPECTED_SCRIPT_BYTES
+        script = workspace.output_dir / "oversized.sh"
+        _write_comment_script_bytes(script, limit + 1)
+        tool = _guarded_tool(workspace)
+
+        result = tool.run_json_sync({"command": f"bash {shlex.quote(str(script))}"})
+
+        assert result["return_code"] == 126
+        assert result["error"].endswith("command denied by policy")
+        assert "inspection limit" not in result["error"]
 
     @pytest.mark.parametrize(
         "command",
