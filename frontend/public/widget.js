@@ -511,7 +511,6 @@
         return;
       }
       runRecoveryFlow();
-      flush();
     }
 
     function onMessage(event) {

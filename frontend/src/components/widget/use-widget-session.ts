@@ -5,7 +5,10 @@ import type { WebSocketConnectionFailure } from "@/hooks/use-websocket"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
-const PARENT_RECOVERABLE_CODES = new Set(["network_unavailable", "rate_limited"])
+// Keep this predicate aligned with the two retry signals emitted by
+// frontend/public/widget.js; every other parent code fails closed.
+const isParentRecoverableCode = (code: string): boolean =>
+  code === "network_unavailable" || code === "rate_limited"
 
 export type WidgetSessionStatus = "waiting" | "active" | "refreshing" | "degraded" | "terminal"
 export type WidgetSessionReconnectReason = "ws_closed" | "token_expired"
@@ -258,7 +261,7 @@ export function useWidgetSession() {
       if (event.data.type === "session_degraded") {
         if (
           typeof event.data.code !== "string"
-          || !PARENT_RECOVERABLE_CODES.has(event.data.code)
+          || !isParentRecoverableCode(event.data.code)
         ) {
           transitionTerminal("unexpected_error")
           return

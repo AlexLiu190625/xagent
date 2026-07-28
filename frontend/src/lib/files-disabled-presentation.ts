@@ -20,8 +20,10 @@ const AMBIGUOUS_FILE_LOCATION_KEYS = new Set(["path", "directory"])
 const LOCAL_PATH_CANDIDATE_START_PATTERN = String.raw`(?:/|~[\\/]|\.{1,2}[\\/]|[a-z]:[\\/]|\\{1,2}[^\\/]+[\\/]|(?:artifacts?|output|uploads?|workspace)(?:[\\/]|$))`
 const EXPLICIT_LOCAL_PATH_RE = /^(?:~[\\/]|\.{1,2}[\\/]|[a-z]:[\\/]|\\{1,2}[^\\/]+[\\/]|(?:artifacts?|output|uploads?|workspace)(?:[\\/]|$))/i
 const LOCAL_POSIX_ROOT_RE = /^\/(?:app|data|etc|home|mnt|opt|private|raw|root|sandbox|srv|tmp|users|var|workspace)(?:[\\/]|$)/i
-// Shell redirects and prose separators are token boundaries, while ordinary
-// slash-delimited text remains outside this deliberately narrow grammar.
+// Shell redirects and prose separators are token boundaries. Relative paths
+// are recognized only under the explicit artifact/output/upload/workspace
+// roots above; arbitrary slash-delimited prose deliberately remains outside
+// this narrow grammar.
 const UNQUOTED_PATH_PREFIX_PATTERN = "(^|[\\s\"'([{=,;<>|:&!])"
 const UNQUOTED_PATH_SUFFIX_PATTERN = "[^\\s\"'`<>),;]*"
 const BARE_FILE_URI_RE = /\bfile:[^\s<>"'`]+/gi
