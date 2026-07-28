@@ -7,6 +7,7 @@ type TestWebSocketMessage = {
   timestamp: string
   data?: unknown
   task_id?: number
+  step_id?: string
   task?: Record<string, unknown>
   status?: string
   run_id?: string | null
@@ -174,8 +175,17 @@ function StateProbe() {
         )}
       </div>
       <div data-testid="task-status">{state.currentTask?.status || ""}</div>
+      <div data-testid="task-title">{state.currentTask?.title || ""}</div>
       <div data-testid="task-id">{state.taskId ?? ""}</div>
       <div data-testid="steps-count">{state.steps.length}</div>
+      <div data-testid="steps">{JSON.stringify(state.steps.map((step) => ({
+        id: step.id,
+        status: step.status,
+        dependencies: step.dependencies,
+        started_at: step.started_at,
+        completed_at: step.completed_at,
+      })))}</div>
+      <div data-testid="dag-phase">{state.dagExecution?.phase ?? ""}</div>
       <div data-testid="history-loading">{String(state.isHistoryLoading)}</div>
       <div data-testid="preview-open">{String(state.filePreview.isOpen)}</div>
       <div data-testid="processing">{String(state.isProcessing)}</div>
@@ -333,6 +343,54 @@ const assistantMessage = (
     },
   },
 })
+
+const dagTraceMessage = (
+  eventType: string,
+  taskId: number,
+  data: Record<string, unknown> = {},
+): TestWebSocketMessage => ({
+  type: "trace_event",
+  timestamp: "2026-05-27T05:00:02Z",
+  task_id: taskId,
+  step_id: typeof data.step_id === "string" ? data.step_id : undefined,
+  data: {
+    event_id: `${eventType}-${taskId}-${String(data.step_id ?? "task")}`,
+    event_type: eventType,
+    data,
+  },
+})
+
+const dagBurst = (taskId: number): TestWebSocketMessage[] => [
+  dagTraceMessage("dag_plan_start", taskId, { phase: "planning" }),
+  dagTraceMessage("dag_plan_end", taskId, {
+    plan_id: `plan-${taskId}`,
+    steps_count: 1,
+    plan_data: {
+      steps: [{
+        id: "step-one",
+        name: "Step one",
+        dependencies: ["dependency-one"],
+      }],
+    },
+  }),
+  dagTraceMessage("dag_execute_start", taskId, { iteration: 1 }),
+  dagTraceMessage("dag_step_start", taskId, {
+    step_id: "step-one",
+    step_name: "Step one",
+    dependencies: ["dependency-one"],
+    started_at: "2026-05-27T05:00:03Z",
+  }),
+  dagTraceMessage("dag_step_end", taskId, {
+    step_id: "step-one",
+    step_name: "Step one",
+    completed_at: "2026-05-27T05:00:04Z",
+  }),
+  dagTraceMessage("dag_step_failed", taskId, {
+    step_id: "step-one",
+    step_name: "Step one",
+    completed_at: "2026-05-27T05:00:05Z",
+  }),
+]
 
 function SeedRunningTask() {
   const { dispatch } = useApp()
@@ -2178,6 +2236,112 @@ describe("AppProvider websocket message routing", () => {
       expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
       expect(screen.getByTestId("task-id").textContent).toBe("98")
       expect(screen.getByTestId("messages").textContent).toContain("Current replacement output")
+    })
+  })
+
+  it("projects every normal Session DAG burst frame against the prior frame", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(99))
+      dagBurst(99).forEach((message) => webSocketOptions.current?.onMessage?.(message))
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("dag-phase").textContent).toBe("failed")
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+    expect(screen.getByTestId("steps").textContent).toContain('"status":"failed"')
+    expect(screen.getByTestId("steps").textContent).toContain('"dependencies":["dependency-one"]')
+    expect(screen.getByTestId("steps").textContent).toContain('"started_at":"2026-05-27T05:00:03Z"')
+    expect(screen.getByTestId("steps").textContent).toContain('"completed_at":"2026-05-27T05:00:05Z"')
+  })
+
+  it("projects every buffered Session DAG burst frame against the prior frame", async () => {
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(100)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    await getSessionControls().sendMessage("replacement", { clientMessageId: "buffered-dag-burst" })
+
+    act(() => {
+      dagBurst(101).forEach((message) => onMessage?.(message))
+      onMessage?.(taskInfoMessage(101))
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("task-id").textContent).toBe("101")
+      expect(screen.getByTestId("dag-phase").textContent).toBe("failed")
+      expect(screen.getByTestId("steps-count").textContent).toBe("1")
+    })
+    expect(screen.getByTestId("steps").textContent).toContain('"status":"failed"')
+    expect(screen.getByTestId("steps").textContent).toContain('"dependencies":["dependency-one"]')
+    expect(screen.getByTestId("steps").textContent).toContain('"started_at":"2026-05-27T05:00:03Z"')
+    expect(screen.getByTestId("steps").textContent).toContain('"completed_at":"2026-05-27T05:00:05Z"')
+  })
+
+  it("keeps a reconnected Session bound when same-task task_info is replayed and accepts its newer follow-up state", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("same-task-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(102, {
+      run_id: "same-task-run",
+      state_version: 5,
+    })))
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("same-task-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => {
+      webSocketOptions.current?.onMessage?.(taskInfoMessage(102, {
+        run_id: "same-task-run",
+        state_version: 5,
+        title: "Refreshed same task",
+        status: "paused",
+      }))
+      webSocketOptions.current?.onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 102,
+        run_id: "same-task-run",
+        state_version: 4,
+        control_state: "paused",
+        status: "paused",
+      })
+      webSocketOptions.current?.onMessage?.({
+        type: "task_paused",
+        timestamp: "2026-05-27T05:00:07Z",
+        task_id: 102,
+        run_id: "same-task-run",
+        state_version: 6,
+        control_state: "paused",
+        status: "paused",
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("bound")
+      expect(screen.getByTestId("task-id").textContent).toBe("102")
+      expect(screen.getByTestId("task-title").textContent).toBe("Refreshed same task")
+      expect(screen.getByTestId("task-status").textContent).toBe("paused")
     })
   })
 

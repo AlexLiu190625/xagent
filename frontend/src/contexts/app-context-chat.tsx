@@ -146,6 +146,28 @@ const reduceSessionConversation = (
   }
 }
 
+type SessionConversationTransition = {
+  accepted: boolean
+  changed: boolean
+  current: SessionConversationState
+  next: SessionConversationState
+}
+
+const transitionSessionConversation = (
+  current: SessionConversationState,
+  action: SessionConversationAction,
+): SessionConversationTransition => {
+  const next = reduceSessionConversation(current, action)
+  const changed = next !== current
+  const accepted = changed || (
+    action.type === "SESSION_TASK_INFO"
+    && current.phase === "bound"
+    && current.connectionIdentity === action.connectionIdentity
+    && current.taskId === action.taskId
+  )
+  return { accepted, changed, current, next }
+}
+
 const asMessageRecord = (value: unknown): Record<string, unknown> =>
   value && typeof value === "object" ? value as Record<string, unknown> : {}
 
@@ -215,7 +237,7 @@ type TaskStateVersionEntry = {
   runId?: string | null
 }
 
-const acceptTaskControlVersion = (
+const canAcceptTaskControlVersion = (
   message: WebSocketMessage,
   envelope: TaskControlEnvelope,
   versions: Map<number, TaskStateVersionEntry>,
@@ -240,6 +262,18 @@ const acceptTaskControlVersion = (
     && envelope.runId !== undefined
     && knownState.runId !== envelope.runId
   if (isOlderVersion || isDifferentRunAtSameVersion) return false
+
+  return true
+}
+
+const acceptTaskControlVersion = (
+  message: WebSocketMessage,
+  envelope: TaskControlEnvelope,
+  versions: Map<number, TaskStateVersionEntry>,
+): boolean => {
+  if (!canAcceptTaskControlVersion(message, envelope, versions)) return false
+  if (!envelope.isStateEvent || envelope.taskId === undefined) return true
+  if (envelope.stateVersion === undefined) return true
 
   versions.delete(envelope.taskId)
   versions.set(envelope.taskId, {
@@ -1585,13 +1619,12 @@ export function AppProvider({
   const dispatchSessionConversation = useCallback(
     (action: SessionConversationAction) => {
       const current = sessionConversationRef.current
-      const next = reduceSessionConversation(current, action)
-      const accepted = next !== current
-      if (accepted) {
-        sessionConversationRef.current = next
+      const transition = transitionSessionConversation(current, action)
+      if (transition.changed) {
+        sessionConversationRef.current = transition.next
         projectSessionAppAction({ type: "SESSION_CONVERSATION", payload: action })
       }
-      return { accepted, current, next }
+      return transition
     },
     [projectSessionAppAction],
   )
@@ -2504,7 +2537,7 @@ export function AppProvider({
             )
 
             // Set DAG execution state to planning phase (only if not already executing or completed)
-            if (!state.dagExecution || state.dagExecution.phase === "planning") {
+            if (!currentState.dagExecution || currentState.dagExecution.phase === "planning") {
               const dagExecution: DAGExecution = {
                 phase: phase as "planning" | "executing" | "completed" | "failed",
                 current_plan: {},
@@ -2539,7 +2572,7 @@ export function AppProvider({
               <>
                 <CheckCircle className="h-4 w-4 inline mr-2 text-green-500" />
                 {t('agent.logs.event.messages.planEnd', { planId, stepsCount })}
-                {state.planMemoryInfo && (
+                {currentState.planMemoryInfo && (
                   <div className="mt-2">
                     <CollapsibleSection
                       title={t('agent.planDetails.memory.title')}
@@ -2549,26 +2582,26 @@ export function AppProvider({
                       <div className="grid grid-cols-2 gap-2 text-xs">
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Search className="h-3 w-3" />
-                          <span>{t('agent.planDetails.memory.stats.found', { count: state.planMemoryInfo.memoriesFound })}</span>
+                          <span>{t('agent.planDetails.memory.stats.found', { count: currentState.planMemoryInfo.memoriesFound })}</span>
                         </div>
                         <div className="flex items-center gap-1 p-2 bg-muted/30 rounded">
                           <Target className="h-3 w-3" />
-                          <span>{t('agent.planDetails.memory.stats.used', { count: state.planMemoryInfo.memoriesUsed })}</span>
+                          <span>{t('agent.planDetails.memory.stats.used', { count: currentState.planMemoryInfo.memoriesUsed })}</span>
                         </div>
                       </div>
-                      {state.planMemoryInfo.enhancedGoal && (
+                      {currentState.planMemoryInfo.enhancedGoal && (
                         <div className="mt-2">
                           <div className="text-xs font-medium text-muted-foreground mb-1">{t('agent.planDetails.memory.enhancedGoalTitle')}</div>
                           <div className="text-xs bg-blue-500/10 p-2 rounded border border-blue-500/20">
-                            {state.planMemoryInfo.enhancedGoal}
+                            {currentState.planMemoryInfo.enhancedGoal}
                           </div>
                         </div>
                       )}
-                      {state.planMemoryInfo.memories && state.planMemoryInfo.memories.length > 0 && (
+                      {currentState.planMemoryInfo.memories && currentState.planMemoryInfo.memories.length > 0 && (
                         <div className="mt-2">
                           <div className="text-xs font-medium text-muted-foreground mb-1">{t('agent.planDetails.memory.relatedTitle')}</div>
                           <div className="space-y-1">
-                            {state.planMemoryInfo.memories.map((memory, index) => (
+                            {currentState.planMemoryInfo.memories.map((memory, index) => (
                               <div
                                 key={index}
                                 className="text-xs p-2 bg-muted/20 rounded border border-border/50"
@@ -2613,9 +2646,9 @@ export function AppProvider({
               })
 
               // Update DAG execution state to executing phase (only if not already completed or failed)
-              if (state.dagExecution && state.dagExecution.phase !== "completed" && state.dagExecution.phase !== "failed") {
+              if (currentState.dagExecution && currentState.dagExecution.phase !== "completed" && currentState.dagExecution.phase !== "failed") {
                 const updatedDAGExecution = {
-                  ...state.dagExecution,
+                  ...currentState.dagExecution,
                   phase: "executing" as const,
                   current_plan: planData,
                   updated_at: message.timestamp,
@@ -2635,9 +2668,9 @@ export function AppProvider({
             dispatch({ type: "SET_PROCESSING", payload: true })
 
             // Update DAG execution state to executing phase
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "executing" as const,
                 updated_at: message.timestamp,
               }
@@ -2684,9 +2717,9 @@ export function AppProvider({
             dispatch({ type: "SET_PROCESSING", payload: false })
 
             // Update DAG execution state to completed phase
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "completed" as const,
                 updated_at: message.timestamp,
               }
@@ -2789,7 +2822,7 @@ export function AppProvider({
 
             // dag_step_start has step_id, should update the right-side step data, do not display message on the left
             // Find existing step first, preserve dependencies
-            const existingStep = state.steps.find(s => s.id === (message.step_id || eventData.step_id || stepName))
+            const existingStep = currentState.steps.find(s => s.id === (message.step_id || eventData.step_id || stepName))
             const step: StepExecution = {
               id: message.step_id || eventData.step_id || stepName,
               name: stepName,
@@ -2830,7 +2863,7 @@ export function AppProvider({
 
             // dag_step_end has step_id, should update right-side step data, do not display message on the left
             const stepId = message.step_id || eventData.step_id || stepName
-            const existingStep = state.steps.find(s => s.id === stepId)
+            const existingStep = currentState.steps.find(s => s.id === stepId)
             const step: StepExecution = {
               id: stepId,
               name: stepName,
@@ -2872,12 +2905,12 @@ export function AppProvider({
           } else if (eventType === "dag_step_failed") {
             const stepName = eventData.step_name || eventData.name || eventData.title || `${t('agent.logs.event.messages.execStepPrefix')}${eventData.step_id || t('common.errors.unknown')}`
             const stepId = message.step_id || eventData.step_id || stepName
-            const existingStep = state.steps.find(s => s.id === stepId)
+            const existingStep = currentState.steps.find(s => s.id === stepId)
 
             // Update DAG execution state to failed
-            if (state.dagExecution) {
+            if (currentState.dagExecution) {
               const updatedDAGExecution = {
-                ...state.dagExecution,
+                ...currentState.dagExecution,
                 phase: "failed" as const,
                 updated_at: message.timestamp,
               }
@@ -4433,11 +4466,11 @@ export function AppProvider({
             dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
             // If we're in replay mode, initialize the replay scheduler
-            if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {
+            if (currentState.isReplaying && currentState.replayTaskId && currentState.replayEventCache.length > 0) {
               initializeReplayScheduler()
             } else {
               // Fix: If we have cache but replay mode is not set, force start replay
-              if (state.replayEventCache.length > 0 && state.replayTaskId && !state.isReplaying) {
+              if (currentState.replayEventCache.length > 0 && currentState.replayTaskId && !currentState.isReplaying) {
                 dispatch({ type: "SET_REPLAY_PLAYING", payload: true })
                 setTimeout(() => {
                   initializeReplayScheduler()
@@ -4489,7 +4522,7 @@ export function AppProvider({
           else if (traceEventData.goal) {
             // For now, create a basic task structure
             const task = {
-              id: state.taskId?.toString() || "unknown",
+              id: currentState.taskId?.toString() || "unknown",
               title: traceEventData.task_preview || traceEventData.goal,
               description: traceEventData.goal,
               status: "completed" as const,
@@ -4658,9 +4691,9 @@ export function AppProvider({
         }
 
         // Update DAG execution status to completed
-        if (state.dagExecution) {
+        if (currentState.dagExecution) {
           const updatedDAGExecution = {
-            ...state.dagExecution,
+            ...currentState.dagExecution,
             phase: taskData.status,
             updated_at: new Date().toISOString()
           }
@@ -4676,8 +4709,8 @@ export function AppProvider({
         }
 
         // Mark that historical data should not be requested again for completed/failed tasks
-        if (state.taskId) {
-          historicalDataRequestMapRef.current.set(state.taskId, true)
+        if (currentState.taskId) {
+          historicalDataRequestMapRef.current.set(currentState.taskId, true)
         }
 
         // Handle file outputs
@@ -4786,15 +4819,15 @@ export function AppProvider({
 
         // Update DAG execution status
         // Update overall DAG status based on step status
-        if (state.dagExecution) {
-          const updatedDAGExecution = { ...state.dagExecution }
+        if (currentState.dagExecution) {
+          const updatedDAGExecution = { ...currentState.dagExecution }
 
           // Update DAG phase based on step status
           if (stepInfo.status === "running") {
             updatedDAGExecution.phase = "executing" as const
           } else if (stepInfo.status === "completed") {
             // Check if all steps are completed
-            const allStepsCompleted = state.steps.every(step =>
+            const allStepsCompleted = currentState.steps.every(step =>
               step.id === stepInfo.id ? stepInfo.status === "completed" : step.status === "completed"
             )
             if (allStepsCompleted) {
@@ -4814,7 +4847,7 @@ export function AppProvider({
         break
 
       case "dag_execution":
-        const dagSteps = stepsFromPlanData(message.data, state.steps)
+        const dagSteps = stepsFromPlanData(message.data, currentState.steps)
         if (dagSteps) {
           dispatch({ type: "SET_STEPS", payload: dagSteps })
         }
@@ -4919,9 +4952,9 @@ export function AppProvider({
           dispatch({ type: "TRIGGER_TASK_UPDATE" })
         }
 
-        if (agentErrorTaskStatus === "failed" && state.dagExecution) {
+        if (agentErrorTaskStatus === "failed" && currentState.dagExecution) {
           const updatedDAGExecution = {
-            ...state.dagExecution,
+            ...currentState.dagExecution,
             phase: "failed" as const,
             updated_at: message.timestamp,
           }
@@ -4985,7 +5018,7 @@ export function AppProvider({
         dispatch({ type: "SYNC_PROCESSING_STATUS" })
 
         // If we're in replay mode, initialize the replay scheduler
-        if (state.isReplaying && state.replayTaskId && state.replayEventCache.length > 0) {
+        if (currentState.isReplaying && currentState.replayTaskId && currentState.replayEventCache.length > 0) {
           initializeReplayScheduler()
         }
         break
@@ -5121,7 +5154,7 @@ export function AppProvider({
       const taskInfoEnvelope = extractTaskControlEnvelope(message)
       if (
         taskInfoEnvelope.taskId !== taskId
-        || !acceptTaskControlVersion(
+        || !canAcceptTaskControlVersion(
           message,
           taskInfoEnvelope,
           taskStateVersionsRef.current,
@@ -5140,6 +5173,11 @@ export function AppProvider({
         taskId,
       })
       if (!transition.accepted || transition.next.phase !== "bound") return
+      if (!acceptTaskControlVersion(
+        message,
+        taskInfoEnvelope,
+        taskStateVersionsRef.current,
+      )) return
       sessionTaskIdRef.current = taskId
       projectSessionAppAction({
         type: "ADOPT_SESSION_TASK",
