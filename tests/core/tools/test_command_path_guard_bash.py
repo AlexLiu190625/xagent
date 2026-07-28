@@ -1014,6 +1014,45 @@ class TestScopedCommandPathGuardBash:
             f"bash {shlex.quote(str(script))} {shlex.quote(str(sibling_file))}"
         )
 
+    @pytest.mark.parametrize("script_name", ["-c", "--rcfile"])
+    def test_shell_option_terminator_treats_dash_prefixed_name_as_script(
+        self,
+        scoped_command_workspace,
+        script_name,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = workspace.output_dir / script_name
+        script.write_text("printf 'safe script\\n'\n", encoding="utf-8")
+        tool = _guarded_tool(workspace)
+
+        result = tool.run_json_sync(
+            {
+                "command": (
+                    f"bash -- {shlex.quote(script_name)} "
+                    f"{shlex.quote(str(sibling_file))}"
+                )
+            }
+        )
+
+        assert result["return_code"] == 0
+        assert result["output"] == "safe script\n"
+
+    def test_rejects_unsafe_dash_prefixed_script_after_option_terminator(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        script = workspace.output_dir / "-c"
+        script.write_text(
+            f"cat {shlex.quote(str(sibling_file))}\n",
+            encoding="utf-8",
+        )
+        tool = _guarded_tool(workspace)
+
+        result = tool.run_json_sync({"command": "bash -- -c safe-argument"})
+
+        assert result["return_code"] == 126
+        assert "sibling secret" not in result["output"]
+
     def test_recursive_shell_script_inspection_is_bounded(
         self, scoped_command_workspace
     ):

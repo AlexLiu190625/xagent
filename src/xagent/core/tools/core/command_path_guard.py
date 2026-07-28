@@ -1067,6 +1067,8 @@ class WorkspaceCommandPathGuard:
             )
         command_option_index: int | None = None
         for index, value in enumerate(literals[:-1]):
+            if value == "--":
+                break
             if (
                 value.startswith("-")
                 and not value.startswith("--")
@@ -1111,6 +1113,9 @@ class WorkspaceCommandPathGuard:
         index = 0
         while index < len(values):
             value = values[index]
+            if value == "--":
+                remaining.extend(values[index:])
+                break
             if value in _BASH_FILE_OPTIONS:
                 if index + 1 < len(values):
                     initialization_files.append(values[index + 1])
