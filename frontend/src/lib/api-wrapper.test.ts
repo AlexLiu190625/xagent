@@ -11,7 +11,6 @@ import {
   AUTH_CACHE_KEY,
   AUTH_TOKEN_UPDATED_EVENT,
   clearStoredAuth,
-  createAuthSession,
   readAuthCache,
   readAuthSessionSnapshot,
 } from "@/lib/auth-cache"
@@ -48,6 +47,21 @@ function mockNavigatorLocks(
       ) => {
         await beforeCallback()
         return callback()
+      }),
+    },
+  })
+}
+
+function mockQueuedNavigatorLocks() {
+  const tails = new Map<string, Promise<void>>()
+  Object.defineProperty(navigator, "locks", {
+    configurable: true,
+    value: {
+      request: vi.fn((name: string, callback: () => Promise<unknown>) => {
+        const previous = tails.get(name) ?? Promise.resolve()
+        const next = previous.then(callback)
+        tails.set(name, next.then(() => undefined, () => undefined))
+        return next
       }),
     },
   })
@@ -264,6 +278,69 @@ describe("api-wrapper auth refresh", () => {
       String(input).endsWith("/api/auth/refresh")
     )).toHaveLength(1)
     expect(readAuthCache()?.refreshToken).toBe("new-refresh")
+  })
+
+  it("uses one refresh request across isolated module realms that share browser storage and locks", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    mockQueuedNavigatorLocks()
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      success: true,
+      access_token: "new-access",
+      refresh_token: "new-refresh",
+      expires_in: 120,
+      refresh_expires_in: 240,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }))
+
+    vi.resetModules()
+    const firstCache = await import("@/lib/auth-cache")
+    const firstApi = await import("@/lib/api-wrapper")
+    const snapshot = firstCache.readAuthSessionSnapshot()
+    vi.resetModules()
+    const secondApi = await import("@/lib/api-wrapper")
+
+    const [first, second] = await Promise.all([
+      firstApi.refreshStoredAccessToken(snapshot),
+      secondApi.refreshStoredAccessToken(snapshot),
+    ])
+
+    expect(first).toMatchObject({ accessToken: "new-access" })
+    expect(second).toMatchObject({ accessToken: "new-access" })
+    expect(vi.mocked(globalThis.fetch).mock.calls.filter(([input]) => String(input).endsWith("/api/auth/refresh"))).toHaveLength(1)
+    expect(readAuthCache()).toMatchObject({ token: "new-access", refreshToken: "new-refresh" })
+  })
+
+  it("allows logout to acquire the mutation lock while refresh HTTP is pending", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    mockQueuedNavigatorLocks()
+    const refreshStarted = deferred<void>()
+    const refreshResponse = deferred<Response>()
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      if (!String(input).endsWith("/api/auth/refresh")) throw new Error("expected refresh request")
+      refreshStarted.resolve()
+      return refreshResponse.promise
+    })
+    const refresh = refreshStoredAccessToken(readAuthSessionSnapshot())
+    await refreshStarted.promise
+
+    const logout = clearStoredAuth()
+
+    await expect(logout).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
+    expect(readAuthCache()).toBeNull()
+    refreshResponse.resolve(new Response(JSON.stringify({ success: true, access_token: "late-access", refresh_token: "late-refresh" }), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }))
+    await expect(refresh).resolves.toEqual({ accessToken: null, rejected: false })
+    expect(readAuthCache()).toBeNull()
+  })
+
+  it("does not issue a conditional refresh without Web Locks while explicit logout remains available", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ accessToken: null, rejected: false })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
+    expect(fetchMock).not.toHaveBeenCalled()
   })
 
   it("does not reuse a changed session while waiting for the lock", async () => {

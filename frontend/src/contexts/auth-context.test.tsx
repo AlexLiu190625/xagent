@@ -435,4 +435,48 @@ describe("AuthProvider storage synchronization", () => {
     expect(screen.getByTestId("logout-token")).toHaveTextContent("access")
     expect(JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "null")).toMatchObject({ token: "access" })
   })
+
+  it("clears the Provider projection when logout falls back from an intent barrier write", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === "auth_login_intent") throw new Error("intent write failed")
+      originalSetItem(key, value)
+    })
+    vi.spyOn(console, "error").mockImplementation(() => {})
+    render(<AuthProvider><AuthLogoutProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("logout-token")).toHaveTextContent("access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Logout" }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId("logout-result")).toHaveTextContent("true")
+      expect(screen.getByTestId("logout-token")).toHaveTextContent("none")
+    })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
+  })
+
+  it("clears the Provider projection even when the login-intent barrier cannot be replaced or removed", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    const originalRemoveItem = localStorage.removeItem.bind(localStorage)
+    vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === "auth_login_intent") throw new Error("intent write failed")
+      originalSetItem(key, value)
+    })
+    vi.spyOn(localStorage, "removeItem").mockImplementation(key => {
+      if (key === "auth_login_intent") throw new Error("intent removal failed")
+      originalRemoveItem(key)
+    })
+    render(<AuthProvider><AuthLogoutProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("logout-token")).toHaveTextContent("access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Logout" }))
+
+    await waitFor(() => {
+      expect(screen.getByTestId("logout-result")).toHaveTextContent("false")
+      expect(screen.getByTestId("logout-token")).toHaveTextContent("none")
+    })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
+  })
 })

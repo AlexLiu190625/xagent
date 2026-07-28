@@ -5,12 +5,12 @@ import {
   type AuthSessionSnapshot,
   clearAuthSessionIfCurrent,
   compareAuthSession, compareCredentialSession,
-  parseRefreshTokenPayload,
+  commitAuthSessionRefresh,
   readAuthSessionSnapshot,
-  refreshAuthSession,
 } from "@/lib/auth-cache"
 
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
+const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
 export type AuthRefreshResult =
   | { accessToken: string; session: AuthSessionSnapshot }
   | { accessToken: null; rejected: boolean }
@@ -38,27 +38,51 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
   }
   throw lastError || new Error("All retry attempts failed")
 }
-async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRefreshResult> {
-  const controller = new AbortController()
-  const timeout = setTimeout(() => controller.abort(), AUTH_REFRESH_TIMEOUT_MS)
+function refreshLockName(session: AuthSessionSnapshot): string | null {
+  return session.sessionId ? `${AUTH_REFRESH_LOCK_PREFIX}${session.sessionId}` : null
+}
+async function withRefreshLock<T>(session: AuthSessionSnapshot, action: () => Promise<T>): Promise<T | null> {
+  const lockName = refreshLockName(session)
+  const locks = typeof navigator === "undefined" ? undefined : navigator.locks
+  if (!lockName || !locks) return null
   try {
-    const result = await refreshAuthSession(session, async refreshToken => {
+    return await locks.request(lockName, action)
+  } catch {
+    return null
+  }
+}
+async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRefreshResult> {
+  const result = await withRefreshLock(session, async () => {
+    const before = compareCredentialSession(session)
+    if (before.status === "credentials_advanced") {
+      return { accessToken: before.projection.snapshot.accessToken!, session: before.projection.snapshot } satisfies AuthRefreshResult
+    }
+    if (before.status !== "exact_credentials") {
+      return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+    }
+    if (!before.projection.cache.refreshToken) return { accessToken: null, rejected: true } satisfies AuthRefreshResult
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), AUTH_REFRESH_TIMEOUT_MS)
+    try {
       const response = await fetch(`${getApiUrl()}/api/auth/refresh`, {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: refreshToken }), signal: controller.signal,
+        body: JSON.stringify({ refresh_token: before.projection.cache.refreshToken }), signal: controller.signal,
       })
-      if (!response.ok) return { ok: false, rejected: response.status === 401 || response.status === 403, payload: null }
-      const payload = parseRefreshTokenPayload(await response.json(), refreshToken)
-      return { ok: payload !== null, rejected: false, payload }
-    })
-    if (result.status === "updated" || result.status === "advanced") {
-      return { accessToken: result.projection.snapshot.accessToken!, session: result.projection.snapshot }
+      if (!response.ok) return { accessToken: null, rejected: response.status === 401 || response.status === 403 } satisfies AuthRefreshResult
+      const committed = await commitAuthSessionRefresh(session, await response.json())
+      if (committed.status === "updated" || committed.status === "advanced") {
+        return { accessToken: committed.projection.snapshot.accessToken!, session: committed.projection.snapshot } satisfies AuthRefreshResult
+      }
+      return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+    } catch (error) {
+      console.error("Token refresh failed:", error)
+      return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+    } finally {
+      clearTimeout(timeout)
     }
-    return { accessToken: null, rejected: result.status === "rejected" }
-  } catch (error) {
-    console.error("Token refresh failed:", error)
-    return { accessToken: null, rejected: false }
-  } finally { clearTimeout(timeout) }
+  })
+  return result ?? { accessToken: null, rejected: false }
 }
 /** Refreshes only the immutable snapshot captured by the caller. */
 export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): Promise<AuthRefreshResult> {
@@ -82,7 +106,7 @@ function withBearer(options: RequestInit, token: string): RequestInit {
 export async function apiRequest(url: string, options: RequestInit = {}): Promise<Response> {
   const session = readAuthSessionSnapshot()
   if (!session.accessToken) return fetch(url, options)
-  let response = await fetchWithRetry(url, withBearer(options, session.accessToken))
+  const response = await fetchWithRetry(url, withBearer(options, session.accessToken))
   if (response.status !== 401 || shouldSkipRefresh(url)) return response
   const afterResponse = compareAuthSession(session)
   if (afterResponse.status === "credentials_advanced" || afterResponse.status === "credentials_and_profile_advanced") {

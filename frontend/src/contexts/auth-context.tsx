@@ -105,8 +105,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(async () => {
     ++operationRef.current
     const result = await clearStoredAuth()
+    if (result.credentialsCleared && mountedRef.current) setProjection(null)
     if (result.status !== "cleared") return false
-    if (mountedRef.current) setProjection(null)
     window.location.href = "/login"
     return true
   }, [])

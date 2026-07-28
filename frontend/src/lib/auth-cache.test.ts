@@ -1,8 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
-  advanceAuthSession, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession, createAuthSession,
-  inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, refreshAuthSession, updateAuthSessionUser, type AuthTokenPayload,
+  AUTH_TOKEN_UPDATED_EVENT, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, commitAuthSessionRefresh, compareAuthSession, createAuthSession,
+  inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, updateAuthSessionUser, type AuthTokenPayload,
   takeOidcAuthLoginIntent,
 } from "@/lib/auth-cache"
 
@@ -25,12 +25,6 @@ function current() {
   if (inspection.status !== "valid") throw new Error("expected session")
   return inspection.projection
 }
-function deferred<T>() {
-  let resolve!: (value: T) => void
-  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise })
-  return { promise, resolve }
-}
-
 describe("auth cache lineage", () => {
   beforeEach(() => { localStorage.clear(); vi.restoreAllMocks(); installLock() })
   afterEach(() => vi.unstubAllGlobals())
@@ -47,7 +41,7 @@ describe("auth cache lineage", () => {
     expect(inspectAuthSession()).toEqual({ status: "absent", projection: null })
     await expect(migrateLegacyAuthSession()).resolves.toEqual({ status: "unavailable" })
     expect(["superseded", "unavailable"]).toContain((await createAuthSession({ user, access_token: "access" })).status)
-    await expect(clearStoredAuth()).resolves.toEqual({ status: "unavailable" })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", credentialsCleared: false })
   })
   it("does not create a bearer session without the login intent that authorized it", async () => {
     expect(await createAuthSession({ user, access_token: "late-access" })).toEqual({ status: "superseded" })
@@ -72,7 +66,7 @@ describe("auth cache lineage", () => {
     const claim = await claimAuthLoginIntent()
     expect(claim.status).toBe("claimed")
     if (claim.status !== "claimed") throw new Error("expected login intent")
-    await expect(clearStoredAuth()).resolves.toEqual({ status: "cleared" })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
 
     expect(await createAuthSession({ user, access_token: "late-access" }, claim.intent)).toEqual({ status: "superseded" })
     expect(inspectAuthSession().status).toBe("absent")
@@ -179,14 +173,44 @@ describe("auth cache lineage", () => {
   it("preserves a profile update when credentials advance", async () => {
     const captured = await created({ user, access_token: "old", refresh_token: "refresh" })
     await updateAuthSessionUser(captured, { ...user, email: "profile@example.com" })
-    await advanceAuthSession(captured, { access_token: "new", refresh_token: "new-refresh" })
+    await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })
     expect(current().cache).toMatchObject({ token: "new", user: { email: "profile@example.com" }, credentialRevision: 1, profileRevision: 1 })
   })
   it("preserves credential advance when profile updates afterwards", async () => {
     const captured = await created({ user, access_token: "old", refresh_token: "refresh" })
-    await advanceAuthSession(captured, { access_token: "new", refresh_token: "new-refresh" })
+    await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })
     await updateAuthSessionUser(captured, { ...user, email: "profile@example.com" })
     expect(current().cache).toMatchObject({ token: "new", user: { email: "profile@example.com" }, credentialRevision: 1, profileRevision: 1 })
+  })
+  it("keeps the exact in-lock refresh token when the server omits a replacement", async () => {
+    const captured = await created({ user, access_token: "old", refresh_token: "old-refresh" })
+
+    const committed = await commitAuthSessionRefresh(captured, { success: true, access_token: "new" })
+
+    expect(committed).toMatchObject({ status: "updated", projection: { snapshot: { accessToken: "new", refreshToken: "old-refresh" } } })
+    expect(current().cache.refreshToken).toBe("old-refresh")
+  })
+  it("rejects a refresh response that does not satisfy the refresh response contract", async () => {
+    const captured = await created({ user, access_token: "old", refresh_token: "old-refresh" })
+
+    expect(await commitAuthSessionRefresh(captured, { access_token: "new", refresh_token: "new-refresh" })).toEqual({ status: "invalid" })
+    expect(current().snapshot).toMatchObject({ accessToken: "old", refreshToken: "old-refresh" })
+  })
+  it("publishes an auth update only after the mutation lock is released", async () => {
+    let lockHeld = false
+    Object.defineProperty(navigator, "locks", { configurable: true, value: {
+      request: vi.fn(async (_name: string, action: () => Promise<unknown>) => {
+        lockHeld = true
+        try { return await action() } finally { lockHeld = false }
+      }),
+    } })
+    const captured = await created({ user, access_token: "old", refresh_token: "old-refresh" })
+    const observedWhileLocked: boolean[] = []
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, () => observedWhileLocked.push(lockHeld), { once: true })
+
+    await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })
+
+    expect(observedWhileLocked).toEqual([false])
   })
   it("rejects profile identity changes while accepting numeric zero and nullable metadata", async () => {
     const zero = await created({ user: { id: 0, username: "zero", email: null, is_admin: false }, access_token: "token" })
@@ -200,7 +224,7 @@ describe("auth cache lineage", () => {
     expect(claim.status).toBe("claimed")
     if (claim.status !== "claimed") throw new Error("expected login intent")
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
-    expect((await advanceAuthSession(captured, { access_token: "new" })).status).toBe("unavailable")
+    expect((await commitAuthSessionRefresh(captured, { success: true, access_token: "new" })).status).toBe("unavailable")
     expect((await createAuthSession({ user, access_token: "late" }, claim.intent)).status).toBe("unavailable")
     expect(current().snapshot.accessToken).toBe("access")
   })
@@ -236,7 +260,7 @@ describe("auth cache lineage", () => {
   })
   it("rejects revision regressions and same-revision profile metadata tampering", async () => {
     const captured = await created()
-    const advanced = await advanceAuthSession(captured, { access_token: "new", refresh_token: "new-refresh" })
+    const advanced = await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })
     if (advanced.status !== "updated") throw new Error("expected credential advance")
     const regressed = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
     regressed.credentialRevision = 0
@@ -256,7 +280,7 @@ describe("auth cache lineage", () => {
     localStorage.setItem(AUTH_CACHE_KEY, JSON.stringify(raw))
     const credentialSnapshot = { ...captured, credentialRevision: Number.MAX_SAFE_INTEGER }
     const beforeCredential = localStorage.getItem(AUTH_CACHE_KEY)
-    expect((await advanceAuthSession(credentialSnapshot, { access_token: "new", refresh_token: "new-refresh" })).status).toBe("invalid")
+    expect((await commitAuthSessionRefresh(credentialSnapshot, { success: true, access_token: "new", refresh_token: "new-refresh" })).status).toBe("invalid")
     expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(beforeCredential)
 
     raw.credentialRevision = 0
@@ -270,32 +294,57 @@ describe("auth cache lineage", () => {
   it("does not clear storage when the logout lock is rejected", async () => {
     await created()
     Object.defineProperty(navigator, "locks", { configurable: true, value: { request: vi.fn(async () => { throw new Error("lock failed") }) } })
-    await expect(clearStoredAuth()).resolves.toEqual({ status: "unavailable" })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", credentialsCleared: false })
     expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { snapshot: { accessToken: "access" } } })
   })
   it("allows explicit logout without Web Locks", async () => {
     await created()
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
-    await expect(clearStoredAuth()).resolves.toEqual({ status: "cleared" })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
     expect(inspectAuthSession().status).toBe("absent")
   })
-  it("serializes explicit logout behind an in-flight refresh without resurrecting its session", async () => {
-    let tail: Promise<void> = Promise.resolve()
+  it("removes credentials and invalidates the old login intent when barrier persistence fails", async () => {
+    const claim = await claimAuthLoginIntent()
+    expect(claim.status).toBe("claimed")
+    if (claim.status !== "claimed") throw new Error("expected login intent")
+    await createAuthSession({ user, access_token: "access", refresh_token: "refresh" }, claim.intent)
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === AUTH_LOGIN_INTENT_KEY) throw new Error("intent write failed")
+      originalSetItem(key, value)
+    })
+    const events: string[] = []
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, () => events.push("updated"), { once: true })
+
+    const result = await clearStoredAuth()
+
+    expect(result).toEqual({ status: "cleared", credentialsCleared: true, barrier: "removed" })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
+    expect(localStorage.getItem(AUTH_LOGIN_INTENT_KEY)).toBeNull()
+    expect(events).toEqual(["updated"])
+    await expect(createAuthSession({ user, access_token: "late" }, claim.intent)).resolves.toEqual({ status: "superseded" })
+  })
+  it("publishes credential deletion after lock release even when a later removal fails", async () => {
+    let lockHeld = false
     Object.defineProperty(navigator, "locks", { configurable: true, value: {
-      request: vi.fn((_name: string, action: () => Promise<unknown>) => {
-        const next = tail.then(action)
-        tail = next.then(() => undefined, () => undefined)
-        return next
+      request: vi.fn(async (_name: string, action: () => Promise<unknown>) => {
+        lockHeld = true
+        try { return await action() } finally { lockHeld = false }
       }),
     } })
-    const captured = await created()
-    const response = deferred<{ ok: boolean; rejected: boolean; payload: { access_token: string; refresh_token: string } }>()
-    const refresh = refreshAuthSession(captured, async () => response.promise)
-    await Promise.resolve()
-    const logout = clearStoredAuth()
-    response.resolve({ ok: true, rejected: false, payload: { access_token: "late", refresh_token: "late-refresh" } })
-    await expect(refresh).resolves.toMatchObject({ status: "updated" })
-    await expect(logout).resolves.toEqual({ status: "cleared" })
-    expect(inspectAuthSession().status).toBe("absent")
+    await created()
+    const originalRemoveItem = localStorage.removeItem.bind(localStorage)
+    vi.spyOn(localStorage, "removeItem").mockImplementation(key => {
+      if (key === LEGACY_AUTH_TOKEN_KEY) throw new Error("legacy cleanup failed")
+      originalRemoveItem(key)
+    })
+    const observedWhileLocked: boolean[] = []
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, () => observedWhileLocked.push(lockHeld), { once: true })
+
+    const result = await clearStoredAuth()
+
+    expect(result).toMatchObject({ status: "unavailable", credentialsCleared: false })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
+    expect(observedWhileLocked).toEqual([false])
   })
 })
