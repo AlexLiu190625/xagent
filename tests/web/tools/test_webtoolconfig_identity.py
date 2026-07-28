@@ -48,6 +48,8 @@ def test_minimal_request_without_user_is_not_admin() -> None:
 
 
 def test_skill_scope_context_does_not_retain_request_resources() -> None:
+    from xagent.web.services.skill_runtime import build_detached_skill_scope
+
     db = object()
     request = _admin_request(actor_user_id=999)
     explicit_user = SimpleNamespace(id=42, is_admin=False)
@@ -61,7 +63,7 @@ def test_skill_scope_context_does_not_retain_request_resources() -> None:
 
     context = cfg.get_skill_scope_context()
 
-    assert context.user_id == 42
+    assert context == build_detached_skill_scope(user_id=42)
     assert not hasattr(context, "db")
     assert not hasattr(context, "request")
     assert not hasattr(context, "user")

@@ -61,6 +61,7 @@ from xagent.web.models.user import User
 from xagent.web.services.skill_runtime import (
     get_skill_runtime_scope,
     handoff_skill_runtime_session,
+    invoke_skill_write_provider,
 )
 
 logger = logging.getLogger(__name__)
@@ -237,18 +238,12 @@ async def _get_manager(request: Request) -> Any:
 
 
 def _write_context(
-    request: Request,
-    user: User,
-    db: Any,
     scope: SkillScopeContext,
 ) -> Any:
     from xagent.skills.library import SkillWriteContext
 
     return SkillWriteContext(
-        user=user,
         user_id=scope.user_id,
-        db=db,
-        request=request,
         metadata=dict(scope.metadata),
     )
 
@@ -646,21 +641,13 @@ async def delete_installed(
     if source == "team":
         from xagent.skills.library import get_skill_write_provider
 
-        writer = get_skill_write_provider()
-        if writer is None:
-            raise HTTPException(
-                status_code=400, detail="No skill writer is registered for this scope."
-            )
-        try:
-            await writer.delete_skill(
-                _write_context(request, _user, db, context),
-                scope="team",
-                name=name,
-            )
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "delete_skill",
+            _write_context(context),
+            scope="team",
+            name=name,
+        )
         logger.info("Skill Hub: deleted team skill %r", name)
         return Response(status_code=status.HTTP_204_NO_CONTENT)
     if source != "user":
@@ -699,22 +686,14 @@ async def create_skill(
     if body.scope != "personal":
         from xagent.skills.library import get_skill_write_provider
 
-        writer = get_skill_write_provider()
-        if writer is None:
-            raise HTTPException(
-                status_code=400, detail="No skill writer is registered for this scope."
-            )
-        try:
-            await writer.create_skill(
-                _write_context(request, _user, db, context),
-                scope=body.scope,
-                name=body.name,
-                files={"SKILL.md": body.skill_md.encode("utf-8")},
-            )
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "create_skill",
+            _write_context(context),
+            scope=body.scope,
+            name=body.name,
+            files={"SKILL.md": body.skill_md.encode("utf-8")},
+        )
     else:
         _write_personal_skill(
             db=db,
@@ -765,23 +744,15 @@ async def edit_installed(
     if source == "team":
         from xagent.skills.library import get_skill_write_provider
 
-        writer = get_skill_write_provider()
-        if writer is None:
-            raise HTTPException(
-                status_code=400, detail="No skill writer is registered for this scope."
-            )
-        try:
-            await writer.update_skill_file(
-                _write_context(request, _user, db, context),
-                scope="team",
-                name=name,
-                path="SKILL.md",
-                content=body.skill_md.encode("utf-8"),
-            )
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "update_skill_file",
+            _write_context(context),
+            scope="team",
+            name=name,
+            path="SKILL.md",
+            content=body.skill_md.encode("utf-8"),
+        )
     elif source != "user":
         raise HTTPException(
             status_code=403,
@@ -933,27 +904,19 @@ async def install_skill(
     if body.scope == "team":
         from xagent.skills.library import get_skill_write_provider
 
-        writer = get_skill_write_provider()
-        if writer is None:
-            raise HTTPException(
-                status_code=400, detail="No skill writer is registered for this scope."
-            )
-        try:
-            await writer.create_skill(
-                _write_context(request, _user, db, context),
-                scope="team",
-                name=body.slug,
-                files=files,
-                origin=registry.id,
-                metadata={
-                    f"{registry.id}_slug": body.slug,
-                    f"{registry.id}_version": body.version,
-                },
-            )
-        except PermissionError as exc:
-            raise HTTPException(status_code=403, detail=str(exc)) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        await invoke_skill_write_provider(
+            get_skill_write_provider(),
+            "create_skill",
+            _write_context(context),
+            scope="team",
+            name=body.slug,
+            files=files,
+            origin=registry.id,
+            metadata={
+                f"{registry.id}_slug": body.slug,
+                f"{registry.id}_version": body.version,
+            },
+        )
     else:
         _write_personal_skill(
             db=db,

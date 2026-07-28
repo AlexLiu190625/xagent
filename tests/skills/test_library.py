@@ -1,7 +1,9 @@
 from dataclasses import fields
+from typing import Callable
 
 import pytest
 
+from xagent import skills
 from xagent.skills.library import (
     CompositeSkillLibraryProvider,
     SkillRecord,
@@ -24,6 +26,44 @@ def test_skill_scope_context_rejects_request_owned_metadata() -> None:
         SkillScopeContext(user_id=7, metadata={"db": object()})
 
 
+@pytest.mark.parametrize("context_type", [SkillScopeContext, SkillWriteContext])
+def test_detached_contexts_reject_scalar_subclasses_with_attached_resources(
+    context_type: Callable[..., object],
+) -> None:
+    class _AttachedStr(str):
+        pass
+
+    class _AttachedInt(int):
+        pass
+
+    attached_key = _AttachedStr("team_id")
+    attached_key.request = object()
+    attached_value = _AttachedInt(11)
+    attached_value.session = object()
+
+    with pytest.raises(TypeError, match="detached scalar"):
+        context_type(user_id=7, metadata={attached_key: 11})
+    with pytest.raises(TypeError, match="detached scalar"):
+        context_type(user_id=7, metadata={"team_id": attached_value})
+
+
+@pytest.mark.parametrize("context_type", [SkillScopeContext, SkillWriteContext])
+@pytest.mark.parametrize("user_id", [True, object()])
+def test_detached_contexts_reject_non_exact_integer_user_ids(
+    context_type: Callable[..., object], user_id: object
+) -> None:
+    class _AttachedInt(int):
+        pass
+
+    subclass_user_id = _AttachedInt(7)
+    subclass_user_id.request = object()
+
+    with pytest.raises(TypeError, match="user_id"):
+        context_type(user_id=user_id)
+    with pytest.raises(TypeError, match="user_id"):
+        context_type(user_id=subclass_user_id)
+
+
 def test_skill_scope_context_copies_and_freezes_metadata() -> None:
     metadata = {"team_id": 11}
     context = SkillScopeContext(user_id=7, metadata=metadata)
@@ -35,24 +75,38 @@ def test_skill_scope_context_copies_and_freezes_metadata() -> None:
         context.metadata["team_id"] = 12  # type: ignore[index]
 
 
-def test_skill_write_context_keeps_request_owned_resources_explicit() -> None:
-    user = object()
-    db = object()
-    request = object()
+def test_skill_write_context_contains_only_detached_identity() -> None:
+    metadata = {"source_id": 11}
 
-    context = SkillWriteContext(
-        user=user,
-        user_id=7,
-        db=db,
-        request=request,
-        metadata={"team_id": 11},
+    context = SkillWriteContext(user_id=7, metadata=metadata)
+
+    assert {field.name for field in fields(context)} == {"user_id", "metadata"}
+    assert context.user_id == 7
+    assert context.metadata == {"source_id": 11}
+    metadata["source_id"] = 12
+    assert context.metadata == {"source_id": 11}
+    with pytest.raises(TypeError):
+        context.metadata["source_id"] = 13  # type: ignore[index]
+
+
+def test_skill_provider_failure_contract_is_exported() -> None:
+    from xagent.skills.library import (
+        SkillWriteProviderError,
+        SkillWriteProviderErrorReason,
     )
 
-    assert context.user is user
-    assert context.user_id == 7
-    assert context.db is db
-    assert context.request is request
-    assert context.metadata == {"team_id": 11}
+    error = SkillWriteProviderError(
+        SkillWriteProviderErrorReason.FORBIDDEN,
+        "You cannot write this skill.",
+    )
+
+    assert error.reason is SkillWriteProviderErrorReason.FORBIDDEN
+    assert error.public_detail == "You cannot write this skill."
+    assert skills.SkillWriteProviderError is SkillWriteProviderError
+    assert skills.SkillWriteProviderErrorReason is SkillWriteProviderErrorReason
+    assert hasattr(skills, "SkillWriteProvider")
+    assert hasattr(skills, "get_skill_write_provider")
+    assert hasattr(skills, "set_skill_write_provider")
 
 
 class StaticProvider:

@@ -7,7 +7,7 @@ Provides REST API endpoints for managing and using skills in the web application
 import logging
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -57,7 +57,6 @@ router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 
 async def _request_skill_manager(
-    _request: Request,
     context: SkillScopeContext,
     db: Session,
 ) -> Any:
@@ -74,7 +73,6 @@ async def _request_skill_manager(
 
 @router.get("/", response_model=list[SkillInfo])
 async def list_skills(
-    request: Request,
     context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Session = Depends(get_db),
 ) -> list[SkillInfo]:
@@ -84,7 +82,7 @@ async def list_skills(
     Returns:
         List of available skills with basic information
     """
-    skill_manager = await _request_skill_manager(request, context, db)
+    skill_manager = await _request_skill_manager(context, db)
     skills = await skill_manager.list_skills()
     # Convert to SkillInfo type
     from typing import cast
@@ -95,7 +93,6 @@ async def list_skills(
 @router.get("/{skill_name}", response_model=SkillDetail)
 async def get_skill(
     skill_name: str,
-    request: Request,
     context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Session = Depends(get_db),
 ) -> SkillDetail:
@@ -111,7 +108,7 @@ async def get_skill(
     Raises:
         HTTPException: If skill not found
     """
-    skill_manager = await _request_skill_manager(request, context, db)
+    skill_manager = await _request_skill_manager(context, db)
     skill = await skill_manager.get_skill(skill_name)
 
     if not skill:
@@ -131,7 +128,6 @@ async def get_skill(
 
 @router.post("/reload", response_model=ReloadResponse)
 async def reload_skills(
-    request: Request,
     context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Session = Depends(get_db),
 ) -> ReloadResponse:
@@ -143,7 +139,7 @@ async def reload_skills(
     Returns:
         Reload status with skill count
     """
-    skill_manager = await _request_skill_manager(request, context, db)
+    skill_manager = await _request_skill_manager(context, db)
     await skill_manager.reload()
     count = len(await skill_manager.list_skills())
 

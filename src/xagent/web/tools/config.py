@@ -1589,9 +1589,9 @@ class WebToolConfig(BaseToolConfig):
 
     def get_skill_scope_context(self) -> Any:
         """Build detached runtime identity for read-only skill providers."""
-        from ...skills.library import SkillScopeContext
+        from ..services.skill_runtime import build_detached_skill_scope
 
-        return SkillScopeContext(user_id=self._user_id)
+        return build_detached_skill_scope(user_id=self._user_id)
 
     def get_tool_selection_spec(self) -> Optional[Any]:
         """Typed spec accessor (preferred over :meth:`get_allowed_tools`).
