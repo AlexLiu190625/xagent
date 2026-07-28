@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import time
 from collections import deque
 from collections.abc import Iterator
@@ -15,6 +16,7 @@ import psycopg2
 import pytest
 from docker.errors import APIError
 from sqlalchemy import text
+from sqlalchemy.exc import TimeoutError as SQLAlchemyTimeoutError
 from sqlalchemy.orm import Session
 from sqlalchemy.pool import QueuePool
 
@@ -59,6 +61,15 @@ EXPECTED_LOAD_SKILL_PARAMETERS = {
     "required": ["skill_name"],
     "type": "object",
 }
+AVAILABLE_TOOLS_MODEL_GETTERS = (
+    "get_vision_model",
+    "get_image_models",
+    "get_video_models",
+    "get_asr_models",
+    "get_tts_models",
+    "get_sound_effect_models",
+    "get_music_models",
+)
 
 
 @pytest.fixture
@@ -322,6 +333,200 @@ def test_authenticated_skill_routes_handoff_one_slot_postgres_pool(
         assert installed_response.status_code == 200, installed_response.text
         assert skill_name in {item["name"] for item in installed_response.json()}
         assert get_engine().pool.checkedout() == 0
+
+
+def test_available_tools_route_uses_retained_models_before_request_db_reads(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    postgres_url: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _configure_postgres_app(
+        monkeypatch,
+        tmp_path=tmp_path,
+        postgres_url=postgres_url,
+    )
+    disable_external_app_services(monkeypatch)
+    session_factory = init_e2e_db()
+    with session_factory() as seed_db:
+        seeded_user = create_e2e_user(
+            seed_db,
+            username="available-tools-pool-user",
+        )
+
+    engine = get_engine()
+    pool = engine.pool
+    assert engine.dialect.name == "postgresql"
+    assert isinstance(pool, QueuePool)
+    assert pool.size() == 1
+    assert pool._max_overflow == 0  # noqa: SLF001
+    assert pool.timeout() == 1
+    assert pool.checkedout() == 0
+
+    getter_call_counts: dict[int, dict[str, int]] = {}
+    factory_returns: list[tuple[WebToolConfig, bool, bool, dict[str, int]]] = []
+    real_getters = {
+        name: getattr(WebToolConfig, name) for name in AVAILABLE_TOOLS_MODEL_GETTERS
+    }
+
+    def _getter_spy(name: str, real_getter: Any) -> Any:
+        def _delegate(config: WebToolConfig) -> Any:
+            counts = getter_call_counts.setdefault(id(config), {})
+            counts[name] = counts.get(name, 0) + 1
+            return real_getter(config)
+
+        return _delegate
+
+    for getter_name, real_getter in real_getters.items():
+        monkeypatch.setattr(
+            WebToolConfig,
+            getter_name,
+            _getter_spy(getter_name, real_getter),
+        )
+
+    real_create_all_tools = ToolFactory.create_all_tools
+
+    async def _factory_spy(
+        config: WebToolConfig,
+        apply_user_override_filter: bool = True,
+    ) -> list[Any]:
+        tools = await real_create_all_tools(
+            config,
+            apply_user_override_filter=apply_user_override_filter,
+        )
+        factory_returns.append(
+            (
+                config,
+                config._retained_factory_model_state is not None,
+                config._factory_runtime_handed_off,
+                dict(getter_call_counts.get(id(config), {})),
+            )
+        )
+        return tools
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_all_tools",
+        staticmethod(_factory_spy),
+    )
+
+    def _assert_route_getters_called_once(
+        config: WebToolConfig,
+        factory_counts: dict[str, int],
+    ) -> None:
+        total_counts = getter_call_counts[id(config)]
+        assert total_counts == {
+            name: factory_counts.get(name, 0) + 1
+            for name in AVAILABLE_TOOLS_MODEL_GETTERS
+        }
+
+    with run_e2e_app_client(
+        monkeypatch,
+        username=seeded_user.username,
+        user_id=seeded_user.id,
+    ) as app:
+        baseline_response = app.client.get(
+            "/api/tools/available",
+            headers=app.headers,
+        )
+        assert baseline_response.status_code == 200, baseline_response.text
+        baseline_body = baseline_response.json()
+        assert isinstance(baseline_body["tools"], list)
+        assert isinstance(baseline_body["count"], int)
+        assert baseline_body["count"] == len(baseline_body["tools"])
+        assert baseline_body["count"] > 0
+        assert all(
+            isinstance(tool, dict)
+            and isinstance(tool.get("name"), str)
+            and isinstance(tool.get("usage_count"), int)
+            for tool in baseline_body["tools"]
+        )
+        assert len(factory_returns) == 1
+
+        (
+            baseline_config,
+            baseline_retained_at_factory_return,
+            baseline_handed_off_at_factory_return,
+            baseline_factory_counts,
+        ) = factory_returns[0]
+        assert type(baseline_config) is WebToolConfig
+        assert baseline_retained_at_factory_return is True
+        assert baseline_handed_off_at_factory_return is True
+        _assert_route_getters_called_once(
+            baseline_config,
+            baseline_factory_counts,
+        )
+        assert baseline_config._retained_factory_model_state is None
+        assert baseline_config._lazy_db is None
+        assert pool.checkedout() == 0
+
+        with app.session_factory() as probe_db:
+            assert probe_db.execute(text("SELECT 1")).scalar_one() == 1
+        assert pool.checkedout() == 0
+
+        real_handoff = WebToolConfig.handoff_factory_runtime
+
+        def _restore_legacy_post_handoff_reads(config: WebToolConfig) -> None:
+            # Preserve verified detach while restoring only the stale read mode.
+            real_handoff(config)
+            config._retained_factory_model_state = None
+            config._factory_runtime_handed_off = False
+
+        monkeypatch.setattr(
+            WebToolConfig,
+            "handoff_factory_runtime",
+            _restore_legacy_post_handoff_reads,
+        )
+        caplog.clear()
+        tools_logger = logging.getLogger("xagent.web.api.tools")
+        capture_directly = caplog.handler not in logging.getLogger().handlers
+        if capture_directly:
+            tools_logger.addHandler(caplog.handler)
+        try:
+            with (
+                caplog.at_level(logging.ERROR, logger="xagent.web.api.tools"),
+                pytest.raises(SQLAlchemyTimeoutError, match="QueuePool limit"),
+            ):
+                app.client.get(
+                    "/api/tools/available",
+                    headers=app.headers,
+                )
+        finally:
+            if capture_directly:
+                tools_logger.removeHandler(caplog.handler)
+
+        assert len(factory_returns) == 2
+        (
+            mutation_config,
+            mutation_retained_at_factory_return,
+            mutation_handed_off_at_factory_return,
+            mutation_factory_counts,
+        ) = factory_returns[1]
+        assert type(mutation_config) is type(baseline_config)
+        assert mutation_config is not baseline_config
+        assert mutation_retained_at_factory_return is False
+        assert mutation_handed_off_at_factory_return is False
+        _assert_route_getters_called_once(
+            mutation_config,
+            mutation_factory_counts,
+        )
+        usage_errors = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == "xagent.web.api.tools"
+            and record.getMessage().startswith("Failed to fetch tool usage stats:")
+        ]
+        assert len(usage_errors) == 1
+        assert "QueuePool limit of size 1 overflow 0 reached" in usage_errors[0]
+
+        # Route cleanup must release the lazy checkout even after the timeout.
+        assert mutation_config._retained_factory_model_state is None
+        assert mutation_config._factory_runtime_handed_off is True
+        assert mutation_config._lazy_db is None
+        assert pool.checkedout() == 0
+        with app.session_factory() as probe_db:
+            assert probe_db.execute(text("SELECT 1")).scalar_one() == 1
+        assert pool.checkedout() == 0
 
 
 @pytest.mark.asyncio
