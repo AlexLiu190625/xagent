@@ -14,7 +14,8 @@ scoped / internal scoped / two known-limitation shapes), plus an Actor-path
 invariant, an external-dir ancestor/descendant boundary check, and the
 provenance split that decides what an unfoldable candidate means (a
 deployment-configured dir keeps its own bind; a workspace path that escapes
-the mount root covering it fails the build).
+the mount root covering it fails the build) together with the identity
+domain that split is decided in.
 """
 
 from __future__ import annotations
@@ -354,19 +355,25 @@ class TestScopeDerivedEscapeFailsClosed:
         assert binding.mount_intent.extra_mounts == (str(link),)
 
 
-class TestDuplicateProvenanceMerging:
+class TestDeploymentAuthorizationIdentityDomain:
     """A path can legitimately be both scope-derived and operator-configured.
 
-    If ``XAGENT_EXTERNAL_UPLOAD_DIRS`` explicitly names the exact same path
-    an Actor's own scope-derived upload dir resolves to, that path is
-    deployment-authorized independently of the scope collision -- an
-    operator who names a path takes responsibility for it regardless of
-    whether some Actor's scope also happens to derive the same path. Before
-    candidates were merged by absolute path, the scope-labeled copy of the
-    duplicate was rejected outright even though the deployment-labeled copy
-    sat right next to it in the same candidate list: a sibling Actor whose
-    own scope did not collide with that deployment entry got the configured
-    extra mount, while the colliding Actor's build failed closed instead.
+    An unfoldable scope-derived candidate fails the build unless the
+    deployment named the same mount point: an operator who names a path
+    takes responsibility for it regardless of whether some Actor's scope
+    also happens to derive it. "The same mount point" is
+    ``canonical_sandbox_path`` -- the identity ``SandboxMountIntent`` itself
+    uses -- not the configured spelling. That distinction is load-bearing
+    because ``XAGENT_EXTERNAL_UPLOAD_DIRS`` takes raw operator strings and
+    absolutizing them leaves ``..`` segments and a leading ``//`` in place:
+    matching on the absolutized spelling instead would reject the Actor
+    whose scope collides with a differently-spelled deployment entry while
+    a sibling Actor -- whose own scope path never touches that entry --
+    still gets it as a stable extra mount, which is exactly the per-Actor
+    intent divergence this module exists to prevent.
+
+    Parametrized over spellings rather than asserted once: the verdict for
+    one mount point must not depend on how it was typed.
     """
 
     def _ca_scope(self, actor: str) -> ExecutionScope:
@@ -377,24 +384,40 @@ class TestDuplicateProvenanceMerging:
             isolate_external_dirs=True,
         )
 
-    def test_scope_and_deployment_duplicate_of_an_escaping_path_is_authorized(
-        self, _uploads_dir, tmp_path, monkeypatch
-    ):
+    def _escaping_actor7_tree(self, uploads_dir, tmp_path) -> Path:
+        """CA root whose ``actor7`` subtree resolves out of it.
+
+        That makes actor7's own scope-derived candidate unfoldable (lexically
+        covered by the CA root, resolving outside it), so its fate is decided
+        purely by whether the deployment named that mount point. actor9's
+        scope path is an ordinary covered path and folds away, so its intent
+        is the fold-only baseline the two builds must agree on.
+        """
         outside = tmp_path.parent / f"{tmp_path.name}-outside-actor"
         outside.mkdir()
-        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        ca_root = scoped_user_root(uploads_dir, OWNER_ID, ("ca1",))
         ca_root.mkdir(parents=True)
-        actor7_dir = ca_root / "actor7"
-        actor7_dir.symlink_to(outside, target_is_directory=True)
+        (ca_root / "actor7").symlink_to(outside, target_is_directory=True)
+        return ca_root
 
-        # The deployment explicitly configures the exact path actor7's own
-        # scope derives -- same absolute string, same escaping symlink --
-        # so this candidate is going to arrive twice for actor7 (once
-        # scope-derived, once deployment-configured) and once for actor9
-        # (deployment-configured only, since actor9's own scope path never
-        # touches actor7's directory).
+    @pytest.mark.parametrize(
+        "spelling",
+        [
+            "{ca}/actor7",
+            "{ca}/actor7/",
+            "{ca}//actor7",
+            "{ca}/./actor7",
+            "{ca}/nonexistent/../actor7",
+            "/{ca}/actor7",
+        ],
+    )
+    def test_every_spelling_of_the_named_mount_point_authorizes_it(
+        self, _uploads_dir, tmp_path, monkeypatch, spelling
+    ):
+        ca_root = self._escaping_actor7_tree(_uploads_dir, tmp_path)
+        configured = spelling.format(ca=str(ca_root))
         monkeypatch.setattr(
-            workspace_binding, "get_external_upload_dirs", lambda: [actor7_dir]
+            workspace_binding, "get_external_upload_dirs", lambda: [Path(configured)]
         )
 
         binding_a = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
@@ -402,7 +425,50 @@ class TestDuplicateProvenanceMerging:
 
         assert binding_a.mount_intent == binding_b.mount_intent
         assert binding_a.mount_intent.mount_root == str(ca_root)
-        assert binding_a.mount_intent.extra_mounts == (str(actor7_dir),)
+        assert binding_a.mount_intent.extra_mounts == (str(ca_root / "actor7"),)
+
+    def test_a_symlink_alias_of_the_path_does_not_authorize_it(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        """The other edge of the same domain: the identity is lexical, so an
+        operator entry that merely *resolves* to the escaping path is a
+        different bind point and authorizes nothing. Naming an alias grants
+        the alias its own mount; the scope path itself still fails closed.
+        """
+        ca_root = self._escaping_actor7_tree(_uploads_dir, tmp_path)
+        alias = ca_root / "aliased-kb"
+        alias.symlink_to(ca_root / "actor7", target_is_directory=True)
+        monkeypatch.setattr(
+            workspace_binding, "get_external_upload_dirs", lambda: [alias]
+        )
+
+        with pytest.raises(SandboxMountEscapeError):
+            build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+
+    def test_ancestor_spelled_non_canonically_still_absorbs_the_mount_root(
+        self, _uploads_dir, monkeypatch
+    ):
+        """The covering direction shares the domain: a deployment ancestor
+        spelled with a ``..`` segment is the same mount point as its
+        canonical spelling, so it absorbs the mount root and the promoted
+        root reaches the intent canonicalized.
+        """
+        user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
+        monkeypatch.setattr(
+            workspace_binding,
+            "get_external_upload_dirs",
+            lambda: [Path(f"{user_root}/nonexistent/..")],
+        )
+        scope = ExecutionScope(
+            sandbox_key_suffix="s",
+            workspace_segments=("proj",),
+            isolate_external_dirs=True,
+        )
+
+        binding = build_chat_workspace_binding(OWNER_ID, scope)
+
+        assert binding.mount_intent.mount_root == str(user_root)
+        assert binding.mount_intent.extra_mounts == ()
 
 
 class TestInternalScopedRow:

@@ -119,9 +119,9 @@ class TestAllowedExternalDirsMatchesWorkspaceBinding:
         )
         candidates = _build_external_allowlist(7, scope)
 
-        assert [(c.path, c.origins) for c in candidates] == [
-            (str(tmp_path / "user_7" / "tenant-a"), frozenset({"scope"})),
-            (str(external_dir), frozenset({"deployment"})),
+        assert [(c.path, c.origin) for c in candidates] == [
+            (str(tmp_path / "user_7" / "tenant-a"), "scope"),
+            (str(external_dir), "deployment"),
         ]
 
 
