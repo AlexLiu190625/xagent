@@ -33,6 +33,7 @@ from .command_policy import (
     CommandPathViolation,
     CommandPolicyViolation,
     PathAccess,
+    resolve_trusted_executable,
 )
 
 logger = logging.getLogger(__name__)
@@ -180,15 +181,6 @@ _SAFE_DEVICE_PATHS = {
     Path("/dev/stdout"),
     Path("/dev/stderr"),
 }
-_TRUSTED_EXECUTABLE_ROOTS = tuple(
-    path.resolve()
-    for path in (
-        Path("/bin"),
-        Path("/usr/bin"),
-        Path("/usr/local/bin"),
-        Path("/opt/homebrew/bin"),
-    )
-)
 _POLICY_TIME_WRAPPER = "__t_"
 
 
@@ -644,6 +636,11 @@ class WorkspaceCommandPathGuard:
         self._workspace = workspace
         self._initial_cwd = workspace.resolve_path("").resolve()
 
+    @property
+    def execution_cwd(self) -> Path:
+        """Return the canonical directory whose paths this guard validates."""
+        return self._initial_cwd
+
     @staticmethod
     def _parse_shell(command: str) -> list[Any]:
         if len(command) > _MAX_COMMAND_POLICY_INPUT_CHARS:
@@ -878,13 +875,11 @@ class WorkspaceCommandPathGuard:
                 self._inspect_direct_shell_script(command_word, state)
                 return state
         elif command_name in _CLASSIFIED_EXECUTABLE_COMMANDS:
-            discovered = shutil.which(command_name)
-            if discovered is not None and not self._is_trusted_system_command(
-                discovered,
-                command_name,
-            ):
-                self._inspect_direct_shell_script(discovered, state)
-                return state
+            if not self._is_trusted_system_command(command_word, command_name):
+                discovered = shutil.which(command_name)
+                if discovered is not None:
+                    self._inspect_direct_shell_script(discovered, state)
+                    return state
 
         if command_name in {"cd", "pushd", "popd"}:
             return self._change_directory(command_name, args, state)
@@ -1219,18 +1214,10 @@ class WorkspaceCommandPathGuard:
 
     @staticmethod
     def _is_trusted_system_command(command_word: str, command_name: str) -> bool:
-        candidate = Path(command_word).expanduser()
-        if not candidate.is_absolute():
-            return False
-        discovered = shutil.which(command_name)
-        if discovered is None:
-            return False
         try:
-            resolved = candidate.resolve()
-            return resolved == Path(discovered).resolve() and any(
-                resolved.is_relative_to(root) for root in _TRUSTED_EXECUTABLE_ROOTS
-            )
-        except (OSError, RuntimeError):
+            resolve_trusted_executable(command_word)
+            return True
+        except CommandPolicyViolation:
             return False
 
     def _inspect_direct_shell_script(
