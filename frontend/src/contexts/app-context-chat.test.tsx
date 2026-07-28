@@ -494,6 +494,7 @@ describe("AppProvider websocket message routing", () => {
     apiRequestMock.mockReset()
     routerPushMock.mockReset()
     sendRawMessageMock.mockReset()
+    sendRawMessageMock.mockReturnValue("sent")
     sendChatMessageMock.mockReset()
     sendChatMessageMock.mockResolvedValue({
       client_message_id: "turn-optimistic",
@@ -2081,7 +2082,7 @@ describe("AppProvider websocket message routing", () => {
   })
 
   it("keeps an unsent reset bound and lets the caller retry without retiring its task", async () => {
-    sendRawMessageMock.mockReturnValueOnce(false)
+    sendRawMessageMock.mockReturnValueOnce("not_sent")
     render(
       <AppProvider token="token" transport={makeSessionTransport()}>
         <SessionControlsProbe />

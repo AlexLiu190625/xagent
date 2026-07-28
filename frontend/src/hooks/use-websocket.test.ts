@@ -153,6 +153,32 @@ describe("useWebSocket message delivery", () => {
     )
   })
 
+  it("returns not_sent when no current open socket owns a raw protocol write", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      autoConnect: false,
+    }))
+
+    expect(result.current.sendMessage({ type: "new_conversation" })).toBe("not_sent")
+  })
+
+  it("returns not_sent when a socket closes between the open check and raw write", async () => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+    socket.send.mockImplementationOnce(() => {
+      socket.readyState = MockWebSocket.CLOSED
+      throw new Error("socket closed during write")
+    })
+
+    expect(result.current.sendMessage({ type: "new_conversation" })).toBe("not_sent")
+  })
+
   it("resolves only after the server accepts the durable message", async () => {
     const { result } = renderHook(() => useWebSocket({
       url: "ws://localhost",
@@ -684,6 +710,71 @@ describe("useWebSocket normalized connections", () => {
       expect(MockWebSocket.instances).toHaveLength(1)
     },
   )
+
+  it("retires a pre-open owner before a close delegate synchronously reconnects", async () => {
+    let reconnect!: () => void
+    const onConnectionClose = vi.fn(() => {
+      reconnect()
+      return "handled" as const
+    })
+    const { result } = renderHook(() => {
+      const webSocket = useWebSocket({
+        connection: sessionConnection(),
+        onConnectionClose,
+      })
+      reconnect = webSocket.connect
+      return webSocket
+    })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const oldSocket = MockWebSocket.instances[0]
+
+    act(() => oldSocket.triggerClose(1011))
+
+    expect(onConnectionClose).toHaveBeenCalledOnce()
+    expect(MockWebSocket.instances).toHaveLength(2)
+    expect(result.current.isConnected).toBe(false)
+  })
+
+  it("rejects old delivery and preparation before a close delegate replaces the owner", async () => {
+    const upload = deferred<Array<{ file_id: string }>>()
+    let reconnect!: () => void
+    const hook = renderHook(() => {
+      const webSocket = useWebSocket({
+        url: "ws://localhost",
+        taskId: 1,
+        uploadFiles: vi.fn(() => upload.promise),
+        onConnectionClose: () => {
+          reconnect()
+          return "handled" as const
+        },
+      })
+      reconnect = webSocket.connect
+      return webSocket
+    })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const oldSocket = MockWebSocket.instances[0]
+    act(() => oldSocket.open())
+    const pending = hook.result.current.sendChatMessage("pending", undefined, false, "old-delivery")
+    const preparing = hook.result.current.sendChatMessage(
+      "preparing",
+      [new File(["data"], "data.txt")],
+      false,
+      "old-preparation",
+    )
+
+    act(() => oldSocket.triggerClose(4001))
+
+    await expect(pending).rejects.toThrow("Connection closed")
+    await expect(preparing).rejects.toThrow("Connection closed")
+    expect(MockWebSocket.instances).toHaveLength(2)
+    const replacement = MockWebSocket.instances[1]
+    act(() => replacement.open())
+    await act(async () => {
+      upload.resolve([{ file_id: "late-upload" }])
+      await Promise.resolve()
+    })
+    expect(replacement.readyState).toBe(MockWebSocket.OPEN)
+  })
 
   it("fails closed and sanitizes when the Session close delegate throws", async () => {
     const secret = "xagent-session-token.st_close_delegate_secret"
@@ -1426,7 +1517,12 @@ describe("useWebSocket normalized connections", () => {
 
   it("bounds 4001 refresh retries across socket opens without resetting on open", async () => {
     authState.refreshAccessToken.mockResolvedValue(true)
-    const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    const onConnectionFailure = vi.fn()
+    const hook = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      onConnectionFailure,
+    }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     vi.useFakeTimers()
 
@@ -1449,6 +1545,12 @@ describe("useWebSocket normalized connections", () => {
       await vi.runOnlyPendingTimersAsync()
     })
     expect(MockWebSocket.instances).toHaveLength(4)
+    expect(onConnectionFailure).toHaveBeenCalledWith({
+      recoverable: false,
+      error: expect.objectContaining({
+        message: "Authentication failed after token refresh retries",
+      }),
+    })
 
     hook.unmount()
   })
@@ -1649,7 +1751,7 @@ describe("useWebSocket normalized connections", () => {
     hook.unmount()
   })
 
-  it("resets the 4001 retry budget only after valid socket activity", async () => {
+  it("does not replenish the 4001 retry budget after valid socket activity", async () => {
     authState.refreshAccessToken.mockResolvedValue(true)
     const hook = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
@@ -1670,28 +1772,30 @@ describe("useWebSocket normalized connections", () => {
       activitySocket.open()
       activitySocket.receive({ type: "task_info", task_id: 1 })
     })
-    for (let index = 2; index < 5; index += 1) {
+    for (let index = 2; index < 3; index += 1) {
       const socket = MockWebSocket.instances[index]
       act(() => socket.triggerClose(4001))
       await act(async () => {
         await Promise.resolve()
         await vi.advanceTimersByTimeAsync(1_000)
       })
-      if (index < 4) act(() => MockWebSocket.instances[index + 1].open())
     }
 
-    expect(MockWebSocket.instances).toHaveLength(6)
+    expect(authState.refreshAccessToken).toHaveBeenCalledTimes(3)
+    expect(MockWebSocket.instances).toHaveLength(4)
     hook.unmount()
   })
 
   it.each([
     ["authorization expired", "authorization expired"],
     ["", "Access denied"],
-  ])("reports 4003 close reason %j or the access-denied fallback", async (reason, expectedMessage) => {
+  ])("reports 4003 close reason %j or the access-denied fallback through structured failure", async (reason, expectedMessage) => {
     const onError = vi.fn()
+    const onConnectionFailure = vi.fn()
     const { result } = renderHook(() => useWebSocket({
       connection: sessionConnection(),
       onError,
+      onConnectionFailure,
     }))
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
     const socket = MockWebSocket.instances[0]
@@ -1701,6 +1805,90 @@ describe("useWebSocket normalized connections", () => {
 
     expect(result.current.connectionError?.message).toBe(expectedMessage)
     expect(onError).toHaveBeenCalledWith(expect.objectContaining({ message: expectedMessage }))
+    expect(onConnectionFailure).toHaveBeenCalledWith({
+      recoverable: false,
+      error: expect.objectContaining({ message: expectedMessage }),
+    })
+  })
+
+  it.each([
+    ["external credentials", () => sessionConnection()],
+    ["missing auth lineage", () => ({
+      ...sessionConnection(),
+      credentialOwner: {
+        kind: "auth-context" as const,
+        accessToken: "access",
+        userId: "user-1",
+      },
+  })],
+  ])("reports permanent 4001 %s through structured failure", async (_name, makeConnection) => {
+    const onConnectionFailure = vi.fn()
+    const onError = vi.fn()
+    const { result } = renderHook(() => useWebSocket({
+      connection: makeConnection(),
+      onConnectionFailure,
+      onError,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    socket.protocol = "xagent-session-v1"
+    act(() => socket.open())
+
+    act(() => socket.triggerClose(4001))
+
+    expect(result.current.connectionError?.message).toMatch(/authentication/i)
+    expect(onConnectionFailure).toHaveBeenCalledWith({
+      recoverable: false,
+      error: expect.objectContaining({ message: result.current.connectionError?.message }),
+    })
+    expect(onError).toHaveBeenCalledOnce()
+  })
+
+  it.each([
+    ["returns false", () => authState.refreshAccessToken.mockResolvedValue(false)],
+    ["rejects", () => authState.refreshAccessToken.mockRejectedValue(new Error("refresh failed"))],
+    ["throws", () => authState.refreshAccessToken.mockImplementation(() => {
+      throw new Error("refresh threw")
+    })],
+  ] as const)("reports a 4001 refresh that %s through structured failure", async (_name, configureRefresh) => {
+    configureRefresh()
+    const onConnectionFailure = vi.fn()
+    const onError = vi.fn()
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+      onConnectionFailure,
+      onError,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    act(() => socket.triggerClose(4001))
+
+    await waitFor(() => expect(onConnectionFailure).toHaveBeenCalledOnce())
+    expect(result.current.connectionError?.message).toMatch(/authentication failed/i)
+    expect(onError).toHaveBeenCalledOnce()
+  })
+
+  it("resets the transport reconnect delay after explicit disconnect without resetting auth refresh", async () => {
+    const { result } = renderHook(() => useWebSocket({ url: "ws://localhost", taskId: 1 }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    vi.useFakeTimers()
+    const first = MockWebSocket.instances[0]
+    act(() => first.open())
+    act(() => first.triggerClose(1011))
+    act(() => result.current.disconnect())
+    act(() => result.current.connect())
+    expect(MockWebSocket.instances).toHaveLength(2)
+    const second = MockWebSocket.instances[1]
+    act(() => second.open())
+    act(() => second.triggerClose(1011))
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1_000)
+    })
+    expect(MockWebSocket.instances).toHaveLength(3)
   })
 
   it("does not suppress a retry for an arbitrary close reason", async () => {

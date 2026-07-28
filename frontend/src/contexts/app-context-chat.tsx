@@ -5741,8 +5741,8 @@ export function AppProvider({
     }
 
     try {
-      const sent = sendRawMessage({ type: "new_conversation" }) as boolean | void
-      if (sent === false) {
+      const sent = sendRawMessage({ type: "new_conversation" })
+      if (sent !== "sent") {
         dispatchSessionConversation({
           type: "SESSION_RESET_NOT_SENT",
           connectionIdentity,

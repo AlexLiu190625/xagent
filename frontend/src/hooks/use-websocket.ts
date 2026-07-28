@@ -22,9 +22,9 @@ const MESSAGE_DUPLICATE_THRESHOLD = 2000 // Same message within 2 seconds is con
 const HANDSHAKE_TIMEOUT_MS = 10_000
 const MAX_AUTH_REFRESH_RETRIES = 3
 
-// Connection values may carry credentials. Lifecycle fencing retains only this
-// opaque identity, never a serialised or hashed descriptor.
-type ConnectionDescriptorIdentity = object
+// Connection values may carry credentials. Lifecycle fencing keeps the
+// normalized connection object opaque; it is never serialized or hashed.
+type ConnectionDescriptorIdentity = WebSocketConnection
 
 interface WebSocketMessage {
   type: string
@@ -75,6 +75,35 @@ export interface WebSocketConnection {
   taskId?: number
   chatTaskIdMode: "required" | "omit"
   credentialOwner: WebSocketCredentialOwner
+}
+
+export type WebSocketSendResult = "sent" | "not_sent"
+
+const sameConnection = (
+  left: WebSocketConnection | null,
+  right: WebSocketConnection | null,
+): boolean => {
+  if (left === right) return true
+  if (!left || !right) return false
+  if (
+    left.identity !== right.identity
+    || left.url !== right.url
+    || left.expectedProtocol !== right.expectedProtocol
+    || left.taskId !== right.taskId
+    || left.chatTaskIdMode !== right.chatTaskIdMode
+    || left.protocols?.length !== right.protocols?.length
+    || left.protocols?.some((protocol, index) => protocol !== right.protocols?.[index])
+    || left.credentialOwner.kind !== right.credentialOwner.kind
+  ) return false
+  if (left.credentialOwner.kind !== "auth-context") return true
+  if (right.credentialOwner.kind !== "auth-context") return false
+  return (
+    left.credentialOwner.accessToken === right.credentialOwner.accessToken
+    && left.credentialOwner.userId === right.credentialOwner.userId
+    && left.credentialOwner.session?.sessionId === right.credentialOwner.session?.sessionId
+    && left.credentialOwner.session?.credentialRevision
+      === right.credentialOwner.session?.credentialRevision
+  )
 }
 
 export interface WebSocketConnectionFailure {
@@ -172,6 +201,11 @@ interface OwnerRetirementOptions {
   notifyDisconnect: boolean
 }
 
+interface ScheduledRetry {
+  lifecycleEpoch: number
+  attemptEpoch: number
+}
+
 export interface UseWebSocketOptions {
   url?: string
   taskId?: number
@@ -228,7 +262,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     refreshAccessToken,
   } = useAuth()
 
-  const normalizedConnection = useMemo<WebSocketConnection | null>(() => {
+  const normalizedConnectionCandidate = useMemo<WebSocketConnection | null>(() => {
     if (connectionOption !== undefined) return connectionOption
     if (!taskId) return null
 
@@ -265,38 +299,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     token,
     url,
   ])
-  // JSON is used only as a lossless React dependency for the string-array
-  // value. It is never retained in the descriptor identity or exposed.
-  const protocolsDependency = normalizedConnection === null
-    ? null
-    : normalizedConnection.protocols === undefined
-      ? "absent"
-      : JSON.stringify(normalizedConnection.protocols)
-  const credentialOwner = normalizedConnection?.credentialOwner
-  const connectionDescriptorIdentity = useMemo<ConnectionDescriptorIdentity | null>(
-    () => (normalizedConnection ? {} : null),
-    [
-      credentialOwner?.kind,
-      credentialOwner?.kind === "auth-context"
-        ? credentialOwner.accessToken
-        : null,
-      credentialOwner?.kind === "auth-context"
-        ? credentialOwner.userId
-        : null,
-      credentialOwner?.kind === "auth-context"
-        ? credentialOwner.session?.sessionId
-        : null,
-      credentialOwner?.kind === "auth-context"
-        ? credentialOwner.session?.credentialRevision
-        : null,
-      normalizedConnection?.chatTaskIdMode,
-      normalizedConnection?.expectedProtocol,
-      normalizedConnection?.identity,
-      normalizedConnection?.taskId,
-      normalizedConnection?.url,
-      protocolsDependency,
-    ],
+  const stableConnectionRef = useRef<WebSocketConnection | null>(
+    normalizedConnectionCandidate,
   )
+  const normalizedConnection = useMemo(() => {
+    if (sameConnection(stableConnectionRef.current, normalizedConnectionCandidate)) {
+      return stableConnectionRef.current
+    }
+    stableConnectionRef.current = normalizedConnectionCandidate
+    return normalizedConnectionCandidate
+  }, [normalizedConnectionCandidate])
+  const connectionDescriptorIdentity = normalizedConnection
 
   const [isConnected, setIsConnected] = useState(false)
   const [lastMessage, setLastMessage] = useState<WebSocketMessage | null>(null)
@@ -307,7 +320,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
   const socketOwnerRef = useRef<SocketOwner | null>(null)
   const connectionRef = useRef<WebSocketConnection | null>(normalizedConnection)
   const descriptorKeyRef = useRef<ConnectionDescriptorIdentity | null>(connectionDescriptorIdentity)
-  const retryTimersRef = useRef(new Set<ReturnType<typeof setTimeout>>())
+  const retryTimersRef = useRef(new Map<ReturnType<typeof setTimeout>, ScheduledRetry>())
   const reconnectAttemptsRef = useRef(0)
   const authRefreshRetriesRef = useRef(0)
   const authRefreshRetryBudgetSessionIdRef = useRef(getInternalSessionId(normalizedConnection))
@@ -365,9 +378,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     )
   }, [])
 
-  const clearRetryTimers = useCallback(() => {
-    for (const timer of retryTimersRef.current) clearTimeout(timer)
-    retryTimersRef.current.clear()
+  const clearRetryTimers = useCallback((
+    matches: (retry: ScheduledRetry) => boolean = () => true,
+  ) => {
+    for (const [timer, retry] of retryTimersRef.current) {
+      if (!matches(retry)) continue
+      clearTimeout(timer)
+      retryTimersRef.current.delete(timer)
+    }
   }, [])
 
   const invalidateLifecycle = useCallback(() => {
@@ -377,25 +395,29 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
   const isCurrentLifecycle = useCallback((
     lifecycleEpoch: number,
-    descriptorKey: ConnectionDescriptorIdentity,
   ) => (
     mountedRef.current
     && lifecycleEpochRef.current === lifecycleEpoch
-    && descriptorKeyRef.current === descriptorKey
   ), [])
 
   // Socket callbacks require this exact owner. Async refresh/retry work may
   // outlive retirement, so it is fenced by the narrower attempt predicate.
   const isCurrentOwner = useCallback((owner: SocketOwner) => (
-    isCurrentLifecycle(owner.lifecycleEpoch, owner.descriptorKey)
+    isCurrentLifecycle(owner.lifecycleEpoch)
     && socketOwnerRef.current === owner
     && socketRef.current === owner.socket
   ), [isCurrentLifecycle])
 
   const isCurrentAttempt = useCallback((owner: SocketOwner) => (
-    isCurrentLifecycle(owner.lifecycleEpoch, owner.descriptorKey)
+    isCurrentLifecycle(owner.lifecycleEpoch)
     && attemptEpochRef.current === owner.attemptEpoch
   ), [isCurrentLifecycle])
+
+  const canApplyRetiredOwnerPolicy = useCallback((owner: SocketOwner) => (
+    isCurrentAttempt(owner)
+    && socketOwnerRef.current === null
+    && socketRef.current === null
+  ), [isCurrentAttempt])
 
   const isCurrentSocket = useCallback((socket: WebSocket, identity: string) => {
     const owner = socketOwnerRef.current
@@ -417,7 +439,19 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     }
   }, [])
 
-  const retireOwner = useCallback((
+  const reportPermanentFailure = useCallback((
+    owner: SocketOwner,
+    error: Error,
+  ) => {
+    if (!canApplyRetiredOwnerPolicy(owner)) return
+    setConnectionError(error)
+    reportConnectionFailure(owner.callbacks, {
+      recoverable: false,
+      error,
+    }, owner.connection.identity)
+  }, [canApplyRetiredOwnerPolicy])
+
+  const retireOwnerCore = useCallback((
     owner: SocketOwner,
     options: OwnerRetirementOptions,
   ) => {
@@ -430,9 +464,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       && socketRef.current === owner.socket
     )
     if (wasCurrent) {
-      clearRetryTimers()
+      clearRetryTimers(retry => (
+        retry.lifecycleEpoch === owner.lifecycleEpoch
+        && retry.attemptEpoch === owner.attemptEpoch
+      ))
       socketRef.current = null
       socketOwnerRef.current = null
+      if (mountedRef.current) setIsConnected(false)
+      isConnectingRef.current = false
     }
     rejectPendingDeliveries(
       options.pendingError,
@@ -459,6 +498,19 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         && recent.attemptEpoch === owner.attemptEpoch
       ),
     )
+    return wasCurrent
+  }, [
+    clearRecentMessages,
+    clearRetryTimers,
+    rejectPendingDeliveries,
+    rejectPreparations,
+  ])
+
+  const retireOwner = useCallback((
+    owner: SocketOwner,
+    options: OwnerRetirementOptions,
+  ) => {
+    const wasCurrent = retireOwnerCore(owner, options)
     if (!wasCurrent) return false
 
     if (
@@ -471,34 +523,28 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         console.error("WebSocket close failed")
       }
     }
-    if (mountedRef.current) setIsConnected(false)
-    isConnectingRef.current = false
     if (options.notifyDisconnect) notifyDisconnect(owner)
     return true
   }, [
-    clearRecentMessages,
-    clearRetryTimers,
     notifyDisconnect,
-    rejectPendingDeliveries,
-    rejectPreparations,
+    retireOwnerCore,
   ])
 
   const scheduleRetry = useCallback((
     callback: () => void,
     delay: number,
     lifecycleEpoch: number,
-    descriptorKey: ConnectionDescriptorIdentity,
     attemptEpoch: number,
   ) => {
     const timer = setTimeout(() => {
       retryTimersRef.current.delete(timer)
       if (
-        !isCurrentLifecycle(lifecycleEpoch, descriptorKey)
+        !isCurrentLifecycle(lifecycleEpoch)
         || attemptEpochRef.current !== attemptEpoch
       ) return
       callback()
     }, delay)
-    retryTimersRef.current.add(timer)
+    retryTimersRef.current.set(timer, { lifecycleEpoch, attemptEpoch })
   }, [isCurrentLifecycle])
 
   useIsomorphicLayoutEffect(() => {
@@ -610,6 +656,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         },
         notifyDisconnect: true,
       })
+      if (socketOwnerRef.current || isConnectingRef.current) return
     } else if (socketRef.current) {
       socketRef.current = null
     }
@@ -648,7 +695,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           close: { code: 1000, reason: "Handshake timeout" },
           notifyDisconnect: true,
         })
-        if (!wasCurrent) return
+        if (!wasCurrent || socketOwnerRef.current || socketRef.current) return
         setConnectionError(handshakeError)
         reportConnectionFailure(owner.callbacks, {
           recoverable: true,
@@ -664,6 +711,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }
         if (connection.expectedProtocol && socket.protocol !== connection.expectedProtocol) {
           const protocolError = new Error("WebSocket subprotocol negotiation failed.")
+          // A protocol mismatch is reported as a terminal connection failure;
+          // suppressing disconnect avoids starting a second recovery path.
           const wasCurrent = retireOwner(owner, {
             pendingError: new Error("Connection closed before the message was accepted."),
             preparationError: new Error("Connection closed before the message was prepared."),
@@ -688,49 +737,48 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       socket.onclose = (event) => {
         if (!isCurrentOwner(owner)) return
 
+        const wasCurrent = retireOwnerCore(owner, {
+          pendingError: new Error("Connection closed before the message was accepted."),
+          preparationError: new Error("Connection closed before the message was prepared."),
+          notifyDisconnect: false,
+        })
+        if (!wasCurrent) return
+
         let closeDisposition: "handled" | "default"
         try {
           closeDisposition = owner.callbacks.onSessionConnectionClose
             ? owner.callbacks.onSessionConnectionClose(event, owner.connection.identity)
             : owner.callbacks.onConnectionClose?.(event) ?? "default"
         } catch {
-          const wasCurrent = retireOwner(owner, {
-            pendingError: new Error("Connection closed before the message was accepted."),
-            preparationError: new Error("Connection closed before the message was prepared."),
-            notifyDisconnect: false,
-          })
-          if (wasCurrent) {
+          if (canApplyRetiredOwnerPolicy(owner)) {
             const handlerError = new Error("WebSocket close handler failed.")
             console.error("WebSocket close handler failed")
-            setConnectionError(handlerError)
-            reportConnectionFailure(owner.callbacks, {
-              recoverable: false,
-              error: handlerError,
-            }, owner.connection.identity)
+            reportPermanentFailure(owner, handlerError)
           }
           return
         }
 
-        const wasCurrent = retireOwner(owner, {
-          pendingError: new Error("Connection closed before the message was accepted."),
-          preparationError: new Error("Connection closed before the message was prepared."),
-          notifyDisconnect: closeDisposition === "default",
-        })
-        if (!wasCurrent) return
+        if (!canApplyRetiredOwnerPolicy(owner)) return
         if (closeDisposition === "handled") return
+
+        notifyDisconnect(owner)
+        if (!canApplyRetiredOwnerPolicy(owner)) return
 
         // Handle authentication errors (4001 = Authentication required)
         if (event.code === 4001) {
           if (owner.connection.credentialOwner.kind !== "auth-context") {
-            owner.callbacks.onError?.(new Error("Authentication failed"))
+            reportPermanentFailure(owner, new Error("Authentication failed"))
             return
           }
           if (!owner.connection.credentialOwner.session) {
-            owner.callbacks.onError?.(new Error("Authentication lineage is unavailable"))
+            reportPermanentFailure(owner, new Error("Authentication lineage is unavailable"))
             return
           }
           if (authRefreshRetriesRef.current >= MAX_AUTH_REFRESH_RETRIES) {
-            owner.callbacks.onError?.(new Error("Authentication failed after token refresh retries"))
+            reportPermanentFailure(
+              owner,
+              new Error("Authentication failed after token refresh retries"),
+            )
             return
           }
           authRefreshRetriesRef.current += 1
@@ -739,32 +787,34 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
               owner.connection.credentialOwner.session,
             )
               .then((refreshSuccess) => {
-                if (!isCurrentAttempt(owner)) return
+                if (!canApplyRetiredOwnerPolicy(owner)) return
                 if (refreshSuccess) {
                   scheduleRetry(
                     connect,
                     1000,
                     owner.lifecycleEpoch,
-                    owner.descriptorKey,
                     owner.attemptEpoch,
                   )
                 } else {
-                  owner.callbacks.onError?.(
+                  reportPermanentFailure(
+                    owner,
                     new Error("Authentication failed and token refresh failed"),
                   )
                 }
               })
               .catch(() => {
-                if (!isCurrentAttempt(owner)) return
+                if (!canApplyRetiredOwnerPolicy(owner)) return
                 console.error("Error refreshing auth token for WebSocket")
-                owner.callbacks.onError?.(
+                reportPermanentFailure(
+                  owner,
                   new Error("Authentication failed and token refresh error"),
                 )
               })
           } catch {
-            if (!isCurrentAttempt(owner)) return
+            if (!canApplyRetiredOwnerPolicy(owner)) return
             console.error("Error refreshing auth token for WebSocket")
-            owner.callbacks.onError?.(
+            reportPermanentFailure(
+              owner,
               new Error("Authentication failed and token refresh error"),
             )
           }
@@ -772,9 +822,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         }
 
         if (event.code === 4003) {
-          const accessError = new Error(event.reason || "Access denied")
-          setConnectionError(accessError)
-          owner.callbacks.onError?.(accessError)
+          reportPermanentFailure(owner, new Error(event.reason || "Access denied"))
           return
         }
 
@@ -796,7 +844,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             connect,
             delay,
             owner.lifecycleEpoch,
-            owner.descriptorKey,
             owner.attemptEpoch,
           )
         }
@@ -812,7 +859,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           close: { code: 1000, reason: "WebSocket transport error" },
           notifyDisconnect: true,
         })
-        if (!wasCurrent) return
+        if (!wasCurrent || socketOwnerRef.current || socketRef.current) return
         setConnectionError(connectionError)
         reportConnectionFailure(owner.callbacks, {
           recoverable: true,
@@ -825,13 +872,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (!isCurrentOwner(owner)) return
         try {
           const data = JSON.parse(event.data)
-          const activityAuthSessionId = getInternalSessionId(owner.connection)
-          if (
-            activityAuthSessionId !== null
-            && activityAuthSessionId === authRefreshRetryBudgetSessionIdRef.current
-          ) {
-            authRefreshRetriesRef.current = 0
-          }
 
           if (data.type === 'message_accepted' || data.type === 'message_rejected') {
             const clientMessageId = data.client_message_id
@@ -1003,15 +1043,19 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }, connectionRef.current?.identity)
     }
   }, [
-    isCurrentAttempt,
+    canApplyRetiredOwnerPolicy,
     isCurrentOwner,
+    notifyDisconnect,
+    reportPermanentFailure,
     retireOwner,
+    retireOwnerCore,
     scheduleRetry,
   ])
 
   const disconnect = useCallback(() => {
     const owner = socketOwnerRef.current
     invalidateLifecycle()
+    reconnectAttemptsRef.current = 0
     if (owner) {
       retireOwner(owner, {
         pendingError: new Error("Disconnected before the message was accepted."),
@@ -1036,7 +1080,9 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     retireOwner,
   ])
 
-  const sendMessage = useCallback((message: Record<string, unknown>) => {
+  const sendMessage = useCallback((
+    message: Record<string, unknown>,
+  ): WebSocketSendResult => {
     const connection = connectionRef.current
     const socket = socketRef.current
     if (
@@ -1044,8 +1090,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       && socket?.readyState === WebSocket.OPEN
       && isCurrentSocket(socket, connection.identity)
     ) {
-      socket.send(JSON.stringify(message))
+      try {
+        socket.send(JSON.stringify(message))
+        return "sent"
+      } catch {
+        return "not_sent"
+      }
     }
+    return "not_sent"
   }, [isCurrentSocket])
 
   const sendChatMessage = useCallback(async (
