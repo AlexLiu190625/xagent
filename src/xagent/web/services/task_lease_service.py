@@ -934,9 +934,15 @@ class _TaskLeaseHeartbeatManager:
                     )
                 except Exception as error:
                     if is_database_pool_timeout(error):
+                        task_ids = ",".join(
+                            str(task_id)
+                            for task_id in sorted({lease.task_id for lease in snapshot})
+                        )
                         logger.warning(
-                            "Task lease heartbeat batch pool checkout timed out "
-                            "for %s active leases: %s",
+                            "component=lease-heartbeat task_ids=[%s] "
+                            "active_lease_count=%s database pool checkout "
+                            "timed out: %s",
+                            task_ids,
                             len(snapshot),
                             error,
                         )

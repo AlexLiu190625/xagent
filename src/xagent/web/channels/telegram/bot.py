@@ -1,21 +1,27 @@
 import asyncio
+import hashlib
 import html
 import json
 import logging
 import mimetypes
 import os
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Coroutine, Dict, Optional, cast
+from typing import TYPE_CHECKING, Any, Coroutine, Dict, Optional, Sequence, cast
 from uuid import uuid4
 
 if TYPE_CHECKING:
     from ....core.agent.service import AgentService
 
-from aiogram import Bot, Dispatcher, types
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import FSInputFile
+from aiogram.types import (
+    CallbackQuery,
+    FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from sqlalchemy.orm import Session
 
 from ....core.file_ref import build_file_id_ref
@@ -24,10 +30,13 @@ from ...models.database import get_session_local
 from ...models.task import TaskStatus
 from ...models.user import User
 from ...services.channel_runtime import (
+    ChannelAgentSnapshot,
     ChannelAuthorizationError,
     ChannelConfigurationError,
     DownloadedChannelFile,
     authorize_channel_sender,
+    get_channel_owner_agent,
+    list_channel_owner_agents,
     load_active_channel_configs,
     load_channel_output_files,
     persist_channel_user_message,
@@ -72,6 +81,7 @@ class TelegramBotInstance:
     queue_flush_delay_seconds = 1.0
     voice_transcription_timeout_seconds = 180.0
     stop_text_aliases = {"/stop", "/pause", "stop", "pause", "停止", "暂停"}
+    agents_page_size = 8
 
     def __init__(
         self,
@@ -92,6 +102,7 @@ class TelegramBotInstance:
         self.user_active_executions: Dict[int, tuple[int, object]] = {}
         self.user_preparing_executions: set[int] = set()
         self.user_stop_events: Dict[int, asyncio.Event] = {}
+        self.user_conversation_generations: Dict[int, int] = {}
         self._accepting = True
         self._ingress_stopped = False
         self._stop_lock: asyncio.Lock | None = None
@@ -100,6 +111,10 @@ class TelegramBotInstance:
         # Load active tasks state
         self.active_tasks_file = Path(f"data/telegram_active_tasks_{instance_id}.json")
         self.active_tasks = self._load_active_tasks()
+
+        # Per-Telegram-user custom agent selection for the next conversation
+        self.selected_agents_file = self._selected_agents_store_path(channel_id, token)
+        self.selected_agents: Dict[int, int] = self._load_selected_agents()
 
         default_props = DefaultBotProperties(parse_mode=ParseMode.HTML)
 
@@ -144,6 +159,51 @@ class TelegramBotInstance:
                 f"Failed to save Telegram active tasks for {self.instance_id}: {e}"
             )
 
+    @staticmethod
+    def _selected_agents_store_path(channel_id: Optional[int], token: str) -> Path:
+        """Durable per-channel selection store.
+
+        Lives under the storage root (survives container recreation, unlike a
+        cwd-relative ``data/`` path) and is keyed by the stable channel id —
+        falling back to a full-token hash — so distinct bots whose tokens share
+        a prefix can never collide on one file.
+        """
+        from ....config import get_storage_root
+
+        if channel_id is not None:
+            key = f"channel_{int(channel_id)}"
+        else:
+            key = hashlib.sha256(token.encode()).hexdigest()[:16]
+        return Path(get_storage_root()) / "telegram" / f"selected_agents_{key}.json"
+
+    def _load_selected_agents(self) -> Dict[int, int]:
+        if self.selected_agents_file.exists():
+            try:
+                with open(self.selected_agents_file, "r") as f:
+                    return {int(k): int(v) for k, v in json.load(f).items()}
+            except Exception as e:
+                logger.error(
+                    f"Failed to load Telegram selected agents for {self.instance_id}: {e}"
+                )
+        return {}
+
+    def _save_selected_agents(self) -> None:
+        try:
+            self.selected_agents_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(self.selected_agents_file, "w") as f:
+                json.dump(self.selected_agents, f)
+        except Exception as e:
+            logger.error(
+                f"Failed to save Telegram selected agents for {self.instance_id}: {e}"
+            )
+
+    def _set_selected_agent(self, user_id: int, agent_id: Optional[int]) -> None:
+        if agent_id is None:
+            self.selected_agents.pop(user_id, None)
+        else:
+            self.selected_agents[user_id] = agent_id
+        self._save_selected_agents()
+
     def _register_handlers(self) -> None:
         from aiogram.filters import Command
 
@@ -165,10 +225,32 @@ class TelegramBotInstance:
             logger.info(
                 f"Received /new from {message.from_user.id} on bot {self.instance_id}"
             )
+            self._set_selected_agent(message.from_user.id, None)
             self._start_new_conversation(message.from_user.id)
             await message.answer(
                 "Fresh start. Send me what you'd like to work on next."
             )
+
+        @self.dp.message(Command("agents"))
+        async def cmd_agents(message: types.Message) -> None:
+            if not self._accepting or message.from_user is None:
+                return
+            logger.info(
+                f"Received /agents from {message.from_user.id} on bot {self.instance_id}"
+            )
+            await self._handle_agents_command(message)
+
+        @self.dp.callback_query(F.data.startswith("agsel:"))
+        async def on_agent_selected(callback: CallbackQuery) -> None:
+            if not self._accepting or callback.from_user is None:
+                return
+            await self._handle_agent_selection_callback(callback)
+
+        @self.dp.callback_query(F.data.startswith("agpage:"))
+        async def on_agents_page(callback: CallbackQuery) -> None:
+            if not self._accepting or callback.from_user is None:
+                return
+            await self._handle_agents_page_callback(callback)
 
         @self.dp.message(Command("stop", "pause"))
         async def cmd_stop(message: types.Message) -> None:
@@ -240,7 +322,15 @@ class TelegramBotInstance:
         )
         return True
 
+    def _conversation_generation(self, user_id: int) -> int:
+        return self.user_conversation_generations.get(user_id, 0)
+
     def _start_new_conversation(self, user_id: int) -> bool:
+        # Bumping the generation fences out any in-flight preparation for the
+        # previous conversation: its result must not overwrite the new state.
+        self.user_conversation_generations[user_id] = (
+            self._conversation_generation(user_id) + 1
+        )
         stopped = self._request_current_conversation_stop(
             user_id, reason="new Telegram conversation requested"
         )
@@ -359,6 +449,175 @@ class TelegramBotInstance:
         if normalized.startswith("/"):
             normalized = normalized.split()[0].split("@", 1)[0]
         return normalized in self.stop_text_aliases
+
+    @staticmethod
+    def _build_agents_keyboard(
+        agents: Sequence[ChannelAgentSnapshot],
+        page: int,
+        *,
+        selected_agent_id: Optional[int],
+    ) -> InlineKeyboardMarkup:
+        page_size = TelegramBotInstance.agents_page_size
+        total_pages = max(1, (len(agents) + page_size - 1) // page_size)
+        page = max(0, min(page, total_pages - 1))
+        page_agents = agents[page * page_size : (page + 1) * page_size]
+
+        default_label = "Default assistant"
+        if selected_agent_id is None:
+            default_label += " ✓"
+        rows = [
+            [InlineKeyboardButton(text=default_label, callback_data="agsel:default")]
+        ]
+        for agent in page_agents:
+            label = agent.name if len(agent.name) <= 60 else f"{agent.name[:57]}..."
+            if agent.agent_id == selected_agent_id:
+                label += " ✓"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=label, callback_data=f"agsel:{agent.agent_id}"
+                    )
+                ]
+            )
+        if total_pages > 1:
+            nav_row = []
+            if page > 0:
+                nav_row.append(
+                    InlineKeyboardButton(
+                        text="⬅ Prev", callback_data=f"agpage:{page - 1}"
+                    )
+                )
+            if page < total_pages - 1:
+                nav_row.append(
+                    InlineKeyboardButton(
+                        text="Next ➡", callback_data=f"agpage:{page + 1}"
+                    )
+                )
+            if nav_row:
+                rows.append(nav_row)
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _handle_agents_command(self, message: types.Message) -> None:
+        user_id = message.from_user.id  # type: ignore[union-attr]
+        try:
+            agents = await list_channel_owner_agents(
+                channel_id=self.channel_id,
+                external_user_id=str(user_id),
+            )
+        except ChannelAuthorizationError:
+            await message.answer("🚫 You are not authorized to use this bot.")
+            return
+        except ChannelConfigurationError:
+            await message.answer(
+                "Configuration error: Cannot find the owner of this bot."
+            )
+            return
+
+        if not agents:
+            await message.answer(
+                "You don't have any custom agents yet. Create one in the "
+                "Agent Builder, then run /agents again."
+            )
+            return
+
+        await message.answer(
+            "Choose the agent for your next conversation:",
+            reply_markup=self._build_agents_keyboard(
+                agents, 0, selected_agent_id=self.selected_agents.get(user_id)
+            ),
+        )
+
+    async def _handle_agent_selection_callback(self, callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id
+        payload = (callback.data or "").removeprefix("agsel:")
+        try:
+            if payload == "default":
+                self._set_selected_agent(user_id, None)
+                self._start_new_conversation(user_id)
+                await callback.answer("Default assistant selected")
+                confirmation = (
+                    "Default assistant selected. "
+                    "Send a message to start a fresh conversation."
+                )
+            else:
+                agent = await get_channel_owner_agent(
+                    channel_id=self.channel_id,
+                    external_user_id=str(user_id),
+                    agent_id=int(payload),
+                )
+                if agent is None:
+                    await callback.answer(
+                        "That agent is no longer available.", show_alert=True
+                    )
+                    return
+                self._set_selected_agent(user_id, agent.agent_id)
+                self._start_new_conversation(user_id)
+                # answerCallbackQuery rejects texts over 200 characters
+                toast = f"{agent.name} selected"
+                if len(toast) > 200:
+                    toast = f"{toast[:197]}..."
+                await callback.answer(toast)
+                confirmation = (
+                    f"Agent selected: {html.escape(agent.name)}. "
+                    "Send a message to start a fresh conversation. "
+                    "Use /new to go back to the default assistant."
+                )
+        except (ChannelAuthorizationError, ChannelConfigurationError):
+            await callback.answer(
+                "You are not authorized to use this bot.", show_alert=True
+            )
+            return
+        except ValueError:
+            await callback.answer()
+            return
+
+        message = callback.message
+        if isinstance(message, types.Message):
+            try:
+                # Dropping reply_markup removes the stale keyboard
+                await message.edit_text(confirmation)
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    logger.warning(
+                        "Failed to edit Telegram agent keyboard message: %s", e
+                    )
+
+    async def _handle_agents_page_callback(self, callback: CallbackQuery) -> None:
+        user_id = callback.from_user.id
+        payload = (callback.data or "").removeprefix("agpage:")
+        try:
+            page = int(payload)
+        except ValueError:
+            await callback.answer()
+            return
+
+        try:
+            agents = await list_channel_owner_agents(
+                channel_id=self.channel_id,
+                external_user_id=str(user_id),
+            )
+        except (ChannelAuthorizationError, ChannelConfigurationError):
+            await callback.answer(
+                "You are not authorized to use this bot.", show_alert=True
+            )
+            return
+
+        message = callback.message
+        if isinstance(message, types.Message):
+            try:
+                await message.edit_reply_markup(
+                    reply_markup=self._build_agents_keyboard(
+                        agents,
+                        page,
+                        selected_agent_id=self.selected_agents.get(user_id),
+                    )
+                )
+            except Exception as e:
+                if "message is not modified" not in str(e).lower():
+                    logger.warning(
+                        "Failed to update Telegram agents keyboard page: %s", e
+                    )
+        await callback.answer()
 
     async def _process_user_queue(self, user_id: int) -> None:
         while True:
@@ -651,6 +910,7 @@ class TelegramBotInstance:
 
         self.user_preparing_executions.add(user_id)
         self._clear_user_stop_request(user_id)
+        conversation_generation = self._conversation_generation(user_id)
         claimed_task_id: int | None = None
         managed_lease: ManagedTaskLease | None = None
         voice_asr_model: Any | None = None
@@ -686,6 +946,7 @@ class TelegramBotInstance:
                     text=text,
                     channel_name=self.channel_name,
                     expected_owner_user_id=expected_owner_user_id,
+                    agent_id=self.selected_agents.get(user_id),
                 )
             except ChannelAuthorizationError:
                 await last_message.answer("🚫 You are not authorized to use this bot.")
@@ -710,9 +971,27 @@ class TelegramBotInstance:
             claimed_task_id = task_id
             owner_user_id = prepared_task.user_id
             is_new_task = prepared_task.is_new_task
+
+            # The user switched conversations (agent selection or /new) while
+            # this turn was being prepared: settle the stale claim without
+            # touching active_tasks or selected_agents.
+            if self._conversation_generation(user_id) != conversation_generation:
+                await self._finalize_requested_stop(
+                    managed_lease,
+                    task_id=task_id,
+                )
+                return
+
             if is_new_task:
                 self.active_tasks[user_id] = task_id
                 self._save_active_tasks()
+
+            if prepared_task.requested_agent_missing:
+                self._set_selected_agent(user_id, None)
+                await last_message.answer(
+                    "The selected agent is no longer available, so I'm using "
+                    "the default assistant for this conversation."
+                )
 
             if self._consume_user_stop_request(user_id):
                 await self._finalize_requested_stop(
@@ -1228,6 +1507,28 @@ class TelegramBotInstance:
             await self.bot.delete_webhook(drop_pending_updates=True)
             if not self._accepting:
                 return
+            try:
+                from aiogram.types import BotCommand
+
+                await self.bot.set_my_commands(
+                    [
+                        BotCommand(
+                            command="new", description="Start a fresh conversation"
+                        ),
+                        BotCommand(
+                            command="agents", description="Choose which agent replies"
+                        ),
+                        BotCommand(command="stop", description="Stop the current run"),
+                    ]
+                )
+            except Exception:
+                logger.warning(
+                    "Failed to register Telegram command menu for %s",
+                    self.instance_id,
+                    exc_info=True,
+                )
+            if not self._accepting:
+                return
             # Get bot info manually just for logging (optional, since dp.start_polling also logs)
             # We remove the duplicate log to avoid confusion
             await self.dp.start_polling(self.bot, handle_signals=False)
@@ -1269,6 +1570,7 @@ class TelegramBotInstance:
             self.user_active_executions.clear()
             self.user_preparing_executions.clear()
             self.user_stop_events.clear()
+            self.user_conversation_generations.clear()
 
     async def _stop_ingress(self) -> None:
         try:

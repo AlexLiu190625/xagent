@@ -31,6 +31,10 @@ from ..services.connector_runtime import (
 )
 from ..services.db_runtime import run_db_io_cancellation_safe
 from ..services.deployments import get_deployment
+from ..services.share_rate_limit import (
+    get_share_rate_limiter,
+    remote_ip_from_request,
+)
 from ..services.workforce_runs import create_workforce_run
 from ..utils.db_timezone import format_datetime_for_api
 from .files import store_uploaded_files
@@ -41,6 +45,7 @@ from .websocket import (
     handle_intervention,
     handle_status_request,
     manager,
+    send_message_delivery,
 )
 
 logger = logging.getLogger(__name__)
@@ -113,6 +118,9 @@ def mint_share_guest_id() -> str:
 class _ChatAccessContext(Protocol):
     @property
     def user(self) -> User: ...
+
+    @property
+    def guest_id(self) -> str: ...
 
 
 _ChatAccessContextT = TypeVar("_ChatAccessContextT", bound=_ChatAccessContext)
@@ -464,7 +472,7 @@ def _get_task_for_workforce_widget_context(
     if task.agent_config.get("auth_mode") != "widget":
         raise HTTPException(status_code=403, detail="Widget is unavailable")
     if task.agent_config.get("guest_id") != access_context.guest_id:
-        raise HTTPException(status_code=403, detail="Access denied for this guest")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
     if int(task.agent_config.get("widget_workforce_id") or 0) != widget_workforce_id:
         raise HTTPException(status_code=403, detail="Widget is unavailable")
     workforce_run_id = task.agent_config.get("workforce_run_id")
@@ -506,7 +514,7 @@ def get_task_for_public_context(
         not task.agent_config
         or task.agent_config.get("guest_id") != access_context.guest_id
     ):
-        raise HTTPException(status_code=403, detail="Access denied for this guest")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
     if (
         access_context.widget_agent_id is not None
         and int(task.agent_id or 0) != access_context.widget_agent_id
@@ -527,9 +535,13 @@ def _require_share_guest_owns_task(
     guest_id (or a different one) fails this strict-inequality compare.
 
     Precondition: callers validate ``task.agent_config`` is a dict first.
+
+    The detail deliberately matches the callers' not-found branch: a
+    distinguishable guest-mismatch message would tell a probing visitor which
+    task ids exist on this share link (#973 enumeration oracle).
     """
     if task.agent_config.get("guest_id") != access_context.guest_id:
-        raise HTTPException(status_code=403, detail="Access denied for this guest")
+        raise HTTPException(status_code=403, detail="Task not found or access denied")
 
 
 def _get_task_for_workforce_share_context(
@@ -1050,6 +1062,7 @@ def _authorize_chat_websocket_sync(
         return WebSocketPrincipal(
             id=int(user_id),
             is_admin=bool(access_context.user.is_admin),
+            guest_id=access_context.guest_id,
         )
 
 
@@ -1100,6 +1113,25 @@ async def _authorize_share_chat_websocket(
     )
 
 
+_WS_CLOSE_REASON_MAX_BYTES = 123
+
+
+def _ws_close_reason(detail: object) -> str:
+    """Coerce an ``HTTPException.detail`` into a valid WS close reason.
+
+    ``detail`` is typed ``Any`` in FastAPI while the WS protocol caps close
+    reasons at 123 UTF-8 bytes — an over-long or non-string value would blow
+    up mid-close and swallow the denial the frontend recovery keys on. Every
+    detail reachable today is a short string literal; this is insurance for
+    the future one that isn't. Truncates on a codepoint boundary.
+    """
+    text = str(detail) if detail is not None else ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= _WS_CLOSE_REASON_MAX_BYTES:
+        return text
+    return encoded[:_WS_CLOSE_REASON_MAX_BYTES].decode("utf-8", errors="ignore")
+
+
 async def public_chat_websocket_endpoint(
     *,
     websocket: WebSocket,
@@ -1134,7 +1166,7 @@ async def public_chat_websocket_endpoint(
                     expected_auth_mode=expected_auth_mode,
                 )
             except HTTPException as exc:
-                await websocket.close(code=4003, reason=exc.detail)
+                await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
                 return
 
             message_data["user_id"] = current_principal.id
@@ -1164,6 +1196,17 @@ async def share_chat_websocket_endpoint(
     token: str = Query(..., description="Authentication token"),
 ) -> None:
     """Serve share websocket chat with per-message revalidation."""
+    # Handshake budget (#973): accept-before-auth (below) means every connect
+    # attempt — valid or garbage token — completes a full 101 upgrade before
+    # rejection, so the attempts themselves need a per-IP ceiling. Checked
+    # *pre-accept* on purpose: an over-limit probe is refused as a plain HTTP
+    # 403 with no upgrade performed at all, which is the cheapest rejection —
+    # unlike the auth denials below, a rate-limited connect carries no reason
+    # the frontend recovery flow needs to read.
+    if not get_share_rate_limiter().allow_ws_connect(remote_ip_from_request(websocket)):
+        await websocket.close(code=4008, reason="Too many connection attempts")
+        return
+
     # Accept the handshake *before* the auth/access checks. uvicorn only
     # preserves a close code + reason on the wire for a *post-accept* close: a
     # pre-accept ``websocket.close()`` is collapsed into a bare HTTP 403 with an
@@ -1181,7 +1224,7 @@ async def share_chat_websocket_endpoint(
             task_id=task_id,
         )
     except HTTPException as exc:
-        await websocket.close(code=4003, reason=exc.detail)
+        await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
         return
     except Exception:
         await websocket.close(code=4001, reason="Authentication required")
@@ -1203,17 +1246,54 @@ async def share_chat_websocket_endpoint(
                     task_id=task_id,
                 )
             except HTTPException as exc:
-                await websocket.close(code=4003, reason=exc.detail)
+                await websocket.close(code=4003, reason=_ws_close_reason(exc.detail))
                 return
 
             message_data["user_id"] = current_principal.id
             message_data["user"] = current_principal
 
-            if message_data.get("type") == "chat":
+            message_type = message_data.get("type")
+            # Abuse control (#973): follow-up turns bypass the HTTP task-create
+            # limiter and each starts an owner-billed run, so rate-limit the
+            # run-starting turn types per guest here. Reject the turn (the
+            # client surfaces it and can retry) rather than closing — a rate
+            # limit is transient. Interventions are control messages, not new
+            # runs, so they are not gated.
+            if (
+                message_type in ("chat", "execute_task")
+                and current_principal.guest_id
+                and not get_share_rate_limiter().allow_ws_turn(
+                    current_principal.guest_id
+                )
+            ):
+                client_message_id = message_data.get("client_message_id")
+                rate_limited_message = (
+                    "You're sending messages too quickly. "
+                    "Please wait a moment and try again."
+                )
+                await send_message_delivery(
+                    websocket,
+                    client_message_id=client_message_id,
+                    turn_id=str(client_message_id or ""),
+                    accepted=False,
+                    message=rate_limited_message,
+                )
+                # send_message_delivery no-ops without a client_message_id, so
+                # a client that didn't tag the turn would otherwise get zero
+                # feedback and see the message silently dropped. Fall back to a
+                # generic error so the throttle is always surfaced.
+                if client_message_id is None:
+                    await manager.send_personal_message(
+                        {"type": "error", "message": rate_limited_message},
+                        websocket,
+                    )
+                continue
+
+            if message_type == "chat":
                 await handle_chat_message(websocket, task_id, message_data)
-            elif message_data.get("type") == "execute_task":
+            elif message_type == "execute_task":
                 await handle_execute_task(websocket, task_id, message_data)
-            elif message_data.get("type") == "intervention":
+            elif message_type == "intervention":
                 await handle_intervention(websocket, task_id, message_data)
     except Exception as exc:
         from fastapi import WebSocketDisconnect

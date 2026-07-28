@@ -19,6 +19,7 @@ from xagent.web.models.trigger import (
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_provisioning import (
+    GMAIL_PUSH_PUBLISHER,
     ensure_gmail_mailbox_provisioned,
     gmail_subscription_path,
     gmail_topic_path,
@@ -135,6 +136,7 @@ def gmail_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX", "xagent-gmail")
     monkeypatch.setenv("XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX", "xagent-gmail-push")
     monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api.example.com/")
+    monkeypatch.delenv("XAGENT_TRIGGER_CALLBACK_BASE_URL", raising=False)
     monkeypatch.setenv(
         "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
         "pubsub-push@demo-project.iam.gserviceaccount.com",
@@ -251,7 +253,35 @@ def test_provisioning_creates_deterministic_resources_and_active_state(
     ]
 
 
-def test_missing_public_api_base_records_failed_state_without_app_base_fallback(
+def test_dedicated_trigger_callback_base_url_overrides_public_api_base(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(
+        "XAGENT_TRIGGER_CALLBACK_BASE_URL", "https://callbacks.example.com/"
+    )
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    subscriber = FakeSubscriber()
+
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: FakePublisher(),
+        subscriber_factory=lambda: subscriber,
+    )
+
+    expected_audience = (
+        f"https://callbacks.example.com/api/triggers/callback/gmail/{state.callback_id}"
+    )
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    assert state.push_audience == expected_audience
+    stored = subscriber.subscriptions[str(state.subscription_name)]
+    assert stored["push_config"]["push_endpoint"] == expected_audience
+    assert stored["push_config"]["oidc_token"]["audience"] == expected_audience
+
+
+def test_missing_callback_base_urls_record_failed_state_without_app_base_fallback(
     db_session: Session, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.delenv("XAGENT_PUBLIC_API_BASE_URL", raising=False)
@@ -268,6 +298,7 @@ def test_missing_public_api_base_records_failed_state_without_app_base_fallback(
     )
 
     assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert "XAGENT_TRIGGER_CALLBACK_BASE_URL" in str(state.last_error)
     assert "XAGENT_PUBLIC_API_BASE_URL" in str(state.last_error)
     assert state.push_audience is None
 
@@ -644,9 +675,19 @@ class ResyncFakeSubscriber(FakeSubscriber):
         from types import SimpleNamespace
 
         stored = self.subscriptions[request["subscription"]]
+        push_config = stored["push_config"]
+        oidc = push_config.get("oidc_token")
         return SimpleNamespace(
             push_config=SimpleNamespace(
-                push_endpoint=stored["push_config"]["push_endpoint"]
+                push_endpoint=push_config["push_endpoint"],
+                oidc_token=(
+                    SimpleNamespace(
+                        service_account_email=oidc.get("service_account_email", ""),
+                        audience=oidc.get("audience", ""),
+                    )
+                    if oidc is not None
+                    else None
+                ),
             )
         )
 
@@ -694,6 +735,241 @@ def test_existing_subscription_endpoint_resyncs_after_base_url_change(
     stored = subscriber.subscriptions[str(second.subscription_name)]
     assert stored["push_config"]["push_endpoint"] == new_audience
     assert stored["push_config"]["oidc_token"]["audience"] == new_audience
+
+
+def test_existing_subscription_resyncs_after_service_account_change(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = ResyncFakeSubscriber()
+    gmail = FakeGmailService()
+
+    first = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    assert subscriber.modify_calls == []
+
+    # Only the OIDC push service account changes; the callback base URL (and
+    # therefore push_endpoint/audience) stays the same.
+    monkeypatch.setenv(
+        "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT",
+        "rotated-push@demo-project.iam.gserviceaccount.com",
+    )
+    second = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert second.push_audience == first.push_audience
+    assert len(subscriber.modify_calls) == 1
+    stored = subscriber.subscriptions[str(second.subscription_name)]
+    assert (
+        stored["push_config"]["oidc_token"]["service_account_email"]
+        == "rotated-push@demo-project.iam.gserviceaccount.com"
+    )
+
+
+def test_existing_subscription_not_resynced_when_config_unchanged(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = ResyncFakeSubscriber()
+    gmail = FakeGmailService()
+
+    kwargs = {
+        "service_factory": lambda _db, _account: gmail,
+        "publisher_factory": lambda: publisher,
+        "subscriber_factory": lambda: subscriber,
+    }
+    ensure_gmail_mailbox_provisioned(db_session, account, **kwargs)
+    ensure_gmail_mailbox_provisioned(db_session, account, **kwargs)
+
+    assert subscriber.modify_calls == []
+
+
+class InspectFailsFakeSubscriber(ResyncFakeSubscriber):
+    """Existing subscription whose push config cannot be inspected."""
+
+    def get_subscription(self, *, request: dict[str, str]) -> Any:
+        raise RuntimeError("pubsub get_subscription unavailable")
+
+
+class ModifyFailsFakeSubscriber(ResyncFakeSubscriber):
+    """Existing subscription whose push config cannot be patched."""
+
+    def modify_push_config(self, *, request: dict[str, Any]) -> None:
+        raise RuntimeError("pubsub modify_push_config unavailable")
+
+
+def test_inspect_failure_falls_through_to_unconditional_resync(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = InspectFailsFakeSubscriber()
+    gmail = FakeGmailService()
+
+    first = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    assert first.status == TriggerProvisioningStatus.ACTIVE.value
+
+    # A base-URL change forces a resync, but inspecting the existing
+    # subscription fails. Inspection is only an optimization, so provisioning
+    # degrades to an unconditional (idempotent) modify_push_config rather than
+    # aborting: the watch still converges to ACTIVE with the new audience.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api-v2.example.com")
+    second = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    new_audience = (
+        f"https://api-v2.example.com/api/triggers/callback/gmail/{second.callback_id}"
+    )
+    assert second.status == TriggerProvisioningStatus.ACTIVE.value
+    assert second.push_audience == new_audience
+    assert len(subscriber.modify_calls) == 1
+    stored = subscriber.subscriptions[str(second.subscription_name)]
+    assert stored["push_config"]["push_endpoint"] == new_audience
+
+
+def test_patch_failure_marks_failed_not_active(
+    db_session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    subscriber = ModifyFailsFakeSubscriber()
+    gmail = FakeGmailService()
+
+    first = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+    assert first.status == TriggerProvisioningStatus.ACTIVE.value
+    old_audience = str(first.push_audience)
+
+    # A base-URL change forces a resync, and the patch itself fails. Unlike an
+    # inspection failure, this must propagate so the watch lands FAILED rather
+    # than recording the new audience as ACTIVE against a subscription that was
+    # never updated.
+    monkeypatch.setenv("XAGENT_PUBLIC_API_BASE_URL", "https://api-v2.example.com")
+    second = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: subscriber,
+    )
+
+    assert second.status == TriggerProvisioningStatus.FAILED.value
+    assert "pubsub modify_push_config unavailable" in str(second.last_error)
+    # The persisted audience must not have advanced to the un-synced value.
+    assert second.push_audience == old_audience
+    assert "api-v2.example.com" not in str(second.push_audience)
+
+
+class GetIamPolicyFailsFakePublisher(FakePublisher):
+    """Topic whose IAM policy cannot be read."""
+
+    def get_iam_policy(self, *, request: dict[str, str]) -> FakePolicy:
+        raise RuntimeError("pubsub get_iam_policy unavailable")
+
+
+class SetIamPolicyFailsFakePublisher(FakePublisher):
+    """Topic whose IAM policy cannot be written."""
+
+    def set_iam_policy(self, *, request: dict[str, Any]) -> None:
+        raise RuntimeError("pubsub set_iam_policy unavailable")
+
+
+@pytest.mark.parametrize(
+    ("publisher_cls", "expected_error"),
+    [
+        (GetIamPolicyFailsFakePublisher, "pubsub get_iam_policy unavailable"),
+        (SetIamPolicyFailsFakePublisher, "pubsub set_iam_policy unavailable"),
+    ],
+)
+def test_iam_policy_failure_marks_failed_not_active(
+    db_session: Session,
+    publisher_cls: type[FakePublisher],
+    expected_error: str,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    gmail = FakeGmailService()
+
+    # If the roles/pubsub.publisher grant for the Gmail push identity cannot
+    # be verified or applied, Gmail may be unable to publish to the topic and
+    # the trigger would silently never fire. The failure must propagate so the
+    # watch lands FAILED for the retry sweep instead of recording ACTIVE.
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher_cls(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert expected_error in str(state.last_error)
+    # Provisioning must stop at the IAM failure: no watch was registered.
+    assert gmail.watch_calls == []
+
+
+def test_iam_grant_appends_to_existing_publisher_binding(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    topic_path = gmail_topic_path("demo-project", "owner@gmail.example")
+    existing_policy = FakePolicy()
+    existing_policy.bindings.add(
+        role="roles/pubsub.publisher", members=["serviceAccount:other@example.iam"]
+    )
+    publisher.policies[topic_path] = existing_policy
+
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    # The Gmail push identity joins the existing roles/pubsub.publisher
+    # binding instead of creating a duplicate binding for the same role.
+    bindings = publisher.policies[topic_path].bindings
+    assert len(bindings) == 1
+    assert bindings[0].members == [
+        "serviceAccount:other@example.iam",
+        f"serviceAccount:{GMAIL_PUSH_PUBLISHER}",
+    ]
 
 
 def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(

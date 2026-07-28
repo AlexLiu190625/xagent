@@ -635,7 +635,9 @@ describe("PublicAgentChatPage", () => {
     localStorage.setItem(taskKey, "71")
     // The WS layer reports a per-guest access denial as a post-accept 4003
     // whose reason surfaces here (see use-websocket.ts onclose 4003 handling).
-    app.connectionError = new Error("Access denied for this guest")
+    // The backend reuses its not-found detail for guest mismatches so task ids
+    // can't be enumerated (#973).
+    app.connectionError = new Error("Task not found or access denied")
 
     renderSharePage()
 

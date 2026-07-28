@@ -9,6 +9,7 @@ from fastapi import (
     Form,
     HTTPException,
     Query,
+    Request,
     UploadFile,
     WebSocket,
 )
@@ -22,6 +23,10 @@ from ..models.user import User
 from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.deployments import find_enabled_share_deployment
+from ..services.share_rate_limit import (
+    get_share_rate_limiter,
+    remote_ip_from_request,
+)
 from .public_chat_access import (
     PublicChatAuthResponse,
     ShareChatAccessContext,
@@ -43,9 +48,16 @@ class ShareAuthRequest(BaseModel):
 @share_router.post("/auth", response_model=PublicChatAuthResponse)
 async def authenticate_share_link(
     request: ShareAuthRequest,
+    http_request: Request,
     db: Session = Depends(get_db),
 ) -> Any:
     """Authenticate a public share link and issue a guest chat token."""
+    # Abuse control (#973): unauthenticated endpoint. Bucket per share token +
+    # per caller IP before any DB work; covers the workforce fallback below.
+    if not get_share_rate_limiter().allow_auth(
+        request.share_token, remote_ip_from_request(http_request)
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     agent = (
         db.query(Agent)
         .filter(
@@ -144,6 +156,10 @@ async def upload_share_file(
     share_info: ShareChatAccessContext = Depends(get_current_share_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
+    # Abuse control (#973): per-guest cap on public uploads. Storage-quota
+    # accounting and orphan GC are the separate hardening tracked for PR3.
+    if not get_share_rate_limiter().allow_upload(share_info.guest_id):
+        raise HTTPException(status_code=429, detail="Too many requests")
     return await upload_share_chat_files(
         file=file,
         files=files,
@@ -162,6 +178,13 @@ async def create_share_task(
     share_info: ShareChatAccessContext = Depends(get_current_share_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
+    # Abuse control (#973): task-create is the costly surface (each spawns an
+    # owner-billed run). Bucket per guest + per share token (the token bucket
+    # stops guest_id rotation from bypassing the per-guest cap).
+    if not get_share_rate_limiter().allow_task_create(
+        share_info.share_token, share_info.guest_id
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     return await create_share_chat_task(
         request=request,
         access_context=share_info,

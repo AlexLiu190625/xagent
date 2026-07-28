@@ -1,0 +1,1455 @@
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
+import { pathToFileURL } from "node:url"
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+
+const widgetScriptPath = resolve(process.cwd(), "public/widget.js")
+const widgetScript = readFileSync(widgetScriptPath, "utf8")
+const widgetScriptUrl = pathToFileURL(widgetScriptPath).href
+
+export const HOST = "https://chat.example"
+export const GRANT = "eyJhbGciOiJIUzI1NiJ9.grant-one.sig"
+const EXCHANGE_URL = `${HOST}/v1/external/chat/sessions`
+const RECONNECT_URL = `${HOST}/v1/external/chat/sessions/reconnect`
+
+const fetchMock = vi.fn()
+
+function runWidget(attributes: Record<string, string>) {
+  const script = document.createElement("script")
+  script.src = `${HOST}/widget.js`
+  for (const [name, value] of Object.entries(attributes)) {
+    script.setAttribute(name, value)
+  }
+  document.body.appendChild(script)
+  Object.defineProperty(document, "currentScript", { configurable: true, value: script })
+  window.eval(`${widgetScript}\n//# sourceURL=${widgetScriptUrl}`)
+  return script
+}
+
+function iframeEl(): HTMLIFrameElement | null {
+  return document.querySelector<HTMLIFrameElement>(".xagent-widget-iframe")
+}
+
+function spyOnIframePostMessage(frame = iframeEl()) {
+  if (!frame?.contentWindow) throw new Error("iframe not mounted")
+  return vi.spyOn(frame.contentWindow, "postMessage")
+}
+
+function fromSpecificIframe(
+  frame: HTMLIFrameElement | null,
+  type: string,
+  extra: Record<string, unknown> = {},
+) {
+  window.dispatchEvent(new MessageEvent("message", {
+    data: { xagent: true, v: 1, type, ...extra },
+    origin: HOST,
+    source: frame?.contentWindow as Window,
+  }))
+}
+
+function fromIframe(type: string, extra: Record<string, unknown> = {}) {
+  fromSpecificIframe(iframeEl(), type, extra)
+}
+
+function jsonResponse(status: number, body: unknown, headers: Record<string, string> = {}) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { "Content-Type": "application/json", ...headers },
+  })
+}
+
+function errorResponse(status: number, code: string) {
+  return jsonResponse(status, { error: { code, message: "nope" } })
+}
+
+// vi.waitFor's condition here (fetchMock call count) goes true the instant
+// fetch() is invoked, which happens synchronously during runWidget(). That
+// resolves the waitFor promise before the mocked Response's real .json()
+// body-read (an inherently async, multi-microtask-tick operation) has settled.
+// A macrotask flush lets every already-scheduled microtask (the fetch/json/
+// applySession chain) drain before we simulate the iframe's "ready" signal.
+function flushAsync() {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
+function firePageShow(persisted: boolean) {
+  const event = new Event("pageshow") as PageTransitionEvent & { persisted: boolean }
+  Object.defineProperty(event, "persisted", { value: persisted })
+  window.dispatchEvent(event)
+}
+
+function firePageHide(persisted: boolean) {
+  const event = new Event("pagehide") as PageTransitionEvent & { persisted: boolean }
+  Object.defineProperty(event, "persisted", { value: persisted })
+  window.dispatchEvent(event)
+}
+
+function firePageRestore() {
+  firePageHide(true)
+  firePageShow(true)
+}
+
+function exchangeBody(overrides: Record<string, unknown> = {}) {
+  return {
+    session_token: "st_first",
+    session_token_expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    reconnect_token: "rt_first",
+    session: {
+      absolute_expires_at: new Date(Date.now() + 8 * 3_600_000).toISOString(),
+      agent: {
+        id: 42,
+        name: "Care Assistant",
+        description: "Rosters and shifts",
+        logo_url: `${HOST}/logo.png`,
+        suggested_prompts: ["What is my next shift?"],
+      },
+    },
+    ...overrides,
+  }
+}
+
+describe("widget session mode", () => {
+  let currentScriptDescriptor: PropertyDescriptor | undefined
+  // runWidget()'s attach() registers message and bfcache lifecycle listeners
+  // directly on the shared jsdom `window` (vitest reuses one window per test
+  // file). Without tracking and removing them, a controller from an earlier
+  // test stays subscribed and reacts to a later test's fromIframe()/
+  // firePageShow() dispatches, corrupting that later test's fetch-call
+  // counts. We wrap addEventListener for the duration of each test to record
+  // every (type, listener) pair the production code registers on window, and
+  // remove them all in afterEach.
+  let windowListeners: Array<[string, EventListenerOrEventListenerObject]> = []
+  let realAddEventListener: typeof window.addEventListener
+
+  beforeEach(() => {
+    currentScriptDescriptor = Object.getOwnPropertyDescriptor(document, "currentScript")
+    document.head.innerHTML = ""
+    document.body.innerHTML = ""
+    localStorage.clear()
+    // The grant dedupe registry lives on window and survives between tests in a file.
+    Reflect.deleteProperty(window as unknown as Record<string, unknown>, "__xagentWidgetGrants")
+    vi.stubGlobal("fetch", fetchMock)
+    fetchMock.mockReset()
+
+    windowListeners = []
+    realAddEventListener = window.addEventListener.bind(window)
+    vi.spyOn(window, "addEventListener").mockImplementation((type, listener, options) => {
+      windowListeners.push([type, listener as EventListenerOrEventListenerObject])
+      realAddEventListener(type, listener, options)
+    })
+  })
+
+  afterEach(async () => {
+    for (const container of document.querySelectorAll(".xagent-widget-container")) {
+      container.remove()
+    }
+    // Let each controller's MutationObserver run its production teardown
+    // before Vitest removes the jsdom globals.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    for (const [type, listener] of windowListeners) {
+      window.removeEventListener(type, listener)
+    }
+    windowListeners = []
+
+    if (currentScriptDescriptor) {
+      Object.defineProperty(document, "currentScript", currentScriptDescriptor)
+    } else {
+      Reflect.deleteProperty(document, "currentScript")
+    }
+    vi.useRealTimers()
+    vi.unstubAllGlobals()
+    vi.restoreAllMocks()
+  })
+
+  it("harness boots the guest path unchanged", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { ticket: "t", agent_id: 17 }))
+    runWidget({ "data-widget-key": "widget-secret" })
+    await vi.waitFor(() => {
+      expect(iframeEl()?.src).toContain("/widget/chat/default")
+    })
+  })
+
+  it("navigates the iframe to the session URL and exchanges the grant immediately", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    const observeSpy = vi.spyOn(MutationObserver.prototype, "observe")
+
+    runWidget({ "data-encrypted-context": GRANT })
+
+    expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
+    expect(observeSpy).toHaveBeenCalledWith(document.body, { childList: true })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
+      method: "POST",
+      credentials: "omit",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ encrypted_context: GRANT }),
+    }))
+  })
+
+  it("sends the opaque grant value verbatim after checking that it is not blank", () => {
+    const rawGrant = `  ${GRANT}\n`
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": rawGrant })
+
+    expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
+      body: JSON.stringify({ encrypted_context: rawGrant }),
+    }))
+  })
+
+  it("fails closed on an empty grant attribute with no DOM and no network", () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+    runWidget({ "data-encrypted-context": "   " })
+
+    expect(fetchMock).not.toHaveBeenCalled()
+    expect(document.querySelector(".xagent-widget-container")).toBeNull()
+    expect(document.head.querySelector("style")).toBeNull()
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[grant_malformed]"))
+  })
+
+  it.each(["data-widget-key", "data-token"])(
+    "fails closed when %s coexists with the grant",
+    (legacyAttribute) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+
+      const script = runWidget({ "data-encrypted-context": GRANT, [legacyAttribute]: "legacy" })
+
+      expect(fetchMock).not.toHaveBeenCalled()
+      expect(document.querySelector(".xagent-widget-container")).toBeNull()
+      expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[attribute_conflict]"))
+      expect(script.hasAttribute("data-encrypted-context")).toBe(false)
+    },
+  )
+
+  it("keeps cosmetic attributes working in session mode", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT, "data-button-color": "rgb(1, 2, 3)" })
+
+    expect(document.head.querySelector("style")?.innerHTML).toContain("rgb(1, 2, 3)")
+  })
+
+  it("never writes a guest id in session mode", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": GRANT })
+
+    expect(localStorage.getItem("xagent_guest_id")).toBeNull()
+  })
+
+  it("removes the grant attribute from the DOM once it is read", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    const script = runWidget({ "data-encrypted-context": GRANT })
+
+    expect(script.hasAttribute("data-encrypted-context")).toBe(false)
+  })
+
+  it("deduplicates the same grant while keeping different grants and message channels isolated", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined)
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      const body = JSON.parse(init.body as string)
+      const suffix = body.encrypted_context === GRANT ? "first" : "second"
+      return Promise.resolve(jsonResponse(200, exchangeBody({
+        session_token: `st_${suffix}`,
+        reconnect_token: `rt_${suffix}`,
+      })))
+    })
+
+    runWidget({ "data-encrypted-context": GRANT })
+    const duplicateScript = runWidget({ "data-encrypted-context": GRANT })
+
+    expect(document.querySelectorAll(".xagent-widget-container")).toHaveLength(1)
+    expect(warnSpy).toHaveBeenCalledWith(expect.stringMatching(
+      /single-use.*fresh grant.*\[duplicate_init\]/,
+    ))
+    expect(duplicateScript.hasAttribute("data-encrypted-context")).toBe(false)
+
+    runWidget({ "data-encrypted-context": `${GRANT}-other` })
+
+    const frames = Array.from(document.querySelectorAll<HTMLIFrameElement>(".xagent-widget-iframe"))
+    expect(frames).toHaveLength(2)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await flushAsync()
+    expect(fetchMock.mock.calls.map((call) => JSON.parse(call[1].body))).toEqual([
+      { encrypted_context: GRANT },
+      { encrypted_context: `${GRANT}-other` },
+    ])
+
+    const firstPost = spyOnIframePostMessage(frames[0])
+    const secondPost = spyOnIframePostMessage(frames[1])
+    fromSpecificIframe(frames[1], "ready")
+
+    expect(firstPost).not.toHaveBeenCalled()
+    expect(secondPost).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+  })
+
+  it("uses the exact 32-bit FNV-1a digest for grant dedupe keys", () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+
+    runWidget({ "data-encrypted-context": "hello" })
+
+    expect(
+      (window as unknown as { __xagentWidgetGrants: Record<string, boolean> })
+        .__xagentWidgetGrants,
+    ).toEqual({ g4f9f2cab: true })
+  })
+
+  it("pushes session_update to the iframe once it announces ready", async () => {
+    const body = exchangeBody()
+    const absoluteExpiresAt = body.session.absolute_expires_at
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, body))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("ready")
+
+    expect(post).toHaveBeenCalledTimes(1)
+    const [message, targetOrigin] = post.mock.calls[0]
+    expect(targetOrigin).toBe(HOST)
+    expect(message).toMatchObject({
+      xagent: true,
+      v: 1,
+      type: "session_update",
+      session_token: "st_first",
+      absolute_expires_at: absoluteExpiresAt,
+      agent: { id: 42, name: "Care Assistant" },
+    })
+    expect(message).not.toHaveProperty("reconnect_token")
+  })
+
+  it("holds only the latest state until ready arrives", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_second",
+        reconnect_token: "rt_second",
+      })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await flushAsync()
+
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+  })
+
+  it("re-sends the current state on every ready", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("ready")
+    fromIframe("ready")
+
+    expect(post).toHaveBeenCalledTimes(2)
+    expect(post.mock.calls[1][0]).toMatchObject({ type: "session_update", session_token: "st_first" })
+  })
+
+  it("ignores messages from a foreign origin, a foreign source, or a foreign shape", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "ready" },
+      origin: "https://evil.example",
+      source: iframeEl()?.contentWindow as Window,
+    }))
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { xagent: true, v: 1, type: "ready" },
+      origin: HOST,
+      source: window,
+    }))
+    fromIframe("ready", { v: 2 })
+    window.dispatchEvent(new MessageEvent("message", {
+      data: { type: "ready" },
+      origin: HOST,
+      source: iframeEl()?.contentWindow as Window,
+    }))
+
+    expect(post).not.toHaveBeenCalled()
+  })
+
+  it("goes terminal and tells the frame when the grant is rejected outright", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(401, "signature_invalid"))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[signature_invalid]"),
+    ))
+    expect(fetchMock).toHaveBeenCalledTimes(1)  // integrity class never retries or reconnects
+    fromIframe("ready")
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "signature_invalid" })
+  })
+
+  it("goes terminal on a stale grant when no reconnect token is held", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(401, "grant_already_used"))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[grant_already_used]"),
+    ))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does not retry a coded 4xx and reports unexpected_error for an uncoded one", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(new Response("<html>payload too large</html>", { status: 413 }))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[unexpected_error] (HTTP 413)"),
+    ))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ["grant_malformed", 400],
+    ["encryption_required", 400],
+    ["agent_not_granted", 403],
+    ["agent_not_available", 409],
+    ["widget_disabled", 409],
+    ["invalid_input", 422],
+    ["invalid_runtime_context", 422],
+  ])("goes terminal on %s without retrying", async (code, status) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(status as number, code as string))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`[${code}] (HTTP ${status})`),
+    ))
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    fromIframe("ready")
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code })
+  })
+
+  it.each(["future_code_v2", "toString"])(
+    "fails closed on the unrecognized error code %s",
+    async (unknownCode) => {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(errorResponse(403, unknownCode))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+        expect.stringContaining("[unexpected_error] (HTTP 403)"),
+      ))
+      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining(`[${unknownCode}]`))
+      fromIframe("ready")
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "unexpected_error" })
+    },
+  )
+
+  it("fails closed when a successful response is missing required session fields", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, { session_token: "st_only" }))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await flushAsync()
+    fromIframe("ready")
+
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[unexpected_error] (HTTP 200)"))
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "unexpected_error" }),
+      HOST,
+    )
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update" }),
+      HOST,
+    )
+  })
+
+  it("retries an uncoded 5xx three times with 1s/2s/4s backoff, then reports network_unavailable", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(
+      new Response("<html>bad gateway</html>", { status: 502 }),
+    ))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+
+    await vi.advanceTimersByTimeAsync(8000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)  // four attempts total, never a fifth
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 502)"))
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_degraded", code: "network_unavailable" }),
+      HOST,
+    )
+  })
+
+  it("retries an unknown coded 5xx before reporting network_unavailable", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(errorResponse(503, "future_server_code")))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(7000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 503)"))
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("[future_server_code]"))
+  })
+
+  it("honors a known error code on 5xx without status-based retry", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(errorResponse(503, "widget_disabled")))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(7000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[widget_disabled] (HTTP 503)"))
+  })
+
+  it("fails closed on an uncoded 429 instead of guessing rate_limited", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(
+      new Response("<html>too many requests</html>", { status: 429 }),
+    ))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(3000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[unexpected_error] (HTTP 429)"))
+  })
+
+  it("treats a rejected fetch as the network class", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(7000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable]"))
+  })
+
+  it("aborts an attempt after 5s and keeps the whole budget inside the 30s idempotency window", async () => {
+    vi.useFakeTimers()
+    const signals: AbortSignal[] = []
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      signals.push(init.signal as AbortSignal)
+      return new Promise((_resolve, reject) => {
+        (init.signal as AbortSignal).addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+      })
+    })
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(5000)
+    expect(signals[0].aborted).toBe(true)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    // attempt 2 at 6s, attempt 3 at 13s, attempt 4 at 22s, all done by 27s
+    await vi.advanceTimersByTimeAsync(22_000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("keeps the 5s deadline active while the response body is being read", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    const signals: AbortSignal[] = []
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      const signal = init.signal as AbortSignal
+      signals.push(signal)
+      const body = new ReadableStream<Uint8Array>({
+        start(controller) {
+          signal.addEventListener("abort", () => {
+            controller.error(new DOMException("aborted", "AbortError"))
+          }, { once: true })
+        },
+      })
+      return Promise.resolve(new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }))
+    })
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(27_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(signals).toHaveLength(4)
+    expect(signals.every((signal) => signal.aborted)).toBe(true)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable]"))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("honors Retry-After on 429 at most twice", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(
+      jsonResponse(429, { error: { code: "rate_limited" } }, { "Retry-After": "3" }),
+    ))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(3000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[rate_limited] (HTTP 429)"))
+  })
+
+  it("honors an HTTP-date Retry-After value", async () => {
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-07-27T00:00:00Z"))
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "Mon, 27 Jul 2026 00:00:03 GMT" },
+    )))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(2999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ["a negative value", "-1"],
+    ["a malformed value", "not-a-date"],
+    ["a missing value", undefined],
+  ])("uses the retry fallback for %s", async (_case, retryAfter) => {
+    vi.useFakeTimers()
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      retryAfter ? { "Retry-After": retryAfter } : {},
+    )))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(999)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    await vi.advanceTimersByTimeAsync(1)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it("counts 429 and transport failures against one four-request exchange budget", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    const signals: AbortSignal[] = []
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(
+        429,
+        { error: { code: "rate_limited" } },
+        { "Retry-After": "3" },
+      ))
+      .mockResolvedValueOnce(jsonResponse(
+        429,
+        { error: { code: "rate_limited" } },
+        { "Retry-After": "3" },
+      ))
+      .mockImplementation((_url: string, init: RequestInit) => {
+        const signal = init.signal as AbortSignal
+        signals.push(signal)
+        return new Promise((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          )
+        })
+      })
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(signals).toHaveLength(2)
+    expect(signals.every((signal) => signal.aborted)).toBe(true)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable]"))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("does not schedule a 429 retry beyond the exchange deadline", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "31" },
+    )))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(30_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[rate_limited] (HTTP 429)"))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("coalesces concurrent reconnect requests into a single call and one broadcast", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_second",
+        reconnect_token: "rt_second",
+      })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    fromIframe("reconnect_request", { reason: "token_expired" })
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)  // one exchange + one reconnect
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      reconnect_token: "rt_first",
+      encrypted_context: GRANT,
+    })
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+  })
+
+  it("restarts a frozen stale-session reconnect with the held reconnect token", async () => {
+    let frozenReconnectSignal: AbortSignal | undefined
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token_expires_at: new Date(Date.now() + 30_000).toISOString(),
+      })))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        frozenReconnectSignal = init.signal as AbortSignal
+        return new Promise(() => undefined)
+      })
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_recovered",
+        reconnect_token: "rt_recovered",
+      })))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    post.mockClear()
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    firePageRestore()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+
+    expect(frozenReconnectSignal?.aborted).toBe(true)
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      EXCHANGE_URL,
+      RECONNECT_URL,
+      RECONNECT_URL,
+    ])
+    expect(JSON.parse(fetchMock.mock.calls[2][1].body)).toEqual({
+      reconnect_token: "rt_first",
+      encrypted_context: GRANT,
+    })
+    await vi.waitFor(() => expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_recovered" }),
+      HOST,
+    ))
+  })
+
+  it("cancels a parked reconnect before bfcache starts a replacement load flow", async () => {
+    let resolveFirstExchange: (value: Response) => void = () => undefined
+    let resolveSecondExchange: (value: Response) => void = () => undefined
+    let firstExchangeSignal: AbortSignal | undefined
+    const reconnectBodies: Array<Record<string, string>> = []
+    const resolveReconnects: Array<(value: Response) => void> = []
+    fetchMock
+      .mockImplementationOnce((_url: string, init: RequestInit) => new Promise<Response>((resolve) => {
+        resolveFirstExchange = resolve
+        firstExchangeSignal = init.signal as AbortSignal
+      }))
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => {
+        resolveSecondExchange = resolve
+      }))
+      .mockImplementation((_url: string, init: RequestInit) => {
+        reconnectBodies.push(JSON.parse(init.body as string))
+        return new Promise<Response>((resolve) => {
+          resolveReconnects.push(resolve)
+        })
+      })
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    firePageRestore()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(firstExchangeSignal?.aborted).toBe(true)
+
+    resolveFirstExchange(jsonResponse(200, exchangeBody({
+      session_token: "st_old",
+      reconnect_token: "rt_old",
+    })))
+    await flushAsync()
+    fromIframe("reconnect_request", { reason: "token_expired" })
+
+    resolveSecondExchange(jsonResponse(200, exchangeBody({
+      session_token: "st_new",
+      reconnect_token: "rt_new",
+    })))
+    await vi.waitFor(() => expect(reconnectBodies).toHaveLength(1))
+
+    expect(reconnectBodies).toEqual([{
+      reconnect_token: "rt_new",
+      encrypted_context: GRANT,
+    }])
+
+    resolveReconnects[0](jsonResponse(200, exchangeBody({
+      session_token: "st_reconnected",
+      reconnect_token: "rt_reconnected",
+    })))
+    await flushAsync()
+  })
+
+  it("keeps the last healthy session without replaying a frozen reconnect", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let frozenReconnectSignal: AbortSignal | undefined
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        frozenReconnectSignal = init.signal as AbortSignal
+        return new Promise(() => undefined)
+      })
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(0)
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(7_000)
+
+    expect(frozenReconnectSignal?.aborted).toBe(true)
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual([
+      EXCHANGE_URL,
+      RECONNECT_URL,
+    ])
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_first" }),
+      HOST,
+    )
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_degraded" }),
+      HOST,
+    )
+  })
+
+  it("never fires a deferred reconnect once the exchange it waited on goes terminal", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(409, "widget_disabled"))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    // Make the frame ready while the exchange is still pending so both the
+    // terminal transition and a deferred reconnect continuation could flush.
+    fromIframe("ready")
+    // reconnect_request arrives while the exchange is still in flight (its
+    // response hasn't been parsed yet), so it coalesces via singleFlight and
+    // defers its own network call until the exchange settles.
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    // The exchange settles into a terminal error.
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[widget_disabled]"),
+    ))
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+    // Give the deferred reconnect's `wait.then` callback a turn to run: it
+    // only wakes up after singleFlight clears state.inflight.exchange, which
+    // happens one more microtask turn after handleResult/goTerminal return.
+    await Promise.resolve()
+    await Promise.resolve()
+
+    // The deferred reconnect must re-check the terminal latch before firing
+    // its network call and bail out instead — no second (reconnect) fetch,
+    // ever, and every broadcast the frame receives is the terminal one.
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    for (const call of post.mock.calls) {
+      expect(call[0]).toMatchObject({ type: "session_terminal", code: "widget_disabled" })
+    }
+    expect(post).toHaveBeenCalledTimes(1)
+  })
+
+  it("answers reconnect_request from a latched terminal state without any network call", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(409, "widget_disabled"))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    // Wait for the exchange to actually finish failing (terminal latch set),
+    // not just for fetch() to have been called — the response body still
+    // needs to be parsed asynchronously before goTerminal() runs.
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining("[widget_disabled]"),
+    ))
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(post).toHaveBeenCalledTimes(2)
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "widget_disabled" })
+  })
+
+  it("reconnects before handing the frame a token with under 60s left", async () => {
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token_expires_at: new Date(Date.now() + 30_000).toISOString(),
+      })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_fresh" })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fromIframe("ready")
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_fresh" })
+  })
+
+  it.each([
+    ["reconnect_invalid", 401],
+    ["session_expired", 401],
+    ["identity_mismatch", 403],
+  ])("goes terminal on %s from the reconnect endpoint without retrying", async (code, status) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(errorResponse(status as number, code as string))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    await flushAsync()
+    fromIframe("ready")
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      expect.stringContaining(`[${code}] (HTTP ${status})`),
+    ))
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code }),
+      HOST,
+    )
+  })
+
+  it("uses the shared four-attempt retry policy on the reconnect endpoint", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fetchMock.mockImplementation(() => Promise.resolve(
+      new Response("<html>bad gateway</html>", { status: 502 }),
+    ))
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(RECONNECT_URL)
+    await vi.advanceTimersByTimeAsync(1000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    await vi.advanceTimersByTimeAsync(2000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    await vi.advanceTimersByTimeAsync(4000)
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+
+    await vi.advanceTimersByTimeAsync(8000)
+    expect(fetchMock).toHaveBeenCalledTimes(5)  // exchange + four reconnect attempts
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 502)"))
+  })
+
+  it("allows two rate-limit retries inside the shared reconnect budget", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "1" },
+    )))
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[rate_limited] (HTTP 429)"))
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it("ignores a late duplicate exchange response after the session moved on", async () => {
+    // Fake timers must be installed before runWidget() schedules postJson's
+    // SESSION_TIMEOUT_MS abort timer, or advanceTimersByTimeAsync below has
+    // nothing to advance and the real timer never fires within the test.
+    vi.useFakeTimers()
+    let resolveLate: (value: Response) => void = () => undefined
+    fetchMock
+      // The first attempt hangs until the client gives up: postJson's own
+      // AbortController fires at SESSION_TIMEOUT_MS, and this mock (like the
+      // "aborts an attempt" test above) must react to that signal the way a
+      // real fetch would, or withRetry never sees this attempt settle and
+      // never starts the retry that's supposed to win the race.
+      .mockImplementationOnce((_url: string, init: RequestInit) => new Promise<Response>((resolve, reject) => {
+        resolveLate = resolve
+        ;(init.signal as AbortSignal).addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")))
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_real" })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+
+    // The first attempt times out and the retry wins.
+    await vi.advanceTimersByTimeAsync(6000)
+    await vi.waitFor(() => expect(post).toHaveBeenCalled())
+    vi.useRealTimers()
+    post.mockClear()
+
+    resolveLate(jsonResponse(200, exchangeBody({ session_token: "st_stale", reconnect_token: "rt_stale" })))
+    await Promise.resolve()
+
+    expect(post).not.toHaveBeenCalled()
+  })
+
+  it("cancels a frozen exchange before starting bfcache recovery", async () => {
+    let resolveFirst: (value: Response) => void = () => undefined
+    let firstSignal: AbortSignal | undefined
+    fetchMock.mockImplementationOnce((_url: string, init: RequestInit) => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+      firstSignal = init.signal as AbortSignal
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    firePageRestore()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    expect(firstSignal?.aborted).toBe(true)
+
+    const post = spyOnIframePostMessage()
+    await flushAsync()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+    post.mockClear()
+
+    resolveFirst(jsonResponse(200, exchangeBody({ session_token: "st_stale", reconnect_token: "rt_stale" })))
+    await flushAsync()
+
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledTimes(1)
+    expect(post.mock.calls[0][0]).toMatchObject({ session_token: "st_second" })
+  })
+
+  it("ignores a superseded exchange failure after the replacement exchange succeeds", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let resolveFirst: (value: Response) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    firePageRestore()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const post = spyOnIframePostMessage()
+    await flushAsync()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+    post.mockClear()
+
+    resolveFirst(errorResponse(409, "agent_not_available"))
+    await flushAsync()
+
+    expect(errorSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[agent_not_available]"),
+    )
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+  })
+
+  it("ignores a superseded exchange failure before the replacement exchange succeeds", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let resolveFirst: (value: Response) => void = () => undefined
+    let resolveSecond: (value: Response) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveSecond = resolve
+    }))
+    firePageRestore()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    resolveFirst(errorResponse(409, "agent_not_available"))
+    await flushAsync()
+
+    expect(errorSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[agent_not_available]"),
+    )
+    expect(post).not.toHaveBeenCalled()
+
+    resolveSecond(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    await flushAsync()
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+  })
+
+  it("keeps the replacement exchange as reconnect's wait owner after the abandoned exchange settles", async () => {
+    let resolveFirst: (value: Response) => void = () => undefined
+    let resolveSecond: (value: Response) => void = () => undefined
+    fetchMock
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => {
+        resolveFirst = resolve
+      }))
+      .mockImplementationOnce(() => new Promise<Response>((resolve) => {
+        resolveSecond = resolve
+      }))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_reconnected",
+        reconnect_token: "rt_reconnected",
+      })))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    firePageRestore()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+
+    resolveFirst(errorResponse(409, "agent_not_available"))
+    await flushAsync()
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    resolveSecond(jsonResponse(200, exchangeBody({
+      session_token: "st_second",
+      reconnect_token: "rt_second",
+    })))
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    await flushAsync()
+
+    expect(fetchMock.mock.calls[2][0]).toBe(RECONNECT_URL)
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_reconnected" }),
+      HOST,
+    )
+  })
+
+  it("does not retry a network failure from a superseded exchange", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    let rejectFirst: (reason: unknown) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((_resolve, reject) => {
+      rejectFirst = reject
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second" })))
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+    post.mockClear()
+
+    fetchMock.mockRejectedValue(new TypeError("Failed to fetch"))
+    rejectFirst(new TypeError("Failed to fetch"))
+    await vi.advanceTimersByTimeAsync(7000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(errorSpy).not.toHaveBeenCalledWith(
+      expect.stringContaining("[network_unavailable]"),
+    )
+    expect(post).not.toHaveBeenCalled()
+    fromIframe("ready")
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second" }),
+      HOST,
+    )
+  })
+
+  it("ignores a canceled exchange even when it resolves before its replacement", async () => {
+    let resolveFirst: (value: Response) => void = () => undefined
+    let resolveSecond: (value: Response) => void = () => undefined
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveFirst = resolve
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fetchMock.mockImplementationOnce(() => new Promise<Response>((resolve) => {
+      resolveSecond = resolve
+    }))
+    firePageRestore()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+
+    const post = spyOnIframePostMessage()
+    resolveFirst(jsonResponse(200, exchangeBody({ session_token: "st_first_winner" })))
+    await flushAsync()
+    fromIframe("ready")
+    expect(post).not.toHaveBeenCalled()
+
+    resolveSecond(jsonResponse(200, exchangeBody({ session_token: "st_second_late" })))
+    await flushAsync()
+
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_second_late" }),
+      HOST,
+    )
+  })
+
+  it("fails closed when reconnect still returns an already-stale token", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(200, exchangeBody({
+      session_token_expires_at: new Date(Date.now() + 10_000).toISOString(),
+    }))))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    fromIframe("ready")
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await flushAsync()
+
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[unexpected_error] (HTTP 200)"))
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "unexpected_error" }),
+      HOST,
+    )
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update" }),
+      HOST,
+    )
+  })
+
+  it("re-runs the load flow when a bfcache restore finds no session", async () => {
+    vi.useFakeTimers()
+    // The exchange never settles: the page was frozen mid-flight.
+    fetchMock.mockImplementationOnce(() => new Promise(() => undefined))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1][0]).toBe(EXCHANGE_URL)
+  })
+
+  it("processes one persisted pagehide only once across repeated pageshow events", async () => {
+    vi.useFakeTimers()
+    let recoverySignal: AbortSignal | undefined
+    fetchMock
+      .mockImplementationOnce(() => new Promise(() => undefined))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        recoverySignal = init.signal as AbortSignal
+        return new Promise(() => undefined)
+      })
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(recoverySignal?.aborted).toBe(false)
+  })
+
+  it("does nothing on a bfcache restore with a healthy session", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    // vi.waitFor's condition above (fetchMock call count) goes true the
+    // instant fetch() is invoked, before the mocked Response's .json() body
+    // read (and the applySession() it feeds) has actually settled — see the
+    // flushAsync() comment near the top of this file for the same race. A
+    // macrotask flush here lets state.session actually be populated before
+    // firePageShow, or this test would spuriously re-trigger the load flow.
+    await flushAsync()
+
+    firePageRestore()
+    await Promise.resolve()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("does nothing on a bfcache restore after a terminal outcome", async () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(errorResponse(403, "agent_not_granted"))
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    // Same race as above: let goTerminal() actually latch state.terminalCode
+    // before firePageShow, or this test would spuriously re-trigger the load
+    // flow while the terminal outcome is still mid-flight.
+    await flushAsync()
+
+    firePageRestore()
+    await Promise.resolve()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("retries a latched rate limit only after a persisted pageshow", async () => {
+    vi.useFakeTimers()
+    vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
+      429,
+      { error: { code: "rate_limited" } },
+      { "Retry-After": "1" },
+    )))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+    await vi.advanceTimersByTimeAsync(3_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_degraded", code: "rate_limited" }),
+      HOST,
+    )
+    post.mockClear()
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+      session_token: "st_recovered",
+    })))
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(fetchMock.mock.calls[3][0]).toBe(EXCHANGE_URL)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_recovered" }),
+      HOST,
+    )
+  })
+
+  it("does nothing on a normal (non-persisted) pageshow", async () => {
+    fetchMock.mockImplementationOnce(() => new Promise(() => undefined))
+    runWidget({ "data-encrypted-context": GRANT })
+
+    firePageShow(false)
+    await Promise.resolve()
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("tears down listeners and pending requests when the session iframe leaves the DOM", async () => {
+    let requestSignal: AbortSignal | undefined
+    const removeListenerSpy = vi.spyOn(window, "removeEventListener")
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal
+      return new Promise(() => undefined)
+    })
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    document.querySelector(".xagent-widget-container")?.remove()
+    await vi.waitFor(() => expect(requestSignal?.aborted).toBe(true))
+    expect(removeListenerSpy).toHaveBeenCalledWith("message", expect.any(Function))
+    expect(removeListenerSpy).toHaveBeenCalledWith("pageshow", expect.any(Function))
+    expect(removeListenerSpy).toHaveBeenCalledWith("pagehide", expect.any(Function))
+
+    firePageRestore()
+    await flushAsync()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+})

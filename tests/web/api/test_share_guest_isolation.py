@@ -18,9 +18,14 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from fastapi import HTTPException
 from starlette.websockets import WebSocketDisconnect
 
-from xagent.web.api.public_chat_access import create_public_chat_access_token
+from xagent.web.api.public_chat_access import (
+    PublicChatAccessContext,
+    create_public_chat_access_token,
+    get_task_for_public_context,
+)
 from xagent.web.models.agent import Agent, AgentStatus
 from xagent.web.models.task import Task
 from xagent.web.models.user import User
@@ -214,7 +219,9 @@ def test_agent_share_ws_connect_denies_foreign_guest() -> None:
         with pytest.raises(WebSocketDisconnect) as denied:
             ws.receive_text()
     assert denied.value.code == 4003
-    assert denied.value.reason == "Access denied for this guest"
+    # Guest mismatch deliberately shares the not-found detail so probing can't
+    # enumerate task ids on a share link (#973).
+    assert denied.value.reason == "Task not found or access denied"
 
 
 def test_agent_share_task_without_guest_id_is_denied() -> None:
@@ -426,3 +433,85 @@ def test_legacy_workforce_share_token_without_guest_id_is_rejected() -> None:
         json={"title": "hi", "description": "hi"},
     )
     assert response.status_code == 401, response.text
+
+
+# ===== enumeration-oracle collapse on the widget gates (#973) =====
+
+
+class _StubQuery:
+    def __init__(self, task: object | None) -> None:
+        self._task = task
+
+    def filter(self, *_criteria: object) -> _StubQuery:
+        return self
+
+    def first(self) -> object | None:
+        return self._task
+
+
+class _StubDb:
+    """Minimal Session double: every Task lookup resolves to one canned row."""
+
+    def __init__(self, task: object | None) -> None:
+        self._task = task
+
+    def query(self, *_entities: object) -> _StubQuery:
+        return _StubQuery(self._task)
+
+
+@pytest.mark.parametrize(
+    ("context_kwargs", "mismatch_task"),
+    [
+        pytest.param(
+            {"widget_agent_id": 1},
+            SimpleNamespace(
+                agent_config={"guest_id": "guest-b"},
+                agent_id=1,
+                channel_id=None,
+            ),
+            id="widget-agent",
+        ),
+        pytest.param(
+            {"widget_workforce_id": 7},
+            SimpleNamespace(
+                agent_config={
+                    "auth_mode": "widget",
+                    "guest_id": "guest-b",
+                    "widget_workforce_id": 7,
+                },
+                channel_id=None,
+            ),
+            id="widget-workforce",
+        ),
+    ],
+)
+def test_widget_gate_guest_mismatch_matches_not_found_detail(
+    context_kwargs: dict[str, Any], mismatch_task: SimpleNamespace
+) -> None:
+    """Widget-side mirrors of the share-gate detail assertion (#973).
+
+    All three ownership gates collapsed their guest-mismatch 403 into the
+    generic not-found detail; the share gate pins this over a real WS
+    handshake above, and these pin the widget and workforce-widget gates. The
+    denial for "task exists but belongs to another guest" must stay
+    byte-identical to "task does not exist", or a probing visitor can
+    enumerate which task ids live behind the widget key.
+    """
+    context = PublicChatAccessContext(
+        user=SimpleNamespace(id=1),
+        channel_id=None,
+        guest_id="guest-a",
+        **context_kwargs,
+    )
+
+    with pytest.raises(HTTPException) as mismatch:
+        get_task_for_public_context(_StubDb(mismatch_task), 41, context)
+    with pytest.raises(HTTPException) as missing:
+        get_task_for_public_context(_StubDb(None), 41, context)
+
+    assert mismatch.value.status_code == 403
+    assert mismatch.value.detail == "Task not found or access denied"
+    assert (mismatch.value.status_code, mismatch.value.detail) == (
+        missing.value.status_code,
+        missing.value.detail,
+    )

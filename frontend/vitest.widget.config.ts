@@ -19,6 +19,12 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         branches: 55,
         functions: 45,
         lines: 80,
+        "public/widget.js": {
+          statements: 95,
+          branches: 90,
+          functions: 95,
+          lines: 95,
+        },
       },
     },
   },
@@ -32,6 +38,7 @@ export default defineConfig({
     // merging to keep this command strictly targeted.
     include: [
       "src/components/widget/widget-bootstrap.test.ts",
+      "src/components/widget/widget-session.test.ts",
       "src/components/widget/public-agent-chat-page.test.tsx",
     ],
   },

@@ -107,6 +107,17 @@ TRIGGER_CALLBACK_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_RATE_LIMIT"
 TRIGGER_CALLBACK_IP_RATE_LIMIT = "XAGENT_TRIGGER_CALLBACK_IP_RATE_LIMIT"
 TRIGGER_CRUD_RATE_LIMIT = "XAGENT_TRIGGER_CRUD_RATE_LIMIT"
 TRUSTED_PROXY_HOPS = "XAGENT_TRUSTED_PROXY_HOPS"
+# Public share-channel abuse controls (#973). Each is a rate string in the
+# ``limits`` notation, e.g. "60/minute" or "500/day".
+SHARE_AUTH_RATE_LIMIT = "XAGENT_SHARE_AUTH_RATE_LIMIT"
+SHARE_AUTH_IP_RATE_LIMIT = "XAGENT_SHARE_AUTH_IP_RATE_LIMIT"
+SHARE_TASK_CREATE_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_RATE_LIMIT"
+SHARE_TASK_CREATE_TOKEN_RATE_LIMIT = "XAGENT_SHARE_TASK_CREATE_TOKEN_RATE_LIMIT"
+SHARE_WS_TURN_RATE_LIMIT = "XAGENT_SHARE_WS_TURN_RATE_LIMIT"
+SHARE_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT"
+SHARE_UPLOAD_RATE_LIMIT = "XAGENT_SHARE_UPLOAD_RATE_LIMIT"
+SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
+SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
 GMAIL_PUBSUB_TOPIC_PREFIX = "XAGENT_GMAIL_PUBSUB_TOPIC_PREFIX"
 GMAIL_PUBSUB_SUBSCRIPTION_PREFIX = "XAGENT_GMAIL_PUBSUB_SUBSCRIPTION_PREFIX"
@@ -114,6 +125,7 @@ GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT = "XAGENT_GMAIL_PUBSUB_PUSH_SERVICE_ACCOUNT"
 GMAIL_PUBSUB_TRANSPORT = "XAGENT_GMAIL_PUBSUB_TRANSPORT"
 GMAIL_REGISTRATION_TIMEOUT_SECONDS = "XAGENT_GMAIL_REGISTRATION_TIMEOUT_SECONDS"
 PUBLIC_API_BASE_URL = "XAGENT_PUBLIC_API_BASE_URL"
+TRIGGER_CALLBACK_BASE_URL = "XAGENT_TRIGGER_CALLBACK_BASE_URL"
 GMAIL_WATCH_ENABLED = "XAGENT_GMAIL_WATCH_ENABLED"
 GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_INTERVAL_SECONDS"
 GMAIL_WATCH_RENEWAL_LEAD_SECONDS = "XAGENT_GMAIL_WATCH_RENEWAL_LEAD_SECONDS"
@@ -326,6 +338,16 @@ def _get_bool_env(env_var: str, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _normalized_env_url(env_var: str) -> str | None:
+    """Return the env var's value normalized as a base URL.
+
+    Strips surrounding whitespace and trailing slashes; unset or blank
+    values normalize to None.
+    """
+    value = (os.getenv(env_var) or "").strip()
+    return value.rstrip("/") or None
+
+
 def get_password_reset_expire_minutes() -> int:
     """Return the password reset token expiry window in minutes."""
     return _get_positive_int_env(PASSWORD_RESET_EXPIRE_MINUTES, 30)
@@ -333,11 +355,7 @@ def get_password_reset_expire_minutes() -> int:
 
 def get_app_base_url() -> str | None:
     """Return the trusted frontend base URL used in email links."""
-    value = os.getenv(APP_BASE_URL)
-    if value is None:
-        return None
-    value = value.strip()
-    return value.rstrip("/") or None
+    return _normalized_env_url(APP_BASE_URL)
 
 
 def get_smtp_host() -> str:
@@ -697,6 +715,93 @@ def get_trigger_crud_rate_limit() -> str:
     return value or "60/minute"
 
 
+def _get_rate_limit(env_var: str, default: str) -> str:
+    """Read a ``limits``-notation rate string with an env override.
+
+    Priority: the given ``XAGENT_*`` env var, else ``default``. The value is
+    validated (and defaulted) at parse time by the rate limiter, so this only
+    trims and falls back on an empty/unset var.
+    """
+    return (os.getenv(env_var) or "").strip() or default
+
+
+def get_share_auth_rate_limit() -> str:
+    """Per-share-token limit on ``POST /api/share/auth`` (#973).
+
+    No ``guest_id`` exists before auth, so this bounds one share link's token
+    minting; the per-IP ceiling below bounds a single client across links.
+    """
+    return _get_rate_limit(SHARE_AUTH_RATE_LIMIT, "60/minute")
+
+
+def get_share_auth_ip_rate_limit() -> str:
+    """Per-IP ceiling on ``POST /api/share/auth`` across all share links."""
+    return _get_rate_limit(SHARE_AUTH_IP_RATE_LIMIT, "300/minute")
+
+
+def get_share_task_create_rate_limit() -> str:
+    """Per-guest limit on public share task creation (#973).
+
+    Task creation is the costly surface (each spawns an owner-billed run), so
+    this is the tighter of the two task-create buckets.
+    """
+    return _get_rate_limit(SHARE_TASK_CREATE_RATE_LIMIT, "30/minute")
+
+
+def get_share_task_create_token_rate_limit() -> str:
+    """Per-share-token ceiling on public share task creation.
+
+    Stops a client rotating fresh ``guest_id`` tokens (one auth each) from
+    bypassing the per-guest bucket on one share link.
+    """
+    return _get_rate_limit(SHARE_TASK_CREATE_TOKEN_RATE_LIMIT, "120/minute")
+
+
+def get_share_ws_turn_rate_limit() -> str:
+    """Per-guest limit on share websocket turns (#973).
+
+    Follow-up turns bypass task-create and each starts an owner-billed run;
+    this caps the burst rate before a turn is enqueued.
+    """
+    return _get_rate_limit(SHARE_WS_TURN_RATE_LIMIT, "60/minute")
+
+
+def get_share_ws_connect_ip_rate_limit() -> str:
+    """Per-IP limit on share websocket connection attempts (#973).
+
+    The share websocket accepts the handshake before auth so denial reasons
+    reach the client, which means even a garbage token completes a full 101
+    upgrade before rejection. This caps how many of those handshakes one IP
+    can open; over-limit attempts are refused pre-accept (no upgrade cost).
+    """
+    return _get_rate_limit(SHARE_WS_CONNECT_IP_RATE_LIMIT, "120/minute")
+
+
+def get_share_upload_rate_limit() -> str:
+    """Per-guest limit on public share file uploads (#973)."""
+    return _get_rate_limit(SHARE_UPLOAD_RATE_LIMIT, "60/minute")
+
+
+def get_share_run_quota() -> str:
+    """Per-share rolling run quota (#973).
+
+    Bounds the owner-billed runs one share link can start per window so a
+    single popular/abused link cannot exhaust the owner's whole team quota.
+    Rolling (not cumulative) so a legitimately busy link self-clears rather
+    than being permanently bricked.
+    """
+    return _get_rate_limit(SHARE_RUN_QUOTA, "500/day")
+
+
+def get_share_run_guest_quota() -> str:
+    """Per-guest rolling run quota within a share link (#973).
+
+    Shorter window than the per-share quota: bounds a single visitor's burst
+    of runs so one guest cannot consume the whole link's budget.
+    """
+    return _get_rate_limit(SHARE_RUN_GUEST_QUOTA, "60/hour")
+
+
 def get_trusted_proxy_hops() -> int:
     """Number of trusted reverse-proxy hops in front of the backend.
 
@@ -795,10 +900,29 @@ def get_public_api_base_url() -> str | None:
 
     Deliberately separate from XAGENT_APP_BASE_URL (the frontend URL used in
     e.g. password-reset emails): externally advertised API and provider callback
-    URLs should normally use the public backend origin.
+    URLs should normally use the public backend origin. Inbound trigger
+    callbacks can override this via XAGENT_TRIGGER_CALLBACK_BASE_URL
+    (see get_trigger_callback_base_url).
     """
-    value = (os.getenv(PUBLIC_API_BASE_URL) or "").strip()
-    return value.rstrip("/") or None
+    return _normalized_env_url(PUBLIC_API_BASE_URL)
+
+
+def get_trigger_callback_base_url() -> str | None:
+    """Base URL for inbound trigger callbacks (Gmail Pub/Sub push, webhooks).
+
+    Priority:
+        1. XAGENT_TRIGGER_CALLBACK_BASE_URL environment variable
+        2. get_public_api_base_url() (backward compatible fallback)
+
+    Only used when building inbound trigger callback endpoints; MCP and A2A
+    keep using XAGENT_PUBLIC_API_BASE_URL. Set this when server-to-server
+    callbacks must reach a different host than the advertised public API
+    origin (e.g. a dedicated ingress).
+    """
+    cleaned = _normalized_env_url(TRIGGER_CALLBACK_BASE_URL)
+    if cleaned is not None:
+        return cleaned
+    return get_public_api_base_url()
 
 
 def get_gmail_watch_enabled() -> bool:

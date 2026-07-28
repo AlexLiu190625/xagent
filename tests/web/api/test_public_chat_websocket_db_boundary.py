@@ -40,7 +40,7 @@ async def test_public_access_websocket_authorization_uses_worker_owned_session(
     closed_sessions: list[bool] = []
     session = object()
     user = SimpleNamespace(id=73, is_admin=True)
-    access_context = SimpleNamespace(user=user)
+    access_context = SimpleNamespace(user=user, guest_id="guest-73")
 
     class TrackingSession:
         def __enter__(self) -> object:
@@ -119,8 +119,8 @@ async def test_public_access_websocket_authorization_uses_worker_owned_session(
     assert all(thread_id != event_loop_thread for thread_id in operation_threads)
     assert is_dataclass(principal)
     assert principal.__dataclass_params__.frozen is True
-    assert {field.name for field in fields(principal)} == {"id", "is_admin"}
-    assert principal == WebSocketPrincipal(id=73, is_admin=True)
+    assert {field.name for field in fields(principal)} == {"id", "is_admin", "guest_id"}
+    assert principal == WebSocketPrincipal(id=73, is_admin=True, guest_id="guest-73")
 
 
 @pytest.mark.asyncio
