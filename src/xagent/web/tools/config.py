@@ -1840,8 +1840,14 @@ class WebToolConfig(BaseToolConfig):
         if self._db_factory is None and isinstance(live_db, Session):
             self._db_factory = self.get_session_factory()
 
+        # Only a real SQLAlchemy Session participates in the verified pool
+        # handoff. Standalone embedders and unit tests may supply a duck-typed
+        # object for synchronous getters; prepare_factory_runtime() deliberately
+        # keeps that legacy path out of the worker/session-factory boundary.
         live_released = (
-            release_db_connection_if_clean(live_db) if live_db is not None else True
+            release_db_connection_if_clean(live_db)
+            if isinstance(live_db, Session)
+            else True
         )
         lazy_released = (
             release_db_connection_if_clean(lazy_db) if lazy_db is not None else True
