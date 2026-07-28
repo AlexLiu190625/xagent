@@ -16,14 +16,14 @@ import {
   type PreviewableInlineFileKind,
 } from '@/components/file/inline-file-preview-utils'
 import { getApiUrl } from '@/lib/utils'
-import { AgentCardPresentationCapability } from '@/contexts/presentation-capabilities'
 import {
-  getFilesDisabledPresentationFileLabel,
+  AgentCardPresentationCapability,
+  resolveAgentCardPresentationCapability,
+} from '@/contexts/presentation-capabilities'
+import {
   isManagedFileUrl,
   projectFilesDisabledPresentation,
-  projectFilesDisabledToolResultPresentation,
   sanitizeFilesDisabledPresentationText,
-  serializeFilesDisabledPresentation,
 } from '@/lib/files-disabled-presentation'
 
 
@@ -55,32 +55,6 @@ const isLikelyMarkdown = (s: string): boolean => {
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   typeof value === 'object' && value !== null && !Array.isArray(value)
 )
-
-export function sanitizeFilesDisabledText(value: string): string {
-  return sanitizeFilesDisabledPresentationText(value)
-}
-
-/**
- * Produces the inert, display-safe representation of structured file metadata.
- * Local file locations are removed from any tool-result record. Generic
- * identifiers and URLs are removed only when that record has explicit file
- * identity; unrelated business records retain those fields.
- */
-export function projectFilesDisabledValue(value: unknown): unknown {
-  return projectFilesDisabledPresentation(value)
-}
-
-export function projectFilesDisabledToolResultOutput(value: unknown): unknown {
-  return projectFilesDisabledToolResultPresentation(value)
-}
-
-export function getFilesDisabledFileLabel(value: unknown): string | null {
-  return getFilesDisabledPresentationFileLabel(value)
-}
-
-export function serializeFilesDisabledValue(value: unknown): string {
-  return serializeFilesDisabledPresentation(value)
-}
 
 interface MarkdownRendererProps {
   content: string
@@ -519,7 +493,11 @@ export function MarkdownRenderer({
 }: MarkdownRendererProps) {
   const { t } = useI18n()
   const inheritedAgentCardsEnabled = React.useContext(AgentCardPresentationCapability)
-  const resolvedAgentCardsEnabled = agentCardsEnabled ?? inheritedAgentCardsEnabled
+  const resolvedAgentCardsEnabled = resolveAgentCardPresentationCapability(
+    filesDisabled,
+    agentCardsEnabled,
+    inheritedAgentCardsEnabled,
+  )
   const contextValue = React.useMemo<MarkdownRendererContextValue>(
     () => ({
       filesDisabled,
@@ -586,7 +564,7 @@ export function JsonRenderer({
       )
     } catch {
       // If not JSON, try to identify Markdown more comprehensively
-      const displayText = filesDisabled ? sanitizeFilesDisabledText(data) : data
+      const displayText = filesDisabled ? sanitizeFilesDisabledPresentationText(data) : data
       if (isLikelyMarkdown(displayText)) {
         return (
           <MarkdownRenderer
@@ -608,7 +586,7 @@ export function JsonRenderer({
     }
   }
 
-  const displayData = filesDisabled ? projectFilesDisabledValue(data) : data
+  const displayData = filesDisabled ? projectFilesDisabledPresentation(data) : data
 
   if (typeof displayData === 'object' && displayData !== null) {
     // Check if it's a result object with output that might be markdown

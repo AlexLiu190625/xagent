@@ -20,15 +20,13 @@ import {
 import { cn } from '@/lib/utils';
 import { useApp } from '@/contexts/app-context-chat';
 import { useI18n, type Translate } from '@/contexts/i18n-context';
+import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import {
-  getFilesDisabledFileLabel,
-  MarkdownRenderer,
-  projectFilesDisabledToolResultOutput,
-  serializeFilesDisabledValue,
-} from "@/components/ui/markdown-renderer";
-import {
+  getFilesDisabledPresentationFileLabel,
   projectFilesDisabledPresentation,
+  projectFilesDisabledToolResultPresentation,
   sanitizeFilesDisabledPresentationText,
+  serializeFilesDisabledPresentation,
 } from "@/lib/files-disabled-presentation";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { normalizeTimestampMs } from '@/lib/time-utils';
@@ -169,7 +167,7 @@ function formatActionContent(value: unknown, filesDisabled = false): string {
     return '';
   }
   if (filesDisabled) {
-    return serializeFilesDisabledValue(value)
+    return serializeFilesDisabledPresentation(value)
   }
   if (typeof value === 'string') {
     return value;
@@ -855,7 +853,7 @@ const CopyButton = ({
   const handleCopy = (e: React.MouseEvent) => {
     e.stopPropagation();
     const text = filesDisabled
-      ? serializeFilesDisabledValue(value)
+      ? serializeFilesDisabledPresentation(value)
       : formatActionContent(value);
     navigator.clipboard.writeText(text);
     setCopied(true);
@@ -948,7 +946,7 @@ const ToolOutputDisplay = ({
 }) => {
   const displayOutput = useMemo(() => (
     filesDisabled && action.data.rawResult !== undefined
-      ? projectFilesDisabledToolResultOutput(action.data.rawResult)
+      ? projectFilesDisabledToolResultPresentation(action.data.rawResult)
       : action.data.output
   ), [action.data.output, action.data.rawResult, filesDisabled]);
 
@@ -969,7 +967,7 @@ const ToolOutputDisplay = ({
           <div className="p-3 bg-muted/30 border border-border/50 rounded-xl text-[10px] sm:text-xs overflow-x-auto">
             {typeof displayOutput === 'string' ? (
               <MarkdownRenderer
-                content={filesDisabled ? serializeFilesDisabledValue(displayOutput) : displayOutput}
+                content={filesDisabled ? serializeFilesDisabledPresentation(displayOutput) : displayOutput}
                 filesDisabled={filesDisabled}
                 onFileClick={onFileClick}
                 onAgentClick={onAgentClick}
@@ -978,7 +976,7 @@ const ToolOutputDisplay = ({
             ) : (
               <pre className="text-foreground/80 whitespace-pre-wrap break-all font-mono">
                 {filesDisabled
-                  ? serializeFilesDisabledValue(displayOutput)
+                  ? serializeFilesDisabledPresentation(displayOutput)
                   : JSON.stringify(displayOutput, null, 2)}
               </pre>
             )}
@@ -1020,7 +1018,7 @@ const PythonToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, 
     : action.data.code;
   const filePath = action.data.args?.file_path;
   const fileLabel = filesDisabled
-    ? getFilesDisabledFileLabel(action.data.args)
+    ? getFilesDisabledPresentationFileLabel(action.data.args)
     : filePath;
   return (
     <div className="pt-2">
@@ -1099,14 +1097,14 @@ const FileToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t,
   const { args, tool } = action.data;
   const filePath = args?.file_path || args?.path;
   const fileLabel = filesDisabled
-    ? getFilesDisabledFileLabel(args)
+    ? getFilesDisabledPresentationFileLabel(args)
     : filePath;
   const rawContent = args?.content || args?.text || args?.code;
   const content = filesDisabled
     ? formatActionContent(rawContent, true)
     : rawContent;
   const fallbackText = !content
-    ? (filesDisabled ? serializeFilesDisabledValue(args) : JSON.stringify(args, null, 2))
+    ? (filesDisabled ? serializeFilesDisabledPresentation(args) : JSON.stringify(args, null, 2))
     : undefined;
 
   return (
@@ -1155,7 +1153,7 @@ const FileToolRenderer = ({ action, filesDisabled, onOpenTerminal, isRunning, t,
 
 const DefaultToolRenderer = ({ action, filesDisabled, isRunning, t, onFileClick, onAgentClick }: any) => {
   const args = filesDisabled
-    ? serializeFilesDisabledValue(action.data.args)
+    ? serializeFilesDisabledPresentation(action.data.args)
     : JSON.stringify(action.data.args, null, 2);
   return (
     <div className="pt-2">
@@ -1288,7 +1286,7 @@ function StepActionItem({
 
       if (args && typeof args === 'object') {
         if ('file_path' in args || 'path' in args) {
-          const fileLabel = filesDisabled ? getFilesDisabledFileLabel(args) : (
+          const fileLabel = filesDisabled ? getFilesDisabledPresentationFileLabel(args) : (
             'file_path' in args ? String(args.file_path) : String(args.path)
           );
           return fileLabel ? `${t('traceEventRenderer.filePrefix')} ${fileLabel}` : null;
@@ -1304,7 +1302,7 @@ function StepActionItem({
       if (args) {
         try {
           const str = filesDisabled
-            ? serializeFilesDisabledValue(args)
+            ? serializeFilesDisabledPresentation(args)
             : JSON.stringify(args);
           return str.length > 50 ? str.slice(0, 50) + '...' : str;
         } catch (e) { return null; }
@@ -1647,7 +1645,7 @@ function StepItem({
         <div key={`${action.id}-summary`} className="ml-7 pr-2 text-sm">
           <MarkdownRenderer
             content={filesDisabled
-              ? serializeFilesDisabledValue(action.data.output)
+              ? serializeFilesDisabledPresentation(action.data.output)
               : String(action.data.output)}
             className="prose-sm leading-relaxed"
             filesDisabled={filesDisabled}

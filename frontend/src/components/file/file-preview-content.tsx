@@ -12,7 +12,7 @@ interface FilePreviewContentProps {
 }
 
 export function FilePreviewContent({ open }: FilePreviewContentProps) {
-  const { state, dispatch, getFilePreviewUrl } = useApp()
+  const { state, dispatch, filesDisabled, getFilePreviewUrl } = useApp()
   const fileAccess = useFileAccess()
   const { filePreview } = state
   const { t } = useI18n()
@@ -117,6 +117,7 @@ export function FilePreviewContent({ open }: FilePreviewContentProps) {
           isLoading={filePreview.isLoading}
           error={filePreview.error}
           viewMode={filePreview.viewMode}
+          filesDisabled={filesDisabled}
         />
       </div>
     </div>

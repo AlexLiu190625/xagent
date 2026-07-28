@@ -20,6 +20,8 @@ describe("files-disabled presentation", () => {
     expect(isManagedFileUrl("/api/files%2Fdownload/file-id")).toBe(true)
     expect(isManagedFileUrl("/%2561pi/files/public/preview/file-id")).toBe(true)
     expect(isManagedFileUrl("/%2Fapi%2Ffiles%2Fpublic%2Fpreview%2Ffile-id")).toBe(true)
+    expect(isManagedFileUrl("/api/files/preview-pdf/presentation-id")).toBe(true)
+    expect(isManagedFileUrl("https://app.example/api/files/preview-pdf/presentation-id")).toBe(true)
     expect(isManagedFileUrl("/api/files/%E0%A4%A")).toBe(true)
     expect(isManagedFileUrl("/%61pi/files/public/%70review/%ZZ/secret")).toBe(true)
     expect(isManagedFileUrl("/api/files/metadata/file-id")).toBe(false)
@@ -52,6 +54,14 @@ describe("files-disabled presentation", () => {
       "Open (/private/tenant/secret.txt), path=/private/tenant/config.json, workspace/draft.md, artifacts/chart.png, output/report.pdf, and uploads/input.csv; keep https://example.com/a/b and `and/or`.",
     )).toBe(
       "Open (secret.txt), path=config.json, draft.md, chart.png, report.pdf, and input.csv; keep https://example.com/a/b and `and/or`.",
+    )
+  })
+
+  it("redacts local paths after shell redirects and prose delimiters", () => {
+    expect(sanitizeFilesDisabledPresentationText(
+      "Write >/private/out.txt, 2>/private/error.txt, </private/input.txt, |/private/pipe.txt, :/private/colon.txt, &/private/and.txt, and !/private/bang.txt.",
+    )).toBe(
+      "Write >out.txt, 2>error.txt, <input.txt, |pipe.txt, :colon.txt, &and.txt, and !bang.txt.",
     )
   })
 
@@ -313,5 +323,45 @@ describe("files-disabled presentation", () => {
     expect(projectFilesDisabledPresentation(value)).toEqual({ artifacts: [{ file_name: "report.txt" }] })
     value.artifacts[0].file_name = "updated.txt"
     expect(projectFilesDisabledPresentation(value)).toEqual({ artifacts: [{ file_name: "updated.txt" }] })
+  })
+
+  it("projects cyclic records through the serializer without retaining file locations", () => {
+    const selfObject: Record<string, unknown> = {
+      file_path: "/private/tenant/object-secret.txt",
+      label: "object",
+    }
+    selfObject.self = selfObject
+
+    const selfArray: unknown[] = [
+      { output_dir: "/private/tenant/array-output", label: "array" },
+    ]
+    selfArray.push(selfArray)
+
+    const left: Record<string, unknown> = {
+      source_path: "/private/tenant/left-secret.txt",
+      label: "left",
+    }
+    const right: Record<string, unknown> = { label: "right", next: left }
+    left.next = right
+
+    const serialized = serializeFilesDisabledPresentation({ selfObject, selfArray, left })
+
+    expect(serialized).not.toContain("/private/")
+    expect(JSON.parse(serialized)).toEqual({
+      selfObject: { label: "object", self: "[Circular]" },
+      selfArray: [{ label: "array" }, "[Circular]"],
+      left: { label: "left", next: { label: "right", next: "[Circular]" } },
+    })
+  })
+
+  it("preserves generic link and src fields and rejects uppercase non-routes", () => {
+    const value = {
+      link: "https://business.example/invoices/42",
+      src: "https://cdn.example/image.png",
+      route: "/api/files/PREVIEW/does-not-exist",
+    }
+
+    expect(projectFilesDisabledPresentation(value)).toEqual(value)
+    expect(isManagedFileUrl(value.route)).toBe(false)
   })
 })

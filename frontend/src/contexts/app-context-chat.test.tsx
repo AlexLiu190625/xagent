@@ -2848,6 +2848,26 @@ describe("AppProvider websocket message routing", () => {
     window.removeEventListener("openFilePreview", previewListener)
   })
 
+  it("disables agent cards when Session files are disabled even if the transport requests cards", () => {
+    const transport = makeSessionTransport() as unknown as {
+      session: Record<string, unknown>
+    }
+    transport.session.agentCards = "enabled"
+
+    const { container } = render(
+      <AppProvider token="token" transport={transport as never}>
+        <SessionControlsProbe />
+        <MarkdownRenderer content="[Specialist](agent://42)" />
+      </AppProvider>,
+    )
+
+    expect(screen.getByTestId("files-disabled")).toHaveTextContent("true")
+    expect(screen.getByTestId("agent-cards-enabled")).toHaveTextContent("false")
+    expect(screen.getByText("Specialist")).not.toHaveAttribute("data-agent-id")
+    expect(container.querySelector("[data-agent-card-wrapper]")).toBeNull()
+    expect(apiRequestMock).not.toHaveBeenCalled()
+  })
+
   it("fails closed for agent cards when a malformed Session transport omits the capability", () => {
     const malformedTransport = makeSessionTransport() as unknown as {
       session: Record<string, unknown>

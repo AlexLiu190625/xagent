@@ -41,6 +41,7 @@ interface FileViewerProps {
   isLoading: boolean
   error: string | null
   viewMode: 'preview' | 'code'
+  filesDisabled?: boolean
 }
 
 function getFileExtension(fileName: string): string {
@@ -161,7 +162,8 @@ export function FileViewer({
   mimeType,
   isLoading,
   error,
-  viewMode
+  viewMode,
+  filesDisabled = false,
 }: FileViewerProps) {
   const { t } = useI18n()
   const fileAccess = useFileAccess()
@@ -345,7 +347,7 @@ export function FileViewer({
           </pre>
         ) : (
           <div className="p-6">
-            <MarkdownRenderer content={content || ''} />
+            <MarkdownRenderer content={content || ''} filesDisabled={filesDisabled} />
           </div>
         )
       ) : (

@@ -20,12 +20,15 @@ const AMBIGUOUS_FILE_LOCATION_KEYS = new Set(["path", "directory"])
 const LOCAL_PATH_CANDIDATE_START_PATTERN = String.raw`(?:/|~[\\/]|\.{1,2}[\\/]|[a-z]:[\\/]|\\{1,2}[^\\/]+[\\/]|(?:artifacts?|output|uploads?|workspace)(?:[\\/]|$))`
 const EXPLICIT_LOCAL_PATH_RE = /^(?:~[\\/]|\.{1,2}[\\/]|[a-z]:[\\/]|\\{1,2}[^\\/]+[\\/]|(?:artifacts?|output|uploads?|workspace)(?:[\\/]|$))/i
 const LOCAL_POSIX_ROOT_RE = /^\/(?:app|data|etc|home|mnt|opt|private|raw|root|sandbox|srv|tmp|users|var|workspace)(?:[\\/]|$)/i
-const UNQUOTED_PATH_PREFIX_PATTERN = "(^|[\\s\"'([{=,;])"
+// Shell redirects and prose separators are token boundaries, while ordinary
+// slash-delimited text remains outside this deliberately narrow grammar.
+const UNQUOTED_PATH_PREFIX_PATTERN = "(^|[\\s\"'([{=,;<>|:&!])"
 const UNQUOTED_PATH_SUFFIX_PATTERN = "[^\\s\"'`<>),;]*"
 const BARE_FILE_URI_RE = /\bfile:[^\s<>"'`]+/gi
 const MANAGED_FILE_PATH_PREFIX_RE = /^\/api\/files(?:\/|$)/
-const MANAGED_FILE_ROUTE_RE = /^\/api\/files(?:\/public)?\/(?:preview|download)(?:\/|$)/
+const MANAGED_FILE_ROUTE_RE = /^\/api\/files(?:\/public)?\/(?:preview-pdf|preview|download)(?:\/|$)/
 const MAX_MANAGED_PATH_DECODES = 2
+const CIRCULAR_PRESENTATION_SENTINEL = "[Circular]"
 
 const isRecord = (value: unknown): value is Record<string, unknown> => (
   typeof value === "object" && value !== null && !Array.isArray(value)
@@ -93,22 +96,35 @@ const rawFileLabel = (value: Record<string, unknown>): string | null => {
 
 const collectKnownLocalPaths = (value: unknown): Map<string, string> => {
   const paths = new Map<string, string>()
+  const visiting = new WeakSet<object>()
   const visit = (item: unknown, fileRecordContext = false): void => {
     if (Array.isArray(item)) {
-      item.forEach((child) => visit(child, fileRecordContext))
+      if (visiting.has(item)) return
+      visiting.add(item)
+      try {
+        item.forEach((child) => visit(child, fileRecordContext))
+      } finally {
+        visiting.delete(item)
+      }
       return
     }
     if (!isRecord(item)) return
-    const label = rawFileLabel(item)
-    for (const [key, child] of Object.entries(item)) {
-      if (isLocalFileLocationKey(key, item, fileRecordContext) && typeof child === "string" && child.trim()) {
-        const fallback = basename(child)
-        if (label || fallback) {
-          const root = normalizeKnownLocalRoot(child.trim())
-          paths.set(root, label ?? fallback ?? root)
+    if (visiting.has(item)) return
+    visiting.add(item)
+    try {
+      const label = rawFileLabel(item)
+      for (const [key, child] of Object.entries(item)) {
+        if (isLocalFileLocationKey(key, item, fileRecordContext) && typeof child === "string" && child.trim()) {
+          const fallback = basename(child)
+          if (label || fallback) {
+            const root = normalizeKnownLocalRoot(child.trim())
+            paths.set(root, label ?? fallback ?? root)
+          }
         }
+        visit(child, fileRecordContext || FILE_RECORD_COLLECTION_KEYS.has(normalizeKey(key)))
       }
-      visit(child, fileRecordContext || FILE_RECORD_COLLECTION_KEYS.has(normalizeKey(key)))
+    } finally {
+      visiting.delete(item)
     }
   }
   visit(value)
@@ -441,7 +457,8 @@ const projectWithPaths = (
   value: unknown,
   knownPaths: Map<string, string>,
   fileRecordContext = false,
-  memo = new WeakMap<object, Record<string, unknown>>(),
+  memo = new WeakMap<object, Map<boolean, unknown>>(),
+  visiting = new WeakSet<object>(),
 ): unknown => {
   if (typeof value === "string") {
     return replaceKnownLocalPaths(
@@ -450,37 +467,58 @@ const projectWithPaths = (
     )
   }
   if (Array.isArray(value)) {
-    const cacheKey = String(fileRecordContext)
-    const cached = memo.get(value)?.[cacheKey]
-    if (cached !== undefined) return cached
-    const projected = value.map((item) => projectWithPaths(item, knownPaths, fileRecordContext, memo))
-    memo.set(value, { ...memo.get(value), [cacheKey]: projected })
-    return projected
+    const cached = memo.get(value)
+    if (cached?.has(fileRecordContext)) return cached.get(fileRecordContext)
+    if (visiting.has(value)) return CIRCULAR_PRESENTATION_SENTINEL
+    visiting.add(value)
+    try {
+      const projected = value.map((item) => projectWithPaths(
+        item,
+        knownPaths,
+        fileRecordContext,
+        memo,
+        visiting,
+      ))
+      const nextCached = cached ?? new Map<boolean, unknown>()
+      nextCached.set(fileRecordContext, projected)
+      memo.set(value, nextCached)
+      return projected
+    } finally {
+      visiting.delete(value)
+    }
   }
   if (!isRecord(value)) return value
-  const cacheKey = String(fileRecordContext)
-  const cached = memo.get(value)?.[cacheKey]
-  if (cached !== undefined) return cached
-  const strongFileIdentity = hasStrongFileIdentity(value)
-  const hasLocalFileEvidence = Object.entries(value).some(([key]) => (
-    isLocalFileLocationKey(key, value, fileRecordContext)
-  ))
-  const projected = Object.fromEntries(Object.entries(value).flatMap(([key, child]) => {
-    const normalized = normalizeKey(key)
-    if (isFileIdKey(normalized) || isFileAccessKey(normalized) || isLocalFileLocationKey(normalized, value, fileRecordContext)) return []
-    if (strongFileIdentity && GENERIC_IDENTITY_AND_LOCATION_KEYS.has(normalized)) return []
-    if ((isStrongFileNameKey(normalized) || (strongFileIdentity && normalized === "name")) && typeof child === "string") {
-      return [[key, basename(child) ?? child]]
-    }
-    return [[key, projectWithPaths(
-      child,
-      knownPaths,
-      fileRecordContext || strongFileIdentity || hasLocalFileEvidence || FILE_RECORD_COLLECTION_KEYS.has(normalized),
-      memo,
-    )]]
-  }))
-  memo.set(value, { ...memo.get(value), [cacheKey]: projected })
-  return projected
+  const cached = memo.get(value)
+  if (cached?.has(fileRecordContext)) return cached.get(fileRecordContext)
+  if (visiting.has(value)) return CIRCULAR_PRESENTATION_SENTINEL
+  visiting.add(value)
+  try {
+    const strongFileIdentity = hasStrongFileIdentity(value)
+    const hasLocalFileEvidence = Object.entries(value).some(([key]) => (
+      isLocalFileLocationKey(key, value, fileRecordContext)
+    ))
+    const projected = Object.fromEntries(Object.entries(value).flatMap(([key, child]) => {
+      const normalized = normalizeKey(key)
+      if (isFileIdKey(normalized) || isFileAccessKey(normalized) || isLocalFileLocationKey(normalized, value, fileRecordContext)) return []
+      if (strongFileIdentity && GENERIC_IDENTITY_AND_LOCATION_KEYS.has(normalized)) return []
+      if ((isStrongFileNameKey(normalized) || (strongFileIdentity && normalized === "name")) && typeof child === "string") {
+        return [[key, basename(child) ?? child]]
+      }
+      return [[key, projectWithPaths(
+        child,
+        knownPaths,
+        fileRecordContext || strongFileIdentity || hasLocalFileEvidence || FILE_RECORD_COLLECTION_KEYS.has(normalized),
+        memo,
+        visiting,
+      )]]
+    }))
+    const nextCached = cached ?? new Map<boolean, unknown>()
+    nextCached.set(fileRecordContext, projected)
+    memo.set(value, nextCached)
+    return projected
+  } finally {
+    visiting.delete(value)
+  }
 }
 
 export function projectFilesDisabledPresentation(value: unknown): unknown {
@@ -506,17 +544,31 @@ export function getFilesDisabledPresentationFileLabel(value: unknown): string | 
   return rawFileLabel(projected)
 }
 
-const hasPresentationEvidence = (value: unknown): boolean => {
-  if (Array.isArray(value)) return value.some(hasPresentationEvidence)
+const hasPresentationEvidence = (value: unknown, visiting = new WeakSet<object>()): boolean => {
+  if (Array.isArray(value)) {
+    if (visiting.has(value)) return false
+    visiting.add(value)
+    try {
+      return value.some((item) => hasPresentationEvidence(item, visiting))
+    } finally {
+      visiting.delete(value)
+    }
+  }
   if (!isRecord(value)) return false
-  const strongIdentity = hasStrongFileIdentity(value)
-  return Object.entries(value).some(([key, child]) => (
-    isFileIdKey(key)
-    || isFileAccessKey(key)
-    || isLocalFileLocationKey(key, value)
-    || (strongIdentity && GENERIC_IDENTITY_AND_LOCATION_KEYS.has(normalizeKey(key)))
-    || hasPresentationEvidence(child)
-  ))
+  if (visiting.has(value)) return false
+  visiting.add(value)
+  try {
+    const strongIdentity = hasStrongFileIdentity(value)
+    return Object.entries(value).some(([key, child]) => (
+      isFileIdKey(key)
+      || isFileAccessKey(key)
+      || isLocalFileLocationKey(key, value)
+      || (strongIdentity && GENERIC_IDENTITY_AND_LOCATION_KEYS.has(normalizeKey(key)))
+      || hasPresentationEvidence(child, visiting)
+    ))
+  } finally {
+    visiting.delete(value)
+  }
 }
 
 export function serializeFilesDisabledPresentation(value: unknown): string {

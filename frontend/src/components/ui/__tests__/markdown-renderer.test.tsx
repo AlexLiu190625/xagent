@@ -51,14 +51,13 @@ vi.mock('@/contexts/i18n-context', () => ({
   }),
 }))
 
-import {
-  getFilesDisabledFileLabel,
-  JsonRenderer,
-  MarkdownRenderer,
-  projectFilesDisabledValue,
-  sanitizeFilesDisabledText,
-} from '../markdown-renderer'
+import { JsonRenderer, MarkdownRenderer } from '../markdown-renderer'
 import { AgentCardPresentationCapability } from '@/contexts/presentation-capabilities'
+import {
+  getFilesDisabledPresentationFileLabel,
+  projectFilesDisabledPresentation,
+  sanitizeFilesDisabledPresentationText,
+} from '@/lib/files-disabled-presentation'
 
 describe('MarkdownRenderer', () => {
   beforeEach(() => {
@@ -66,14 +65,14 @@ describe('MarkdownRenderer', () => {
   })
 
   it('retains snake-case filenames as the safe label for file records', () => {
-    expect(getFilesDisabledFileLabel({
+    expect(getFilesDisabledPresentationFileLabel({
       file_path: '/private/report.pdf',
       file_name: 'report.pdf',
     })).toBe('report.pdf')
   })
 
   it('preserves unrelated backtick URLs while inertizing file references', () => {
-    expect(sanitizeFilesDisabledText(
+    expect(sanitizeFilesDisabledPresentationText(
       'Call `https://api.example/tasks/42` then [open report](file:secret-id).',
     )).toBe(
       'Call `https://api.example/tasks/42` then open report.',
@@ -81,7 +80,7 @@ describe('MarkdownRenderer', () => {
   })
 
   it('removes producer-shaped local path fields without erasing sibling business identity', () => {
-    expect(projectFilesDisabledValue({
+    expect(projectFilesDisabledPresentation({
       success: true,
       id: 'workspace-id',
       url: 'https://api.example/workspaces/workspace-id',
@@ -128,7 +127,7 @@ describe('MarkdownRenderer', () => {
       },
     }
 
-    expect(projectFilesDisabledValue(connectorResult)).toEqual({
+    expect(projectFilesDisabledPresentation(connectorResult)).toEqual({
       ...connectorResult,
       preview: {
         id: 'invoice-42',
@@ -139,7 +138,7 @@ describe('MarkdownRenderer', () => {
   })
 
   it('removes local path fields emitted by current workspace, media, and document tools', () => {
-    const projected = projectFilesDisabledValue({
+    const projected = projectFilesDisabledPresentation({
       audio_path: '/private/output/audio.mp3',
       videoPath: '/private/output/video.mp4',
       translation_path: '/private/output/translation.json',
@@ -169,7 +168,7 @@ describe('MarkdownRenderer', () => {
   })
 
   it('removes all file identities and the HTML source from prepared asset results', () => {
-    expect(projectFilesDisabledValue({
+    expect(projectFilesDisabledPresentation({
       success: true,
       source_file_id: 'source-file-id',
       assetFileID: 'asset-file-id',
@@ -281,6 +280,19 @@ describe('MarkdownRenderer', () => {
     fireEvent.click(screen.getByText('report.docx'))
     fireEvent.click(screen.getByText('generated image'))
     expect(handleFileClick).not.toHaveBeenCalled()
+  })
+
+  it('disables agent cards whenever files are disabled, including an explicit card capability', () => {
+    render(
+      <MarkdownRenderer
+        filesDisabled
+        agentCardsEnabled
+        content="[Specialist](agent://42)"
+      />,
+    )
+
+    expect(screen.getByText('Specialist')).not.toHaveAttribute('data-agent-id')
+    expect(apiRequestMock).not.toHaveBeenCalled()
   })
 
   it('keeps managed app URLs inert and avoids agent-card REST calls when their capabilities are disabled', () => {

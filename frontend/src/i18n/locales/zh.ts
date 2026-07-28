@@ -3327,7 +3327,6 @@ const zh = {
     previewFile: "预览文件",
     filePrefix: "文件:",
     queryPrefix: "查询:",
-    pathPrefix: "路径:",
     bashPrefix: "Bash命令:",
     searchPrefix: "搜索:",
     workforceDelegation: "Workforce 委派",

@@ -9,7 +9,10 @@ import { ReplayScheduler } from '@/lib/replay-scheduler'
 import { CollapsibleSection } from "@/components/collapsible-section"
 import { Badge } from "@/components/ui/badge"
 import { ClarificationForm } from "@/components/chat/clarification-form"
-import { AgentCardPresentationCapability } from "@/contexts/presentation-capabilities"
+import {
+  AgentCardPresentationCapability,
+  resolveAgentCardPresentationCapability,
+} from "@/contexts/presentation-capabilities"
 import {
   FileAccessProvider,
   type FileAccessPolicy,
@@ -1647,10 +1650,14 @@ export function AppProvider({
     sessionTransport?.files,
     transport?.capabilities?.files,
   )
-  const agentCardsEnabled = resolveTransportCapability(
+  const requestedAgentCardsEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.agentCards,
     transport?.capabilities?.agentCards,
+  )
+  const agentCardsEnabled = resolveAgentCardPresentationCapability(
+    filesDisabled,
+    requestedAgentCardsEnabled,
   )
   const voiceInputEnabled = resolveTransportCapability(
     sessionTransport,

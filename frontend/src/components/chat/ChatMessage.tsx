@@ -5,11 +5,11 @@ import { cn } from "@/lib/utils";
 import { TraceEventRenderer, type AgentExecutionSummary } from "./TraceEventRenderer";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
+import { MarkdownRenderer } from "@/components/ui/markdown-renderer";
 import {
-  MarkdownRenderer,
-  sanitizeFilesDisabledText,
-  serializeFilesDisabledValue,
-} from "@/components/ui/markdown-renderer";
+  sanitizeFilesDisabledPresentationText,
+  serializeFilesDisabledPresentation,
+} from "@/lib/files-disabled-presentation";
 import { Button } from "@/components/ui/button";
 import { normalizeTimestampMs } from "@/lib/time-utils";
 import { FileChip } from "./FileChip";
@@ -180,7 +180,7 @@ function ExpandableMessage({
   if (!content) return null;
 
   if (filesDisabled) {
-    const inertContent = sanitizeFilesDisabledText(content);
+    const inertContent = sanitizeFilesDisabledPresentationText(content);
     return (
       <div className="relative max-w-full min-w-0">
         <div className="max-w-full min-w-0 text-sm leading-relaxed whitespace-pre-wrap break-words [overflow-wrap:anywhere] py-[2px]">
@@ -384,7 +384,7 @@ export function ChatMessage({
     ? failedMessageText
     : typeof content === "string" ? content : rawContent;
   const displayCopyableContent = filesDisabled && copyableContent
-    ? serializeFilesDisabledValue(copyableContent)
+    ? serializeFilesDisabledPresentation(copyableContent)
     : copyableContent;
 
   const handleCopy = () => {

@@ -17,7 +17,14 @@ interface FilePreviewDialogProps {
 }
 
 export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps) {
-  const { state, dispatch, switchFilePreview, getFilePreviewUrl, getFileDownloadUrl } = useApp()
+  const {
+    state,
+    dispatch,
+    filesDisabled,
+    switchFilePreview,
+    getFilePreviewUrl,
+    getFileDownloadUrl,
+  } = useApp()
   const fileAccess = useFileAccess()
   const { filePreview } = state
   const [viewMode, setViewMode] = useState<'preview' | 'code'>('preview')
@@ -269,6 +276,7 @@ export function FilePreviewDialog({ open, onOpenChange }: FilePreviewDialogProps
               isLoading={filePreview.isLoading}
               error={filePreview.error}
               viewMode={viewMode}
+              filesDisabled={filesDisabled}
             />
           </div>
         </div>

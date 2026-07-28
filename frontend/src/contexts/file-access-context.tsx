@@ -80,6 +80,8 @@ const appendPublicToken = (url: string, accessToken: string): string => {
  * The public widget/share provider owns this capability. Its access token is
  * captured by the provider instance, never read from browser storage, and is
  * only attached to the file routes that need public guest authorization.
+ * Browser media loads cannot attach an Authorization header, so the query
+ * token stays scoped to those public routes rather than becoming ambient auth.
  */
 export function createPublicFileAccessPolicy(accessToken: string): FileAccessPolicy {
   const publicUrl = (path: string) => appendPublicToken(buildUrl(path), accessToken)
