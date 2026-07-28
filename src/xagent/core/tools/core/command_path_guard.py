@@ -515,6 +515,8 @@ class _BashInvocation:
     initialization_files: tuple[str, ...]
     command_text: str | None = None
     script: str | None = None
+    reads_stdin: bool = False
+    lists_options: bool = False
 
 
 _COMMAND_WRAPPER_GRAMMARS = {
@@ -1281,6 +1283,14 @@ class WorkspaceCommandPathGuard:
         if invocation.command_text is not None:
             self._validate_shell_states(invocation.command_text, state)
             return
+        if invocation.reads_stdin:
+            listing_context = (
+                " after listing options" if invocation.lists_options else ""
+            )
+            raise CommandPolicyViolation(
+                f"cannot inspect {command_name} input without command text or a script"
+                f"{listing_context}"
+            )
         if invocation.script is None:
             raise CommandPolicyViolation(
                 f"cannot inspect {command_name} input without command text or a script"
@@ -1304,6 +1314,7 @@ class WorkspaceCommandPathGuard:
                 return _BashInvocation(
                     initialization_files=tuple(initialization_files),
                     script=values[index] if index < len(values) else None,
+                    reads_stdin=index >= len(values),
                 )
             if value in _BASH_FILE_OPTIONS:
                 index += 1
@@ -1329,7 +1340,10 @@ class WorkspaceCommandPathGuard:
                     f"cannot safely inspect bash option {value}"
                 )
             if value == "-":
-                return _BashInvocation(initialization_files=tuple(initialization_files))
+                return _BashInvocation(
+                    initialization_files=tuple(initialization_files),
+                    reads_stdin=True,
+                )
             if value.startswith(("-", "+")) and len(value) > 1:
                 named_option_count = 0
                 has_command_text = False
@@ -1349,8 +1363,10 @@ class WorkspaceCommandPathGuard:
                 index += 1
                 for _ in range(named_option_count):
                     if index >= len(values):
-                        raise CommandPolicyViolation(
-                            f"missing bash argument for {value}"
+                        return _BashInvocation(
+                            initialization_files=tuple(initialization_files),
+                            reads_stdin=True,
+                            lists_options=True,
                         )
                     argument = values[index]
                     if isinstance(argument, _CommandValue) and not argument.is_static:
@@ -1377,14 +1393,18 @@ class WorkspaceCommandPathGuard:
                     )
                 if stdin_mode:
                     return _BashInvocation(
-                        initialization_files=tuple(initialization_files)
+                        initialization_files=tuple(initialization_files),
+                        reads_stdin=True,
                     )
                 continue
             return _BashInvocation(
                 initialization_files=tuple(initialization_files),
                 script=value,
             )
-        return _BashInvocation(initialization_files=tuple(initialization_files))
+        return _BashInvocation(
+            initialization_files=tuple(initialization_files),
+            reads_stdin=True,
+        )
 
     def _check_sourced_shell(
         self,

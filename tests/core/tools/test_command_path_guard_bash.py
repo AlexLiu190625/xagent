@@ -3,6 +3,7 @@
 import os
 import shlex
 import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -13,6 +14,7 @@ from xagent.core.tools.core.command_path_guard import WorkspaceCommandPathGuard
 from xagent.core.tools.core.command_policy import (
     CommandPathViolation,
     CommandPolicyViolation,
+    resolve_trusted_executable,
 )
 from xagent.core.workspace import TaskWorkspace
 
@@ -64,6 +66,14 @@ def _guarded_tool(workspace):
 def _write_comment_script_bytes(path, size):
     prefix = b"#"
     path.write_bytes(prefix + (b"x" * (size - len(prefix))))
+
+
+@pytest.fixture(scope="module")
+def trusted_bash_executable():
+    try:
+        return resolve_trusted_executable("bash")
+    except CommandPolicyViolation:
+        pytest.skip("trusted Bash is unavailable")
 
 
 class TestScopedCommandPathGuardBash:
@@ -736,14 +746,180 @@ class TestScopedCommandPathGuardBash:
         guard.validate(f"bash {option} {option_value} -c 'printf safe'")
 
     @pytest.mark.parametrize(
+        ("case", "expected_markers"),
+        [
+            ("minus-o", {"command"}),
+            ("plus-o", {"command"}),
+            ("minus-O", {"command"}),
+            ("plus-O", {"command"}),
+            ("short-cluster", {"command"}),
+            ("stdin", {"stdin"}),
+            ("file-option", {"init", "command"}),
+            ("terminator", {"script"}),
+            ("command-text", {"command"}),
+            ("bare-minus-o", {"listing", "stdin"}),
+            ("bare-plus-o", {"listing", "stdin"}),
+            ("bare-minus-O", {"listing", "stdin"}),
+            ("bare-plus-O", {"listing", "stdin"}),
+            ("bare-minus-xo", {"listing", "stdin"}),
+            ("bare-plus-xO", {"listing", "stdin"}),
+        ],
+    )
+    def test_trusted_bash_invocation_outcome_matrix(
+        self,
+        scoped_command_workspace,
+        trusted_bash_executable,
+        case,
+        expected_markers,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        markers = {
+            "command": "__COMMAND_MARKER__",
+            "init": "__INIT_MARKER__",
+            "script": "__SCRIPT_MARKER__",
+            "stdin": "__STDIN_MARKER__",
+        }
+        script = workspace.output_dir / "-policy-script"
+        script.write_text(
+            f"printf %s {markers['script']}\n",
+            encoding="utf-8",
+        )
+        init_file = workspace.output_dir / "policy.rc"
+        init_file.write_text(
+            f"printf %s {markers['init']}\n",
+            encoding="utf-8",
+        )
+        named_options = {
+            "minus-o": ["-o", "posix"],
+            "plus-o": ["+o", "posix"],
+            "minus-O": ["-O", "extglob"],
+            "plus-O": ["+O", "extglob"],
+        }
+        if case in named_options:
+            arguments = [
+                *named_options[case],
+                "-c",
+                f"printf %s {markers['command']}",
+            ]
+            stdin = ""
+        elif case == "short-cluster":
+            arguments = ["-xc", f"printf %s {markers['command']}"]
+            stdin = ""
+        elif case == "stdin":
+            arguments = ["-s"]
+            stdin = f"printf %s {markers['stdin']}"
+        elif case == "file-option":
+            arguments = [
+                "--rcfile",
+                str(init_file),
+                "-i",
+                "-c",
+                f"printf %s {markers['command']}",
+            ]
+            stdin = ""
+        elif case == "terminator":
+            arguments = ["--", script.name]
+            stdin = ""
+        elif case == "command-text":
+            arguments = ["-c", f"printf %s {markers['command']}"]
+            stdin = ""
+        else:
+            arguments = [
+                {
+                    "bare-minus-o": "-o",
+                    "bare-plus-o": "+o",
+                    "bare-minus-O": "-O",
+                    "bare-plus-O": "+O",
+                    "bare-minus-xo": "-xo",
+                    "bare-plus-xO": "+xO",
+                }[case]
+            ]
+            stdin = f"printf %s {markers['stdin']}"
+
+        environment = os.environ.copy()
+        for name in command_path_guard_module._IMPLICIT_SHELL_ENVIRONMENT:
+            environment.pop(name, None)
+        completed = subprocess.run(
+            [str(trusted_bash_executable), *arguments],
+            cwd=workspace.output_dir,
+            env=environment,
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+
+        assert completed.returncode == 0
+        for outcome, marker in markers.items():
+            if outcome in expected_markers:
+                assert marker in completed.stdout
+            else:
+                assert marker not in completed.stdout
+        if "listing" in expected_markers:
+            assert completed.stdout.index(markers["stdin"]) > 0
+
+        guard = WorkspaceCommandPathGuard(workspace)
+        if expected_markers == {"stdin"} or "listing" in expected_markers:
+            with pytest.raises(
+                CommandPolicyViolation,
+                match="without command text or a script",
+            ):
+                guard.validate_argv(["bash", *arguments])
+        else:
+            guard.validate_argv(["bash", *arguments])
+
+    @pytest.mark.parametrize("option", ["-o", "+o", "-O", "+O", "-xo", "+xO"])
+    def test_bare_bash_named_option_listing_remains_stdin_fed_and_rejected(
+        self,
+        scoped_command_workspace,
+        option,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="without command text or a script",
+        ):
+            guard.validate(f"bash {option}")
+
+    def test_guarded_executor_runs_named_bash_option_value_once(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        executor = _guarded_executor(workspace)
+
+        result = executor.execute_command(
+            ["bash", "-o", "posix", "-c", "printf %s __COMMAND_MARKER__"],
+            shell=False,
+        )
+
+        assert result["return_code"] == 0
+        assert result["output"] == "__COMMAND_MARKER__"
+
+    @pytest.mark.parametrize("option", ["-o", "+o", "-O", "+O"])
+    def test_guarded_executor_rejects_bare_bash_named_option_as_stdin_fed(
+        self,
+        scoped_command_workspace,
+        caplog,
+        option,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        executor = _guarded_executor(workspace)
+
+        result = executor.execute_command(["bash", option], shell=False)
+
+        assert result["return_code"] == 126
+        assert result["error"].endswith("command denied by policy")
+        assert "without command text or a script" in caplog.text
+        assert "missing bash argument" not in caplog.text
+
+    @pytest.mark.parametrize(
         "command",
         [
             "bash --rcfile",
             "bash --init-file",
-            "bash -o",
-            "bash +o",
-            "bash -O",
-            "bash +O",
             "bash -c",
         ],
     )
