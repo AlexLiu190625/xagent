@@ -199,24 +199,35 @@ def _get_or_create_watch_state(
 
 
 def _ensure_topic(publisher: Any, topic_path: str) -> None:
+    """Create the topic and grant the Gmail push identity permission to publish.
+
+    IAM failures are never swallowed. The caller marks the watch ``ACTIVE`` on
+    return, so a swallowed ``get_iam_policy``/``set_iam_policy`` failure would
+    record success on a topic Gmail may be unable to publish to — the trigger
+    would silently never fire. Letting the failure propagate lands the watch in
+    ``FAILED`` for the retry sweep instead, matching ``_sync_push_config``.
+    Unlike ``_sync_push_config``, the read cannot fall through to an
+    unconditional write:
+    granting the role is a read-modify-write of the policy, so a failed read
+    must propagate as well.
+    """
     try:
         publisher.create_topic(request={"name": topic_path})
     except Exception as exc:
         if not _is_already_exists(exc):
             raise
     # Gmail publishes watch notifications as this Google-owned identity.
-    try:
-        policy = publisher.get_iam_policy(request={"resource": topic_path})
-        member = f"serviceAccount:{GMAIL_PUSH_PUBLISHER}"
-        for binding in policy.bindings:
-            if binding.role == "roles/pubsub.publisher" and member in binding.members:
+    policy = publisher.get_iam_policy(request={"resource": topic_path})
+    member = f"serviceAccount:{GMAIL_PUSH_PUBLISHER}"
+    for binding in policy.bindings:
+        if binding.role == "roles/pubsub.publisher":
+            if member in binding.members:
                 return
+            binding.members.append(member)
+            break
+    else:
         policy.bindings.add(role="roles/pubsub.publisher", members=[member])
-        publisher.set_iam_policy(request={"resource": topic_path, "policy": policy})
-    except Exception as exc:
-        logger.warning(
-            "Could not verify Gmail publish permission on %s: %s", topic_path, exc
-        )
+    publisher.set_iam_policy(request={"resource": topic_path, "policy": policy})
 
 
 def _ensure_push_subscription(

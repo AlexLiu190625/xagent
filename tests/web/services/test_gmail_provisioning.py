@@ -19,6 +19,7 @@ from xagent.web.models.trigger import (
 from xagent.web.models.user import User
 from xagent.web.models.user_oauth import UserOAuth
 from xagent.web.services.gmail_provisioning import (
+    GMAIL_PUSH_PUBLISHER,
     ensure_gmail_mailbox_provisioned,
     gmail_subscription_path,
     gmail_topic_path,
@@ -889,6 +890,86 @@ def test_patch_failure_marks_failed_not_active(
     # The persisted audience must not have advanced to the un-synced value.
     assert second.push_audience == old_audience
     assert "api-v2.example.com" not in str(second.push_audience)
+
+
+class GetIamPolicyFailsFakePublisher(FakePublisher):
+    """Topic whose IAM policy cannot be read."""
+
+    def get_iam_policy(self, *, request: dict[str, str]) -> FakePolicy:
+        raise RuntimeError("pubsub get_iam_policy unavailable")
+
+
+class SetIamPolicyFailsFakePublisher(FakePublisher):
+    """Topic whose IAM policy cannot be written."""
+
+    def set_iam_policy(self, *, request: dict[str, Any]) -> None:
+        raise RuntimeError("pubsub set_iam_policy unavailable")
+
+
+@pytest.mark.parametrize(
+    ("publisher_cls", "expected_error"),
+    [
+        (GetIamPolicyFailsFakePublisher, "pubsub get_iam_policy unavailable"),
+        (SetIamPolicyFailsFakePublisher, "pubsub set_iam_policy unavailable"),
+    ],
+)
+def test_iam_policy_failure_marks_failed_not_active(
+    db_session: Session,
+    publisher_cls: type[FakePublisher],
+    expected_error: str,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    gmail = FakeGmailService()
+
+    # If the roles/pubsub.publisher grant for the Gmail push identity cannot
+    # be verified or applied, Gmail may be unable to publish to the topic and
+    # the trigger would silently never fire. The failure must propagate so the
+    # watch lands FAILED for the retry sweep instead of recording ACTIVE.
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: gmail,
+        publisher_factory=lambda: publisher_cls(),
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert state.status == TriggerProvisioningStatus.FAILED.value
+    assert expected_error in str(state.last_error)
+    # Provisioning must stop at the IAM failure: no watch was registered.
+    assert gmail.watch_calls == []
+
+
+def test_iam_grant_appends_to_existing_publisher_binding(
+    db_session: Session,
+) -> None:
+    user = _create_user(db_session)
+    account = _create_oauth(db_session, user)
+    publisher = FakePublisher()
+    topic_path = gmail_topic_path("demo-project", "owner@gmail.example")
+    existing_policy = FakePolicy()
+    existing_policy.bindings.add(
+        role="roles/pubsub.publisher", members=["serviceAccount:other@example.iam"]
+    )
+    publisher.policies[topic_path] = existing_policy
+
+    state = ensure_gmail_mailbox_provisioned(
+        db_session,
+        account,
+        service_factory=lambda _db, _account: FakeGmailService(),
+        publisher_factory=lambda: publisher,
+        subscriber_factory=lambda: FakeSubscriber(),
+    )
+
+    assert state.status == TriggerProvisioningStatus.ACTIVE.value
+    # The Gmail push identity joins the existing roles/pubsub.publisher
+    # binding instead of creating a duplicate binding for the same role.
+    bindings = publisher.policies[topic_path].bindings
+    assert len(bindings) == 1
+    assert bindings[0].members == [
+        "serviceAccount:other@example.iam",
+        f"serviceAccount:{GMAIL_PUSH_PUBLISHER}",
+    ]
 
 
 def test_renewal_scan_uses_per_mailbox_provisioning_when_project_configured(
