@@ -104,6 +104,10 @@ class _AbortableFailingPrepareConfig(_FailingPrepareConfig):
         self._calls.append("handoff")
 
 
+class _CleanupBaseException(BaseException):
+    pass
+
+
 @pytest.mark.asyncio
 async def test_shared_cleanup_surfaces_a_stable_boundary_error_after_success():
     cleanup_fault = ValueError("private cleanup detail")
@@ -121,6 +125,25 @@ async def test_shared_cleanup_surfaces_a_stable_boundary_error_after_success():
 
     assert str(caught.value) == "Tool runtime cleanup could not be completed."
     assert caught.value.__cause__ is cleanup_fault
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_fault", [SystemExit("exit"), _CleanupBaseException()])
+async def test_shared_cleanup_preserves_successful_body_base_exception_identity(
+    cleanup_fault,
+):
+    async def body() -> None:
+        return None
+
+    def cleanup() -> None:
+        raise cleanup_fault
+
+    with pytest.raises(type(cleanup_fault)) as caught:
+        await run_with_tool_runtime_cleanup(
+            body, cleanup, logger=logging.getLogger(__name__)
+        )
+
+    assert caught.value is cleanup_fault
 
 
 @pytest.mark.asyncio
@@ -378,6 +401,64 @@ async def test_real_prepare_then_build_failure_aborts_without_retaining_runtime(
         assert config.request is None
         assert config._user is None
         assert engine.pool.checkedout() == 0
+    finally:
+        live_db.close()
+        config.close()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_partial_prepare_base_exception_uses_real_abort_not_handoff(
+    monkeypatch, tmp_path
+):
+    from xagent.web.models.tool_config import ToolConfig
+    from xagent.web.tools.config import WebToolConfig
+
+    class PrepareFailure(BaseException):
+        pass
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'partial-prepare-abort.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    live_db = factory()
+    request = object()
+    user = object()
+    config = WebToolConfig(
+        db=live_db,
+        db_factory=factory,
+        request=request,
+        user=user,
+        user_id=1,
+    )
+    partial_snapshot = object()
+    primary = PrepareFailure()
+    handoff_calls: list[str] = []
+
+    async def partial_prepare(candidate):
+        candidate._factory_runtime_snapshot = partial_snapshot
+        raise primary
+
+    def unexpected_handoff(_candidate):
+        handoff_calls.append("handoff")
+
+    monkeypatch.setattr(WebToolConfig, "prepare_factory_runtime", partial_prepare)
+    monkeypatch.setattr(WebToolConfig, "handoff_factory_runtime", unexpected_handoff)
+    try:
+        with pytest.raises(PrepareFailure) as caught:
+            await ToolFactory.create_all_tools(config)
+
+        assert caught.value is primary
+        assert handoff_calls == []
+        assert config._factory_runtime_snapshot is None
+        assert config._live_db is None
+        assert config.request is None
+        assert config._user is None
     finally:
         live_db.close()
         config.close()

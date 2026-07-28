@@ -1883,9 +1883,6 @@ class WebToolConfig(BaseToolConfig):
         self._live_db = None
         self.request = None
         self._user = None
-        self._live_db = None
-        self.request = None
-        self._user = None
 
     async def refresh_runtime_policy(self) -> None:
         """Refresh only detached per-turn policy before signature comparison."""

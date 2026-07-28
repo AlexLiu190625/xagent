@@ -55,9 +55,12 @@ async def run_with_tool_runtime_cleanup(
         try:
             cleanup()
         except BaseException as cleanup_error:
-            if primary_error is None:
+            if primary_error is not None:
+                logger.error(cleanup_error_message, exc_info=True)
+            elif isinstance(cleanup_error, Exception):
                 raise ToolFactoryRuntimeSessionBoundaryError() from cleanup_error
-            logger.error(cleanup_error_message, exc_info=True)
+            else:
+                raise
 
 
 _PUBLIC_MCP_UNAVAILABLE_REASONS = frozenset(
