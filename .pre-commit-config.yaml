@@ -44,7 +44,12 @@ repos:
           - chromadb
           - openpyxl
           - types-openpyxl
-          - mcp
+          # Pin to the project's resolved mcp (uv.lock). Unpinned, the mypy
+          # hook env resolves the latest release, and mcp 2.0.0 moved
+          # `mcp.server.fastmcp`, renamed `streamablehttp_client` and
+          # dropped `Server.list_tools`/`call_tool`, which fails the whole
+          # run against code written for the locked 1.x API.
+          - mcp==1.19.0
           - pandas-stubs
           - matplotlib-stubs
           - docker
