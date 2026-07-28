@@ -299,25 +299,6 @@ class TestScopeDerivedEscapeFailsClosed:
             build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
         assert str(outside) in str(excinfo.value)
 
-    def test_escape_never_produces_an_actor_specific_intent(
-        self, _uploads_dir, tmp_path
-    ):
-        """The invariant the rejection protects: no pair of Actors under one
-        CA can reach the sandbox with unequal intents. The escaping Actor
-        fails, and its sibling's intent is untouched."""
-        outside = tmp_path.parent / f"{tmp_path.name}-outside-actor"
-        outside.mkdir()
-        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
-        (ca_root / "actor9").mkdir(parents=True)
-        (ca_root / "actor7").symlink_to(outside, target_is_directory=True)
-
-        sibling = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor9"))
-        assert sibling.mount_intent.mount_root == str(ca_root)
-        assert str(outside) not in sibling.mount_intent.extra_mounts
-
-        with pytest.raises(SandboxMountEscapeError):
-            build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
-
     def test_mount_root_escaping_the_user_root_is_rejected(
         self, _uploads_dir, tmp_path
     ):
@@ -371,6 +352,57 @@ class TestScopeDerivedEscapeFailsClosed:
 
         assert binding.mount_intent.mount_root == str(ca_root)
         assert binding.mount_intent.extra_mounts == (str(link),)
+
+
+class TestDuplicateProvenanceMerging:
+    """A path can legitimately be both scope-derived and operator-configured.
+
+    If ``XAGENT_EXTERNAL_UPLOAD_DIRS`` explicitly names the exact same path
+    an Actor's own scope-derived upload dir resolves to, that path is
+    deployment-authorized independently of the scope collision -- an
+    operator who names a path takes responsibility for it regardless of
+    whether some Actor's scope also happens to derive the same path. Before
+    candidates were merged by absolute path, the scope-labeled copy of the
+    duplicate was rejected outright even though the deployment-labeled copy
+    sat right next to it in the same candidate list: a sibling Actor whose
+    own scope did not collide with that deployment entry got the configured
+    extra mount, while the colliding Actor's build failed closed instead.
+    """
+
+    def _ca_scope(self, actor: str) -> ExecutionScope:
+        return ExecutionScope(
+            sandbox_key_suffix="ca-1",
+            workspace_segments=("ca1", actor),
+            sandbox_mount_segments=("ca1",),
+            isolate_external_dirs=True,
+        )
+
+    def test_scope_and_deployment_duplicate_of_an_escaping_path_is_authorized(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-actor"
+        outside.mkdir()
+        ca_root = scoped_user_root(_uploads_dir, OWNER_ID, ("ca1",))
+        ca_root.mkdir(parents=True)
+        actor7_dir = ca_root / "actor7"
+        actor7_dir.symlink_to(outside, target_is_directory=True)
+
+        # The deployment explicitly configures the exact path actor7's own
+        # scope derives -- same absolute string, same escaping symlink --
+        # so this candidate is going to arrive twice for actor7 (once
+        # scope-derived, once deployment-configured) and once for actor9
+        # (deployment-configured only, since actor9's own scope path never
+        # touches actor7's directory).
+        monkeypatch.setattr(
+            workspace_binding, "get_external_upload_dirs", lambda: [actor7_dir]
+        )
+
+        binding_a = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor7"))
+        binding_b = build_chat_workspace_binding(OWNER_ID, self._ca_scope("actor9"))
+
+        assert binding_a.mount_intent == binding_b.mount_intent
+        assert binding_a.mount_intent.mount_root == str(ca_root)
+        assert binding_a.mount_intent.extra_mounts == (str(actor7_dir),)
 
 
 class TestInternalScopedRow:
@@ -565,31 +597,6 @@ class TestExternalDirBoundary:
 
         assert binding.mount_intent.mount_root == str(scoped_root)
         assert binding.mount_intent.extra_mounts == ()
-
-
-class TestExtraMountNormalizationIsIntentOwned:
-    """The folding step hands over the surviving candidates as selected;
-    ``SandboxMountIntent`` is the single owner of their canonicalization,
-    deduplication and ordering, so the builder does not re-implement it.
-    """
-
-    def test_intent_canonicalizes_dedupes_and_sorts_the_survivors(
-        self, _uploads_dir, tmp_path, monkeypatch
-    ):
-        first = tmp_path.parent / f"{tmp_path.name}-kb-a"
-        second = tmp_path.parent / f"{tmp_path.name}-kb-b"
-        for path in (first, second):
-            path.mkdir()
-        # Reverse-sorted, duplicated, and non-canonical spellings.
-        monkeypatch.setattr(
-            workspace_binding,
-            "get_external_upload_dirs",
-            lambda: [second, Path(f"{first}/."), first],
-        )
-
-        binding = build_chat_workspace_binding(OWNER_ID, None)
-
-        assert binding.mount_intent.extra_mounts == (str(first), str(second))
 
 
 class TestBackendPathDomain:

@@ -50,7 +50,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Literal, Optional, Sequence
+from typing import Iterable, Literal, Optional, Sequence
 
 from ...config import get_external_upload_dirs, get_uploads_dir
 from ...core.execution_scope import ExecutionScope
@@ -95,25 +95,66 @@ def _warn_once(kind: str, message: str, *args: object) -> None:
 
 @dataclass(frozen=True)
 class _MountCandidate:
-    """One fold candidate plus the provenance that decides its fold policy.
+    """One fold candidate plus the provenance set that decides its fold policy.
+
+    ``origins`` is every reason this exact path entered folding, not a
+    single label: :func:`_merge_mount_candidates` coalesces candidates that
+    absolutize to the same path before any verdict is computed, unioning
+    their origins, because the same physical path can legitimately arrive
+    from more than one source (see below) and its authorization is the
+    union, not whichever source happened to be listed first.
 
     ``"scope"`` -- derived from this owner's workspace root at the scope's
     segments. Its containment in the mount root is a *precondition*, not an
     observation: the CA root is chosen so it covers this path, the directory
     tree it names is workspace-controlled, and its spelling varies per Actor.
     A per-Actor survivor in the folded set would break the #296 invariant
-    that every Actor under one CA folds to a byte-identical intent, so this
-    candidate must fold away (or absorb the root) or the build fails closed.
+    that every Actor under one CA folds to a byte-identical intent, so a
+    candidate whose origins are *only* ``{"scope"}`` must fold away (or
+    absorb the root) or the build fails closed.
 
     ``"deployment"`` -- an operator-configured external directory
     (``XAGENT_EXTERNAL_UPLOAD_DIRS``). It is an independently declared mount
     in its own right, identical for every Actor in the process, so keeping
     its own bind neither breaks intent equality nor exposes anything the
-    deployment did not name explicitly.
+    deployment did not name explicitly. Any candidate whose origins include
+    ``"deployment"`` -- alone or merged with ``"scope"`` -- is
+    deployment-authorized and keeps its own mount rather than failing the
+    build: an operator who explicitly lists a path takes responsibility for
+    it regardless of whether a scope also happens to derive the same path.
     """
 
     path: str
-    origin: Literal["scope", "deployment"]
+    origins: frozenset[Literal["scope", "deployment"]]
+
+
+def _merge_mount_candidates(
+    candidates: Iterable[_MountCandidate],
+) -> tuple[_MountCandidate, ...]:
+    """Coalesce candidates sharing an absolutized path before any verdict.
+
+    ``candidates`` are already backend-domain absolutized (see
+    :func:`_fold_mount_paths`). An operator can list the exact same
+    directory a scope independently derives in
+    ``XAGENT_EXTERNAL_UPLOAD_DIRS``; without this merge that path enters
+    folding as two separate candidates with the same verdict but different
+    ``origins``, and the escape check in :func:`_fold_mount_paths` would
+    reject the scope-labeled one even though the deployment-labeled one
+    independently authorizes the identical path -- rejecting one Actor
+    while a sibling whose scope happens not to collide with the same
+    deployment entry succeeds, which is exactly the per-Actor divergence
+    this module exists to prevent. Merging first makes one candidate per
+    path carry the union of every origin that named it, so the fold and
+    escape checks downstream only ever see one verdict per path.
+    """
+    merged: dict[str, set[Literal["scope", "deployment"]]] = {}
+    order: list[str] = []
+    for candidate in candidates:
+        if candidate.path not in merged:
+            merged[candidate.path] = set()
+            order.append(candidate.path)
+        merged[candidate.path].update(candidate.origins)
+    return tuple(_MountCandidate(path, frozenset(merged[path])) for path in order)
 
 
 def _build_external_allowlist(
@@ -130,8 +171,9 @@ def _build_external_allowlist(
     Actor-logical allowlist that is pinned equivalent to chat's own by test.
     Backend-domain absolutization belongs to :func:`_fold_mount_paths`, which
     is where these values stop being an allowlist and become mount
-    candidates; the ``origin`` each one carries is what lets that folding
-    tell the two trust levels apart.
+    candidates; the ``origins`` each one carries is what lets that folding
+    tell the two trust levels apart (after :func:`_merge_mount_candidates`
+    unions any that collide on the same path).
     """
     segments = (
         scope.workspace_segments
@@ -140,8 +182,11 @@ def _build_external_allowlist(
     )
     user_upload_dir = scoped_user_root(get_uploads_dir(), owner_id, segments)
     return (
-        _MountCandidate(str(user_upload_dir), "scope"),
-        *(_MountCandidate(str(d), "deployment") for d in get_external_upload_dirs()),
+        _MountCandidate(str(user_upload_dir), frozenset({"scope"})),
+        *(
+            _MountCandidate(str(d), frozenset({"deployment"}))
+            for d in get_external_upload_dirs()
+        ),
     )
 
 
@@ -193,7 +238,9 @@ def _fold_mount_paths(
     configuration (``XAGENT_UPLOADS_DIR``, ``XAGENT_EXTERNAL_UPLOAD_DIRS``)
     and may be relative or ``~``-prefixed, which the mount-path contract
     rejects and which the pre-projection path mapper used to absolutize for
-    them.
+    them. Candidates that absolutize to the same path are then merged (see
+    :func:`_merge_mount_candidates`) so validation below sees one verdict
+    per path, decided by the union of every origin that named it.
 
     Then, repeatedly, each candidate is classified against the current root
     by :func:`_fold_relation`:
@@ -207,8 +254,8 @@ def _fold_mount_paths(
       each other -- so promoting the shortest one is unambiguous and a
       single promotion reclassifies everything else against the new root.
     - anything left over is disjoint, and provenance decides its fate: a
-      deployment-configured candidate keeps its own mount, a scope-derived
-      one fails the build closed.
+      candidate whose merged origins include ``"deployment"`` keeps its own
+      mount, one whose origins are only ``{"scope"}`` fails the build closed.
 
     A scope-derived candidate is always lexically the root, its descendant
     or its ancestor -- ``scoped_user_root`` composes both from the same user
@@ -218,7 +265,10 @@ def _fold_mount_paths(
     out of the root it is required to share. Granting that its own bind
     would hand the backend a writable mount of whatever the symlink points
     at and give this Actor an intent no sibling Actor under the same CA
-    produces, so it raises ``SandboxMountEscapeError`` instead.
+    produces, so it raises ``SandboxMountEscapeError`` instead -- unless an
+    operator-configured deployment entry independently names the same
+    absolute path, in which case the merged candidate is
+    deployment-authorized (see :func:`_merge_mount_candidates`).
 
     Returns the final root and the surviving candidates in candidate order,
     each in its absolutized (never symlink-resolved) spelling;
@@ -226,8 +276,8 @@ def _fold_mount_paths(
     ordering.
     """
     root = str(absolute_backend_mount_path(mount_root))
-    remaining = tuple(
-        _MountCandidate(str(absolute_backend_mount_path(c.path)), c.origin)
+    remaining = _merge_mount_candidates(
+        _MountCandidate(str(absolute_backend_mount_path(c.path)), c.origins)
         for c in candidates
     )
     resolved = {c.path: resolve_backend_mount_path(c.path) for c in remaining}
@@ -244,7 +294,7 @@ def _fold_mount_paths(
             # promotion can widen the root enough to cover a candidate that
             # was disjoint from the narrower one.
             for candidate, verdict in verdicts:
-                if verdict == "disjoint" and candidate.origin == "scope":
+                if verdict == "disjoint" and "deployment" not in candidate.origins:
                     raise SandboxMountEscapeError(
                         f"Workspace path {candidate.path!r} (resolving to "
                         f"{resolved[candidate.path]!r}) is neither inside nor "
