@@ -82,6 +82,7 @@ type SessionConversationState =
 type SessionConversationAction =
   | { type: "SESSION_TASK_INFO"; connectionIdentity: string; taskId: number }
   | { type: "SESSION_RESET_REQUESTED"; connectionIdentity: string; taskId: number }
+  | { type: "SESSION_RESET_NOT_SENT"; connectionIdentity: string }
   | { type: "SESSION_RESET_ACKNOWLEDGED"; connectionIdentity: string }
   | { type: "SESSION_REPLACEMENT_SENDING"; connectionIdentity: string }
   | { type: "SESSION_REPLACEMENT_ACCEPTED"; connectionIdentity: string }
@@ -115,6 +116,10 @@ const reduceSessionConversation = (
     case "SESSION_RESET_REQUESTED":
       return state.phase === "bound" && state.connectionIdentity === action.connectionIdentity
         ? { phase: "reset_requested", connectionIdentity: action.connectionIdentity, taskId: action.taskId }
+        : state
+    case "SESSION_RESET_NOT_SENT":
+      return state.phase === "reset_requested" && state.connectionIdentity === action.connectionIdentity
+        ? { phase: "bound", connectionIdentity: state.connectionIdentity, taskId: state.taskId }
         : state
     case "SESSION_RESET_ACKNOWLEDGED":
       return state.phase === "reset_requested" && state.connectionIdentity === action.connectionIdentity
@@ -1232,7 +1237,10 @@ function appReducer(state: AppState, action: AppAction): AppState {
       return { ...state, messages: [] }
 
     case "RESET_STATE":
-      return createInitialState()
+      return {
+        ...createInitialState(),
+        sessionConversation: state.sessionConversation,
+      }
 
     case "OPEN_FILE_PREVIEW":
       // Support passing single file or multiple file list
@@ -1506,9 +1514,10 @@ interface SessionMessageOwner {
 
 interface SessionPreAdoptionBuffer {
   connectionIdentity: string
+  candidate: { message: WebSocketMessage; taskId: number } | null
   frames: WebSocketMessage[]
   bytes: number
-  timeout: ReturnType<typeof setTimeout>
+  timeout: ReturnType<typeof setTimeout> | null
 }
 
 const serializedWebSocketMessageBytes = (message: WebSocketMessage): number =>
@@ -1564,16 +1573,27 @@ export function AppProvider({
     (content: string) => isDuplicateMessage(content, "result"),
     [isDuplicateMessage],
   )
+  // Session frames can arrive as a burst before React commits. Project those
+  // actions synchronously so every frame is reduced against the preceding one.
+  const stateRef = useRef(state)
+  stateRef.current = state
+  const projectSessionAppAction = useCallback((action: AppAction) => {
+    stateRef.current = appReducer(stateRef.current, action)
+    dispatch(action)
+  }, [])
   const sessionConversationRef = useRef<SessionConversationState>(initialSessionConversationState)
   const dispatchSessionConversation = useCallback(
     (action: SessionConversationAction) => {
-      sessionConversationRef.current = reduceSessionConversation(
-        sessionConversationRef.current,
-        action,
-      )
-      dispatch({ type: "SESSION_CONVERSATION", payload: action })
+      const current = sessionConversationRef.current
+      const next = reduceSessionConversation(current, action)
+      const accepted = next !== current
+      if (accepted) {
+        sessionConversationRef.current = next
+        projectSessionAppAction({ type: "SESSION_CONVERSATION", payload: action })
+      }
+      return { accepted, current, next }
     },
-    [],
+    [projectSessionAppAction],
   )
   useLayoutEffect(() => {
     sessionConversationRef.current = state.sessionConversation
@@ -1623,6 +1643,7 @@ export function AppProvider({
   )
   const sessionResetFlightRef = useRef<SessionResetFlight | null>(null)
   const sessionPreAdoptionBufferRef = useRef<SessionPreAdoptionBuffer | null>(null)
+  const flushingSessionPreAdoptionCandidateRef = useRef<WebSocketMessage | null>(null)
   const retiredSessionTaskIdsRef = useRef(new Set<number>())
   const sessionMessageHandlerRef = useRef<
     (message: WebSocketMessage, owner: SessionMessageOwner) => void
@@ -1635,9 +1656,6 @@ export function AppProvider({
     new Map<number, TaskStateVersionEntry>()
   )
 
-  // Ref to track current state for WebSocket message handler
-  const stateRef = useRef(state)
-  stateRef.current = state
   // Session task ownership is established only by a current-socket task_info;
   // never import a legacy route/storage Task id into this protocol state.
   const sessionTaskIdRef = useRef<number | null>(null)
@@ -1665,7 +1683,7 @@ export function AppProvider({
   const discardSessionPreAdoptionBuffer = useCallback(() => {
     const buffer = sessionPreAdoptionBufferRef.current
     if (!buffer) return
-    clearTimeout(buffer.timeout)
+    if (buffer.timeout !== null) clearTimeout(buffer.timeout)
     sessionPreAdoptionBufferRef.current = null
   }, [])
 
@@ -1678,26 +1696,47 @@ export function AppProvider({
     })
   }, [discardSessionPreAdoptionBuffer, dispatchSessionConversation, rejectSessionResetFlight])
 
-  const startSessionPreAdoptionBuffer = useCallback((connectionIdentity: string) => {
+  const beginSessionPreAdoptionBuffer = useCallback((connectionIdentity: string) => {
     discardSessionPreAdoptionBuffer()
-    const timeout = setTimeout(() => {
+    sessionPreAdoptionBufferRef.current = {
+      connectionIdentity,
+      candidate: null,
+      frames: [],
+      bytes: 0,
+      timeout: null,
+    }
+  }, [discardSessionPreAdoptionBuffer])
+
+  const activateSessionPreAdoptionBuffer = useCallback((connectionIdentity: string) => {
+    const buffer = sessionPreAdoptionBufferRef.current
+    if (!buffer || buffer.connectionIdentity !== connectionIdentity) {
+      requireSessionReload(
+        new Error("Replacement conversation transaction is missing; reload required.")
+      )
+      return
+    }
+    if (buffer.timeout !== null) return
+    buffer.timeout = setTimeout(() => {
       const buffer = sessionPreAdoptionBufferRef.current
       if (buffer?.connectionIdentity !== connectionIdentity) return
       requireSessionReload(
         new Error("Replacement conversation did not publish task_info before its deadline; reload required.")
       )
     }, SESSION_TASK_ADOPTION_TIMEOUT_MS)
-    sessionPreAdoptionBufferRef.current = {
-      connectionIdentity,
-      frames: [],
-      bytes: 0,
-      timeout,
+    if (buffer.candidate) {
+      flushingSessionPreAdoptionCandidateRef.current = buffer.candidate.message
+      try {
+        sessionMessageHandlerRef.current(buffer.candidate.message, { connectionIdentity })
+      } finally {
+        flushingSessionPreAdoptionCandidateRef.current = null
+      }
     }
-  }, [discardSessionPreAdoptionBuffer, requireSessionReload])
+  }, [requireSessionReload])
 
   const bufferSessionPreAdoptionFrame = useCallback((
     message: WebSocketMessage,
     owner: SessionMessageOwner,
+    candidateTaskId?: number,
   ): boolean => {
     const buffer = sessionPreAdoptionBufferRef.current
     if (!buffer || buffer.connectionIdentity !== owner.connectionIdentity) {
@@ -1707,8 +1746,15 @@ export function AppProvider({
       return false
     }
     const bytes = serializedWebSocketMessageBytes(message)
+    if (candidateTaskId !== undefined && buffer.candidate) {
+      if (buffer.candidate.taskId === candidateTaskId) return true
+      requireSessionReload(
+        new Error("Replacement conversation published conflicting task_info; reload required.")
+      )
+      return false
+    }
     if (
-      buffer.frames.length >= MAX_SESSION_PRE_ADOPTION_FRAMES
+      buffer.frames.length + (buffer.candidate ? 1 : 0) >= MAX_SESSION_PRE_ADOPTION_FRAMES
       || buffer.bytes + bytes > MAX_SESSION_PRE_ADOPTION_BYTES
     ) {
       requireSessionReload(
@@ -1716,7 +1762,11 @@ export function AppProvider({
       )
       return false
     }
-    buffer.frames.push(message)
+    if (candidateTaskId !== undefined) {
+      buffer.candidate = { message, taskId: candidateTaskId }
+    } else {
+      buffer.frames.push(message)
+    }
     buffer.bytes += bytes
     return true
   }, [requireSessionReload])
@@ -4963,6 +5013,12 @@ export function AppProvider({
         return
       }
 
+      const transition = dispatchSessionConversation({
+        type: "SESSION_RESET_ACKNOWLEDGED",
+        connectionIdentity: owner.connectionIdentity,
+      })
+      if (!transition.accepted) return
+
       const retiredTaskId = sessionTaskIdRef.current
       if (retiredTaskId !== null) {
         retiredSessionTaskIdsRef.current.add(retiredTaskId)
@@ -4983,10 +5039,6 @@ export function AppProvider({
       sessionTaskIdRef.current = null
       taskStateVersionsRef.current.clear()
       stateRef.current.replayScheduler?.stop()
-      dispatchSessionConversation({
-        type: "SESSION_RESET_ACKNOWLEDGED",
-        connectionIdentity: owner.connectionIdentity,
-      })
       pendingTaskToExecuteRef.current = null
       lastConnectedTaskId.current = null
       recentMessagesRef.current.clear()
@@ -5000,7 +5052,7 @@ export function AppProvider({
       const nextDeliveryGeneration = deliveryGenerationRef.current + 1
       deliveryGenerationRef.current = nextDeliveryGeneration
       setDeliveryGeneration(nextDeliveryGeneration)
-      dispatch({ type: "RESET_SESSION_CONVERSATION" })
+      projectSessionAppAction({ type: "RESET_SESSION_CONVERSATION" })
       resetFlight.resolve()
       return
     }
@@ -5024,10 +5076,33 @@ export function AppProvider({
         return
       }
       const lifecycle = sessionConversationRef.current
+      const isFlushingCandidate =
+        flushingSessionPreAdoptionCandidateRef.current === message
+      if (
+        !isFlushingCandidate
+        && (
+          lifecycle.phase === "replacement_sending"
+          || lifecycle.phase === "replacement_awaiting_task"
+        )
+      ) {
+        if (!bufferSessionPreAdoptionFrame(message, owner, taskId)) return
+        const buffer = sessionPreAdoptionBufferRef.current
+        if (
+          lifecycle.phase === "replacement_awaiting_task"
+          && buffer?.timeout != null
+        ) {
+          flushingSessionPreAdoptionCandidateRef.current = message
+          try {
+            handleSessionMessage(message, owner)
+          } finally {
+            flushingSessionPreAdoptionCandidateRef.current = null
+          }
+        }
+        return
+      }
       if (
         lifecycle.phase === "reset_requested"
         || lifecycle.phase === "replacement_ready"
-        || lifecycle.phase === "replacement_sending"
         || lifecycle.phase === "reload_required"
       ) {
         return
@@ -5038,6 +5113,9 @@ export function AppProvider({
         currentTaskId !== null
         && currentTaskId !== taskId
       ) {
+        requireSessionReload(
+          new Error("Session task lineage changed without a reset; reload required.")
+        )
         return
       }
       const taskInfoEnvelope = extractTaskControlEnvelope(message)
@@ -5056,14 +5134,14 @@ export function AppProvider({
         ? sessionPreAdoptionBufferRef.current?.frames.slice() ?? []
         : []
       discardSessionPreAdoptionBuffer()
-      dispatchSessionConversation({
+      const transition = dispatchSessionConversation({
         type: "SESSION_TASK_INFO",
         connectionIdentity: owner.connectionIdentity,
         taskId,
       })
-      if (sessionConversationRef.current.phase !== "bound") return
+      if (!transition.accepted || transition.next.phase !== "bound") return
       sessionTaskIdRef.current = taskId
-      dispatch({
+      projectSessionAppAction({
         type: "ADOPT_SESSION_TASK",
         payload: {
           taskId,
@@ -5076,27 +5154,40 @@ export function AppProvider({
       return
     }
 
-    if (sessionConversationRef.current.phase === "replacement_awaiting_task") {
+    if (
+      binding.present
+      && binding.valid
+      && retiredSessionTaskIdsRef.current.has(binding.taskId)
+    ) {
+      return
+    }
+    if (
+      sessionConversationRef.current.phase === "replacement_sending"
+      || sessionConversationRef.current.phase === "replacement_awaiting_task"
+    ) {
       bufferSessionPreAdoptionFrame(message, owner)
       return
     }
     if (
       sessionConversationRef.current.phase === "reset_requested"
       || sessionConversationRef.current.phase === "replacement_ready"
-      || sessionConversationRef.current.phase === "replacement_sending"
       || sessionConversationRef.current.phase === "reload_required"
     ) return
     if (binding.present && binding.valid) {
       if (
-        retiredSessionTaskIdsRef.current.has(binding.taskId)
-        || sessionTaskIdRef.current === null
-        || sessionTaskIdRef.current !== binding.taskId
+        sessionTaskIdRef.current === null
       ) {
+        return
+      }
+      if (sessionTaskIdRef.current !== binding.taskId) {
+        requireSessionReload(
+          new Error("Session task lineage changed without a reset; reload required.")
+        )
         return
       }
     }
 
-    handleMessage(message, dispatch, stateRef.current, {
+    handleMessage(message, projectSessionAppAction, stateRef.current, {
       skipHistory: true,
       filesDisabled: true,
     })
@@ -5262,10 +5353,14 @@ export function AppProvider({
         )
       }
       if (startsReplacementConversation) {
-        dispatchSessionConversation({
+        const transition = dispatchSessionConversation({
           type: "SESSION_REPLACEMENT_SENDING",
           connectionIdentity: sessionDeliveryOwner.connectionIdentity,
         })
+        if (!transition.accepted) {
+          throw new Error("The replacement conversation is no longer available.")
+        }
+        beginSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
       }
       beginSessionMessageDelivery()
       try {
@@ -5279,11 +5374,12 @@ export function AppProvider({
           if (!replacementSendStillOwned()) {
             return
           }
-          dispatchSessionConversation({
+          const transition = dispatchSessionConversation({
             type: "SESSION_REPLACEMENT_ACCEPTED",
             connectionIdentity: sessionDeliveryOwner.connectionIdentity,
           })
-          startSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
+          if (!transition.accepted) return
+          activateSessionPreAdoptionBuffer(sessionDeliveryOwner.connectionIdentity)
         }
         addOptimisticUserMessage(state.taskId)
       } catch (error) {
@@ -5291,6 +5387,7 @@ export function AppProvider({
           if (!replacementSendStillOwned()) {
             throw error
           }
+          discardSessionPreAdoptionBuffer()
           dispatchSessionConversation({
             type: "SESSION_REPLACEMENT_REJECTED",
             connectionIdentity: sessionDeliveryOwner.connectionIdentity,
@@ -5512,12 +5609,14 @@ export function AppProvider({
     }
   }, [
     beginSessionMessageDelivery,
+    beginSessionPreAdoptionBuffer,
+    activateSessionPreAdoptionBuffer,
+    discardSessionPreAdoptionBuffer,
     dispatchSessionConversation,
     endSessionMessageDelivery,
     queuePendingMessage,
     sendChatMessage,
     sessionTransport,
-    startSessionPreAdoptionBuffer,
     state.currentTask?.status,
     state.taskId,
   ])
@@ -5590,14 +5689,31 @@ export function AppProvider({
       timeout,
     }
     sessionResetFlightRef.current = resetFlight
-    dispatchSessionConversation({
+    const transition = dispatchSessionConversation({
       type: "SESSION_RESET_REQUESTED",
       connectionIdentity,
       taskId: establishedSessionTaskId,
     })
+    if (!transition.accepted) {
+      rejectSessionResetFlight(
+        resetFlight,
+        new Error("Conversation reset is no longer available."),
+      )
+      return promise
+    }
 
     try {
-      sendRawMessage({ type: "new_conversation" })
+      const sent = sendRawMessage({ type: "new_conversation" }) as boolean | void
+      if (sent === false) {
+        dispatchSessionConversation({
+          type: "SESSION_RESET_NOT_SENT",
+          connectionIdentity,
+        })
+        rejectSessionResetFlight(
+          resetFlight,
+          new Error("Conversation reset was not sent; retry the request."),
+        )
+      }
     } catch (error) {
       const resetError =
         error instanceof Error ? error : new Error(String(error))
