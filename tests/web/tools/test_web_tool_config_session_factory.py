@@ -2,7 +2,7 @@ import asyncio
 import functools
 import logging
 import threading
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -105,6 +105,38 @@ def _assert_factory_model_getters_are_neutral(cfg):
         assert getattr(cfg, f"get_{field_name}")() is None
     for field_name in _FACTORY_MODEL_MAPPING_FIELDS:
         assert getattr(cfg, f"get_{field_name}")() == {}
+
+
+_MAPPING_PROXY_TYPE = type(MappingProxyType({}))
+
+
+def _graph_reaches_identity(root, target):
+    visited = set()
+
+    def _visit(value):
+        if value is target:
+            return True
+        if id(value) in visited:
+            return False
+        if is_dataclass(value) and not isinstance(value, type):
+            children = (getattr(value, item.name) for item in fields(value))
+        elif type(value) in {dict, _MAPPING_PROXY_TYPE}:
+            children = (child for key, item in value.items() for child in (key, item))
+        elif type(value) in {list, tuple, set, frozenset}:
+            children = iter(value)
+        else:
+            return False
+        visited.add(id(value))
+        return any(_visit(child) for child in children)
+
+    return _visit(root)
+
+
+def _assert_identities_not_reachable(root, forbidden_by_name):
+    for name, forbidden in forbidden_by_name.items():
+        assert not _graph_reaches_identity(root, forbidden), (
+            f"retained model state reaches forbidden {name}"
+        )
 
 
 class _Chain:
@@ -1062,15 +1094,49 @@ async def test_handoff_retains_loaded_model_values_without_database_fallback():
         "music_models",
     ):
         assert isinstance(getattr(retained, name), mapping_proxy_type)
-    for forbidden in (
-        snapshot,
-        plan,
-        credential_map,
-        sql_connections,
-        custom_api_configs,
-        published_agent_records,
-    ):
-        assert all(value is not forbidden for value in vars(retained).values())
+    forbidden_state = {
+        "snapshot": snapshot,
+        "plan": plan,
+        "credential map": credential_map,
+        "SQL connections": sql_connections,
+        "Custom API configs": custom_api_configs,
+        "published-agent records": published_agent_records,
+    }
+    _assert_identities_not_reachable(vars(retained), forbidden_state)
+
+    positive_control = object()
+    positive_control_graph = {
+        "nested": [
+            (
+                MappingProxyType(
+                    {"set": {frozenset({positive_control})}},
+                ),
+            ),
+        ],
+    }
+    assert _graph_reaches_identity(positive_control_graph, positive_control)
+    with pytest.raises(AssertionError, match="positive control"):
+        _assert_identities_not_reachable(
+            positive_control_graph,
+            {"positive control": positive_control},
+        )
+    assert not _graph_reaches_identity(
+        SimpleNamespace(hidden=positive_control),
+        positive_control,
+    )
+
+    mutated_retained = replace(retained)
+    object.__setattr__(
+        mutated_retained,
+        "_hidden_construction_state",
+        {"snapshot": snapshot},
+    )
+    with pytest.raises(AssertionError, match="snapshot"):
+        _assert_identities_not_reachable(
+            vars(mutated_retained),
+            {"snapshot": snapshot},
+        )
+    _assert_identities_not_reachable(vars(retained), forbidden_state)
 
     assert cfg.get_vision_model() is None
     assert cfg.get_image_generate_model() is None
