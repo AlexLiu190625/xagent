@@ -517,12 +517,16 @@ class SandboxMountIntent:
     Classification into ``covered_extras`` / ``covering_extras`` /
     ``disjoint_extras`` is purely lexical string comparison over the
     normalized paths — it does not touch the filesystem and cannot detect
-    symlinks, bind-mount aliasing, or host-side path mappings. Callers must
-    pass backend-side absolute paths that have already been resolved (e.g.
-    via ``realpath``) on their own side before constructing this type; this
-    type performs no such resolution itself. Deciding what to do with the
-    disjoint set (e.g. fail-closed against an allow-list) is left to the
-    caller.
+    symlinks, bind-mount aliasing, or host-side path mappings, and this type
+    performs no resolution of its own. A caller acting on the verdict owns
+    the resolved view: both folding directions (dropping a covered extra,
+    promoting a covering one) assume the surviving mount physically contains
+    the dropped path, and a symlink breaks that in either direction. So
+    either pass backend-side paths that are already resolved (e.g. via
+    ``realpath``), or classify the resolved paths as well and treat a
+    disagreement between the two verdicts as disjoint. Deciding what to do
+    with the disjoint set (e.g. fail-closed against an allow-list) is left
+    to the caller.
     """
 
     mount_root: Optional[str] = None

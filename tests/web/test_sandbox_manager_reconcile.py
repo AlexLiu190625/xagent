@@ -597,3 +597,49 @@ class TestPrepareRootMkdir:
         )
 
         assert Path(binding.prepare_root).is_dir()
+
+
+class TestProviderCacheMountIntentGate:
+    """A cached lease provider owns the mount intent its primary container
+    was built from, and hands that same intent to every worker it creates.
+    So the provider cache must pass the same spec gate the sandbox cache
+    does: without it a second caller on the same lifecycle key silently
+    receives the first caller's mounts, and ``attach_provider`` then
+    succeeds by object identity with nothing left to catch the divergence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_second_mount_intent_is_rejected_on_cache_hit(
+        self, _env, tmp_path
+    ) -> None:
+        manager, service = _make_manager()
+        first = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=_intent(tmp_path, "actor-a")
+        )
+
+        with pytest.raises(SandboxRuntimeConflictError):
+            await manager.get_or_create_lease_provider(
+                "user", "1", mount_intent=_intent(tmp_path, "actor-b")
+            )
+
+        # The rejected caller leaves no trace: same provider, same container.
+        assert manager._lease_providers["user::1"] is first
+        assert first._mount_intent == _intent(tmp_path, "actor-a")
+        assert set(service._containers) == {"user::1"}
+
+    @pytest.mark.asyncio
+    async def test_matching_mount_intent_still_shares_the_provider(
+        self, _env, tmp_path
+    ) -> None:
+        """The #296 sharing case must keep working: two callers whose
+        intents fold to the same desired spec get the one provider."""
+        manager, service = _make_manager()
+        first = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=_intent(tmp_path, "ca-root")
+        )
+        second = await manager.get_or_create_lease_provider(
+            "user", "1", mount_intent=_intent(tmp_path, "ca-root")
+        )
+
+        assert second is first
+        assert set(service._containers) == {"user::1"}

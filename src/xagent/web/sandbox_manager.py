@@ -232,6 +232,42 @@ class SandboxLeaseProvider:
         self._workers.clear()
 
 
+def absolute_backend_mount_path(path: str | Path) -> Path:
+    """Absolutize one backend-domain path: env vars, then ``~``, then cwd.
+
+    The backend domain is this process's own filesystem; translation to the
+    machine actually running the container backend happens afterwards, in
+    ``SandboxPathMapper``. The configuration values that reach it
+    (``XAGENT_UPLOADS_DIR``, ``XAGENT_EXTERNAL_UPLOAD_DIRS``) are raw strings
+    and may be relative or ``~``-prefixed, while every downstream mount
+    consumer -- the volume tuples and ``SandboxMountIntent``'s lexical
+    classification alike -- requires an absolute path. Every producer of a
+    backend-domain mount path goes through this one function so a relative
+    spelling resolves to the same directory everywhere.
+    """
+    backend_path = Path(os.path.expandvars(str(path))).expanduser()
+    if not backend_path.is_absolute():
+        backend_path = Path.cwd() / backend_path
+    return backend_path
+
+
+def resolve_backend_mount_path(path: str | Path) -> str:
+    """Absolutize a backend-domain path and resolve its symlinks.
+
+    ``SandboxMountIntent``'s covered/covering/disjoint split is purely
+    lexical, so it cannot tell a directory that is lexically inside a mount
+    root from a symlink at that same lexical position pointing somewhere
+    else entirely. Only the second one is *not* exposed by the root's bind,
+    so folding decisions must be taken against resolved paths -- this is the
+    resolver that answers that question.
+
+    The paths that end up mounted deliberately keep their unresolved
+    spelling: the guest mount point has to stay the path the rest of the
+    system (file tools, the workspace allowlist) already refers to.
+    """
+    return os.path.realpath(absolute_backend_mount_path(path))
+
+
 class SandboxPathMapper:
     """Translate backend-visible workspace paths into sandbox volume tuples."""
 
@@ -261,10 +297,7 @@ class SandboxPathMapper:
 
     @staticmethod
     def _as_backend_path(path: str | Path) -> Path:
-        backend_path = Path(os.path.expandvars(str(path))).expanduser()
-        if not backend_path.is_absolute():
-            backend_path = Path.cwd() / backend_path
-        return backend_path
+        return absolute_backend_mount_path(path)
 
     def _relative_to_backend_storage(self, backend_path: Path) -> Path | None:
         try:
@@ -1701,16 +1734,35 @@ class SandboxManager:
         once for the whole check-then-create sequence; the internal builder
         it calls on a cache miss takes no lock of its own.
 
+        A cached provider is handed out only after the requested mount
+        intent passes the same spec-cache gate a cached *sandbox* must pass
+        (``_get_or_create_sandbox_locked``'s first gate): the provider owns
+        the mount intent its primary container was built from and hands it
+        to every worker it later creates, so returning it to a caller
+        wanting different mounts would silently serve the first caller's
+        container — the exact silent adoption that gate exists to reject.
+        A cached provider always implies a cached spec for its primary
+        (every pop site drops both together), so the comparison never
+        degrades to "no cached spec, allow".
+
         ``prepare_root``, when given, is only consulted on that cache miss
         (a fresh creation attempt) — see ``ChatWorkspaceBinding.prepare_root``
         and ``_prepare_workspace_mounts``; a cache hit never creates
         directories at all.
         """
         base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+        sandbox_name = self.make_sandbox_name(lifecycle_type, lifecycle_id)
         async with self._lifecycle_locked(base_name):
             async with self._activity_guard:
                 provider = self._lease_providers.get(base_name)
                 if provider is not None:
+                    self._ensure_config_equivalent(
+                        sandbox_name,
+                        self._config_cache.get(sandbox_name),
+                        self._build_runtime_spec(
+                            lifecycle_type, lifecycle_id, mount_intent=mount_intent
+                        ),
+                    )
                     self._touch_locked(base_name)
                     return provider
 
@@ -2173,12 +2225,15 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     using the same ``host_side_sources`` flag the runtime build path uses)
     and code mounts (``build_code_mount_volumes``) are already host-domain
     triples and are compared as-is. External upload dirs are backend-domain
-    paths: they are folded (normalized + deduplicated, the same backend-
-    domain normalization ``SandboxMountIntent`` itself applies) before being
-    converted to host domain through the same ``SandboxPathMapper`` the
-    runtime mount-building path uses. Conflict detection itself always runs
-    in the post-mapper host domain, over the combined triple set from all
-    three sources.
+    paths: they are absolutized through ``absolute_backend_mount_path`` (the
+    same owner the runtime mount-building path uses, so a relative
+    ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry is checked as the directory it
+    actually names) and folded (normalized + deduplicated, the same
+    backend-domain normalization ``SandboxMountIntent`` itself applies)
+    before being converted to host domain through the same
+    ``SandboxPathMapper`` the runtime mount-building path uses. Conflict
+    detection itself always runs in the post-mapper host domain, over the
+    combined triple set from all three sources.
 
     Raises:
         SandboxRuntimeConflictError: Two configured mounts disagree at a
@@ -2198,7 +2253,7 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     volumes.extend(build_code_mount_volumes())
 
     folded_external = SandboxMountIntent(
-        extra_mounts=tuple(str(d) for d in external_dirs)
+        extra_mounts=tuple(str(absolute_backend_mount_path(d)) for d in external_dirs)
     ).extra_mounts
     for backend_dir in folded_external:
         volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))

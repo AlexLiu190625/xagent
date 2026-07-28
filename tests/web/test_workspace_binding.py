@@ -111,12 +111,6 @@ class TestUnscopedRow:
         binding = build_chat_workspace_binding(OWNER_ID, None)
         assert binding.prepare_root == str(scoped_user_root(_uploads_dir, OWNER_ID, ()))
 
-    def test_policy_workspace_root_is_user_root(self, _uploads_dir):
-        binding = build_chat_workspace_binding(OWNER_ID, None)
-        assert binding.policy.workspace_root == str(
-            scoped_user_root(_uploads_dir, OWNER_ID, ())
-        )
-
 
 class TestScopedIsolateFalseRow:
     """Row b: scoped, isolate_external_dirs=False (default).
@@ -426,3 +420,108 @@ class TestExternalDirBoundary:
 
         assert binding.mount_intent.mount_root == str(scoped_root)
         assert binding.mount_intent.extra_mounts == ()
+
+
+class TestBackendPathDomain:
+    """Folding candidates are absolutized, and symlink-checked, first.
+
+    ``SandboxMountIntent`` compares paths lexically and rejects relative
+    ones outright, so the builder owns both halves of that precondition:
+    raw configuration spellings become absolute backend-domain paths, and a
+    candidate whose lexical position disagrees with where it actually
+    resolves is never folded away.
+    """
+
+    def test_relative_external_dir_is_absolutized(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        """``XAGENT_EXTERNAL_UPLOAD_DIRS`` accepts any spelling naming an
+        existing directory, cwd-relative included; the pre-projection path
+        mapper absolutized those, so rejecting them here would fail every
+        task on a deployment that configures one."""
+        external = tmp_path.parent / f"{tmp_path.name}-relative-kb"
+        external.mkdir()
+        monkeypatch.chdir(external.parent)
+        monkeypatch.setattr(
+            workspace_binding,
+            "get_external_upload_dirs",
+            lambda: [Path(external.name)],
+        )
+
+        binding = build_chat_workspace_binding(OWNER_ID, None)
+
+        assert binding.mount_intent.extra_mounts == (str(Path.cwd() / external.name),)
+
+    def test_relative_uploads_dir_absolutizes_the_mount_root(
+        self, tmp_path, monkeypatch
+    ):
+        """Same for ``XAGENT_UPLOADS_DIR``, which reaches the mount root."""
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(workspace_binding, "get_uploads_dir", lambda: Path("up"))
+        monkeypatch.setattr(workspace_binding, "get_external_upload_dirs", lambda: [])
+
+        binding = build_chat_workspace_binding(OWNER_ID, None)
+
+        expected = str(Path.cwd() / "up" / f"user_{OWNER_ID}")
+        assert binding.mount_intent.mount_root == expected
+        assert binding.prepare_root == expected
+
+    def test_symlink_escaping_the_root_keeps_its_own_mount(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        """A candidate lexically under the mount root but resolving outside
+        it is exposed by nothing once the root is bind-mounted, so folding
+        it away would silently drop the mount."""
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-kb"
+        outside.mkdir()
+        user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
+        user_root.mkdir(parents=True)
+        link = user_root / "shared-kb"
+        link.symlink_to(outside, target_is_directory=True)
+        monkeypatch.setattr(
+            workspace_binding, "get_external_upload_dirs", lambda: [link]
+        )
+
+        binding = build_chat_workspace_binding(OWNER_ID, None)
+
+        assert binding.mount_intent.mount_root == str(user_root)
+        assert binding.mount_intent.extra_mounts == (str(link),)
+
+    def test_symlink_staying_inside_the_root_still_folds_away(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        """The veto is resolution-driven, not "any symlink is disjoint": a
+        link resolving back inside the root is genuinely redundant and must
+        still fold, or #296's shared container splits again."""
+        user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
+        target = user_root / "real-kb"
+        target.mkdir(parents=True)
+        link = user_root / "linked-kb"
+        link.symlink_to(target, target_is_directory=True)
+        monkeypatch.setattr(
+            workspace_binding, "get_external_upload_dirs", lambda: [link]
+        )
+
+        binding = build_chat_workspace_binding(OWNER_ID, None)
+
+        assert binding.mount_intent.mount_root == str(user_root)
+        assert binding.mount_intent.extra_mounts == ()
+
+    def test_symlink_only_resolving_to_an_ancestor_is_not_promoted(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        """The covering direction needs the same veto: mounting a link that
+        merely *resolves* to an ancestor does not expose the mount root at
+        the mount root's own path, so it must not absorb it."""
+        alias = tmp_path.parent / f"{tmp_path.name}-alias"
+        alias.symlink_to(_uploads_dir, target_is_directory=True)
+        user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
+        user_root.mkdir(parents=True)
+        monkeypatch.setattr(
+            workspace_binding, "get_external_upload_dirs", lambda: [alias]
+        )
+
+        binding = build_chat_workspace_binding(OWNER_ID, None)
+
+        assert binding.mount_intent.mount_root == str(user_root)
+        assert binding.mount_intent.extra_mounts == (str(alias),)

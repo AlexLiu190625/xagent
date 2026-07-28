@@ -66,12 +66,12 @@ class TestAllowedExternalDirs:
 class TestAllowedExternalDirsMatchesWorkspaceBinding:
     """Two independent implementations of the same computation exist today:
     ``chat._build_allowed_external_dirs`` (consumed by ``WebToolConfig``) and
-    ``workspace_binding._build_external_allowlist`` (consumed by
-    ``ChatWorkspaceBinding.policy`` and folded into the sandbox mount intent)
-    -- see the ``workspace_binding`` module docstring for why they are not
-    yet collapsed onto one. Pin them equivalent across scope shapes so a
-    change to one that silently diverges from the other is caught here
-    instead of only showing up as a runtime access-policy/mount mismatch.
+    ``workspace_binding._build_external_allowlist`` (the sandbox mount
+    intent's folding input) -- see the ``workspace_binding`` module
+    docstring for why they are not yet collapsed onto one. Pin them
+    equivalent across scope shapes so a change to one that silently
+    diverges from the other is caught here instead of only showing up as a
+    runtime access-policy/mount mismatch.
     """
 
     @pytest.mark.parametrize(

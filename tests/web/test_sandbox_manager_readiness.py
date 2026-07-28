@@ -205,3 +205,40 @@ async def test_readiness_allows_non_conflicting_external_dir(tmp_path: Path):
         ),
     ):
         await check_sandbox_static_readiness(_ProbeStub(True))
+
+
+@pytest.mark.asyncio
+async def test_readiness_absolutizes_relative_external_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """A relative ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry is checked as the
+    directory it actually names.
+
+    ``get_external_upload_dirs`` accepts any spelling that resolves to an
+    existing directory, including one relative to the process cwd, while
+    the mount-path contract only compares absolute paths. Absolutizing
+    through the same owner the runtime build path uses is what lets the
+    startup gate see this entry and the equivalent absolute
+    ``SANDBOX_VOLUMES`` spelling as the same host path -- and keeps a legal
+    relative configuration from failing startup outright.
+    """
+    external_dir = tmp_path / "shared-kb"
+    external_dir.mkdir()
+    monkeypatch.chdir(tmp_path)
+
+    with (
+        patch.dict(
+            "os.environ",
+            {
+                "SANDBOX_VOLUMES": f"{Path.cwd() / 'shared-kb'}:/guest-other:ro",
+                "XAGENT_EXTERNAL_UPLOAD_DIRS": "shared-kb",
+            },
+            clear=True,
+        ),
+        patch(
+            "xagent.web.sandbox_manager.build_code_mount_volumes",
+            return_value=[],
+        ),
+    ):
+        with pytest.raises(SandboxRuntimeConflictError):
+            await check_sandbox_static_readiness(_ProbeStub(True))
