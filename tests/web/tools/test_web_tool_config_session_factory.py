@@ -2,7 +2,8 @@ import asyncio
 import functools
 import logging
 import threading
-from types import SimpleNamespace
+from dataclasses import fields, is_dataclass
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 from sqlalchemy import create_engine, event
@@ -902,6 +903,147 @@ async def test_factory_runtime_snapshot_is_rebuilt_for_each_build(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_handoff_retains_loaded_model_values_without_database_fallback():
+    from xagent.web.tools.config import (
+        _ToolFactoryRuntimeLoadPlan,
+        _ToolFactoryRuntimeSnapshot,
+    )
+
+    image_adapter = object()
+    video_adapter = object()
+    tts_adapter = object()
+    music_adapter = object()
+    credential_map = {("provider", "api_key"): "secret"}
+    sql_connections = {"database": "postgresql://secret"}
+    custom_api_configs = [{"id": object()}]
+    published_agent_records = [object()]
+    plan = _ToolFactoryRuntimeLoadPlan(
+        user_id=1,
+        task_id=None,
+        connector_runtime_turn_id=None,
+        load_policy=False,
+        load_basic=False,
+        load_sql=False,
+        load_custom_api=False,
+        load_vision=True,
+        load_image=True,
+        load_video=False,
+        load_audio=True,
+        published_agent_policy=None,
+    )
+    snapshot = _ToolFactoryRuntimeSnapshot(
+        plan=plan,
+        tool_credentials=credential_map,
+        sql_connections=sql_connections,
+        custom_api_configs=custom_api_configs,
+        vision_model=None,
+        image_models={"image": image_adapter},
+        image_generate_model=None,
+        image_edit_model=image_adapter,
+        video_models={"video": video_adapter},
+        video_model=video_adapter,
+        asr_models={},
+        asr_model=None,
+        tts_models={"tts": tts_adapter},
+        tts_model=tts_adapter,
+        sound_effect_models={},
+        sound_effect_model=None,
+        music_models={"music": music_adapter},
+        music_model=music_adapter,
+        published_agent_records=published_agent_records,
+    )
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=1,
+    )
+    cfg._factory_runtime_snapshot = snapshot
+    cfg.handoff_factory_runtime()
+
+    retained = cfg._retained_factory_model_state
+    assert is_dataclass(retained)
+    assert retained.__dataclass_params__.frozen
+    assert {item.name for item in fields(retained)} == {
+        "load_vision",
+        "load_image",
+        "load_video",
+        "load_audio",
+        "vision_model",
+        "image_models",
+        "image_generate_model",
+        "image_edit_model",
+        "video_models",
+        "video_model",
+        "asr_models",
+        "asr_model",
+        "tts_models",
+        "tts_model",
+        "sound_effect_models",
+        "sound_effect_model",
+        "music_models",
+        "music_model",
+    }
+    mapping_proxy_type = type(MappingProxyType({}))
+    for name in (
+        "image_models",
+        "video_models",
+        "asr_models",
+        "tts_models",
+        "sound_effect_models",
+        "music_models",
+    ):
+        assert isinstance(getattr(retained, name), mapping_proxy_type)
+    for forbidden in (
+        snapshot,
+        plan,
+        credential_map,
+        sql_connections,
+        custom_api_configs,
+        published_agent_records,
+    ):
+        assert all(value is not forbidden for value in vars(retained).values())
+
+    assert cfg.get_vision_model() is None
+    assert cfg.get_image_generate_model() is None
+    assert cfg.get_image_edit_model() is image_adapter
+    assert cfg.get_video_model() is None
+    assert cfg.get_asr_model() is None
+    assert cfg.get_tts_model() is tts_adapter
+    assert cfg.get_sound_effect_model() is None
+    assert cfg.get_music_model() is music_adapter
+
+    mapping_getters = (
+        (cfg.get_image_models, {"image": image_adapter}),
+        (cfg.get_video_models, {}),
+        (cfg.get_asr_models, {}),
+        (cfg.get_tts_models, {"tts": tts_adapter}),
+        (cfg.get_sound_effect_models, {}),
+        (cfg.get_music_models, {"music": music_adapter}),
+    )
+    for getter, expected in mapping_getters:
+        returned = getter()
+        assert returned == expected
+        returned["mutation"] = object()
+        assert getter() == expected
+        assert getter() is not returned
+
+    cfg.close()
+
+    assert cfg._retained_factory_model_state is None
+    assert cfg.get_vision_model() is None
+    assert cfg.get_image_generate_model() is None
+    assert cfg.get_image_edit_model() is None
+    assert cfg.get_video_model() is None
+    assert cfg.get_asr_model() is None
+    assert cfg.get_tts_model() is None
+    assert cfg.get_sound_effect_model() is None
+    assert cfg.get_music_model() is None
+    for getter, _expected in mapping_getters:
+        assert getter() == {}
+
+
+@pytest.mark.asyncio
 async def test_policy_refresh_defers_full_factory_inputs_until_build(monkeypatch):
     sessions: list[_TrackingSession] = []
 
@@ -1054,24 +1196,32 @@ async def test_factory_prepare_snapshots_selected_sync_factory_inputs(
     assert cfg.get_sql_connections() == {"WAREHOUSE": "sqlite:///warehouse.db"}
     assert cfg.get_custom_api_configs() == []
     assert cfg.get_vision_model() is model_values["get_default_vision_model"]
-    assert cfg.get_image_models() is model_values["get_image_models"]
     assert (
         cfg.get_image_generate_model()
         is model_values["get_default_image_generate_model"]
     )
     assert cfg.get_image_edit_model() is model_values["get_default_image_edit_model"]
-    assert cfg.get_video_models() is model_values["get_video_models"]
     assert cfg.get_video_model() is model_values["get_default_video_model"]
-    assert cfg.get_asr_models() is model_values["get_asr_models"]
     assert cfg.get_asr_model() is model_values["get_default_asr_model"]
-    assert cfg.get_tts_models() is model_values["get_tts_models"]
     assert cfg.get_tts_model() is model_values["get_default_tts_model"]
-    assert cfg.get_sound_effect_models() is model_values["get_sound_effect_models"]
     assert (
         cfg.get_sound_effect_model() is model_values["get_default_sound_effect_model"]
     )
-    assert cfg.get_music_models() is model_values["get_music_models"]
     assert cfg.get_music_model() is model_values["get_default_music_model"]
+    mapping_getters = (
+        (cfg.get_image_models, "get_image_models"),
+        (cfg.get_video_models, "get_video_models"),
+        (cfg.get_asr_models, "get_asr_models"),
+        (cfg.get_tts_models, "get_tts_models"),
+        (cfg.get_sound_effect_models, "get_sound_effect_models"),
+        (cfg.get_music_models, "get_music_models"),
+    )
+    for getter, model_value_name in mapping_getters:
+        expected = model_values[model_value_name]
+        returned = getter()
+        assert returned == expected
+        assert returned is not expected
+        assert all(returned[key] is value for key, value in expected.items())
     assert loader_thread_ids
     assert all(thread_id != main_thread_id for thread_id in loader_thread_ids)
 
