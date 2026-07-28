@@ -19,12 +19,18 @@ from uuid import uuid4
 from ...config import get_default_task_execution_mode
 from ...core.file_storage.keys import build_task_output_storage_key
 from ...core.workspace import WorkspaceFileRegistration
+from ..models.agent import Agent, AgentOrigin
 from ..models.database import get_session_local
 from ..models.task import Task, TaskStatus
 from ..models.uploaded_file import UploadedFile
 from ..models.user import User
 from ..models.user_channel import UserChannel
+from .agent_team_scope import get_agent_team_scope, owned_agent_clause
 from .chat_history_service import persist_user_message
+from .connector_runtime import (
+    bind_connector_runtime_selection_snapshot,
+    prepare_connector_runtime_selection_snapshot,
+)
 from .db_runtime import await_task_settlement, run_db_io_cancellation_safe
 from .managed_task_lease import (
     ManagedTaskLease,
@@ -59,6 +65,14 @@ class ChannelOwnerSnapshot:
 
 
 @dataclass(frozen=True)
+class ChannelAgentSnapshot:
+    """Detached Agent Builder identity selectable from a channel."""
+
+    agent_id: int
+    name: str
+
+
+@dataclass(frozen=True)
 class ClaimedChannelTask:
     """Detached channel turn identity with an already-managed exact lease."""
 
@@ -66,6 +80,7 @@ class ClaimedChannelTask:
     task_id: int
     is_new_task: bool
     managed_lease: ManagedTaskLease
+    requested_agent_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -76,6 +91,7 @@ class _ChannelTaskClaimSnapshot:
     task_id: int
     is_new_task: bool
     lease: TaskLease
+    requested_agent_missing: bool = False
 
 
 @dataclass(frozen=True)
@@ -238,6 +254,94 @@ async def authorize_channel_sender(
     )
 
 
+def _owned_channel_agents_query(db: Any, owner_id: int) -> Any:
+    # Mirrors AgentStore.list_agent_items: agents the owner manages, with
+    # workforce-generated manager agents excluded like every other external
+    # channel (share/widget/api-keys/triggers).
+    return db.query(Agent).filter(
+        owned_agent_clause(owner_id, get_agent_team_scope(db, owner_id)),
+        Agent.origin != AgentOrigin.WORKFORCE_GENERATED_MANAGER.value,
+    )
+
+
+def _list_channel_owner_agents_sync(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+) -> tuple[ChannelAgentSnapshot, ...]:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        owner = _load_channel_owner_sync(
+            db,
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+        )
+        agents = (
+            _owned_channel_agents_query(db, owner.user_id)
+            .order_by(Agent.created_at.desc())
+            .all()
+        )
+        return tuple(
+            ChannelAgentSnapshot(agent_id=int(agent.id), name=str(agent.name))
+            for agent in agents
+        )
+
+
+async def list_channel_owner_agents(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+) -> tuple[ChannelAgentSnapshot, ...]:
+    """List the channel owner's selectable Agent Builder agents."""
+
+    return await run_db_io_cancellation_safe(
+        lambda: _list_channel_owner_agents_sync(
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+        )
+    )
+
+
+def _get_channel_owner_agent_sync(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    agent_id: int,
+) -> ChannelAgentSnapshot | None:
+    SessionLocal = get_session_local()
+    with SessionLocal() as db:
+        owner = _load_channel_owner_sync(
+            db,
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+        )
+        agent = (
+            _owned_channel_agents_query(db, owner.user_id)
+            .filter(Agent.id == int(agent_id))
+            .first()
+        )
+        if agent is None:
+            return None
+        return ChannelAgentSnapshot(agent_id=int(agent.id), name=str(agent.name))
+
+
+async def get_channel_owner_agent(
+    *,
+    channel_id: int | None,
+    external_user_id: str,
+    agent_id: int,
+) -> ChannelAgentSnapshot | None:
+    """Resolve one selectable agent, or ``None`` when not owner-visible."""
+
+    return await run_db_io_cancellation_safe(
+        lambda: _get_channel_owner_agent_sync(
+            channel_id=channel_id,
+            external_user_id=external_user_id,
+            agent_id=agent_id,
+        )
+    )
+
+
 def _prepare_channel_task_sync(
     *,
     channel_id: int | None,
@@ -246,6 +350,7 @@ def _prepare_channel_task_sync(
     text: str,
     channel_name: str | None,
     expected_owner_user_id: int | None,
+    agent_id: int | None = None,
 ) -> _ChannelTaskClaimSnapshot | None:
     SessionLocal = get_session_local()
     with SessionLocal() as db:
@@ -272,8 +377,32 @@ def _prepare_channel_task_sync(
                     .first()
                 )
 
+            # Revalidate the requested selection on every turn, not only for
+            # new tasks. A conversation may only continue when its task binding
+            # still matches the selection: a stale selection (agent deleted or
+            # visibility revoked) or a drifted binding evicts to a fresh task
+            # instead of resuming with stale cached agent state.
+            agent_row = None
+            requested_agent_missing = False
+            if agent_id is not None:
+                agent_row = (
+                    _owned_channel_agents_query(db, owner_id)
+                    .filter(Agent.id == int(agent_id))
+                    .first()
+                )
+                requested_agent_missing = agent_row is None
+                if task is not None:
+                    if agent_row is None:
+                        # Evict to a clean default task; never fail the turn.
+                        task = None
+                    elif task.agent_id is None or int(task.agent_id) != int(
+                        agent_row.id
+                    ):
+                        task = None
+
             is_new_task = task is None
             if task is None:
+                task_agent_id = int(agent_row.id) if agent_row is not None else None
                 task_title = text or "Untitled Task"
                 if len(task_title) > 50:
                     task_title = f"{task_title[:50]}..."
@@ -282,10 +411,20 @@ def _prepare_channel_task_sync(
                     title=task_title,
                     description=text,
                     status=TaskStatus.PENDING,
-                    execution_mode=get_default_task_execution_mode(),
+                    execution_mode=get_default_task_execution_mode(
+                        agent_id=task_agent_id
+                    ),
                     channel_id=channel_id,
                     channel_name=channel_name,
-                    connector_runtime_selected_refs=[],
+                    agent_id=task_agent_id,
+                )
+                selected_refs = prepare_connector_runtime_selection_snapshot(
+                    db=db,
+                    agent=agent_row,
+                    connector_user_id=owner_id,
+                )
+                bind_connector_runtime_selection_snapshot(
+                    task=task, selected_refs=selected_refs
                 )
                 db.add(task)
                 db.flush()
@@ -308,6 +447,7 @@ def _prepare_channel_task_sync(
                 task_id=task_id,
                 is_new_task=is_new_task,
                 lease=lease,
+                requested_agent_missing=requested_agent_missing,
             )
         except Exception:
             db.rollback()
@@ -322,6 +462,7 @@ async def prepare_channel_task(
     text: str,
     channel_name: str | None,
     expected_owner_user_id: int | None = None,
+    agent_id: int | None = None,
 ) -> ClaimedChannelTask | None:
     """Authorize, resolve/create, and claim one exact channel run atomically."""
 
@@ -334,6 +475,7 @@ async def prepare_channel_task(
             text=text,
             channel_name=channel_name,
             expected_owner_user_id=expected_owner_user_id,
+            agent_id=agent_id,
         )
     )
     snapshot, cancellation = await await_task_settlement(worker)
@@ -382,6 +524,7 @@ async def prepare_channel_task(
         task_id=snapshot.task_id,
         is_new_task=snapshot.is_new_task,
         managed_lease=managed_lease,
+        requested_agent_missing=snapshot.requested_agent_missing,
     )
 
 

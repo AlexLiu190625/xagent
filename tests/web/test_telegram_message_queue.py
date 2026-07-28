@@ -29,6 +29,9 @@ def make_bot() -> TelegramBotInstance:
     bot.user_active_executions = {}
     bot.user_preparing_executions = set()
     bot.user_stop_events = {}
+    bot.user_conversation_generations = {}
+    bot.selected_agents = {}
+    bot._save_selected_agents = lambda: None
     return bot
 
 
@@ -378,6 +381,7 @@ async def test_stop_after_prepare_settles_preclaimed_task_instead_of_orphaning_i
             task_id=44,
             is_new_task=True,
             managed_lease=managed,
+            requested_agent_missing=False,
         )
 
     monkeypatch.setattr(
@@ -984,6 +988,7 @@ async def test_channel_failure_suppresses_stale_error_after_exact_settlement_rej
             task_id=44,
             is_new_task=True,
             managed_lease=managed,
+            requested_agent_missing=False,
         )
 
     monkeypatch.setattr(
@@ -1055,3 +1060,457 @@ def test_stop_request_text_aliases(text: str, expected: bool) -> None:
     bot = make_bot()
 
     assert bot._is_stop_request_text(text) is expected
+
+
+def _agent(agent_id: int, name: str) -> SimpleNamespace:
+    return SimpleNamespace(agent_id=agent_id, name=name)
+
+
+def test_build_agents_keyboard_lists_default_and_agents() -> None:
+    agents = [_agent(1, "Alpha"), _agent(2, "Beta")]
+
+    keyboard = TelegramBotInstance._build_agents_keyboard(
+        agents, 0, selected_agent_id=2
+    )
+
+    rows = keyboard.inline_keyboard
+    assert rows[0][0].text == "Default assistant"
+    assert rows[0][0].callback_data == "agsel:default"
+    assert rows[1][0].text == "Alpha"
+    assert rows[1][0].callback_data == "agsel:1"
+    assert rows[2][0].text == "Beta ✓"
+    assert rows[2][0].callback_data == "agsel:2"
+    assert len(rows) == 3
+    for row in rows:
+        for button in row:
+            assert len(button.callback_data.encode()) <= 64
+
+
+def test_build_agents_keyboard_truncates_long_names_with_ellipsis() -> None:
+    long_name = "A" * 80
+
+    keyboard = TelegramBotInstance._build_agents_keyboard(
+        [_agent(1, long_name)], 0, selected_agent_id=None
+    )
+
+    label = keyboard.inline_keyboard[1][0].text
+    assert label == f"{'A' * 57}..."
+
+
+def test_build_agents_keyboard_marks_default_when_no_selection() -> None:
+    keyboard = TelegramBotInstance._build_agents_keyboard(
+        [_agent(1, "Alpha")], 0, selected_agent_id=None
+    )
+
+    assert keyboard.inline_keyboard[0][0].text == "Default assistant ✓"
+
+
+def test_build_agents_keyboard_paginates() -> None:
+    agents = [_agent(i, f"Agent {i}") for i in range(20)]
+    page_size = TelegramBotInstance.agents_page_size
+
+    first = TelegramBotInstance._build_agents_keyboard(
+        agents, 0, selected_agent_id=None
+    )
+    # default row + page of agents + nav row
+    assert len(first.inline_keyboard) == page_size + 2
+    assert [b.text for b in first.inline_keyboard[-1]] == ["Next ➡"]
+    assert first.inline_keyboard[-1][0].callback_data == "agpage:1"
+
+    middle = TelegramBotInstance._build_agents_keyboard(
+        agents, 1, selected_agent_id=None
+    )
+    assert [b.text for b in middle.inline_keyboard[-1]] == ["⬅ Prev", "Next ➡"]
+
+    # An out-of-range page clamps to the last page
+    last = TelegramBotInstance._build_agents_keyboard(
+        agents, 99, selected_agent_id=None
+    )
+    assert [b.text for b in last.inline_keyboard[-1]] == ["⬅ Prev"]
+    assert last.inline_keyboard[1][0].text == f"Agent {2 * page_size}"
+
+
+class _FakeCallback:
+    def __init__(self, user_id: int, data: str) -> None:
+        self.from_user = SimpleNamespace(id=user_id)
+        self.data = data
+        self.answers: list[tuple[tuple, dict]] = []
+        self.message = None
+
+    async def answer(self, *args, **kwargs) -> None:
+        self.answers.append((args, kwargs))
+
+
+@pytest.mark.asyncio
+async def test_agent_selection_callback_binds_agent_and_starts_fresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.active_tasks = {123: 44}
+    bot._save_active_tasks = lambda: None
+
+    async def fake_get_agent(**kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs == {
+            "channel_id": 1,
+            "external_user_id": "123",
+            "agent_id": 7,
+        }
+        return SimpleNamespace(agent_id=7, name="Research Agent")
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_channel_owner_agent",
+        fake_get_agent,
+    )
+
+    callback = _FakeCallback(123, "agsel:7")
+    await bot._handle_agent_selection_callback(callback)  # type: ignore[arg-type]
+
+    assert bot.selected_agents == {123: 7}
+    assert bot.active_tasks[123] == -1
+    assert callback.answers == [(("Research Agent selected",), {})]
+
+
+@pytest.mark.asyncio
+async def test_agent_selection_callback_default_clears_selection() -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.active_tasks = {123: 44}
+    bot._save_active_tasks = lambda: None
+    bot.selected_agents = {123: 7}
+
+    callback = _FakeCallback(123, "agsel:default")
+    await bot._handle_agent_selection_callback(callback)  # type: ignore[arg-type]
+
+    assert bot.selected_agents == {}
+    assert bot.active_tasks[123] == -1
+    assert callback.answers == [(("Default assistant selected",), {})]
+
+
+@pytest.mark.asyncio
+async def test_agent_selection_callback_alerts_when_agent_gone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.active_tasks = {123: 44}
+    bot._save_active_tasks = lambda: None
+    bot.selected_agents = {123: 7}
+
+    async def fake_get_agent(**_kwargs):  # type: ignore[no-untyped-def]
+        return None
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_channel_owner_agent",
+        fake_get_agent,
+    )
+
+    callback = _FakeCallback(123, "agsel:9")
+    await bot._handle_agent_selection_callback(callback)  # type: ignore[arg-type]
+
+    # Selection and conversation stay untouched
+    assert bot.selected_agents == {123: 7}
+    assert bot.active_tasks[123] == 44
+    assert callback.answers == [
+        (("That agent is no longer available.",), {"show_alert": True})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_agents_command_reports_empty_agent_list(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+
+    async def fake_list(**_kwargs):  # type: ignore[no-untyped-def]
+        return ()
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.list_channel_owner_agents",
+        fake_list,
+    )
+
+    answers: list[tuple[str, dict]] = []
+
+    class Message:
+        from_user = SimpleNamespace(id=123)
+
+        async def answer(self, text: str, **kwargs) -> None:
+            answers.append((text, kwargs))
+
+    await bot._handle_agents_command(Message())  # type: ignore[arg-type]
+
+    assert len(answers) == 1
+    assert "don't have any custom agents yet" in answers[0][0]
+
+
+@pytest.mark.asyncio
+async def test_agents_command_sends_keyboard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.selected_agents = {123: 2}
+
+    async def fake_list(**kwargs):  # type: ignore[no-untyped-def]
+        assert kwargs == {"channel_id": 1, "external_user_id": "123"}
+        return (_agent(1, "Alpha"), _agent(2, "Beta"))
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.list_channel_owner_agents",
+        fake_list,
+    )
+
+    answers: list[tuple[str, dict]] = []
+
+    class Message:
+        from_user = SimpleNamespace(id=123)
+
+        async def answer(self, text: str, **kwargs) -> None:
+            answers.append((text, kwargs))
+
+    await bot._handle_agents_command(Message())  # type: ignore[arg-type]
+
+    assert len(answers) == 1
+    keyboard = answers[0][1]["reply_markup"]
+    assert keyboard.inline_keyboard[2][0].text == "Beta ✓"
+
+
+@pytest.mark.asyncio
+async def test_agents_command_reports_unauthorized_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.services.channel_runtime import ChannelAuthorizationError
+
+    bot = make_bot()
+    bot.channel_id = 1
+
+    async def fake_list(**_kwargs):  # type: ignore[no-untyped-def]
+        raise ChannelAuthorizationError("nope")
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.list_channel_owner_agents",
+        fake_list,
+    )
+
+    answers: list[str] = []
+
+    class Message:
+        from_user = SimpleNamespace(id=123)
+
+        async def answer(self, text: str, **_kwargs) -> None:
+            answers.append(text)
+
+    await bot._handle_agents_command(Message())  # type: ignore[arg-type]
+
+    assert answers == ["🚫 You are not authorized to use this bot."]
+
+
+def test_set_selected_agent_round_trips_persistence(tmp_path: Path) -> None:
+    bot = object.__new__(TelegramBotInstance)
+    bot.instance_id = "test-bot"
+    bot.selected_agents_file = tmp_path / "selected_agents.json"
+    bot.selected_agents = {}
+
+    bot._set_selected_agent(123, 7)
+    assert bot._load_selected_agents() == {123: 7}
+
+    bot._set_selected_agent(123, None)
+    assert bot._load_selected_agents() == {}
+
+
+@pytest.mark.asyncio
+async def test_batch_passes_selected_agent_and_clears_stale_selection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.channel_name = "Telegram agent selection"
+    bot.active_tasks = {}
+    bot._save_active_tasks = lambda: None
+    bot._clear_user_stop_request = lambda _user_id: None
+    bot.selected_agents = {123: 7}
+
+    stop_checks = 0
+
+    def consume_stop(_user_id: int) -> bool:
+        nonlocal stop_checks
+        stop_checks += 1
+        return stop_checks == 1
+
+    bot._consume_user_stop_request = consume_stop
+
+    lease = TaskLease(task_id=44, runner_id="runner-a", run_id="run-a")
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+
+        async def finalize_result(self, **_kwargs) -> bool:
+            return True
+
+        async def close(self) -> bool:
+            return True
+
+    prepare_kwargs: dict = {}
+
+    async def prepare(**kwargs):  # type: ignore[no-untyped-def]
+        prepare_kwargs.update(kwargs)
+        return SimpleNamespace(
+            user_id=5,
+            task_id=44,
+            is_new_task=True,
+            managed_lease=FakeManagedLease(),
+            requested_agent_missing=True,
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task",
+        prepare,
+    )
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    bot._extract_message_content = extract_text
+
+    answers: list[str] = []
+
+    class Message:
+        voice = None
+        chat = SimpleNamespace(id=456)
+
+        async def answer(self, text: str, **_kwargs) -> None:
+            answers.append(text)
+
+    await bot._process_user_messages_batch(123, [Message()])  # type: ignore[arg-type]
+
+    assert prepare_kwargs["agent_id"] == 7
+    assert bot.selected_agents == {}
+    assert any("no longer available" in text for text in answers)
+
+
+def test_selected_agents_store_path_is_durable_and_collision_free(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("XAGENT_STORAGE_ROOT", str(tmp_path))
+
+    by_channel = TelegramBotInstance._selected_agents_store_path(5, "12345678:token-a")
+    other_channel = TelegramBotInstance._selected_agents_store_path(
+        6, "12345678:token-a"
+    )
+    assert by_channel == tmp_path / "telegram" / "selected_agents_channel_5.json"
+    assert by_channel != other_channel
+    assert by_channel.is_relative_to(tmp_path)
+
+    # Without a channel id the key is a full-token hash, so distinct bots
+    # sharing an eight-character token prefix cannot collide.
+    same_prefix_a = TelegramBotInstance._selected_agents_store_path(
+        None, "12345678:token-a"
+    )
+    same_prefix_b = TelegramBotInstance._selected_agents_store_path(
+        None, "12345678:token-b"
+    )
+    assert same_prefix_a != same_prefix_b
+    assert same_prefix_a.is_relative_to(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_agent_selection_toast_stays_within_telegram_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.active_tasks = {}
+    bot._save_active_tasks = lambda: None
+    # 192-char name: the raw toast would be 201 chars, one over the API limit
+    long_name = "A" * 192
+
+    async def fake_get_agent(**_kwargs):  # type: ignore[no-untyped-def]
+        return SimpleNamespace(agent_id=7, name=long_name)
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.get_channel_owner_agent",
+        fake_get_agent,
+    )
+
+    callback = _FakeCallback(123, "agsel:7")
+    await bot._handle_agent_selection_callback(callback)  # type: ignore[arg-type]
+
+    toast = callback.answers[0][0][0]
+    assert len(toast) == 200
+    assert toast.endswith("...")
+    assert bot.selected_agents == {123: 7}
+
+
+@pytest.mark.asyncio
+async def test_batch_discards_prepared_task_after_conversation_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bot = make_bot()
+    bot.channel_id = 1
+    bot.channel_name = "Telegram generation fence"
+    bot.active_tasks = {}
+    bot._save_active_tasks = lambda: None
+    bot._clear_user_stop_request = lambda _user_id: None
+    bot._consume_user_stop_request = lambda _user_id: False
+    bot.selected_agents = {123: 7}
+
+    lease = TaskLease(task_id=44, runner_id="runner-a", run_id="run-a")
+    finalized: list[TaskStatus] = []
+
+    class FakeManagedLease:
+        heartbeat_task = None
+
+        def __init__(self) -> None:
+            self.lease = lease
+
+        async def finalize_result(self, *, status: TaskStatus, **_kwargs) -> bool:
+            finalized.append(status)
+            return True
+
+        async def close(self) -> bool:
+            return True
+
+    async def prepare(**_kwargs):  # type: ignore[no-untyped-def]
+        # The user switches agents while this preparation is in flight
+        bot._set_selected_agent(123, 9)
+        bot._start_new_conversation(123)
+        return SimpleNamespace(
+            user_id=5,
+            task_id=44,
+            is_new_task=True,
+            managed_lease=FakeManagedLease(),
+            requested_agent_missing=True,
+        )
+
+    monkeypatch.setattr(
+        "xagent.web.channels.telegram.bot.prepare_channel_task",
+        prepare,
+    )
+
+    async def extract_text(_message):  # type: ignore[no-untyped-def]
+        return "hello", []
+
+    bot._extract_message_content = extract_text
+
+    answers: list[str] = []
+
+    class Message:
+        voice = None
+        chat = SimpleNamespace(id=456)
+
+        async def answer(self, text: str, **_kwargs) -> None:
+            answers.append(text)
+
+    await bot._process_user_messages_batch(123, [Message()])  # type: ignore[arg-type]
+
+    # The stale claim is settled, and neither the new conversation marker nor
+    # the newer agent selection is overwritten by the stale result.
+    assert finalized == [TaskStatus.PAUSED]
+    assert bot.active_tasks[123] == -1
+    assert bot.selected_agents == {123: 9}
+    assert answers == []
