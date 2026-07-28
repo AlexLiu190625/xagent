@@ -250,7 +250,8 @@ describe("SessionAgentChatPage connection failure integration", () => {
     dispatchSession()
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
 
-    act(() => MockWebSocket.instances[0].open("xagent-session-v1"))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open("xagent-session-v1"))
     dispatchDegradedSession()
 
     await waitFor(() => {
@@ -260,5 +261,7 @@ describe("SessionAgentChatPage connection failure integration", () => {
     })
     expect(screen.queryByTestId("session-start")).not.toBeInTheDocument()
     expect(MockWebSocket.constructionCount).toBe(1)
+    expect(socket.close).toHaveBeenCalledTimes(1)
+    expect(socket.readyState).toBe(MockWebSocket.CLOSED)
   })
 })
