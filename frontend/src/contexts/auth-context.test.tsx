@@ -82,6 +82,25 @@ function AuthLogoutProbe() {
   </>
 }
 
+function AuthLoginLogoutProbe() {
+  const { login, logout, token } = useAuth()
+  const [loginResult, setLoginResult] = React.useState("pending")
+  const [logoutResult, setLogoutResult] = React.useState("pending")
+  return <>
+    <span data-testid="login-logout-token">{token || "none"}</span>
+    <span data-testid="login-result">{loginResult}</span>
+    <span data-testid="login-logout-result">{logoutResult}</span>
+    <button onClick={() => { void login("alice", "password").then(value => setLoginResult(String(value))) }}>Login</button>
+    <button onClick={() => { void logout().then(value => setLogoutResult(String(value))) }}>Logout</button>
+  </>
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  const promise = new Promise<T>(resolvePromise => { resolve = resolvePromise })
+  return { promise, resolve }
+}
+
 function AuthSsrProbe() {
   const { isLoading, session } = useAuth()
   return <span>{`${isLoading}:${session.accessToken || "none"}`}</span>
@@ -476,6 +495,47 @@ describe("AuthProvider storage synchronization", () => {
     await waitFor(() => {
       expect(screen.getByTestId("logout-result")).toHaveTextContent("false")
       expect(screen.getByTestId("logout-token")).toHaveTextContent("none")
+    })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
+  })
+
+  it("does not persist a same-tab login response after logout invalidates the operation", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "existing-access", "existing-refresh", 120, 240)
+    const loginResponse = deferred<Response>()
+    vi.mocked(apiRequest).mockImplementation(async url => {
+      if (String(url).endsWith("/api/auth/login")) return loginResponse.promise
+      return new Response(null, { status: 404 })
+    })
+    render(<AuthProvider><AuthLoginLogoutProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("login-logout-token")).toHaveTextContent("existing-access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Login" }))
+    await waitFor(() => expect(apiRequest).toHaveBeenCalledWith(expect.stringContaining("/api/auth/login"), expect.anything()))
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    const originalRemoveItem = localStorage.removeItem.bind(localStorage)
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === "auth_login_intent" || key === "auth_revoked_login_intent") throw new Error("barrier persistence failed")
+      originalSetItem(key, value)
+    })
+    const removeItem = vi.spyOn(localStorage, "removeItem").mockImplementation(key => {
+      if (key === "auth_login_intent") throw new Error("intent removal failed")
+      originalRemoveItem(key)
+    })
+    fireEvent.click(screen.getByRole("button", { name: "Logout" }))
+    await waitFor(() => expect(screen.getByTestId("login-logout-token")).toHaveTextContent("none"))
+    setItem.mockRestore()
+    removeItem.mockRestore()
+
+    await act(async () => {
+      loginResponse.resolve(new Response(JSON.stringify({
+        user: { id: "1", username: "alice" }, access_token: "late-access", refresh_token: "late-refresh",
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      await loginResponse.promise
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("login-result")).toHaveTextContent("false")
+      expect(screen.getByTestId("login-logout-token")).toHaveTextContent("none")
     })
     expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
   })

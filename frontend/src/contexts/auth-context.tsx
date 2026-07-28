@@ -96,7 +96,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       if (claimed.status !== "claimed") return false
       const response = await apiRequest(`${getApiUrl()}/api/auth/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ username, password }) })
       if (!response.ok) return false
-      const created = await createAuthSession(await response.json(), claimed.intent)
+      const payload = await response.json()
+      if (!mountedRef.current || operation !== operationRef.current) return false
+      const created = await createAuthSession(payload, claimed.intent)
       if (created.status !== "created") return false
       if (mountedRef.current && operation === operationRef.current) setProjection(created.projection)
       return true

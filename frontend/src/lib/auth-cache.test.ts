@@ -324,6 +324,54 @@ describe("auth cache lineage", () => {
     expect(events).toEqual(["updated"])
     await expect(createAuthSession({ user, access_token: "late" }, claim.intent)).resolves.toEqual({ status: "superseded" })
   })
+  it("revokes the exact pending login intent when a logout cannot replace or remove it", async () => {
+    await created({ user, access_token: "existing-access", refresh_token: "existing-refresh" })
+    const pending = await claimAuthLoginIntent()
+    expect(pending.status).toBe("claimed")
+    if (pending.status !== "claimed") throw new Error("expected pending intent")
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    const originalRemoveItem = localStorage.removeItem.bind(localStorage)
+    const setItem = vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === AUTH_LOGIN_INTENT_KEY) throw new Error("intent write failed")
+      originalSetItem(key, value)
+    })
+    const removeItem = vi.spyOn(localStorage, "removeItem").mockImplementation(key => {
+      if (key === AUTH_LOGIN_INTENT_KEY) throw new Error("intent removal failed")
+      originalRemoveItem(key)
+    })
+
+    const result = await clearStoredAuth()
+
+    expect(result).toMatchObject({ status: "cleared", credentialsCleared: true, barrier: "revoked" })
+    await expect(createAuthSession({ user, access_token: "late-access" }, pending.intent)).resolves.toEqual({ status: "superseded" })
+    expect(inspectAuthSession().status).toBe("absent")
+    setItem.mockRestore()
+    removeItem.mockRestore()
+    const later = await claimAuthLoginIntent()
+    expect(later.status).toBe("claimed")
+    if (later.status !== "claimed") throw new Error("expected later intent")
+    await expect(createAuthSession({ user, access_token: "later-access" }, later.intent)).resolves.toMatchObject({ status: "created" })
+  })
+  it("reports unavailable when logout cannot persist a revoked pending intent", async () => {
+    await created({ user, access_token: "existing-access", refresh_token: "existing-refresh" })
+    const pending = await claimAuthLoginIntent()
+    expect(pending.status).toBe("claimed")
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    const originalRemoveItem = localStorage.removeItem.bind(localStorage)
+    vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === AUTH_LOGIN_INTENT_KEY || key === "auth_revoked_login_intent") throw new Error("barrier persistence failed")
+      originalSetItem(key, value)
+    })
+    vi.spyOn(localStorage, "removeItem").mockImplementation(key => {
+      if (key === AUTH_LOGIN_INTENT_KEY) throw new Error("intent removal failed")
+      originalRemoveItem(key)
+    })
+
+    const result = await clearStoredAuth()
+
+    expect(result).toMatchObject({ status: "unavailable", credentialsCleared: true, barrier: "unavailable" })
+    expect(inspectAuthSession().status).toBe("absent")
+  })
   it("publishes credential deletion after lock release even when a later removal fails", async () => {
     let lockHeld = false
     Object.defineProperty(navigator, "locks", { configurable: true, value: {

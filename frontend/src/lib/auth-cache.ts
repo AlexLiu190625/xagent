@@ -1,5 +1,6 @@
 export const AUTH_CACHE_KEY = "auth_cache"
 export const AUTH_LOGIN_INTENT_KEY = "auth_login_intent"
+export const AUTH_REVOKED_LOGIN_INTENT_KEY = "auth_revoked_login_intent"
 export const AUTH_OIDC_INTENT_KEY = "auth_oidc_intent"
 export const AUTH_TOKEN_UPDATED_EVENT = "auth-token-updated"
 export const LEGACY_AUTH_TOKEN_KEY = "auth_token"
@@ -61,7 +62,7 @@ export type AuthMutationResult =
 export type AuthLogoutResult = {
   status: "cleared" | "unavailable"
   credentialsCleared: boolean
-  barrier: "installed" | "removed" | "unavailable"
+  barrier: "installed" | "removed" | "revoked" | "unavailable"
 }
 export type AuthIntentClaimResult =
   | { status: "claimed"; intent: AuthLoginIntent }
@@ -161,8 +162,9 @@ function serializeAuthLoginIntent(intent: AuthLoginIntent): string {
   return JSON.stringify(persisted)
 }
 function hasAuthLoginIntent(storage: AuthStorage, intent: AuthLoginIntent | null | undefined): boolean {
-  return typeof intent?.id === "string" && intent.id.length > 0
-    && parseAuthLoginIntent(storage.getItem(AUTH_LOGIN_INTENT_KEY))?.id === intent.id
+  if (typeof intent?.id !== "string" || intent.id.length === 0) return false
+  return parseAuthLoginIntent(storage.getItem(AUTH_LOGIN_INTENT_KEY))?.id === intent.id
+    && parseAuthLoginIntent(storage.getItem(AUTH_REVOKED_LOGIN_INTENT_KEY))?.id !== intent.id
 }
 function replaceAuthLoginIntent(storage: AuthStorage): AuthLoginIntent {
   const intent = { id: createSessionId() }
@@ -366,7 +368,13 @@ function unavailable(): AuthMutationResult { return { status: "unavailable" } }
 function nextRevision(value: number): number | null { return value < MAX_REVISION ? value + 1 : null }
 /** Claims exclusive user intent before a password request or OIDC redirect begins. */
 export async function claimAuthLoginIntent(): Promise<AuthIntentClaimResult> {
-  const result = await withMutationLock(true, async ({ storage }) => ({ status: "claimed" as const, intent: replaceAuthLoginIntent(storage) }))
+  const result = await withMutationLock(true, async ({ storage }) => {
+    const intent = replaceAuthLoginIntent(storage)
+    // Tombstones fence only their exact old capability. A later claim has a
+    // distinct id, so failure to prune an old tombstone cannot invalidate it.
+    try { storage.removeItem(AUTH_REVOKED_LOGIN_INTENT_KEY) } catch { /* stale tombstone remains safely scoped */ }
+    return { status: "claimed" as const, intent }
+  })
   return result ?? { status: "unavailable" }
 }
 /** Claims an intent and binds it to this tab before an OIDC full-page redirect. */
@@ -489,15 +497,25 @@ export async function clearAuthSessionIfCurrent(captured: AuthSessionSnapshot): 
 export async function clearStoredAuth(): Promise<AuthLogoutResult> {
   const result = await withMutationLock(false, async ({ storage, markAuthUpdated }) => {
     let barrier: AuthLogoutResult["barrier"] = "unavailable"
+    let pendingIntent: AuthLoginIntent | null = null
+    try { pendingIntent = parseAuthLoginIntent(storage.getItem(AUTH_LOGIN_INTENT_KEY)) } catch { /* no durable intent to revoke */ }
     try {
       replaceAuthLoginIntent(storage)
+      try { storage.removeItem(AUTH_REVOKED_LOGIN_INTENT_KEY) } catch { /* a new barrier supersedes the old tombstone */ }
       barrier = "installed"
     } catch {
       try {
         storage.removeItem(AUTH_LOGIN_INTENT_KEY)
         barrier = "removed"
       } catch {
-        barrier = "unavailable"
+        if (pendingIntent) {
+          try {
+            storage.setItem(AUTH_REVOKED_LOGIN_INTENT_KEY, serializeAuthLoginIntent(pendingIntent))
+            barrier = "revoked"
+          } catch {
+            barrier = "unavailable"
+          }
+        }
       }
     }
 
