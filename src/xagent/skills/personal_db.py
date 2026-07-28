@@ -2,23 +2,24 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from .library import SkillRecord, SkillScopeContext
 
 
-class XagentPersonalDbSkillProvider:
-    """Load personal skills owned by the current xagent user."""
+def _load_personal_skill_records_sync(user_id: int) -> list[SkillRecord]:
+    """Load and detach one user's personal skills in an owned DB session."""
+    from sqlalchemy.orm import selectinload
 
-    async def list_records(self, context: SkillScopeContext) -> list[SkillRecord]:
-        db = context.db
-        user_id = context.user_id or getattr(context.user, "id", None)
-        if db is None or user_id is None:
-            return []
+    from xagent.web.models.database import get_session_local
+    from xagent.web.models.skill import UserSkill
 
-        from xagent.web.models.skill import UserSkill
-
+    session_factory = get_session_local()
+    with session_factory() as db:
         skills = (
             db.query(UserSkill)
-            .filter(UserSkill.user_id == int(user_id))
+            .options(selectinload(UserSkill.files))
+            .filter(UserSkill.user_id == user_id)
             .order_by(UserSkill.name)
             .all()
         )
@@ -34,11 +35,26 @@ class XagentPersonalDbSkillProvider:
                     scope="personal",
                     files=files,
                     path=f"db://personal/{skill.id}",
-                    metadata=dict(skill.skill_metadata or {}),
+                    metadata=deepcopy(dict(skill.skill_metadata or {})),
                     provider_id="xagent-personal-db",
                 )
             )
         return records
+
+
+class XagentPersonalDbSkillProvider:
+    """Load personal skills owned by the current xagent user."""
+
+    async def list_records(self, context: SkillScopeContext) -> list[SkillRecord]:
+        if context.user_id is None:
+            return []
+
+        from xagent.web.services.db_runtime import run_db_io_cancellation_safe
+
+        user_id = int(context.user_id)
+        return await run_db_io_cancellation_safe(
+            lambda: _load_personal_skill_records_sync(user_id)
+        )
 
     async def read_file(
         self, context: SkillScopeContext, record: SkillRecord, path: str

@@ -231,23 +231,39 @@ async def _get_manager(request: Request) -> Any:
     return mgr
 
 
-def _scope_context(request: Request, user: User, db: Any) -> Any:
-    from xagent.skills.library import SkillScopeContext
-
+def _scope_identity(user: User) -> tuple[int | None, dict[str, Any]]:
+    user_id = int(user.id) if user.id is not None else None
     metadata: dict[str, Any] = {}
     team_id = getattr(user, "_saas_team_id", None)
     if isinstance(team_id, int):
         metadata["team_id"] = team_id
+    return user_id, metadata
+
+
+def _scope_context(user: User) -> Any:
+    from xagent.skills.library import SkillScopeContext
+
+    user_id, metadata = _scope_identity(user)
     return SkillScopeContext(
+        user_id=user_id,
+        metadata=metadata,
+    )
+
+
+def _write_context(request: Request, user: User, db: Any) -> Any:
+    from xagent.skills.library import SkillWriteContext
+
+    user_id, metadata = _scope_identity(user)
+    return SkillWriteContext(
         user=user,
-        user_id=int(user.id) if user.id is not None else None,
+        user_id=user_id,
         db=db,
         request=request,
         metadata=metadata,
     )
 
 
-async def _get_scoped_manager(request: Request, user: User, db: Any) -> Any:
+async def _get_scoped_manager(request: Request, user: User) -> Any:
     """Build a per-request SkillManager (no persistent per-user cache).
 
     Caching strategy — decouple by volatility:
@@ -257,13 +273,13 @@ async def _get_scoped_manager(request: Request, user: User, db: Any) -> Any:
         we reuse the records already loaded by the process-wide
         ``app.state.skill_manager`` via ``StaticRecordsProvider``.
       - Personal-DB records are volatile, so ``XagentPersonalDbSkillProvider``
-        is queried fresh on every request (cheap: one SQL query).
+        opens its own short session and is queried fresh on every request.
 
     *Custom-provider path* (SaaS / overlay installed via
     ``set_skill_library_provider``): the provider is used as-is with the
-    user context so that team-scoped records are included.  Each request
-    still gets its own ``SkillManager`` instance, so there is no shared
-    mutable state between concurrent requests.
+    detached scope identity so that team-scoped records can be included.
+    Each request still gets its own ``SkillManager`` instance, so there is no
+    shared mutable state between concurrent requests.
 
     In both paths:
     * No stale-delete bug — the DB layer is always re-queried.
@@ -278,7 +294,7 @@ async def _get_scoped_manager(request: Request, user: User, db: Any) -> Any:
     from xagent.skills.manager import SkillManager
     from xagent.skills.personal_db import XagentPersonalDbSkillProvider
 
-    ctx = _scope_context(request, user, db)
+    ctx = _scope_context(user)
 
     custom_provider = get_skill_library_provider()
     if custom_provider is not None:
@@ -592,7 +608,7 @@ async def list_installed(
     _user: User = Depends(get_current_user),
 ) -> List[SkillSummary]:
     """List every skill the SkillManager can see, tagged with source."""
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     summaries: list[SkillSummary] = []
     for skill in mgr._skills_cache.values():  # noqa: SLF001
         summaries.append(_skill_to_summary(skill))
@@ -608,7 +624,7 @@ async def get_installed(
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillDetail:
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -627,7 +643,7 @@ async def delete_installed(
     _user: User = Depends(get_current_user),
 ) -> Response:
     """Remove a user-installed skill. Builtin / external are refused."""
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -642,7 +658,7 @@ async def delete_installed(
             )
         try:
             await writer.delete_skill(
-                _scope_context(request, _user, db),
+                _write_context(request, _user, db),
                 scope="team",
                 name=name,
             )
@@ -694,7 +710,7 @@ async def create_skill(
             )
         try:
             await writer.create_skill(
-                _scope_context(request, _user, db),
+                _write_context(request, _user, db),
                 scope=body.scope,
                 name=body.name,
                 files={"SKILL.md": body.skill_md.encode("utf-8")},
@@ -711,7 +727,7 @@ async def create_skill(
             files={"SKILL.md": body.skill_md.encode("utf-8")},
         )
 
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     skill = await mgr.get_skill(body.name)
     if skill is None:
         # Most likely cause: malformed YAML frontmatter that the parser
@@ -744,7 +760,7 @@ async def edit_installed(
     refused so we don't silently fork a shipped skill (and so symlinked
     external roots stay readonly from our side).
     """
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -759,7 +775,7 @@ async def edit_installed(
             )
         try:
             await writer.update_skill_file(
-                _scope_context(request, _user, db),
+                _write_context(request, _user, db),
                 scope="team",
                 name=name,
                 path="SKILL.md",
@@ -776,7 +792,7 @@ async def edit_installed(
         )
     else:
         _update_personal_skill_md(db=db, user=_user, name=name, skill_md=body.skill_md)
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     reloaded = await mgr.get_skill(name)
     if reloaded is None:
         raise HTTPException(
@@ -818,7 +834,7 @@ async def registry_list(
     registry = get_registry(source)
     payload = await asyncio.to_thread(registry.list_skills, sort, limit, cursor)
     items_raw = payload.get("items", []) if isinstance(payload, dict) else []
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     installed = _installed_slugs(mgr)
     items = [
         _summary_from_registry_item(i, installed, registry)
@@ -854,7 +870,7 @@ async def registry_search(
         if isinstance(payload, dict)
         else []
     )
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     installed = _installed_slugs(mgr)
     items = [
         _summary_from_registry_item(i, installed, registry)
@@ -926,7 +942,7 @@ async def install_skill(
             )
         try:
             await writer.create_skill(
-                _scope_context(request, _user, db),
+                _write_context(request, _user, db),
                 scope="team",
                 name=body.slug,
                 files=files,
@@ -951,7 +967,7 @@ async def install_skill(
             clawhub_version=body.version,
         )
 
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     skill = await mgr.get_skill(body.slug)
     if skill is None:
         raise HTTPException(
@@ -991,7 +1007,7 @@ async def registry_detail(
     latest = payload.get("latestVersion") or {}
     moderation = payload.get("moderation")
     metadata = payload.get("metadata") or {}
-    mgr = await _get_scoped_manager(request, _user, db)
+    mgr = await _get_scoped_manager(request, _user)
     installed = _installed_slugs(mgr)
     return RegistrySkillDetail(
         slug=slug,

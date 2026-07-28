@@ -11,12 +11,37 @@ from __future__ import annotations
 import mimetypes
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from typing import Any, Protocol
+from types import MappingProxyType
+from typing import Any, Mapping, Protocol
+
+SkillScopeMetadataValue = str | int | float | bool | None
 
 
 @dataclass(frozen=True)
 class SkillScopeContext:
-    """Request/runtime context passed to skill providers."""
+    """Detached runtime identity passed to read-only skill providers.
+
+    Request objects, ORM entities, and database sessions must never enter this
+    context because agent services may retain it across long-running waits.
+    """
+
+    user_id: int | None = None
+    metadata: Mapping[str, SkillScopeMetadataValue] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        metadata = dict(self.metadata)
+        if any(
+            not isinstance(key, str)
+            or not isinstance(value, (str, int, float, bool, type(None)))
+            for key, value in metadata.items()
+        ):
+            raise TypeError("skill scope metadata must contain detached scalar values")
+        object.__setattr__(self, "metadata", MappingProxyType(metadata))
+
+
+@dataclass(frozen=True)
+class SkillWriteContext:
+    """Request-owned resources passed only to scoped skill write providers."""
 
     user: Any | None = None
     user_id: int | None = None
@@ -65,7 +90,7 @@ class SkillWriteProvider(Protocol):
 
     async def create_skill(
         self,
-        context: SkillScopeContext,
+        context: SkillWriteContext,
         *,
         scope: str,
         name: str,
@@ -77,7 +102,7 @@ class SkillWriteProvider(Protocol):
 
     async def update_skill_file(
         self,
-        context: SkillScopeContext,
+        context: SkillWriteContext,
         *,
         scope: str,
         name: str,
@@ -88,7 +113,7 @@ class SkillWriteProvider(Protocol):
 
     async def delete_skill(
         self,
-        context: SkillScopeContext,
+        context: SkillWriteContext,
         *,
         scope: str,
         name: str,
