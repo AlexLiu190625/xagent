@@ -2024,3 +2024,81 @@ class TestCdSymlinkTraversal:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate("cat '{}'")
+
+
+class TestNoEffectCommandClassification:
+    """Commands with no filesystem write effect must not poison script inspection.
+
+    The unknown-effect flag stays session-wide (an *unknown* command has an
+    unknowable target set), but commands that cannot write the filesystem, and
+    path-scoped writers whose writes are recorded per-path, no longer trip it.
+    """
+
+    @pytest.mark.parametrize(
+        "setup_command",
+        [
+            "echo hi",
+            "printf hi",
+            "pwd",
+            "true",
+            "test -f safe.sh",
+            "export FOO=bar",
+            "declare BAR=baz",
+        ],
+    )
+    def test_no_effect_command_before_script_is_allowed(
+        self, scoped_command_workspace, setup_command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "safe.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"{setup_command} && bash safe.sh")
+
+    def test_mkdir_before_script_is_allowed_and_scopes_write(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "safe.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        # mkdir writes only its operand (recorded per-path), so a later,
+        # unrelated script inspection is not blocked.
+        guard.validate("mkdir out && bash safe.sh")
+
+    def test_mkdir_outside_workspace_is_rejected(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(f"mkdir {shlex.quote(str(sibling_file.parent / 'x'))}")
+
+    def test_redirect_write_from_no_effect_command_still_blocks_inspection(
+        self, scoped_command_workspace
+    ):
+        # A no-effect command with a redirect still registers the redirect's
+        # write, so inspecting that script afterwards is rejected. Declassifying
+        # the command does not exempt its redirections.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "safe.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate("echo hi > safe.sh; bash safe.sh")
+
+    def test_unknown_command_still_poisons_script_inspection(
+        self, scoped_command_workspace
+    ):
+        # Genuinely unknown commands keep the session-wide fail-closed contract.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "safe.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate("python -c pass && bash safe.sh")

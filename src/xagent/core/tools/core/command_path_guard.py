@@ -159,10 +159,29 @@ def _active_validation_session() -> _ValidationSession:
 
 
 _READ_COMMANDS = {"cat"}
-_WRITE_COMMANDS = {"rm"}
+# Path-scoped writers: every operand is validated as a workspace write and
+# recorded per-path, so they never poison the session-wide unknown-effect flag.
+_WRITE_COMMANDS = {"rm", "mkdir"}
 _SHELL_COMMANDS = {"bash"}
 _UNSUPPORTED_SHELL_COMMANDS = {"dash", "sh", "zsh"}
 _UNSUPPORTED_PRIVILEGE_COMMANDS = {"sudo"}
+# Commands with no filesystem write effect of their own. Redirections are
+# validated separately, so these can never mutate a later-inspected script and
+# must not poison the session-wide unknown-effect flag. Keep this conservative:
+# only add a command here once it is known to be unable to write the filesystem.
+_NO_FILESYSTEM_EFFECT_COMMANDS = {
+    "echo",
+    "printf",
+    "pwd",
+    "true",
+    "false",
+    ":",
+    "test",
+    "[",
+    "export",
+    "declare",
+    "typeset",
+}
 _BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
 _BASH_LONG_FLAG_OPTIONS = {
     "--debug",
@@ -964,6 +983,10 @@ class WorkspaceCommandPathGuard:
             )
         elif command_name in _COMMAND_WRAPPER_GRAMMARS:
             return self._check_command_wrapper(command_name, args, state)
+        elif command_name in _NO_FILESYSTEM_EFFECT_COMMANDS:
+            # No filesystem write effect of its own; any redirection is validated
+            # separately, so this cannot have mutated a later-inspected script.
+            pass
         else:
             _active_validation_session().effects.unknown_effect = True
         return state
