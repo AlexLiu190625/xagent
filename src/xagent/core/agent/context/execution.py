@@ -7,6 +7,12 @@ from enum import Enum
 from typing import Any
 from uuid import uuid4
 
+from ...context_ref import (
+    CONTEXT_REFS_KEY,
+    ContextReference,
+    normalize_context_references,
+    split_tool_result_context_references,
+)
 from ...file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ...tools.artifacts import (
     format_tool_result_for_observation,
@@ -34,6 +40,8 @@ from .skill_tool import LOADED_SKILLS_METADATA_KEY, SKILL_INDEX_METADATA_KEY
 READ_FILE_CONTEXT_LIMIT = 12_000
 COMPACT_SUMMARY_MAX_TOKENS = 1024
 COMPACT_SUMMARY_MIN_TOKENS = 256
+COMPACT_CONTEXT_REF_MAX_TOKENS = 2048
+COMPACT_DROPPED_REF_NOTICE_MAX_CHARS = 2048
 
 
 def _utcnow() -> datetime:
@@ -155,8 +163,23 @@ class ExecutionContext:
         tool_name: str,
         result: Any,
         tool_call_id: str | None = None,
+        *,
+        context_refs: Any = (),
     ) -> Message:
-        context_result = self._sanitize_tool_result_for_context(tool_name, result)
+        public_result, embedded_refs = split_tool_result_context_references(result)
+        explicit_refs = normalize_context_references(context_refs)
+        all_context_refs = []
+        seen_context_refs: set[str] = set()
+        for reference in (*explicit_refs, *embedded_refs):
+            identity = reference.identity_key()
+            if identity in seen_context_refs:
+                continue
+            seen_context_refs.add(identity)
+            all_context_refs.append(reference)
+
+        context_result = self._sanitize_tool_result_for_context(
+            tool_name, public_result
+        )
         content = self._format_tool_result(tool_name, context_result)
         metadata = {
             "tool_name": tool_name,
@@ -171,6 +194,7 @@ class ExecutionContext:
             content,
             tool_call_id=tool_call_id,
             metadata=metadata,
+            context_refs=tuple(all_context_refs),
         )
 
     def attach_workspace(
@@ -325,17 +349,20 @@ class ExecutionContext:
             if include_system and message_dict.get("role") == "system":
                 content = str(message_dict.get("content") or "").strip()
                 if content:
-                    messages.append(
-                        {
-                            "role": "user",
-                            "content": (
-                                "Previous system-context message retained for "
-                                "continuity. Current system instructions above "
-                                "take precedence:\n"
-                                f"{content}"
-                            ),
-                        }
-                    )
+                    continuity_message: dict[str, Any] = {
+                        "role": "user",
+                        "content": (
+                            "Previous system-context message retained for "
+                            "continuity. Current system instructions above "
+                            "take precedence:\n"
+                            f"{content}"
+                        ),
+                    }
+                    if CONTEXT_REFS_KEY in message_dict:
+                        continuity_message[CONTEXT_REFS_KEY] = message_dict[
+                            CONTEXT_REFS_KEY
+                        ]
+                    messages.append(continuity_message)
                 continue
             messages.append(message_dict)
 
@@ -541,6 +568,7 @@ class ExecutionContext:
             tool_call_id=response_message.tool_call_id,
             hidden=response_message.hidden,
             output_tokens=output_tokens,
+            context_refs=response_message.context_refs,
         )
         self.messages.append(updated_response)
         self.llm_calls.append(
@@ -752,6 +780,9 @@ class ExecutionContext:
                     "tool_call_id": message.tool_call_id,
                     "hidden": message.hidden,
                     "output_tokens": message.output_tokens,
+                    "context_refs": [
+                        reference.durable_dict() for reference in message.context_refs
+                    ],
                 }
                 for message in self.messages
             ],
@@ -797,6 +828,7 @@ class ExecutionContext:
                 tool_call_id=item.get("tool_call_id"),
                 hidden=item.get("hidden", False),
                 output_tokens=item.get("output_tokens"),
+                context_refs=item.get("context_refs", ()),
             )
             for item in data.get("messages", [])
         ]
@@ -963,7 +995,11 @@ class ExecutionContext:
             )
 
         latest_user = self._latest_visible_user_message()
-        summary_message = Message.role_system(
+        compacted_context_refs, dropped_context_refs = (
+            self._context_refs_removed_by_compaction(latest_user)
+        )
+        dropped_refs_notice = self._dropped_context_refs_notice(dropped_context_refs)
+        summary_content = (
             "Compacted conversation summary:\n"
             f"{summary}\n\n"
             "Use this summary as the current execution state. Continue from the "
@@ -971,8 +1007,14 @@ class ExecutionContext:
             "regenerate completed artifacts unless the latest user request "
             "explicitly asks to restart, revise, or regenerate them. Current system "
             "instructions still take precedence, and the latest user request remains "
-            "the overall goal.",
+            "the overall goal."
+        )
+        if dropped_refs_notice:
+            summary_content = f"{summary_content}\n\n{dropped_refs_notice}"
+        summary_message = Message.role_system(
+            summary_content,
             metadata={"compacted_context": True},
+            context_refs=compacted_context_refs,
         )
         next_messages = [summary_message]
         if latest_user is not None:
@@ -987,11 +1029,79 @@ class ExecutionContext:
                 "removed_count": max(0, original_count - len(self.messages)),
                 "summary_chars": len(summary),
                 "compact_model": getattr(llm, "model_name", None),
+                "retained_context_ref_count": len(compacted_context_refs),
+                "dropped_context_ref_count": len(dropped_context_refs),
             },
         )
         if original_tokens is not None:
             return self._annotate_compact_result(result, original_tokens)
         return result
+
+    def _context_refs_removed_by_compaction(
+        self, latest_user: Message | None
+    ) -> tuple[tuple[ContextReference, ...], tuple[ContextReference, ...]]:
+        seen = (
+            {reference.identity_key() for reference in latest_user.context_refs}
+            if latest_user is not None
+            else set()
+        )
+        latest_user_tokens = (
+            sum(reference.estimated_tokens() for reference in latest_user.context_refs)
+            if latest_user is not None
+            else 0
+        )
+        remaining_tokens = max(
+            0,
+            min(
+                COMPACT_CONTEXT_REF_MAX_TOKENS,
+                self.compact_config.threshold // 8,
+            )
+            - latest_user_tokens,
+        )
+        retained: list[ContextReference] = []
+        dropped: list[ContextReference] = []
+        for message in reversed(self.messages):
+            if message.hidden or message is latest_user:
+                continue
+            for reference in reversed(message.context_refs):
+                identity = reference.identity_key()
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                reference_tokens = reference.estimated_tokens()
+                if reference_tokens <= remaining_tokens:
+                    retained.append(reference)
+                    remaining_tokens -= reference_tokens
+                else:
+                    dropped.append(reference)
+        retained.reverse()
+        return tuple(retained), tuple(dropped)
+
+    @staticmethod
+    def _dropped_context_refs_notice(
+        references: tuple[ContextReference, ...],
+    ) -> str:
+        if not references:
+            return ""
+        prefix = (
+            "Older image references exceeded the structured-reference budget and "
+            "will not be automatically rematerialized after compaction. Durable "
+            "handles retained in this summary:\n"
+        )
+        lines: list[str] = []
+        current_chars = len(prefix)
+        omitted = 0
+        for reference in references:
+            filename = reference.safe_file_ref.get("filename") or "image"
+            line = f"- [image: {filename}, file_id={reference.file_id}]"
+            if current_chars + len(line) + 1 > COMPACT_DROPPED_REF_NOTICE_MAX_CHARS:
+                omitted += 1
+                continue
+            lines.append(line)
+            current_chars += len(line) + 1
+        if omitted:
+            lines.append(f"- ... {omitted} additional older reference(s) omitted")
+        return prefix + "\n".join(lines)
 
     def _latest_visible_user_message(self) -> Message | None:
         for message in reversed(self.messages):
@@ -1057,6 +1167,8 @@ class ExecutionContext:
                     + json.dumps(message.tool_calls, ensure_ascii=False, default=str)
                 )
             chunks.append(message.content)
+            if message.context_refs:
+                chunks.append(message.context_refs_text())
         return "\n".join(chunks)
 
     def _compact_response_text(self, response: Any) -> str:
@@ -1103,10 +1215,16 @@ class ExecutionContext:
         return self._estimate_message_tokens(self.messages)
 
     def _estimate_message_tokens(self, messages: list[Message]) -> int:
-        return sum(max(1, len(message.content) // 4) for message in messages)
+        return sum(
+            max(1, len(message.content) // 4) + message.context_refs_token_estimate()
+            for message in messages
+        )
 
     def _message_content_chars(self, messages: list[Message]) -> int:
-        return sum(len(message.content) for message in messages)
+        return sum(
+            len(message.content) + (4 * message.context_refs_token_estimate())
+            for message in messages
+        )
 
     def _tail_window_preserving_tool_pairs(self, keep_count: int) -> list[Message]:
         """Keep recent messages without cutting a native tool-call exchange."""
@@ -1176,9 +1294,14 @@ class ExecutionContext:
         for index in range(len(messages) - 1, -1, -1):
             message = messages[index]
             if message.role == "assistant" and message.output_tokens is not None:
-                message_tokens = message.output_tokens
+                message_tokens = (
+                    message.output_tokens + message.context_refs_token_estimate()
+                )
             else:
-                message_tokens = max(1, len(message.content) // 4)
+                message_tokens = (
+                    max(1, len(message.content) // 4)
+                    + message.context_refs_token_estimate()
+                )
 
             if current_tokens + message_tokens > max_tokens:
                 break

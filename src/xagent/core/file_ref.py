@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import mimetypes
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 from urllib.parse import quote, unquote, urlsplit
 
@@ -158,6 +158,49 @@ def build_workspace_file_ref(
         "relative_path": relative_path,
         "file_path": str(resolved_path),
     }
+
+
+def sanitize_file_ref_for_context(file_ref: dict[str, Any]) -> dict[str, Any]:
+    """Return the durable, model-safe subset of a registered FileRef.
+
+    Local storage paths are intentionally excluded so messages, checkpoints,
+    and traces can persist this value without leaking host filesystem details.
+    """
+
+    file_id = str(file_ref.get("file_id") or "").strip()
+    raw_filename = str(file_ref.get("filename") or "").strip()
+    filename = Path(raw_filename.replace("\\", "/")).name.strip()
+    if not file_id:
+        raise ValueError("FileRef must contain a registered file_id")
+    if not filename:
+        raise ValueError("FileRef must contain a filename")
+    build_file_id_ref(file_id)
+
+    mime_type = str(file_ref.get("mime_type") or guess_mime_type(filename))
+    raw_size = file_ref.get("size")
+    size = int(raw_size) if raw_size is not None else None
+    if size is not None and size < 0:
+        raise ValueError("FileRef size must not be negative")
+    result = build_file_ref(
+        file_id=file_id,
+        filename=filename,
+        mime_type=mime_type,
+        size=size,
+    )
+    relative_path = file_ref.get("relative_path")
+    if relative_path is not None:
+        raw_relative = str(relative_path).strip()
+        windows_relative = PureWindowsPath(raw_relative)
+        relative = Path(raw_relative.replace("\\", "/"))
+        is_windows_rooted = bool(windows_relative.drive or windows_relative.root)
+        if (
+            raw_relative
+            and not is_windows_rooted
+            and not relative.is_absolute()
+            and ".." not in relative.parts
+        ):
+            result["relative_path"] = relative.as_posix()
+    return result
 
 
 def safe_asset_filename(filename: str) -> str:
