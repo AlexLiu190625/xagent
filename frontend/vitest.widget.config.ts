@@ -94,6 +94,9 @@ const widgetConfig = mergeConfig(baseConfig, defineConfig({
         "src/components/file/file-preview-content.tsx": {
           statements: 70, branches: 50, functions: 55, lines: 70,
         },
+        "src/components/file/file-viewer.tsx": {
+          statements: 70, branches: 55, functions: 80, lines: 70,
+        },
         "src/components/file/inline-file-preview.tsx": {
           statements: 70, branches: 55, functions: 60, lines: 70,
         },

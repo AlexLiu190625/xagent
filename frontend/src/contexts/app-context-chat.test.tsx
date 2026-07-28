@@ -1474,7 +1474,7 @@ describe("AppProvider websocket message routing", () => {
     expect(transport.session.onConnectionOpen).toHaveBeenCalledWith(
       transport.session.connection?.identity,
     )
-    expect(webSocketOptions.current?.uploadFiles).toBeUndefined()
+    expect(webSocketOptions.current?.uploadFiles).toEqual(expect.any(Function))
 
     let delivery!: Promise<void>
     act(() => {
@@ -2846,6 +2846,89 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("preview-open").textContent).toBe("false")
     expect(apiRequestMock).not.toHaveBeenCalled()
     window.removeEventListener("openFilePreview", previewListener)
+  })
+
+  it("uses a top-level disabled files capability at every transport and presentation boundary", async () => {
+    const transport = {
+      capabilities: { files: "disabled" as const },
+      uploadFiles: vi.fn(),
+    }
+    render(
+      <AppProvider token="token" transport={transport}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>,
+    )
+
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+    expect(screen.getByTestId("files-disabled")).toHaveTextContent("true")
+
+    const disabledUpload = webSocketOptions.current?.uploadFiles as (
+      files: File[],
+      params: { taskId?: number | null; taskType: string },
+    ) => Promise<unknown>
+    await expect(disabledUpload([file], { taskType: "task" })).rejects.toThrow(
+      /files.*disabled|disabled.*files/i,
+    )
+    await expect(
+      getSessionControls().sendMessage("Disabled file", undefined, [file]),
+    ).rejects.toThrow(/files.*disabled|disabled.*files/i)
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(transport.uploadFiles).not.toHaveBeenCalled()
+
+    act(() => {
+      getSessionControls().openFilePreview("manual-file", "manual.pdf")
+    })
+    expect(screen.getByTestId("preview-open")).toHaveTextContent("false")
+    expect(() => getSessionControls().getFilePreviewUrl("manual-file")).toThrow(
+      /files.*disabled|disabled.*files/i,
+    )
+    expect(() => getSessionControls().getFileDownloadUrl("manual-file")).toThrow(
+      /files.*disabled|disabled.*files/i,
+    )
+
+    act(() => {
+      webSocketOptions.current?.onMessage?.({
+        type: "task_completed",
+        timestamp: "2026-05-27T05:00:06Z",
+        task_id: 71,
+        task: { id: 71, status: "completed" },
+        status: "completed",
+        file_outputs: [{ file_id: "generated-file", filename: "generated.pdf" }],
+      } as TestWebSocketMessage)
+    })
+    expect(screen.getByTestId("preview-open")).toHaveTextContent("false")
+  })
+
+  it("fails closed when a malformed Session descriptor omits files", async () => {
+    const transport = makeSessionTransport() as unknown as {
+      uploadFiles: ReturnType<typeof vi.fn>
+      session: Record<string, unknown>
+    }
+    delete transport.session.files
+    render(
+      <AppProvider token="token" transport={transport as never}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>,
+    )
+
+    const file = new File(["secret"], "secret.txt", { type: "text/plain" })
+    expect(screen.getByTestId("files-disabled")).toHaveTextContent("true")
+    const disabledUpload = webSocketOptions.current?.uploadFiles as (
+      files: File[],
+      params: { taskId?: number | null; taskType: string },
+    ) => Promise<unknown>
+    await expect(disabledUpload([file], { taskType: "task" })).rejects.toThrow(
+      /files.*disabled|disabled.*files/i,
+    )
+    await expect(
+      getSessionControls().sendMessage("Malformed Session file", undefined, [file]),
+    ).rejects.toThrow(/files.*disabled|disabled.*files/i)
+    expect(apiRequestMock).not.toHaveBeenCalled()
+    expect(sendChatMessageMock).not.toHaveBeenCalled()
+    expect(transport.uploadFiles).not.toHaveBeenCalled()
   })
 
   it("disables agent cards when Session files are disabled even if the transport requests cards", () => {

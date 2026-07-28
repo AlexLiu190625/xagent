@@ -133,6 +133,18 @@ const collectKnownLocalPaths = (value: unknown): Map<string, string> => {
 
 const escapeRegex = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
 
+const isUriSchemePathBoundary = (
+  source: string,
+  matchOffset: number,
+  prefix: string,
+): boolean => {
+  if (prefix !== ":") return false
+  const scheme = source
+    .slice(0, matchOffset)
+    .match(/(?:^|[^a-zA-Z0-9+.-])([A-Za-z][A-Za-z0-9+.-]*)$/)?.[1]
+  return scheme !== undefined && /^[A-Za-z][A-Za-z0-9+.-]*$/.test(scheme)
+}
+
 const replaceKnownLocalPaths = (value: string, knownPaths: Map<string, string>): string => {
   const entries = [...knownPaths.entries()].sort(([left], [right]) => right.length - left.length)
   if (entries.length === 0) return value
@@ -143,7 +155,8 @@ const replaceKnownLocalPaths = (value: string, knownPaths: Map<string, string>):
     UNQUOTED_PATH_PREFIX_PATTERN + "(" + roots + ")(?:[\\\\\\/][^\\s\\\"'`<>(),;]*)*(?=$|[\\s\\\"'`,.;:!?<>()])",
     "g",
   )
-  return value.replace(knownRootToken, (_match, prefix: string, path: string) => {
+  return value.replace(knownRootToken, (_match, prefix: string, path: string, offset: number, source: string) => {
+    if (isUriSchemePathBoundary(source, offset, prefix)) return _match
     const matched = entries.find(([root]) => path === root)
     return `${prefix}${matched?.[1] ?? basename(path) ?? path}`
   })
@@ -214,8 +227,16 @@ const sanitizePlainPresentationText = (
     return basename(path) || path
   })
   return redactUnquotedPaths
-    ? sanitized.replace(LOCAL_PATH_TOKEN_RE, (_match, prefix: string, path: string) => (
-      isRecognizedLocalPath(path) ? `${prefix}${basename(path) || path}` : _match
+    ? sanitized.replace(LOCAL_PATH_TOKEN_RE, (
+      _match,
+      prefix: string,
+      path: string,
+      offset: number,
+      source: string,
+    ) => (
+      !isUriSchemePathBoundary(source, offset, prefix) && isRecognizedLocalPath(path)
+        ? `${prefix}${basename(path) || path}`
+        : _match
     ))
     : sanitized
 }

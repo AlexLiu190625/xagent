@@ -356,6 +356,50 @@ describe("TraceEventRenderer", () => {
     })
   })
 
+  it("terminates cyclic tool output at the renderer boundary without exposing local paths", () => {
+    appContextMock.filesDisabled = true
+    const output: Record<string, unknown> = {
+      label: "cyclic output",
+      file_path: "/private/tenant/cyclic-secret.txt",
+    }
+    output.self = output
+
+    const { container } = render(
+      <TraceEventRenderer
+        events={[
+          {
+            event_id: "start",
+            event_type: "react_task_start",
+            step_id: "cyclic-output",
+            timestamp: Date.now(),
+            data: { step_name: "Inspect cyclic output", description: "Inspect cyclic output" },
+          },
+          {
+            event_id: "tool-start",
+            event_type: "tool_execution_start",
+            step_id: "cyclic-output",
+            timestamp: Date.now() + 1,
+            data: { tool_name: "inspect_cyclic", tool_args: {} },
+          },
+          {
+            event_id: "tool-end",
+            event_type: "tool_execution_end",
+            step_id: "cyclic-output",
+            timestamp: Date.now() + 2,
+            data: { result: { success: true, output } },
+          },
+        ]}
+      />,
+    )
+
+    fireEvent.click(screen.getByRole("button", {
+      name: /traceEventRenderer.executeTool:inspect_cyclic/,
+    }))
+
+    expect(container).toHaveTextContent("[Circular]")
+    expect(container.innerHTML).not.toContain("/private/tenant/cyclic-secret.txt")
+  })
+
   it("projects the complete tool result before selecting a files-disabled message", () => {
     appContextMock.filesDisabled = true
 

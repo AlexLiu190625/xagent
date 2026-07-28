@@ -65,6 +65,14 @@ describe("files-disabled presentation", () => {
     )
   })
 
+  it("redacts prose labels after a colon and preserves URI schemes", () => {
+    expect(sanitizeFilesDisabledPresentationText(
+      "Label:/private/tenant/one.txt and Label: /private/tenant/two.txt; keep urn:/private/tenant/urn.txt, VSCODE:/private/tenant/code.txt, custom+tool:/private/tenant/custom.txt, http:/private/tenant/http.txt, and https:/private/tenant/https.txt.",
+    )).toBe(
+      "Label:/private/tenant/one.txt and Label: two.txt; keep urn:/private/tenant/urn.txt, VSCODE:/private/tenant/code.txt, custom+tool:/private/tenant/custom.txt, http:/private/tenant/http.txt, and https:/private/tenant/https.txt.",
+    )
+  })
+
   it("preserves business routes while redacting local roots and file-like absolute paths", () => {
     expect(sanitizeFilesDisabledPresentationText([
       "Keep /v1/shifts, /v1/openapi.json, /care/shift/42, and /care/export.csv.",
@@ -246,6 +254,16 @@ describe("files-disabled presentation", () => {
     })).toEqual({
       files: [{ file_name: "report.pdf" }],
       message: "Created secret.pdf",
+    })
+  })
+
+  it("preserves URI schemes when a known local root would otherwise match", () => {
+    expect(projectFilesDisabledPresentation({
+      files: [{ file_name: "report.pdf", output_dir: "/private/reports" }],
+      message: "Open urn:/private/reports/urn.txt and vscode:/private/reports/code.txt",
+    })).toEqual({
+      files: [{ file_name: "report.pdf" }],
+      message: "Open urn:/private/reports/urn.txt and vscode:/private/reports/code.txt",
     })
   })
 

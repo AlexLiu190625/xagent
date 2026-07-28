@@ -1650,6 +1650,9 @@ export function AppProvider({
     sessionTransport?.files,
     transport?.capabilities?.files,
   )
+  const rejectDisabledFileUpload = useCallback(async () => {
+    throw new Error("Files are disabled for this conversation.")
+  }, [])
   const requestedAgentCardsEnabled = resolveTransportCapability(
     sessionTransport,
     sessionTransport?.agentCards,
@@ -1934,10 +1937,9 @@ export function AppProvider({
     taskId: state.taskId || undefined,
     token,
     buildWebSocketUrl: transport?.buildWebSocketUrl,
-    uploadFiles:
-      sessionTransport?.files === "disabled"
-        ? undefined
-        : transport?.uploadFiles,
+    uploadFiles: filesDisabled
+      ? rejectDisabledFileUpload
+      : transport?.uploadFiles,
     connection:
       sessionTransport === undefined
         ? undefined
@@ -1961,7 +1963,7 @@ export function AppProvider({
         sessionMessageHandlerRef.current(message, sessionMessageOwner)
         return
       }
-      handleMessage(message, dispatch, stateRef.current)
+      handleMessage(message, dispatch, stateRef.current, { filesDisabled })
     },
     onConnect: onConnect, // Pass the callback
     autoConnect: true,
@@ -5234,7 +5236,7 @@ export function AppProvider({
 
     handleMessage(message, projectSessionAppAction, stateRef.current, {
       skipHistory: true,
-      filesDisabled: true,
+      filesDisabled,
     })
   }
 
@@ -5282,11 +5284,11 @@ export function AppProvider({
       throw new Error("Message not sent: the Session chat is closed.")
     }
     if (
-      sessionTransport?.files === "disabled"
+      filesDisabled
       && files
       && files.length > 0
     ) {
-      throw new Error("Files are disabled for Session conversations.")
+      throw new Error("Files are disabled for this conversation.")
     }
     if (sessionTransport && sessionConversationRef.current.phase === "reset_requested") {
       throw new Error(
@@ -5659,6 +5661,7 @@ export function AppProvider({
     discardSessionPreAdoptionBuffer,
     dispatchSessionConversation,
     endSessionMessageDelivery,
+    filesDisabled,
     queuePendingMessage,
     sendChatMessage,
     sessionTransport,
@@ -5798,7 +5801,7 @@ export function AppProvider({
         // but with isReplaying: false to ensure it gets processed for display
         const message = event.data as WebSocketMessage
         const tempState = { ...stateRef.current, isReplaying: false }
-        handleMessage(message, dispatch, tempState)
+        handleMessage(message, dispatch, tempState, { filesDisabled })
       },
       () => {
         // Replay completed
@@ -5816,7 +5819,7 @@ export function AppProvider({
 
     // Always start the scheduler since this function is called when we want to replay
     scheduler.play()
-  }, [state.isReplaying, state.replayTaskId, state.replayEventCache, state.replaySpeed, dispatch])
+  }, [state.isReplaying, state.replayTaskId, state.replayEventCache, state.replaySpeed, dispatch, filesDisabled])
 
   const executeTask = useCallback((description: string) => {
     if (!state.taskId) return
@@ -5877,7 +5880,7 @@ export function AppProvider({
   }, [router])
 
   const openFilePreview = useCallback((fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => {
-    if (sessionTransport?.files === "disabled") return
+    if (filesDisabled) return
     console.log('🎯 openFilePreview called:', {
       fileId,
       fileName,
@@ -5886,40 +5889,40 @@ export function AppProvider({
       index
     })
     dispatch({ type: "OPEN_FILE_PREVIEW", payload: { fileId, fileName, files, index } })
-  }, [sessionTransport?.files])
+  }, [filesDisabled])
 
   const switchFilePreview = useCallback((index: number) => {
-    if (sessionTransport?.files === "disabled") return
+    if (filesDisabled) return
     const { availableFiles } = state.filePreview
     if (index >= 0 && index < availableFiles.length) {
       const file = availableFiles[index]
       dispatch({ type: "SWITCH_FILE_PREVIEW", payload: { fileId: file.fileId, fileName: file.fileName, index } })
     }
-  }, [sessionTransport?.files, state.filePreview.availableFiles])
+  }, [filesDisabled, state.filePreview.availableFiles])
 
   const closeFilePreview = useCallback(() => {
     dispatch({ type: "CLOSE_FILE_PREVIEW" })
   }, [])
 
   const getFilePreviewUrl = useCallback((fileId: string) => {
-    if (sessionTransport?.files === "disabled") {
-      throw new Error("Files are disabled for Session conversations.")
+    if (filesDisabled) {
+      throw new Error("Files are disabled for this conversation.")
     }
     if (transport?.fileAccess) {
       return transport.fileAccess.previewUrl(fileId)
     }
     return `${getApiUrl()}/api/files/preview/${encodeURIComponent(fileId)}`
-  }, [sessionTransport?.files, transport])
+  }, [filesDisabled, transport])
 
   const getFileDownloadUrl = useCallback((fileId: string) => {
-    if (sessionTransport?.files === "disabled") {
-      throw new Error("Files are disabled for Session conversations.")
+    if (filesDisabled) {
+      throw new Error("Files are disabled for this conversation.")
     }
     if (transport?.fileAccess) {
       return transport.fileAccess.downloadUrl(fileId)
     }
     return `${getApiUrl()}/api/files/download/${encodeURIComponent(fileId)}`
-  }, [sessionTransport?.files, transport])
+  }, [filesDisabled, transport])
 
 
   // Replay control methods
