@@ -125,6 +125,21 @@ const dispatchSession = () => {
   })
 }
 
+const dispatchDegradedSession = () => {
+  act(() => {
+    window.dispatchEvent(new MessageEvent("message", {
+      data: {
+        xagent: true,
+        v: 1,
+        type: "session_degraded",
+        code: "network_unavailable",
+      },
+      origin: PARENT_ORIGIN,
+      source: EMBEDDED_PARENT as unknown as MessageEventSource,
+    }))
+  })
+}
+
 describe("SessionAgentChatPage connection failure integration", () => {
   beforeEach(() => {
     MockWebSocket.instances = []
@@ -227,6 +242,23 @@ describe("SessionAgentChatPage connection failure integration", () => {
       .toBeInTheDocument()
     expect(screen.getByText("widgetChat.status.connecting"))
       .toBeInTheDocument()
+    expect(MockWebSocket.constructionCount).toBe(1)
+  })
+
+  it("renders an existing Session as unavailable after a degraded parent update", async () => {
+    render(<SessionAgentChatPage />)
+    dispatchSession()
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+
+    act(() => MockWebSocket.instances[0].open("xagent-session-v1"))
+    dispatchDegradedSession()
+
+    await waitFor(() => {
+      expect(screen.getByRole("heading", {
+        name: "widgetSession.unavailable.title",
+      })).toBeInTheDocument()
+    })
+    expect(screen.queryByTestId("session-start")).not.toBeInTheDocument()
     expect(MockWebSocket.constructionCount).toBe(1)
   })
 })

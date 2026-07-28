@@ -102,8 +102,9 @@ function SessionConversationContent({
     )
   }
 
-  if (status === "terminal" || !agent) {
-    const isExpired = getSessionTerminalPresentation(terminalCode) === "expired"
+  if (status === "degraded" || status === "terminal" || !agent) {
+    const isExpired = status !== "degraded"
+      && getSessionTerminalPresentation(terminalCode) === "expired"
     return (
       <div className="flex h-screen items-center justify-center bg-background p-6">
         <div className="max-w-md text-center">

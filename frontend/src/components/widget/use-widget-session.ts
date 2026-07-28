@@ -17,7 +17,7 @@ interface RecoveryState {
   retryTimer: ReturnType<typeof setTimeout> | null
 }
 
-export type WidgetSessionStatus = "waiting" | "active" | "refreshing" | "terminal"
+export type WidgetSessionStatus = "waiting" | "active" | "refreshing" | "degraded" | "terminal"
 export type WidgetSessionReconnectReason = "ws_closed" | "token_expired"
 
 export interface WidgetSessionAgent {
@@ -175,7 +175,7 @@ export function useWidgetSession() {
     clearStabilityTimer()
     clearWarningTimer()
     setState((current) => ({
-      status: "refreshing",
+      status: "degraded",
       session: null,
       agent: current.agent,
       terminalCode: null,

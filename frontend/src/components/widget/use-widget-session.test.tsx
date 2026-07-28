@@ -96,7 +96,7 @@ describe("useWidgetSession", () => {
     expect(postMessage).not.toHaveBeenCalled()
   })
 
-  it("keeps a recoverable parent failure open for a later session update", () => {
+  it("keeps a degraded parent failure nonterminal for a later session update", () => {
     const { result } = renderHook(() => useWidgetSession())
 
     dispatchFromParent({
@@ -106,7 +106,7 @@ describe("useWidgetSession", () => {
       code: "network_unavailable",
     })
 
-    expect(result.current.status).toBe("refreshing")
+    expect(result.current.status).toBe("degraded")
     expect(result.current.session).toBeNull()
     expect(result.current.agent).toBeNull()
     expect(result.current.terminalCode).toBeNull()
@@ -134,7 +134,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it("hands recovery ownership to the parent on session_degraded", () => {
+  it("does not create another reconnect request after session_degraded", () => {
     vi.useFakeTimers()
     const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
     const { result } = renderHook(() => useWidgetSession())
@@ -151,7 +151,7 @@ describe("useWidgetSession", () => {
     })
     act(() => vi.advanceTimersByTime(60_000))
 
-    expect(result.current.status).toBe("refreshing")
+    expect(result.current.status).toBe("degraded")
     expect(result.current.session).toBeNull()
     expect(result.current.agent?.name).toBe("Support Agent")
     expect(result.current.terminalCode).toBeNull()

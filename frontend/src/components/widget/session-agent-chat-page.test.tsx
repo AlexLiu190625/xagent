@@ -6,7 +6,7 @@ import type { WidgetSession } from "./use-widget-session"
 
 const bridge = vi.hoisted(() => ({
   value: {
-    status: "waiting" as "waiting" | "active" | "refreshing" | "terminal",
+    status: "waiting" as "waiting" | "active" | "refreshing" | "degraded" | "terminal",
     session: null as WidgetSession | null,
     agent: null as WidgetSession["agent"] | null,
     terminalCode: null as string | null,
@@ -145,7 +145,7 @@ function setBridge(
   bridge.value.session = session
   if (session) {
     bridge.value.agent = session.agent
-  } else if (status !== "refreshing") {
+  } else if (status !== "refreshing" && status !== "degraded") {
     bridge.value.agent = null
   }
   bridge.value.terminalCode = terminalCode
@@ -372,6 +372,38 @@ describe("SessionAgentChatPage", () => {
     expect(screen.getByRole("heading", { name: "Support Agent" })).toBeInTheDocument()
     expect(screen.getByTestId("session-conversation-panel")).toBeInTheDocument()
     expect(screen.getByText("widgetChat.status.connecting")).toBeInTheDocument()
+    expect(app.provider?.transport?.session?.connection).toBeNull()
+  })
+
+  it("renders first-message degradation as unavailable without a spinner", () => {
+    setBridge("degraded", null)
+
+    render(<SessionAgentChatPage />)
+
+    expect(screen.getByRole("heading", {
+      name: "widgetSession.unavailable.title",
+    })).toBeInTheDocument()
+    expect(screen.getByText("widgetSession.unavailable.description")).toBeInTheDocument()
+    expect(screen.queryByText("widgetChat.status.initializing")).not.toBeInTheDocument()
+    expect(screen.queryByText("widgetChat.status.connecting")).not.toBeInTheDocument()
+  })
+
+  it("removes all conversation controls after degradation with an existing Agent", () => {
+    setBridge("active", activeSession())
+    app.state.taskId = 71
+    setBridge("degraded", null)
+
+    render(<SessionAgentChatPage />)
+
+    expect(screen.getByRole("heading", {
+      name: "widgetSession.unavailable.title",
+    })).toBeInTheDocument()
+    expect(screen.getByText("widgetSession.unavailable.description")).toBeInTheDocument()
+    expect(screen.queryByRole("button", { name: "start:Support Agent" })).not.toBeInTheDocument()
+    expect(screen.queryByRole("button", {
+      name: "widgetSession.startNewConversation",
+    })).not.toBeInTheDocument()
+    expect(screen.queryByTestId("session-conversation-panel")).not.toBeInTheDocument()
     expect(app.provider?.transport?.session?.connection).toBeNull()
   })
 
