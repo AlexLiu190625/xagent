@@ -1831,6 +1831,16 @@ class WebToolConfig(BaseToolConfig):
         it, the request, and its ORM user untouched. A lazily-created session is
         owned by this config and is therefore terminally closed on every path.
         """
+        self._detach_factory_runtime_resources()
+        self.discard_prepared_factory_runtime()
+
+    def abort_factory_runtime(self) -> None:
+        """Discard factory-only values while detaching request-owned resources."""
+        self.discard_prepared_factory_runtime()
+        self._detach_factory_runtime_resources()
+
+    def _detach_factory_runtime_resources(self) -> None:
+        """Detach every construction-owned session reference after verification."""
         from sqlalchemy.orm import Session
 
         from ..models.database import release_db_connection_if_clean
@@ -1870,7 +1880,9 @@ class WebToolConfig(BaseToolConfig):
         if not live_released or not lazy_released:
             raise ToolFactoryRuntimeSessionBoundaryError()
 
-        self.discard_prepared_factory_runtime()
+        self._live_db = None
+        self.request = None
+        self._user = None
         self._live_db = None
         self.request = None
         self._user = None

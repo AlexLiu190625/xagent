@@ -4,11 +4,17 @@ Issue #889 requires the config's DB connection to be released again before
 sandbox workspace setup because override/allowlist reads may reopen it.
 """
 
+import logging
+
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
 
+from xagent.core.tools.adapters.vibe.config import (
+    ToolFactoryRuntimeSessionBoundaryError,
+    run_with_tool_runtime_cleanup,
+)
 from xagent.core.tools.adapters.vibe.factory import ToolFactory, ToolRegistry
 
 
@@ -90,6 +96,77 @@ class _FailingVerifiedHandoffConfig:
         raise ValueError("handoff failed")
 
 
+class _AbortableFailingPrepareConfig(_FailingPrepareConfig):
+    def abort_factory_runtime(self) -> None:
+        self._calls.append("abort")
+
+    def handoff_factory_runtime(self) -> None:
+        self._calls.append("handoff")
+
+
+@pytest.mark.asyncio
+async def test_shared_cleanup_surfaces_a_stable_boundary_error_after_success():
+    cleanup_fault = ValueError("private cleanup detail")
+
+    async def body() -> str:
+        return "done"
+
+    def cleanup() -> None:
+        raise cleanup_fault
+
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError) as caught:
+        await run_with_tool_runtime_cleanup(
+            body, cleanup, logger=logging.getLogger(__name__)
+        )
+
+    assert str(caught.value) == "Tool runtime cleanup could not be completed."
+    assert caught.value.__cause__ is cleanup_fault
+
+
+@pytest.mark.asyncio
+async def test_shared_cleanup_preserves_primary_base_exception_identity(caplog):
+    primary = KeyboardInterrupt("primary sentinel")
+    cleanup_fault = SystemExit("cleanup sentinel")
+
+    async def body() -> None:
+        raise primary
+
+    def cleanup() -> None:
+        raise cleanup_fault
+
+    with pytest.raises(KeyboardInterrupt) as caught:
+        await run_with_tool_runtime_cleanup(
+            body,
+            cleanup,
+            logger=logging.getLogger("xagent.runtime.cleanup.test"),
+        )
+
+    assert caught.value is primary
+    assert (
+        "Tool runtime cleanup failed after the primary operation failed" in caplog.text
+    )
+
+
+@pytest.mark.asyncio
+async def test_shared_cleanup_returns_when_body_and_cleanup_succeed():
+    calls: list[str] = []
+
+    async def body() -> str:
+        calls.append("body")
+        return "done"
+
+    def cleanup() -> None:
+        calls.append("cleanup")
+
+    assert (
+        await run_with_tool_runtime_cleanup(
+            body, cleanup, logger=logging.getLogger(__name__)
+        )
+        == "done"
+    )
+    assert calls == ["body", "cleanup"]
+
+
 @pytest.mark.asyncio
 async def test_release_prepared_runtime_when_prepare_fails():
     calls: list[str] = []
@@ -101,6 +178,16 @@ async def test_release_prepared_runtime_when_prepare_fails():
 
 
 @pytest.mark.asyncio
+async def test_prepare_failure_prefers_concrete_abort_over_success_handoff():
+    calls: list[str] = []
+
+    with pytest.raises(RuntimeError, match="prepare failed"):
+        await ToolFactory.create_all_tools(_AbortableFailingPrepareConfig(calls))
+
+    assert calls == ["prepare", "abort"]
+
+
+@pytest.mark.asyncio
 async def test_prepare_error_wins_when_release_also_fails(caplog):
     calls: list[str] = []
 
@@ -108,7 +195,7 @@ async def test_prepare_error_wins_when_release_also_fails(caplog):
         await ToolFactory.create_all_tools(_FailingPrepareAndReleaseConfig(calls))
 
     assert calls == ["prepare", "release"]
-    assert "Failed to release prepared tool-factory runtime" in caplog.text
+    assert "Failed to finalize tool-factory runtime" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -121,9 +208,10 @@ async def test_release_error_propagates_without_primary_error(monkeypatch):
 
     monkeypatch.setattr(ToolFactory, "_create_all_tools_prepared", build_tools)
 
-    with pytest.raises(ValueError, match="release failed"):
+    with pytest.raises(ToolFactoryRuntimeSessionBoundaryError) as caught:
         await ToolFactory.create_all_tools(_FailingReleaseConfig(calls))
 
+    assert str(caught.value) == "Tool runtime cleanup could not be completed."
     assert calls == ["build", "release"]
 
 
@@ -143,7 +231,7 @@ async def test_primary_build_error_wins_when_verified_handoff_fails(
         await ToolFactory.create_all_tools(_FailingVerifiedHandoffConfig(calls))
 
     assert calls == ["build", "handoff"]
-    assert "Failed to hand off tool-factory runtime" in caplog.text
+    assert "Failed to finalize tool-factory runtime" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -165,8 +253,8 @@ async def test_real_web_config_primary_error_identity_wins_over_handoff_fault(
     live_db = factory()
     config = WebToolConfig(db=live_db, db_factory=factory, request=None, user_id=1)
     sentinel = RuntimeError("build sentinel")
-    handoff_fault = ValueError("independent handoff fault")
-    real_handoff = WebToolConfig.handoff_factory_runtime
+    abort_fault = ValueError("independent abort fault")
+    real_abort = WebToolConfig.abort_factory_runtime
 
     async def prepare(_config):
         return None
@@ -175,20 +263,20 @@ async def test_real_web_config_primary_error_identity_wins_over_handoff_fault(
         config.db.query(ToolConfig).all()
         raise sentinel
 
-    def failing_handoff(config):
-        real_handoff(config)
-        raise handoff_fault
+    def failing_abort(config):
+        real_abort(config)
+        raise abort_fault
 
     monkeypatch.setattr(WebToolConfig, "prepare_factory_runtime", prepare)
     monkeypatch.setattr(ToolFactory, "_create_all_tools_prepared", build_tools)
-    monkeypatch.setattr(WebToolConfig, "handoff_factory_runtime", failing_handoff)
+    monkeypatch.setattr(WebToolConfig, "abort_factory_runtime", failing_abort)
     try:
         with pytest.raises(RuntimeError) as caught:
             await ToolFactory.create_all_tools(config)
 
         assert caught.value is sentinel
         assert engine.pool.checkedout() == 0
-        assert "Failed to hand off tool-factory runtime" in caplog.text
+        assert "Failed to finalize tool-factory runtime" in caplog.text
     finally:
         live_db.close()
         config.close()
@@ -238,9 +326,59 @@ async def test_primary_error_identity_wins_over_real_session_boundary_failure(
         assert caught.value is sentinel
         assert config._live_db is live_db
         assert engine.pool.checkedout() == 1
-        assert "Failed to hand off tool-factory runtime" in caplog.text
+        assert "Failed to finalize tool-factory runtime" in caplog.text
     finally:
         live_db.rollback()
+        live_db.close()
+        config.close()
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_real_prepare_then_build_failure_aborts_without_retaining_runtime(
+    monkeypatch, tmp_path
+):
+    from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
+    from xagent.web.models.tool_config import ToolConfig
+    from xagent.web.tools.config import WebToolConfig
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'abort-runtime.db'}",
+        poolclass=QueuePool,
+        pool_size=1,
+        max_overflow=0,
+        connect_args={"check_same_thread": False},
+    )
+    ToolConfig.__table__.create(bind=engine)
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    live_db = factory()
+    request = object()
+    user = object()
+    config = WebToolConfig(
+        db=live_db,
+        db_factory=factory,
+        request=request,
+        user=user,
+        user_id=1,
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=[]),
+    )
+    sentinel = RuntimeError("build after prepare sentinel")
+
+    async def fail_build(_config, apply_user_override_filter=True):
+        raise sentinel
+
+    monkeypatch.setattr(ToolFactory, "_create_all_tools_prepared", fail_build)
+    try:
+        with pytest.raises(RuntimeError) as caught:
+            await ToolFactory.create_all_tools(config)
+
+        assert caught.value is sentinel
+        assert config._factory_runtime_snapshot is None
+        assert config._live_db is None
+        assert config.request is None
+        assert config._user is None
+        assert engine.pool.checkedout() == 0
+    finally:
         live_db.close()
         config.close()
         engine.dispose()
