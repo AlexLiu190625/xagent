@@ -4,6 +4,7 @@ Tests for CommandExecutor tool
 
 import os
 import shlex
+import shutil
 import sys
 from pathlib import Path
 from typing import Sequence
@@ -21,11 +22,14 @@ from xagent.core.tools.core.command_executor import (
     execute_command,
     execute_script,
 )
+from xagent.core.tools.core.command_path_guard import WorkspaceCommandPathGuard
 from xagent.core.tools.core.command_policy import (
     CommandPathViolation,
     CommandPolicyGuard,
     CommandPolicyViolation,
+    resolve_trusted_executable,
 )
+from xagent.core.workspace import TaskWorkspace
 
 
 @pytest.fixture
@@ -263,6 +267,215 @@ class TestCommandExecutorTool:
 
 
 class TestCommandPolicyFoundation:
+    @staticmethod
+    def _workspace_guard(tmp_path):
+        workspace = TaskWorkspace("task", str(tmp_path / "workspace"))
+        guard = WorkspaceCommandPathGuard(workspace)
+        return workspace, guard
+
+    @pytest.mark.parametrize("working_directory", [None, ""])
+    def test_executor_adopts_guard_working_directory(
+        self,
+        tmp_path,
+        mock_run,
+        working_directory,
+    ):
+        workspace, guard = self._workspace_guard(tmp_path)
+        canonical_cwd = workspace.resolve_path("").resolve()
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        executor = CommandExecutorCore(
+            working_directory=working_directory,
+            path_guard=guard,
+        )
+        result = executor.execute_command(["true"], shell=False)
+
+        assert executor.working_directory == str(canonical_cwd)
+        assert mock_run.call_args.kwargs["cwd"] == canonical_cwd
+        assert result["success"] is True
+
+    @pytest.mark.parametrize("spelling", ["exact", "equivalent", "symlink"])
+    def test_executor_accepts_canonically_equivalent_guard_cwd(
+        self,
+        tmp_path,
+        mock_run,
+        spelling,
+    ):
+        workspace, guard = self._workspace_guard(tmp_path)
+        canonical_cwd = workspace.resolve_path("").resolve()
+        if spelling == "exact":
+            caller_cwd = str(canonical_cwd)
+        elif spelling == "equivalent":
+            caller_cwd = f"{canonical_cwd}/."
+        else:
+            alias = tmp_path / "workspace-alias"
+            alias.symlink_to(canonical_cwd, target_is_directory=True)
+            caller_cwd = str(alias)
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        executor = CommandExecutorCore(
+            working_directory=caller_cwd,
+            path_guard=guard,
+        )
+        executor.execute_command(["true"], shell=False)
+
+        assert executor.working_directory == str(canonical_cwd)
+        assert mock_run.call_args.kwargs["cwd"] == canonical_cwd
+
+    def test_executor_keeps_guard_cwd_after_caller_symlink_retarget(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        workspace, guard = self._workspace_guard(tmp_path)
+        canonical_cwd = workspace.resolve_path("").resolve()
+        other_cwd = tmp_path / "other"
+        other_cwd.mkdir()
+        alias = tmp_path / "workspace-alias"
+        alias.symlink_to(canonical_cwd, target_is_directory=True)
+        executor = CommandExecutorCore(
+            working_directory=str(alias),
+            path_guard=guard,
+        )
+        alias.unlink()
+        alias.symlink_to(other_cwd, target_is_directory=True)
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        executor.execute_command(["true"], shell=False)
+
+        assert mock_run.call_args.kwargs["cwd"] == canonical_cwd
+
+    def test_executor_rejects_guard_cwd_mismatch_before_validation_or_spawn(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        class CwdBoundGuard:
+            def __init__(self, execution_cwd):
+                self.execution_cwd = execution_cwd
+                self.validate = Mock()
+                self.validate_argv = Mock()
+
+        guard_cwd = tmp_path / "guard"
+        guard_cwd.mkdir()
+        caller_cwd = tmp_path / "caller"
+        caller_cwd.mkdir()
+        guard = CwdBoundGuard(guard_cwd.resolve())
+
+        with pytest.raises(
+            ValueError,
+            match="working_directory does not match command policy execution cwd",
+        ):
+            CommandExecutorCore(
+                working_directory=str(caller_cwd),
+                path_guard=guard,
+            )
+
+        guard.validate.assert_not_called()
+        guard.validate_argv.assert_not_called()
+        mock_run.assert_not_called()
+
+    def test_executor_preserves_legacy_cwd_for_guard_without_binding(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+        caller_cwd = f"{tmp_path}/."
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        executor = CommandExecutorCore(
+            working_directory=caller_cwd,
+            path_guard=guard,
+        )
+        executor.execute_command(["true"], shell=False)
+
+        assert executor.working_directory == caller_cwd
+        assert mock_run.call_args.kwargs["cwd"] == caller_cwd
+
+    def test_executor_preserves_legacy_cwd_for_policy_with_no_requirement(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        class OptionalCwdGuard:
+            execution_cwd = None
+
+            def validate(self, command):
+                return None
+
+            def validate_argv(self, argv):
+                return None
+
+        caller_cwd = f"{tmp_path}/."
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        executor = CommandExecutorCore(
+            working_directory=caller_cwd,
+            path_guard=OptionalCwdGuard(),
+        )
+        executor.execute_command(["true"], shell=False)
+
+        assert executor.working_directory == caller_cwd
+        assert mock_run.call_args.kwargs["cwd"] == caller_cwd
+
+    def test_executor_working_directory_is_read_only_with_bound_policy(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        workspace, guard = self._workspace_guard(tmp_path)
+        canonical_cwd = workspace.resolve_path("").resolve()
+        other_cwd = tmp_path / "other"
+        other_cwd.mkdir()
+        executor = CommandExecutorCore(path_guard=guard)
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        with pytest.raises(AttributeError):
+            executor.working_directory = str(other_cwd)
+        executor.execute_command(["true"], shell=False)
+
+        assert mock_run.call_args.kwargs["cwd"] == canonical_cwd
+
+    @pytest.mark.parametrize("replacement", ["other_guard", "none"])
+    def test_executor_path_guard_is_read_only_and_keeps_original_binding(
+        self,
+        tmp_path,
+        mock_run,
+        replacement,
+    ):
+        class CwdBoundGuard:
+            def __init__(self, execution_cwd):
+                self.execution_cwd = execution_cwd
+                self.validate = Mock()
+                self.validate_argv = Mock()
+
+        original_cwd = tmp_path / "original"
+        original_cwd.mkdir()
+        other_cwd = tmp_path / "other"
+        other_cwd.mkdir()
+        original_guard = CwdBoundGuard(original_cwd.resolve())
+        other_guard = CwdBoundGuard(other_cwd.resolve())
+        executor = CommandExecutorCore(path_guard=original_guard)
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        with pytest.raises(AttributeError):
+            executor.path_guard = other_guard if replacement == "other_guard" else None
+        result = executor.execute_command(["true"], shell=False)
+
+        original_guard.validate_argv.assert_called_once_with(["true"])
+        other_guard.validate_argv.assert_not_called()
+        assert mock_run.call_args.kwargs["cwd"] == original_cwd.resolve()
+        assert result["success"] is True
+
+    def test_trusted_executable_resolution_rejects_relative_command_paths(self):
+        bash = shutil.which("bash")
+        assert bash is not None
+        relative_bash = os.path.relpath(bash, Path.cwd())
+
+        with pytest.raises(CommandPolicyViolation):
+            resolve_trusted_executable(relative_bash)
+
     @pytest.mark.parametrize(
         ("command", "shell"),
         [
@@ -336,27 +549,81 @@ class TestCommandPolicyFoundation:
         assert "internal parser detail" not in result["error"]
         mock_run.assert_not_called()
 
-    def test_injected_policy_rejects_execute_script_before_tempfile_creation(
+    def test_injected_policy_rejects_execute_script_without_side_effects(
         self,
+        tmp_path,
+        mock_run,
         monkeypatch,
     ):
         guard = Mock(spec=CommandPolicyGuard)
         create_tempfile = Mock()
+        marker = tmp_path / "fake-bash-ran"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_bash = fake_bin / "bash"
+        fake_bash.write_text(
+            f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n",
+            encoding="utf-8",
+        )
+        fake_bash.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
         monkeypatch.setattr(
             "xagent.core.tools.core.command_executor.tempfile.NamedTemporaryFile",
             create_tempfile,
         )
 
-        result = CommandExecutorCore(path_guard=guard).execute_script("echo unsafe")
+        result = CommandExecutorCore(path_guard=guard).execute_script("echo allowed")
+
+        guard.validate.assert_not_called()
+        guard.validate_argv.assert_not_called()
+        mock_run.assert_not_called()
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert result["error"] == (
+            "Command rejected by workspace path policy: command denied by policy"
+        )
+        create_tempfile.assert_not_called()
+        assert not marker.exists()
+
+    def test_unguarded_execute_script_preserves_real_tempfile_semantics(self):
+        result = CommandExecutorCore().execute_script(
+            'printf \'%s\\n%s\\n\' "$0" "${BASH_SOURCE[0]}"',
+        )
+
+        script_path, bash_source = result["output"].splitlines()
+        assert result["success"] is True
+        assert script_path == bash_source
+        assert Path(script_path).is_absolute()
+        assert not Path(script_path).exists()
+
+    @pytest.mark.parametrize("interpreter", ["bash", "python", "bash -O extglob", "'"])
+    def test_injected_policy_rejects_execute_script_for_all_interpreters(
+        self,
+        mock_run,
+        interpreter,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+
+        result = CommandExecutorCore(path_guard=guard).execute_script(
+            "echo unsafe",
+            interpreter=interpreter,
+        )
 
         assert result["success"] is False
         assert result["return_code"] == 126
-        assert "script execution is unavailable" in result["error"]
-        create_tempfile.assert_not_called()
+        guard.validate.assert_not_called()
+        guard.validate_argv.assert_not_called()
+        mock_run.assert_not_called()
 
     def test_injected_policy_allows_shell_command_execution(self, mock_run):
         guard = Mock(spec=CommandPolicyGuard)
         mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+        bash = shutil.which("bash")
+        assert bash is not None
+        trusted_bash = str(Path(bash).resolve())
 
         result = CommandExecutorCore(path_guard=guard).execute_command("printf allowed")
 
@@ -365,6 +632,140 @@ class TestCommandPolicyFoundation:
         mock_run.assert_called_once()
         assert mock_run.call_args.args[0] == "printf allowed"
         assert mock_run.call_args.kwargs["shell"] is True
+        assert mock_run.call_args.kwargs["executable"] == trusted_bash
+        assert result["success"] is True
+
+    def test_injected_policy_rejects_path_shadowed_bash_before_spawn(
+        self,
+        tmp_path,
+        mock_run,
+        monkeypatch,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+        marker = tmp_path / "fake-bash-ran"
+        fake_bin = tmp_path / "bin"
+        fake_bin.mkdir()
+        fake_bash = fake_bin / "bash"
+        fake_bash.write_text(
+            f"#!/bin/sh\ntouch {shlex.quote(str(marker))}\n",
+            encoding="utf-8",
+        )
+        fake_bash.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_command("printf allowed")
+
+        guard.validate.assert_called_once_with("printf allowed")
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        mock_run.assert_not_called()
+        assert not marker.exists()
+
+    def test_injected_policy_uses_absolute_bash_identity_for_argv_execution(
+        self,
+        mock_run,
+    ):
+        guard = Mock(spec=CommandPolicyGuard)
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+        command = ["bash", "-c", "printf allowed"]
+        bash = shutil.which("bash")
+        assert bash is not None
+        trusted_bash = str(Path(bash).resolve())
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        guard.validate_argv.assert_called_once_with(command)
+        assert mock_run.call_args.args[0] == [
+            trusted_bash,
+            "-c",
+            "printf allowed",
+        ]
+        assert result["success"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["env", "bash", "-c", "printf unsafe"],
+            ["timeout", "1", "bash", "-c", "printf unsafe"],
+        ],
+    )
+    def test_workspace_policy_rejects_wrapped_bash_argv_before_spawn(
+        self,
+        tmp_path,
+        mock_run,
+        monkeypatch,
+        command,
+    ):
+        workspace, guard = self._workspace_guard(tmp_path)
+        marker = tmp_path / "fake-bash-ran"
+        fake_bin = workspace.output_dir / "bin"
+        fake_bin.mkdir()
+        fake_bash = fake_bin / "bash"
+        fake_bash.write_text(
+            f"touch {shlex.quote(str(marker))}\n",
+            encoding="utf-8",
+        )
+        fake_bash.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        mock_run.assert_not_called()
+        assert not marker.exists()
+
+    def test_workspace_policy_uses_absolute_bash_identity_for_direct_argv(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        _, guard = self._workspace_guard(tmp_path)
+        command = ["bash", "-c", "printf allowed"]
+        bash = shutil.which("bash")
+        assert bash is not None
+        trusted_bash = str(Path(bash).resolve())
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        assert mock_run.call_args.args[0] == [
+            trusted_bash,
+            "-c",
+            "printf allowed",
+        ]
+        assert result["success"] is True
+
+    def test_workspace_policy_preserves_non_bash_wrapper_argv(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        _, guard = self._workspace_guard(tmp_path)
+        command = ["env", "printf", "allowed"]
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        assert mock_run.call_args.args[0] == command
         assert result["success"] is True
 
     def test_injected_policy_allows_argv_command_execution(self, mock_run):

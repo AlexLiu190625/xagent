@@ -13,9 +13,12 @@ from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
 from .command_policy import (
+    CommandArgvExecutionPolicy,
     CommandPathViolation,
     CommandPolicyGuard,
     CommandPolicyViolation,
+    CwdBoundCommandPolicy,
+    resolve_trusted_executable,
 )
 
 logger = logging.getLogger(__name__)
@@ -143,6 +146,37 @@ def _validate_working_directory(working_directory: Optional[str]) -> None:
         )
 
 
+def _bind_policy_working_directory(
+    working_directory: Optional[str],
+    path_guard: Optional[CommandPolicyGuard],
+) -> str | Path | None:
+    """Bind execution to a cwd-aware policy while preserving legacy guards."""
+    if path_guard is None or not isinstance(path_guard, CwdBoundCommandPolicy):
+        return working_directory
+
+    policy_cwd = path_guard.execution_cwd
+    if policy_cwd is None:
+        return working_directory
+    if not policy_cwd.is_absolute():
+        raise ValueError("command policy execution cwd must be canonical and absolute")
+    try:
+        canonical_policy_cwd = policy_cwd.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValueError("command policy execution cwd must be accessible") from exc
+    if canonical_policy_cwd != policy_cwd:
+        raise ValueError("command policy execution cwd must be canonical and absolute")
+    _validate_working_directory(str(policy_cwd))
+
+    if working_directory:
+        _validate_working_directory(working_directory)
+        caller_cwd = Path(working_directory).expanduser().resolve(strict=True)
+        if caller_cwd != policy_cwd:
+            raise ValueError(
+                "working_directory does not match command policy execution cwd"
+            )
+    return policy_cwd
+
+
 def _sanitize_interpreter_suffix(interpreter: str) -> str:
     """
     Sanitize interpreter name for use as temp file suffix.
@@ -174,9 +208,24 @@ class CommandExecutorCore:
             working_directory: Directory to use as working directory during execution
             path_guard: Optional policy implementation invoked before process creation
         """
-        self.working_directory = working_directory
-        self.path_guard = path_guard
+        self._path_guard = path_guard
+        self._working_directory = _bind_policy_working_directory(
+            working_directory,
+            path_guard,
+        )
         self.timeout = 300  # 5 minutes default
+
+    @property
+    def working_directory(self) -> Optional[str]:
+        """Return the configured cwd without exposing a mutation surface."""
+        if self._working_directory is None:
+            return None
+        return os.fspath(self._working_directory)
+
+    @property
+    def path_guard(self) -> Optional[CommandPolicyGuard]:
+        """Return the captured policy guard without exposing a mutation surface."""
+        return self._path_guard
 
     def execute_command(
         self,
@@ -209,14 +258,22 @@ class CommandExecutorCore:
         if shell and not isinstance(command, str):
             return _command_rejected_result("shell=True requires a string command")
 
-        if self.path_guard is not None:
+        argv_prepared_by_policy = False
+        if self._path_guard is not None:
             try:
                 if shell:
-                    self.path_guard.validate(cast(str, command))
+                    self._path_guard.validate(cast(str, command))
                 else:
                     argv = [command] if isinstance(command, str) else list(command)
-                    self.path_guard.validate_argv(argv)
-                    command = argv
+                    if isinstance(
+                        self._path_guard,
+                        CommandArgvExecutionPolicy,
+                    ):
+                        command = self._path_guard.prepare_argv_for_execution(argv)
+                        argv_prepared_by_policy = True
+                    else:
+                        self._path_guard.validate_argv(argv)
+                        command = argv
             except CommandPolicyViolation as exc:
                 return _command_rejected_result(exc)
             except Exception:
@@ -235,14 +292,40 @@ class CommandExecutorCore:
                 f"CommandExecutor: Using working directory: {self.working_directory}"
             )
 
+        run_options: dict[str, Any] = {
+            "shell": shell,
+            "capture_output": capture_output,
+            "text": True,
+            "timeout": timeout,
+            "cwd": self._working_directory,
+        }
+        if self._path_guard is not None and shell:
+            try:
+                run_options["executable"] = os.fspath(
+                    resolve_trusted_executable("bash")
+                )
+            except CommandPolicyViolation as exc:
+                return _command_rejected_result(exc)
+        elif (
+            self._path_guard is not None
+            and not shell
+            and not argv_prepared_by_policy
+            and isinstance(command, list)
+            and command
+            and os.path.basename(command[0]) == "bash"
+        ):
+            try:
+                command = [
+                    os.fspath(resolve_trusted_executable(command[0])),
+                    *command[1:],
+                ]
+            except CommandPolicyViolation as exc:
+                return _command_rejected_result(exc)
+
         try:
             result = subprocess.run(
                 command,
-                shell=shell,
-                capture_output=capture_output,
-                text=True,
-                timeout=timeout,
-                cwd=self.working_directory,  # Use cwd parameter instead of os.chdir()
+                **run_options,
             )
 
             output = result.stdout if capture_output else ""
@@ -290,6 +373,11 @@ class CommandExecutorCore:
         """
         Execute script content with specified interpreter.
 
+        Guarded execution is rejected because this method's real-file semantics
+        cannot yet be preserved through the command policy without introducing
+        a validation-to-execution race. Unguarded execution retains its legacy
+        temporary-file behavior.
+
         Args:
             script_content: Script content to execute
             interpreter: Interpreter to use (bash, python, node, sh, etc.)
@@ -303,9 +391,11 @@ class CommandExecutorCore:
         """
         timeout = _validate_timeout(timeout, self.timeout)
 
-        if self.path_guard is not None:
+        if self._path_guard is not None:
             return _command_rejected_result(
-                "script execution is unavailable under an injected command policy"
+                CommandPolicyViolation(
+                    "restricted execute_script requires race-safe file semantics"
+                )
             )
 
         try:
