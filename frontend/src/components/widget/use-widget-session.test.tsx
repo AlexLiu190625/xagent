@@ -391,7 +391,7 @@ describe("useWidgetSession", () => {
     )
   })
 
-  it("advances recovery after each near-expiry parent reply instead of leaving the bridge latched", () => {
+  it("waits for a parent result when near-expiry updates arrive during recovery", () => {
     vi.useFakeTimers()
     const postMessage = vi.spyOn(EMBEDDED_PARENT, "postMessage").mockImplementation(() => undefined)
     const { result } = renderHook(() => useWidgetSession())
@@ -411,42 +411,40 @@ describe("useWidgetSession", () => {
       session_token_expires_at: new Date(Date.now() + 59_000).toISOString(),
     }))
 
-    expect(result.current.status).toBe("terminal")
-    expect(result.current.terminalCode).toBe("network_unavailable")
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.terminalCode).toBeNull()
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
   })
 
-  it("fails terminal after bounded parent response deadlines and backoff", () => {
-    vi.useFakeTimers()
-    const { result } = renderHook(() => useWidgetSession())
-    dispatchFromParent(updateMessage())
-
-    act(() => {
-      result.current.requestReconnect("ws_closed")
-      vi.advanceTimersByTime(10_000 + 1_000 + 10_000 + 2_000 + 10_000)
-    })
-
-    expect(result.current.status).toBe("terminal")
-    expect(result.current.terminalCode).toBe("network_unavailable")
-  })
-
-  it("does not reset the recovery budget when session updates arrive without an open socket", () => {
+  it("waits for the parent-owned retry phase instead of starting its own deadline", () => {
     vi.useFakeTimers()
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
 
     act(() => result.current.requestReconnect("ws_closed"))
+    act(() => vi.advanceTimersByTime(30_000))
+
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.terminalCode).toBeNull()
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
+  })
+
+  it("coalesces socket closes while the parent recovery phase is active", () => {
+    vi.useFakeTimers()
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
+
+    act(() => result.current.requestReconnect("ws_closed"))
     act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
-    dispatchFromParent(updateMessage())
     act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
-    dispatchFromParent(updateMessage())
     act(() => vi.advanceTimersByTime(15_000))
     act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
 
-    expect(result.current.status).toBe("terminal")
-    expect(result.current.terminalCode).toBe("network_unavailable")
-    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(3)
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.terminalCode).toBeNull()
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(1)
   })
 
   it("starts the stability window from the validated socket open for the active generation", () => {
@@ -468,7 +466,7 @@ describe("useWidgetSession", () => {
     expect(result.current.terminalCode).toBeNull()
   })
 
-  it("does not reset the recovery budget when the socket closes before its stability window", () => {
+  it("coalesces socket closes before the parent has replied", () => {
     vi.useFakeTimers()
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
@@ -484,8 +482,8 @@ describe("useWidgetSession", () => {
     dispatchFromParent(updateMessage())
     act(() => result.current.handleConnectionClose(new CloseEvent("close", { code: 1006 })))
 
-    expect(result.current.status).toBe("terminal")
-    expect(result.current.terminalCode).toBe("network_unavailable")
+    expect(result.current.status).toBe("refreshing")
+    expect(result.current.terminalCode).toBeNull()
   })
 
   it("ignores a stale socket close or failure after accepting a newer Session generation", () => {

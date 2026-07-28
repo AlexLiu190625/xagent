@@ -178,7 +178,7 @@ describe("widget session mode", () => {
     runWidget({ "data-encrypted-context": GRANT })
 
     expect(iframeEl()?.src).toBe(`${HOST}/widget/chat/session`)
-    expect(observeSpy).toHaveBeenCalledWith(document.body, { childList: true })
+    expect(observeSpy).toHaveBeenCalledWith(document.body, { childList: true, subtree: true })
     expect(fetchMock).toHaveBeenCalledTimes(1)
     expect(fetchMock).toHaveBeenCalledWith(EXCHANGE_URL, expect.objectContaining({
       method: "POST",
@@ -495,7 +495,33 @@ describe("widget session mode", () => {
     )
   })
 
-  it("retries an uncoded 5xx three times with 1s/2s/4s backoff, then reports network_unavailable", async () => {
+  it("publishes degraded between retryable parent attempts and resumes the same phase on success", async () => {
+    vi.useFakeTimers()
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_recovered" })))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    fromIframe("ready")
+
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_degraded", code: "network_unavailable" }),
+      HOST,
+    )
+
+    await vi.advanceTimersByTimeAsync(1_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_update", session_token: "st_recovered" }),
+      HOST,
+    )
+  })
+
+  it("retries an uncoded 5xx three times with 1s/2s/4s backoff, then terminalizes network_unavailable", async () => {
     vi.useFakeTimers()
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockImplementation(() => Promise.resolve(
@@ -518,9 +544,11 @@ describe("widget session mode", () => {
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 502)"))
     fromIframe("ready")
     expect(post).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "session_degraded", code: "network_unavailable" }),
+      expect.objectContaining({ type: "session_terminal", code: "network_unavailable" }),
       HOST,
     )
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
   })
 
   it("retries an unknown coded 5xx before reporting network_unavailable", async () => {
@@ -1396,7 +1424,7 @@ describe("widget session mode", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
-  it("retries a latched rate limit only after a persisted pageshow", async () => {
+  it("keeps retryable rate limits inside the active parent phase", async () => {
     vi.useFakeTimers()
     vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(
@@ -1417,20 +1445,10 @@ describe("widget session mode", () => {
     post.mockClear()
 
     fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(1_000)
     expect(fetchMock).toHaveBeenCalledTimes(3)
-
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody({
-      session_token: "st_recovered",
-    })))
-    firePageRestore()
-    await vi.advanceTimersByTimeAsync(0)
-
-    expect(fetchMock).toHaveBeenCalledTimes(4)
-    expect(fetchMock.mock.calls[3][0]).toBe(EXCHANGE_URL)
-    expect(post).toHaveBeenCalledWith(
-      expect.objectContaining({ type: "session_update", session_token: "st_recovered" }),
-      HOST,
-    )
+    await vi.advanceTimersByTimeAsync(30_000)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
   it("does nothing on a normal (non-persisted) pageshow", async () => {
@@ -1462,5 +1480,18 @@ describe("widget session mode", () => {
     firePageRestore()
     await flushAsync()
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("tears down when the iframe is removed from its still-mounted widget subtree", async () => {
+    let requestSignal: AbortSignal | undefined
+    fetchMock.mockImplementation((_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal
+      return new Promise(() => undefined)
+    })
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+
+    iframeEl()?.remove()
+    await vi.waitFor(() => expect(requestSignal?.aborted).toBe(true))
   })
 })

@@ -28,11 +28,6 @@
     identity_mismatch: true,
     rate_limited: true
   };
-  var TRANSIENT_SESSION_CODES = {
-    network_unavailable: true,
-    rate_limited: true
-  };
-
   function sessionAbortError() {
     return new DOMException('session request superseded', 'AbortError');
   }
@@ -84,7 +79,7 @@
   // Every request counts against the shared total-attempt and absolute-deadline
   // budget. Transport failures and coded rate limits also have narrower
   // per-class retry caps inside it.
-  function withRetry(makeRequest, policy, signal) {
+  function withRetry(makeRequest, policy, signal, onRetry) {
     var attempts = 0;
     var transportRetries = 0;
     var rateLimited = 0;
@@ -99,10 +94,11 @@
       return result;
     }
 
-    function retryAfter(wait, result, error) {
+    function retryAfter(wait, result, error, code) {
       if (attempts >= policy.maxAttempts || wait >= remainingMs()) {
         return giveUp(result, error);
       }
+      if (onRetry) onRetry(code);
       return sessionDelay(wait, signal).then(run);
     }
 
@@ -112,7 +108,7 @@
       }
       var wait = policy.retryDelays[transportRetries];
       transportRetries += 1;
-      return retryAfter(wait, result, error);
+      return retryAfter(wait, result, error, 'network_unavailable');
     }
 
     function run() {
@@ -128,7 +124,7 @@
         if (code === 'rate_limited') {
           if (rateLimited >= policy.maxRateLimitRetries) return result;
           rateLimited += 1;
-          return retryAfter(retryAfterMs(result), result, null);
+          return retryAfter(retryAfterMs(result), result, null, 'rate_limited');
         }
         if (!isKnownSessionErrorCode(code) && result.status >= 500) {
           return retryTransportOrGiveUp(result, null);
@@ -427,7 +423,7 @@
       window.addEventListener('pageshow', onPageShow);
       window.addEventListener('pagehide', onPageHide);
       state.observer = new MutationObserver(onDomMutation);
-      state.observer.observe(document.body, { childList: true });
+      state.observer.observe(document.body, { childList: true, subtree: true });
       runLoadFlow();
     }
 
@@ -436,7 +432,16 @@
     }
 
     function runRecoveryFlow() {
-      return state.reconnectToken ? reconnect() : exchange();
+      if (state.terminalCode) {
+        flush();
+        return Promise.resolve();
+      }
+      // A request that arrives while the initial exchange is still resolving
+      // must wait for that exchange to publish its reconnect token. Once a
+      // token exists, reconnect() is the sole endpoint writer.
+      return isNonBlankString(state.reconnectToken) || inflightPromise('exchange')
+        ? reconnect()
+        : exchange();
     }
 
     function onDomMutation() {
@@ -502,7 +507,7 @@
         state.ready = true;
         flush();
       } else if (data.type === 'reconnect_request') {
-        reconnect();
+        runRecoveryFlow();
       }
     }
 
@@ -532,15 +537,14 @@
         send({ type: 'session_terminal', code: state.terminalCode });
         return;
       }
-      if (state.recoverableCode &&
-          (!state.session || isStale(state.session.session_token_expires_at))) {
+      if (state.recoverableCode) {
         send({ type: 'session_degraded', code: state.recoverableCode });
         return;
       }
       if (!state.session) return;
       // Rule 3: refresh before any use of the token, including handing it over.
       if (isStale(state.session.session_token_expires_at)) {
-        reconnect();
+        runRecoveryFlow();
         return;
       }
       send({
@@ -591,14 +595,17 @@
       state.recoverableCode = null;
     }
 
+    function recordRetry(code) {
+      if (state.terminalCode) return;
+      state.recoverableCode = code;
+      logSession('warn', 'session recovery is retrying', code);
+      flush();
+    }
+
     function recordFailure(code, status) {
       if (state.terminalCode) return;
-      if (Object.prototype.hasOwnProperty.call(TRANSIENT_SESSION_CODES, code)) {
-        state.recoverableCode = code;
-      } else {
-        state.terminalCode = code;
-        state.recoverableCode = null;
-      }
+      state.terminalCode = code;
+      state.recoverableCode = null;
       logSession('error', 'chat unavailable', code, status);
       flush();
     }
@@ -739,7 +746,9 @@
             timeoutMs,
             signal
           );
-        }, SESSION_RETRY_POLICY, signal).then(function (result) {
+        }, SESSION_RETRY_POLICY, signal, function (code) {
+          if (!signal.aborted) recordRetry(code);
+        }).then(function (result) {
           handleResult(result, 'exchange');
         }, function () {
           if (!signal.aborted) recordFailure('network_unavailable');
@@ -748,9 +757,12 @@
     }
 
     function reconnect() {
-      if (state.terminalCode || state.recoverableCode) {
+      if (state.terminalCode) {
         flush();
         return Promise.resolve();
+      }
+      if (state.recoverableCode) {
+        return inflightPromise('reconnect') || inflightPromise('exchange') || Promise.resolve();
       }
       return singleFlight('reconnect', function (signal) {
         // If an exchange is still in flight, wait for it: it will land the
@@ -763,7 +775,9 @@
           // failure. Its transition already flushed the authoritative state;
           // this parked continuation must neither issue a request nor flush a
           // duplicate terminal message.
-          if (state.terminalCode || state.recoverableCode) return;
+          if (state.terminalCode) return;
+          if (state.recoverableCode) return inflightPromise('reconnect') || inflightPromise('exchange');
+          if (!isNonBlankString(state.reconnectToken)) return exchange();
           var body = { reconnect_token: state.reconnectToken };
           body.encrypted_context = state.grant;
           return withRetry(function (timeoutMs) {
@@ -773,7 +787,9 @@
               timeoutMs,
               signal
             );
-          }, SESSION_RETRY_POLICY, signal).then(function (result) {
+          }, SESSION_RETRY_POLICY, signal, function (code) {
+            if (!signal.aborted) recordRetry(code);
+          }).then(function (result) {
             handleResult(result, 'reconnect');
           }, function () {
             if (!signal.aborted) recordFailure('network_unavailable');

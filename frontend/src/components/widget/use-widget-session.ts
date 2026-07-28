@@ -5,17 +5,7 @@ import type { WebSocketConnectionFailure } from "@/hooks/use-websocket"
 
 const TOKEN_REFRESH_THRESHOLD_MS = 60_000
 const EXPIRY_WARNING_LEAD_MS = 10 * 60_000
-const PARENT_RESPONSE_DEADLINE_MS = 10_000
-const SESSION_STABILITY_WINDOW_MS = 15_000
-const MAX_CONSECUTIVE_RECOVERY_ATTEMPTS = 3
 const PARENT_RECOVERABLE_CODES = new Set(["network_unavailable", "rate_limited"])
-
-interface RecoveryState {
-  attempts: number
-  reason: WidgetSessionReconnectReason
-  responseTimer: ReturnType<typeof setTimeout> | null
-  retryTimer: ReturnType<typeof setTimeout> | null
-}
 
 export type WidgetSessionStatus = "waiting" | "active" | "refreshing" | "degraded" | "terminal"
 export type WidgetSessionReconnectReason = "ws_closed" | "token_expired"
@@ -116,15 +106,11 @@ export function useWidgetSession() {
   const [state, setState] = useState<WidgetSessionBridgeState>(initialState)
   const mountedRef = useRef(false)
   const targetOriginRef = useRef<string | null>(null)
-  const recoveryRef = useRef<RecoveryState | null>(null)
-  const consecutiveRecoveryAttemptsRef = useRef(0)
+  const recoveryInFlightRef = useRef(false)
   const terminalRef = useRef(false)
   const generationRef = useRef(0)
   const activeSessionGenerationRef = useRef<number | null>(null)
   const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const stabilityTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const stabilityConnectionIdentityRef = useRef<string | null>(null)
-  const issueReconnectRequestRef = useRef<(reason: WidgetSessionReconnectReason) => void>(() => undefined)
 
   const clearWarningTimer = useCallback(() => {
     if (warningTimerRef.current) {
@@ -133,30 +119,11 @@ export function useWidgetSession() {
     }
   }, [])
 
-  const clearStabilityTimer = useCallback(() => {
-    if (stabilityTimerRef.current) {
-      clearTimeout(stabilityTimerRef.current)
-      stabilityTimerRef.current = null
-    }
-    stabilityConnectionIdentityRef.current = null
-  }, [])
-
-  const clearRecoveryTimers = useCallback(() => {
-    const recovery = recoveryRef.current
-    if (!recovery) return
-    if (recovery.responseTimer) clearTimeout(recovery.responseTimer)
-    if (recovery.retryTimer) clearTimeout(recovery.retryTimer)
-    recovery.responseTimer = null
-    recovery.retryTimer = null
-  }, [])
-
   const transitionTerminal = useCallback((code: string) => {
     if (terminalRef.current) return
     terminalRef.current = true
     activeSessionGenerationRef.current = null
-    clearRecoveryTimers()
-    recoveryRef.current = null
-    clearStabilityTimer()
+    recoveryInFlightRef.current = false
     clearWarningTimer()
     setState({
       status: "terminal",
@@ -165,14 +132,11 @@ export function useWidgetSession() {
       terminalCode: code,
       isAbsoluteExpiryWarningVisible: false,
     })
-  }, [clearRecoveryTimers, clearStabilityTimer, clearWarningTimer])
+  }, [clearWarningTimer])
 
   const transitionDegraded = useCallback(() => {
     if (terminalRef.current) return
     activeSessionGenerationRef.current = null
-    clearRecoveryTimers()
-    recoveryRef.current = null
-    clearStabilityTimer()
     clearWarningTimer()
     setState((current) => ({
       status: "degraded",
@@ -181,28 +145,14 @@ export function useWidgetSession() {
       terminalCode: null,
       isAbsoluteExpiryWarningVisible: false,
     }))
-  }, [clearRecoveryTimers, clearStabilityTimer, clearWarningTimer])
+  }, [clearWarningTimer])
 
   const issueReconnectRequest = useCallback((reason: WidgetSessionReconnectReason) => {
     const targetOrigin = targetOriginRef.current
     if (!mountedRef.current || !targetOrigin || terminalRef.current) return
 
-    const recovery = recoveryRef.current ?? {
-      attempts: consecutiveRecoveryAttemptsRef.current,
-      reason,
-      responseTimer: null,
-      retryTimer: null,
-    }
-    recoveryRef.current = recovery
-    if (recovery.responseTimer || recovery.retryTimer) return
-    if (recovery.attempts >= MAX_CONSECUTIVE_RECOVERY_ATTEMPTS) {
-      transitionTerminal("network_unavailable")
-      return
-    }
-
-    recovery.attempts += 1
-    recovery.reason = reason
-    consecutiveRecoveryAttemptsRef.current = recovery.attempts
+    if (recoveryInFlightRef.current) return
+    recoveryInFlightRef.current = true
     clearWarningTimer()
     setState((current) => ({
       status: "refreshing",
@@ -212,81 +162,19 @@ export function useWidgetSession() {
       isAbsoluteExpiryWarningVisible: false,
     }))
     window.parent.postMessage({ xagent: true, v: 1, type: "reconnect_request", reason }, targetOrigin)
-    recovery.responseTimer = setTimeout(() => {
-      if (recoveryRef.current !== recovery || terminalRef.current) return
-      recovery.responseTimer = null
-      if (recovery.attempts >= MAX_CONSECUTIVE_RECOVERY_ATTEMPTS) {
-        transitionTerminal("network_unavailable")
-        return
-      }
-      const delay = recovery.attempts === 1 ? 1_000 : 2_000
-      recovery.retryTimer = setTimeout(() => {
-        if (recoveryRef.current !== recovery || terminalRef.current) return
-        recovery.retryTimer = null
-        issueReconnectRequestRef.current(recovery.reason)
-      }, delay)
-    }, PARENT_RESPONSE_DEADLINE_MS)
-  }, [clearWarningTimer, transitionTerminal])
-
-  issueReconnectRequestRef.current = issueReconnectRequest
-
-  const advanceRecovery = useCallback((reason: WidgetSessionReconnectReason) => {
-    const recovery = recoveryRef.current
-    if (!recovery) {
-      issueReconnectRequest(reason)
-      return
-    }
-    if (recovery.responseTimer) {
-      clearTimeout(recovery.responseTimer)
-      recovery.responseTimer = null
-    }
-    if (recovery.retryTimer) return
-    if (recovery.attempts >= MAX_CONSECUTIVE_RECOVERY_ATTEMPTS) {
-      transitionTerminal("network_unavailable")
-      return
-    }
-    recovery.reason = reason
-    const delay = recovery.attempts === 1 ? 1_000 : 2_000
-    recovery.retryTimer = setTimeout(() => {
-      if (recoveryRef.current !== recovery || terminalRef.current) return
-      recovery.retryTimer = null
-      issueReconnectRequestRef.current(recovery.reason)
-    }, delay)
-  }, [issueReconnectRequest, transitionTerminal])
+  }, [clearWarningTimer])
 
   const requestReconnect = useCallback((reason: WidgetSessionReconnectReason) => {
-    if (!mountedRef.current || terminalRef.current || recoveryRef.current) return
-    clearStabilityTimer()
+    if (!mountedRef.current || terminalRef.current || recoveryInFlightRef.current) return
     activeSessionGenerationRef.current = null
     issueReconnectRequest(reason)
-  }, [clearStabilityTimer, issueReconnectRequest])
-
-  const armStabilityWindow = useCallback((connectionIdentity: string) => {
-    clearStabilityTimer()
-    stabilityConnectionIdentityRef.current = connectionIdentity
-    stabilityTimerRef.current = setTimeout(() => {
-      if (
-        terminalRef.current
-        || recoveryRef.current
-        || stabilityConnectionIdentityRef.current !== connectionIdentity
-      ) return
-      stabilityTimerRef.current = null
-      stabilityConnectionIdentityRef.current = null
-      consecutiveRecoveryAttemptsRef.current = 0
-    }, SESSION_STABILITY_WINDOW_MS)
-  }, [clearStabilityTimer])
+  }, [issueReconnectRequest])
 
   const handleConnectionOpen = useCallback((connectionIdentity: string) => {
-    const activeGeneration = activeSessionGenerationRef.current
-    if (
-      !mountedRef.current
-      || terminalRef.current
-      || recoveryRef.current
-      || activeGeneration === null
-      || connectionIdentity !== `widget-session:${activeGeneration}`
-    ) return
-    armStabilityWindow(connectionIdentity)
-  }, [armStabilityWindow])
+    // The parent owns recovery scheduling; opening a socket does not affect
+    // its request budget.
+    void connectionIdentity
+  }, [])
 
   const isActiveConnection = useCallback((connectionIdentity?: string) => {
     const activeGeneration = activeSessionGenerationRef.current
@@ -301,7 +189,6 @@ export function useWidgetSession() {
     connectionIdentity?: string,
   ): "handled" => {
     if (!isActiveConnection(connectionIdentity)) return "handled"
-    clearStabilityTimer()
     if (event.code === 1000) {
       transitionTerminal("unexpected_error")
       return "handled"
@@ -319,20 +206,19 @@ export function useWidgetSession() {
 
     requestReconnect("ws_closed")
     return "handled"
-  }, [clearStabilityTimer, isActiveConnection, requestReconnect, transitionTerminal])
+  }, [isActiveConnection, requestReconnect, transitionTerminal])
 
   const handleConnectionFailure = useCallback((
     failure: WebSocketConnectionFailure,
     connectionIdentity?: string,
   ) => {
     if (!isActiveConnection(connectionIdentity)) return
-    clearStabilityTimer()
     if (failure.recoverable) {
       requestReconnect("ws_closed")
       return
     }
     transitionTerminal("unexpected_error")
-  }, [clearStabilityTimer, isActiveConnection, requestReconnect, transitionTerminal])
+  }, [isActiveConnection, requestReconnect, transitionTerminal])
 
   const scheduleExpiryWarning = useCallback((absoluteExpiresAt: number) => {
     clearWarningTimer()
@@ -397,17 +283,11 @@ export function useWidgetSession() {
       }
 
       if (tokenExpiresAt - now < TOKEN_REFRESH_THRESHOLD_MS) {
-        if (recoveryRef.current) {
-          advanceRecovery("token_expired")
-        } else {
-          requestReconnect("token_expired")
-        }
+        requestReconnect("token_expired")
         return
       }
 
-      clearRecoveryTimers()
-      recoveryRef.current = null
-      clearStabilityTimer()
+      recoveryInFlightRef.current = false
       generationRef.current += 1
       const session: WidgetSession = {
         token,
@@ -434,13 +314,10 @@ export function useWidgetSession() {
       mountedRef.current = false
       activeSessionGenerationRef.current = null
       window.removeEventListener("message", onMessage)
-      clearRecoveryTimers()
-      recoveryRef.current = null
-      clearStabilityTimer()
+      recoveryInFlightRef.current = false
       clearWarningTimer()
     }
-    // The bridge owns timers for its mounted lifetime; callback behavior reads
-    // refs so a render must not retire an in-flight recovery attempt.
+    // The bridge owns its parent message subscription for the mounted lifetime.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
