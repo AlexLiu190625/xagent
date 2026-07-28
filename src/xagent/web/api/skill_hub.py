@@ -48,6 +48,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from xagent.skills.library import SkillScopeContext
 from xagent.web.api.skill_hub_registry import (
     _MAX_DOWNLOAD_BYTES,
     SkillRegistry,
@@ -57,6 +58,10 @@ from xagent.web.api.skill_hub_registry import (
 from xagent.web.auth_dependencies import get_current_user
 from xagent.web.models.database import get_db
 from xagent.web.models.user import User
+from xagent.web.services.skill_runtime import (
+    get_skill_runtime_scope,
+    handoff_skill_runtime_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,39 +236,28 @@ async def _get_manager(request: Request) -> Any:
     return mgr
 
 
-def _scope_identity(user: User) -> tuple[int | None, dict[str, Any]]:
-    user_id = int(user.id) if user.id is not None else None
-    metadata: dict[str, Any] = {}
-    team_id = getattr(user, "_saas_team_id", None)
-    if isinstance(team_id, int):
-        metadata["team_id"] = team_id
-    return user_id, metadata
-
-
-def _scope_context(user: User) -> Any:
-    from xagent.skills.library import SkillScopeContext
-
-    user_id, metadata = _scope_identity(user)
-    return SkillScopeContext(
-        user_id=user_id,
-        metadata=metadata,
-    )
-
-
-def _write_context(request: Request, user: User, db: Any) -> Any:
+def _write_context(
+    request: Request,
+    user: User,
+    db: Any,
+    scope: SkillScopeContext,
+) -> Any:
     from xagent.skills.library import SkillWriteContext
 
-    user_id, metadata = _scope_identity(user)
     return SkillWriteContext(
         user=user,
-        user_id=user_id,
+        user_id=scope.user_id,
         db=db,
         request=request,
-        metadata=metadata,
+        metadata=dict(scope.metadata),
     )
 
 
-async def _get_scoped_manager(request: Request, user: User) -> Any:
+async def _get_scoped_manager(
+    request: Request,
+    context: SkillScopeContext,
+    db: Any,
+) -> Any:
     """Build a per-request SkillManager (no persistent per-user cache).
 
     Caching strategy — decouple by volatility:
@@ -294,12 +288,12 @@ async def _get_scoped_manager(request: Request, user: User) -> Any:
     from xagent.skills.manager import SkillManager
     from xagent.skills.personal_db import XagentPersonalDbSkillProvider
 
-    ctx = _scope_context(user)
+    handoff_skill_runtime_session(db)
 
     custom_provider = get_skill_library_provider()
     if custom_provider is not None:
         # Custom (e.g. SaaS) provider — use as-is; it handles all layers.
-        mgr = SkillManager(provider=custom_provider, context=ctx)
+        mgr = SkillManager(provider=custom_provider, context=context)
     else:
         # Default path: cached FS records + fresh personal-DB per request.
         global_mgr = await _get_manager(request)
@@ -311,7 +305,7 @@ async def _get_scoped_manager(request: Request, user: User) -> Any:
         provider = CompositeSkillLibraryProvider(
             [StaticRecordsProvider(fs_records), XagentPersonalDbSkillProvider()]
         )
-        mgr = SkillManager(provider=provider, context=ctx)
+        mgr = SkillManager(provider=provider, context=context)
 
     await mgr.reload()
     return mgr
@@ -604,11 +598,11 @@ def _check_registry_security_gate(registry: Any, detail: dict) -> None:
 @router.get("/installed", response_model=List[SkillSummary])
 async def list_installed(
     request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
-    _user: User = Depends(get_current_user),
 ) -> List[SkillSummary]:
     """List every skill the SkillManager can see, tagged with source."""
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     summaries: list[SkillSummary] = []
     for skill in mgr._skills_cache.values():  # noqa: SLF001
         summaries.append(_skill_to_summary(skill))
@@ -621,10 +615,10 @@ async def list_installed(
 async def get_installed(
     name: str,
     request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
-    _user: User = Depends(get_current_user),
 ) -> SkillDetail:
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -639,11 +633,12 @@ async def get_installed(
 async def delete_installed(
     name: str,
     request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> Response:
     """Remove a user-installed skill. Builtin / external are refused."""
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -658,7 +653,7 @@ async def delete_installed(
             )
         try:
             await writer.delete_skill(
-                _write_context(request, _user, db),
+                _write_context(request, _user, db, context),
                 scope="team",
                 name=name,
             )
@@ -690,6 +685,7 @@ async def delete_installed(
 async def create_skill(
     body: CreateSkillRequest,
     request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillSummary:
@@ -710,7 +706,7 @@ async def create_skill(
             )
         try:
             await writer.create_skill(
-                _write_context(request, _user, db),
+                _write_context(request, _user, db, context),
                 scope=body.scope,
                 name=body.name,
                 files={"SKILL.md": body.skill_md.encode("utf-8")},
@@ -727,7 +723,7 @@ async def create_skill(
             files={"SKILL.md": body.skill_md.encode("utf-8")},
         )
 
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(body.name)
     if skill is None:
         # Most likely cause: malformed YAML frontmatter that the parser
@@ -751,6 +747,7 @@ async def edit_installed(
     name: str,
     body: EditSkillRequest,
     request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillSummary:
@@ -760,7 +757,7 @@ async def edit_installed(
     refused so we don't silently fork a shipped skill (and so symlinked
     external roots stay readonly from our side).
     """
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(name)
     if not skill:
         raise HTTPException(status_code=404, detail="Skill not found")
@@ -775,7 +772,7 @@ async def edit_installed(
             )
         try:
             await writer.update_skill_file(
-                _write_context(request, _user, db),
+                _write_context(request, _user, db, context),
                 scope="team",
                 name=name,
                 path="SKILL.md",
@@ -792,7 +789,7 @@ async def edit_installed(
         )
     else:
         _update_personal_skill_md(db=db, user=_user, name=name, skill_md=body.skill_md)
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     reloaded = await mgr.get_skill(name)
     if reloaded is None:
         raise HTTPException(
@@ -813,7 +810,7 @@ async def edit_installed(
 
 @router.get("/registries")
 async def list_registries(
-    _user: User = Depends(get_current_user),
+    _context: SkillScopeContext = Depends(get_skill_runtime_scope),
 ) -> List[Dict[str, str]]:
     """Return available skill registries (ClawHub, etc.).
     The frontend uses this to build the source-selector dropdown."""
@@ -827,14 +824,14 @@ async def registry_list(
     limit: int = Query(24, ge=1, le=100),
     cursor: Optional[str] = Query(None),
     source: str = Query("clawhub"),
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
-    _user: User = Depends(get_current_user),
 ) -> RegistryListResponse:
     """Browse a skill registry's catalog."""
     registry = get_registry(source)
     payload = await asyncio.to_thread(registry.list_skills, sort, limit, cursor)
     items_raw = payload.get("items", []) if isinstance(payload, dict) else []
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     installed = _installed_slugs(mgr)
     items = [
         _summary_from_registry_item(i, installed, registry)
@@ -859,8 +856,8 @@ async def registry_search(
     q: str = Query(..., min_length=1, max_length=200),
     limit: int = Query(24, ge=1, le=100),
     source: str = Query("clawhub"),
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
-    _user: User = Depends(get_current_user),
 ) -> RegistryListResponse:
     """Full-text search a skill registry."""
     registry = get_registry(source)
@@ -870,7 +867,7 @@ async def registry_search(
         if isinstance(payload, dict)
         else []
     )
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     installed = _installed_slugs(mgr)
     items = [
         _summary_from_registry_item(i, installed, registry)
@@ -891,6 +888,7 @@ async def install_skill(
     source: str,
     body: InstallSkillRequest,
     request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
     _user: User = Depends(get_current_user),
 ) -> SkillSummary:
@@ -942,7 +940,7 @@ async def install_skill(
             )
         try:
             await writer.create_skill(
-                _write_context(request, _user, db),
+                _write_context(request, _user, db, context),
                 scope="team",
                 name=body.slug,
                 files=files,
@@ -967,7 +965,7 @@ async def install_skill(
             clawhub_version=body.version,
         )
 
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     skill = await mgr.get_skill(body.slug)
     if skill is None:
         raise HTTPException(
@@ -992,8 +990,8 @@ async def registry_detail(
     slug: str,
     request: Request,
     source: str = Query("clawhub"),
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
     db: Any = Depends(get_db),
-    _user: User = Depends(get_current_user),
 ) -> RegistrySkillDetail:
     """Single-skill detail from a registry."""
     registry = get_registry(source)
@@ -1007,7 +1005,7 @@ async def registry_detail(
     latest = payload.get("latestVersion") or {}
     moderation = payload.get("moderation")
     metadata = payload.get("metadata") or {}
-    mgr = await _get_scoped_manager(request, _user)
+    mgr = await _get_scoped_manager(request, context, db)
     installed = _installed_slugs(mgr)
     return RegistrySkillDetail(
         slug=slug,

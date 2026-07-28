@@ -600,15 +600,23 @@ jobs:
       - name: Verify Docker
         run: docker version
 
-      - name: Pull MinIO image
-        # Use Docker Hub (minio/minio) — more reliable than quay.io which
-        # intermittently returns 504. Retry up to 3 times; fail the step if
-        # all attempts fail so the image-not-found error surfaces here rather
-        # than as a confusing Docker daemon error inside the e2e fixture.
+      - name: Pull e2e service images
+        # Retry service images before pytest so registry failures surface here
+        # instead of as confusing Docker daemon errors inside e2e fixtures.
         run: |
-          for i in 1 2 3; do
-            docker pull minio/minio && break
-            [ "$i" -lt 3 ] && echo "Attempt $i failed, retrying in 15s..." && sleep 15 || exit 1
+          for image in minio/minio postgres:16-bookworm; do
+            pulled=false
+            for i in 1 2 3; do
+              if docker pull "$image"; then
+                pulled=true
+                break
+              fi
+              if [ "$i" -lt 3 ]; then
+                echo "Pull attempt $i for $image failed; retrying in 15s..."
+                sleep 15
+              fi
+            done
+            [ "$pulled" = true ] || exit 1
           done
 
       - name: Run e2e tests

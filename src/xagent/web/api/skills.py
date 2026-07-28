@@ -9,9 +9,14 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
 
-from ..auth_dependencies import get_current_user
-from ..models.user import User
+from ...skills.library import SkillScopeContext
+from ..models.database import get_db
+from ..services.skill_runtime import (
+    get_skill_runtime_scope,
+    handoff_skill_runtime_session,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -51,18 +56,15 @@ class ReloadResponse(BaseModel):
 router = APIRouter(prefix="/api/skills", tags=["skills"])
 
 
-def _skill_context(current_user: User) -> Any:
-    from ...skills.library import SkillScopeContext
-
-    return SkillScopeContext(
-        user_id=int(current_user.id) if current_user.id is not None else None
-    )
-
-
-async def _request_skill_manager(_request: Request, current_user: User) -> Any:
+async def _request_skill_manager(
+    _request: Request,
+    context: SkillScopeContext,
+    db: Session,
+) -> Any:
     from ...skills.utils import create_skill_manager
 
-    manager: Any = create_skill_manager(context=_skill_context(current_user))
+    handoff_skill_runtime_session(db)
+    manager: Any = create_skill_manager(context=context)
     await manager.ensure_initialized()
     return manager
 
@@ -72,7 +74,9 @@ async def _request_skill_manager(_request: Request, current_user: User) -> Any:
 
 @router.get("/", response_model=list[SkillInfo])
 async def list_skills(
-    request: Request, current_user: User = Depends(get_current_user)
+    request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
+    db: Session = Depends(get_db),
 ) -> list[SkillInfo]:
     """
     List all available skills
@@ -80,7 +84,7 @@ async def list_skills(
     Returns:
         List of available skills with basic information
     """
-    skill_manager = await _request_skill_manager(request, current_user)
+    skill_manager = await _request_skill_manager(request, context, db)
     skills = await skill_manager.list_skills()
     # Convert to SkillInfo type
     from typing import cast
@@ -92,7 +96,8 @@ async def list_skills(
 async def get_skill(
     skill_name: str,
     request: Request,
-    current_user: User = Depends(get_current_user),
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
+    db: Session = Depends(get_db),
 ) -> SkillDetail:
     """
     Get single skill detail (including template)
@@ -106,7 +111,7 @@ async def get_skill(
     Raises:
         HTTPException: If skill not found
     """
-    skill_manager = await _request_skill_manager(request, current_user)
+    skill_manager = await _request_skill_manager(request, context, db)
     skill = await skill_manager.get_skill(skill_name)
 
     if not skill:
@@ -126,7 +131,9 @@ async def get_skill(
 
 @router.post("/reload", response_model=ReloadResponse)
 async def reload_skills(
-    request: Request, current_user: User = Depends(get_current_user)
+    request: Request,
+    context: SkillScopeContext = Depends(get_skill_runtime_scope),
+    db: Session = Depends(get_db),
 ) -> ReloadResponse:
     """
     Manually reload all skills
@@ -136,7 +143,7 @@ async def reload_skills(
     Returns:
         Reload status with skill count
     """
-    skill_manager = await _request_skill_manager(request, current_user)
+    skill_manager = await _request_skill_manager(request, context, db)
     await skill_manager.reload()
     count = len(await skill_manager.list_skills())
 
