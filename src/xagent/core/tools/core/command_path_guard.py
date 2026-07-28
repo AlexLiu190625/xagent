@@ -26,7 +26,17 @@ from typing import (
     cast,
 )
 
-import bashlex
+try:
+    import bashlex
+except ModuleNotFoundError as _bashlex_import_error:  # pragma: no cover
+    # ``bashlex`` ships in the optional ``command-path-guard`` extra, not the
+    # base dependencies. Import lazily so importing this module (and collecting
+    # its tests) never fails on a plain install; construction fails closed with
+    # an actionable hint when the parser is genuinely required.
+    bashlex = None
+    _BASHLEX_IMPORT_ERROR: ModuleNotFoundError | None = _bashlex_import_error
+else:
+    _BASHLEX_IMPORT_ERROR = None
 
 from ...workspace import TaskWorkspace
 from .command_policy import (
@@ -39,7 +49,11 @@ from .command_policy import (
 logger = logging.getLogger(__name__)
 
 _MAX_COMMAND_POLICY_INPUT_CHARS = 64 * 1024
-_MAX_INSPECTED_SCRIPT_BYTES = _MAX_COMMAND_POLICY_INPUT_CHARS
+# Bounded budget for reading script/config files off disk before inspection.
+# Numerically equal to the character input cap but kept in its own byte domain
+# (compared against ``os.fstat().st_size`` and ``len(raw_bytes)``) so the two
+# limits can move independently instead of silently coupling chars to bytes.
+_MAX_INSPECTED_SCRIPT_BYTES = 64 * 1024
 _MAX_INSPECTED_SCRIPT_DEPTH = 8
 _MAX_COMMAND_WRAPPER_DEPTH = 32
 _MAX_POSSIBLE_SHELL_STATES = 16
@@ -636,6 +650,11 @@ class WorkspaceCommandPathGuard:
     """Validate Bash language boundaries against one task workspace."""
 
     def __init__(self, workspace: TaskWorkspace) -> None:
+        if bashlex is None:
+            raise ModuleNotFoundError(
+                "WorkspaceCommandPathGuard requires the 'bashlex' parser. Install "
+                "the optional extra: pip install 'xagent[command-path-guard]'."
+            ) from _BASHLEX_IMPORT_ERROR
         self._workspace = workspace
         self._initial_cwd = workspace.resolve_path("").resolve()
 
@@ -657,12 +676,19 @@ class WorkspaceCommandPathGuard:
         ):
             return []
         policy_source = _normalize_policy_shell_source(command)
+        if bashlex is None:  # pragma: no cover - guarded at construction
+            raise CommandPolicyViolation("shell command parser is unavailable")
         try:
             nodes = cast(list[Any], bashlex.parse(policy_source))
         except Exception as exc:
             # bashlex exposes several parser-internal exception types. Normalize
             # all of them at this boundary so malformed input never reaches the
             # executor through a parser-version-specific failure mode.
+            #
+            # Invariant: input bashlex cannot model (``$(( ))``, ``[[ ]]``,
+            # ``case``, ``select``, ``coproc``, array assignments, ...) MUST stay
+            # fail-closed here. Never relax this into a fail-open path to reduce
+            # false positives on unparsable input.
             logger.debug("Command path guard rejected unparsed shell input")
             raise CommandPolicyViolation("cannot safely parse shell command") from exc
         _mark_unmodeled_expansions(nodes, policy_source)
@@ -899,11 +925,11 @@ class WorkspaceCommandPathGuard:
                 f"cannot safely inspect privilege escalation via {command_name}"
             )
         if self._is_direct_command_path(command_word):
-            if not self._is_trusted_system_command(command_word, command_name):
+            if not self._is_trusted_system_command(command_word):
                 self._inspect_direct_shell_script(command_word, state)
                 return state
         elif command_name in _CLASSIFIED_EXECUTABLE_COMMANDS:
-            if not self._is_trusted_system_command(command_word, command_name):
+            if not self._is_trusted_system_command(command_word):
                 discovered = shutil.which(command_name)
                 if discovered is not None:
                     self._inspect_direct_shell_script(discovered, state)
@@ -980,6 +1006,53 @@ class WorkspaceCommandPathGuard:
             )
         return home
 
+    @staticmethod
+    def _reject_symlink_traversing_chdir(target_word: str, cwd: Path) -> None:
+        """Reject a directory change whose target path crosses a symlink.
+
+        The guard tracks a *physically* resolved cwd, but Bash's ``cd``/``pushd``
+        (without ``-P``) are *logical*: they collapse ``..`` textually against
+        the pre-symlink path instead of following symlinks. When a target both
+        crosses a symlink and carries ``..`` segments, the guard's resolved cwd
+        diverges from where Bash actually lands, so a later relative operand can
+        resolve inside the workspace while Bash reads/writes a sibling tenant's
+        files. Physical and logical resolution agree whenever no symlink is
+        traversed, so rejecting symlink-crossing directory changes keeps the
+        tracked cwd equal to Bash's logical cwd. Fail closed rather than emulate
+        logical ``cd``. ``cd -``/``popd``/stack rotation restore an
+        already-validated, symlink-free cwd and do not reach this check.
+        """
+        if isinstance(target_word, _CommandValue) and not target_word.is_static:
+            # Dynamic targets are rejected by the resolver below; do not probe
+            # an unexpanded literal against the filesystem.
+            return
+        target = Path(target_word).expanduser()
+        if target.is_absolute():
+            probe = Path(target.anchor)
+            parts = target.parts[1:]
+        else:
+            probe = cwd
+            parts = target.parts
+        for part in parts:
+            if part == ".":
+                continue
+            if part == "..":
+                probe = probe.parent
+                continue
+            probe = probe / part
+            try:
+                crosses_symlink = probe.is_symlink()
+            except OSError as exc:
+                raise CommandPolicyViolation(
+                    "cannot inspect directory change target"
+                ) from exc
+            if crosses_symlink:
+                raise CommandPolicyViolation(
+                    "cannot safely resolve a directory change that traverses a "
+                    "symlink; Bash resolves 'cd' logically while the guard "
+                    "resolves physically"
+                )
+
     def _change_directory(
         self,
         command_name: str,
@@ -998,6 +1071,7 @@ class WorkspaceCommandPathGuard:
                     )
                 target = state.previous_cwd
             else:
+                self._reject_symlink_traversing_chdir(target_word, state.cwd)
                 target = self._check_path(target_word, state.cwd, "read")
             return replace(state, cwd=target, previous_cwd=state.cwd)
 
@@ -1012,6 +1086,7 @@ class WorkspaceCommandPathGuard:
             if operands:
                 if operands[0] == "-":
                     raise CommandPolicyViolation("cannot safely resolve pushd target")
+                self._reject_symlink_traversing_chdir(operands[0], state.cwd)
                 target = self._check_path(operands[0], state.cwd, "read")
                 stack = (state.cwd, *state.directory_stack)
             else:
@@ -1243,7 +1318,7 @@ class WorkspaceCommandPathGuard:
         return "/" in command_word
 
     @staticmethod
-    def _is_trusted_system_command(command_word: str, command_name: str) -> bool:
+    def _is_trusted_system_command(command_word: str) -> bool:
         try:
             resolve_trusted_executable(command_word)
             return True
@@ -1613,7 +1688,7 @@ class WorkspaceCommandPathGuard:
                 "instead of using active globs or shell expansions"
             )
 
-        if raw_path in {"", "-", "{}"}:
+        if raw_path in {"", "-"}:
             return cwd
 
         candidate = Path(raw_path).expanduser()

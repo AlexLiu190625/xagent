@@ -5,6 +5,7 @@ import shlex
 import shutil
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -1934,3 +1935,92 @@ class TestScopedCommandPathGuardBash:
         assert result["success"] is False
         assert result["return_code"] == 126
         assert "command denied by policy" in result["error"]
+
+
+class TestCdSymlinkTraversal:
+    """`cd`/`pushd` logical-vs-physical divergence must not escape the workspace.
+
+    Bash's ``cd`` (without ``-P``) is logical: it collapses ``..`` textually
+    against the pre-symlink path. The guard resolves physically. When a target
+    crosses a symlink and carries enough ``..`` to round-trip past its real
+    depth, the two disagree and a fully-classified ``cd`` + ``cat``/``rm``
+    sequence could reach a sibling tenant's files. The guard fails closed on any
+    directory change that traverses a symlink.
+    """
+
+    def test_cd_through_symlink_with_dotdot_is_rejected(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        ws = Path(workspace.resolve_path(""))
+        (ws / "a" / "b" / "c" / "d" / "e" / "f").mkdir(parents=True)
+        (ws / "s").symlink_to(ws / "a" / "b" / "c" / "d" / "e" / "f")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="traverses a symlink"):
+            guard.validate("cd s/../../../../../..")
+
+    def test_pushd_through_symlink_is_rejected(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        ws = Path(workspace.resolve_path(""))
+        (ws / "deep" / "nested").mkdir(parents=True)
+        (ws / "link").symlink_to(ws / "deep" / "nested")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="traverses a symlink"):
+            guard.validate("pushd link/../..")
+
+    def test_symlink_free_cd_still_resolves(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        ws = Path(workspace.resolve_path(""))
+        (ws / "sub" / "inner").mkdir(parents=True)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        # Real directories with a textual ``..`` cross no symlink and stay in
+        # the workspace, so navigation and a subsequent read are allowed.
+        guard.validate("cd sub/inner/.. && cat placeholder.txt")
+
+    def test_guarded_executor_blocks_cd_symlink_escape(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        ws = Path(workspace.resolve_path(""))
+        (ws / "a" / "b" / "c" / "d" / "e" / "f").mkdir(parents=True)
+        (ws / "s").symlink_to(ws / "a" / "b" / "c" / "d" / "e" / "f")
+        tool = _guarded_tool(workspace)
+        rel_secret = os.path.relpath(sibling_file, ws)
+
+        result = tool.run_json_sync(
+            {"command": f"cd s/../../../../../.. && cat {rel_secret}"}
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "sibling secret" not in (result.get("output") or "")
+        assert sibling_file.read_text(encoding="utf-8") == "sibling secret"
+
+    def test_guarded_executor_blocks_cd_symlink_escape_rm_variant(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        ws = Path(workspace.resolve_path(""))
+        (ws / "a" / "b" / "c" / "d" / "e" / "f").mkdir(parents=True)
+        (ws / "s").symlink_to(ws / "a" / "b" / "c" / "d" / "e" / "f")
+        tool = _guarded_tool(workspace)
+        rel_secret = os.path.relpath(sibling_file, ws)
+
+        result = tool.run_json_sync(
+            {"command": f"cd s/../../../../../.. && rm {rel_secret}"}
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert sibling_file.exists()
+
+    def test_quoted_brace_literal_is_checked_as_a_file_path(
+        self, scoped_command_workspace
+    ):
+        # ``{}`` is no longer a cwd sentinel: a quoted literal is authorized as
+        # the file itself and still resolves inside the workspace.
+        workspace, _, _ = scoped_command_workspace
+        ws = Path(workspace.resolve_path(""))
+        (ws / "{}").write_text("brace", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("cat '{}'")
