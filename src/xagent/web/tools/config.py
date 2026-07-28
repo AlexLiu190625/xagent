@@ -1970,7 +1970,6 @@ class WebToolConfig(BaseToolConfig):
         try:
             self._detach_factory_runtime_resources()
         finally:
-            self._retained_factory_model_state = None
             self._factory_runtime_handed_off = True
 
     def _detach_factory_runtime_resources(self) -> None:

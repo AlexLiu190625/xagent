@@ -39,6 +39,74 @@ def _factory():
     return sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
+_FACTORY_MODEL_VALUE_FIELDS = (
+    "vision_model",
+    "image_generate_model",
+    "image_edit_model",
+    "video_model",
+    "asr_model",
+    "tts_model",
+    "sound_effect_model",
+    "music_model",
+)
+_FACTORY_MODEL_MAPPING_FIELDS = (
+    "image_models",
+    "video_models",
+    "asr_models",
+    "tts_models",
+    "sound_effect_models",
+    "music_models",
+)
+
+
+def _factory_model_snapshot(generation):
+    from xagent.web.tools.config import (
+        _ToolFactoryRuntimeLoadPlan,
+        _ToolFactoryRuntimeSnapshot,
+    )
+
+    values = {field_name: object() for field_name in _FACTORY_MODEL_VALUE_FIELDS}
+    for field_name in _FACTORY_MODEL_MAPPING_FIELDS:
+        values[field_name] = {
+            "shared": object(),
+            f"only-{generation}": object(),
+        }
+    plan = _ToolFactoryRuntimeLoadPlan(
+        user_id=None,
+        task_id=None,
+        connector_runtime_turn_id=None,
+        load_policy=False,
+        load_basic=False,
+        load_sql=False,
+        load_custom_api=False,
+        load_vision=True,
+        load_image=True,
+        load_video=True,
+        load_audio=True,
+        published_agent_policy=None,
+    )
+    return _ToolFactoryRuntimeSnapshot(plan=plan, **values), values
+
+
+def _assert_factory_model_values(cfg, expected):
+    for field_name in _FACTORY_MODEL_VALUE_FIELDS:
+        getter = getattr(cfg, f"get_{field_name}")
+        assert getter() is expected[field_name]
+    for field_name in _FACTORY_MODEL_MAPPING_FIELDS:
+        getter = getattr(cfg, f"get_{field_name}")
+        actual = getter()
+        expected_mapping = expected[field_name]
+        assert actual.keys() == expected_mapping.keys()
+        assert all(actual[key] is value for key, value in expected_mapping.items())
+
+
+def _assert_factory_model_getters_are_neutral(cfg):
+    for field_name in _FACTORY_MODEL_VALUE_FIELDS:
+        assert getattr(cfg, f"get_{field_name}")() is None
+    for field_name in _FACTORY_MODEL_MAPPING_FIELDS:
+        assert getattr(cfg, f"get_{field_name}")() == {}
+
+
 class _Chain:
     """Minimal chainable query stub: filter/join return self, terminals empty."""
 
@@ -1041,6 +1109,236 @@ async def test_handoff_retains_loaded_model_values_without_database_fallback():
     assert cfg.get_music_model() is None
     for getter, _expected in mapping_getters:
         assert getter() == {}
+
+
+def test_handoff_replaces_retained_model_generation_without_merging():
+    snapshot_a, values_a = _factory_model_snapshot("a")
+    snapshot_b, values_b = _factory_model_snapshot("b")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+
+    cfg._apply_factory_runtime_snapshot(snapshot_a)
+    cfg.handoff_factory_runtime()
+    retained_a = cfg._retained_factory_model_state
+    assert retained_a is not None
+    _assert_factory_model_values(cfg, values_a)
+
+    cfg._apply_factory_runtime_snapshot(snapshot_b)
+    cfg.handoff_factory_runtime()
+    retained_b = cfg._retained_factory_model_state
+    assert retained_b is not None
+    assert retained_b is not retained_a
+    _assert_factory_model_values(cfg, values_b)
+
+
+@pytest.mark.asyncio
+async def test_policy_refresh_and_construction_discard_preserve_retained_generation():
+    snapshot_a, _values_a = _factory_model_snapshot("a")
+    snapshot_b, values_b = _factory_model_snapshot("b")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot_b)
+    cfg.handoff_factory_runtime()
+    retained_b = cfg._retained_factory_model_state
+    assert retained_b is not None
+
+    # Construction cleanup and policy refresh must not erase the last handoff.
+    cfg._apply_factory_runtime_snapshot(snapshot_a)
+    cfg.discard_prepared_factory_runtime()
+    assert cfg._retained_factory_model_state is retained_b
+    _assert_factory_model_values(cfg, values_b)
+
+    await cfg.refresh_runtime_policy()
+    assert cfg._retained_factory_model_state is retained_b
+    _assert_factory_model_values(cfg, values_b)
+
+
+def test_abort_discards_new_construction_without_erasing_retained_generation():
+    snapshot_a, values_a = _factory_model_snapshot("a")
+    snapshot_b, _values_b = _factory_model_snapshot("b")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot_a)
+    cfg.handoff_factory_runtime()
+    retained_a = cfg._retained_factory_model_state
+    assert retained_a is not None
+
+    cfg._apply_factory_runtime_snapshot(snapshot_b)
+    cfg.abort_factory_runtime()
+
+    assert cfg._factory_runtime_snapshot is None
+    assert cfg._retained_factory_model_state is retained_a
+    assert cfg._factory_runtime_handed_off is True
+    _assert_factory_model_values(cfg, values_a)
+
+
+def test_abort_without_retained_generation_leaves_neutral_handed_off_state():
+    snapshot, _values = _factory_model_snapshot("initial")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot)
+
+    cfg.abort_factory_runtime()
+
+    assert cfg._factory_runtime_snapshot is None
+    assert cfg._retained_factory_model_state is None
+    assert cfg._factory_runtime_handed_off is True
+    _assert_factory_model_getters_are_neutral(cfg)
+
+
+@pytest.mark.parametrize(
+    ("lazy_outcome", "expected_close_calls", "expected_invalidate_calls"),
+    [
+        ("absent", 0, 0),
+        ("close-succeeds", 1, 0),
+        ("invalidate-succeeds", 1, 1),
+        ("cleanup-fails", 1, 1),
+    ],
+)
+def test_close_clears_retained_generation_for_every_lazy_cleanup_outcome(
+    lazy_outcome,
+    expected_close_calls,
+    expected_invalidate_calls,
+):
+    class MatrixLazySession:
+        def __init__(self, outcome):
+            self.outcome = outcome
+            self.close_calls = 0
+            self.invalidate_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+            if self.outcome in {"invalidate-succeeds", "cleanup-fails"}:
+                raise RuntimeError("close failed")
+
+        def invalidate(self):
+            self.invalidate_calls += 1
+            if self.outcome == "cleanup-fails":
+                raise RuntimeError("invalidate failed")
+
+    snapshot, _values = _factory_model_snapshot("close")
+    cfg = WebToolConfig(
+        db=None,
+        db_factory=lambda: (_ for _ in ()).throw(AssertionError("db fallback")),
+        request=None,
+        user_id=None,
+    )
+    cfg._apply_factory_runtime_snapshot(snapshot)
+    cfg.handoff_factory_runtime()
+    lazy_db = None if lazy_outcome == "absent" else MatrixLazySession(lazy_outcome)
+    cfg._lazy_db = lazy_db
+
+    if lazy_outcome == "cleanup-fails":
+        with pytest.raises(
+            ToolFactoryRuntimeSessionBoundaryError,
+            match="Tool runtime cleanup could not be completed",
+        ):
+            cfg.close()
+    else:
+        cfg.close()
+
+    assert cfg._retained_factory_model_state is None
+    assert cfg._factory_runtime_handed_off is True
+    _assert_factory_model_getters_are_neutral(cfg)
+    if lazy_db is not None:
+        assert lazy_db.close_calls == expected_close_calls
+        assert lazy_db.invalidate_calls == expected_invalidate_calls
+
+    if lazy_outcome == "cleanup-fails":
+        lazy_db.outcome = "close-succeeds"
+    cfg.close()
+    assert cfg._retained_factory_model_state is None
+    assert cfg._lazy_db is None
+    _assert_factory_model_getters_are_neutral(cfg)
+
+
+def test_failed_verified_handoff_does_not_replace_retained_generation(tmp_path):
+    engine = create_engine(f"sqlite:///{tmp_path / 'retained-handoff-failure.db'}")
+    factory = sessionmaker(bind=engine, autocommit=False, autoflush=False)
+    live_db = factory()
+    snapshot_a, _values_a = _factory_model_snapshot("a")
+    snapshot_b, _values_b = _factory_model_snapshot("b")
+    request = SimpleNamespace(user=object())
+    cfg = WebToolConfig(
+        db=live_db,
+        db_factory=factory,
+        request=request,
+        user=request.user,
+        user_id=None,
+    )
+    try:
+        cfg._apply_factory_runtime_snapshot(snapshot_a)
+        cfg.handoff_factory_runtime()
+        retained_a = cfg._retained_factory_model_state
+        assert retained_a is not None
+
+        live_db.add(
+            User(
+                username="retained-handoff-failure",
+                password_hash="hash",
+                is_admin=False,
+            )
+        )
+        cfg._live_db = live_db
+        cfg.request = request
+        cfg._user = request.user
+        cfg._apply_factory_runtime_snapshot(snapshot_b)
+
+        with pytest.raises(ToolFactoryRuntimeSessionBoundaryError):
+            cfg.handoff_factory_runtime()
+
+        assert cfg._retained_factory_model_state is retained_a
+        assert cfg._factory_runtime_snapshot is snapshot_b
+        assert cfg._live_db is live_db
+        assert cfg.request is request
+        assert cfg._user is request.user
+    finally:
+        live_db.rollback()
+        live_db.close()
+        cfg._live_db = None
+        cfg.request = None
+        cfg._user = None
+        cfg.close()
+        engine.dispose()
+
+
+def test_standalone_unhanded_off_model_getter_uses_legacy_loader_once(monkeypatch):
+    image_adapter = object()
+    loader_calls = 0
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    def load_image_models():
+        nonlocal loader_calls
+        loader_calls += 1
+        return {"image": image_adapter}
+
+    monkeypatch.setattr(cfg, "_load_image_models", load_image_models)
+
+    first = cfg.get_image_models()
+    second = cfg.get_image_models()
+
+    assert loader_calls == 1
+    assert first == {"image": image_adapter}
+    assert second == {"image": image_adapter}
+    assert first is not second
+    assert first["image"] is image_adapter
+    assert second["image"] is image_adapter
 
 
 @pytest.mark.asyncio
