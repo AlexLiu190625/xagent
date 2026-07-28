@@ -23,7 +23,6 @@
     invalid_input: true,
     invalid_runtime_context: true,
     encryption_required: true,
-    network_unavailable: true,
     reconnect_invalid: true,
     session_expired: true,
     identity_mismatch: true,
@@ -91,7 +90,8 @@
     return {
       ok: false,
       status: 0,
-      data: { error: { code: code || 'network_unavailable' } }
+      data: null,
+      syntheticCode: code || 'network_unavailable'
     };
   }
 
@@ -627,6 +627,7 @@
     }
 
     function classifySessionFailure(result) {
+      if (result && result.syntheticCode) return result.syntheticCode;
       var code = sessionErrorCode(result);
       if (isKnownSessionErrorCode(code)) return code;
       if (result.status >= 500) return 'network_unavailable';

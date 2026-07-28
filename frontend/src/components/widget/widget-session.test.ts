@@ -597,6 +597,18 @@ describe("widget session mode", () => {
     expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("[future_server_code]"))
   })
 
+  it("retries a server-supplied network_unavailable 5xx as an unknown transport failure", async () => {
+    vi.useFakeTimers()
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockImplementation(() => Promise.resolve(errorResponse(503, "network_unavailable")))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(7_000)
+
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 503)"))
+  })
+
   it("honors a known error code on 5xx without status-based retry", async () => {
     vi.useFakeTimers()
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
@@ -1234,14 +1246,23 @@ describe("widget session mode", () => {
 
     await vi.advanceTimersByTimeAsync(22_000)
     expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(4)
+    expect(result.current.status).toBe("degraded")
+    expect(result.current.terminalCode).toBeNull()
+    expect(bridge.parent.postMessage.mock.calls.filter(
+      ([message]) => message.type === "reconnect_request",
+    )).toHaveLength(1)
+
+    await vi.advanceTimersByTimeAsync(3_000)
+    expect(result.current.status).toBe("degraded")
+    expect(result.current.terminalCode).toBeNull()
+    fromIframe("ready")
+    expect(fetchMock).toHaveBeenCalledTimes(5)
     expect(result.current.status).toBe("degraded")
     expect(result.current.terminalCode).toBeNull()
 
-    fromIframe("ready")
-    expect(fetchMock).toHaveBeenCalledTimes(5)
-
     resolveFourth(jsonResponse(200, exchangeBody({ session_token: "st_fourth" })))
-    await vi.advanceTimersByTimeAsync(3_000)
+    await vi.advanceTimersByTimeAsync(0)
 
     expect(result.current.status).toBe("active")
     expect(result.current.session?.token).toBe("st_fourth")
@@ -1264,9 +1285,10 @@ describe("widget session mode", () => {
 
     await vi.advanceTimersByTimeAsync(0)
     act(() => result.current.requestReconnect("ws_closed"))
-    await vi.advanceTimersByTimeAsync(8_000)
+    await vi.advanceTimersByTimeAsync(31_000)
 
     expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(4)
     expect(result.current.status).toBe("terminal")
     expect(result.current.terminalCode).toBe("network_unavailable")
     expect(bridge.postToIframe.mock.calls.filter(
