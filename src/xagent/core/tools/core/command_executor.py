@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional, cast
 
 from .command_policy import (
+    CommandArgvExecutionPolicy,
     CommandPathViolation,
     CommandPolicyGuard,
     CommandPolicyViolation,
@@ -207,7 +208,7 @@ class CommandExecutorCore:
             working_directory: Directory to use as working directory during execution
             path_guard: Optional policy implementation invoked before process creation
         """
-        self.path_guard = path_guard
+        self._path_guard = path_guard
         self._working_directory = _bind_policy_working_directory(
             working_directory,
             path_guard,
@@ -220,6 +221,11 @@ class CommandExecutorCore:
         if self._working_directory is None:
             return None
         return os.fspath(self._working_directory)
+
+    @property
+    def path_guard(self) -> Optional[CommandPolicyGuard]:
+        """Return the captured policy guard without exposing a mutation surface."""
+        return self._path_guard
 
     def execute_command(
         self,
@@ -252,14 +258,22 @@ class CommandExecutorCore:
         if shell and not isinstance(command, str):
             return _command_rejected_result("shell=True requires a string command")
 
-        if self.path_guard is not None:
+        argv_prepared_by_policy = False
+        if self._path_guard is not None:
             try:
                 if shell:
-                    self.path_guard.validate(cast(str, command))
+                    self._path_guard.validate(cast(str, command))
                 else:
                     argv = [command] if isinstance(command, str) else list(command)
-                    self.path_guard.validate_argv(argv)
-                    command = argv
+                    if isinstance(
+                        self._path_guard,
+                        CommandArgvExecutionPolicy,
+                    ):
+                        command = self._path_guard.prepare_argv_for_execution(argv)
+                        argv_prepared_by_policy = True
+                    else:
+                        self._path_guard.validate_argv(argv)
+                        command = argv
             except CommandPolicyViolation as exc:
                 return _command_rejected_result(exc)
             except Exception:
@@ -285,7 +299,7 @@ class CommandExecutorCore:
             "timeout": timeout,
             "cwd": self._working_directory,
         }
-        if self.path_guard is not None and shell:
+        if self._path_guard is not None and shell:
             try:
                 run_options["executable"] = os.fspath(
                     resolve_trusted_executable("bash")
@@ -293,8 +307,9 @@ class CommandExecutorCore:
             except CommandPolicyViolation as exc:
                 return _command_rejected_result(exc)
         elif (
-            self.path_guard is not None
+            self._path_guard is not None
             and not shell
+            and not argv_prepared_by_policy
             and isinstance(command, list)
             and command
             and os.path.basename(command[0]) == "bash"
@@ -376,7 +391,7 @@ class CommandExecutorCore:
         """
         timeout = _validate_timeout(timeout, self.timeout)
 
-        if self.path_guard is not None:
+        if self._path_guard is not None:
             return _command_rejected_result(
                 CommandPolicyViolation(
                     "restricted execute_script requires race-safe file semantics"

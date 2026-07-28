@@ -86,6 +86,7 @@ class _ValidationSession:
     script_bytes: int = 0
     node_state_evaluations: int = 0
     argv_tokens: int = 0
+    wrapped_bash_dispatch: bool = False
     effects: _EffectScope = field(default_factory=_EffectScope)
 
     def charge_parse(self, source_chars: int) -> None:
@@ -746,16 +747,41 @@ class WorkspaceCommandPathGuard:
 
         No shell interprets this form, so shell expansion syntax remains literal.
         """
+        self._validate_and_prepare_argv(argv, prepare_execution=False)
+
+    def prepare_argv_for_execution(self, argv: Sequence[str]) -> list[str]:
+        """Validate argv and bind direct Bash to its trusted executable identity."""
+        return self._validate_and_prepare_argv(argv, prepare_execution=True)
+
+    def _validate_and_prepare_argv(
+        self,
+        argv: Sequence[str],
+        *,
+        prepare_execution: bool,
+    ) -> list[str]:
         with _validation_session_scope() as session:
             session.charge_argv_tokens(len(argv))
+            execution_argv = list(argv)
             if not argv:
-                return
+                return execution_argv
+            if (
+                prepare_execution
+                and os.path.basename(execution_argv[0]) in _SHELL_COMMANDS
+            ):
+                execution_argv[0] = os.fspath(
+                    resolve_trusted_executable(execution_argv[0])
+                )
             self._validate_command_values(
-                argv[0],
-                argv[1:],
+                execution_argv[0],
+                execution_argv[1:],
                 _ShellState(cwd=self._initial_cwd),
                 charge_argv=False,
             )
+            if prepare_execution and session.wrapped_bash_dispatch:
+                raise CommandPolicyViolation(
+                    "cannot safely execute Bash through a command wrapper"
+                )
+            return execution_argv
 
     def _validate_node(self, node: Any, state: _ShellState) -> _ShellState:
         _active_validation_session().charge_node_state_evaluation()
@@ -1075,6 +1101,8 @@ class WorkspaceCommandPathGuard:
         command_word = values[index]
         if isinstance(command_word, _CommandValue) and not command_word.is_static:
             raise CommandPolicyViolation("cannot resolve dynamic command name")
+        if os.path.basename(command_word) in _SHELL_COMMANDS:
+            _active_validation_session().wrapped_bash_dispatch = True
         # Wrappers spawn a child command: validate its paths against the adjusted
         # child cwd, but never propagate child shell directory state to the parent.
         validated_state = self._validate_command_values(

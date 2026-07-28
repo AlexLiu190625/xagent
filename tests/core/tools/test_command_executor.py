@@ -437,6 +437,37 @@ class TestCommandPolicyFoundation:
 
         assert mock_run.call_args.kwargs["cwd"] == canonical_cwd
 
+    @pytest.mark.parametrize("replacement", ["other_guard", "none"])
+    def test_executor_path_guard_is_read_only_and_keeps_original_binding(
+        self,
+        tmp_path,
+        mock_run,
+        replacement,
+    ):
+        class CwdBoundGuard:
+            def __init__(self, execution_cwd):
+                self.execution_cwd = execution_cwd
+                self.validate = Mock()
+                self.validate_argv = Mock()
+
+        original_cwd = tmp_path / "original"
+        original_cwd.mkdir()
+        other_cwd = tmp_path / "other"
+        other_cwd.mkdir()
+        original_guard = CwdBoundGuard(original_cwd.resolve())
+        other_guard = CwdBoundGuard(other_cwd.resolve())
+        executor = CommandExecutorCore(path_guard=original_guard)
+        mock_run.return_value = Mock(stdout="", stderr="", returncode=0)
+
+        with pytest.raises(AttributeError):
+            executor.path_guard = other_guard if replacement == "other_guard" else None
+        result = executor.execute_command(["true"], shell=False)
+
+        original_guard.validate_argv.assert_called_once_with(["true"])
+        other_guard.validate_argv.assert_not_called()
+        assert mock_run.call_args.kwargs["cwd"] == original_cwd.resolve()
+        assert result["success"] is True
+
     def test_trusted_executable_resolution_rejects_relative_command_paths(self):
         bash = shutil.which("bash")
         assert bash is not None
@@ -655,6 +686,86 @@ class TestCommandPolicyFoundation:
             "-c",
             "printf allowed",
         ]
+        assert result["success"] is True
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            ["env", "bash", "-c", "printf unsafe"],
+            ["timeout", "1", "bash", "-c", "printf unsafe"],
+        ],
+    )
+    def test_workspace_policy_rejects_wrapped_bash_argv_before_spawn(
+        self,
+        tmp_path,
+        mock_run,
+        monkeypatch,
+        command,
+    ):
+        workspace, guard = self._workspace_guard(tmp_path)
+        marker = tmp_path / "fake-bash-ran"
+        fake_bin = workspace.output_dir / "bin"
+        fake_bin.mkdir()
+        fake_bash = fake_bin / "bash"
+        fake_bash.write_text(
+            f"touch {shlex.quote(str(marker))}\n",
+            encoding="utf-8",
+        )
+        fake_bash.chmod(0o755)
+        monkeypatch.setenv(
+            "PATH",
+            f"{fake_bin}{os.pathsep}{os.environ.get('PATH', '')}",
+        )
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        mock_run.assert_not_called()
+        assert not marker.exists()
+
+    def test_workspace_policy_uses_absolute_bash_identity_for_direct_argv(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        _, guard = self._workspace_guard(tmp_path)
+        command = ["bash", "-c", "printf allowed"]
+        bash = shutil.which("bash")
+        assert bash is not None
+        trusted_bash = str(Path(bash).resolve())
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        assert mock_run.call_args.args[0] == [
+            trusted_bash,
+            "-c",
+            "printf allowed",
+        ]
+        assert result["success"] is True
+
+    def test_workspace_policy_preserves_non_bash_wrapper_argv(
+        self,
+        tmp_path,
+        mock_run,
+    ):
+        _, guard = self._workspace_guard(tmp_path)
+        command = ["env", "printf", "allowed"]
+        mock_run.return_value = Mock(stdout="allowed", stderr="", returncode=0)
+
+        result = CommandExecutorCore(path_guard=guard).execute_command(
+            command,
+            shell=False,
+        )
+
+        assert mock_run.call_args.args[0] == command
         assert result["success"] is True
 
     def test_injected_policy_allows_argv_command_execution(self, mock_run):

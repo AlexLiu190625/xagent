@@ -48,6 +48,13 @@ class CwdBoundCommandPolicy(Protocol):
     def execution_cwd(self) -> Path | None: ...
 
 
+@runtime_checkable
+class CommandArgvExecutionPolicy(Protocol):
+    """Validate argv once and return the exact vector safe to execute."""
+
+    def prepare_argv_for_execution(self, argv: Sequence[str]) -> list[str]: ...
+
+
 def resolve_trusted_executable(executable: str) -> Path:
     """Resolve an executable to one canonical identity under a system root."""
     if "/" in executable and not Path(executable).is_absolute():
