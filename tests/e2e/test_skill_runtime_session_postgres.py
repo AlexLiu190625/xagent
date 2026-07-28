@@ -1,15 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import time
+from collections import deque
 from collections.abc import Iterator
+from functools import partial
 from pathlib import Path
+from types import FunctionType, MethodType, ModuleType, SimpleNamespace
 from typing import Any
 from uuid import uuid4
 
 import psycopg2
 import pytest
 from docker.errors import APIError
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+from sqlalchemy.pool import QueuePool
 
 from tests.e2e.app_harness import (
     create_e2e_user,
@@ -22,13 +29,36 @@ from tests.e2e.minio_harness import (
     _docker_client,
     _free_port,
 )
+from xagent.core.agent.service import AgentService
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.tools.adapters.vibe.selection_spec import ToolSelectionSpec
 from xagent.web.models.database import get_engine
 from xagent.web.models.skill import UserSkill, UserSkillFile
+from xagent.web.models.user import User
+from xagent.web.tools.config import WebToolConfig
 
 pytestmark = [pytest.mark.e2e, pytest.mark.docker]
 
 POSTGRES_PASSWORD = "xagent_test"
 POSTGRES_DATABASE = "xagent_test"
+SKILL_INDEX_SENTINEL = "Pool handoff regression fixture"
+QUESTION = "Which deployment target should I use?"
+EXPECTED_SKILL_INDEX_LINE = (
+    "- session-safe: Pool handoff regression fixture "
+    "When to use: Test authenticated Skill database reads"
+)
+EXPECTED_LOAD_SKILL_PARAMETERS = {
+    "properties": {
+        "skill_name": {
+            "description": (
+                "Exact name of the skill to load, as listed in the skill index."
+            ),
+            "type": "string",
+        }
+    },
+    "required": ["skill_name"],
+    "type": "object",
+}
 
 
 @pytest.fixture
@@ -144,6 +174,121 @@ when_to_use: Test authenticated Skill database reads
     return name
 
 
+class _WaitingLLM:
+    model_name = "waiting-regression"
+    context_window = 32_000
+
+    def __init__(self, *, call_id: str) -> None:
+        self.call_id = call_id
+        self.calls: list[dict[str, Any]] = []
+
+    async def chat(self, **kwargs: Any) -> dict[str, Any]:
+        self.calls.append(kwargs)
+        return {
+            "content": "I need one required choice.",
+            "tool_calls": [
+                {
+                    "id": self.call_id,
+                    "function": {
+                        "name": "ask_user_question",
+                        "arguments": json.dumps(
+                            {
+                                "message": QUESTION,
+                                "interactions": [],
+                            }
+                        ),
+                    },
+                }
+            ],
+        }
+
+
+def _owned_references(value: object) -> list[object]:
+    if value is None or type(value) in {str, bytes, int, float, bool}:
+        return []
+    if isinstance(value, ModuleType | type):
+        return []
+    if isinstance(value, dict):
+        return [*value.keys(), *value.values()]
+    if isinstance(value, list | tuple | set | frozenset | deque):
+        return list(value)
+    if isinstance(value, partial):
+        return [value.func, *value.args, *(value.keywords or {}).values()]
+    if isinstance(value, MethodType):
+        return [value.__self__, value.__func__]
+    if isinstance(value, FunctionType):
+        references: list[object] = [
+            *(value.__defaults__ or ()),
+            *(value.__kwdefaults__ or {}).values(),
+        ]
+        for cell in value.__closure__ or ():
+            try:
+                references.append(cell.cell_contents)
+            except ValueError:
+                pass
+        return references
+    try:
+        return list(vars(value).values())
+    except TypeError:
+        return []
+
+
+def _assert_resources_not_reachable(
+    *,
+    roots: dict[str, object],
+    forbidden: dict[str, object],
+) -> None:
+    forbidden_by_id = {id(value): name for name, value in forbidden.items()}
+    queue = deque((name, value) for name, value in roots.items())
+    seen: set[int] = set()
+    while queue:
+        path, value = queue.popleft()
+        value_id = id(value)
+        if value_id in seen:
+            continue
+        seen.add(value_id)
+        forbidden_name = forbidden_by_id.get(value_id)
+        assert forbidden_name is None, f"{path} retains caller {forbidden_name}"
+        for index, reference in enumerate(_owned_references(value)):
+            queue.append((f"{path}[{index}]", reference))
+
+
+def _assert_detached_retained_service(
+    *,
+    caller_db: Session,
+    request: object,
+    user: User,
+    user_id: int,
+    config: WebToolConfig,
+    service: AgentService,
+) -> None:
+    assert get_engine().pool.checkedout() == 0, "verified factory handoff leaked"
+    assert config is service.tool_config
+    assert config._live_db is None
+    assert config._lazy_db is None
+    assert config.request is None
+    assert config._user is None
+    assert service.skill_scope_context.user_id == user_id
+    assert not hasattr(service.skill_scope_context, "db")
+    assert not hasattr(service.skill_scope_context, "request")
+    assert not hasattr(service.skill_scope_context, "user")
+    assert caller_db is not config._live_db
+    assert request is not config.request
+    assert user is not config._user
+    _assert_resources_not_reachable(
+        roots={
+            "tools": service.tools,
+            "config": config,
+            "service": service,
+        },
+        forbidden={
+            "Session": caller_db,
+            "request": request,
+            "ORM User": user,
+        },
+    )
+
+
 def test_authenticated_skill_routes_handoff_one_slot_postgres_pool(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -177,3 +322,239 @@ def test_authenticated_skill_routes_handoff_one_slot_postgres_pool(
         assert installed_response.status_code == 200, installed_response.text
         assert skill_name in {item["name"] for item in installed_response.json()}
         assert get_engine().pool.checkedout() == 0
+
+
+@pytest.mark.asyncio
+async def test_retained_agent_services_wait_without_holding_postgres_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    postgres_url: str,
+) -> None:
+    from xagent.web.api.chat import create_default_tools
+
+    _configure_postgres_app(
+        monkeypatch,
+        tmp_path=tmp_path,
+        postgres_url=postgres_url,
+    )
+    disable_external_app_services(monkeypatch)
+    session_factory = init_e2e_db()
+    with session_factory() as seed_db:
+        seeded_user = create_e2e_user(
+            seed_db,
+            username="retained-skill-runtime-user",
+        )
+        skill_name = _seed_personal_skill(seed_db, user_id=seeded_user.id)
+
+    engine = get_engine()
+    pool = engine.pool
+    assert engine.dialect.name == "postgresql"
+    assert isinstance(pool, QueuePool)
+    assert pool.size() == 1
+    assert pool._max_overflow == 0  # noqa: SLF001
+    assert pool.timeout() == 1
+    assert pool.checkedout() == 0
+
+    real_create_all_tools = ToolFactory.create_all_tools
+    factory_calls: list[WebToolConfig] = []
+
+    async def _count_create_all_tools(
+        config: WebToolConfig,
+        apply_user_override_filter: bool = True,
+    ) -> list[Any]:
+        factory_calls.append(config)
+        return await real_create_all_tools(
+            config,
+            apply_user_override_filter=apply_user_override_filter,
+        )
+
+    real_load_mcp = WebToolConfig._load_mcp_server_configs
+    mcp_loads: list[tuple[WebToolConfig, list[dict[str, Any]]]] = []
+
+    async def _spy_load_mcp(
+        config: WebToolConfig,
+    ) -> list[dict[str, Any]]:
+        loaded = await real_load_mcp(config)
+        mcp_loads.append((config, loaded))
+        return loaded
+
+    monkeypatch.setattr(
+        ToolFactory,
+        "create_all_tools",
+        staticmethod(_count_create_all_tools),
+    )
+    monkeypatch.setattr(
+        WebToolConfig,
+        "_load_mcp_server_configs",
+        _spy_load_mcp,
+    )
+
+    selection = ToolSelectionSpec.from_raw(tool_categories=["skill", "mcp"])
+    retained: list[
+        tuple[list[Any], WebToolConfig, AgentService, _WaitingLLM, Session]
+    ] = []
+    try:
+        for index in range(2):
+            caller_db = session_factory()
+            orm_user = caller_db.get(User, seeded_user.id)
+            assert orm_user is not None
+            assert orm_user.username == seeded_user.username
+            assert pool.checkedout() == 1
+            request = SimpleNamespace(
+                marker=f"request-{index}-{uuid4().hex}",
+                user=orm_user,
+            )
+
+            tools, config = await create_default_tools(
+                caller_db,
+                request=request,
+                user=orm_user,
+                task_id=f"retained-skill-runtime-{index}",
+                allowed_skills=[skill_name],
+                tool_selection_spec=selection,
+            )
+            llm = _WaitingLLM(call_id=f"ask-{index}")
+            service = AgentService(
+                name=f"retained-skill-runtime-{index}",
+                id=f"retained-skill-runtime-{index}",
+                pattern="react",
+                llm=llm,
+                tools=tools,
+                tool_config=config,
+                enable_workspace=False,
+            )
+
+            _assert_detached_retained_service(
+                caller_db=caller_db,
+                request=request,
+                user=orm_user,
+                user_id=seeded_user.id,
+                config=config,
+                service=service,
+            )
+            retained.append((tools, config, service, llm, caller_db))
+
+        assert len(factory_calls) == 2
+        assert len(mcp_loads) == 2
+        assert all(loaded == [] for _config, loaded in mcp_loads)
+        assert [config for config, _loaded in mcp_loads] == [
+            retained[0][1],
+            retained[1][1],
+        ]
+
+        for index, (tools, config, service, llm, _caller_db) in enumerate(retained):
+            result = await service.execute_task(
+                f"Run the session-safe skill, service {index}.",
+                task_id=f"retained-skill-runtime-{index}",
+            )
+
+            assert result["success"] is False
+            assert result["status"] == "waiting_for_user"
+            assert result["message"] == QUESTION
+            assert result["message_type"] == "question"
+            assert result["interactions"] == []
+            assert result["chat_response"] == {
+                "message": QUESTION,
+                "interactions": [],
+            }
+            assert (
+                service.get_execution_status(f"retained-skill-runtime-{index}")[
+                    "status"
+                ]
+                == "waiting_for_user"
+            )
+            assert len(llm.calls) == 1
+            first_call = llm.calls[0]
+            system_text = "\n".join(
+                str(message.get("content", ""))
+                for message in first_call["messages"]
+                if message.get("role") == "system"
+            )
+            assert SKILL_INDEX_SENTINEL in system_text
+            assert EXPECTED_SKILL_INDEX_LINE in system_text
+            load_skill_schemas = [
+                schema
+                for schema in first_call["tools"]
+                if schema["function"]["name"] == "load_skill"
+            ]
+            assert load_skill_schemas == [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "load_skill",
+                        "description": (
+                            "Load a skill's full instructions into the system context.\n"
+                            "\n"
+                            "The available skills are listed in the system context "
+                            "with one-line summaries. Call this when one of them "
+                            "clearly matches the current task; its detailed guidance "
+                            "becomes available from the next step on. Do not load "
+                            "skills that are unrelated to the task."
+                        ),
+                        "parameters": EXPECTED_LOAD_SKILL_PARAMETERS,
+                    },
+                }
+            ]
+            assert service.tools == tools
+            assert config is service.tool_config
+            assert pool.checkedout() == 0
+
+        assert len(factory_calls) == 2
+        with session_factory() as probe_db:
+            assert probe_db.execute(text("SELECT 1")).scalar_one() == 1
+        assert pool.checkedout() == 0
+
+        real_handoff = WebToolConfig.handoff_factory_runtime
+        mutation_db = session_factory()
+        mutation_config: WebToolConfig | None = None
+        try:
+            mutation_user = mutation_db.get(User, seeded_user.id)
+            assert mutation_user is not None
+            mutation_request = SimpleNamespace(
+                marker=f"mutation-{uuid4().hex}",
+                user=mutation_user,
+            )
+            monkeypatch.setattr(
+                WebToolConfig,
+                "handoff_factory_runtime",
+                WebToolConfig.discard_prepared_factory_runtime,
+            )
+            _mutation_tools, mutation_config = await create_default_tools(
+                mutation_db,
+                request=mutation_request,
+                user=mutation_user,
+                task_id="retained-skill-runtime-mutation",
+                allowed_skills=[skill_name],
+                tool_selection_spec=selection,
+            )
+            with pytest.raises(AssertionError, match="verified factory handoff leaked"):
+                _assert_detached_retained_service(
+                    caller_db=mutation_db,
+                    request=mutation_request,
+                    user=mutation_user,
+                    user_id=seeded_user.id,
+                    config=mutation_config,
+                    service=AgentService(
+                        name="retained-skill-runtime-mutation",
+                        id="retained-skill-runtime-mutation",
+                        pattern="react",
+                        llm=_WaitingLLM(call_id="ask-mutation"),
+                        tools=_mutation_tools,
+                        tool_config=mutation_config,
+                        enable_workspace=False,
+                    ),
+                )
+        finally:
+            monkeypatch.setattr(
+                WebToolConfig,
+                "handoff_factory_runtime",
+                real_handoff,
+            )
+            mutation_db.close()
+            if mutation_config is not None:
+                mutation_config.close()
+    finally:
+        for _tools, config, _service, _llm, caller_db in retained:
+            caller_db.close()
+            config.close()
+        engine.dispose()
