@@ -430,6 +430,7 @@
       terminalCode: null,
       recoverableCode: null,
       exchangeRetry: createRetryLineage(),
+      reconnectRetry: null,
       detached: false,
       observer: null,
       inflight: { exchange: null, reconnect: null },
@@ -606,9 +607,23 @@
     }
 
     function applySession(payload) {
+      var reconnectTokenChanged = payload.reconnectToken !== state.reconnectToken;
       state.session = payload.session;
       state.reconnectToken = payload.reconnectToken;
+      if (reconnectTokenChanged) state.reconnectRetry = null;
       state.recoverableCode = null;
+    }
+
+    function reconnectRetryLineage(reconnectToken) {
+      var current = state.reconnectRetry;
+      if (!current || current.reconnectToken !== reconnectToken) {
+        current = {
+          reconnectToken: reconnectToken,
+          lineage: createRetryLineage()
+        };
+        state.reconnectRetry = current;
+      }
+      return current.lineage;
     }
 
     function recordRetry(code) {
@@ -785,6 +800,7 @@
       return singleFlight('reconnect', function (signal) {
         var body = { reconnect_token: reconnectToken };
         body.encrypted_context = state.grant;
+        var retryLineage = reconnectRetryLineage(reconnectToken);
         return withRetry(function (timeoutMs) {
           return postJson(
             host + '/v1/external/chat/sessions/reconnect',
@@ -794,7 +810,7 @@
           );
         }, SESSION_RETRY_POLICY, signal, function (code) {
           if (!signal.aborted) recordRetry(code);
-        }).then(function (result) {
+        }, retryLineage).then(function (result) {
           handleResult(result, 'reconnect');
         }, function () {
           if (!signal.aborted) recordFailure('network_unavailable');

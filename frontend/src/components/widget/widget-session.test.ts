@@ -1086,6 +1086,139 @@ describe("widget session mode", () => {
     expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("[network_unavailable] (HTTP 502)"))
   })
 
+  it("terminalizes a restored reconnect after its fourth request was already dispatched", async () => {
+    vi.useFakeTimers()
+    let fourthSignal: AbortSignal | undefined
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token_expires_at: new Date(Date.now() + 30_000).toISOString(),
+      })))
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        fourthSignal = init.signal as AbortSignal
+        return new Promise<Response>(() => undefined)
+      })
+      .mockResolvedValue(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("ready")
+    await vi.advanceTimersByTimeAsync(7_000)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(4)
+
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(fourthSignal?.aborted).toBe(true)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(4)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "network_unavailable" }),
+      HOST,
+    )
+  })
+
+  it("continues a restored reconnect with only its remaining attempts", async () => {
+    vi.useFakeTimers()
+    let secondSignal: AbortSignal | undefined
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token_expires_at: new Date(Date.now() + 30_000).toISOString(),
+      })))
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        secondSignal = init.signal as AbortSignal
+        return new Promise<Response>((_resolve, reject) => {
+          ;(init.signal as AbortSignal).addEventListener(
+            "abort",
+            () => reject(new DOMException("aborted", "AbortError")),
+            { once: true },
+          )
+        })
+      })
+      .mockResolvedValue(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("ready")
+    await vi.advanceTimersByTimeAsync(1_000)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(2)
+
+    firePageRestore()
+    await vi.advanceTimersByTimeAsync(7_000)
+
+    expect(secondSignal?.aborted).toBe(true)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(4)
+  })
+
+  it("does not restart reconnect after a bfcache suspension passes its original deadline", async () => {
+    vi.useFakeTimers()
+    const startedAt = new Date("2026-07-28T00:00:00.000Z")
+    vi.setSystemTime(startedAt)
+    const reconnectSignals: AbortSignal[] = []
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token_expires_at: new Date(startedAt.getTime() + 30_000).toISOString(),
+      })))
+      .mockImplementation((_url: string, init: RequestInit) => {
+        reconnectSignals.push(init.signal as AbortSignal)
+        return new Promise<Response>(() => undefined)
+      })
+
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("ready")
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(1)
+
+    firePageHide(true)
+    vi.setSystemTime(new Date(startedAt.getTime() + 31_000))
+    firePageShow(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(reconnectSignals[0]?.aborted).toBe(true)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(1)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "network_unavailable" }),
+      HOST,
+    )
+  })
+
+  it("starts a fresh retry lineage after success rotates the reconnect token", async () => {
+    vi.useFakeTimers()
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockResolvedValueOnce(jsonResponse(502, { error: { code: "upstream_unavailable" } }))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_second",
+        reconnect_token: "rt_second",
+      })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_third",
+        reconnect_token: "rt_third",
+      })))
+
+    runWidget({ "data-encrypted-context": GRANT })
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("ready")
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(7_000)
+    expect(fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)).toHaveLength(4)
+
+    fromIframe("reconnect_request", { reason: "token_expired" })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const reconnectCalls = fetchMock.mock.calls.filter(([url]) => url === RECONNECT_URL)
+    expect(reconnectCalls).toHaveLength(5)
+    expect(JSON.parse(reconnectCalls[4][1].body)).toMatchObject({ reconnect_token: "rt_second" })
+  })
+
   it("allows two rate-limit retries inside the shared reconnect budget", async () => {
     vi.useFakeTimers()
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
