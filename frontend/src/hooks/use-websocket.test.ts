@@ -73,17 +73,26 @@ class MockWebSocket {
   }
 }
 
+const sessionConnections = new Map<string, WebSocketConnection>()
+
 const sessionConnection = (
   overrides: Partial<WebSocketConnection> = {},
-): WebSocketConnection => ({
-  identity: "widget-session:1",
-  url: "wss://embed.example/v1/external/chat/sessions/ws",
-  protocols: ["xagent-session-v1", "xagent-session-token.st_secret"],
-  expectedProtocol: "xagent-session-v1",
-  chatTaskIdMode: "omit",
-  credentialOwner: { kind: "external" },
-  ...overrides,
-})
+): WebSocketConnection => {
+  const key = JSON.stringify(overrides)
+  const existing = sessionConnections.get(key)
+  if (existing) return existing
+  const connection: WebSocketConnection = {
+    identity: "widget-session:1",
+    url: "wss://embed.example/v1/external/chat/sessions/ws",
+    protocols: ["xagent-session-v1", "xagent-session-token.st_secret"],
+    expectedProtocol: "xagent-session-v1",
+    chatTaskIdMode: "omit",
+    credentialOwner: { kind: "external" },
+    ...overrides,
+  }
+  sessionConnections.set(key, connection)
+  return connection
+}
 
 const deferred = <T,>() => {
   let resolve!: (value: T) => void
@@ -119,6 +128,7 @@ describe("useWebSocket message delivery", () => {
   beforeEach(() => {
     MockWebSocket.instances = []
     MockWebSocket.constructorError = null
+    sessionConnections.clear()
     localStorage.clear()
     authState.user = { id: "user-1" }
     authState.token = "token"
@@ -1429,15 +1439,19 @@ describe("useWebSocket normalized connections", () => {
     },
   )
 
-  it("does not reconnect for a new descriptor object with identical values", async () => {
+  it("uses the normalized connection object as lifecycle identity", async () => {
+    const connection = sessionConnection()
     const hook = renderHook(
       ({ connection }) => useWebSocket({ connection }),
-      { initialProps: { connection: sessionConnection() } },
+      { initialProps: { connection } },
     )
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
 
-    hook.rerender({ connection: sessionConnection() })
+    hook.rerender({ connection })
     expect(MockWebSocket.instances).toHaveLength(1)
+
+    hook.rerender({ connection: { ...connection } })
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
   })
 
   it("retires a stalled handshake before reporting its structured transport failure", async () => {
@@ -1824,8 +1838,9 @@ describe("useWebSocket normalized connections", () => {
   ])("reports permanent 4001 %s through structured failure", async (_name, makeConnection) => {
     const onConnectionFailure = vi.fn()
     const onError = vi.fn()
+    const connection = makeConnection()
     const { result } = renderHook(() => useWebSocket({
-      connection: makeConnection(),
+      connection,
       onConnectionFailure,
       onError,
     }))
@@ -1932,7 +1947,7 @@ describe("useWebSocket normalized connections", () => {
     await waitFor(() => expect(MockWebSocket.instances).toHaveLength(2))
   })
 
-  it("keeps a socket across a profile-only auth revision", async () => {
+  it("starts a new lifecycle when a caller replaces the descriptor for a profile-only auth revision", async () => {
     const first = sessionConnection({ credentialOwner: {
       kind: "auth-context", accessToken: "access", userId: "user-1",
       session: { ...authState.session, profileRevision: 0 },
@@ -1945,7 +1960,7 @@ describe("useWebSocket normalized connections", () => {
       ...firstOwner, session: { ...authState.session, profileRevision: 1, profileFingerprint: '["alice",null,null]' },
     } } })
     await Promise.resolve()
-    expect(MockWebSocket.instances).toHaveLength(1)
+    expect(MockWebSocket.instances).toHaveLength(2)
   })
 
   it("replaces a socket when its auth credential revision changes", async () => {

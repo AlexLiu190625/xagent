@@ -79,33 +79,6 @@ export interface WebSocketConnection {
 
 export type WebSocketSendResult = "sent" | "not_sent"
 
-const sameConnection = (
-  left: WebSocketConnection | null,
-  right: WebSocketConnection | null,
-): boolean => {
-  if (left === right) return true
-  if (!left || !right) return false
-  if (
-    left.identity !== right.identity
-    || left.url !== right.url
-    || left.expectedProtocol !== right.expectedProtocol
-    || left.taskId !== right.taskId
-    || left.chatTaskIdMode !== right.chatTaskIdMode
-    || left.protocols?.length !== right.protocols?.length
-    || left.protocols?.some((protocol, index) => protocol !== right.protocols?.[index])
-    || left.credentialOwner.kind !== right.credentialOwner.kind
-  ) return false
-  if (left.credentialOwner.kind !== "auth-context") return true
-  if (right.credentialOwner.kind !== "auth-context") return false
-  return (
-    left.credentialOwner.accessToken === right.credentialOwner.accessToken
-    && left.credentialOwner.userId === right.credentialOwner.userId
-    && left.credentialOwner.session?.sessionId === right.credentialOwner.session?.sessionId
-    && left.credentialOwner.session?.credentialRevision
-      === right.credentialOwner.session?.credentialRevision
-  )
-}
-
 export interface WebSocketConnectionFailure {
   recoverable: boolean
   error: Error
@@ -262,7 +235,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     refreshAccessToken,
   } = useAuth()
 
-  const normalizedConnectionCandidate = useMemo<WebSocketConnection | null>(() => {
+  const normalizedConnection = useMemo<WebSocketConnection | null>(() => {
     if (connectionOption !== undefined) return connectionOption
     if (!taskId) return null
 
@@ -299,16 +272,6 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     token,
     url,
   ])
-  const stableConnectionRef = useRef<WebSocketConnection | null>(
-    normalizedConnectionCandidate,
-  )
-  const normalizedConnection = useMemo(() => {
-    if (sameConnection(stableConnectionRef.current, normalizedConnectionCandidate)) {
-      return stableConnectionRef.current
-    }
-    stableConnectionRef.current = normalizedConnectionCandidate
-    return normalizedConnectionCandidate
-  }, [normalizedConnectionCandidate])
   const connectionDescriptorIdentity = normalizedConnection
 
   const [isConnected, setIsConnected] = useState(false)
