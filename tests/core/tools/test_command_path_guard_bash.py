@@ -2,9 +2,11 @@
 
 import os
 import shlex
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from xagent.core.tools.core import command_path_guard as command_path_guard_module
 from xagent.core.tools.core.command_executor import CommandExecutorCore
 from xagent.core.tools.core.command_path_guard import WorkspaceCommandPathGuard
 from xagent.core.tools.core.command_policy import (
@@ -1181,3 +1183,295 @@ class TestScopedCommandPathGuardBash:
 
         with pytest.raises(CommandPolicyViolation):
             guard.validate(command_template)
+
+    @pytest.mark.parametrize("effect_command", ["rm -f safe.sh", "python -c pass"])
+    def test_effect_before_script_rejects_but_script_before_effect_is_allowed(
+        self,
+        scoped_command_workspace,
+        effect_command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script = workspace.output_dir / "safe.sh"
+        script.write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate(f"{effect_command}; bash safe.sh")
+
+        guard.validate(f"bash safe.sh; {effect_command}")
+
+    @pytest.mark.parametrize("effect_command", ["rm -f safe.sh", "python -c pass"])
+    @pytest.mark.parametrize("script_first", [False, True])
+    def test_pipeline_rejects_concurrent_script_effects_in_both_directions(
+        self,
+        scoped_command_workspace,
+        effect_command,
+        script_first,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script = workspace.output_dir / "safe.sh"
+        script.write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        members = ["bash safe.sh", effect_command]
+        if not script_first:
+            members.reverse()
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by a concurrent command",
+        ):
+            guard.validate(" | ".join(members))
+
+    def test_effect_ledger_resets_for_fresh_top_level_validation(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script = workspace.output_dir / "safe.sh"
+        script.write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("python -c pass")
+        guard.validate("bash safe.sh")
+
+    def test_parse_attempt_budget_is_shared_across_nested_scripts(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "outer.sh").write_text(
+            "bash inner.sh\n",
+            encoding="utf-8",
+        )
+        (workspace.output_dir / "inner.sh").write_text(":\n", encoding="utf-8")
+        monkeypatch.setattr(
+            command_path_guard_module,
+            "_MAX_POLICY_PARSE_ATTEMPTS",
+            2,
+            raising=False,
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy parse attempt budget exceeded",
+        ):
+            guard.validate("bash outer.sh")
+
+    def test_node_state_evaluation_budget_is_deterministic(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        monkeypatch.setattr(
+            command_path_guard_module,
+            "_MAX_POLICY_NODE_STATE_EVALUATIONS",
+            1,
+            raising=False,
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy node-state evaluation budget exceeded",
+        ):
+            guard.validate("true; true")
+
+    def test_argv_token_budget_accepts_boundary_and_rejects_exhaustion(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        limit = 8192
+
+        guard.validate_argv(["unknown", *(["value"] * (limit - 1))])
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy argv token budget exceeded",
+        ):
+            guard.validate_argv(["unknown", *(["value"] * limit)])
+
+    def test_nested_public_reentry_shares_session_and_exception_resets_it(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        original = guard._validate_command_values
+        reentered = False
+
+        def reenter(*args, **kwargs):
+            nonlocal reentered
+            if not reentered:
+                reentered = True
+                guard.validate_argv(["nested", "value"])
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(command_path_guard_module, "_MAX_POLICY_ARGV_TOKENS", 3)
+        monkeypatch.setattr(guard, "_validate_command_values", reenter)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy argv token budget exceeded",
+        ):
+            guard.validate_argv(["outer", "value"])
+
+        monkeypatch.setattr(guard, "_validate_command_values", original)
+        guard.validate_argv(["fresh", "value", "control"])
+
+    def test_validation_sessions_are_isolated_across_concurrent_contexts(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        monkeypatch.setattr(command_path_guard_module, "_MAX_POLICY_ARGV_TOKENS", 1)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(guard.validate_argv, (["one"], ["two"])))
+
+        assert results == [None, None]
+
+    def test_cumulative_source_character_budget_is_shared(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        command = "bash -c ':'"
+        monkeypatch.setattr(
+            command_path_guard_module,
+            "_MAX_POLICY_SOURCE_CHARS",
+            len(command),
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy source character budget exceeded",
+        ):
+            guard.validate(command)
+
+    def test_cumulative_script_byte_budget_is_shared(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        script_source = "# comment\n"
+        (workspace.output_dir / "one.sh").write_text(script_source, encoding="utf-8")
+        (workspace.output_dir / "two.sh").write_text(script_source, encoding="utf-8")
+        monkeypatch.setattr(
+            command_path_guard_module,
+            "_MAX_POLICY_SCRIPT_BYTES",
+            len(script_source.encode("utf-8")) * 2 - 1,
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy script byte budget exceeded",
+        ):
+            guard.validate("bash one.sh; bash two.sh")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "env python -c pass; bash safe.sh",
+            "(python -c pass); bash safe.sh",
+            "source effect.sh; bash safe.sh",
+            "bash -c 'python -c pass'; bash safe.sh",
+        ],
+    )
+    def test_unknown_effect_propagates_through_nested_shell_regions(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "safe.sh").write_text("# safe\n", encoding="utf-8")
+        (workspace.output_dir / "effect.sh").write_text(
+            "python -c pass\n",
+            encoding="utf-8",
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate(command)
+
+    @pytest.mark.parametrize("command", ["env true", "xargs true"])
+    def test_nested_argv_dispatch_charges_shared_token_budget(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        monkeypatch.setattr(command_path_guard_module, "_MAX_POLICY_ARGV_TOKENS", 2)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy argv token budget exceeded",
+        ):
+            guard.validate(command)
+
+    def test_deterministic_budgets_allow_ordinary_nested_validation(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        monkeypatch.setattr(command_path_guard_module, "_MAX_POLICY_PARSE_ATTEMPTS", 2)
+        monkeypatch.setattr(command_path_guard_module, "_MAX_POLICY_SOURCE_CHARS", 32)
+        monkeypatch.setattr(
+            command_path_guard_module,
+            "_MAX_POLICY_NODE_STATE_EVALUATIONS",
+            2,
+        )
+        monkeypatch.setattr(command_path_guard_module, "_MAX_POLICY_ARGV_TOKENS", 4)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("bash -c ':'")
+
+    def test_comment_only_input_consumes_parse_attempt_budget(
+        self,
+        scoped_command_workspace,
+        monkeypatch,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        monkeypatch.setattr(command_path_guard_module, "_MAX_POLICY_PARSE_ATTEMPTS", 0)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="command policy parse attempt budget exceeded",
+        ):
+            guard.validate("# comment only\n")
+
+    def test_new_effect_rejection_keeps_executor_exit_126_contract(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "safe.sh").write_text("# safe\n", encoding="utf-8")
+        tool = _guarded_tool(workspace)
+
+        result = tool.run_json_sync(
+            {"command": "python -c pass; bash safe.sh"},
+        )
+
+        assert result["success"] is False
+        assert result["return_code"] == 126
+        assert "command denied by policy" in result["error"]

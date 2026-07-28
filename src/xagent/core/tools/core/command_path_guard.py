@@ -14,12 +14,14 @@ import os
 import re
 import shutil
 import stat
+from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
     Any,
     Iterable,
+    Iterator,
     Sequence,
     SupportsIndex,
     cast,
@@ -41,10 +43,105 @@ _MAX_INSPECTED_SCRIPT_DEPTH = 8
 _MAX_COMMAND_WRAPPER_DEPTH = 32
 _MAX_COMMAND_POLICY_INPUT_CHARS = 64 * 1024
 _MAX_POSSIBLE_SHELL_STATES = 16
-_COMMAND_WRITTEN_PATHS: ContextVar[set[Path] | None] = ContextVar(
-    "command_written_paths",
+_MAX_POLICY_PARSE_ATTEMPTS = 64
+_MAX_POLICY_SOURCE_CHARS = 1024 * 1024
+_MAX_POLICY_SCRIPT_BYTES = 1024 * 1024
+_MAX_POLICY_NODE_STATE_EVALUATIONS = 4096
+_MAX_POLICY_ARGV_TOKENS = 8192
+
+
+@dataclass
+class _EffectScope:
+    prior_written_paths: frozenset[Path] = frozenset()
+    prior_unknown_effect: bool = False
+    written_paths: set[Path] = field(default_factory=set)
+    unknown_effect: bool = False
+    inspected_scripts: set[Path] = field(default_factory=set)
+
+    @property
+    def visible_written_paths(self) -> frozenset[Path]:
+        return self.prior_written_paths | self.written_paths
+
+    @property
+    def has_visible_unknown_effect(self) -> bool:
+        return self.prior_unknown_effect or self.unknown_effect
+
+    def inspect_script(self, script_path: Path) -> None:
+        if self.has_visible_unknown_effect or script_path in self.visible_written_paths:
+            raise CommandPolicyViolation(
+                "cannot inspect a script affected by an earlier command"
+            )
+        self.inspected_scripts.add(script_path)
+
+    def merge(self, child: _EffectScope) -> None:
+        self.written_paths.update(child.written_paths)
+        self.unknown_effect = self.unknown_effect or child.unknown_effect
+        self.inspected_scripts.update(child.inspected_scripts)
+
+
+@dataclass
+class _ValidationSession:
+    parse_attempts: int = 0
+    source_chars: int = 0
+    script_bytes: int = 0
+    node_state_evaluations: int = 0
+    argv_tokens: int = 0
+    effects: _EffectScope = field(default_factory=_EffectScope)
+
+    def charge_parse(self, source_chars: int) -> None:
+        self.parse_attempts += 1
+        if self.parse_attempts > _MAX_POLICY_PARSE_ATTEMPTS:
+            raise CommandPolicyViolation("command policy parse attempt budget exceeded")
+        self.source_chars += source_chars
+        if self.source_chars > _MAX_POLICY_SOURCE_CHARS:
+            raise CommandPolicyViolation(
+                "command policy source character budget exceeded"
+            )
+
+    def charge_script_bytes(self, script_bytes: int) -> None:
+        self.script_bytes += script_bytes
+        if self.script_bytes > _MAX_POLICY_SCRIPT_BYTES:
+            raise CommandPolicyViolation("command policy script byte budget exceeded")
+
+    def charge_node_state_evaluation(self) -> None:
+        self.node_state_evaluations += 1
+        if self.node_state_evaluations > _MAX_POLICY_NODE_STATE_EVALUATIONS:
+            raise CommandPolicyViolation(
+                "command policy node-state evaluation budget exceeded"
+            )
+
+    def charge_argv_tokens(self, argv_tokens: int) -> None:
+        self.argv_tokens += argv_tokens
+        if self.argv_tokens > _MAX_POLICY_ARGV_TOKENS:
+            raise CommandPolicyViolation("command policy argv token budget exceeded")
+
+
+_VALIDATION_SESSION: ContextVar[_ValidationSession | None] = ContextVar(
+    "command_validation_session",
     default=None,
 )
+
+
+@contextmanager
+def _validation_session_scope() -> Iterator[_ValidationSession]:
+    session = _VALIDATION_SESSION.get()
+    token = None
+    if session is None:
+        session = _ValidationSession()
+        token = _VALIDATION_SESSION.set(session)
+    try:
+        yield session
+    finally:
+        if token is not None:
+            _VALIDATION_SESSION.reset(token)
+
+
+def _active_validation_session() -> _ValidationSession:
+    session = _VALIDATION_SESSION.get()
+    if session is None:
+        raise RuntimeError("command validation requires an active session")
+    return session
+
 
 _READ_COMMANDS = {"cat"}
 _WRITE_COMMANDS = {"rm"}
@@ -481,6 +578,7 @@ class WorkspaceCommandPathGuard:
             raise CommandPolicyViolation("command is too large to inspect")
         if "\x00" in command:
             raise CommandPolicyViolation("command contains a null byte")
+        _active_validation_session().charge_parse(len(command))
         if not any(
             line.strip() and not line.lstrip().startswith("#")
             for line in command.splitlines()
@@ -500,8 +598,7 @@ class WorkspaceCommandPathGuard:
 
     def validate(self, command: str) -> None:
         """Reject unsupported syntax and unsafe paths in ``command``."""
-        write_token = _COMMAND_WRITTEN_PATHS.set(set())
-        try:
+        with _validation_session_scope():
             active_environment = self._active_implicit_shell_environment()
             if active_environment is not None:
                 raise CommandPolicyViolation(
@@ -512,8 +609,6 @@ class WorkspaceCommandPathGuard:
             states: tuple[_ShellState, ...] = (_ShellState(cwd=self._initial_cwd),)
             for node in nodes:
                 states = self._validate_node_states(node, states)
-        finally:
-            _COMMAND_WRITTEN_PATHS.reset(write_token)
 
     def _validate_node_states(
         self,
@@ -580,19 +675,19 @@ class WorkspaceCommandPathGuard:
 
         No shell interprets this form, so shell expansion syntax remains literal.
         """
-        if not argv:
-            return
-        write_token = _COMMAND_WRITTEN_PATHS.set(set())
-        try:
+        with _validation_session_scope() as session:
+            session.charge_argv_tokens(len(argv))
+            if not argv:
+                return
             self._validate_command_values(
                 argv[0],
                 argv[1:],
                 _ShellState(cwd=self._initial_cwd),
+                charge_argv=False,
             )
-        finally:
-            _COMMAND_WRITTEN_PATHS.reset(write_token)
 
     def _validate_node(self, node: Any, state: _ShellState) -> _ShellState:
+        _active_validation_session().charge_node_state_evaluation()
         kind = getattr(node, "kind", None)
         if kind == "list":
             states = self._validate_list_states(node, (state,))
@@ -603,9 +698,7 @@ class WorkspaceCommandPathGuard:
             return states[0]
 
         if kind == "pipeline":
-            for part in node.parts:
-                if getattr(part, "kind", None) != "pipe":
-                    self._validate_node(part, state)
+            self._validate_pipeline(node, state)
             return state
 
         if kind == "compound":
@@ -626,6 +719,47 @@ class WorkspaceCommandPathGuard:
 
         self._validate_nested_nodes(node, state)
         return state
+
+    def _validate_pipeline(self, node: Any, state: _ShellState) -> None:
+        session = _active_validation_session()
+        parent_scope = session.effects
+        member_scopes: list[_EffectScope] = []
+        try:
+            for part in node.parts:
+                if getattr(part, "kind", None) == "pipe":
+                    continue
+                member_scope = _EffectScope(
+                    prior_written_paths=parent_scope.visible_written_paths,
+                    prior_unknown_effect=parent_scope.has_visible_unknown_effect,
+                )
+                session.effects = member_scope
+                self._validate_node(part, state)
+                member_scopes.append(member_scope)
+        finally:
+            session.effects = parent_scope
+
+        unknown_member_count = sum(scope.unknown_effect for scope in member_scopes)
+        write_owner_counts: dict[Path, int] = {}
+        for member_scope in member_scopes:
+            for path in member_scope.written_paths:
+                write_owner_counts[path] = write_owner_counts.get(path, 0) + 1
+
+        for member_scope in member_scopes:
+            concurrent_unknown = unknown_member_count > int(member_scope.unknown_effect)
+            concurrent_write = any(
+                write_owner_counts.get(script_path, 0)
+                > int(script_path in member_scope.written_paths)
+                for script_path in member_scope.inspected_scripts
+            )
+            if member_scope.inspected_scripts and (
+                concurrent_unknown or concurrent_write
+            ):
+                raise CommandPolicyViolation(
+                    "cannot inspect a script affected by a concurrent command"
+                )
+
+        for member_scope in member_scopes:
+            parent_scope.merge(member_scope)
 
     def _validate_command(self, node: Any, state: _ShellState) -> _ShellState:
         words: list[Any] = []
@@ -657,7 +791,11 @@ class WorkspaceCommandPathGuard:
         command_word: str,
         args: Sequence[str],
         state: _ShellState,
+        *,
+        charge_argv: bool = True,
     ) -> _ShellState:
+        if charge_argv:
+            _active_validation_session().charge_argv_tokens(1 + len(args))
         command_name = os.path.basename(command_word)
         if self._is_direct_command_path(command_word):
             if not self._is_trusted_system_command(command_word, command_name):
@@ -701,6 +839,8 @@ class WorkspaceCommandPathGuard:
             )
         elif command_name in _COMMAND_WRAPPER_GRAMMARS:
             return self._check_command_wrapper(command_name, args, state)
+        else:
+            _active_validation_session().effects.unknown_effect = True
         return state
 
     def _validate_redirect(self, node: Any, state: _ShellState) -> None:
@@ -935,11 +1075,8 @@ class WorkspaceCommandPathGuard:
 
     def _read_policy_script(self, raw_path: str, cwd: Path) -> str:
         script_path = self._check_path(raw_path, cwd, "read")
-        written_paths = _COMMAND_WRITTEN_PATHS.get()
-        if written_paths is not None and script_path in written_paths:
-            raise CommandPolicyViolation(
-                "cannot inspect a script modified earlier in the same command"
-            )
+        session = _active_validation_session()
+        session.effects.inspect_script(script_path)
 
         descriptor: int | None = None
         try:
@@ -950,6 +1087,7 @@ class WorkspaceCommandPathGuard:
                 or metadata.st_size > _MAX_INSPECTED_SCRIPT_BYTES
             ):
                 raise CommandPathViolation(access="read", path=script_path)
+            session.charge_script_bytes(metadata.st_size)
             with os.fdopen(descriptor, "rb") as script_file:
                 descriptor = None
                 raw_script = script_file.read(_MAX_INSPECTED_SCRIPT_BYTES + 1)
@@ -1348,7 +1486,6 @@ class WorkspaceCommandPathGuard:
             )
         except ValueError as exc:
             raise CommandPathViolation(access=access, path=candidate) from exc
-        written_paths = _COMMAND_WRITTEN_PATHS.get()
-        if access == "write" and written_paths is not None:
-            written_paths.add(resolved)
+        if access == "write":
+            _active_validation_session().effects.written_paths.add(resolved)
         return resolved
