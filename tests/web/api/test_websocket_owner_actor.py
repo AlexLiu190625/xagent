@@ -114,6 +114,14 @@ async def test_rejected_delivery_serializes_an_explicit_outcome() -> None:
     assert payload["type"] == "message_rejected"
     assert payload["rejection_outcome"] == "not_accepted"
 
+    with pytest.raises(ValueError, match="requires an explicit rejection outcome"):
+        await send_message_delivery(
+            MagicMock(),
+            client_message_id="missing-outcome-turn",
+            turn_id="missing-outcome-turn",
+            accepted=False,
+        )
+
 
 @pytest.mark.asyncio
 async def test_websocket_authentication_returns_frozen_principal_off_loop(
@@ -1513,6 +1521,7 @@ async def test_live_control_delivery_failure_pool_timeout_is_not_retried(
     assert len(rejected) == 1
     assert rejected[0]["client_message_id"] == "live-control-pool-timeout"
     assert "inject failed" in rejected[0]["message"]
+    assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
 @pytest.mark.asyncio
@@ -1737,6 +1746,49 @@ async def test_failed_durable_delivery_is_not_silently_accepted(db_session) -> N
     assert len(rejected) == 1
     assert rejected[0]["retry_with_new_id"] is True
     assert rejected[0]["rejection_outcome"] == "not_accepted"
+
+
+@pytest.mark.asyncio
+async def test_pending_same_id_delivery_reports_unknown_outcome(db_session) -> None:
+    owner = _user(db_session, "pending-owner")
+    task = _task(db_session, owner.id, status=TaskStatus.COMPLETED)
+    db_session.add(
+        TaskChatMessage(
+            task_id=int(task.id),
+            user_id=int(owner.id),
+            role="user",
+            content="Pending guidance",
+            message_type="user_message",
+            turn_id="pending-turn-1",
+            delivery_status=DELIVERY_PENDING,
+        )
+    )
+    db_session.commit()
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Pending guidance",
+                "client_message_id": "pending-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["client_message_id"] == "pending-turn-1"
+    assert rejected[0]["rejection_outcome"] == "outcome_unknown"
 
 
 @pytest.mark.asyncio
