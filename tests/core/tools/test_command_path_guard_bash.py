@@ -2889,16 +2889,37 @@ class TestCopyInstallMoveLinkDestructive:
             "cp -rL . copied",
             "cp --recursive --dereference . copied",
             "cp -rH . copied",
+            "cp --derefe -r . copied",
+            "cp -r --derefe . copied",
+            "cp --recurs --dereference . copied",
+            "cp -r --follow-comm . copied",
         ],
     )
     def test_copy_recursive_symlink_dereference_is_rejected(
         self, scoped_command_workspace, command
     ):
+        # `--derefe`/`--recurs`/`--follow-comm` are GNU unambiguous-prefix
+        # abbreviations of `--dereference`/`--recursive`/
+        # `--follow-command-line-symlink`; an abbreviated spelling of
+        # either flag must be classified identically to the full name so
+        # this hard denial still fires.
         workspace, _, _ = scoped_command_workspace
         guard = WorkspaceCommandPathGuard(workspace)
 
         with pytest.raises(CommandPolicyViolation, match="symbolic links"):
             guard.validate(command)
+
+    def test_copy_dereference_abbreviation_without_recursive_is_allowed(
+        self, scoped_command_workspace
+    ):
+        # The hard denial only fires for the recursive+dereference
+        # combination; an abbreviated `--dereference` alone must not be
+        # misclassified as triggering it.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("cp --derefe own.txt copied.txt")
 
     def test_cp_target_directory_bundled_behind_recursive_is_write_checked(
         self, scoped_command_workspace
@@ -3961,6 +3982,8 @@ class TestTarCommand:
         [
             "tar -cf archive.tar -T file-list.txt",
             "tar --create --files-from=file-list.txt -f archive.tar",
+            "tar --create --files-fr=own.txt -f archive.tar",
+            "tar --create --files-fr own.txt -f archive.tar",
             "tar -cf archive.tar --checkpoint-action=exec=sh own.txt",
             "tar -cf archive.tar --checkpoint-action exec=sh own.txt",
             "tar -cf archive.tar -F hook.sh own.txt",
@@ -3975,6 +3998,47 @@ class TestTarCommand:
 
         with pytest.raises(CommandPolicyViolation):
             guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "option_spelling",
+        ["--listed-incr", "--listed-incremental"],
+    )
+    @pytest.mark.parametrize("attach_form", ["=", " "])
+    def test_create_mode_listed_incremental_write_checks_out_of_workspace_path(
+        self, scoped_command_workspace, option_spelling, attach_form
+    ):
+        # `--listed-incr` is the GNU unambiguous-prefix abbreviation of
+        # `--listed-incremental`; both spellings, in both the `=`-attached
+        # and space-separated forms, must resolve to the same
+        # write-checked snapshot-file option, not fall through as an
+        # unchecked (read-checked) source positional.
+        workspace, external_file, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(external_file))
+        option = (
+            f"{option_spelling}={outside}"
+            if attach_form == "="
+            else f"{option_spelling} {outside}"
+        )
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"tar --create {option} -f a.tar own.txt")
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "option_spelling",
+        ["--listed-incr", "--listed-incremental"],
+    )
+    def test_create_mode_listed_incremental_workspace_path_is_allowed(
+        self, scoped_command_workspace, option_spelling
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"tar --create {option_spelling}=snapshot -f a.tar own.txt")
 
     def test_short_option_bundle_consumes_archive_value(self, scoped_command_workspace):
         # `-xzf archive.tgz`: `x`=extract, `z`=unrecognized flag (skipped),
@@ -4056,19 +4120,27 @@ class TestTarCommand:
 
         guard.validate("tar --index-file listing.txt -xf a.tar")
 
-    @pytest.mark.parametrize("mode_flag", ["-xf", "-tf"])
-    def test_unrecognized_long_option_fails_closed_in_extract_and_list_mode(
+    @pytest.mark.parametrize(
+        "mode_flag", ["-xf", "-tf", "-cf", "-rf", "-uf", "-Af", "-df"]
+    )
+    def test_unrecognized_bare_long_option_fails_closed_in_every_mode(
         self, scoped_command_workspace, mode_flag
     ):
-        # An unrecognized long option with no attached value is ambiguous:
-        # it may take a separated argument this parser cannot identify,
-        # which would otherwise become an unchecked member-selector
-        # positional in extract/list mode.
+        # A bare (argument-free) unrecognized long option is ambiguous: it
+        # may take a separated argument this parser cannot identify, which
+        # would otherwise become an unchecked member-selector positional in
+        # extract/list mode, or an under-strict source/destination
+        # positional in create/append/update/concatenate/compare mode
+        # instead of the write-checked or hard-denied classification the
+        # real option would receive (e.g. `--listed-incremental`/
+        # `--files-from`). It fails closed in every mode, not only
+        # extract/list.
         workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
         guard = WorkspaceCommandPathGuard(workspace)
 
         with pytest.raises(CommandPolicyViolation):
-            guard.validate(f"tar --not-a-tar-option {mode_flag} a.tar")
+            guard.validate(f"tar --not-a-tar-option {mode_flag} a.tar own.txt")
 
     def test_unrecognized_long_option_with_value_fails_closed_regardless_of_mode(
         self, scoped_command_workspace
@@ -4079,19 +4151,6 @@ class TestTarCommand:
 
         with pytest.raises(CommandPolicyViolation):
             guard.validate("tar --not-a-tar-option=value -cf archive.tar own.txt")
-
-    def test_unrecognized_bare_long_option_is_allowed_outside_extract_and_list_mode(
-        self, scoped_command_workspace
-    ):
-        # Create/append/update/concatenate/compare mode already path-checks
-        # every positional as a source, so a bare (argument-free) unmodeled
-        # long option there is not the exploitable ambiguity extract/list
-        # mode has and stays permissive.
-        workspace, _, _ = scoped_command_workspace
-        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
-        guard = WorkspaceCommandPathGuard(workspace)
-
-        guard.validate("tar --not-a-tar-option -cf archive.tar own.txt")
 
 
 class TestSedAwkCommand:
@@ -5464,7 +5523,10 @@ class TestBundledAndAbbreviatedPathOptionCoverage:
     hole through: the `=`-form was covered here, but the space-separated
     form was not, so `_check_rsync` fell back to its unmodeled-flag path
     and swept the value into the generic read/write operand list instead
-    of write-checking it).
+    of write-checking it). tar's `--listed-incr`/`--files-fr` rows cover the
+    same abbreviation gap in create/append/update/concatenate/compare mode
+    specifically, not only extract/list, which is where an earlier revision
+    of this parser left it unguarded.
 
     Each row names one path-bearing option a command owns and drives a
     bundled-short-cluster form (when the option has one; `None` skips it)
@@ -5478,6 +5540,13 @@ class TestBundledAndAbbreviatedPathOptionCoverage:
     here has no guarantee any of these bug classes was ever checked for it
     — that gap is the point of this table, not an oversight to silently
     fill in.
+
+    `TestModeFlagAbbreviationCoverage` below extends the same guard to a
+    different shape of the same bug class: a GNU-abbreviated long option
+    that is a bare mode *flag* rather than a path-bearing option (cp's
+    `--derefe`/`--recurs`), where the recurrence risk is a flag-combination
+    check missing the abbreviated spelling entirely rather than
+    misclassifying a value's read/write access.
     """
 
     # (label, bundled-short-form template or None, GNU-abbreviated-long-form
@@ -5539,6 +5608,18 @@ class TestBundledAndAbbreviatedPathOptionCoverage:
             "rsync -a --files-fr={path} own.txt d",
             None,
         ),
+        (
+            "tar --listed-incremental (create mode)",
+            None,
+            "tar --create --listed-incr={path} -f a.tar own.txt",
+            "write",
+        ),
+        (
+            "tar --files-from (create mode)",
+            None,
+            "tar --create --files-fr={path} -f a.tar",
+            None,
+        ),
     ]
 
     @pytest.mark.parametrize(
@@ -5584,3 +5665,48 @@ class TestBundledAndAbbreviatedPathOptionCoverage:
             with pytest.raises(CommandPathViolation) as space_exc:
                 guard.validate(space_command)
             assert space_exc.value.access == expected_access
+
+
+class TestModeFlagAbbreviationCoverage:
+    """Recurrence guard for a GNU-abbreviated long option that is a bare
+    mode *flag* rather than a path-bearing option.
+
+    `cp`'s `--dereference`/`--recursive`/`--follow-command-line-symlink`
+    carry no value; the bug this covers is a flag-combination check
+    (recursive copy through a dereferenced symlink) matching only the full
+    spelling, so an abbreviated flag silently misses the combination
+    entirely instead of triggering the hard denial. Unlike
+    `TestBundledAndAbbreviatedPathOptionCoverage`'s table, there is no
+    `--abbr=value`/`--abbr value` duality to drive (a bare flag takes no
+    argument), so each row is a single, already fully-formed command.
+    """
+
+    # (label, command using a GNU-abbreviated mode flag that must still
+    # trigger the recursive+dereference hard denial)
+    _ABBREVIATED_MODE_FLAG_COMMANDS: list[tuple[str, str]] = [
+        ("cp --derefe (long, abbreviated) + -r (short)", "cp --derefe -r . copied"),
+        ("cp -r (short) + --derefe (long, abbreviated)", "cp -r --derefe . copied"),
+        (
+            "cp --recurs (long, abbreviated) + --dereference (long, full)",
+            "cp --recurs --dereference . copied",
+        ),
+        (
+            "cp -r (short) + --follow-comm (long, abbreviated)",
+            "cp -r --follow-comm . copied",
+        ),
+    ]
+
+    @pytest.mark.parametrize(
+        ("label", "command"),
+        _ABBREVIATED_MODE_FLAG_COMMANDS,
+        ids=[row[0] for row in _ABBREVIATED_MODE_FLAG_COMMANDS],
+    )
+    def test_abbreviated_mode_flag_still_triggers_hard_denial(
+        self, scoped_command_workspace, label, command
+    ):
+        del label  # only used as the parametrize id
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="symbolic links"):
+            guard.validate(command)

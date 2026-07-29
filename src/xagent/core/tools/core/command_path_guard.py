@@ -2246,7 +2246,12 @@ class WorkspaceCommandPathGuard:
         `--dereference`, `-H`) can read arbitrarily deep external content
         through a single approved read boundary, which cannot be bounded
         statically, so that combination is a hard denial regardless of the
-        actual paths involved.
+        actual paths involved. `--recursive`/`--dereference`/
+        `--follow-command-line-symlink` resolve through `_resolve_long_option`
+        against the same `_TARGET_DIR_KNOWN_LONG_OPTIONS` set
+        `_parse_target_directory` uses for this family, so a GNU-abbreviated
+        spelling (`--derefe`) is classified identically to the full name
+        instead of silently missing this detection.
         """
         recursive = False
         dereferences_links = False
@@ -2254,10 +2259,15 @@ class WorkspaceCommandPathGuard:
             text = str(value)
             if text == "--":
                 break
-            if text == "--recursive":
-                recursive = True
-            elif text in {"--dereference", "--follow-command-line-symlink"}:
-                dereferences_links = True
+            if text.startswith("--"):
+                raw_option, _, _ = text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _TARGET_DIR_KNOWN_LONG_OPTIONS
+                )
+                if resolved == "--recursive":
+                    recursive = True
+                elif resolved in {"--dereference", "--follow-command-line-symlink"}:
+                    dereferences_links = True
             elif text.startswith("-") and not text.startswith("--"):
                 flags = text[1:]
                 recursive = recursive or "r" in flags or "R" in flags
@@ -2686,11 +2696,16 @@ class WorkspaceCommandPathGuard:
                     )
                 continue
             if event.kind == "unresolved_option":
-                if invocation.mode in {"extract", "list"}:
-                    raise CommandPolicyViolation(
-                        f"cannot safely resolve tar option {event.value}"
-                    )
-                continue
+                # Fails closed in every mode, not only extract/list: the
+                # same parser ambiguity (bare flag vs. a hidden argument)
+                # would otherwise let an abbreviated write-checked
+                # (`--listed-incremental`) or hard-denied (`--files-from`)
+                # option's value leak through as an ordinary source/
+                # destination positional in create/append/update/
+                # concatenate/compare mode.
+                raise CommandPolicyViolation(
+                    f"cannot safely resolve tar option {event.value}"
+                )
             if event.value is None:
                 continue
 
@@ -2849,18 +2864,27 @@ class WorkspaceCommandPathGuard:
     ) -> tuple[int, _TarEvent | None]:
         """Parse one `--`-prefixed tar argument into a typed event.
 
-        An unrecognized long option with an attached `=value` unambiguously
-        carries a value this family does not model, and fails closed
-        immediately regardless of mode (mirroring `rsync`/`curl`/`wget`).
-        An unrecognized option with NO attached value is ambiguous: it may
-        be a bare flag (common; e.g. `--gzip`), or it may take a separate
-        following token this parser cannot identify as its argument, which
-        would otherwise be misclassified as an unchecked archive-member
-        positional in extract/list mode (that value is never path-checked
-        there). Rather than guess its arity, it is returned as an
-        `unresolved_option` event so `_check_tar` can fail closed in
-        extract/list mode specifically, where that ambiguity is exploitable,
-        while leaving other modes' (already-checked) positionals unaffected.
+        The option resolves through `_resolve_long_option` (GNU
+        unambiguous-prefix abbreviation, e.g. `--listed-incr` for
+        `--listed-incremental`, `--files-fr` for `--files-from`) against
+        this family's known path-bearing and dangerous long options, so an
+        abbreviated spelling is classified identically to the full name
+        instead of falling through as unmodeled. An unrecognized long
+        option with an attached `=value` unambiguously carries a value this
+        family does not model, and fails closed immediately regardless of
+        mode (mirroring `rsync`/`curl`/`wget`). An unrecognized option with
+        NO attached value is ambiguous: it may be a bare flag (common; e.g.
+        `--gzip`), or it may take a separate following token this parser
+        cannot identify as its argument, which would otherwise be
+        misclassified as an unchecked archive-member positional in
+        extract/list mode (never path-checked there) or as an unchecked
+        source/destination positional in the other modes (source_access-
+        checked, not the write/hard-deny classification the real option
+        would receive). Rather than guess its arity, it is returned as an
+        `unresolved_option` event; `_check_tar` fails closed on that event
+        in every mode, not only extract/list, since the same ambiguity is
+        exploitable wherever a long option could silently misclassify a
+        value it would otherwise write-check or hard-deny.
         """
         value = values[index]
         text = str(value)
@@ -2882,8 +2906,10 @@ class WorkspaceCommandPathGuard:
             "--rsh-command",
         }
         option, separator, attached = text.partition("=")
-        kind = path_options.get(option)
-        is_dangerous = option in dangerous_options
+        known_long_options = frozenset(path_options) | dangerous_options
+        resolved = self._resolve_long_option(option, known_long_options)
+        kind = path_options.get(resolved) if resolved is not None else None
+        is_dangerous = resolved in dangerous_options if resolved is not None else False
         if kind is None and not is_dangerous:
             if separator:
                 raise CommandPolicyViolation(
