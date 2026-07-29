@@ -4211,9 +4211,27 @@ class WorkspaceCommandPathGuard:
         though it only *reads* its argument today: rsync may hard-link
         unchanged files from that tree straight into the destination, so a
         read-only external root is not sufficient authorization for it.
-        `--files-from`/`-f`/`--filter`/`-e`/`--rsh`/... delegate to an
-        external file list or shell command this guard cannot inspect
-        safely and fail closed rather than silently bypassing containment.
+        `--log-file`/`--write-batch`/`--only-write-batch` also write to a
+        filename argument; `--read-batch` reads one (the batched changes it
+        replays are still bounded by the invocation's own destination
+        operand, so its file argument is a plain read, not a write slot).
+        `--files-from`/`--include-from`/`--exclude-from`/`-f`/`--filter`/
+        `-e`/`--rsh`/... delegate to an external file list or shell command
+        this guard cannot inspect safely and fail closed unconditionally
+        rather than access-checking their own argument: the file's
+        *contents* can name further paths this guard never sees, so a
+        plain read check of the file itself would not bound what rsync
+        actually touches.
+
+        Long options resolve through `_resolve_long_option` (GNU
+        unambiguous-prefix abbreviation, e.g. `--link-des=`/`--link-des ` for
+        `--link-dest`), so an abbreviation of any modeled option — write,
+        read, scalar, or denied — is classified identically to its full
+        name in both the `=`-attached and space-separated spelling. An
+        option this map cannot resolve (a typo, an unsupported flag, or an
+        ambiguous abbreviation) fails closed when it visibly carries a
+        value (`=`-attached); a bare unmodeled long option is still assumed
+        to be a value-free flag, matching curl/wget.
         """
         self._reject_dynamic_values("rsync arguments", values)
         denied_options = {
@@ -4237,6 +4255,10 @@ class WorkspaceCommandPathGuard:
             "--compare-dest": "read",
             "--copy-dest": "read",
             "--link-dest": "write",
+            "--log-file": "write",
+            "--write-batch": "write",
+            "--only-write-batch": "write",
+            "--read-batch": "read",
         }
         scalar_options = {
             "--block-size",
@@ -4257,6 +4279,11 @@ class WorkspaceCommandPathGuard:
             "--usermap",
             "--groupmap",
         }
+        known_long_options = (
+            frozenset(path_options)
+            | frozenset(scalar_options)
+            | frozenset(option for option in denied_options if option.startswith("--"))
+        )
         operands: list[str] = []
         options_done = False
         index = 0
@@ -4272,7 +4299,17 @@ class WorkspaceCommandPathGuard:
                 index += 1
                 continue
             option, separator, attached_text = text.partition("=")
-            if option in denied_options or (
+            resolved_option = option
+            if (
+                text.startswith("--")
+                and option not in path_options
+                and option not in scalar_options
+                and option not in denied_options
+            ):
+                candidate = self._resolve_long_option(option, known_long_options)
+                if candidate is not None:
+                    resolved_option = candidate
+            if resolved_option in denied_options or (
                 text.startswith("-")
                 and not text.startswith("--")
                 and any(flag in text[1:] for flag in {"e", "f", "L", "H"})
@@ -4280,31 +4317,32 @@ class WorkspaceCommandPathGuard:
                 raise CommandPolicyViolation(
                     f"cannot safely inspect rsync option {option}"
                 )
-            if option in path_options:
+            if resolved_option in path_options:
                 argument, index = self._take_option_argument(
                     values,
                     index,
                     attached_argument=(
                         self._derived_value(value, attached_text) if separator else None
                     ),
-                    context=f"rsync argument for {option}",
+                    context=f"rsync argument for {resolved_option}",
                 )
                 assert argument is not None
-                self._check_path(argument, cwd, path_options[option])
+                self._check_path(argument, cwd, path_options[resolved_option])
                 continue
-            if option in scalar_options:
+            if resolved_option in scalar_options:
                 _, index = self._take_option_argument(
                     values,
                     index,
                     attached_argument=(
                         self._derived_value(value, attached_text) if separator else None
                     ),
-                    context=f"rsync argument for {option}",
+                    context=f"rsync argument for {resolved_option}",
                 )
                 continue
             if text.startswith("--"):
-                # Long flag options are argument-free here. Options with
-                # unmodeled values fail closed instead of shifting operands.
+                # Long flag options are argument-free here. An option this
+                # map cannot resolve fails closed instead of shifting
+                # operands when it visibly carries a value.
                 if separator:
                     raise CommandPolicyViolation(
                         f"cannot safely inspect rsync option {option}"

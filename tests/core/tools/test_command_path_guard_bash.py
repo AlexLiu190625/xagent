@@ -4962,12 +4962,81 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         assert exc_info.value.access == "write"
 
-    def test_rsync_log_file_option_still_rejects_out_of_workspace(
+    def test_rsync_backup_dir_requires_write_authorization(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"rsync -a --backup-dir={shlex.quote(str(external_file.parent))} "
+                "source copied"
+            )
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize("option_spelling", ["--link-des", "--link-dest"])
+    def test_rsync_link_dest_space_separated_form_requires_write_authorization(
+        self, scoped_command_workspace, option_spelling
+    ):
+        # `--link-dest` may hard-link unchanged files straight into the
+        # destination, so a read-only external root (read-allowed, not
+        # write-allowed) is not sufficient authorization for it. Both the
+        # GNU unambiguous-prefix abbreviation and the full spelling must
+        # resolve through `_resolve_long_option` and write-check the
+        # space-separated argument instead of leaking it into the generic
+        # read/write operand list.
+        workspace, external_file, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"rsync -a {option_spelling} {shlex.quote(str(external_file))} "
+                "own.txt d"
+            )
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize("option_spelling", ["--backup-di", "--backup-dir"])
+    def test_rsync_backup_dir_space_separated_form_requires_write_authorization(
+        self, scoped_command_workspace, option_spelling
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"rsync -a {option_spelling} {shlex.quote(str(external_file))} "
+                "own.txt d"
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_rsync_benign_local_invocation_is_allowed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "src.txt").write_text("src\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("rsync -a src.txt dst.txt")
+
+    def test_rsync_remote_source_still_rejects_the_whole_invocation(
         self, scoped_command_workspace
     ):
-        # Pin: `rsync --log-file <out> ...` already rejects today (the
-        # unconsumed value becomes an extra read-checked source operand);
-        # this must stay a rejection, not be "fixed" into an ALLOW.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("rsync src host:/x")
+
+    def test_rsync_log_file_option_is_write_checked(self, scoped_command_workspace):
+        # `--log-file` is a modeled write-owning option: its argument must
+        # be write-checked directly, not leaked into the generic
+        # read/write operand list (the prior, coincidental behavior this
+        # test used to pin).
         workspace, _, sibling_file = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
         guard = WorkspaceCommandPathGuard(workspace)
@@ -4977,7 +5046,7 @@ class TestDdBase64GzipRemoteTransferCommand:
                 f"rsync --log-file {shlex.quote(str(sibling_file))} own.txt dest.txt"
             )
 
-        assert exc_info.value.access == "read"
+        assert exc_info.value.access == "write"
 
     # -- curl/wget/rsync shared uninspectable-option pins -----------------
 
@@ -4988,6 +5057,7 @@ class TestDdBase64GzipRemoteTransferCommand:
             "wget --config config",
             "rsync host:/secret copied",
             "rsync --files-from=list.txt source copied",
+            "rsync --files-fr list.txt source copied",
         ],
     )
     def test_rejects_uninspectable_new_tool_path_sources(
@@ -5383,23 +5453,38 @@ class TestDdBase64GzipRemoteTransferCommand:
 
 
 class TestBundledAndAbbreviatedPathOptionCoverage:
-    """Recurrence guard for the two bug classes this module's hand-rolled
-    option parsers kept reintroducing: a value-taking option not recognized
-    when bundled behind another short flag (tar's `xfC`, curl's `-sD`,
-    wget's `-qO`, cp/mv/ln's `-rt`), and a GNU-abbreviated long option not
-    resolved to the option it stands for (grep's `--fil=`, cp/mv/ln's
-    `--targ=`, curl's `--dump-hea=`, wget's `--output-docu=`).
+    """Recurrence guard for the bug classes this module's hand-rolled option
+    parsers kept reintroducing: a value-taking option not recognized when
+    bundled behind another short flag (tar's `xfC`, curl's `-sD`, wget's
+    `-qO`, cp/mv/ln's `-rt`), and a GNU-abbreviated long option not resolved
+    to the option it stands for — in EITHER the `=`-attached form (grep's
+    `--fil=`, cp/mv/ln's `--targ=`, curl's `--dump-hea=`, wget's
+    `--output-docu=`) or the space-separated form (rsync's `--link-des
+    <path>`, which is what let the abbreviated-`--link-dest`/`--backup-dir`
+    hole through: the `=`-form was covered here, but the space-separated
+    form was not, so `_check_rsync` fell back to its unmodeled-flag path
+    and swept the value into the generic read/write operand list instead
+    of write-checking it).
 
-    Each row names one path-bearing option a command owns and drives BOTH
-    a bundled-short-cluster form and a GNU-abbreviated long-option form of
-    it against an out-of-workspace path. A command added later that owns a
-    path-bearing option without an entry here has no guarantee either bug
-    class was ever checked for it — that gap is the point of this table,
-    not an oversight to silently fill in.
+    Each row names one path-bearing option a command owns and drives a
+    bundled-short-cluster form (when the option has one; `None` skips it)
+    plus BOTH the `--abbr=value` and `--abbr value` spellings of its
+    GNU-abbreviated long-option form, against an out-of-workspace path.
+    `expected_access` of `None` marks an option this guard denies
+    unconditionally (rsync's `--files-from`, which delegates to an external
+    file list this guard cannot inspect) rather than access-classifies: both
+    spellings must still raise, just without a specific access to assert.
+    A command added later that owns a path-bearing option without an entry
+    here has no guarantee any of these bug classes was ever checked for it
+    — that gap is the point of this table, not an oversight to silently
+    fill in.
     """
 
-    # (label, bundled-short-form template, GNU-abbreviated-long-form template)
-    _BUNDLED_AND_ABBREVIATED_PATH_OPTIONS: list[tuple[str, str, str, str]] = [
+    # (label, bundled-short-form template or None, GNU-abbreviated-long-form
+    # `=`-attached template, expected access or None for unconditional deny)
+    _BUNDLED_AND_ABBREVIATED_PATH_OPTIONS: list[
+        tuple[str, str | None, str, str | None]
+    ] = [
         ("sort -o", "sort -ro{path} own.txt", "sort --out={path} own.txt", "write"),
         ("sort -T", "sort -rT{path} own.txt", "sort --temp={path} own.txt", "write"),
         ("grep -f", "grep -vf {path} own.txt", "grep --fil={path} own.txt", "read"),
@@ -5436,6 +5521,24 @@ class TestBundledAndAbbreviatedPathOptionCoverage:
             "wget -O keep --output-fi={path} https://example.invalid/file",
             "write",
         ),
+        (
+            "rsync --link-dest",
+            None,
+            "rsync -a --link-des={path} own.txt d",
+            "write",
+        ),
+        (
+            "rsync --backup-dir",
+            None,
+            "rsync -a --backup-di={path} own.txt d",
+            "write",
+        ),
+        (
+            "rsync --files-from",
+            None,
+            "rsync -a --files-fr={path} own.txt d",
+            None,
+        ),
     ]
 
     @pytest.mark.parametrize(
@@ -5457,10 +5560,27 @@ class TestBundledAndAbbreviatedPathOptionCoverage:
         guard = WorkspaceCommandPathGuard(workspace)
         outside = shlex.quote(str(sibling_file))
 
-        with pytest.raises(CommandPathViolation) as bundled_exc:
-            guard.validate(bundled_template.format(path=outside))
-        assert bundled_exc.value.access == expected_access
+        if bundled_template is not None:
+            with pytest.raises(CommandPathViolation) as bundled_exc:
+                guard.validate(bundled_template.format(path=outside))
+            assert bundled_exc.value.access == expected_access
 
-        with pytest.raises(CommandPathViolation) as abbreviated_exc:
-            guard.validate(abbreviated_template.format(path=outside))
-        assert abbreviated_exc.value.access == expected_access
+        assert "={path}" in abbreviated_template
+        equals_command = abbreviated_template.format(path=outside)
+        space_command = abbreviated_template.replace("={path}", " {path}").format(
+            path=outside
+        )
+
+        if expected_access is None:
+            with pytest.raises(CommandPolicyViolation):
+                guard.validate(equals_command)
+            with pytest.raises(CommandPolicyViolation):
+                guard.validate(space_command)
+        else:
+            with pytest.raises(CommandPathViolation) as equals_exc:
+                guard.validate(equals_command)
+            assert equals_exc.value.access == expected_access
+
+            with pytest.raises(CommandPathViolation) as space_exc:
+                guard.validate(space_command)
+            assert space_exc.value.access == expected_access
