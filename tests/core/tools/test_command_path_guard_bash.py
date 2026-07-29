@@ -2593,6 +2593,26 @@ class TestWriteCreateFamily:
 
         guard.validate("chmod --reference=mode.ref own.txt")
 
+    def test_chmod_reference_abbreviation_still_write_checks_the_target(
+        self, scoped_command_workspace
+    ):
+        # `--ref=` is the same option as `--reference=` via GNU unambiguous-
+        # prefix abbreviation. The presence check deciding whether the
+        # leading operand is the (excluded) MODE positional must use the
+        # SAME resolved option set `_partition_path_options` itself uses,
+        # not a second raw-string pass: otherwise an abbreviated
+        # `--reference` looks absent, the real target gets misread as MODE
+        # and stripped from the operand list, and the write check on it is
+        # silently skipped entirely.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "mode.ref").write_text("", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"chmod --ref=mode.ref {shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "write"
+
     @pytest.mark.parametrize(
         "command_template",
         ["touch --reference={path} own.txt", "touch -r {path} own.txt"],

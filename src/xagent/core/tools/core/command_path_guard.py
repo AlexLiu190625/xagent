@@ -1942,13 +1942,24 @@ class WorkspaceCommandPathGuard:
         this family has no non-path positional.
         """
         if command_name in _OWNERSHIP_MODE_COMMANDS:
+            reference_options = frozenset({"--reference"})
             operands = self._partition_path_options(
                 values,
                 cwd,
                 option_access={"--reference": "read"},
             )
+            # Must resolve through the same `_resolve_long_option` set the
+            # partitioning pass above uses for this option, not an
+            # independent raw-string pass: otherwise a GNU-abbreviated
+            # `--ref=` is consumed (and read-checked) above but looks absent
+            # here, so the real target is misread as the excluded MODE
+            # positional and its write check is silently skipped.
             has_reference = any(
-                str(value) == "--reference" or str(value).startswith("--reference=")
+                str(value).startswith("--")
+                and self._resolve_long_option(
+                    str(value).partition("=")[0], reference_options
+                )
+                is not None
                 for value in values
             )
             if not has_reference and operands:
