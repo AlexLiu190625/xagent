@@ -152,7 +152,6 @@ const reduceSessionConversation = (
 type SessionConversationTransition = {
   accepted: boolean
   changed: boolean
-  current: SessionConversationState
   next: SessionConversationState
 }
 
@@ -168,7 +167,7 @@ const transitionSessionConversation = (
     && current.connectionIdentity === action.connectionIdentity
     && current.taskId === action.taskId
   )
-  return { accepted, changed, current, next }
+  return { accepted, changed, next }
 }
 
 const asMessageRecord = (value: unknown): Record<string, unknown> =>
@@ -930,7 +929,7 @@ const createInitialState = (): AppState => ({
   sessionConversation: { ...initialSessionConversationState },
 })
 
-function appReducer(state: AppState, action: AppAction): AppState {
+function projectAppState(state: AppState, action: AppAction): AppState {
   console.log('🔍 Reducer called with action:', action.type, action)
 
   switch (action.type) {
@@ -1450,6 +1449,13 @@ function appReducer(state: AppState, action: AppAction): AppState {
   }
 }
 
+type AppStateCommit = { state: AppState }
+
+const commitProjectedAppState = (
+  _: AppState,
+  commit: AppStateCommit,
+): AppState => commit.state
+
 interface PendingMessage {
   message: string
   files?: File[]
@@ -1584,7 +1590,11 @@ export function AppProvider({
   token?: string
   transport?: AppProviderTransportConfig
 }) {
-  const [state, dispatch] = useReducer(appReducer, undefined, createInitialState)
+  const [state, privateCommit] = useReducer(
+    commitProjectedAppState,
+    undefined,
+    createInitialState,
+  )
   const pendingTaskToExecuteRef = useRef<{ description: string } | null>(null)
   const startDelayedPlaybackRef = useRef<() => void>(() => {})
   const isHistoricalDataLoadingRef = useRef(false)
@@ -1610,13 +1620,13 @@ export function AppProvider({
     (content: string) => isDuplicateMessage(content, "result"),
     [isDuplicateMessage],
   )
-  // Session frames can arrive as a burst before React commits. Project those
-  // actions synchronously so every frame is reduced against the preceding one.
+  // All actions are projected synchronously so each action observes the state
+  // produced by the preceding action before React commits the batch.
   const stateRef = useRef(state)
-  stateRef.current = state
-  const projectSessionAppAction = useCallback((action: AppAction) => {
-    stateRef.current = appReducer(stateRef.current, action)
-    dispatch(action)
+  const dispatch = useCallback((action: AppAction) => {
+    const next = projectAppState(stateRef.current, action)
+    stateRef.current = next
+    privateCommit({ state: next })
   }, [])
   const sessionConversationRef = useRef<SessionConversationState>(initialSessionConversationState)
   const dispatchSessionConversation = useCallback(
@@ -1625,11 +1635,11 @@ export function AppProvider({
       const transition = transitionSessionConversation(current, action)
       if (transition.changed) {
         sessionConversationRef.current = transition.next
-        projectSessionAppAction({ type: "SESSION_CONVERSATION", payload: action })
+        dispatch({ type: "SESSION_CONVERSATION", payload: action })
       }
       return transition
     },
-    [projectSessionAppAction],
+    [dispatch],
   )
   useLayoutEffect(() => {
     sessionConversationRef.current = state.sessionConversation
@@ -5094,7 +5104,7 @@ export function AppProvider({
       const nextDeliveryGeneration = deliveryGenerationRef.current + 1
       deliveryGenerationRef.current = nextDeliveryGeneration
       setDeliveryGeneration(nextDeliveryGeneration)
-      projectSessionAppAction({ type: "RESET_SESSION_CONVERSATION" })
+      dispatch({ type: "RESET_SESSION_CONVERSATION" })
       resetFlight.resolve()
       return
     }
@@ -5188,7 +5198,7 @@ export function AppProvider({
         taskStateVersionsRef.current,
       )) return
       sessionTaskIdRef.current = taskId
-      projectSessionAppAction({
+      dispatch({
         type: "ADOPT_SESSION_TASK",
         payload: {
           taskId,
@@ -5234,7 +5244,7 @@ export function AppProvider({
       }
     }
 
-    handleMessage(message, projectSessionAppAction, stateRef.current, {
+    handleMessage(message, dispatch, stateRef.current, {
       skipHistory: true,
       filesDisabled,
     })
@@ -5742,20 +5752,18 @@ export function AppProvider({
       resolveReset = resolve
       rejectReset = reject
     })
-    let resetFlight!: SessionResetFlight
-    const timeout = setTimeout(() => {
-      if (sessionResetFlightRef.current !== resetFlight) return
-      requireSessionReload(
-        new Error("Conversation reset acknowledgement timed out; reload required.")
-      )
-    }, SESSION_RESET_ACK_TIMEOUT_MS)
-    resetFlight = {
+    const resetFlight: SessionResetFlight = {
       connectionIdentity,
       deliveryGeneration: deliveryGenerationRef.current,
       promise,
       resolve: resolveReset,
       reject: rejectReset,
-      timeout,
+      timeout: setTimeout(() => {
+        if (sessionResetFlightRef.current !== resetFlight) return
+        requireSessionReload(
+          new Error("Conversation reset acknowledgement timed out; reload required.")
+        )
+      }, SESSION_RESET_ACK_TIMEOUT_MS),
     }
     sessionResetFlightRef.current = resetFlight
     const transition = dispatchSessionConversation({
@@ -5859,11 +5867,11 @@ export function AppProvider({
 
   const selectStep = useCallback((stepId: string | null) => {
     dispatch({ type: "SELECT_STEP", payload: stepId })
-  }, [])
+  }, [dispatch])
 
   const clearMessages = useCallback(() => {
     dispatch({ type: "CLEAR_MESSAGES" })
-  }, [])
+  }, [dispatch])
 
   const setTaskId = useCallback((taskId: number | null, options?: { navigate?: boolean }) => {
     // Only reset historical data request flag when changing to a different task
@@ -5898,7 +5906,7 @@ export function AppProvider({
       isHistoricalDataLoadingRef.current = true
       dispatch({ type: "SET_HISTORY_LOADING", payload: true })
     }
-  }, [router])
+  }, [dispatch, router])
 
   const openFilePreview = useCallback((fileId: string, fileName: string, files?: Array<{ fileId: string; fileName: string }>, index?: number) => {
     if (filesDisabled) return
@@ -5910,7 +5918,7 @@ export function AppProvider({
       index
     })
     dispatch({ type: "OPEN_FILE_PREVIEW", payload: { fileId, fileName, files, index } })
-  }, [filesDisabled])
+  }, [dispatch, filesDisabled])
 
   const switchFilePreview = useCallback((index: number) => {
     if (filesDisabled) return
@@ -5923,7 +5931,7 @@ export function AppProvider({
 
   const closeFilePreview = useCallback(() => {
     dispatch({ type: "CLOSE_FILE_PREVIEW" })
-  }, [])
+  }, [dispatch])
 
   const getFilePreviewUrl = useCallback((fileId: string) => {
     if (filesDisabled) {
@@ -5949,23 +5957,23 @@ export function AppProvider({
   // Replay control methods
   const startReplay = useCallback((taskId: number, events: TraceEvent[]) => {
     dispatch({ type: "START_REPLAY", payload: { taskId, events } })
-  }, [])
+  }, [dispatch])
 
   const stopReplay = useCallback(() => {
     dispatch({ type: "STOP_REPLAY" })
-  }, [])
+  }, [dispatch])
 
   const setReplayPlaying = useCallback((isPlaying: boolean) => {
     dispatch({ type: "SET_REPLAY_PLAYING", payload: isPlaying })
-  }, [])
+  }, [dispatch])
 
   const setReplaySpeed = useCallback((speed: number) => {
     dispatch({ type: "SET_REPLAY_SPEED", payload: speed })
-  }, [])
+  }, [dispatch])
 
   const setReplayProgress = useCallback((progress: number) => {
     dispatch({ type: "SET_REPLAY_PROGRESS", payload: progress })
-  }, [])
+  }, [dispatch])
 
   useLayoutEffect(() => {
     startDelayedPlaybackRef.current = initializeReplayScheduler

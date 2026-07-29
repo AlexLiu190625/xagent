@@ -1,4 +1,5 @@
 import React from "react"
+import { flushSync } from "react-dom"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -2329,6 +2330,136 @@ describe("AppProvider websocket message routing", () => {
     expect(screen.getByTestId("steps").textContent).toContain('"dependencies":["dependency-one"]')
     expect(screen.getByTestId("steps").textContent).toContain('"started_at":"2026-05-27T05:00:03Z"')
     expect(screen.getByTestId("steps").textContent).toContain('"completed_at":"2026-05-27T05:00:05Z"')
+  })
+
+  for (const strictMode of [false, true]) {
+    for (const order of ["ordinary-first", "session-first"] as const) {
+      it(`preserves ${order} actions in one batch${strictMode ? " under StrictMode" : ""}`, async () => {
+        const captured = { current: null as null | ReturnType<typeof useApp> }
+        function Capture() {
+          captured.current = useApp()
+          return <StateProbe />
+        }
+        const provider = (
+          <AppProvider token="token" transport={makeSessionTransport()}>
+            <Capture />
+          </AppProvider>
+        )
+        render(strictMode ? <React.StrictMode>{provider}</React.StrictMode> : provider)
+
+        const onMessage = webSocketOptions.current?.onMessage
+        const sessionTaskId = order === "ordinary-first"
+          ? (strictMode ? 104 : 103)
+          : (strictMode ? 106 : 105)
+        const ordinaryAction = {
+          type: "ADD_MESSAGE" as const,
+          payload: {
+            id: `${order}-${String(strictMode)}-ordinary`,
+            role: "assistant" as const,
+            content: "ordinary action",
+            timestamp: "2026-05-27T05:00:00Z",
+            status: "completed" as const,
+          },
+        }
+
+        act(() => {
+          if (order === "ordinary-first") {
+            captured.current?.dispatch(ordinaryAction)
+            onMessage?.(taskInfoMessage(sessionTaskId))
+            return
+          }
+          onMessage?.(taskInfoMessage(sessionTaskId))
+          captured.current?.dispatch(ordinaryAction)
+        })
+
+        await waitFor(() => {
+          expect(screen.getByTestId("messages").textContent).toContain("ordinary action")
+          expect(screen.getByTestId("task-id").textContent).toBe(String(sessionTaskId))
+        })
+      })
+    }
+  }
+
+  it("projects an effectful replay action once under StrictMode", () => {
+    const captured = { current: null as null | ReturnType<typeof useApp> }
+    const replayScheduler = { setPlaybackSpeed: vi.fn() }
+    function Capture() {
+      captured.current = useApp()
+      return null
+    }
+
+    render(
+      <React.StrictMode>
+        <AppProvider token="token">
+          <Capture />
+        </AppProvider>
+      </React.StrictMode>,
+    )
+
+    act(() => {
+      captured.current?.dispatch({
+        type: "SET_REPLAY_SCHEDULER",
+        payload: replayScheduler as never,
+      })
+      captured.current?.dispatch({ type: "SET_REPLAY_SPEED", payload: 2 })
+    })
+
+    expect(replayScheduler.setPlaybackSpeed).toHaveBeenCalledTimes(1)
+    expect(replayScheduler.setPlaybackSpeed).toHaveBeenCalledWith(2)
+    expect(captured.current?.state.replaySpeed).toBe(2)
+  })
+
+  it("keeps the projection head through a priority-split provider render", async () => {
+    const captured = { current: null as null | ReturnType<typeof useApp> }
+    let renderAtHigherPriority!: () => void
+    function Capture() {
+      captured.current = useApp()
+      return <StateProbe />
+    }
+    function PriorityHarness() {
+      const [revision, setRevision] = React.useState(0)
+      renderAtHigherPriority = () => setRevision(current => current + 1)
+      return (
+        <AppProvider token="token">
+          <div data-testid="priority-revision">{revision}</div>
+          <Capture />
+        </AppProvider>
+      )
+    }
+
+    render(<PriorityHarness />)
+
+    act(() => {
+      React.startTransition(() => {
+        captured.current?.dispatch({
+          type: "ADD_MESSAGE",
+          payload: {
+            id: "pending-low-priority",
+            role: "assistant",
+            content: "pending low priority",
+            timestamp: "2026-05-27T05:00:00Z",
+            status: "completed",
+          },
+        })
+      })
+      flushSync(renderAtHigherPriority)
+      captured.current?.dispatch({
+        type: "ADD_MESSAGE",
+        payload: {
+          id: "later-action",
+          role: "assistant",
+          content: "later action",
+          timestamp: "2026-05-27T05:00:01Z",
+          status: "completed",
+        },
+      })
+    })
+
+    await waitFor(() => {
+      expect(screen.getByTestId("priority-revision").textContent).toBe("1")
+      expect(screen.getByTestId("messages").textContent).toContain("pending low priority")
+      expect(screen.getByTestId("messages").textContent).toContain("later action")
+    })
   })
 
   it("keeps a reconnected Session bound when same-task task_info is replayed and accepts its newer follow-up state", async () => {
