@@ -203,7 +203,7 @@ export function useWidgetSession() {
     window.parent.postMessage({
       xagent: true,
       v: 1,
-      type: "session_open",
+      type: "session_connection_open",
       session_delivery_id: deliveryId,
     }, targetOrigin)
   }, [])

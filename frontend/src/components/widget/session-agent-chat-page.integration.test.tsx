@@ -246,6 +246,26 @@ describe("SessionAgentChatPage connection failure integration", () => {
     expect(MockWebSocket.constructionCount).toBe(1)
   })
 
+  it("echoes the exact delivery discriminator after the current socket opens", async () => {
+    const parentPostMessage = vi.spyOn(window, "postMessage")
+      .mockImplementation(() => {})
+
+    render(<SessionAgentChatPage />)
+    dispatchSession()
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    act(() => MockWebSocket.instances[0].open("xagent-session-v1"))
+
+    expect(parentPostMessage).toHaveBeenCalledWith(
+      {
+        xagent: true,
+        v: 1,
+        type: "session_connection_open",
+        session_delivery_id: "delivery-a",
+      },
+      PARENT_ORIGIN,
+    )
+  })
+
   it("renders an existing Session as unavailable after a degraded parent update", async () => {
     render(<SessionAgentChatPage />)
     dispatchSession()

@@ -77,8 +77,8 @@ describe("useWidgetSession", () => {
     act(() => result.current.handleConnectionOpen("widget-session:999"))
     act(() => result.current.handleConnectionOpen("widget-session:1"))
 
-    expect(postMessage.mock.calls.filter(([message]) => message?.type === "session_open")).toEqual([[
-      { xagent: true, v: 1, type: "session_open", session_delivery_id: "delivery-b" },
+    expect(postMessage.mock.calls.filter(([message]) => message?.type === "session_connection_open")).toEqual([[
+      { xagent: true, v: 1, type: "session_connection_open", session_delivery_id: "delivery-b" },
       PARENT_ORIGIN,
     ]])
   })

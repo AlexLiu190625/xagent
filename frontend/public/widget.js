@@ -480,12 +480,14 @@
         state.rapidRecoveries += 1;
       }
       var recovery = isNonBlankString(state.reconnectToken) ? reconnect() : exchange();
-      state.recoveryFlight = Promise.resolve(recovery).then(function () {
-        state.recoveryFlight = null;
+      var recoveryFlight;
+      recoveryFlight = Promise.resolve(recovery).then(function () {
+        if (state.recoveryFlight === recoveryFlight) state.recoveryFlight = null;
       }, function () {
-        state.recoveryFlight = null;
+        if (state.recoveryFlight === recoveryFlight) state.recoveryFlight = null;
       });
-      return state.recoveryFlight;
+      state.recoveryFlight = recoveryFlight;
+      return recoveryFlight;
     }
 
     function onDomMutation() {
@@ -539,6 +541,10 @@
       if (state.recoveryFlight === frozenRecoveryFlight) state.recoveryFlight = null;
       state.recoverableCode = null;
       if (state.session && !isStale(state.session.session_token_expires_at)) {
+        // A persisted restore reuses the token lineage but starts a new
+        // parent/iframe delivery epoch; the pagehide-invalidated ID cannot
+        // establish post-restore stability.
+        state.session.session_delivery_id = mintDeliveryId();
         flush();
         return;
       }
@@ -556,7 +562,7 @@
         flush();
       } else if (data.type === 'reconnect_request') {
         runRecoveryFlow();
-      } else if (data.type === 'session_open') {
+      } else if (data.type === 'session_connection_open') {
         if (!isNonBlankString(data.session_delivery_id)) return;
         beginStability(data.session_delivery_id);
       }

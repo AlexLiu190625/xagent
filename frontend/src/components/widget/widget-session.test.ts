@@ -466,39 +466,109 @@ describe("widget session mode", () => {
     const deliveryId = post.mock.calls[0][0].session_delivery_id
 
     await vi.advanceTimersByTimeAsync(14_999)
-    fromIframe("session_open", { session_delivery_id: deliveryId })
-    fromIframe("session_open", { session_delivery_id: deliveryId })
+    fromIframe("session_connection_open", { session_delivery_id: deliveryId })
+    fromIframe("session_connection_open", { session_delivery_id: deliveryId })
     await vi.advanceTimersByTimeAsync(14_999)
     fromIframe("reconnect_request", { reason: "ws_closed" })
     await vi.advanceTimersByTimeAsync(0)
     expect(fetchMock).toHaveBeenCalledTimes(2)
   })
 
-  it("ignores stale and malformed opens across bfcache after pagehide invalidates delivery", async () => {
+  it("mints a fresh delivery epoch for a healthy bfcache restore and resets only at 15 seconds", async () => {
     vi.useFakeTimers()
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
-      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_restore", reconnect_token: "rt_restore" })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second", reconnect_token: "rt_second" })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_third", reconnect_token: "rt_third" })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_fourth", reconnect_token: "rt_fourth" })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_fifth", reconnect_token: "rt_fifth" })))
     runWidget({ "data-encrypted-context": GRANT })
     const post = spyOnIframePostMessage()
     await vi.advanceTimersByTimeAsync(0)
     fromIframe("ready")
-    const oldId = post.mock.calls[0][0].session_delivery_id
-    fromIframe("session_open", { session_delivery_id: oldId })
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await vi.advanceTimersByTimeAsync(0)
+    const oldId = post.mock.calls.at(-1)?.[0].session_delivery_id
+    fromIframe("session_connection_open", { session_delivery_id: oldId })
     firePageHide(true)
     firePageShow(true)
     const newId = post.mock.calls.at(-1)?.[0].session_delivery_id
+    expect(newId).not.toBe(oldId)
 
     for (const session_delivery_id of [undefined, " ", 1, true, {}, []]) {
-      fromIframe("session_open", { session_delivery_id })
+      fromIframe("session_connection_open", { session_delivery_id })
     }
-    fromIframe("session_open", { session_delivery_id: oldId })
-    fromIframe("session_open", { session_delivery_id: newId })
-    await vi.advanceTimersByTimeAsync(15_000)
+    fromIframe("session_connection_open", { session_delivery_id: oldId })
+    fromIframe("session_connection_open", { session_delivery_id: newId })
+    await vi.advanceTimersByTimeAsync(14_999)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await vi.advanceTimersByTimeAsync(1)
+
+    for (let recovery = 0; recovery < 3; recovery += 1) {
+      fromIframe("reconnect_request", { reason: "ws_closed" })
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(recovery + 3))
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "network_unavailable" }),
+      HOST,
+    )
+  })
+
+  it("keeps the resumed recovery owner when the canceled wrapper settles before a duplicate signal", async () => {
+    vi.useFakeTimers()
+    let frozenSignal: AbortSignal | undefined
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_second",
+        reconnect_token: "rt_second",
+        session_token_expires_at: new Date(Date.now() + 61_000).toISOString(),
+      })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({
+        session_token: "st_third",
+        reconnect_token: "rt_third",
+        session_token_expires_at: new Date(Date.now() + 61_000).toISOString(),
+      })))
+      .mockImplementationOnce((_url: string, init: RequestInit) => {
+        frozenSignal = init.signal as AbortSignal
+        return new Promise<Response>((_resolve, reject) => {
+          frozenSignal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true })
+        })
+      })
+      .mockImplementationOnce(() => new Promise<Response>(() => undefined))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("ready")
+
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2))
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(3))
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(4))
+
+    await vi.advanceTimersByTimeAsync(2_000)
+    firePageHide(true)
+    firePageShow(true)
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(5))
+    await vi.advanceTimersByTimeAsync(0)
+    expect(frozenSignal?.aborted).toBe(true)
 
     fromIframe("reconnect_request", { reason: "ws_closed" })
     await vi.advanceTimersByTimeAsync(0)
-    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(post).not.toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal" }),
+      HOST,
+    )
   })
 
   it("ignores messages from a foreign origin, a foreign source, or a foreign shape", async () => {
