@@ -73,6 +73,12 @@ describe("files-disabled presentation", () => {
     )
   })
 
+  it("preserves ordinary colon ratios", () => {
+    expect(sanitizeFilesDisabledPresentationText("Render at 16:9 and compare 16/9 with 1/2.")).toBe(
+      "Render at 16:9 and compare 16/9 with 1/2.",
+    )
+  })
+
   it("preserves business routes while redacting local roots and file-like absolute paths", () => {
     expect(sanitizeFilesDisabledPresentationText([
       "Keep /v1/shifts, /v1/openapi.json, /care/shift/42, and /care/export.csv.",
@@ -259,11 +265,11 @@ describe("files-disabled presentation", () => {
 
   it("redacts known local roots after scheme-like prefixes", () => {
     expect(projectFilesDisabledPresentation({
-      files: [{ file_name: "report.pdf", output_dir: "/private/reports" }],
-      message: "Open urn:/private/reports/urn.txt and vscode:/private/reports/code.txt",
+      files: [{ file_name: "report.pdf", output_dir: "/custom/output" }],
+      message: "Open urn:/custom/output/nested/secret.txt and custom+tool:/custom/output/tool.txt",
     })).toEqual({
       files: [{ file_name: "report.pdf" }],
-      message: "Open urn:urn.txt and vscode:code.txt",
+      message: "Open urn:report.pdf and custom+tool:report.pdf",
     })
   })
 
