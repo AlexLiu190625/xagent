@@ -362,12 +362,35 @@ describe("api-wrapper auth refresh", () => {
     { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: "60", refresh_expires_in: 120 },
     { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 0, refresh_expires_in: 120 },
     { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 60, refresh_expires_in: -1 },
+    { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: Number.MAX_SAFE_INTEGER, refresh_expires_in: 120 },
   ])("rejects an incomplete or malformed refresh response without advancing cache lineage", async payload => {
     writeAuthCache(user, "old-access", "old-refresh", 120, 240)
     const before = localStorage.getItem(AUTH_CACHE_KEY)
     vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(payload), {
       status: 200, headers: { "Content-Type": "application/json" },
     }))
+
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ status: "invalid_response", accessToken: null })
+
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
+  })
+
+  it("classifies an expiry that becomes unsafe before commit as an invalid response", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    const before = localStorage.getItem(AUTH_CACHE_KEY)
+    const now = 1_000
+    const boundaryExpiry = Math.floor((Number.MAX_SAFE_INTEGER - now) / 1_000)
+    vi.spyOn(Date, "now")
+      .mockReturnValueOnce(now)
+      .mockReturnValueOnce(now)
+      .mockReturnValueOnce(now)
+      .mockReturnValueOnce(now)
+      .mockReturnValueOnce(now)
+      .mockReturnValue(now + 1_000)
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      success: true, access_token: "new-access", refresh_token: "new-refresh",
+      expires_in: boundaryExpiry, refresh_expires_in: 120,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }))
 
     await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ status: "invalid_response", accessToken: null })
 

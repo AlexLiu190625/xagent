@@ -150,13 +150,17 @@ function normalizeToken(value: unknown): string | null {
 }
 function normalizeExpiry(value: unknown): number | undefined | null {
   if (value === undefined) return undefined
-  return isStrictPositiveInteger(value) ? value : null
+  return isSafeAuthExpirySeconds(value) ? value : null
 }
 function deadlineFromSeconds(now: number, seconds: number | undefined): number | undefined | null {
   if (seconds === undefined) return undefined
   const milliseconds = seconds * 1000
   const deadline = now + milliseconds
   return Number.isFinite(milliseconds) && Number.isSafeInteger(deadline) && deadline > now ? deadline : null
+}
+/** Validates an expiry together with the absolute deadline auth storage will persist. */
+export function isSafeAuthExpirySeconds(value: unknown, now = Date.now()): value is number {
+  return isStrictPositiveInteger(value) && deadlineFromSeconds(now, value) !== null
 }
 function createSessionId(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") return crypto.randomUUID()
@@ -216,8 +220,7 @@ export function parseAuthTokenPayload(value: unknown): AuthTokenPayload | null {
   const refresh = data.refresh_token === undefined ? undefined : normalizeToken(data.refresh_token)
   const expiresIn = normalizeExpiry(data.expires_in)
   const refreshExpiresIn = normalizeExpiry(data.refresh_expires_in)
-  if (!user || !accessToken || refresh === null || expiresIn === null || refreshExpiresIn === null
-    || deadlineFromSeconds(Date.now(), expiresIn) === null || deadlineFromSeconds(Date.now(), refreshExpiresIn) === null) return null
+  if (!user || !accessToken || refresh === null || expiresIn === null || refreshExpiresIn === null) return null
   return { user, access_token: accessToken, refresh_token: refresh, expires_in: expiresIn, refresh_expires_in: refreshExpiresIn }
 }
 function parseRefreshCommitPayload(value: unknown): Omit<AuthTokenPayload, "user"> | null {
@@ -228,8 +231,7 @@ function parseRefreshCommitPayload(value: unknown): Omit<AuthTokenPayload, "user
   const refresh = normalizeToken(data.refresh_token)
   const expiresIn = normalizeExpiry(data.expires_in)
   const refreshExpiresIn = normalizeExpiry(data.refresh_expires_in)
-  if (!accessToken || !refresh || expiresIn === null || refreshExpiresIn === null
-    || deadlineFromSeconds(Date.now(), expiresIn) === null || deadlineFromSeconds(Date.now(), refreshExpiresIn) === null) return null
+  if (!accessToken || !refresh || expiresIn === null || refreshExpiresIn === null) return null
   return { access_token: accessToken, refresh_token: refresh, expires_in: expiresIn, refresh_expires_in: refreshExpiresIn }
 }
 function parseCanonical(raw: string): AuthCache | null {

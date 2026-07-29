@@ -8,6 +8,7 @@ import {
   compareAuthSession, compareCredentialSession,
   commitAuthSessionRefresh,
   getAuthStorageAvailability,
+  isSafeAuthExpirySeconds,
   readAuthSessionSnapshot,
 } from "@/lib/auth-cache"
 
@@ -72,7 +73,7 @@ function parseStrictRefreshResponse(value: unknown): StrictRefreshResponse | nul
   if (typeof value !== "object" || value === null) return null
   const payload = value as Partial<StrictRefreshResponse>
   const nonblank = (token: unknown): token is string => typeof token === "string" && token.trim().length > 0
-  const expiry = (seconds: unknown): seconds is number => typeof seconds === "number" && Number.isSafeInteger(seconds) && seconds > 0
+  const expiry = isSafeAuthExpirySeconds
   return payload.success === true && nonblank(payload.access_token) && nonblank(payload.refresh_token)
     && expiry(payload.expires_in) && expiry(payload.refresh_expires_in)
     ? payload as StrictRefreshResponse
@@ -110,6 +111,7 @@ async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRe
         } satisfies AuthRefreshResult
       }
       if (committed.status === "unavailable") return { status: "unavailable", accessToken: null, reason: committed.reason } satisfies AuthRefreshResult
+      if (committed.status === "invalid") return { status: "invalid_response", accessToken: null } satisfies AuthRefreshResult
       return { status: "not_current", accessToken: null } satisfies AuthRefreshResult
     } catch (error) {
       console.error("Token refresh failed:", error)
