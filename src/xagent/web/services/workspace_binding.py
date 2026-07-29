@@ -40,10 +40,11 @@ projection removes. That is a hard invariant rather than a best effort: an
 Actor subtree that cannot fold into the CA root fails the build instead of
 becoming an Actor-specific bind.
 
-Because that classification is lexical, every candidate is absolutized and
-symlink-resolved in the backend path domain first, and what a disagreement
-between the two views means depends on where the candidate came from --
-its :class:`_MountCandidate` provenance, see :func:`_fold_mount_paths`.
+Because that classification is lexical, every candidate is absolutized,
+canonicalized and symlink-resolved in the backend path domain first, and
+what a disagreement between the two views means depends on where the
+candidate came from -- its :class:`_MountCandidate` provenance, see
+:func:`_fold_mount_paths`.
 """
 
 from __future__ import annotations
@@ -134,7 +135,7 @@ def _build_external_allowlist(
 
     ``path`` entries keep chat's exact spelling and order -- this mirrors an
     Actor-logical allowlist that is pinned equivalent to chat's own by test.
-    Backend-domain absolutization belongs to :func:`_fold_mount_paths`, which
+    Backend-domain normalization belongs to :func:`_fold_mount_paths`, which
     is where these values stop being an allowlist and become mount
     candidates; the ``origin`` each one carries is what lets that folding
     tell the two trust levels apart.
@@ -149,6 +150,20 @@ def _build_external_allowlist(
         _MountCandidate(str(user_upload_dir), "scope"),
         *(_MountCandidate(str(d), "deployment") for d in get_external_upload_dirs()),
     )
+
+
+def _canonical_mount_path(path: str) -> str:
+    """One raw mount path in the identity domain the fold decides in.
+
+    Absolutizes in the backend domain (raw configuration may be relative or
+    ``~``-prefixed) and then canonicalizes, because the spelling that
+    survives folding does not reach the backend as typed:
+    ``SandboxMountIntent`` canonicalizes it. Folding on the pre-canonical
+    spelling would therefore decide coverage, symlink resolution and
+    authorization for a path other than the one actually mounted, and let
+    two spellings of one mount point produce two different intents.
+    """
+    return canonical_sandbox_path(str(absolute_backend_mount_path(path)))
 
 
 def _lexical_relation(root: str, path: str) -> str:
@@ -195,16 +210,11 @@ def _fold_mount_paths(
 ) -> tuple[str, tuple[str, ...]]:
     """Collapse a mount root and allowlist candidates into one physical set.
 
-    Root and candidate paths are first absolutized in the backend path
-    domain (``absolute_backend_mount_path``): they come from raw
-    configuration (``XAGENT_UPLOADS_DIR``, ``XAGENT_EXTERNAL_UPLOAD_DIRS``)
-    and may be relative or ``~``-prefixed, which the mount-path contract
-    rejects and which the pre-projection path mapper used to absolutize for
-    them. Absolutizing does not canonicalize: a ``..`` segment or a leading
-    ``//`` survives it, so a candidate's *identity* is
-    ``canonical_sandbox_path`` of its absolutized spelling -- the same owner
-    ``SandboxMountIntent`` uses for mount-path identity, so two spellings of
-    one mount point are one mount point here too.
+    Root and candidate paths first enter the identity domain the whole fold
+    decides in (:func:`_canonical_mount_path`), which is
+    ``SandboxMountIntent``'s own mount-path identity. Every step below --
+    coverage, symlink resolution, authorization, promotion, the returned
+    spelling -- therefore judges one mount point once, however it was typed.
 
     Then, repeatedly, each candidate is classified against the current root
     by :func:`_fold_relation`:
@@ -215,7 +225,7 @@ def _fold_mount_paths(
       candidate is promoted to root and the old root is dropped (it is now
       implied by the promoted one). Covering candidates are always a
       lexical chain -- all are prefixes of the same root, hence prefixes of
-      each other -- so promoting the widest one (shortest identity) is
+      each other -- so promoting the widest one (shortest path) is
       unambiguous and a single promotion reclassifies everything else
       against the new root.
     - anything left over is disjoint, and provenance decides its fate: a
@@ -237,22 +247,20 @@ def _fold_mount_paths(
     operator who names a mount point takes responsibility for it whatever a
     scope also derives, but only for the mount point actually named -- a
     symlink *alias* of it is a different bind point and does not authorize
-    its target.
+    its target. Canonicalization is lexical and keeps that distinction: it
+    folds redundant spellings of one path together, it does not follow the
+    symlink that makes an alias a path of its own.
 
     Returns the final root and the surviving candidates in candidate order,
-    each in its absolutized (never symlink-resolved) spelling;
-    ``SandboxMountIntent`` owns their canonicalization, deduplication and
-    ordering, so two spellings of one surviving mount point collapse there.
+    each canonical and never symlink-resolved -- the spelling the guest
+    mount point keeps. ``SandboxMountIntent`` still owns their deduplication
+    and ordering.
     """
-    root = str(absolute_backend_mount_path(mount_root))
+    root = _canonical_mount_path(mount_root)
     remaining = tuple(
-        _MountCandidate(str(absolute_backend_mount_path(c.path)), c.origin)
-        for c in candidates
+        _MountCandidate(_canonical_mount_path(c.path), c.origin) for c in candidates
     )
-    identity = {c.path: canonical_sandbox_path(c.path) for c in remaining}
-    deployment_identities = {
-        identity[c.path] for c in remaining if c.origin == "deployment"
-    }
+    deployment_identities = {c.path for c in remaining if c.origin == "deployment"}
     resolved = {c.path: resolve_backend_mount_path(c.path) for c in remaining}
     resolved_root = resolve_backend_mount_path(root)
 
@@ -269,7 +277,7 @@ def _fold_mount_paths(
             for candidate, verdict in verdicts:
                 if (
                     verdict == "disjoint"
-                    and identity[candidate.path] not in deployment_identities
+                    and candidate.path not in deployment_identities
                 ):
                     raise SandboxMountEscapeError(
                         f"Workspace path {candidate.path!r} (resolving to "
@@ -281,7 +289,7 @@ def _fold_mount_paths(
             return root, tuple(
                 c.path for c, verdict in verdicts if verdict != "covered"
             )
-        new_root = min(covering, key=lambda c: len(identity[c.path]))
+        new_root = min(covering, key=lambda c: len(c.path))
         remaining = tuple(c for c in remaining if c.path != new_root.path)
         root, resolved_root = new_root.path, resolved[new_root.path]
 

@@ -30,6 +30,7 @@ import xagent.web.services.workspace_binding as workspace_binding
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.workspace import scoped_user_root
 from xagent.sandbox import SandboxContractError, SandboxMountEscapeError
+from xagent.web.sandbox_manager import SandboxManager
 from xagent.web.services.workspace_binding import (
     ChatWorkspaceBinding,
     build_chat_workspace_binding,
@@ -100,6 +101,13 @@ def _new_physical_paths(binding: ChatWorkspaceBinding) -> set[str]:
     intent = binding.mount_intent
     assert intent.mount_root is not None
     return {intent.mount_root} | set(intent.extra_mounts)
+
+
+def _spec_mount_paths(binding: ChatWorkspaceBinding) -> list[tuple[Path, bool]]:
+    """The mount list this binding's intent puts in the runtime spec."""
+    return SandboxManager._workspace_mount_paths(
+        "user", str(OWNER_ID), binding.mount_intent
+    )
 
 
 class TestUnscopedRow:
@@ -373,7 +381,9 @@ class TestDeploymentAuthorizationIdentityDomain:
     intent divergence this module exists to prevent.
 
     Parametrized over spellings rather than asserted once: the verdict for
-    one mount point must not depend on how it was typed.
+    one mount point must not depend on how it was typed. Only spellings that
+    survive ``Path`` are listed -- a trailing slash, a doubled inner slash or
+    a ``.`` segment is already gone before production code sees the value.
     """
 
     def _ca_scope(self, actor: str) -> ExecutionScope:
@@ -404,9 +414,6 @@ class TestDeploymentAuthorizationIdentityDomain:
         "spelling",
         [
             "{ca}/actor7",
-            "{ca}/actor7/",
-            "{ca}//actor7",
-            "{ca}/./actor7",
             "{ca}/nonexistent/../actor7",
             "/{ca}/actor7",
         ],
@@ -469,6 +476,51 @@ class TestDeploymentAuthorizationIdentityDomain:
 
         assert binding.mount_intent.mount_root == str(user_root)
         assert binding.mount_intent.extra_mounts == ()
+
+    def test_ancestor_spelled_through_a_symlink_and_dotdot_folds_identically(
+        self, _uploads_dir, tmp_path, monkeypatch
+    ):
+        """The two normalizations must not disagree on one mount point.
+
+        ``..`` after a symlink is where lexical and resolved normalization
+        part ways: ``<root>/link/..`` is lexically ``<root>``, while resolving
+        the raw spelling lands wherever ``link`` points. Folding has to judge
+        the path that will actually be mounted -- the canonical one -- so
+        this spelling of an ancestor must absorb the mount root exactly as
+        the plain spelling does, down to the runtime spec's mount list. Both
+        directions matter: it is the covering side here, and the same domain
+        split decides the escape rejection above.
+        """
+        # Nested one level down, so that resolving ``link/..`` lands on a
+        # directory that is not an ancestor of the mount root either -- the
+        # resolved view then contradicts the lexical one instead of agreeing
+        # with it by accident.
+        outside = tmp_path.parent / f"{tmp_path.name}-outside-root" / "nested"
+        outside.mkdir(parents=True)
+        user_root = scoped_user_root(_uploads_dir, OWNER_ID, ())
+        user_root.mkdir(parents=True)
+        (user_root / "link").symlink_to(outside, target_is_directory=True)
+        scope = ExecutionScope(
+            sandbox_key_suffix="s",
+            workspace_segments=("proj",),
+            isolate_external_dirs=True,
+        )
+
+        def build(spelling: str) -> ChatWorkspaceBinding:
+            monkeypatch.setattr(
+                workspace_binding,
+                "get_external_upload_dirs",
+                lambda: [Path(spelling)],
+            )
+            return build_chat_workspace_binding(OWNER_ID, scope)
+
+        aliased = build(f"{user_root}/link/..")
+        plain = build(str(user_root))
+
+        assert aliased.mount_intent == plain.mount_intent
+        assert aliased.mount_intent.mount_root == str(user_root)
+        assert aliased.mount_intent.extra_mounts == ()
+        assert _spec_mount_paths(aliased) == _spec_mount_paths(plain)
 
 
 class TestInternalScopedRow:
@@ -666,13 +718,13 @@ class TestExternalDirBoundary:
 
 
 class TestBackendPathDomain:
-    """Folding candidates are absolutized, and symlink-checked, first.
+    """Folding candidates are normalized, and symlink-checked, first.
 
     ``SandboxMountIntent`` compares paths lexically and rejects relative
     ones outright, so the builder owns both halves of that precondition:
-    raw configuration spellings become absolute backend-domain paths, and a
-    candidate whose lexical position disagrees with where it actually
-    resolves is never folded away.
+    raw configuration spellings become absolute, canonical backend-domain
+    paths, and a candidate whose lexical position disagrees with where it
+    actually resolves is never folded away.
     """
 
     def test_relative_external_dir_is_absolutized(
