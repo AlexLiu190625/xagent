@@ -251,7 +251,6 @@ _COMMAND_VALUE_OPTIONS = {
     "head": frozenset({"-c", "--bytes", "-n", "--lines"}),
     "tail": frozenset({"-c", "--bytes", "-n", "--lines"}),
     "tac": frozenset({"-s", "--separator"}),
-    "truncate": frozenset({"-s", "--size"}),
 }
 _BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
 _BASH_LONG_FLAG_OPTIONS = {
@@ -631,7 +630,18 @@ class _CommandWrapperGrammar:
 
 @dataclass(frozen=True)
 class _ScriptCommandGrammar:
-    """`sed`/`awk` argv shape: script source options plus file operands."""
+    """`sed`/`awk` argv shape: script source options plus file operands.
+
+    `value_options` holds long option names (`--...`) that take a mandatory
+    scalar (non-path) value, such as sed's `--line-length`; the matching
+    short spelling, if any, belongs in `short_value_options` instead.
+    `optional_write_options` holds awk's gawk-style `-o`/`--pretty-print`,
+    `-p`/`--profile`, `-d`/`--dump-variables` options, keyed by BOTH the
+    short (`-x`) and long (`--xxx`) spelling, mapped to the fixed filename
+    gawk uses when no explicit argument is given; unlike `value_options`,
+    these never consume a separate token (GNU optional-argument
+    convention: the value, if given, must be attached).
+    """
 
     language: Literal["sed", "awk"]
     expression_long_option: str
@@ -641,6 +651,7 @@ class _ScriptCommandGrammar:
     short_value_options: frozenset[str] = frozenset()
     in_place_short_option: str | None = None
     in_place_long_option: str | None = None
+    optional_write_options: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -757,13 +768,13 @@ _COMMAND_WRAPPER_GRAMMARS = {
 
 # `-l`/`--line-length` (sed) and `-F`/`-v` (awk) take a scalar value that is
 # never a path, so they are skipped rather than routed through the file-
-# operand check. sed's short options additionally bundle (e.g. `-ne`,
-# `-i.bak`), which `awk` does not, so `short_flag_options` stays empty for awk
-# and its `-e`/`-f` are only ever standalone or attached without bundling.
+# operand check. Both families bundle short options (e.g. sed's `-ne`,
+# `-i.bak`; awk's `-Fx`, gawk's `-o[file]`), so both list at least one
+# `short_value_options`/`optional_write_options` entry.
 _SED_GRAMMAR = _ScriptCommandGrammar(
     language="sed",
     expression_long_option="--expression",
-    value_options=frozenset({"-l", "--line-length"}),
+    value_options=frozenset({"--line-length"}),
     short_flag_options=frozenset({"E", "n", "r", "s", "u", "z"}),
     short_value_options=frozenset({"l"}),
     in_place_short_option="i",
@@ -772,8 +783,19 @@ _SED_GRAMMAR = _ScriptCommandGrammar(
 _AWK_GRAMMAR = _ScriptCommandGrammar(
     language="awk",
     expression_long_option="--source",
-    value_options=frozenset({"-F", "-v"}),
+    short_value_options=frozenset({"F", "v"}),
     ignores_assignment_arguments=True,
+    # gawk's optional-argument write options: the value, if present, is
+    # always attached (never a separate token); the default is the fixed
+    # filename gawk itself writes when no argument is given.
+    optional_write_options={
+        "-o": "awkprof.out",
+        "--pretty-print": "awkprof.out",
+        "-p": "awkprof.out",
+        "--profile": "awkprof.out",
+        "-d": "awkvars.out",
+        "--dump-variables": "awkvars.out",
+    },
 )
 # `system(...)` always executes an arbitrary shell command; `print`/`printf`
 # redirection and `getline` I/O are located structurally instead (see
@@ -784,34 +806,48 @@ _AWK_PRINT_PATTERN = re.compile(r"\b(?:print|printf)\b")
 _AWK_GETLINE_PATTERN = re.compile(r"\bgetline\b")
 _AWK_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
+# Commands routed to a dedicated per-family handler in
+# `_validate_command_values` (own a slot — write/read split, target-directory,
+# every-operand-write-sensitivity, script-source parsing, ... — a flat
+# read/write classification cannot express). This is the single source of
+# truth for that dispatch set: `_CLASSIFIED_EXECUTABLE_COMMANDS` below and the
+# test suite's coverage registry both derive from it, so a command dispatched
+# here without a matching test entry fails the coverage gate instead of
+# silently going untested.
+_DEDICATED_HANDLER_COMMANDS = frozenset(
+    {
+        "sort",
+        "uniq",
+        "diff",
+        "grep",
+        "cp",
+        "install",
+        "mv",
+        "ln",
+        "unlink",
+        "shred",
+        "find",
+        "tar",
+        "sed",
+        "awk",
+        "dd",
+        "base64",
+        "gzip",
+        "rsync",
+        "curl",
+        "wget",
+    }
+)
+
 _CLASSIFIED_EXECUTABLE_COMMANDS = {
     *_READ_COMMANDS,
     *_WRITE_COMMANDS,
     *_SHELL_COMMANDS,
     *_UNSUPPORTED_SHELL_COMMANDS,
     *_UNSUPPORTED_PRIVILEGE_COMMANDS,
+    *_DEDICATED_HANDLER_COMMANDS,
     "chroot",
     "xargs",
-    "sort",
-    "uniq",
-    "diff",
-    "grep",
-    "cp",
-    "install",
-    "mv",
-    "ln",
-    "sed",
-    "awk",
-    "unlink",
-    "shred",
-    "find",
-    "tar",
-    "dd",
-    "base64",
-    "gzip",
-    "rsync",
-    "curl",
-    "wget",
     *(
         name
         for name in _COMMAND_WRAPPER_GRAMMARS
@@ -882,6 +918,24 @@ _SORT_KNOWN_LONG_OPTIONS = frozenset(
     }
 )
 
+# `grep`'s short options bundle into one token (e.g. `-if file` combines the
+# `-i` flag with the `-f` pattern-file option), so its grammar is split into a
+# flag set (no value) and a value set (one following/attached argument, with
+# a read/scalar access) for the short-option-cluster parser, the same shape
+# `sort` uses. `-e`/`-f` also carry the (never-a-path) pattern text/pattern
+# file, so they are not paths themselves in this map; only `-f`'s argument is.
+_GREP_SHORT_FLAG_OPTIONS = frozenset("EFGPivwxcLloqsaIHhnTZzrRVb")
+_GREP_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
+    "e": None,
+    "f": "read",
+    "m": None,
+    "A": None,
+    "B": None,
+    "C": None,
+    "D": None,
+    "d": None,
+}
+
 
 @dataclass(frozen=True)
 class _PathEvent:
@@ -943,6 +997,8 @@ _TarEventKind = Literal[
     "positional",
     "dangerous",
     "absolute_names",
+    "verbose_output",
+    "unresolved_option",
 ]
 
 
@@ -1722,9 +1778,12 @@ class WorkspaceCommandPathGuard:
 
         `uniq [OPTION]... [INPUT [OUTPUT]]`: the first operand is the input
         (read), the second, if present, is the output (write). Its own
-        options only take scalar (non-path) values, so an unrecognized
-        `--`-option must still fail closed rather than silently shift the
-        positional write slot.
+        value-bearing options only take scalar (non-path) values, and its
+        no-value long options (`--count`, `--repeated`, `--all-repeated`,
+        `--ignore-case`, `--unique`, `--zero-terminated`, `--group`) never
+        consume an argument, so listing them separately keeps an
+        unrecognized `--`-option failing closed rather than silently
+        shifting the positional write slot.
         """
         scalar_options = frozenset(
             {"-f", "--skip-fields", "-s", "--skip-chars", "-w", "--check-chars"}
@@ -1734,6 +1793,17 @@ class WorkspaceCommandPathGuard:
             cwd,
             option_access=dict.fromkeys(scalar_options),
             attached_short_options=frozenset({"-f", "-s", "-w"}),
+            flag_long_options=frozenset(
+                {
+                    "--count",
+                    "--repeated",
+                    "--all-repeated",
+                    "--ignore-case",
+                    "--unique",
+                    "--zero-terminated",
+                    "--group",
+                }
+            ),
             fail_closed_on_unknown_long_option=True,
         )
         if operands:
@@ -1744,9 +1814,12 @@ class WorkspaceCommandPathGuard:
     def _check_diff(self, values: Sequence[str], cwd: Path) -> None:
         """Classify `diff`'s write (`--output`) and read-control options.
 
-        `-N`/`--new-file` takes no argument, so it is unaffected by the
-        write-slot fail-closed rule below (which only gates `--`-prefixed
-        options that would otherwise consume an argument silently).
+        `-N`/`--new-file` and diff's other common no-value long options
+        (`--brief`, `--unified`, `--recursive`, `--ignore-case`, `--color`,
+        `--side-by-side`) never consume an argument, so listing them
+        separately keeps the write-slot fail-closed rule below (which only
+        gates `--`-prefixed options that would otherwise consume an
+        argument silently) from rejecting ordinary read-only usage.
         """
         for raw_path in self._partition_path_options(
             values,
@@ -1756,6 +1829,17 @@ class WorkspaceCommandPathGuard:
                 "--from-file": "read",
                 "--to-file": "read",
             },
+            flag_long_options=frozenset(
+                {
+                    "--brief",
+                    "--unified",
+                    "--recursive",
+                    "--ignore-case",
+                    "--color",
+                    "--side-by-side",
+                    "--new-file",
+                }
+            ),
             fail_closed_on_unknown_long_option=True,
         ):
             self._check_path(raw_path, cwd, "read")
@@ -1810,8 +1894,27 @@ class WorkspaceCommandPathGuard:
                 )
                 index += 1
                 continue
-            if value_text.startswith("-") and value_text != "-":
+            if value_text.startswith("--"):
+                # Long flag options this family does not model (e.g.
+                # `--color=auto`) carry no path, so they are skipped rather
+                # than parsed further.
                 index += 1
+                continue
+            if value_text.startswith("-") and value_text != "-":
+                # A bundled short-option cluster (e.g. `-if`, `-vf`, `-nf`):
+                # only the trailing character may carry a value, so `-f`'s
+                # pattern-file argument is still read-checked even when it is
+                # not the leading flag in the token.
+                cluster_chars = value_text[1:]
+                if "e" in cluster_chars or "f" in cluster_chars:
+                    explicit_pattern = True
+                index = self._parse_short_option_cluster(
+                    values,
+                    index,
+                    cwd,
+                    flag_options=_GREP_SHORT_FLAG_OPTIONS,
+                    value_options=_GREP_SHORT_VALUE_OPTIONS,
+                )
                 continue
             positionals.append(value)
             index += 1
@@ -1832,8 +1935,11 @@ class WorkspaceCommandPathGuard:
         argument are not paths, so that leading operand is excluded from the
         write check. `--reference=RFILE` supplies the same role from a file
         instead (itself a read path, classified through the access-map
-        substrate), so no positional is excluded when it is present. Every
-        other write command in this family has no non-path positional.
+        substrate), so no positional is excluded when it is present.
+        `touch`/`truncate` own their own `-r`/`--reference` read slot (the
+        reference file's timestamps/size are read, never written) plus, for
+        `truncate`, the `-s`/`--size` scalar; every other write command in
+        this family has no non-path positional.
         """
         if command_name in _OWNERSHIP_MODE_COMMANDS:
             operands = self._partition_path_options(
@@ -1847,6 +1953,24 @@ class WorkspaceCommandPathGuard:
             )
             if not has_reference and operands:
                 operands = operands[1:]
+            for raw_path in operands:
+                self._check_path(raw_path, cwd, "write")
+            return
+        if command_name in {"touch", "truncate"}:
+            option_access: dict[str, PathAccess | None] = {
+                "-r": "read",
+                "--reference": "read",
+            }
+            attached_short_options = {"-r"}
+            if command_name == "truncate":
+                option_access.update({"-s": None, "--size": None})
+                attached_short_options.add("-s")
+            operands = self._partition_path_options(
+                values,
+                cwd,
+                option_access=option_access,
+                attached_short_options=frozenset(attached_short_options),
+            )
             for raw_path in operands:
                 self._check_path(raw_path, cwd, "write")
             return
@@ -2038,6 +2162,18 @@ class WorkspaceCommandPathGuard:
                 continue
             if text in flag_options:
                 index += 1
+                continue
+            if not text.startswith("--"):
+                # A bundled cluster (e.g. `-Dm755`): only the trailing
+                # value-taking character may carry an attached argument, so
+                # this shares the same GNU bundling contract as `sort`.
+                index = self._parse_short_option_cluster(
+                    values,
+                    index,
+                    cwd,
+                    flag_options=frozenset("bcCDpsTv"),
+                    value_options={"g": None, "m": None, "o": None, "S": None},
+                )
                 continue
             raise CommandPolicyViolation(f"cannot safely inspect install option {text}")
 
@@ -2335,6 +2471,12 @@ class WorkspaceCommandPathGuard:
                         "tar absolute extraction paths cannot be inspected safely"
                     )
                 continue
+            if event.kind == "unresolved_option":
+                if invocation.mode in {"extract", "list"}:
+                    raise CommandPolicyViolation(
+                        f"cannot safely resolve tar option {event.value}"
+                    )
+                continue
             if event.value is None:
                 continue
 
@@ -2355,6 +2497,10 @@ class WorkspaceCommandPathGuard:
             elif event.kind == "incremental":
                 # The snapshot file can be updated even when the archive
                 # itself is only read (e.g. listing against a snapshot).
+                self._check_path(event.value, cwd, "write")
+            elif event.kind == "verbose_output":
+                # `--index-file` always writes the verbose listing, even
+                # when the archive itself is only read (e.g. `--list`).
                 self._check_path(event.value, cwd, "write")
             elif event.kind == "add_file":
                 self._check_path(event.value, active_cwd, source_access)
@@ -2487,6 +2633,21 @@ class WorkspaceCommandPathGuard:
         values: Sequence[str],
         index: int,
     ) -> tuple[int, _TarEvent | None]:
+        """Parse one `--`-prefixed tar argument into a typed event.
+
+        An unrecognized long option with an attached `=value` unambiguously
+        carries a value this family does not model, and fails closed
+        immediately regardless of mode (mirroring `rsync`/`curl`/`wget`).
+        An unrecognized option with NO attached value is ambiguous: it may
+        be a bare flag (common; e.g. `--gzip`), or it may take a separate
+        following token this parser cannot identify as its argument, which
+        would otherwise be misclassified as an unchecked archive-member
+        positional in extract/list mode (that value is never path-checked
+        there). Rather than guess its arity, it is returned as an
+        `unresolved_option` event so `_check_tar` can fail closed in
+        extract/list mode specifically, where that ambiguity is exploitable,
+        while leaving other modes' (already-checked) positionals unaffected.
+        """
         value = values[index]
         text = str(value)
         path_options: dict[str, _TarEventKind] = {
@@ -2496,6 +2657,7 @@ class WorkspaceCommandPathGuard:
             "--exclude-from": "exclude_from",
             "--listed-incremental": "incremental",
             "--add-file": "add_file",
+            "--index-file": "verbose_output",
         }
         dangerous_options = {
             "--use-compress-program",
@@ -2509,7 +2671,11 @@ class WorkspaceCommandPathGuard:
         kind = path_options.get(option)
         is_dangerous = option in dangerous_options
         if kind is None and not is_dangerous:
-            return index + 1, None
+            if separator:
+                raise CommandPolicyViolation(
+                    f"cannot safely resolve tar option {option}"
+                )
+            return index + 1, _TarEvent("unresolved_option", option)
 
         argument, next_index = self._take_option_argument(
             values,
@@ -2682,13 +2848,19 @@ class WorkspaceCommandPathGuard:
         *,
         option_access: Mapping[str, PathAccess | None],
         attached_short_options: frozenset[str] = frozenset(),
+        flag_long_options: frozenset[str] = frozenset(),
         fail_closed_on_unknown_long_option: bool = False,
     ) -> list[str]:
         """Split path-bearing options from operands using a per-option access map.
 
         Each key in `option_access` consumes exactly one following or attached
         token; a `None` access consumes it without a path check (a scalar
-        value), `"read"`/`"write"` checks it. Long options resolve through
+        value), `"read"`/`"write"` checks it. `flag_long_options` is a
+        separate set of long options that never take an argument (bare, or
+        with an optional attached `=value` this family ignores); listing a
+        long option there instead of in `option_access` is required for any
+        option that owns no value slot, since `option_access` always consumes
+        a following/attached token. Long options resolve through
         `_resolve_long_option` first, so an accepted abbreviation (`--out=`
         for `--output`) is classified identically to the full name. A family
         that owns a write slot must set `fail_closed_on_unknown_long_option`
@@ -2698,8 +2870,9 @@ class WorkspaceCommandPathGuard:
         left in place as an ordinary (over-checked, never under-checked)
         operand, matching the family's existing single-access classification.
         """
-        known_long_options = frozenset(
-            option for option in option_access if option.startswith("--")
+        known_long_options = (
+            frozenset(option for option in option_access if option.startswith("--"))
+            | flag_long_options
         )
         remaining: list[str] = []
         options_done = False
@@ -2727,12 +2900,19 @@ class WorkspaceCommandPathGuard:
             if value_text.startswith("--"):
                 raw_option, separator, _ = value_text.partition("=")
                 resolved = raw_option
-                if resolved not in option_access and known_long_options:
+                if (
+                    resolved not in option_access
+                    and resolved not in flag_long_options
+                    and known_long_options
+                ):
                     candidate = self._resolve_long_option(
                         raw_option, known_long_options
                     )
                     if candidate is not None:
                         resolved = candidate
+                if resolved in flag_long_options:
+                    index += 1
+                    continue
                 if resolved in option_access:
                     access = option_access[resolved]
                     argument: str
@@ -2836,11 +3016,33 @@ class WorkspaceCommandPathGuard:
         `_read_policy_script` (M4: the same `unknown_effect` gate, non-regular-
         file rejection, and bounded read every other script read uses) before
         the same lexer, rather than a parallel copy. sed's `-i`/`--in-place`
-        switches the remaining file operands from read to write.
+        switches the remaining file operands from read to write. Long options
+        resolve through `_resolve_long_option` (GNU unambiguous-prefix
+        abbreviation, e.g. `--expr=` for `--expression`); an option this
+        family does not recognize fails closed instead of being silently
+        skipped, since a write-owning spelling (`--file`, `--in-place`, awk's
+        `--pretty-print`/`--profile`/`--dump-variables`) could otherwise hide
+        behind an unrecognized abbreviation or typo. Single-dash tokens are
+        always parsed as a short-option cluster (`_consume_script_short_options`),
+        which fails closed the same way for an unmodeled short option.
         """
         positionals: list[str] = []
         explicit_script = False
         file_access: PathAccess = "read"
+        known_long_options = frozenset(
+            {"--file", grammar.expression_long_option}
+            | {option for option in grammar.value_options if option.startswith("--")}
+            | (
+                {grammar.in_place_long_option}
+                if grammar.in_place_long_option is not None
+                else set()
+            )
+            | {
+                option
+                for option in grammar.optional_write_options
+                if option.startswith("--")
+            }
+        )
         index = 0
         while index < len(values):
             value = values[index]
@@ -2848,66 +3050,70 @@ class WorkspaceCommandPathGuard:
                 positionals.extend(values[index + 1 :])
                 break
             value_text = str(value)
-            if value_text in {"-f", "--file"}:
-                explicit_script = True
-                if index + 1 < len(values):
-                    self._inspect_script_file(grammar.language, values[index + 1], cwd)
-                index += 2
-                continue
-            if value_text.startswith("--file="):
-                explicit_script = True
-                self._inspect_script_file(
-                    grammar.language,
-                    self._derived_value(value, value_text[len("--file=") :]),
-                    cwd,
-                )
-                index += 1
-                continue
-            if value_text.startswith("-f") and not value_text.startswith("--f"):
-                explicit_script = True
-                self._inspect_script_file(
-                    grammar.language, self._derived_value(value, value_text[2:]), cwd
-                )
-                index += 1
-                continue
-            if value_text in {"-e", grammar.expression_long_option}:
-                explicit_script = True
-                if index + 1 < len(values):
-                    self._check_script_expression(
-                        grammar.language, values[index + 1], cwd
+            if value_text.startswith("--") and value_text != "--":
+                raw_option, separator, attached = value_text.partition("=")
+                resolved = self._resolve_long_option(raw_option, known_long_options)
+                if resolved is None:
+                    raise CommandPolicyViolation(
+                        f"cannot safely inspect {grammar.language} option {raw_option}"
                     )
-                index += 2
-                continue
-            if value_text.startswith(f"{grammar.expression_long_option}="):
-                explicit_script = True
-                self._check_script_expression(
-                    grammar.language,
-                    self._derived_value(
-                        value,
-                        value_text[len(grammar.expression_long_option) + 1 :],
+                if resolved == "--file":
+                    explicit_script = True
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"{grammar.language} argument for {resolved}",
+                    )
+                    assert argument is not None
+                    self._inspect_script_file(grammar.language, argument, cwd)
+                    continue
+                if resolved == grammar.expression_long_option:
+                    explicit_script = True
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"{grammar.language} argument for {resolved}",
+                    )
+                    assert argument is not None
+                    self._check_script_expression(grammar.language, argument, cwd)
+                    continue
+                if resolved == grammar.in_place_long_option:
+                    file_access = "write"
+                    index += 1
+                    continue
+                if resolved in grammar.optional_write_options:
+                    argument = (
+                        self._derived_value(value, attached)
+                        if separator
+                        else _CommandValue(grammar.optional_write_options[resolved])
+                    )
+                    self._check_path(argument, cwd, "write")
+                    index += 1
+                    continue
+                # The remaining known long options are mandatory scalar
+                # values (e.g. sed's `--line-length`), never a path.
+                _, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached) if separator else None
                     ),
-                    cwd,
+                    context=f"{grammar.language} argument for {resolved}",
                 )
-                index += 1
-                continue
-            if value_text.startswith("-e") and not value_text.startswith("--"):
-                explicit_script = True
-                self._check_script_expression(
-                    grammar.language, self._derived_value(value, value_text[2:]), cwd
-                )
-                index += 1
-                continue
-            if grammar.in_place_long_option is not None and (
-                value_text == grammar.in_place_long_option
-                or value_text.startswith(f"{grammar.in_place_long_option}=")
-            ):
-                file_access = "write"
-                index += 1
                 continue
             if (
-                grammar.short_flag_options
+                (
+                    grammar.short_flag_options
+                    or grammar.short_value_options
+                    or grammar.optional_write_options
+                )
                 and value_text.startswith("-")
-                and not value_text.startswith("--")
                 and value_text != "-"
             ):
                 option_result = self._consume_script_short_options(
@@ -2918,12 +3124,10 @@ class WorkspaceCommandPathGuard:
                     file_access = "write"
                 index = option_result.next_index
                 continue
-            if value_text in grammar.value_options:
-                index += 2
-                continue
             if value_text.startswith("-") and value_text != "-":
-                index += 1
-                continue
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect {grammar.language} option {value_text}"
+                )
             if not grammar.ignores_assignment_arguments or "=" not in value_text:
                 positionals.append(value)
             index += 1
@@ -2983,6 +3187,19 @@ class WorkspaceCommandPathGuard:
                     next_index=next_index,
                     explicit_script=option in {"e", "f"},
                 )
+            if f"-{option}" in grammar.optional_write_options:
+                # gawk's optional-argument convention: an attached value is
+                # this option's argument, but a separate following token
+                # never is (unlike `-e`/`-f` above), so nothing beyond this
+                # token is ever consumed.
+                attached_text = token_text[cursor + 1 :]
+                argument = (
+                    self._derived_value(token, attached_text)
+                    if attached_text
+                    else _CommandValue(grammar.optional_write_options[f"-{option}"])
+                )
+                self._check_path(argument, cwd, "write")
+                return _ScriptShortOptionResult(next_index=index + 1)
             raise CommandPolicyViolation(
                 f"cannot safely inspect {grammar.language} option -{option}"
             )
@@ -3338,6 +3555,15 @@ class WorkspaceCommandPathGuard:
             index += 1
 
     def _scan_awk_getline_io(self, script: str, cwd: Path) -> None:
+        """Path-check `getline`'s `< FILE` source past any receiving target.
+
+        `getline` may fill a plain identifier, a field reference (`$0`,
+        `$1`, a dynamic `$(expr)`), or an array element (`arr[i]`) before
+        the optional `< FILE` clause; `_skip_awk_getline_target` advances
+        past whichever form is present so the `<` is still found instead of
+        the read check being silently skipped when the target is not a bare
+        identifier.
+        """
         for match in _AWK_GETLINE_PATTERN.finditer(script):
             prefix = script[: match.start()].rstrip()
             if prefix.endswith("|"):
@@ -3348,14 +3574,93 @@ class WorkspaceCommandPathGuard:
             cursor = match.end()
             while cursor < len(script) and script[cursor] in " \t":
                 cursor += 1
-            identifier = _AWK_IDENTIFIER_PATTERN.match(script, cursor)
-            if identifier is not None:
-                cursor = identifier.end()
-                while cursor < len(script) and script[cursor] in " \t":
-                    cursor += 1
+            cursor = self._skip_awk_getline_target(script, cursor)
+            while cursor < len(script) and script[cursor] in " \t":
+                cursor += 1
             if cursor < len(script) and script[cursor] == "<":
                 target = self._scan_awk_redirect_target(script, cursor + 1)
                 self._check_path(target, cwd, "read")
+
+    def _skip_awk_getline_target(self, script: str, cursor: int) -> int:
+        """Advance past a `getline` receiving target, if one is present.
+
+        Recognizes a plain identifier (optionally subscripted, `arr[i]`), a
+        field reference (`$0`, `$NF`, or a parenthesized `$(expr)`), or a
+        parenthesized expression; a bare `getline` (no target) or any other
+        following syntax is left untouched, so the caller still finds an
+        immediately following `< FILE`.
+        """
+        if cursor >= len(script):
+            return cursor
+        character = script[cursor]
+        if character == "$":
+            cursor += 1
+            if cursor < len(script) and script[cursor].isdigit():
+                while cursor < len(script) and script[cursor].isdigit():
+                    cursor += 1
+                return self._skip_awk_getline_subscript(script, cursor)
+            identifier = _AWK_IDENTIFIER_PATTERN.match(script, cursor)
+            if identifier is not None:
+                return self._skip_awk_getline_subscript(script, identifier.end())
+            if cursor < len(script) and script[cursor] == "(":
+                return self._skip_awk_balanced(script, cursor, "(", ")")
+            raise CommandPolicyViolation(
+                "cannot safely inspect awk getline field target"
+            )
+        if character == "(":
+            return self._skip_awk_balanced(script, cursor, "(", ")")
+        identifier = _AWK_IDENTIFIER_PATTERN.match(script, cursor)
+        if identifier is not None:
+            return self._skip_awk_getline_subscript(script, identifier.end())
+        return cursor
+
+    def _skip_awk_getline_subscript(self, script: str, cursor: int) -> int:
+        while cursor < len(script) and script[cursor] in " \t":
+            cursor += 1
+        if cursor < len(script) and script[cursor] == "[":
+            return self._skip_awk_balanced(script, cursor, "[", "]")
+        return cursor
+
+    @staticmethod
+    def _skip_awk_balanced(
+        script: str,
+        index: int,
+        open_char: str,
+        close_char: str,
+    ) -> int:
+        """Advance past one balanced `open_char`/`close_char` region.
+
+        Quoted content inside is skipped whole (escape-aware) so a string
+        literal carrying a stray `<`, `(`, `)`, `[`, or `]` cannot desynchronize
+        depth tracking or be misread as the following redirect operator.
+        """
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        cursor = index
+        while cursor < len(script):
+            character = script[cursor]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == quote:
+                    quote = None
+                cursor += 1
+                continue
+            if character in {"'", '"'}:
+                quote = character
+                cursor += 1
+                continue
+            if character == open_char:
+                depth += 1
+            elif character == close_char:
+                depth -= 1
+                if depth == 0:
+                    return cursor + 1
+            cursor += 1
+        raise CommandPolicyViolation("cannot safely inspect awk getline target")
 
     @staticmethod
     def _scan_awk_redirect_target(script: str, index: int) -> str:
@@ -3546,6 +3851,8 @@ class WorkspaceCommandPathGuard:
                 "--verbose",
                 "-V",
                 "--version",
+                "--fast",
+                "--best",
                 *{f"-{level}" for level in range(1, 10)},
             },
             scalar_options={"-S", "--suffix"},
@@ -3755,10 +4062,15 @@ class WorkspaceCommandPathGuard:
     def _check_curl(self, values: Sequence[str], cwd: Path) -> None:
         """`curl`: `-o`/`--output`/`--output-dir` write; `-T`/`--upload-file`/
         `--netrc-file` read; an `@file` payload to `-d`/`--data*` reads that
-        file. `-K`/`--config` (arbitrary runtime options) and `-O`/
+        file. `-D`/`--dump-header`, `-c`/`--cookie-jar`, `--trace`,
+        `--trace-ascii`, and `--stderr` also write to a filename argument.
+        `-K`/`--config` (arbitrary runtime options) and `-O`/
         `--remote-name[-all]` (output filename derived from the remote URL
         or response, not statically knowable) cannot be inspected safely and
-        fail closed.
+        fail closed. An unrecognized long option with an attached `=value`
+        also fails closed (mirroring `rsync`): curl accepts a value for many
+        long options this family does not model, so an unmodeled one cannot
+        be assumed to be a value-free flag once it visibly carries a value.
         """
         self._reject_dynamic_values("curl arguments", values)
         index = 0
@@ -3795,6 +4107,43 @@ class WorkspaceCommandPathGuard:
                 self._check_path(argument, cwd, "write")
                 continue
             if text.startswith("-o") and len(text) > 2:
+                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
+                index += 1
+                continue
+            if text in {
+                "-D",
+                "--dump-header",
+                "-c",
+                "--cookie-jar",
+                "--trace",
+                "--trace-ascii",
+                "--stderr",
+            } or text.startswith(
+                (
+                    "--dump-header=",
+                    "--cookie-jar=",
+                    "--trace=",
+                    "--trace-ascii=",
+                    "--stderr=",
+                )
+            ):
+                option, separator, attached_text = text.partition("=")
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"curl argument for {option}",
+                )
+                assert argument is not None
+                self._check_path(argument, cwd, "write")
+                continue
+            if (
+                (text.startswith("-D") or text.startswith("-c"))
+                and not text.startswith("--")
+                and len(text) > 2
+            ):
                 self._check_path(self._derived_value(value, text[2:]), cwd, "write")
                 index += 1
                 continue
@@ -3850,16 +4199,23 @@ class WorkspaceCommandPathGuard:
                     )
                 index += 1
                 continue
+            option, separator, _ = text.partition("=")
+            if text.startswith("--") and separator:
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect curl option {option}"
+                )
             index += 1
 
     def _check_wget(self, values: Sequence[str], cwd: Path) -> None:
         """`wget`: `-O`/`--output-document` write; `-P`/`--directory-prefix`
-        write directory; `--post-file`/`--body-file` read. `--config` and
-        `-i`/`--input-file` (a runtime URL list) cannot be inspected safely
-        and fail closed. A URL operand with no explicit `-O` output (and not
-        `--spider`, which fetches nothing to disk) resolves its output
-        filename from the remote response, which is not statically
-        knowable, so that combination fails closed too.
+        write directory; `-o`/`--output-file` (log file) write;
+        `--post-file`/`--body-file` read. `--config` and `-i`/`--input-file`
+        (a runtime URL list) cannot be inspected safely and fail closed. A
+        URL operand with no explicit `-O` output (and not `--spider`, which
+        fetches nothing to disk) resolves its output filename from the
+        remote response, which is not statically knowable, so that
+        combination fails closed too. An unrecognized long option with an
+        attached `=value` also fails closed (mirroring `rsync`/`curl`).
         """
         self._reject_dynamic_values("wget arguments", values)
         has_explicit_output = False
@@ -3924,8 +4280,32 @@ class WorkspaceCommandPathGuard:
                 assert argument is not None
                 self._check_path(argument, cwd, "read")
                 continue
+            if text in {"-o", "--output-file"} or text.startswith("--output-file="):
+                option, separator, attached_text = text.partition("=")
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"wget argument for {option}",
+                )
+                assert argument is not None
+                self._check_path(argument, cwd, "write")
+                continue
+            if text.startswith("-o") and not text.startswith("--") and len(text) > 2:
+                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
+                index += 1
+                continue
             if not text.startswith("-"):
                 has_url_operand = True
+                index += 1
+                continue
+            option, separator, _ = text.partition("=")
+            if text.startswith("--") and separator:
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect wget option {option}"
+                )
             index += 1
         if has_url_operand and not has_explicit_output and not spider_mode:
             raise CommandPolicyViolation(
