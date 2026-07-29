@@ -8,7 +8,7 @@ import secrets
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Protocol, TypeVar
+from typing import Any, Callable, Protocol, TypeGuard, TypeVar
 
 from fastapi import Depends, HTTPException, Query, UploadFile, WebSocket
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -124,6 +124,24 @@ class _ChatAccessContext(Protocol):
 
 
 _ChatAccessContextT = TypeVar("_ChatAccessContextT", bound=_ChatAccessContext)
+
+
+def _is_strict_int(value: object) -> TypeGuard[int]:
+    """Whether a JWT claim is a real ``int`` — a row id we may query on.
+
+    Every id claim on a widget/share guest token goes through here rather than a
+    bare ``isinstance(..., int)`` (#992). ``bool`` subclasses ``int``, so a
+    ``true`` claim would pass isinstance, and SQLAlchemy renders it as ``= 1``:
+    it resolves to row id 1 *and* then compares equal to an owner id of 1 in
+    Python (``1 == True``), which would admit a guest as the first user. The
+    behaviour is also backend-dependent — SQLite binds and matches where
+    PostgreSQL typically raises — so a bare isinstance check makes an auth
+    decision that varies by database.
+
+    These tokens are server-minted and signed, so no caller can present such a
+    claim today; this keeps every id claim failing closed regardless.
+    """
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def create_public_chat_access_token(data: dict[str, Any]) -> str:
@@ -286,21 +304,27 @@ def get_public_chat_user(
         if auth_mode != "widget":
             raise ValueError("Invalid token payload")
 
-        if not user_id or not guest_id:
+        # Defense in depth (#992): the same guard get_share_chat_user applies.
+        # Without it the two widget branches below disagreed about a string
+        # user_id — the agent branch failed closed on an int/str owner
+        # comparison, while the workforce branch coerced it and admitted the
+        # request. Establishing the type here is what lets both branches pass
+        # ``user_id`` straight to their ``ensure_widget_*_available`` helper.
+        if not _is_strict_int(user_id) or not user_id or not guest_id:
             raise ValueError("Invalid token payload")
 
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
             raise ValueError("User not found")
 
-        if isinstance(widget_workforce_id, int):
+        if _is_strict_int(widget_workforce_id):
             # Workforce widget: re-validate the deployment on every use so
             # disabling the widget or rotating its key cuts off live guests,
             # mirroring the workforce share path.
             ensure_widget_workforce_available(
                 db,
                 widget_workforce_id,
-                int(user_id),
+                user_id,
                 expected_widget_key=widget_key
                 if isinstance(widget_key, str) and widget_key
                 else None,
@@ -318,7 +342,7 @@ def get_public_chat_user(
         # tokens (mirrors the share path). The per-message WS revalidation
         # calls back through here, so live sessions drop on the next inbound
         # message too.
-        if not isinstance(widget_agent_id, int):
+        if not _is_strict_int(widget_agent_id):
             raise ValueError("Invalid widget token payload")
         ensure_widget_agent_available(
             db,
@@ -362,7 +386,7 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
 
         if auth_mode != "share":
             raise ValueError("Invalid token payload")
-        if not isinstance(user_id, int):
+        if not _is_strict_int(user_id):
             raise ValueError("Invalid token payload")
         if not isinstance(share_token, str) or not share_token:
             raise ValueError("Invalid share token payload")
@@ -378,7 +402,7 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
         if not user:
             raise ValueError("User not found")
 
-        if isinstance(share_workforce_id, int):
+        if _is_strict_int(share_workforce_id):
             workforce = ensure_share_workforce_available(
                 db,
                 share_workforce_id,
@@ -392,7 +416,7 @@ def get_share_chat_user(token: str, db: Session) -> ShareChatAccessContext:
                 workforce=workforce,
             )
 
-        if not isinstance(share_agent_id, int):
+        if not _is_strict_int(share_agent_id):
             raise ValueError("Invalid share token payload")
 
         agent = ensure_share_agent_available(
