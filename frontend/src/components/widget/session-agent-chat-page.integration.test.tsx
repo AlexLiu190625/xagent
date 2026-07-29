@@ -104,6 +104,7 @@ const sessionUpdate = () => {
     xagent: true,
     v: 1,
     type: "session_update",
+    session_delivery_id: "delivery-a",
     session_token: SESSION_TOKEN,
     session_token_expires_at: new Date(now + 15 * 60_000).toISOString(),
     absolute_expires_at: new Date(now + 30 * 60_000).toISOString(),

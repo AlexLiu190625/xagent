@@ -19,6 +19,7 @@ function updateMessage(overrides: Record<string, unknown> = {}) {
     xagent: true,
     v: 1,
     type: "session_update",
+    session_delivery_id: "delivery-a",
     session_token: "st_session_token",
     session_token_expires_at: new Date(now + 15 * 60_000).toISOString(),
     absolute_expires_at: new Date(now + 30 * 60_000).toISOString(),
@@ -67,6 +68,37 @@ describe("useWidgetSession", () => {
       "*",
     )
   })
+
+  it("echoes the delivery ID only after the current socket generation opens", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ session_delivery_id: "delivery-b" }))
+
+    act(() => result.current.handleConnectionOpen("widget-session:999"))
+    act(() => result.current.handleConnectionOpen("widget-session:1"))
+
+    expect(postMessage.mock.calls.filter(([message]) => message?.type === "session_open")).toEqual([[
+      { xagent: true, v: 1, type: "session_open", session_delivery_id: "delivery-b" },
+      PARENT_ORIGIN,
+    ]])
+  })
+
+  it.each([undefined, " ", 1, true, {}, []])(
+    "fails closed on malformed delivery IDs before replacing the active generation: %p",
+    (session_delivery_id) => {
+      const postMessage = vi.spyOn(window, "postMessage")
+      const { result } = renderHook(() => useWidgetSession())
+      dispatchFromParent(updateMessage({ session_delivery_id: "delivery-a" }))
+      const previousGeneration = result.current.session?.generation
+
+      dispatchFromParent(updateMessage({ session_delivery_id }))
+
+      expect(previousGeneration).toBe(1)
+      expect(result.current.status).toBe("terminal")
+      expect(result.current.session).toBeNull()
+      expect(postMessage.mock.calls.filter(([message]) => message?.type === "reconnect_request")).toHaveLength(0)
+    },
+  )
 
   it("pins the first valid parent origin internally and rejects messages from another origin", () => {
     const { result } = renderHook(() => useWidgetSession())

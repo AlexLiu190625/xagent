@@ -434,8 +434,16 @@
       detached: false,
       observer: null,
       inflight: { exchange: null, reconnect: null },
+      recoveryFlight: null,
       restorePending: false,
-      frozenInflight: { exchange: null, reconnect: null }
+      frozenInflight: { exchange: null, reconnect: null },
+      frozenRecoveryFlight: null,
+      rapidRecoveries: 0,
+      deliverySequence: 0,
+      awaitedDeliveryId: null,
+      invalidatedDeliveryId: null,
+      stableDeliveryId: null,
+      stabilityTimer: null
     };
 
     function attach(iframe) {
@@ -453,12 +461,31 @@
       return exchange();
     }
 
-    function runRecoveryFlow() {
+    function runRecoveryFlow(isResume) {
       if (state.terminalCode) {
         flush();
         return Promise.resolve();
       }
-      return isNonBlankString(state.reconnectToken) ? reconnect() : exchange();
+      // Join the existing parent owner before touching the rapid-recovery
+      // circuit: iframe close/error bursts do not consume logical attempts.
+      if (state.recoveryFlight) return state.recoveryFlight;
+      var initialExchange = !state.session && inflightPromise('exchange');
+      if (initialExchange) return initialExchange;
+      if (!isResume) {
+        invalidateStability();
+        if (state.rapidRecoveries >= 3) {
+          recordFailure('network_unavailable');
+          return Promise.resolve();
+        }
+        state.rapidRecoveries += 1;
+      }
+      var recovery = isNonBlankString(state.reconnectToken) ? reconnect() : exchange();
+      state.recoveryFlight = Promise.resolve(recovery).then(function () {
+        state.recoveryFlight = null;
+      }, function () {
+        state.recoveryFlight = null;
+      });
+      return state.recoveryFlight;
     }
 
     function onDomMutation() {
@@ -484,9 +511,11 @@
     // earlier pageshow for the same navigation.
     function onPageHide(event) {
       if (!event.persisted || state.detached) return;
+      invalidateStability();
       state.restorePending = true;
       state.frozenInflight.exchange = state.inflight.exchange;
       state.frozenInflight.reconnect = state.inflight.reconnect;
+      state.frozenRecoveryFlight = state.recoveryFlight;
     }
 
     // Scripts do not re-run on a bfcache restore. Consume each persisted
@@ -500,17 +529,20 @@
       state.restorePending = false;
       var frozenExchange = state.frozenInflight.exchange;
       var frozenReconnect = state.frozenInflight.reconnect;
+      var frozenRecoveryFlight = state.frozenRecoveryFlight;
       state.frozenInflight.exchange = null;
       state.frozenInflight.reconnect = null;
+      state.frozenRecoveryFlight = null;
       if (state.terminalCode) return;
       cancelInflightIfCurrent('exchange', frozenExchange);
       cancelInflightIfCurrent('reconnect', frozenReconnect);
+      if (state.recoveryFlight === frozenRecoveryFlight) state.recoveryFlight = null;
       state.recoverableCode = null;
       if (state.session && !isStale(state.session.session_token_expires_at)) {
         flush();
         return;
       }
-      runRecoveryFlow();
+      runRecoveryFlow(Boolean(frozenRecoveryFlight));
     }
 
     function onMessage(event) {
@@ -524,6 +556,9 @@
         flush();
       } else if (data.type === 'reconnect_request') {
         runRecoveryFlow();
+      } else if (data.type === 'session_open') {
+        if (!isNonBlankString(data.session_delivery_id)) return;
+        beginStability(data.session_delivery_id);
       }
     }
 
@@ -563,8 +598,13 @@
         runRecoveryFlow();
         return;
       }
+      var deliveryId = state.session.session_delivery_id;
+      if (deliveryId !== state.stableDeliveryId && deliveryId !== state.invalidatedDeliveryId) {
+        state.awaitedDeliveryId = deliveryId;
+      }
       send({
         type: 'session_update',
+        session_delivery_id: deliveryId,
         session_token: state.session.session_token,
         session_token_expires_at: state.session.session_token_expires_at,
         absolute_expires_at: state.session.absolute_expires_at,
@@ -608,9 +648,40 @@
     function applySession(payload) {
       var reconnectTokenChanged = payload.reconnectToken !== state.reconnectToken;
       state.session = payload.session;
+      state.session.session_delivery_id = mintDeliveryId();
+      state.awaitedDeliveryId = null;
       state.reconnectToken = payload.reconnectToken;
       if (reconnectTokenChanged) state.reconnectRetry = null;
       state.recoverableCode = null;
+    }
+
+    function mintDeliveryId() {
+      state.deliverySequence += 1;
+      return 'widget-delivery-' + Date.now().toString(36) + '-' + state.deliverySequence;
+    }
+
+    function invalidateStability() {
+      if (state.stabilityTimer) {
+        clearTimeout(state.stabilityTimer);
+        state.stabilityTimer = null;
+      }
+      if (state.awaitedDeliveryId) {
+        state.invalidatedDeliveryId = state.awaitedDeliveryId;
+        state.awaitedDeliveryId = null;
+      }
+    }
+
+    function beginStability(deliveryId) {
+      if (deliveryId !== state.awaitedDeliveryId || deliveryId === state.invalidatedDeliveryId) return;
+      if (state.stabilityTimer || state.stableDeliveryId === deliveryId) return;
+      var timer = setTimeout(function () {
+        if (state.stabilityTimer !== timer || state.awaitedDeliveryId !== deliveryId) return;
+        state.stabilityTimer = null;
+        state.awaitedDeliveryId = null;
+        state.stableDeliveryId = deliveryId;
+        state.rapidRecoveries = 0;
+      }, 15000);
+      state.stabilityTimer = timer;
     }
 
     function reconnectRetryLineage(reconnectToken) {
@@ -764,18 +835,24 @@
       cancelInflight(key);
     }
 
+    // Exchange and reconnect differ only in endpoint/body/lineage; both keep
+    // retry publication fenced by the operation signal.
+    function requestSessionWithRetry(url, body, retryLineage, signal) {
+      return withRetry(function (timeoutMs) {
+        return postJson(url, body, timeoutMs, signal);
+      }, SESSION_RETRY_POLICY, signal, function (code) {
+        if (!signal.aborted) recordRetry(code);
+      }, retryLineage);
+    }
+
     function exchange() {
       return singleFlight('exchange', function (signal) {
-        return withRetry(function (timeoutMs) {
-          return postJson(
-            host + '/v1/external/chat/sessions',
-            { encrypted_context: state.grant },
-            timeoutMs,
-            signal
-          );
-        }, SESSION_RETRY_POLICY, signal, function (code) {
-          if (!signal.aborted) recordRetry(code);
-        }, state.exchangeRetry).then(function (result) {
+        return requestSessionWithRetry(
+          host + '/v1/external/chat/sessions',
+          { encrypted_context: state.grant },
+          state.exchangeRetry,
+          signal
+        ).then(function (result) {
           handleResult(result, 'exchange');
         }, function () {
           if (!signal.aborted) recordFailure('network_unavailable');
@@ -800,16 +877,12 @@
         var body = { reconnect_token: reconnectToken };
         body.encrypted_context = state.grant;
         var retryLineage = reconnectRetryLineage(reconnectToken);
-        return withRetry(function (timeoutMs) {
-          return postJson(
-            host + '/v1/external/chat/sessions/reconnect',
-            body,
-            timeoutMs,
-            signal
-          );
-        }, SESSION_RETRY_POLICY, signal, function (code) {
-          if (!signal.aborted) recordRetry(code);
-        }, retryLineage).then(function (result) {
+        return requestSessionWithRetry(
+          host + '/v1/external/chat/sessions/reconnect',
+          body,
+          retryLineage,
+          signal
+        ).then(function (result) {
           handleResult(result, 'reconnect');
         }, function () {
           if (!signal.aborted) recordFailure('network_unavailable');

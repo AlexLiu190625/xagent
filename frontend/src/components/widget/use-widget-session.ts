@@ -60,6 +60,9 @@ const parseDate = (value: unknown): number | null => {
   return Number.isFinite(timestamp) ? timestamp : null
 }
 
+const isNonBlankString = (value: unknown): value is string =>
+  typeof value === "string" && value.trim().length > 0
+
 const parseAgent = (value: unknown): WidgetSessionAgent | null => {
   if (!isRecord(value)) return null
   if (!Number.isInteger(value.id) || (value.id as number) <= 0) return null
@@ -113,6 +116,7 @@ export function useWidgetSession() {
   const terminalRef = useRef(false)
   const generationRef = useRef(0)
   const activeSessionGenerationRef = useRef<number | null>(null)
+  const activeDeliveryIdRef = useRef<string | null>(null)
   const warningTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const clearWarningTimer = useCallback(() => {
@@ -126,6 +130,7 @@ export function useWidgetSession() {
     if (terminalRef.current) return
     terminalRef.current = true
     activeSessionGenerationRef.current = null
+    activeDeliveryIdRef.current = null
     recoveryInFlightRef.current = false
     clearWarningTimer()
     setState({
@@ -140,6 +145,7 @@ export function useWidgetSession() {
   const transitionDegraded = useCallback(() => {
     if (terminalRef.current) return
     activeSessionGenerationRef.current = null
+    activeDeliveryIdRef.current = null
     clearWarningTimer()
     setState((current) => ({
       status: "degraded",
@@ -173,18 +179,33 @@ export function useWidgetSession() {
     issueReconnectRequest(reason)
   }, [issueReconnectRequest])
 
-  const handleConnectionOpen = useCallback((connectionIdentity: string) => {
-    // The parent owns recovery scheduling; opening a socket does not affect
-    // its request budget.
-    void connectionIdentity
-  }, [])
-
   const isActiveConnection = useCallback((connectionIdentity?: string) => {
     const activeGeneration = activeSessionGenerationRef.current
     return connectionIdentity === undefined || (
       activeGeneration !== null
       && connectionIdentity === `widget-session:${activeGeneration}`
     )
+  }, [])
+
+  const handleConnectionOpen = useCallback((connectionIdentity: string) => {
+    const activeGeneration = activeSessionGenerationRef.current
+    const deliveryId = activeDeliveryIdRef.current
+    const targetOrigin = targetOriginRef.current
+    if (
+      !mountedRef.current
+      || !targetOrigin
+      || terminalRef.current
+      || activeGeneration === null
+      || !deliveryId
+      || connectionIdentity !== `widget-session:${activeGeneration}`
+    ) return
+
+    window.parent.postMessage({
+      xagent: true,
+      v: 1,
+      type: "session_open",
+      session_delivery_id: deliveryId,
+    }, targetOrigin)
   }, [])
 
   const handleConnectionClose = useCallback((
@@ -271,10 +292,11 @@ export function useWidgetSession() {
       }
 
       const token = event.data.session_token
+      const deliveryId = event.data.session_delivery_id
       const tokenExpiresAt = parseDate(event.data.session_token_expires_at)
       const absoluteExpiresAt = parseDate(event.data.absolute_expires_at)
       const agent = parseAgent(event.data.agent)
-      if (typeof token !== "string" || !token.trim() || tokenExpiresAt === null || absoluteExpiresAt === null || !agent) {
+      if (!isNonBlankString(deliveryId) || typeof token !== "string" || !token.trim() || tokenExpiresAt === null || absoluteExpiresAt === null || !agent) {
         transitionTerminal("unexpected_error")
         return
       }
@@ -300,6 +322,7 @@ export function useWidgetSession() {
         generation: generationRef.current,
       }
       activeSessionGenerationRef.current = session.generation
+      activeDeliveryIdRef.current = deliveryId
       setState({
         status: "active",
         session,
@@ -316,6 +339,7 @@ export function useWidgetSession() {
     return () => {
       mountedRef.current = false
       activeSessionGenerationRef.current = null
+      activeDeliveryIdRef.current = null
       window.removeEventListener("message", onMessage)
       recoveryInFlightRef.current = false
       clearWarningTimer()
