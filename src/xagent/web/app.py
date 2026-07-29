@@ -67,6 +67,10 @@ from .dynamic_memory_store import get_memory_store
 from .logging_config import setup_logging
 from .models.database import init_db
 from .services.a2a_protocol import A2AApiError, a2a_api_error_handler, a2a_error
+from .services.skill_runtime import (
+    SkillRuntimeSessionBoundaryError,
+    skill_runtime_session_boundary_error_handler,
+)
 from .services.task_lease_recovery import run_task_lease_recovery_loop
 from .services.uploaded_file_recovery import (
     run_uploaded_file_compensation_recovery_loop,
@@ -731,6 +735,10 @@ async def global_exception_handler(request: Request, exc: Exception) -> Any:
 # See web/api/v1/errors.py for the contract.
 app.add_exception_handler(V1ApiError, v1_api_error_handler)  # type: ignore[arg-type]
 app.add_exception_handler(A2AApiError, a2a_api_error_handler)  # type: ignore[arg-type]
+app.add_exception_handler(
+    SkillRuntimeSessionBoundaryError,
+    cast(Any, skill_runtime_session_boundary_error_handler),
+)
 
 
 # Add CORS middleware
