@@ -1327,14 +1327,15 @@ class WebToolConfig(BaseToolConfig):
         """Whether to include basic tools."""
         return True
 
-    def _get_factory_model_value(
+    def _resolve_factory_model_field(
         self,
         *,
         load_flag: str,
         field_name: str,
         cache_name: str,
-        loader: Callable[[], Any | None],
-    ) -> Any | None:
+        loader: Callable[[], Any],
+        terminal_neutral: Any,
+    ) -> Any:
         snapshot = self._factory_runtime_snapshot
         if snapshot is not None and getattr(snapshot.plan, load_flag):
             return getattr(snapshot, field_name)
@@ -1344,13 +1345,29 @@ class WebToolConfig(BaseToolConfig):
             return getattr(retained, field_name)
 
         if self._factory_runtime_handed_off:
-            return None
+            return terminal_neutral
 
         cached = getattr(self, cache_name)
         if cached is None:
             cached = loader()
             setattr(self, cache_name, cached)
         return cached
+
+    def _get_factory_model_value(
+        self,
+        *,
+        load_flag: str,
+        field_name: str,
+        cache_name: str,
+        loader: Callable[[], Any | None],
+    ) -> Any | None:
+        return self._resolve_factory_model_field(
+            load_flag=load_flag,
+            field_name=field_name,
+            cache_name=cache_name,
+            loader=loader,
+            terminal_neutral=None,
+        )
 
     def _get_factory_model_mapping(
         self,
@@ -1360,22 +1377,14 @@ class WebToolConfig(BaseToolConfig):
         cache_name: str,
         loader: Callable[[], Mapping[str, Any]],
     ) -> Dict[str, Any]:
-        snapshot = self._factory_runtime_snapshot
-        if snapshot is not None and getattr(snapshot.plan, load_flag):
-            return dict(getattr(snapshot, field_name))
-
-        retained = self._retained_factory_model_state
-        if retained is not None and getattr(retained, load_flag):
-            return dict(getattr(retained, field_name))
-
-        if self._factory_runtime_handed_off:
-            return {}
-
-        cached = getattr(self, cache_name)
-        if cached is None:
-            cached = loader()
-            setattr(self, cache_name, cached)
-        return dict(cached)
+        resolved = self._resolve_factory_model_field(
+            load_flag=load_flag,
+            field_name=field_name,
+            cache_name=cache_name,
+            loader=loader,
+            terminal_neutral={},
+        )
+        return dict(resolved)
 
     def get_vision_model(self) -> Optional[Any]:
         """Get vision model, prioritizing explicitly provided model over database."""
@@ -2135,7 +2144,14 @@ class WebToolConfig(BaseToolConfig):
         return self.db
 
     def close(self) -> None:
-        """Close the lazily-opened factory session, if any."""
+        """Terminally close factory/database-backed model state and resources.
+
+        This discards prepared and retained factory state, closes any owned
+        lazy database session, and prevents later model getters from loading
+        or exposing factory/database-backed snapshots or caches. An explicit
+        constructor-supplied vision model is independent and remains
+        authoritative after close.
+        """
         try:
             self.discard_prepared_factory_runtime()
             lazy_db = self._lazy_db

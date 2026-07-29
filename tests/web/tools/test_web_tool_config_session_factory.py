@@ -2,6 +2,7 @@ import asyncio
 import functools
 import logging
 import threading
+from collections.abc import Mapping
 from dataclasses import fields, is_dataclass, replace
 from types import MappingProxyType, SimpleNamespace
 
@@ -153,6 +154,25 @@ class _Chain:
 
     def first(self):
         return None
+
+
+class _NonEmptyMappingWithHostileBool(Mapping[str, object]):
+    def __init__(self, value):
+        self._value = value
+
+    def __bool__(self):
+        raise AssertionError("mapping truthiness must not be consulted")
+
+    def __getitem__(self, key):
+        if key != "model":
+            raise KeyError(key)
+        return self._value
+
+    def __iter__(self):
+        return iter(("model",))
+
+    def __len__(self):
+        return 1
 
 
 class _ListChain:
@@ -1405,6 +1425,128 @@ def test_standalone_unhanded_off_model_getter_uses_legacy_loader_once(monkeypatc
     assert first is not second
     assert first["image"] is image_adapter
     assert second["image"] is image_adapter
+
+
+def test_model_getters_delegate_to_shared_resolver(monkeypatch):
+    vision_model = object()
+    image_model = object()
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+    resolver_calls = []
+
+    def resolve_factory_model_field(**kwargs):
+        resolver_calls.append(kwargs)
+        if kwargs["field_name"] == "vision_model":
+            return vision_model
+        return {"image": image_model}
+
+    monkeypatch.setattr(
+        cfg,
+        "_resolve_factory_model_field",
+        resolve_factory_model_field,
+    )
+
+    assert cfg.get_vision_model() is vision_model
+    assert cfg.get_image_models() == {"image": image_model}
+    assert resolver_calls[0]["terminal_neutral"] is None
+    assert resolver_calls[1]["terminal_neutral"] == {}
+
+
+def test_unhanded_off_mapping_loader_avoids_truthiness_and_preserves_values(
+    monkeypatch,
+):
+    image_model = object()
+    loader_calls = 0
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    def load_image_models():
+        nonlocal loader_calls
+        loader_calls += 1
+        return _NonEmptyMappingWithHostileBool(image_model)
+
+    monkeypatch.setattr(cfg, "_load_image_models", load_image_models)
+
+    first = cfg.get_image_models()
+    second = cfg.get_image_models()
+
+    assert loader_calls == 1
+    assert type(first) is dict
+    assert first["model"] is image_model
+    assert second["model"] is image_model
+    assert first is not second
+    first["mutation"] = object()
+    assert "mutation" not in second
+
+
+def test_unhanded_off_invalid_mapping_loader_result_remains_fail_loud(monkeypatch):
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    monkeypatch.setattr(cfg, "_load_image_models", lambda: None)
+
+    with pytest.raises(TypeError):
+        cfg.get_image_models()
+
+
+def test_empty_unhanded_off_mapping_loader_is_cached_and_returns_fresh_dicts(
+    monkeypatch,
+):
+    loader_calls = 0
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+
+    def load_image_models():
+        nonlocal loader_calls
+        loader_calls += 1
+        return {}
+
+    monkeypatch.setattr(cfg, "_load_image_models", load_image_models)
+
+    first = cfg.get_image_models()
+    second = cfg.get_image_models()
+
+    assert loader_calls == 1
+    assert first == second == {}
+    assert first is not second
+
+
+def test_close_neutralizes_prefilled_model_mapping_caches_without_loading(monkeypatch):
+    cfg = WebToolConfig(db=object(), request=None, user_id=None)
+    mapping_getters = (
+        (cfg.get_image_models, "_cached_image_configs", "_load_image_models"),
+        (cfg.get_video_models, "_cached_video_configs", "_load_video_models"),
+        (cfg.get_asr_models, "_cached_asr_models", "_load_asr_models"),
+        (cfg.get_tts_models, "_cached_tts_models", "_load_tts_models"),
+        (
+            cfg.get_sound_effect_models,
+            "_cached_sound_effect_models",
+            "_load_sound_effect_models",
+        ),
+        (cfg.get_music_models, "_cached_music_models", "_load_music_models"),
+    )
+
+    def fail_if_called():
+        raise AssertionError("terminal config attempted a model loader")
+
+    for _getter, cache_name, loader_name in mapping_getters:
+        setattr(cfg, cache_name, {"prefilled": object()})
+        monkeypatch.setattr(cfg, loader_name, fail_if_called)
+
+    cfg.close()
+
+    for getter, _cache_name, _loader_name in mapping_getters:
+        assert getter() == {}
+
+
+def test_explicit_vision_model_remains_authoritative_after_close():
+    explicit_vision_model = object()
+    cfg = WebToolConfig(
+        db=object(),
+        request=None,
+        user_id=None,
+        vision_model=explicit_vision_model,
+    )
+
+    cfg.close()
+
+    assert cfg.get_vision_model() is explicit_vision_model
 
 
 @pytest.mark.asyncio
