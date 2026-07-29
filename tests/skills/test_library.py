@@ -6,6 +6,7 @@ import pytest
 from xagent import skills
 from xagent.skills.library import (
     CompositeSkillLibraryProvider,
+    FilesystemSkillLibraryProvider,
     SkillRecord,
     SkillScopeContext,
     SkillWriteContext,
@@ -156,6 +157,72 @@ async def test_composite_provider_later_records_override_earlier_by_name():
     assert skill["description"] == "personal"
     assert skill["source"] == "personal"
     assert skill["scope"] == "personal"
+
+
+@pytest.mark.asyncio
+async def test_composite_records_survive_unavailable_personal_database(
+    monkeypatch: pytest.MonkeyPatch, tmp_path
+) -> None:
+    from xagent.skills.personal_db import XagentPersonalDbSkillProvider
+    from xagent.web.models import database
+
+    filesystem_skill = tmp_path / "filesystem-writer"
+    filesystem_skill.mkdir()
+    (filesystem_skill / "SKILL.md").write_bytes(
+        b"---\ndescription: filesystem\n---\n# Filesystem writer\n"
+    )
+
+    monkeypatch.setattr(database, "get_optional_session_local", lambda: None)
+    provider = CompositeSkillLibraryProvider(
+        [
+            FilesystemSkillLibraryProvider([tmp_path]),
+            StaticProvider(
+                "overlay", [_record("overlay-writer", "overlay", "overlay")]
+            ),
+            XagentPersonalDbSkillProvider(),
+        ]
+    )
+
+    records = await provider.list_records(SkillScopeContext(user_id=7))
+
+    assert [record.name for record in records] == [
+        "filesystem-writer",
+        "overlay-writer",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_composite_propagates_personal_database_failure_without_partial_records(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from xagent.skills.personal_db import XagentPersonalDbSkillProvider
+    from xagent.web.models import database
+
+    error = RuntimeError("Session Local is not initialized. Call init_db() first.")
+
+    def _failing_session_factory():
+        raise error
+
+    monkeypatch.setattr(
+        database,
+        "get_optional_session_local",
+        lambda: _failing_session_factory,
+    )
+    provider = CompositeSkillLibraryProvider(
+        [
+            StaticProvider("builtin", [_record("writer", "builtin", "builtin")]),
+            XagentPersonalDbSkillProvider(),
+        ]
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await provider.list_records(SkillScopeContext(user_id=7))
+
+    assert caught.value is error
+    assert (
+        str(caught.value) == "Session Local is not initialized. Call init_db() first."
+    )
+    assert not any("unavailable" in record.message.lower() for record in caplog.records)
 
 
 @pytest.mark.asyncio

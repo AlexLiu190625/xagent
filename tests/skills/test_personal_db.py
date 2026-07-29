@@ -19,6 +19,43 @@ from xagent.web.models.user import User
 _SKILL_MD = b"---\ndescription: writer\n---\n# Writer\n"
 
 
+def test_optional_session_factory_preserves_strict_database_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from xagent.web.models import database
+
+    monkeypatch.setattr(database, "_SessionLocal", None)
+
+    assert database.get_optional_session_local() is None
+    with pytest.raises(RuntimeError) as caught:
+        database.get_session_local()
+    assert (
+        str(caught.value) == "Session Local is not initialized. Call init_db() first."
+    )
+
+    session_factory = object()
+    monkeypatch.setattr(database, "_SessionLocal", session_factory)
+
+    assert database.get_optional_session_local() is session_factory
+    assert database.get_session_local() is session_factory
+
+
+@pytest.mark.asyncio
+async def test_personal_provider_skips_unavailable_database_with_warning(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from xagent.web.models import database
+
+    monkeypatch.setattr(database, "get_optional_session_local", lambda: None)
+
+    records = await XagentPersonalDbSkillProvider().list_records(
+        SkillScopeContext(user_id=7)
+    )
+
+    assert records == []
+    assert "personal skill" in caplog.text.lower()
+
+
 def _seed_personal_skill(session_factory) -> None:
     with session_factory() as db:
         db.execute(
@@ -85,7 +122,7 @@ async def test_personal_provider_owns_and_closes_its_database_session(
 
     from xagent.web.models import database
 
-    monkeypatch.setattr(database, "get_session_local", lambda: session_factory)
+    monkeypatch.setattr(database, "get_optional_session_local", lambda: session_factory)
 
     records = await XagentPersonalDbSkillProvider().list_records(
         SkillScopeContext(user_id=7)
@@ -147,7 +184,7 @@ async def test_personal_provider_returns_postgresql_pool_connection(
 
             monkeypatch.setattr(
                 database,
-                "get_session_local",
+                "get_optional_session_local",
                 lambda: session_factory,
             )
 
@@ -180,7 +217,7 @@ async def test_personal_provider_skips_database_without_runtime_user(
 
     monkeypatch.setattr(
         database,
-        "get_session_local",
+        "get_optional_session_local",
         _unexpected_session_factory,
     )
 
@@ -193,11 +230,13 @@ async def test_personal_provider_skips_database_without_runtime_user(
 async def test_personal_provider_drains_owned_db_work_before_cancellation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from xagent.web.models import database
+
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
 
-    def _blocking_load(user_id: int):
+    def _blocking_load(_session_factory, user_id: int):
         assert user_id == 7
         started.set()
         release.wait(timeout=5)
@@ -208,6 +247,7 @@ async def test_personal_provider_drains_owned_db_work_before_cancellation(
         "xagent.skills.personal_db._load_personal_skill_records_sync",
         _blocking_load,
     )
+    monkeypatch.setattr(database, "get_optional_session_local", lambda: object())
 
     task = asyncio.create_task(
         XagentPersonalDbSkillProvider().list_records(SkillScopeContext(user_id=7))

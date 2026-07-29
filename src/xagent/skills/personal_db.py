@@ -2,19 +2,23 @@
 
 from __future__ import annotations
 
+import logging
 from copy import deepcopy
+from typing import Any
 
 from .library import SkillRecord, SkillScopeContext
 
+logger = logging.getLogger(__name__)
 
-def _load_personal_skill_records_sync(user_id: int) -> list[SkillRecord]:
+
+def _load_personal_skill_records_sync(
+    session_factory: Any, user_id: int
+) -> list[SkillRecord]:
     """Load and detach one user's personal skills in an owned DB session."""
     from sqlalchemy.orm import selectinload
 
-    from xagent.web.models.database import get_session_local
     from xagent.web.models.skill import UserSkill
 
-    session_factory = get_session_local()
     with session_factory() as db:
         skills = (
             db.query(UserSkill)
@@ -49,11 +53,16 @@ class XagentPersonalDbSkillProvider:
         if context.user_id is None:
             return []
 
+        from xagent.web.models.database import get_optional_session_local
         from xagent.web.services.db_runtime import run_db_io_cancellation_safe
 
         user_id = int(context.user_id)
+        session_factory = get_optional_session_local()
+        if session_factory is None:
+            logger.warning("Personal skill database layer is unavailable")
+            return []
         return await run_db_io_cancellation_safe(
-            lambda: _load_personal_skill_records_sync(user_id)
+            lambda: _load_personal_skill_records_sync(session_factory, user_id)
         )
 
     async def read_file(
