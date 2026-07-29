@@ -9,6 +9,7 @@ from uuid import uuid4
 from ...config import get_compact_threshold_default, get_compact_threshold_ratio
 from ..model.intent import enter_goal, exit_goal
 from ..workspace import WorkspaceManager
+from .checkpoint import read_latest_checkpoint_payload
 from .context import ContextManager, ExecutionContext
 from .result import extract_assistant_message
 from .runtime import ExecutionInterrupted, PatternRuntime, load_pattern_checkpoint
@@ -887,20 +888,8 @@ class AgentRunner:
         if self.tracer is None:
             return None
 
-        for method_name in (
-            "load_latest_checkpoint",
-            "get_latest_checkpoint",
-            "latest_checkpoint",
-        ):
-            method = getattr(self.tracer, method_name, None)
-            if not callable(method):
-                continue
-            payload = method(execution_id)
-            if inspect.isawaitable(payload):
-                payload = await payload
-            if isinstance(payload, dict):
-                return payload
-        return None
+        payload = await read_latest_checkpoint_payload(self.tracer, execution_id)
+        return payload if isinstance(payload, dict) else None
 
     async def _persist_injected_context(
         self,

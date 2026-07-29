@@ -274,6 +274,38 @@ class TracerCheckpointStore:
         return dict(payload) if payload is not None else None
 
 
+class EmptyCanonicalCheckpointStore:
+    def __init__(self) -> None:
+        self.legacy_reads = 0
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        return None
+
+    def get_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        self.legacy_reads += 1
+        raise AssertionError("canonical empty result must end checkpoint lookup")
+
+
+@pytest.mark.asyncio
+async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> None:
+    checkpoint_store = EmptyCanonicalCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=checkpoint_store,
+    )
+
+    context = await runner.inject_user_message(
+        "missing-execution",
+        "Continue",
+        request_interrupt=False,
+    )
+
+    assert context is None
+    assert checkpoint_store.legacy_reads == 0
+
+
 @pytest.mark.asyncio
 async def test_runner_builds_context_and_invokes_pattern(tmp_path: Path) -> None:
     workspace_manager = FakeWorkspaceManager(tmp_path)
