@@ -4393,6 +4393,65 @@ class TestSedAwkCommand:
 
         guard.validate(command)
 
+    def test_awk_program_containing_assignment_syntax_is_still_inspected(
+        self, scoped_command_workspace
+    ):
+        # The CLI `var=value` operand skip (`ignores_assignment_arguments`)
+        # must never apply to the PROGRAM token itself: dropping it here
+        # (because the program text happens to contain "=") would silently
+        # disable all program inspection, letting `system()` through
+        # unchecked.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("awk 'BEGIN{x=1; system(\"id\")}'")
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "awk '{{x=1; print > \"{path}\"}}' own.txt",
+            "awk '{{x=1; getline l < \"{path}\"}}' own.txt",
+        ],
+    )
+    def test_awk_assignment_bearing_program_still_classifies_redirect_targets(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=str(sibling_file)))
+
+    def test_awk_positional_assignment_operand_after_program_is_not_a_path(
+        self, scoped_command_workspace
+    ):
+        # A real `var=value` CLI operand, positioned AFTER the program, is
+        # still a scalar assignment, not a file operand — the fix must not
+        # turn this into a spurious path check.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("awk '{print}' x=1 own.txt")
+
+    def test_awk_redirect_target_string_concatenation_fails_closed(
+        self, scoped_command_workspace
+    ):
+        # `print > "sub/" "../../8/x"` is awk string concatenation (bare
+        # juxtaposition); only resolving the first quoted literal and
+        # ignoring what follows would validate `"sub/"` while the actual
+        # runtime target escapes it. Anything after the closing quote other
+        # than a statement terminator must fail closed.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate('awk \'{print > "sub/" "../../8/x"}\' own.txt')
+
     @pytest.mark.parametrize(
         "command",
         [

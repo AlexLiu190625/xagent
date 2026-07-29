@@ -3128,8 +3128,21 @@ class WorkspaceCommandPathGuard:
                 raise CommandPolicyViolation(
                     f"cannot safely inspect {grammar.language} option {value_text}"
                 )
-            if not grammar.ignores_assignment_arguments or "=" not in value_text:
-                positionals.append(value)
+            # The CLI `var=value` assignment-operand skip only applies once
+            # the program itself has already been consumed (an explicit
+            # script via `-f`/`--file`/`-e`, or a prior positional): it must
+            # never swallow the program token, or an inline program whose
+            # text happens to contain "=" would be silently dropped from
+            # inspection entirely.
+            already_have_program = explicit_script or bool(positionals)
+            if (
+                grammar.ignores_assignment_arguments
+                and already_have_program
+                and "=" in value_text
+            ):
+                index += 1
+                continue
+            positionals.append(value)
             index += 1
 
         if not explicit_script and positionals:
@@ -3670,6 +3683,13 @@ class WorkspaceCommandPathGuard:
         path statically; any other form (a bareword, a field reference like
         `$1`, a variable, a parenthesized expression) is dynamic from this
         lexer's point of view and is rejected rather than silently skipped.
+        Awk concatenates adjacent expressions by bare juxtaposition (no
+        operator), so anything other than a statement terminator following
+        the closing quote (another string literal, an identifier, `$`, `(`,
+        ...) means the true runtime target is this literal PLUS more text
+        this lexer cannot resolve; that must fail closed too, rather than
+        validating only the leading literal while the concatenated
+        remainder silently escapes containment.
         """
         cursor = index
         while cursor < len(script) and script[cursor] in " \t":
@@ -3686,7 +3706,15 @@ class WorkspaceCommandPathGuard:
             elif character == "\\":
                 escaped = True
             elif character == '"':
-                return script[start:cursor]
+                literal = script[start:cursor]
+                trailer = cursor + 1
+                while trailer < len(script) and script[trailer] in " \t":
+                    trailer += 1
+                if trailer < len(script) and script[trailer] not in ";\n}":
+                    raise CommandPolicyViolation(
+                        "cannot resolve dynamic awk redirect target"
+                    )
+                return literal
             cursor += 1
         raise CommandPolicyViolation("cannot safely inspect awk redirect target")
 
