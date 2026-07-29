@@ -21,6 +21,7 @@ from typing import (
     Any,
     Iterable,
     Iterator,
+    Mapping,
     Sequence,
     SupportsIndex,
     cast,
@@ -158,7 +159,24 @@ def _active_validation_session() -> _ValidationSession:
     return session
 
 
-_READ_COMMANDS = {"cat"}
+# Plain readers: every operand is validated as a workspace read. A command
+# whose grammar carries a write slot or a read-control file argument (that
+# argument is itself a path, not a value to skip) gets its own dedicated
+# handler below instead and must not be added here.
+_READ_COMMANDS = {
+    "cat",
+    "cmp",
+    "cut",
+    "file",
+    "head",
+    "less",
+    "ls",
+    "more",
+    "stat",
+    "tac",
+    "tail",
+    "wc",
+}
 # Path-scoped writers: every operand is validated as a workspace write and
 # recorded per-path, so they never poison the session-wide unknown-effect flag.
 _WRITE_COMMANDS = {"rm", "mkdir"}
@@ -184,8 +202,27 @@ _NO_FILESYSTEM_EFFECT_COMMANDS = {
 }
 # Options that consume a following token as their value, per classified command,
 # so the value is not misread as a path operand (e.g. `mkdir -m 0755 dir`).
+# Only options whose value is never a path belong here; a value option that is
+# itself a path (e.g. `wc --files0-from`) needs a dedicated handler instead so
+# the argument gets checked, not skipped.
 _COMMAND_VALUE_OPTIONS = {
     "mkdir": frozenset({"-m", "--mode"}),
+    "cut": frozenset(
+        {
+            "-b",
+            "--bytes",
+            "-c",
+            "--characters",
+            "-d",
+            "--delimiter",
+            "-f",
+            "--fields",
+            "--output-delimiter",
+        }
+    ),
+    "head": frozenset({"-c", "--bytes", "-n", "--lines"}),
+    "tail": frozenset({"-c", "--bytes", "-n", "--lines"}),
+    "tac": frozenset({"-s", "--separator"}),
 }
 _BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
 _BASH_LONG_FLAG_OPTIONS = {
@@ -662,12 +699,79 @@ _CLASSIFIED_EXECUTABLE_COMMANDS = {
     *_UNSUPPORTED_PRIVILEGE_COMMANDS,
     "chroot",
     "xargs",
+    "sort",
+    "uniq",
+    "diff",
+    "grep",
     *(
         name
         for name in _COMMAND_WRAPPER_GRAMMARS
         if name not in {"builtin", "command", "exec", _POLICY_TIME_WRAPPER}
     ),
 }
+
+# `sort`'s short options bundle into one token (e.g. `-no file` combines the
+# `-n` flag with the `-o` write-path option), so its grammar is split into a
+# flag set (no value) and a value set (one following/attached argument, with
+# a read/write/skip access) for the short-option-cluster parser.
+_SORT_SHORT_FLAG_OPTIONS = frozenset("bdfgiMhnRrVcCmsuz")
+_SORT_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
+    "k": None,
+    "o": "write",
+    "S": None,
+    "t": None,
+    "T": "write",
+}
+_SORT_LONG_PATH_OPTIONS: dict[str, PathAccess] = {
+    "--files0-from": "read",
+    "--output": "write",
+    "--random-source": "read",
+    "--temporary-directory": "write",
+}
+_SORT_LONG_SCALAR_OPTIONS = frozenset(
+    {
+        "--batch-size",
+        "--buffer-size",
+        "--field-separator",
+        "--key",
+        "--parallel",
+        "--sort",
+    }
+)
+_SORT_LONG_FLAG_OPTIONS = frozenset(
+    {
+        "--check",
+        "--debug",
+        "--dictionary-order",
+        "--general-numeric-sort",
+        "--help",
+        "--human-numeric-sort",
+        "--ignore-case",
+        "--ignore-leading-blanks",
+        "--ignore-nonprinting",
+        "--merge",
+        "--month-sort",
+        "--numeric-sort",
+        "--random-sort",
+        "--reverse",
+        "--stable",
+        "--unique",
+        "--version",
+        "--version-sort",
+        "--zero-terminated",
+    }
+)
+# `--compress-program` delegates to an arbitrary external program; this is a
+# hard denial regardless of abbreviation, not a plain unknown option.
+_SORT_DENIED_LONG_OPTIONS = frozenset({"--compress-program"})
+_SORT_KNOWN_LONG_OPTIONS = frozenset(
+    {
+        *_SORT_LONG_PATH_OPTIONS,
+        *_SORT_LONG_SCALAR_OPTIONS,
+        *_SORT_LONG_FLAG_OPTIONS,
+        *_SORT_DENIED_LONG_OPTIONS,
+    }
+)
 
 
 class WorkspaceCommandPathGuard:
@@ -969,7 +1073,7 @@ class WorkspaceCommandPathGuard:
         if command_name in {"declare", "export", "typeset"}:
             self._reject_implicit_shell_environment(args)
         if command_name in _READ_COMMANDS:
-            self._check_operands(args, state.cwd, "read")
+            self._check_read_command(command_name, args, state.cwd)
         elif command_name in _WRITE_COMMANDS:
             self._check_operands(
                 args,
@@ -977,6 +1081,14 @@ class WorkspaceCommandPathGuard:
                 "write",
                 value_options=_COMMAND_VALUE_OPTIONS.get(command_name, frozenset()),
             )
+        elif command_name == "sort":
+            self._check_sort(args, state.cwd)
+        elif command_name == "uniq":
+            self._check_uniq(args, state.cwd)
+        elif command_name == "diff":
+            self._check_diff(args, state.cwd)
+        elif command_name == "grep":
+            self._check_grep(args, state.cwd)
         elif command_name in _SHELL_COMMANDS:
             self._check_nested_shell(command_name, args, state)
         elif command_name in _UNSUPPORTED_SHELL_COMMANDS:
@@ -1283,6 +1395,386 @@ class WorkspaceCommandPathGuard:
     ) -> None:
         for raw_path in self._operands(values, value_options=value_options):
             self._check_path(raw_path, cwd, access)
+
+    def _check_read_command(
+        self,
+        command_name: str,
+        values: Sequence[str],
+        cwd: Path,
+    ) -> None:
+        """Dispatch a plain read-family command to its operand check.
+
+        `file` and `wc` carry a read-control option whose value is itself a
+        path (a pattern/magic file, or a NUL-delimited file-of-filenames), so
+        they are partitioned through the access-map substrate first; every
+        other read command is a flat operand check with only skip-valued
+        options (`_COMMAND_VALUE_OPTIONS`).
+        """
+        if command_name == "file":
+            values = self._partition_path_options(
+                values,
+                cwd,
+                option_access={
+                    "-f": "read",
+                    "-m": "read",
+                    "--files-from": "read",
+                    "--magic-file": "read",
+                },
+                attached_short_options=frozenset({"-f", "-m"}),
+            )
+        elif command_name == "wc":
+            values = self._partition_path_options(
+                values,
+                cwd,
+                option_access={"--files0-from": "read"},
+            )
+        self._check_operands(
+            values,
+            cwd,
+            "read",
+            value_options=_COMMAND_VALUE_OPTIONS.get(command_name, frozenset()),
+        )
+
+    def _check_sort(self, values: Sequence[str], cwd: Path) -> None:
+        """Classify `sort`'s write (`-o`/`-T`) and read-control path options.
+
+        `sort` owns two write slots (`-o`/`--output`, `-T`/`--temporary-directory`)
+        and two read-control slots (`--files0-from`, `--random-source`), so it
+        cannot be a flat read command: an unrecognized option must fail closed
+        rather than silently let a write slot bypass containment.
+        """
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value == "--":
+                for raw_path in values[index + 1 :]:
+                    self._check_path(raw_path, cwd, "read")
+                return
+
+            value_text = str(value)
+            if value_text.startswith("--"):
+                raw_option, separator, _ = value_text.partition("=")
+                option = self._resolve_long_option(raw_option, _SORT_KNOWN_LONG_OPTIONS)
+                if option is None:
+                    raise CommandPolicyViolation(
+                        f"cannot safely resolve sort option {raw_option}"
+                    )
+                if option in _SORT_DENIED_LONG_OPTIONS:
+                    raise CommandPolicyViolation(
+                        f"sort option {option} cannot safely delegate execution"
+                    )
+                path_access = _SORT_LONG_PATH_OPTIONS.get(option)
+                if path_access is not None:
+                    argument: str
+                    if separator:
+                        argument = self._derived_value(
+                            value, value[len(raw_option) + 1 :]
+                        )
+                        index += 1
+                    elif index + 1 < len(values):
+                        argument = values[index + 1]
+                        index += 2
+                    else:
+                        raise CommandPolicyViolation(
+                            f"missing sort argument for {option}"
+                        )
+                    self._check_path(argument, cwd, path_access)
+                    continue
+                if option in _SORT_LONG_SCALAR_OPTIONS:
+                    if separator:
+                        index += 1
+                    elif index + 1 < len(values):
+                        index += 2
+                    else:
+                        raise CommandPolicyViolation(
+                            f"missing sort argument for {option}"
+                        )
+                    continue
+                # The remaining recognized long options (`_SORT_LONG_FLAG_OPTIONS`,
+                # including the optional-value `--check[=WHEN]`) take no
+                # separate argument.
+                index += 1
+                continue
+
+            if value_text.startswith("-") and value_text != "-":
+                index = self._parse_short_option_cluster(
+                    values,
+                    index,
+                    cwd,
+                    flag_options=_SORT_SHORT_FLAG_OPTIONS,
+                    value_options=_SORT_SHORT_VALUE_OPTIONS,
+                )
+                continue
+
+            self._check_path(value, cwd, "read")
+            index += 1
+
+    def _check_uniq(self, values: Sequence[str], cwd: Path) -> None:
+        """Classify `uniq`'s positional read/write slots.
+
+        `uniq [OPTION]... [INPUT [OUTPUT]]`: the first operand is the input
+        (read), the second, if present, is the output (write). Its own
+        options only take scalar (non-path) values, so an unrecognized
+        `--`-option must still fail closed rather than silently shift the
+        positional write slot.
+        """
+        scalar_options = frozenset(
+            {"-f", "--skip-fields", "-s", "--skip-chars", "-w", "--check-chars"}
+        )
+        operands = self._partition_path_options(
+            values,
+            cwd,
+            option_access=dict.fromkeys(scalar_options),
+            attached_short_options=frozenset({"-f", "-s", "-w"}),
+            fail_closed_on_unknown_long_option=True,
+        )
+        if operands:
+            self._check_path(operands[0], cwd, "read")
+        if len(operands) > 1:
+            self._check_path(operands[1], cwd, "write")
+
+    def _check_diff(self, values: Sequence[str], cwd: Path) -> None:
+        """Classify `diff`'s write (`--output`) and read-control options.
+
+        `-N`/`--new-file` takes no argument, so it is unaffected by the
+        write-slot fail-closed rule below (which only gates `--`-prefixed
+        options that would otherwise consume an argument silently).
+        """
+        for raw_path in self._partition_path_options(
+            values,
+            cwd,
+            option_access={
+                "--output": "write",
+                "--from-file": "read",
+                "--to-file": "read",
+            },
+            fail_closed_on_unknown_long_option=True,
+        ):
+            self._check_path(raw_path, cwd, "read")
+
+    def _check_grep(self, values: Sequence[str], cwd: Path) -> None:
+        """Classify `grep`'s pattern-file read option and file operands.
+
+        `-r`/`-R` (recurse into a directory) take no argument, so the
+        directory they precede already reaches the file-operand loop below
+        unmodified; no dedicated handling is needed for them.
+        """
+        positionals: list[str] = []
+        explicit_pattern = False
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value == "--":
+                positionals.extend(values[index + 1 :])
+                break
+            value_text = str(value)
+            if value_text in {"-e", "--regexp"}:
+                explicit_pattern = True
+                index += 2
+                continue
+            if value_text.startswith("-e") or value_text.startswith("--regexp="):
+                explicit_pattern = True
+                index += 1
+                continue
+            if value_text in {"-f", "--file"}:
+                explicit_pattern = True
+                if index + 1 < len(values):
+                    self._check_path(values[index + 1], cwd, "read")
+                index += 2
+                continue
+            if value_text.startswith("-f") or value_text.startswith("--file="):
+                explicit_pattern = True
+                attached = value.split("=", 1)[1] if "=" in value_text else value[2:]
+                if attached:
+                    self._check_path(self._derived_value(value, attached), cwd, "read")
+                index += 1
+                continue
+            if value_text == "--exclude-from":
+                if index + 1 < len(values):
+                    self._check_path(values[index + 1], cwd, "read")
+                index += 2
+                continue
+            if value_text.startswith("--exclude-from="):
+                self._check_path(
+                    self._derived_value(value, value.split("=", 1)[1]),
+                    cwd,
+                    "read",
+                )
+                index += 1
+                continue
+            if value_text.startswith("-") and value_text != "-":
+                index += 1
+                continue
+            positionals.append(value)
+            index += 1
+
+        file_operands = positionals if explicit_pattern else positionals[1:]
+        for raw_path in file_operands:
+            self._check_path(raw_path, cwd, "read")
+
+    def _parse_short_option_cluster(
+        self,
+        values: Sequence[str],
+        index: int,
+        cwd: Path,
+        *,
+        flag_options: frozenset[str],
+        value_options: Mapping[str, PathAccess | None],
+    ) -> int:
+        """Parse one bundled short-option token (e.g. `-no<file>`).
+
+        GNU short options bundle into a single token where only the last
+        option in the cluster may carry a value (attached, e.g. `-ofile`, or
+        as the following token). Any character not recognized as a flag or a
+        value option fails closed rather than being silently skipped, so an
+        unmodeled option can never hide a path argument. Returns the index of
+        the next unconsumed token.
+        """
+        source = values[index]
+        options = str(source)[1:]
+        cursor = 0
+        while cursor < len(options):
+            option = options[cursor]
+            if option in flag_options:
+                cursor += 1
+                continue
+            if option not in value_options:
+                raise CommandPolicyViolation(f"cannot safely resolve option -{option}")
+            attached = options[cursor + 1 :]
+            argument: str
+            if attached:
+                argument = self._derived_value(source, attached)
+                next_index = index + 1
+            elif index + 1 < len(values):
+                argument = values[index + 1]
+                next_index = index + 2
+            else:
+                raise CommandPolicyViolation(f"missing argument for -{option}")
+            access = value_options[option]
+            if access is not None:
+                self._check_path(argument, cwd, access)
+            return next_index
+        return index + 1
+
+    @staticmethod
+    def _resolve_long_option(value: str, known: Iterable[str]) -> str | None:
+        """Resolve a GNU unambiguous-prefix long option, or None if it can't be.
+
+        `known` must contain the full `--...` option name. An exact match
+        always wins; otherwise a prefix must match exactly one candidate.
+        Ambiguous or unmatched prefixes return None so the caller decides
+        whether that is a benign skip (pure-read families) or a fail-closed
+        violation (families that own a write slot).
+        """
+        if value in known:
+            return value
+        matches = [candidate for candidate in known if candidate.startswith(value)]
+        if len(matches) == 1:
+            return matches[0]
+        return None
+
+    def _partition_path_options(
+        self,
+        values: Sequence[str],
+        cwd: Path,
+        *,
+        option_access: Mapping[str, PathAccess | None],
+        attached_short_options: frozenset[str] = frozenset(),
+        fail_closed_on_unknown_long_option: bool = False,
+    ) -> list[str]:
+        """Split path-bearing options from operands using a per-option access map.
+
+        Each key in `option_access` consumes exactly one following or attached
+        token; a `None` access consumes it without a path check (a scalar
+        value), `"read"`/`"write"` checks it. Long options resolve through
+        `_resolve_long_option` first, so an accepted abbreviation (`--out=`
+        for `--output`) is classified identically to the full name. A family
+        that owns a write slot must set `fail_closed_on_unknown_long_option`
+        so a long option this map cannot resolve — a typo, an unsupported
+        flag, or an ambiguous abbreviation — cannot silently bypass write
+        containment; pure-read families leave it unset and such an option is
+        left in place as an ordinary (over-checked, never under-checked)
+        operand, matching the family's existing single-access classification.
+        """
+        known_long_options = frozenset(
+            option for option in option_access if option.startswith("--")
+        )
+        remaining: list[str] = []
+        options_done = False
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if not options_done and value == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not value.startswith("-") or value == "-":
+                remaining.append(value)
+                index += 1
+                continue
+            if value in option_access:
+                if index + 1 >= len(values):
+                    raise CommandPolicyViolation(f"missing argument for {value}")
+                access = option_access[value]
+                if access is not None:
+                    self._check_path(values[index + 1], cwd, access)
+                index += 2
+                continue
+
+            value_text = str(value)
+            if value_text.startswith("--"):
+                raw_option, separator, _ = value_text.partition("=")
+                resolved = raw_option
+                if resolved not in option_access and known_long_options:
+                    candidate = self._resolve_long_option(
+                        raw_option, known_long_options
+                    )
+                    if candidate is not None:
+                        resolved = candidate
+                if resolved in option_access:
+                    access = option_access[resolved]
+                    argument: str
+                    if separator:
+                        argument = self._derived_value(
+                            value, value[len(raw_option) + 1 :]
+                        )
+                        index += 1
+                    elif index + 1 < len(values):
+                        argument = values[index + 1]
+                        index += 2
+                    else:
+                        raise CommandPolicyViolation(f"missing argument for {resolved}")
+                    if access is not None:
+                        self._check_path(argument, cwd, access)
+                    continue
+                if fail_closed_on_unknown_long_option:
+                    raise CommandPolicyViolation(
+                        f"cannot safely resolve option {raw_option}"
+                    )
+                index += 1
+                continue
+
+            matching_short = next(
+                (
+                    option
+                    for option in attached_short_options
+                    if value_text.startswith(option) and len(value_text) > len(option)
+                ),
+                None,
+            )
+            if matching_short is not None:
+                access = option_access[matching_short]
+                if access is not None:
+                    self._check_path(
+                        self._derived_value(value, value_text[len(matching_short) :]),
+                        cwd,
+                        access,
+                    )
+                index += 1
+                continue
+            # Unknown short options are not paths for these simple grammars.
+            index += 1
+        return remaining
 
     def _read_policy_script(self, raw_path: str, cwd: Path) -> str:
         script_path = self._check_path(raw_path, cwd, "read")
