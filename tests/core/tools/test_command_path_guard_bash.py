@@ -2442,6 +2442,51 @@ class TestSortUniqDiffGrepHandlers:
 
         guard.validate(command)
 
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "grep --fil={path} own.txt",
+            "grep --reg=sibling {path}",
+            "grep --exclude-fr={path} own.txt",
+        ],
+    )
+    def test_grep_long_option_abbreviation_still_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        # `--fil=`/`--reg=`/`--exclude-fr=` are GNU unambiguous-prefix
+        # abbreviations of `--file`/`--regexp`/`--exclude-from`. An
+        # unrecognized long option is skipped whole (this family's own
+        # documented pure-read permissiveness), so leaving these
+        # unresolved either drops the pattern-file read check entirely or
+        # misclassifies the real file operand as the (excluded) pattern
+        # positional — a silent read-containment bypass, not merely a
+        # missed classification.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "grep --fil=pattern.txt own.txt",
+            "grep --reg=needle own.txt",
+        ],
+    )
+    def test_grep_long_option_abbreviation_workspace_paths_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "pattern.txt").write_text("needle", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
     def test_grep_rejects_unmodeled_short_option(self, scoped_command_workspace):
         workspace, _, _ = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")

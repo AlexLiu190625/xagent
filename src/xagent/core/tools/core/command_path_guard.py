@@ -935,6 +935,7 @@ _GREP_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
     "D": None,
     "d": None,
 }
+_GREP_KNOWN_LONG_OPTIONS = frozenset({"--regexp", "--file", "--exclude-from"})
 
 
 @dataclass(frozen=True)
@@ -1849,7 +1850,18 @@ class WorkspaceCommandPathGuard:
 
         `-r`/`-R` (recurse into a directory) take no argument, so the
         directory they precede already reaches the file-operand loop below
-        unmodified; no dedicated handling is needed for them.
+        unmodified; no dedicated handling is needed for them. `--regexp`/
+        `--file`/`--exclude-from` resolve through `_resolve_long_option`
+        (GNU unambiguous-prefix abbreviation, e.g. `--fil=` for `--file`),
+        so an abbreviated spelling is classified identically to the full
+        name instead of falling through as an unrecognized option: for
+        `--file`/`--exclude-from` that would silently skip the read check
+        on the pattern-file argument, and for `--regexp` it would leave
+        `explicit_pattern` unset, misreading the real first file operand as
+        the (excluded) pattern positional. An option this family does not
+        recognize stays permissive (an ordinary, over-checked-never-
+        under-checked operand) rather than failing closed, matching grep's
+        existing pure-read classification.
         """
         positionals: list[str] = []
         explicit_pattern = False
@@ -1860,41 +1872,62 @@ class WorkspaceCommandPathGuard:
                 positionals.extend(values[index + 1 :])
                 break
             value_text = str(value)
-            if value_text in {"-e", "--regexp"}:
+            if value_text == "-e":
                 explicit_pattern = True
-                index += 2
+                _, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=None,
+                    context="grep argument for -e",
+                )
                 continue
-            if value_text.startswith("-e") or value_text.startswith("--regexp="):
+            if value_text.startswith("-e") and not value_text.startswith("--"):
                 explicit_pattern = True
                 index += 1
                 continue
-            if value_text in {"-f", "--file"}:
+            if value_text == "-f":
                 explicit_pattern = True
                 if index + 1 < len(values):
                     self._check_path(values[index + 1], cwd, "read")
                 index += 2
                 continue
-            if value_text.startswith("-f") or value_text.startswith("--file="):
+            if value_text.startswith("-f") and not value_text.startswith("--"):
                 explicit_pattern = True
-                attached = value.split("=", 1)[1] if "=" in value_text else value[2:]
+                attached = value_text[2:]
                 if attached:
                     self._check_path(self._derived_value(value, attached), cwd, "read")
                 index += 1
                 continue
-            if value_text == "--exclude-from":
-                if index + 1 < len(values):
-                    self._check_path(values[index + 1], cwd, "read")
-                index += 2
-                continue
-            if value_text.startswith("--exclude-from="):
-                self._check_path(
-                    self._derived_value(value, value.split("=", 1)[1]),
-                    cwd,
-                    "read",
-                )
-                index += 1
-                continue
             if value_text.startswith("--"):
+                raw_option, separator, attached = value_text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _GREP_KNOWN_LONG_OPTIONS
+                )
+                if resolved == "--regexp":
+                    explicit_pattern = True
+                    _, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"grep argument for {resolved}",
+                    )
+                    continue
+                if resolved in {"--file", "--exclude-from"}:
+                    if resolved == "--file":
+                        explicit_pattern = True
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"grep argument for {resolved}",
+                    )
+                    assert argument is not None
+                    self._check_path(argument, cwd, "read")
+                    continue
                 # Long flag options this family does not model (e.g.
                 # `--color=auto`) carry no path, so they are skipped rather
                 # than parsed further.
