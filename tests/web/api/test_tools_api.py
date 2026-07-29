@@ -159,7 +159,12 @@ class _AvailableToolsRouteHarness:
                 harness.events.append("sandbox_get")
                 return object()
 
-            async def attach(self, _scope: str, _user_id: str) -> bool:
+            async def attach_provider(
+                self, _scope: str, _user_id: str, _provider: object
+            ) -> bool:
+                # The route holds the provider it just obtained, so it
+                # attaches that object by identity rather than asking whether
+                # some provider exists for the key.
                 harness.events.append("sandbox_attach")
                 return True
 
