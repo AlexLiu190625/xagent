@@ -19,6 +19,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import (
     Any,
+    Callable,
     Iterable,
     Iterator,
     Mapping,
@@ -103,6 +104,14 @@ class _ValidationSession:
     argv_tokens: int = 0
     wrapped_bash_dispatch: bool = False
     effects: _EffectScope = field(default_factory=_EffectScope)
+    # `find`-scoped side channel: while set, every `_check_path` resolution
+    # reports its (raw_path, access) pair here before any short-circuit, so a
+    # `-exec`/`-execdir`/`-ok`/`-okdir` clause's write-ness can be classified
+    # from the same single enforcement pass that validates it. `None` outside
+    # find's own clause enforcement; `_check_find` saves and restores the
+    # prior value around every entry (including nested `find`) so an inner
+    # find's clause classification can never leak into an outer one.
+    find_clause_observer: Callable[[str, PathAccess], None] | None = None
 
     def charge_parse(self, source_chars: int) -> None:
         self.parse_attempts += 1
@@ -557,10 +566,24 @@ class _CommandValue(str):
     """A shell word plus whether bashlex proved it has no runtime expansion."""
 
     is_static: bool
+    # Arity-preserving no-op resolution target for this exact value, set only
+    # on the specific `{}` word tagged by `find`'s exec/execdir/ok/okdir clause
+    # enforcement (see `_tag_find_placeholder`). The tag rides on the value
+    # itself rather than on any shared instance/session state, so it cannot
+    # outlive the one call it was built for and cannot leak into unrelated
+    # path resolution (e.g. a literal `{}` filename outside `find`).
+    find_placeholder_cwd: Path | None
 
-    def __new__(cls, value: str, *, is_static: bool = True) -> _CommandValue:
+    def __new__(
+        cls,
+        value: str,
+        *,
+        is_static: bool = True,
+        find_placeholder_cwd: Path | None = None,
+    ) -> _CommandValue:
         instance = super().__new__(cls, value)
         instance.is_static = is_static
+        instance.find_placeholder_cwd = find_placeholder_cwd
         return instance
 
     def __getitem__(self, key: SupportsIndex | slice) -> str:
@@ -727,6 +750,7 @@ _CLASSIFIED_EXECUTABLE_COMMANDS = {
     "ln",
     "unlink",
     "shred",
+    "find",
     *(
         name
         for name in _COMMAND_WRAPPER_GRAMMARS
@@ -796,6 +820,43 @@ _SORT_KNOWN_LONG_OPTIONS = frozenset(
         *_SORT_DENIED_LONG_OPTIONS,
     }
 )
+
+
+@dataclass(frozen=True)
+class _PathEvent:
+    """One fixed (non-`{}`) find operand and the access it must be checked as."""
+
+    value: str
+    access: PathAccess
+
+
+@dataclass(frozen=True)
+class _FindExecClause:
+    """One `-exec`/`-execdir`/`-ok`/`-okdir ... ;`/`+` clause, unparsed inside."""
+
+    marker: str
+    command: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class _FindInvocation:
+    roots: tuple[str, ...]
+    path_events: tuple[_PathEvent, ...]
+    exec_clauses: tuple[_FindExecClause, ...]
+    writes_delete: bool = False
+
+
+# `-fprint`/`-fprint0`/`-fls` write one filename argument; `-fprintf` writes
+# the same filename argument followed by a separate format-string argument
+# that is never itself a path.
+_FIND_OUTPUT_ACTIONS: dict[str, int] = {
+    "-fprint": 1,
+    "-fprint0": 1,
+    "-fls": 1,
+    "-fprintf": 2,
+}
+_FIND_REFERENCE_PREDICATES = frozenset({"-newer", "-anewer", "-cnewer", "-samefile"})
+_FIND_EXEC_MARKERS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
 
 
 class WorkspaceCommandPathGuard:
@@ -1116,6 +1177,8 @@ class WorkspaceCommandPathGuard:
             self._check_move_or_link(args, state.cwd)
         elif command_name in {"unlink", "shred"}:
             self._check_destructive_file_command(command_name, args, state.cwd)
+        elif command_name == "find":
+            self._check_find(args, state)
         elif command_name in _SHELL_COMMANDS:
             self._check_nested_shell(command_name, args, state)
         elif command_name in _UNSUPPORTED_SHELL_COMMANDS:
@@ -1919,6 +1982,202 @@ class WorkspaceCommandPathGuard:
         for raw_path in operands:
             self._check_path(raw_path, cwd, "write")
 
+    def _check_find(self, literals: Sequence[str], state: _ShellState) -> None:
+        """Classify `find` per the frozen single-pass, observer-scoped algorithm.
+
+        1. Parse once into fixed path events, exec/execdir/ok/okdir clauses,
+           and a delete flag.
+        2. Fixed path events are checked on the real session effects.
+        3. Each clause's write-ness is classified through the SAME real
+           enforcement pass (`_validate_nested_command_words`), via a
+           clause-scoped observer that inspects every raw operand before that
+           operand's own path resolution: an OR over `{}` presence and
+           execdir/okdir-relative operands, aggregated with `-delete`.
+        4. The root is then checked write if any clause (or `-delete`) writes,
+           read otherwise; a write root additionally poisons the session
+           (find's per-match children are not exact-registerable, so the
+           write effect cannot be captured as a single path).
+        """
+        invocation = self._parse_find_invocation(literals)
+        for event in invocation.path_events:
+            self._check_path(event.value, state.cwd, event.access)
+
+        session = _active_validation_session()
+        writes_root = invocation.writes_delete
+        saved_observer = session.find_clause_observer
+        # Suspend whatever observer an enclosing find clause left active: this
+        # find's own path events and root must never be misclassified as
+        # belonging to an outer find's clause, and a nested find below must
+        # not corrupt this find's own classification either.
+        session.find_clause_observer = None
+        try:
+            for clause in invocation.exec_clauses:
+                clause_writes_root = False
+
+                def _observe(
+                    raw_path: str,
+                    access: PathAccess,
+                    _clause: _FindExecClause = clause,
+                ) -> None:
+                    nonlocal clause_writes_root
+                    if access != "write":
+                        return
+                    if "{}" in str(raw_path) or (
+                        _clause.marker in {"-execdir", "-okdir"}
+                        and self._is_relative_file_operand(raw_path)
+                    ):
+                        clause_writes_root = True
+
+                session.find_clause_observer = _observe
+                try:
+                    self._validate_nested_command_words(
+                        self._tag_find_placeholder(clause.command, state.cwd),
+                        state,
+                    )
+                finally:
+                    session.find_clause_observer = None
+                writes_root = writes_root or clause_writes_root
+
+            root_access: PathAccess = "write" if writes_root else "read"
+            for root in invocation.roots:
+                self._check_path(root, state.cwd, root_access)
+            if writes_root:
+                session.effects.unknown_effect = True
+        finally:
+            session.find_clause_observer = saved_observer
+
+    def _parse_find_invocation(self, literals: Sequence[str]) -> _FindInvocation:
+        """Parse `find`'s argv once into roots, fixed path events and clauses.
+
+        Global traversal-mode options (`-H`/`-L`/`-P`, `-Olevel`, `-D debugopts`)
+        precede the starting points and must not consume them. `-files0-from`
+        supplies roots at runtime and is rejected outright rather than trusted
+        blind. Reference predicates take a path argument except `-newerXt`,
+        whose argument is a timestamp string, not a path.
+        """
+        self._reject_dynamic_values("find arguments", literals)
+
+        root_start = 0
+        while root_start < len(literals):
+            option = str(literals[root_start])
+            if option in {"-H", "-L"}:
+                raise CommandPolicyViolation(
+                    "cannot safely inspect find traversal that follows symbolic links"
+                )
+            if option == "-P" or option.startswith("-O"):
+                root_start += 1
+                continue
+            if option == "-D":
+                if root_start + 1 >= len(literals):
+                    raise CommandPolicyViolation("missing find argument for -D")
+                root_start += 2
+                continue
+            if option.startswith("-D"):
+                root_start += 1
+                continue
+            break
+
+        roots: list[str] = []
+        expression_start = len(literals)
+        for index, value in enumerate(literals[root_start:], start=root_start):
+            text = str(value)
+            if text.startswith("-") or text in {"!", "("}:
+                expression_start = index
+                break
+            roots.append(value)
+        if not roots:
+            roots = ["."]
+
+        expression = literals[expression_start:]
+        path_events: list[_PathEvent] = []
+        clauses: list[_FindExecClause] = []
+        writes_delete = False
+        index = 0
+        while index < len(expression):
+            marker = str(expression[index])
+            if marker == "-files0-from" or marker.startswith("-files0-from="):
+                raise CommandPolicyViolation(
+                    "cannot safely inspect find runtime root list"
+                )
+            if marker == "-delete":
+                writes_delete = True
+                index += 1
+                continue
+            if marker in _FIND_OUTPUT_ACTIONS:
+                argument_count = _FIND_OUTPUT_ACTIONS[marker]
+                if index + argument_count >= len(expression):
+                    raise CommandPolicyViolation(f"missing find argument for {marker}")
+                path_events.append(_PathEvent(expression[index + 1], "write"))
+                index += argument_count + 1
+                continue
+            if marker in _FIND_REFERENCE_PREDICATES or (
+                marker.startswith("-newer")
+                and marker != "-newer"
+                and not marker.endswith("t")
+            ):
+                if index + 1 >= len(expression):
+                    raise CommandPolicyViolation(f"missing find argument for {marker}")
+                path_events.append(_PathEvent(expression[index + 1], "read"))
+                index += 2
+                continue
+            if marker.startswith("-newer") and marker.endswith("t"):
+                if index + 1 >= len(expression):
+                    raise CommandPolicyViolation(f"missing find argument for {marker}")
+                index += 2
+                continue
+            if marker not in _FIND_EXEC_MARKERS:
+                index += 1
+                continue
+
+            nested: list[str] = []
+            index += 1
+            while index < len(expression) and str(expression[index]) not in {";", "+"}:
+                nested.append(expression[index])
+                index += 1
+            if not nested or index >= len(expression):
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect unterminated find action {marker}"
+                )
+            clauses.append(_FindExecClause(marker=marker, command=tuple(nested)))
+            index += 1
+
+        return _FindInvocation(
+            roots=tuple(roots),
+            path_events=tuple(path_events),
+            exec_clauses=tuple(clauses),
+            writes_delete=writes_delete,
+        )
+
+    @staticmethod
+    def _is_relative_file_operand(raw_path: str) -> bool:
+        return raw_path not in {"", "-", "{}"} and not Path(str(raw_path)).is_absolute()
+
+    @staticmethod
+    def _tag_find_placeholder(
+        words: Sequence[str],
+        cwd: Path,
+    ) -> tuple[_CommandValue, ...]:
+        """Tag exact `{}` operands with find's arity-preserving cwd resolution.
+
+        `{}` is never removed or replaced in the operand vector (removing it
+        would shift positional operands, e.g. turning a 2-operand `cp` into a
+        1-operand call that silently skips its destination check); only the
+        specific `_CommandValue` instance representing a literal `{}` word
+        carries the resolution target, so an unrelated word is never affected.
+        """
+        tagged: list[_CommandValue] = []
+        for word in words:
+            if str(word) != "{}":
+                tagged.append(
+                    word if isinstance(word, _CommandValue) else _CommandValue(word)
+                )
+                continue
+            is_static = not isinstance(word, _CommandValue) or word.is_static
+            tagged.append(
+                _CommandValue(word, is_static=is_static, find_placeholder_cwd=cwd)
+            )
+        return tuple(tagged)
+
     def _parse_short_option_cluster(
         self,
         values: Sequence[str],
@@ -2536,6 +2795,21 @@ class WorkspaceCommandPathGuard:
                 "cannot resolve dynamic path operand; enumerate concrete paths "
                 "instead of using active globs or shell expansions"
             )
+
+        # Invariant: the find-clause observer must fire before any sentinel
+        # short-circuit below (including the `{}` no-op resolution). A `{}`
+        # write operand that returns early first would never reach the
+        # observer, so `find`'s write-root classification would silently miss
+        # every `{}` exec argument.
+        find_observer = _active_validation_session().find_clause_observer
+        if find_observer is not None:
+            find_observer(raw_path, access)
+
+        if (
+            isinstance(raw_path, _CommandValue)
+            and raw_path.find_placeholder_cwd is not None
+        ):
+            return raw_path.find_placeholder_cwd
 
         if raw_path in {"", "-"}:
             return cwd

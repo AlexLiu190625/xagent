@@ -2861,13 +2861,15 @@ class TestCommandCoverage:
         "ln": "_check_move_or_link",
         "unlink": "_check_destructive_file_command",
         "shred": "_check_destructive_file_command",
+        "find": "_check_find",
     }
     _DEDICATED_HANDLER_COMMANDS = frozenset(_DEDICATED_HANDLER_METHODS)
     _S1_COMMANDS = frozenset({"sort", "uniq", "diff", "grep"}) | _READ_FAMILY_COMMANDS
     _S2_COMMANDS = _WRITE_CREATE_FAMILY_COMMANDS | frozenset(
         {"cp", "install", "mv", "ln", "unlink", "shred"}
     )
-    _ALL_COMMANDS = _S1_COMMANDS | _S2_COMMANDS
+    _S3_COMMANDS = frozenset({"find"})
+    _ALL_COMMANDS = _S1_COMMANDS | _S2_COMMANDS | _S3_COMMANDS
 
     # Each entry: (positive command, negative command template with `{outside}`).
     _REGISTRY: dict[str, tuple[str, str]] = {
@@ -2899,6 +2901,7 @@ class TestCommandCoverage:
         "ln": ("ln own.txt dest.txt", "ln own.txt {outside}"),
         "unlink": ("unlink own.txt", "unlink {outside}"),
         "shred": ("shred own.txt", "shred {outside}"),
+        "find": ("find own.txt -print", "find {outside}"),
     }
 
     def test_registry_covers_every_classified_command(self):
@@ -3149,3 +3152,235 @@ class TestNoEffectCommandClassification:
             match="cannot inspect a script affected by an earlier command",
         ):
             guard.validate("python -c pass && bash safe.sh")
+
+
+class TestFindCommand:
+    """`find`: frozen single-pass, observer-scoped `-exec`/`-execdir` algorithm.
+
+    The searched root's read/write classification comes from a clause-scoped
+    observer that inspects every raw operand of an exec/execdir/ok/okdir
+    clause's real enforcement pass, not from a second throwaway pass and not
+    from inspecting `written_paths` after the fact.
+    """
+
+    def test_exec_write_via_placeholder_marks_root_write(
+        self, scoped_command_workspace
+    ):
+        # The observer fires on the raw "{}" operand before any short-circuit
+        # and marks the searched root write-sensitive; the external directory
+        # is only approved for read, so the write-checked root is rejected.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        external_dir = shlex.quote(str(external_file.parent))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate("find {ext} -exec rm {{}} \\;".format(ext=external_dir))
+
+        assert exc_info.value.access == "write"
+
+    def test_exec_placeholder_is_arity_preserving_destination_still_checked(
+        self, scoped_command_workspace
+    ):
+        # "{}" stays a real operand (never pre-stripped or substituted before
+        # dispatch), so `cp`'s source/destination split is unaffected and the
+        # fixed destination is still write-checked by the same enforcement
+        # pass that classified "{}".
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("data", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate("find . -exec cp {{}} {out} \\;".format(out=outside))
+
+        assert exc_info.value.access == "write"
+
+    def test_exec_write_root_poisons_later_script_inspection(
+        self, scoped_command_workspace
+    ):
+        # A write-root find sets unknown_effect: find's per-match children are
+        # not exact-registerable, so the poison must be session-wide.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "build.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate("find . -exec rm {} \\; ; bash build.sh")
+
+    def test_exec_then_execdir_write_or_aggregates_over_all_clauses(
+        self, scoped_command_workspace
+    ):
+        # writes_root is an OR over every clause: a read clause first must not
+        # shadow a write clause that follows it.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        external_dir = shlex.quote(str(external_file.parent))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                "find {ext} -exec cat {{}} \\; -execdir rm {{}} \\;".format(
+                    ext=external_dir
+                )
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_execdir_then_exec_write_or_aggregates_regardless_of_order(
+        self, scoped_command_workspace
+    ):
+        # Mutation pin for the same invariant in the opposite clause order: a
+        # last-clause-wins bug (assignment instead of OR-accumulate) would let
+        # the later read clause erase the earlier write classification.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        external_dir = shlex.quote(str(external_file.parent))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                "find {ext} -execdir rm {{}} \\; -exec cat {{}} \\;".format(
+                    ext=external_dir
+                )
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_fprintf_out_of_workspace_destination_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate("find . -fprintf {out} '%p'".format(out=outside))
+
+        assert exc_info.value.access == "write"
+
+    def test_fprintf_in_workspace_registers_on_the_real_effects(
+        self, scoped_command_workspace
+    ):
+        # Fixed path events are checked on the real session effects, not a
+        # throwaway classification pass, so the write is visible to a later
+        # script inspection in the same command chain.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "report.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate("find . -fprintf report.sh '%p' && bash report.sh")
+
+    def test_files0_from_fails_closed(self, scoped_command_workspace):
+        # A runtime root list cannot be inspected statically.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("find -files0-from roots.txt")
+
+    @pytest.mark.parametrize("global_option", ["-O2", "-D tree"])
+    def test_global_options_do_not_swallow_the_following_root(
+        self, scoped_command_workspace, global_option
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"find {global_option} {outside}")
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize("global_option", ["-O2", "-D tree"])
+    def test_global_options_root_inside_workspace_is_allowed(
+        self, scoped_command_workspace, global_option
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own_dir").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"find {global_option} own_dir")
+
+    def test_newermt_timestamp_argument_is_not_treated_as_a_path(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("find . -newermt '2026-01-01'")
+
+    def test_samefile_reference_argument_is_read_checked(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate("find . -samefile {out}".format(out=outside))
+
+        assert exc_info.value.access == "read"
+
+    def test_delete_marks_root_write(self, scoped_command_workspace):
+        # `-delete` also participates in the writes_root OR, not only
+        # exec/execdir/ok/okdir clauses.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        external_dir = shlex.quote(str(external_file.parent))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate("find {ext} -delete".format(ext=external_dir))
+
+        assert exc_info.value.access == "write"
+
+    def test_nested_find_sharing_the_outer_terminator_fails_closed(
+        self, scoped_command_workspace
+    ):
+        # `-exec`/`-execdir` consume tokens up to the first bare `;`/`+`
+        # regardless of nesting (matching find's own runtime parser), so an
+        # inner find embedded in an outer clause loses its own terminator to
+        # the outer's. The inner find then raises for its own unterminated
+        # `-execdir`, which is a sound fail-closed outcome, not a corrupted
+        # outer classification.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "a").mkdir()
+        (workspace.output_dir / "a" / "b").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("find a -exec find b -execdir rm {} \\; \\;")
+
+    def test_nested_find_without_further_exec_nesting_leaves_outer_intact(
+        self, scoped_command_workspace
+    ):
+        # A cleanly-terminated nested find (no further -exec inside it) is a
+        # positive control: the inner find's own write classification (via
+        # `-delete`) must reach the real session effects exactly as an outer
+        # command's would, and the outer find's own clause-loop bookkeeping
+        # must not be corrupted by the recursion (the outer clause here is a
+        # plain read of the inner find's stdout, never itself write-flagged).
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "a").mkdir()
+        (workspace.output_dir / "b").mkdir()
+        (workspace.output_dir / "build.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate("find a -exec find b -delete \\; ; bash build.sh")
+
+    def test_positive_find_inside_workspace_with_exec_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("data", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("find . -exec cat {} \\;")
