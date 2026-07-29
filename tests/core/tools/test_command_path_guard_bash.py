@@ -2865,6 +2865,12 @@ class TestCommandCoverage:
         "tar": "_check_tar",
         "sed": "_check_script_command",
         "awk": "_check_script_command",
+        "dd": "_check_dd",
+        "base64": "_check_base64",
+        "gzip": "_check_gzip",
+        "rsync": "_check_rsync",
+        "curl": "_check_curl",
+        "wget": "_check_wget",
     }
     _DEDICATED_HANDLER_COMMANDS = frozenset(_DEDICATED_HANDLER_METHODS)
     _S1_COMMANDS = frozenset({"sort", "uniq", "diff", "grep"}) | _READ_FAMILY_COMMANDS
@@ -2874,8 +2880,14 @@ class TestCommandCoverage:
     _S3_COMMANDS = frozenset({"find"})
     _S4_COMMANDS = frozenset({"tar"})
     _S5_COMMANDS = frozenset({"sed", "awk"})
+    _S6_COMMANDS = frozenset({"dd", "base64", "gzip", "rsync", "curl", "wget"})
     _ALL_COMMANDS = (
-        _S1_COMMANDS | _S2_COMMANDS | _S3_COMMANDS | _S4_COMMANDS | _S5_COMMANDS
+        _S1_COMMANDS
+        | _S2_COMMANDS
+        | _S3_COMMANDS
+        | _S4_COMMANDS
+        | _S5_COMMANDS
+        | _S6_COMMANDS
     )
 
     # Each entry: (positive command, negative command template with `{outside}`).
@@ -2914,6 +2926,21 @@ class TestCommandCoverage:
         "awk": (
             "awk '{print $0}' own.txt",
             "awk '{{print $0 > \"{outside}\"}}' own.txt",
+        ),
+        "dd": ("dd if=own.txt of=dest.bin", "dd if=own.txt of={outside}"),
+        "base64": (
+            "base64 -i own.txt -o own.b64",
+            "base64 -i own.txt -o {outside}",
+        ),
+        "gzip": ("gzip own.txt", "gzip {outside}"),
+        "rsync": ("rsync own.txt dest.txt", "rsync own.txt {outside}"),
+        "curl": (
+            "curl -o out.bin https://example.invalid/file",
+            "curl -o {outside} https://example.invalid/file",
+        ),
+        "wget": (
+            "wget -O out.bin https://example.invalid/file",
+            "wget -O {outside} https://example.invalid/file",
         ),
     }
 
@@ -4039,3 +4066,302 @@ class TestSedAwkCommand:
                 guard._inspect_script_file(
                     "sed", str(script_path), workspace.output_dir
                 )
+
+
+class TestDdBase64GzipRemoteTransferCommand:
+    """`dd`/`base64`/`gzip` and the remote-transfer family (`rsync`/`curl`/
+    `wget`): the final family stage of the file-command policy layer.
+
+    `gzip`'s default mode is the family's M2-additive case (a real write
+    check on the operand plus `unknown_effect` for the non-enumerable
+    derived `.gz`); `rsync` is the family's all-or-nothing remote case
+    (M5: any remote operand rejects the whole invocation, not just the
+    remote side); `curl`/`wget` fail closed on their own uninspectable
+    option grammar, independent of `_is_remote_transfer_operand`.
+    """
+
+    # -- dd --------------------------------------------------------------
+
+    def test_dd_write_operand_outside_workspace_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"dd if=own.txt of={shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "write"
+
+    def test_dd_read_operand_outside_workspace_rejected(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"dd if={shlex.quote(str(sibling_file))} of=own.txt")
+
+        assert exc_info.value.access == "read"
+
+    def test_dd_non_path_assignments_are_allowed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("dd if=own.txt of=own2.txt bs=512 count=1")
+
+    def test_dd_flag_assignments_are_not_paths(self, scoped_command_workspace):
+        # `iflag=`/`oflag=` share the `if=`/`of=` prefix character but are
+        # not path-bearing; a substring match instead of an exact prefix
+        # match would misclassify them.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("dd iflag=fullblock oflag=sync")
+
+    def test_dd_argv_uses_same_path_policy(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate_argv(["dd", f"if={sibling_file}", "of=copy.bin"])
+
+    # -- base64 ------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "base64 -i{path}",
+            "base64 --input {path}",
+            "base64 --input={path}",
+            "base64 -di{path}",
+            "base64 -o{path}",
+            "base64 --output {path}",
+            "base64 --output={path}",
+            "base64 -do{path}",
+        ],
+    )
+    def test_rejects_base64_path_option_variants(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    def test_base64_workspace_input_and_output_are_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("base64 -i own.txt -o own.b64")
+
+    def test_base64_argv_uses_same_path_policy(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate_argv(["base64", "-i", str(sibling_file)])
+
+    # -- gzip ----------------------------------------------------------------
+
+    def test_gzip_default_mode_write_checks_the_operand(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"gzip {shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "write"
+
+    def test_gzip_stdout_mode_keeps_external_operand_read_only(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"gzip -c {shlex.quote(str(external_file))}")
+        guard.validate(f"gzip -lt {shlex.quote(str(external_file))}")
+
+    def test_gzip_default_mode_poisons_later_script_inspection(
+        self, scoped_command_workspace
+    ):
+        # The `.gz` gzip actually creates is a distinct, non-enumerable path
+        # this guard never computes; the operand's own write check cannot
+        # capture that derived file, so `unknown_effect` (M2 additive) must
+        # poison later script inspection in the same chain.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate("gzip own.txt ; bash own.txt.gz")
+
+    # -- rsync -----------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "rsync own.txt host:/remote",
+            "rsync own.txt user@host:/remote",
+            "rsync own.txt rsync://host/remote",
+        ],
+    )
+    def test_rsync_remote_operand_rejects_the_whole_invocation(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_rsync_local_destination_outside_workspace_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"rsync own.txt {shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "write"
+
+    def test_rsync_link_dest_requires_write_authorization(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"rsync -a --link-dest={shlex.quote(str(external_file.parent))} "
+                "source copied"
+            )
+
+        assert exc_info.value.access == "write"
+
+    # -- curl/wget/rsync shared uninspectable-option pins -----------------
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -O https://example.invalid/file",
+            "wget --config config",
+            "rsync host:/secret copied",
+            "rsync --files-from=list.txt source copied",
+        ],
+    )
+    def test_rejects_uninspectable_new_tool_path_sources(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_wget_config_option_fails_closed_regardless_of_path(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(f"wget --config {shlex.quote(str(sibling_file))}")
+
+    # -- curl ----------------------------------------------------------------
+
+    def test_curl_output_outside_workspace_rejected(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"curl -o {outside} https://example.invalid/file")
+
+        assert exc_info.value.access == "write"
+
+    # -- wget ------------------------------------------------------------
+
+    def test_wget_output_outside_workspace_rejected(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"wget -O {outside} https://example.invalid/file")
+
+        assert exc_info.value.access == "write"
+
+    # -- bypass-pin allow-list (ported from the abandoned command-families
+    # branch, re-expressed on the current effect model; the `environment=`
+    # kwarg variants from that branch are not ported — see m2/S6 deviation
+    # notes) ----------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "gzip -c own.txt",
+            "rsync -av own.txt copied.txt",
+            "curl -oout.txt https://example.invalid/file",
+            "wget -Oout.txt https://example.invalid/file",
+        ],
+    )
+    def test_allows_newly_classified_tool_workspace_paths(
+        self,
+        scoped_command_workspace,
+        command,
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "gzip {path}",
+            "rsync own.txt {path}",
+            "curl -o {path} https://example.invalid/file",
+            "wget -O {path} https://example.invalid/file",
+        ],
+    )
+    def test_rejects_newly_classified_tool_writes_to_sibling(
+        self,
+        scoped_command_workspace,
+        command_template,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    def test_rejects_newly_classified_tool_reads_from_sibling(
+        self,
+        scoped_command_workspace,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"rsync {shlex.quote(str(sibling_file))} copied.txt")
+
+        assert exc_info.value.access == "read"

@@ -806,6 +806,12 @@ _CLASSIFIED_EXECUTABLE_COMMANDS = {
     "shred",
     "find",
     "tar",
+    "dd",
+    "base64",
+    "gzip",
+    "rsync",
+    "curl",
+    "wget",
     *(
         name
         for name in _COMMAND_WRAPPER_GRAMMARS
@@ -1279,6 +1285,18 @@ class WorkspaceCommandPathGuard:
             self._check_script_command(_SED_GRAMMAR, args, state.cwd)
         elif command_name == "awk":
             self._check_script_command(_AWK_GRAMMAR, args, state.cwd)
+        elif command_name == "dd":
+            self._check_dd(args, state.cwd)
+        elif command_name == "base64":
+            self._check_base64(args, state.cwd)
+        elif command_name == "gzip":
+            self._check_gzip(args, state.cwd)
+        elif command_name == "rsync":
+            self._check_rsync(args, state.cwd)
+        elif command_name == "curl":
+            self._check_curl(args, state.cwd)
+        elif command_name == "wget":
+            self._check_wget(args, state.cwd)
         elif command_name in _SHELL_COMMANDS:
             self._check_nested_shell(command_name, args, state)
         elif command_name in _UNSUPPORTED_SHELL_COMMANDS:
@@ -3366,6 +3384,553 @@ class WorkspaceCommandPathGuard:
                 return script[start:cursor]
             cursor += 1
         raise CommandPolicyViolation("cannot safely inspect awk redirect target")
+
+    def _check_dd(self, values: Sequence[str], cwd: Path) -> None:
+        """`dd`: `if=`/`of=` operands are paths; every other `key=value`
+        operand (`bs=`, `count=`, `seek=`, `iflag=`, `oflag=`, ...) is a
+        scalar and is never a path.
+        """
+        self._reject_dynamic_values("dd arguments", values)
+        for value in values:
+            text = str(value)
+            if text.startswith("if="):
+                self._check_path(value.split("=", 1)[1], cwd, "read")
+            elif text.startswith("of="):
+                self._check_path(value.split("=", 1)[1], cwd, "write")
+
+    def _check_base64(self, values: Sequence[str], cwd: Path) -> None:
+        """`base64`: `-i`/`--input` reads, `-o`/`--output` writes.
+
+        `-b`/`--break` and `-w`/`--wrap` take a scalar column-width value
+        that is never a path.
+        """
+        self._reject_dynamic_values("base64 arguments", values)
+        inputs: list[str] = []
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value == "--":
+                inputs.extend(values[index + 1 :])
+                break
+            if value in {"--input", "--output"}:
+                if index + 1 < len(values):
+                    self._check_path(
+                        values[index + 1],
+                        cwd,
+                        "read" if value == "--input" else "write",
+                    )
+                index += 2
+                continue
+            if value.startswith(("--input=", "--output=")):
+                self._check_path(
+                    value.split("=", 1)[1],
+                    cwd,
+                    "read" if value.startswith("--input=") else "write",
+                )
+                index += 1
+                continue
+            if value in {"--break", "--wrap"}:
+                index += 2
+                continue
+            if value.startswith(("--break=", "--wrap=")):
+                index += 1
+                continue
+            if value.startswith("-") and not value.startswith("--") and value != "-":
+                index = self._check_base64_short_options(values, index, cwd)
+                continue
+            inputs.append(value)
+            index += 1
+        for raw_path in inputs:
+            self._check_path(raw_path, cwd, "read")
+
+    def _check_base64_short_options(
+        self,
+        values: Sequence[str],
+        index: int,
+        cwd: Path,
+    ) -> int:
+        """Parse one bundled base64 short-option token (e.g. `-di<file>`).
+
+        Only `i`/`o`/`b`/`w` take a value (attached, e.g. `-ifile`, or as the
+        following token); any other character in the cluster (`-d` decode,
+        etc.) is a flag and is skipped without consuming an argument.
+        """
+        value = values[index]
+        options = value[1:]
+        cursor = 0
+        while cursor < len(options):
+            option = options[cursor]
+            if option in {"i", "o", "b", "w"}:
+                attached = options[cursor + 1 :]
+                argument, next_index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached) if attached else None
+                    ),
+                    context=f"base64 argument for -{option}",
+                    required=False,
+                )
+                if argument is not None and option in {"i", "o"}:
+                    self._check_path(
+                        argument,
+                        cwd,
+                        "read" if option == "i" else "write",
+                    )
+                return next_index
+            cursor += 1
+        return index + 1
+
+    def _check_gzip(self, values: Sequence[str], cwd: Path) -> None:
+        """`gzip`: default mode replaces its operand with a derived `.gz` file.
+
+        The `.gz` suffix (and any `--suffix`-overridden variant) is a
+        distinct, non-enumerable path this guard does not compute, so
+        default mode both write-checks the operand itself (gzip removes the
+        original after compressing it) and poisons `unknown_effect` for the
+        derived compressed file — additive to, not a replacement for, the
+        operand's own containment check (M2). `-c`/`--stdout`/`-l`/`--list`/
+        `-t`/`--test` never create or remove a file, so the operand stays a
+        plain read in those modes.
+        """
+        self._reject_dynamic_values("gzip arguments", values)
+        read_only_mode = any(
+            value
+            in {
+                "-c",
+                "--stdout",
+                "--to-stdout",
+                "-l",
+                "--list",
+                "-t",
+                "--test",
+            }
+            or (
+                str(value).startswith("-")
+                and not str(value).startswith("--")
+                and any(flag in str(value)[1:] for flag in {"c", "l", "t"})
+            )
+            for value in values
+        )
+        operands = self._strict_simple_operands(
+            "gzip",
+            values,
+            flag_options={
+                "-a",
+                "--ascii",
+                "-c",
+                "--stdout",
+                "--to-stdout",
+                "-d",
+                "--decompress",
+                "--uncompress",
+                "-f",
+                "--force",
+                "-h",
+                "--help",
+                "-k",
+                "--keep",
+                "-l",
+                "--list",
+                "-n",
+                "--no-name",
+                "-N",
+                "--name",
+                "-q",
+                "--quiet",
+                "-r",
+                "--recursive",
+                "-t",
+                "--test",
+                "-v",
+                "--verbose",
+                "-V",
+                "--version",
+                *{f"-{level}" for level in range(1, 10)},
+            },
+            scalar_options={"-S", "--suffix"},
+            allow_short_bundles=True,
+        )
+        access: PathAccess = "read" if read_only_mode else "write"
+        if not read_only_mode:
+            _active_validation_session().effects.unknown_effect = True
+        for operand in operands:
+            self._check_path(operand, cwd, access)
+
+    def _strict_simple_operands(
+        self,
+        command_name: str,
+        values: Sequence[str],
+        *,
+        flag_options: set[str],
+        scalar_options: set[str] | frozenset[str] = frozenset(),
+        allow_short_bundles: bool = False,
+    ) -> list[str]:
+        """Parse a simple GNU-style argv into flag/scalar options and operands.
+
+        An option this family does not recognize fails closed rather than
+        being silently treated as an operand or skipped, so an unmodeled
+        option can never hide (or misclassify) a path argument. Only used by
+        families narrow enough that every option is either a no-value flag
+        or a single-scalar-value option (gzip); families with path-bearing
+        options use `_partition_path_options` instead.
+        """
+        operands: list[str] = []
+        options_done = False
+        index = 0
+        short_flags = {
+            option[1:]
+            for option in flag_options
+            if option.startswith("-") and not option.startswith("--")
+        }
+        while index < len(values):
+            value = values[index]
+            text = str(value)
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not text.startswith("-") or text == "-":
+                operands.append(value)
+                index += 1
+                continue
+            if text in flag_options:
+                index += 1
+                continue
+            if text in scalar_options:
+                if index + 1 >= len(values):
+                    raise CommandPolicyViolation(
+                        f"missing {command_name} argument for {text}"
+                    )
+                index += 2
+                continue
+            if any(
+                text.startswith(f"{option}=")
+                for option in scalar_options
+                if option.startswith("--")
+            ):
+                index += 1
+                continue
+            if (
+                allow_short_bundles
+                and text.startswith("-")
+                and not text.startswith("--")
+                and set(text[1:]).issubset(short_flags)
+            ):
+                index += 1
+                continue
+            raise CommandPolicyViolation(
+                f"cannot safely inspect {command_name} option {text}"
+            )
+        return operands
+
+    def _check_rsync(self, values: Sequence[str], cwd: Path) -> None:
+        """`rsync`: any remote operand rejects the WHOLE invocation (M5).
+
+        A local invocation classifies its source/dest positionals plus its
+        write/read-control options. `--link-dest` is a write slot even
+        though it only *reads* its argument today: rsync may hard-link
+        unchanged files from that tree straight into the destination, so a
+        read-only external root is not sufficient authorization for it.
+        `--files-from`/`-f`/`--filter`/`-e`/`--rsh`/... delegate to an
+        external file list or shell command this guard cannot inspect
+        safely and fail closed rather than silently bypassing containment.
+        """
+        self._reject_dynamic_values("rsync arguments", values)
+        denied_options = {
+            "-e",
+            "--rsh",
+            "-f",
+            "--filter",
+            "--files-from",
+            "--include-from",
+            "--exclude-from",
+            "--password-file",
+            "--rsync-path",
+            "--copy-links",
+            "--copy-unsafe-links",
+            "--keep-dirlinks",
+        }
+        path_options: dict[str, PathAccess] = {
+            "--backup-dir": "write",
+            "--partial-dir": "write",
+            "--temp-dir": "write",
+            "--compare-dest": "read",
+            "--copy-dest": "read",
+            "--link-dest": "write",
+        }
+        scalar_options = {
+            "--block-size",
+            "--bwlimit",
+            "--checksum-choice",
+            "--chmod",
+            "--compress-choice",
+            "--compress-level",
+            "--contimeout",
+            "--max-alloc",
+            "--max-delete",
+            "--max-size",
+            "--min-size",
+            "--out-format",
+            "--port",
+            "--sockopts",
+            "--timeout",
+            "--usermap",
+            "--groupmap",
+        }
+        operands: list[str] = []
+        options_done = False
+        index = 0
+        while index < len(values):
+            value = values[index]
+            text = str(value)
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not text.startswith("-") or text == "-":
+                operands.append(value)
+                index += 1
+                continue
+            option, separator, attached_text = text.partition("=")
+            if option in denied_options or (
+                text.startswith("-")
+                and not text.startswith("--")
+                and any(flag in text[1:] for flag in {"e", "f", "L", "H"})
+            ):
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect rsync option {option}"
+                )
+            if option in path_options:
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"rsync argument for {option}",
+                )
+                assert argument is not None
+                self._check_path(argument, cwd, path_options[option])
+                continue
+            if option in scalar_options:
+                _, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"rsync argument for {option}",
+                )
+                continue
+            if text.startswith("--"):
+                # Long flag options are argument-free here. Options with
+                # unmodeled values fail closed instead of shifting operands.
+                if separator:
+                    raise CommandPolicyViolation(
+                        f"cannot safely inspect rsync option {option}"
+                    )
+                index += 1
+                continue
+            # Common short flags may be bundled (for example -avz).
+            index += 1
+
+        if len(operands) < 2:
+            return
+        if any(self._is_remote_transfer_operand(operand) for operand in operands):
+            raise CommandPolicyViolation("cannot safely inspect remote rsync operands")
+        for operand in operands[:-1]:
+            self._check_path(operand, cwd, "read")
+        self._check_path(operands[-1], cwd, "write")
+
+    @staticmethod
+    def _is_remote_transfer_operand(value: str) -> bool:
+        """Return whether `value` is a remote address, not a local path.
+
+        Covers `rsync://host/path`, `host:path`, and `user@host:path`.
+        """
+        text = str(value)
+        return text.startswith("rsync://") or ":" in text
+
+    def _check_curl(self, values: Sequence[str], cwd: Path) -> None:
+        """`curl`: `-o`/`--output`/`--output-dir` write; `-T`/`--upload-file`/
+        `--netrc-file` read; an `@file` payload to `-d`/`--data*` reads that
+        file. `-K`/`--config` (arbitrary runtime options) and `-O`/
+        `--remote-name[-all]` (output filename derived from the remote URL
+        or response, not statically knowable) cannot be inspected safely and
+        fail closed.
+        """
+        self._reject_dynamic_values("curl arguments", values)
+        index = 0
+        while index < len(values):
+            value = values[index]
+            text = str(value)
+            if text in {"-O", "--remote-name", "--remote-name-all"} or (
+                text.startswith("-O") and not text.startswith("--")
+            ):
+                raise CommandPolicyViolation(
+                    "cannot safely resolve curl remote output filename"
+                )
+            if (
+                text in {"-K", "--config"}
+                or text.startswith("--config=")
+                or (text.startswith("-K") and len(text) > 2)
+            ):
+                raise CommandPolicyViolation(
+                    "cannot safely inspect curl runtime configuration"
+                )
+            if text in {"-o", "--output", "--output-dir"} or text.startswith(
+                ("--output=", "--output-dir=")
+            ):
+                option, separator, attached_text = text.partition("=")
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"curl argument for {option}",
+                )
+                assert argument is not None
+                self._check_path(argument, cwd, "write")
+                continue
+            if text.startswith("-o") and len(text) > 2:
+                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
+                index += 1
+                continue
+            if text in {"-T", "--upload-file", "--netrc-file"} or text.startswith(
+                ("--upload-file=", "--netrc-file=")
+            ):
+                option, separator, attached_text = text.partition("=")
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"curl argument for {option}",
+                )
+                assert argument is not None
+                self._check_path(argument, cwd, "read")
+                continue
+            if text.startswith("-T") and len(text) > 2:
+                self._check_path(self._derived_value(value, text[2:]), cwd, "read")
+                index += 1
+                continue
+            if text in {
+                "-d",
+                "--data",
+                "--data-binary",
+                "--data-raw",
+            } or text.startswith(("--data=", "--data-binary=", "--data-raw=")):
+                option, separator, attached_text = text.partition("=")
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"curl argument for {option}",
+                )
+                assert argument is not None
+                if str(argument).startswith("@"):
+                    self._check_path(
+                        self._derived_value(argument, str(argument)[1:]),
+                        cwd,
+                        "read",
+                    )
+                continue
+            if text.startswith("-d") and len(text) > 2:
+                argument = self._derived_value(value, text[2:])
+                if str(argument).startswith("@"):
+                    self._check_path(
+                        self._derived_value(argument, str(argument)[1:]),
+                        cwd,
+                        "read",
+                    )
+                index += 1
+                continue
+            index += 1
+
+    def _check_wget(self, values: Sequence[str], cwd: Path) -> None:
+        """`wget`: `-O`/`--output-document` write; `-P`/`--directory-prefix`
+        write directory; `--post-file`/`--body-file` read. `--config` and
+        `-i`/`--input-file` (a runtime URL list) cannot be inspected safely
+        and fail closed. A URL operand with no explicit `-O` output (and not
+        `--spider`, which fetches nothing to disk) resolves its output
+        filename from the remote response, which is not statically
+        knowable, so that combination fails closed too.
+        """
+        self._reject_dynamic_values("wget arguments", values)
+        has_explicit_output = False
+        spider_mode = False
+        has_url_operand = False
+        index = 0
+        while index < len(values):
+            value = values[index]
+            text = str(value)
+            if text == "--config" or text.startswith("--config="):
+                raise CommandPolicyViolation(
+                    "cannot safely inspect wget runtime configuration"
+                )
+            if text in {"-i", "--input-file"} or text.startswith(
+                ("-i", "--input-file=")
+            ):
+                raise CommandPolicyViolation(
+                    "cannot safely inspect wget runtime URL list"
+                )
+            if text == "--spider":
+                spider_mode = True
+                index += 1
+                continue
+            if text in {"-O", "--output-document", "-P", "--directory-prefix"} or (
+                text.startswith("--output-document=")
+                or text.startswith("--directory-prefix=")
+            ):
+                option, separator, attached_text = text.partition("=")
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"wget argument for {option}",
+                )
+                assert argument is not None
+                self._check_path(argument, cwd, "write")
+                if text in {"-O", "--output-document"} or text.startswith(
+                    "--output-document="
+                ):
+                    has_explicit_output = True
+                continue
+            if (text.startswith("-O") or text.startswith("-P")) and len(text) > 2:
+                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
+                if text.startswith("-O"):
+                    has_explicit_output = True
+                index += 1
+                continue
+            if text in {"--post-file", "--body-file"} or text.startswith(
+                ("--post-file=", "--body-file=")
+            ):
+                option, separator, attached_text = text.partition("=")
+                argument, index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(value, attached_text) if separator else None
+                    ),
+                    context=f"wget argument for {option}",
+                )
+                assert argument is not None
+                self._check_path(argument, cwd, "read")
+                continue
+            if not text.startswith("-"):
+                has_url_operand = True
+            index += 1
+        if has_url_operand and not has_explicit_output and not spider_mode:
+            raise CommandPolicyViolation(
+                "cannot safely resolve wget remote output filename"
+            )
 
     def _inspect_shell_script(
         self,
