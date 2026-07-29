@@ -179,7 +179,24 @@ _READ_COMMANDS = {
 }
 # Path-scoped writers: every operand is validated as a workspace write and
 # recorded per-path, so they never poison the session-wide unknown-effect flag.
-_WRITE_COMMANDS = {"rm", "mkdir"}
+# `chmod`/`chown`/`chgrp` own a leading non-path positional (mode or
+# owner[:group]/group spec) that `_check_write_command` strips before the
+# write check; every other member here has no non-path positional.
+_WRITE_COMMANDS = {
+    "chgrp",
+    "chmod",
+    "chown",
+    "mkdir",
+    "rm",
+    "rmdir",
+    "tee",
+    "touch",
+    "truncate",
+}
+# Subset of `_WRITE_COMMANDS` whose first non-option operand is a mode or
+# owner/group spec, not a path; `--reference=RFILE` supplies that role from a
+# file instead, so no positional is stripped when it is present.
+_OWNERSHIP_MODE_COMMANDS = frozenset({"chmod", "chown", "chgrp"})
 _SHELL_COMMANDS = {"bash"}
 _UNSUPPORTED_SHELL_COMMANDS = {"dash", "sh", "zsh"}
 _UNSUPPORTED_PRIVILEGE_COMMANDS = {"sudo"}
@@ -223,6 +240,7 @@ _COMMAND_VALUE_OPTIONS = {
     "head": frozenset({"-c", "--bytes", "-n", "--lines"}),
     "tail": frozenset({"-c", "--bytes", "-n", "--lines"}),
     "tac": frozenset({"-s", "--separator"}),
+    "truncate": frozenset({"-s", "--size"}),
 }
 _BASH_FILE_OPTIONS = {"--init-file", "--rcfile"}
 _BASH_LONG_FLAG_OPTIONS = {
@@ -703,6 +721,12 @@ _CLASSIFIED_EXECUTABLE_COMMANDS = {
     "uniq",
     "diff",
     "grep",
+    "cp",
+    "install",
+    "mv",
+    "ln",
+    "unlink",
+    "shred",
     *(
         name
         for name in _COMMAND_WRAPPER_GRAMMARS
@@ -1075,12 +1099,7 @@ class WorkspaceCommandPathGuard:
         if command_name in _READ_COMMANDS:
             self._check_read_command(command_name, args, state.cwd)
         elif command_name in _WRITE_COMMANDS:
-            self._check_operands(
-                args,
-                state.cwd,
-                "write",
-                value_options=_COMMAND_VALUE_OPTIONS.get(command_name, frozenset()),
-            )
+            self._check_write_command(command_name, args, state.cwd)
         elif command_name == "sort":
             self._check_sort(args, state.cwd)
         elif command_name == "uniq":
@@ -1089,6 +1108,14 @@ class WorkspaceCommandPathGuard:
             self._check_diff(args, state.cwd)
         elif command_name == "grep":
             self._check_grep(args, state.cwd)
+        elif command_name == "cp":
+            self._check_copy(args, state.cwd)
+        elif command_name == "install":
+            self._check_install(args, state.cwd)
+        elif command_name in {"mv", "ln"}:
+            self._check_move_or_link(args, state.cwd)
+        elif command_name in {"unlink", "shred"}:
+            self._check_destructive_file_command(command_name, args, state.cwd)
         elif command_name in _SHELL_COMMANDS:
             self._check_nested_shell(command_name, args, state)
         elif command_name in _UNSUPPORTED_SHELL_COMMANDS:
@@ -1611,6 +1638,286 @@ class WorkspaceCommandPathGuard:
         file_operands = positionals if explicit_pattern else positionals[1:]
         for raw_path in file_operands:
             self._check_path(raw_path, cwd, "read")
+
+    def _check_write_command(
+        self,
+        command_name: str,
+        values: Sequence[str],
+        cwd: Path,
+    ) -> None:
+        """Dispatch a `_WRITE_COMMANDS` member to its operand write check.
+
+        `chmod`'s MODE and `chown`/`chgrp`'s OWNER[:GROUP]/GROUP positional
+        argument are not paths, so that leading operand is excluded from the
+        write check. `--reference=RFILE` supplies the same role from a file
+        instead (itself a read path, classified through the access-map
+        substrate), so no positional is excluded when it is present. Every
+        other write command in this family has no non-path positional.
+        """
+        if command_name in _OWNERSHIP_MODE_COMMANDS:
+            operands = self._partition_path_options(
+                values,
+                cwd,
+                option_access={"--reference": "read"},
+            )
+            has_reference = any(
+                str(value) == "--reference" or str(value).startswith("--reference=")
+                for value in values
+            )
+            if not has_reference and operands:
+                operands = operands[1:]
+            for raw_path in operands:
+                self._check_path(raw_path, cwd, "write")
+            return
+        self._check_operands(
+            values,
+            cwd,
+            "write",
+            value_options=_COMMAND_VALUE_OPTIONS.get(command_name, frozenset()),
+        )
+
+    def _parse_target_directory(
+        self,
+        values: Sequence[str],
+    ) -> tuple[str | None, list[str]]:
+        """Split a `-t`/`--target-directory VALUE` destination from operands.
+
+        Shared by `cp` and `mv`/`ln`: when present, every remaining operand is
+        a source and the target directory is the sole write destination;
+        otherwise the caller treats the last operand as the destination.
+        """
+        target_dir: str | None = None
+        operands: list[str] = []
+        options_done = False
+        index = 0
+        while index < len(values):
+            value = values[index]
+            text = str(value)
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if not options_done and text in {"-t", "--target-directory"}:
+                if index + 1 >= len(values):
+                    raise CommandPolicyViolation(f"missing argument for {text}")
+                target_dir = values[index + 1]
+                index += 2
+                continue
+            if not options_done and text.startswith("--target-directory="):
+                target_dir = self._derived_value(value, text.split("=", 1)[1])
+                index += 1
+                continue
+            if not options_done and text.startswith("-t") and len(text) > 2:
+                target_dir = self._derived_value(value, text[2:])
+                index += 1
+                continue
+            if not options_done and text.startswith("-") and text != "-":
+                index += 1
+                continue
+            operands.append(value)
+            index += 1
+        return target_dir, operands
+
+    def _check_copy(self, values: Sequence[str], cwd: Path) -> None:
+        """`cp`: sources read, destination (or `-t` target directory) write.
+
+        Recursively copying through a dereferenced symlink (`-L`/
+        `--dereference`, `-H`) can read arbitrarily deep external content
+        through a single approved read boundary, which cannot be bounded
+        statically, so that combination is a hard denial regardless of the
+        actual paths involved.
+        """
+        recursive = False
+        dereferences_links = False
+        for value in values:
+            text = str(value)
+            if text == "--":
+                break
+            if text == "--recursive":
+                recursive = True
+            elif text in {"--dereference", "--follow-command-line-symlink"}:
+                dereferences_links = True
+            elif text.startswith("-") and not text.startswith("--"):
+                flags = text[1:]
+                recursive = recursive or "r" in flags or "R" in flags
+                dereferences_links = dereferences_links or "L" in flags or "H" in flags
+        if recursive and dereferences_links:
+            raise CommandPolicyViolation(
+                "cannot safely inspect recursive copying that follows symbolic links"
+            )
+
+        target_dir, operands = self._parse_target_directory(values)
+        if target_dir is not None:
+            for raw_path in operands:
+                self._check_path(raw_path, cwd, "read")
+            self._check_path(target_dir, cwd, "write")
+            return
+        if len(operands) < 2:
+            return
+        for raw_path in operands[:-1]:
+            self._check_path(raw_path, cwd, "read")
+        self._check_path(operands[-1], cwd, "write")
+
+    def _check_install(self, values: Sequence[str], cwd: Path) -> None:
+        """`install`: `-t/--target-directory` write; `-d` marks every operand write.
+
+        Scalar options (`-g/-m/-o/-S/--context`) never carry a path, and the
+        delegated `--strip-program` is a hard denial; an unrecognized option
+        fails closed rather than silently letting one shift the destination
+        slot.
+        """
+        target_dir: str | None = None
+        operands: list[str] = []
+        directory_mode = False
+        options_done = False
+        scalar_options = frozenset(
+            {
+                "-g",
+                "--group",
+                "-m",
+                "--mode",
+                "-o",
+                "--owner",
+                "-S",
+                "--suffix",
+                "--context",
+            }
+        )
+        flag_options = frozenset(
+            {
+                "-b",
+                "--backup",
+                "-c",
+                "-C",
+                "--compare",
+                "-D",
+                "-p",
+                "--preserve-timestamps",
+                "-s",
+                "--strip",
+                "-T",
+                "--no-target-directory",
+                "-v",
+                "--verbose",
+                "--help",
+                "--version",
+            }
+        )
+        index = 0
+        while index < len(values):
+            value = values[index]
+            text = str(value)
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not text.startswith("-") or text == "-":
+                operands.append(value)
+                index += 1
+                continue
+            if text in {"-d", "--directory"}:
+                directory_mode = True
+                index += 1
+                continue
+            if text in {"-t", "--target-directory"}:
+                if index + 1 >= len(values):
+                    raise CommandPolicyViolation(f"missing install argument for {text}")
+                target_dir = values[index + 1]
+                index += 2
+                continue
+            if text.startswith("--target-directory="):
+                target_dir = self._derived_value(value, text.split("=", 1)[1])
+                index += 1
+                continue
+            if text.startswith("-t") and len(text) > 2:
+                target_dir = self._derived_value(value, text[2:])
+                index += 1
+                continue
+            if text == "--strip-program" or text.startswith("--strip-program="):
+                raise CommandPolicyViolation(
+                    "cannot safely inspect install delegated strip program"
+                )
+            if text in scalar_options:
+                if index + 1 >= len(values):
+                    raise CommandPolicyViolation(f"missing install argument for {text}")
+                index += 2
+                continue
+            if any(
+                text.startswith(f"{option}=")
+                for option in scalar_options
+                if option.startswith("--")
+            ):
+                index += 1
+                continue
+            if any(
+                text.startswith(option) and len(text) > len(option)
+                for option in {"-g", "-m", "-o", "-S"}
+            ):
+                index += 1
+                continue
+            if text in flag_options:
+                index += 1
+                continue
+            raise CommandPolicyViolation(f"cannot safely inspect install option {text}")
+
+        if directory_mode:
+            for operand in operands:
+                self._check_path(operand, cwd, "write")
+            return
+        if target_dir is not None:
+            for operand in operands:
+                self._check_path(operand, cwd, "read")
+            self._check_path(target_dir, cwd, "write")
+            return
+        if len(operands) < 2:
+            return
+        for operand in operands[:-1]:
+            self._check_path(operand, cwd, "read")
+        self._check_path(operands[-1], cwd, "write")
+
+    def _check_move_or_link(self, values: Sequence[str], cwd: Path) -> None:
+        """`mv`/`ln`: every operand is write-sensitive, including `ln` sources.
+
+        A hard link inside the workspace aliases its source inode; later path
+        resolution sees only the workspace-side alias, so an external
+        read-only source must be write-checked here rather than read-checked,
+        or it would stay silently mutable through the link.
+        """
+        target_dir, operands = self._parse_target_directory(values)
+        for raw_path in operands:
+            self._check_path(raw_path, cwd, "write")
+        if target_dir is not None:
+            self._check_path(target_dir, cwd, "write")
+
+    def _check_destructive_file_command(
+        self,
+        command_name: str,
+        values: Sequence[str],
+        cwd: Path,
+    ) -> None:
+        """`unlink`/`shred`: every remaining operand is a write target.
+
+        `shred` additionally accepts `--random-source=FILE` (itself a read
+        path) and scalar `-n`/`--iterations`, `-s`/`--size` options whose
+        value must not be misread as a path operand.
+        """
+        if command_name == "shred":
+            operands = self._partition_path_options(
+                values,
+                cwd,
+                option_access={
+                    "--random-source": "read",
+                    "-n": None,
+                    "--iterations": None,
+                    "-s": None,
+                    "--size": None,
+                },
+                attached_short_options=frozenset({"-n", "-s"}),
+            )
+        else:
+            operands = self._operands(values)
+        for raw_path in operands:
+            self._check_path(raw_path, cwd, "write")
 
     def _parse_short_option_cluster(
         self,

@@ -2364,6 +2364,314 @@ class TestSortUniqDiffGrepHandlers:
         assert exc_info.value.access == "read"
 
 
+def _trust_locally_shadowed_ownership_commands(monkeypatch):
+    """Treat `chown` as a trusted system command regardless of its host path.
+
+    macOS ships `chown` under `/usr/sbin`, outside this guard's fixed trusted
+    executable roots (`/bin`, `/usr/bin`, `/usr/local/bin`,
+    `/opt/homebrew/bin`, owned by `command_policy.py`); most Linux
+    distributions ship it under `/usr/bin`, already trusted there. This keeps
+    the S2 write-classification tests independent of that host difference
+    without touching the trusted-roots list itself.
+    """
+    original = WorkspaceCommandPathGuard._is_trusted_system_command
+
+    def _is_trusted(command_word: str) -> bool:
+        if os.path.basename(command_word) == "chown":
+            return True
+        return original(command_word)
+
+    monkeypatch.setattr(
+        WorkspaceCommandPathGuard,
+        "_is_trusted_system_command",
+        staticmethod(_is_trusted),
+    )
+
+
+class TestWriteCreateFamily:
+    """Write/create commands newly classified alongside `rm`/`mkdir`: I3 (the
+
+    destination registers a write) plus I2 (a non-path positional or option
+    value is not misread as a path while the real operand is still checked).
+    """
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "chmod 755 {path}",
+            "chown owner {path}",
+            "chgrp staff {path}",
+            "rmdir {path}",
+            "tee {path}",
+            "touch {path}",
+            "truncate -s 10 {path}",
+        ],
+    )
+    def test_write_create_family_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template, monkeypatch
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod 755 own.txt",
+            "chown owner own.txt",
+            "chgrp staff own.txt",
+            "rmdir own_dir",
+            "tee own.txt",
+            "touch own.txt",
+            "truncate -s 10 own.txt",
+        ],
+    )
+    def test_write_create_family_workspace_paths_are_allowed(
+        self, scoped_command_workspace, command, monkeypatch
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "chmod {path} own.txt",
+            "chown {path} own.txt",
+            "chgrp {path} own.txt",
+            "truncate -s {path} own.txt",
+        ],
+    )
+    def test_write_create_leading_scalar_is_not_treated_as_a_path(
+        self, scoped_command_workspace, command_template, monkeypatch
+    ):
+        # chmod's mode, chown/chgrp's owner/group spec, and truncate's -s size
+        # are never paths, so an out-of-workspace-looking value does not
+        # cause a spurious rejection.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "chmod 755 {path}",
+            "chown owner {path}",
+            "chgrp staff {path}",
+            "truncate -s 100 {path}",
+        ],
+    )
+    def test_write_create_real_operand_outside_workspace_still_rejected(
+        self, scoped_command_workspace, command_template, monkeypatch
+    ):
+        # Skipping the leading scalar must not skip the real path operand.
+        workspace, _, sibling_file = scoped_command_workspace
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    def test_chmod_reference_file_is_read_checked(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"chmod --reference={shlex.quote(str(sibling_file))} own.txt"
+            )
+
+        assert exc_info.value.access == "read"
+
+    def test_chmod_reference_file_workspace_path_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "mode.ref").write_text("", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("chmod --reference=mode.ref own.txt")
+
+
+class TestCopyInstallMoveLinkDestructive:
+    """Dedicated handlers for cp/install/mv/ln/unlink/shred.
+
+    Each owns a slot a flat write classification cannot express: `cp`/
+    `install`'s source-vs-destination split (and `-t/--target-directory`),
+    `ln`'s every-operand-write-sensitivity (I4), and `shred`'s scalar/read
+    options.
+    """
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "cp own.txt {path}",
+            "install own.txt {path}",
+            "mv own.txt {path}",
+            "ln own.txt {path}",
+            "unlink {path}",
+            "shred {path}",
+        ],
+    )
+    def test_copy_move_link_family_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cp own.txt dest.txt",
+            "install own.txt dest.txt",
+            "mv own.txt dest.txt",
+            "ln own.txt dest.txt",
+            "unlink own.txt",
+            "shred own.txt",
+        ],
+    )
+    def test_copy_move_link_family_workspace_paths_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_copy_source_outside_workspace_is_read_checked(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"cp {shlex.quote(str(sibling_file))} dest.txt")
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "cp own.txt -t {path}",
+            "install own.txt -t {path}",
+        ],
+    )
+    def test_target_directory_option_outside_workspace_is_rejected(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                command_template.format(path=shlex.quote(str(sibling_file.parent)))
+            )
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cp own.txt -t out",
+            "install own.txt -t out",
+        ],
+    )
+    def test_target_directory_option_workspace_path_is_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "out").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_install_directory_mode_marks_every_operand_write(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"install -d {shlex.quote(str(sibling_file.parent / 'x'))}")
+
+        assert exc_info.value.access == "write"
+
+    def test_ln_source_inside_workspace_aliasing_external_read_only_dir_is_rejected(
+        self, scoped_command_workspace
+    ):
+        # I4: a hard link inside the workspace aliases the external source
+        # inode, so the source is write-checked, not merely read-checked;
+        # the external directory is only approved for read.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"ln {shlex.quote(str(external_file))} alias.txt")
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "cp -rL . copied",
+            "cp --recursive --dereference . copied",
+            "cp -rH . copied",
+        ],
+    )
+    def test_copy_recursive_symlink_dereference_is_rejected(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation, match="symbolic links"):
+            guard.validate(command)
+
+    def test_shred_scalar_options_are_not_treated_as_paths(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"shred -n {shlex.quote(str(sibling_file))} -s10 own.txt")
+
+    def test_shred_random_source_is_read_checked(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"shred --random-source={shlex.quote(str(sibling_file))} own.txt"
+            )
+
+        assert exc_info.value.access == "read"
+
+
 class TestPathClassificationSubstrate:
     """Unit tests for the shared option-classification substrate itself.
 
@@ -2509,8 +2817,8 @@ class TestPathClassificationSubstrate:
                 )
 
 
-class TestS1CommandCoverage:
-    """Mutation-sensitive coverage gate for every command classified in S1.
+class TestCommandCoverage:
+    """Mutation-sensitive coverage gate for every classified command (S1+S2).
 
     Reflects over the guard's live classification sets so a command dropped
     from dispatch, from the shadow-script set, or left without a test is
@@ -2532,8 +2840,34 @@ class TestS1CommandCoverage:
             "cut",
         }
     )
-    _DEDICATED_HANDLER_COMMANDS = frozenset({"sort", "uniq", "diff", "grep"})
-    _S1_COMMANDS = _READ_FAMILY_COMMANDS | _DEDICATED_HANDLER_COMMANDS
+    # Flat write/create family: every operand is a plain workspace write, with
+    # at most an option-keyed scalar value skipped (`_COMMAND_VALUE_OPTIONS`)
+    # or, for chmod/chown/chgrp, a leading non-path positional.
+    _WRITE_CREATE_FAMILY_COMMANDS = frozenset(
+        {"chmod", "chown", "chgrp", "rmdir", "tee", "touch", "truncate"}
+    )
+    # Dedicated handlers: each owns a slot (write/read split, target-directory,
+    # every-operand-write-sensitivity, ...) a flat classification cannot
+    # express. Maps command name to the guard method that classifies it; a
+    # method may serve more than one command name (`mv`/`ln`, `unlink`/`shred`).
+    _DEDICATED_HANDLER_METHODS: dict[str, str] = {
+        "sort": "_check_sort",
+        "uniq": "_check_uniq",
+        "diff": "_check_diff",
+        "grep": "_check_grep",
+        "cp": "_check_copy",
+        "install": "_check_install",
+        "mv": "_check_move_or_link",
+        "ln": "_check_move_or_link",
+        "unlink": "_check_destructive_file_command",
+        "shred": "_check_destructive_file_command",
+    }
+    _DEDICATED_HANDLER_COMMANDS = frozenset(_DEDICATED_HANDLER_METHODS)
+    _S1_COMMANDS = frozenset({"sort", "uniq", "diff", "grep"}) | _READ_FAMILY_COMMANDS
+    _S2_COMMANDS = _WRITE_CREATE_FAMILY_COMMANDS | frozenset(
+        {"cp", "install", "mv", "ln", "unlink", "shred"}
+    )
+    _ALL_COMMANDS = _S1_COMMANDS | _S2_COMMANDS
 
     # Each entry: (positive command, negative command template with `{outside}`).
     _REGISTRY: dict[str, tuple[str, str]] = {
@@ -2552,45 +2886,64 @@ class TestS1CommandCoverage:
         "uniq": ("uniq own.txt", "uniq {outside}"),
         "diff": ("diff own.txt own.txt", "diff own.txt {outside}"),
         "grep": ("grep pattern own.txt", "grep pattern {outside}"),
+        "chmod": ("chmod 755 own.txt", "chmod 755 {outside}"),
+        "chown": ("chown owner own.txt", "chown owner {outside}"),
+        "chgrp": ("chgrp staff own.txt", "chgrp staff {outside}"),
+        "rmdir": ("rmdir own_dir", "rmdir {outside}"),
+        "tee": ("tee own.txt", "tee {outside}"),
+        "touch": ("touch own.txt", "touch {outside}"),
+        "truncate": ("truncate -s 1 own.txt", "truncate -s 1 {outside}"),
+        "cp": ("cp own.txt dest.txt", "cp own.txt {outside}"),
+        "install": ("install own.txt dest.txt", "install own.txt {outside}"),
+        "mv": ("mv own.txt dest.txt", "mv own.txt {outside}"),
+        "ln": ("ln own.txt dest.txt", "ln own.txt {outside}"),
+        "unlink": ("unlink own.txt", "unlink {outside}"),
+        "shred": ("shred own.txt", "shred {outside}"),
     }
 
-    def test_registry_covers_every_s1_command(self):
-        assert set(self._REGISTRY) == self._S1_COMMANDS
+    def test_registry_covers_every_classified_command(self):
+        assert set(self._REGISTRY) == self._ALL_COMMANDS
 
     def test_read_family_commands_are_classified_as_read(self):
         for command_name in self._READ_FAMILY_COMMANDS:
             assert command_name in command_path_guard_module._READ_COMMANDS
 
+    def test_write_create_family_commands_are_classified_as_write(self):
+        for command_name in self._WRITE_CREATE_FAMILY_COMMANDS:
+            assert command_name in command_path_guard_module._WRITE_COMMANDS
+
     def test_dedicated_handlers_are_not_flat_read_or_write(self):
-        for command_name in self._DEDICATED_HANDLER_COMMANDS:
+        for command_name, method_name in self._DEDICATED_HANDLER_METHODS.items():
             assert command_name not in command_path_guard_module._READ_COMMANDS
             assert command_name not in command_path_guard_module._WRITE_COMMANDS
-            assert hasattr(WorkspaceCommandPathGuard, f"_check_{command_name}")
+            assert hasattr(WorkspaceCommandPathGuard, method_name)
 
-    def test_every_s1_command_is_shadow_script_classified(self):
-        for command_name in self._S1_COMMANDS:
+    def test_every_command_is_shadow_script_classified(self):
+        for command_name in self._ALL_COMMANDS:
             assert (
                 command_name
                 in command_path_guard_module._CLASSIFIED_EXECUTABLE_COMMANDS
             )
 
-    @pytest.mark.parametrize("command_name", sorted(_S1_COMMANDS))
+    @pytest.mark.parametrize("command_name", sorted(_ALL_COMMANDS))
     def test_registry_positive_case_is_accepted(
-        self, scoped_command_workspace, command_name
+        self, scoped_command_workspace, command_name, monkeypatch
     ):
         workspace, _, _ = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("data\n", encoding="utf-8")
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
         guard = WorkspaceCommandPathGuard(workspace)
         positive_command, _ = self._REGISTRY[command_name]
 
         guard.validate(positive_command)
 
-    @pytest.mark.parametrize("command_name", sorted(_S1_COMMANDS))
+    @pytest.mark.parametrize("command_name", sorted(_ALL_COMMANDS))
     def test_registry_negative_case_is_rejected(
-        self, scoped_command_workspace, command_name
+        self, scoped_command_workspace, command_name, monkeypatch
     ):
         workspace, _, sibling_file = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("data\n", encoding="utf-8")
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
         guard = WorkspaceCommandPathGuard(workspace)
         _, negative_template = self._REGISTRY[command_name]
 
