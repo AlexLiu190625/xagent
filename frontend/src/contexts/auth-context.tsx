@@ -3,10 +3,13 @@
 import React, { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react"
 import { getApiUrl } from "@/lib/utils"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
+import { toast } from "@/components/ui/sonner"
+import { useI18n } from "@/contexts/i18n-context"
+import { authMutationUnavailableTranslationKey } from "@/lib/auth-pages"
 import {
   AUTH_CACHE_DURATION_MS, AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT,
   type AuthCacheUser, type AuthSessionProjection, type AuthSessionSnapshot,
-  authMutationUnavailableMessage, clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
+  clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
   claimAuthLoginIntent, createAuthSession, inspectAuthSession, migrateLegacyAuthSession,
 } from "@/lib/auth-cache"
 
@@ -26,12 +29,20 @@ const ANONYMOUS_AUTH_CONTEXT: AuthContextType = {
   isLoading: false, inTeam: false, teamRole: null,
   login: async () => false, logout: async () => false, checkAuth: async () => false, refreshAccessToken: async () => false,
 }
+const AUTH_REFRESH_UNAVAILABLE_TOAST_ID = "auth-refresh-unavailable"
 function currentProjection(): AuthSessionProjection | null {
   const inspection = inspectAuthSession()
   return inspection.status === "valid" ? inspection.projection : null
 }
+function isCurrentCredentialLineage(current: AuthSessionProjection | null, captured: AuthSessionSnapshot): boolean {
+  return current?.snapshot.sessionId === captured.sessionId
+    && current.snapshot.credentialRevision === captured.credentialRevision
+    && current.snapshot.accessToken === captured.accessToken
+    && current.snapshot.refreshToken === captured.refreshToken
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
+  const { t } = useI18n()
   const [projection, setProjection] = useState<AuthSessionProjection | null>(() => currentProjection())
   const [isLoading, setIsLoading] = useState(true)
   const [lastCheck, setLastCheck] = useState<{ key: string | null; at: number }>({ key: null, at: 0 })
@@ -59,7 +70,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => { mountedRef.current = false; initializationRef.current += 1 }
   }, [sync])
   useEffect(() => {
-    const handler = (event: Event) => { if ((event as StorageEvent).key === AUTH_CACHE_KEY) sync() }
+    const handler = (event: Event) => {
+      if (event.type === AUTH_TOKEN_UPDATED_EVENT || (event as StorageEvent).key === AUTH_CACHE_KEY) sync()
+    }
     window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, handler); window.addEventListener("storage", handler)
     return () => { window.removeEventListener(AUTH_TOKEN_UPDATED_EVENT, handler); window.removeEventListener("storage", handler) }
   }, [sync])
@@ -158,7 +171,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         await clearAuthSessionIfCurrent(expected)
         break
       case "unavailable":
-        console.error(authMutationUnavailableMessage(result.reason))
+        if (mountedRef.current && operation === operationRef.current && isCurrentCredentialLineage(current, expected)) {
+          toast.error(t(authMutationUnavailableTranslationKey(result.reason)), { id: AUTH_REFRESH_UNAVAILABLE_TOAST_ID })
+        }
         break
       case "not_current":
       case "invalid_response":
@@ -168,7 +183,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const after = currentProjection()
     if (mountedRef.current && operation === operationRef.current) setProjection(after)
     return false
-  }, [projection])
+  }, [projection, t])
   refreshRef.current = refreshAccessToken
   return <AuthContext.Provider value={{ user, isAuthenticated: Boolean(user && token), token, refreshToken, session, isLoading, inTeam, teamRole, login, logout, checkAuth, refreshAccessToken }}>{children}</AuthContext.Provider>
 }

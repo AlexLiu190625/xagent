@@ -2515,6 +2515,28 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
+  it("requires reload when the current replacement connection publishes a different task", async () => {
+    const { rerender } = render(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("different-task-old"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(102)))
+
+    rerender(
+      <AppProvider token="token" transport={makeSessionTransport(makeSessionConnection("different-task-new"))}>
+        <SessionControlsProbe />
+        <StateProbe />
+      </AppProvider>
+    )
+    act(() => webSocketOptions.current?.onMessage?.(taskInfoMessage(103)))
+
+    await waitFor(() => {
+      expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    })
+  })
+
   it("rejects an outstanding reset when AppProvider unmounts", async () => {
     const { unmount } = render(
       <AppProvider token="token" transport={makeSessionTransport()}>

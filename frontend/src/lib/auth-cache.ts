@@ -337,10 +337,10 @@ export function compareCredentialSession(captured: AuthSessionSnapshot, inspecti
 }
 function isExactCredential(c: AuthCredentialComparison): boolean { return c.status === "exact_credentials" }
 function isCredentialAdvanced(c: AuthCredentialComparison): boolean { return c.status === "credentials_advanced" }
-function dispatchAuthTokenUpdated(storage: AuthStorage) {
+function dispatchAuthTokenUpdated() {
   if (typeof window === "undefined" || typeof window.dispatchEvent !== "function") return
   try {
-    window.dispatchEvent(new StorageEvent(AUTH_TOKEN_UPDATED_EVENT, { key: AUTH_CACHE_KEY, newValue: storage.getItem(AUTH_CACHE_KEY) }))
+    window.dispatchEvent(new Event(AUTH_TOKEN_UPDATED_EVENT))
   } catch {
     // Storage persistence owns correctness; cross-context notification is best effort.
   }
@@ -348,17 +348,25 @@ function dispatchAuthTokenUpdated(storage: AuthStorage) {
 function snapshotAuthStorage(storage: AuthStorage): Map<string, string | null> {
   return new Map(AUTH_OWNED_LOCAL_STORAGE_KEYS.map(key => [key, storage.getItem(key)]))
 }
-function restoreAuthStorage(storage: AuthStorage, snapshot: ReadonlyMap<string, string | null>) {
-  for (const [key, value] of snapshot) {
-    if (storage.getItem(key) === value) continue
+function restoreStorageValue(storage: AuthStorage | AuthSessionStorage, key: string, value: string | null): boolean {
+  try {
+    if (storage.getItem(key) === value) return true
     if (value === null) storage.removeItem(key)
     else storage.setItem(key, value)
+    return true
+  } catch {
+    return false
   }
 }
-function restoreSessionValue(storage: AuthSessionStorage, key: string, value: string | null) {
-  if (storage.getItem(key) === value) return
-  if (value === null) storage.removeItem(key)
-  else storage.setItem(key, value)
+function restoreAuthStorage(storage: AuthStorage, snapshot: ReadonlyMap<string, string | null>): boolean {
+  let restored = true
+  for (const [key, value] of snapshot) {
+    if (!restoreStorageValue(storage, key, value)) restored = false
+  }
+  return restored
+}
+function restoreSessionValue(storage: AuthSessionStorage, key: string, value: string | null): boolean {
+  return restoreStorageValue(storage, key, value)
 }
 type AuthMutationContext = {
   storage: AuthStorage
@@ -409,9 +417,8 @@ async function withMutationLock<T>(conditional: boolean, action: (context: AuthM
       shouldDispatch = changed
       return { status: "completed", value }
     } catch {
-      if (snapshot) {
-        try { restoreAuthStorage(storage, snapshot) } catch { /* Storage remains unavailable to this operation. */ }
-      }
+      const rollbackComplete = !snapshot || restoreAuthStorage(storage, snapshot)
+      if (!rollbackComplete) shouldDispatch = true
       return { status: "unavailable", reason: "operation_failed" }
     }
   }
@@ -422,18 +429,10 @@ async function withMutationLock<T>(conditional: boolean, action: (context: AuthM
   } finally {
     // A same-tab observer may synchronously read storage, so publication must
     // happen only after the Web Lock callback has returned successfully.
-    if (shouldDispatch) dispatchAuthTokenUpdated(storage)
+    if (shouldDispatch) dispatchAuthTokenUpdated()
   }
 }
 function unavailable(reason: AuthMutationUnavailableReason): AuthMutationResult { return { status: "unavailable", reason } }
-/** The sole user-facing copy mapper for browser auth availability failures. */
-export function authMutationUnavailableMessage(reason: AuthMutationUnavailableReason): string {
-  switch (reason) {
-    case "storage_unavailable": return "Your browser is blocking local storage. Enable storage and try again."
-    case "coordination_unavailable": return "Your browser does not support the secure sign-in features this application requires."
-    case "operation_failed": return "Your sign-in session could not be updated. Please try again."
-  }
-}
 function nextRevision(value: number): number | null { return value < MAX_REVISION ? value + 1 : null }
 /** Claims exclusive user intent before a password request or OIDC redirect begins. */
 export async function claimAuthLoginIntent(): Promise<AuthIntentClaimResult> {

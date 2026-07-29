@@ -2069,4 +2069,23 @@ describe("widget session mode", () => {
     iframeEl()?.remove()
     await vi.waitFor(() => expect(requestSignal?.aborted).toBe(true))
   })
+
+  it("cancels the delivery-stability timer when the session iframe is detached", async () => {
+    vi.useFakeTimers()
+    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
+    const clearTimeoutSpy = vi.spyOn(window, "clearTimeout")
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+    await vi.advanceTimersByTimeAsync(0)
+    fromIframe("ready")
+    const deliveryId = post.mock.calls.at(-1)?.[0].session_delivery_id
+    fromIframe("session_connection_open", { session_delivery_id: deliveryId })
+    const clearsBeforeDetach = clearTimeoutSpy.mock.calls.length
+
+    iframeEl()?.remove()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(clearTimeoutSpy.mock.calls.length).toBeGreaterThan(clearsBeforeDetach)
+  })
 })

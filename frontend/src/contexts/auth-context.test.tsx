@@ -12,12 +12,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 import { AnonymousAuthProvider, AuthProvider, useAuth } from "@/contexts/auth-context"
 import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
-import { AUTH_CACHE_KEY, clearStoredAuth } from "@/lib/auth-cache"
+import { AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT, clearStoredAuth } from "@/lib/auth-cache"
+
+const toastError = vi.hoisted(() => vi.fn())
+const translate = vi.hoisted(() => vi.fn((key: string) => `translated:${key}`))
 
 vi.mock("@/lib/api-wrapper", () => ({
   apiRequest: vi.fn(async () => new Response(null, { status: 404 })),
   refreshStoredAccessToken: vi.fn(),
 }))
+vi.mock("@/components/ui/sonner", () => ({ toast: { error: toastError } }))
+vi.mock("@/contexts/i18n-context", () => ({ useI18n: () => ({ t: translate }) }))
 
 afterEach(() => {
   cleanup()
@@ -139,6 +144,8 @@ describe("AuthProvider storage synchronization", () => {
   beforeEach(() => {
     localStorage.clear()
     vi.restoreAllMocks()
+    toastError.mockReset()
+    translate.mockClear()
     Object.defineProperty(navigator, "locks", {
       configurable: true,
       value: { request: vi.fn(async (_name: string, callback: () => Promise<unknown>) => callback()) },
@@ -256,6 +263,23 @@ describe("AuthProvider storage synchronization", () => {
     })
 
     expect(screen.getByTestId("access-token")).toHaveTextContent("bob-access")
+  })
+
+  it("recomputes the projection from a value-free same-tab invalidation", async () => {
+    writeAuthCache(
+      { id: "1", username: "alice", email: null, is_admin: false },
+      "alice-access",
+      "alice-refresh",
+      120,
+      240,
+    )
+    render(<AuthProvider><AuthProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("access-token")).toHaveTextContent("alice-access"))
+
+    localStorage.removeItem(AUTH_CACHE_KEY)
+    act(() => window.dispatchEvent(new Event(AUTH_TOKEN_UPDATED_EVENT)))
+
+    expect(screen.getByTestId("access-token")).toHaveTextContent("none")
   })
 
   it("keeps auth state when a 401 leaves the refresh cache intact", async () => {
@@ -535,5 +559,86 @@ describe("AuthProvider storage synchronization", () => {
       expect(screen.getByTestId("login-logout-token")).toHaveTextContent("none")
     })
     expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
+  })
+
+  it("shows the localized unavailable refresh toast with its stable deduplication ID", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
+    vi.mocked(refreshStoredAccessToken).mockResolvedValue({
+      status: "unavailable", accessToken: null, reason: "coordination_unavailable",
+    })
+    render(<AuthProvider><AuthRefreshProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+
+    await waitFor(() => expect(toastError).toHaveBeenCalledWith(
+      "translated:login.alerts.coordination_unavailable",
+      { id: "auth-refresh-unavailable" },
+    ))
+  })
+
+  it("does not show a refresh toast after the provider unmounts", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
+    const refresh = deferred<{ status: "unavailable"; accessToken: null; reason: "operation_failed" }>()
+    vi.mocked(refreshStoredAccessToken).mockReturnValue(refresh.promise)
+    const rendered = render(<AuthProvider><AuthRefreshProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+    rendered.unmount()
+    await act(async () => {
+      refresh.resolve({ status: "unavailable", accessToken: null, reason: "operation_failed" })
+      await refresh.promise
+    })
+
+    expect(toastError).not.toHaveBeenCalled()
+  })
+
+  it("does not show a refresh toast after the captured session is replaced", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "alice-access", "alice-refresh", 120, 240)
+    const refresh = deferred<{ status: "unavailable"; accessToken: null; reason: "operation_failed" }>()
+    vi.mocked(refreshStoredAccessToken).mockReturnValue(refresh.promise)
+    render(<AuthProvider><AuthRefreshProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("alice-access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+    writeAuthCache({ id: "2", username: "bob", email: null, is_admin: false }, "bob-access", "bob-refresh", 120, 240)
+    act(() => window.dispatchEvent(new StorageEvent("storage", { key: AUTH_CACHE_KEY })))
+    await waitFor(() => expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("bob-access"))
+    await act(async () => {
+      refresh.resolve({ status: "unavailable", accessToken: null, reason: "operation_failed" })
+      await refresh.promise
+    })
+
+    expect(toastError).not.toHaveBeenCalled()
+  })
+
+  it("suppresses the stale refresh operation and emits one stable-ID toast for the current operation", async () => {
+    writeAuthCache({ id: "1", username: "alice", email: null, is_admin: false }, "access", "refresh", 120, 240)
+    const first = deferred<{ status: "unavailable"; accessToken: null; reason: "operation_failed" }>()
+    const second = deferred<{ status: "unavailable"; accessToken: null; reason: "operation_failed" }>()
+    vi.mocked(refreshStoredAccessToken)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise)
+    render(<AuthProvider><AuthRefreshProbe /></AuthProvider>)
+    await waitFor(() => expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("access"))
+
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+    fireEvent.click(screen.getByRole("button", { name: "Refresh access token" }))
+    await act(async () => {
+      first.resolve({ status: "unavailable", accessToken: null, reason: "operation_failed" })
+      await first.promise
+    })
+    expect(toastError).not.toHaveBeenCalled()
+    await act(async () => {
+      second.resolve({ status: "unavailable", accessToken: null, reason: "operation_failed" })
+      await second.promise
+    })
+
+    expect(toastError).toHaveBeenCalledTimes(1)
+    expect(toastError).toHaveBeenCalledWith(
+      "translated:login.alerts.operation_failed",
+      { id: "auth-refresh-unavailable" },
+    )
   })
 })

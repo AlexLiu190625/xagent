@@ -1,6 +1,6 @@
 "use client"
 
-import React, { useEffect, useState } from "react"
+import React, { useCallback, useEffect, useState } from "react"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { getApiUrl } from "@/lib/utils"
@@ -22,9 +22,10 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useSetupStatus } from "@/hooks/use-setup-status"
 import { AuthPageShell } from "@/components/auth/auth-page-shell"
 import { AuthFormCard } from "@/components/auth/auth-form-card"
-import { authMutationUnavailableMessage, claimAuthLoginIntent, claimOidcAuthLoginIntent, createAuthSession } from "@/lib/auth-cache"
+import { claimAuthLoginIntent, claimOidcAuthLoginIntent, createAuthSession } from "@/lib/auth-cache"
+import { authMutationUnavailableTranslationKey } from "@/lib/auth-pages"
 
-function isAuthMutationUnavailableReason(value: string | null): value is Parameters<typeof authMutationUnavailableMessage>[0] {
+function isAuthMutationUnavailableReason(value: string | null): value is Parameters<typeof authMutationUnavailableTranslationKey>[0] {
   return value === "storage_unavailable" || value === "coordination_unavailable" || value === "operation_failed"
 }
 
@@ -39,6 +40,11 @@ export function LoginPage() {
     identifier: "",
     password: ""
   })
+  const authMutationUnavailableMessage = useCallback(
+    (reason: Parameters<typeof authMutationUnavailableTranslationKey>[0]) =>
+      t(authMutationUnavailableTranslationKey(reason)),
+    [t],
+  )
 
   const { isLoading: isStatusLoading, registrationEnabled } = useSetupStatus({
     redirectToSetupIfNeeded: true,
@@ -74,7 +80,7 @@ export function LoginPage() {
     }
 
     void checkGoogleStatus()
-  }, [t])
+  }, [authMutationUnavailableMessage, t, tDynamic])
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()

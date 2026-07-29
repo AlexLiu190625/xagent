@@ -642,6 +642,9 @@ const zh = {
       auth_failed: "用户名/邮箱或密码错误",
       network_failed: "登录失败，请稍后重试",
       google_failed: "Google 登录失败，请重试",
+      storage_unavailable: "浏览器阻止了本地存储。请启用本地存储后重试。",
+      coordination_unavailable: "您的浏览器不支持此应用所需的安全登录功能。",
+      operation_failed: "无法更新您的登录会话，请重试。",
     },
     google: {
       continue: "使用 Google 继续",

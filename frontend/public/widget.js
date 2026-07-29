@@ -497,6 +497,7 @@
     function detach() {
       if (state.detached) return;
       state.detached = true;
+      invalidateStability();
       cancelInflight('exchange');
       cancelInflight('reconnect');
       window.removeEventListener('message', onMessage);

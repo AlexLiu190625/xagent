@@ -292,11 +292,22 @@ export function useWidgetSession() {
       }
 
       const token = event.data.session_token
+      const hasDeliveryId = Object.prototype.hasOwnProperty.call(
+        event.data,
+        "session_delivery_id",
+      )
       const deliveryId = event.data.session_delivery_id
       const tokenExpiresAt = parseDate(event.data.session_token_expires_at)
       const absoluteExpiresAt = parseDate(event.data.absolute_expires_at)
       const agent = parseAgent(event.data.agent)
-      if (!isNonBlankString(deliveryId) || typeof token !== "string" || !token.trim() || tokenExpiresAt === null || absoluteExpiresAt === null || !agent) {
+      if (
+        (hasDeliveryId && !isNonBlankString(deliveryId))
+        || typeof token !== "string"
+        || !token.trim()
+        || tokenExpiresAt === null
+        || absoluteExpiresAt === null
+        || !agent
+      ) {
         transitionTerminal("unexpected_error")
         return
       }
@@ -322,7 +333,7 @@ export function useWidgetSession() {
         generation: generationRef.current,
       }
       activeSessionGenerationRef.current = session.generation
-      activeDeliveryIdRef.current = deliveryId
+      activeDeliveryIdRef.current = hasDeliveryId ? deliveryId as string : null
       setState({
         status: "active",
         session,

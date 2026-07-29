@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, AUTH_OIDC_INTENT_KEY, AUTH_REVOKED_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
   AUTH_TOKEN_UPDATED_EVENT, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, commitAuthSessionRefresh, compareAuthSession, createAuthSession,
-  authMutationUnavailableMessage, inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, updateAuthSessionUser, type AuthTokenPayload,
+  inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, updateAuthSessionUser, type AuthTokenPayload,
   takeOidcAuthLoginIntent,
 } from "@/lib/auth-cache"
 
@@ -50,13 +50,6 @@ describe("auth cache lineage", () => {
   it("does not create a bearer session without the login intent that authorized it", async () => {
     expect(await createAuthSession({ user, access_token: "late-access" })).toEqual({ status: "superseded" })
     expect(inspectAuthSession().status).toBe("absent")
-  })
-  it.each([
-    ["storage_unavailable", "Your browser is blocking local storage. Enable storage and try again."],
-    ["coordination_unavailable", "Your browser does not support the secure sign-in features this application requires."],
-    ["operation_failed", "Your sign-in session could not be updated. Please try again."],
-  ] as const)("maps %s through the single auth availability presentation mapper", (reason, expected) => {
-    expect(authMutationUnavailableMessage(reason)).toBe(expected)
   })
   it("consumes a claimed intent so its response cannot be committed twice", async () => {
     const claim = await claimAuthLoginIntent()
@@ -268,6 +261,28 @@ describe("auth cache lineage", () => {
     expect(await createAuthSession({ user, access_token: "access" }, claim.intent)).toEqual({ status: "unavailable", reason: "operation_failed" })
 
     expect(authStorageSnapshot()).toEqual(before)
+  })
+  it("continues rollback after one key fails, restores later keys, and publishes a value-free invalidation", async () => {
+    localStorage.setItem(LEGACY_AUTH_TOKEN_KEY, "legacy-access")
+    localStorage.setItem(LEGACY_AUTH_USER_KEY, JSON.stringify(user))
+    const originalRemoveItem = localStorage.removeItem.bind(localStorage)
+    let rollingBack = false
+    vi.spyOn(localStorage, "removeItem").mockImplementation(key => {
+      if (key === LEGACY_AUTH_USER_KEY) {
+        rollingBack = true
+        throw new Error("legacy user cleanup blocked")
+      }
+      if (rollingBack && key === AUTH_CACHE_KEY) throw new Error("cache rollback blocked")
+      originalRemoveItem(key)
+    })
+    const events: Event[] = []
+    window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, event => events.push(event), { once: true })
+
+    await expect(migrateLegacyAuthSession()).resolves.toEqual({ status: "unavailable", reason: "operation_failed" })
+
+    expect(localStorage.getItem(LEGACY_AUTH_TOKEN_KEY)).toBe("legacy-access")
+    expect(events).toHaveLength(1)
+    expect(events[0]).not.toBeInstanceOf(StorageEvent)
   })
   it("does not supersede the local login intent when OIDC session binding is unavailable", async () => {
     localStorage.setItem(AUTH_LOGIN_INTENT_KEY, JSON.stringify({ schemaVersion: 1, id: "existing-intent" }))

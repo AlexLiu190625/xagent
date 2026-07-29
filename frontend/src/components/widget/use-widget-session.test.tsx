@@ -100,6 +100,23 @@ describe("useWidgetSession", () => {
     },
   )
 
+  it("accepts a legacy v1 update with no delivery ID and never echoes a stale ID", () => {
+    const postMessage = vi.spyOn(window, "postMessage")
+    const { result } = renderHook(() => useWidgetSession())
+    dispatchFromParent(updateMessage({ session_delivery_id: "delivery-a" }))
+
+    const legacyUpdate: Record<string, unknown> = updateMessage()
+    delete legacyUpdate.session_delivery_id
+    dispatchFromParent(legacyUpdate)
+
+    expect(result.current.status).toBe("active")
+    expect(result.current.session?.generation).toBe(2)
+
+    act(() => result.current.handleConnectionOpen("widget-session:2"))
+
+    expect(postMessage.mock.calls.filter(([message]) => message?.type === "session_connection_open")).toHaveLength(0)
+  })
+
   it("pins the first valid parent origin internally and rejects messages from another origin", () => {
     const { result } = renderHook(() => useWidgetSession())
 

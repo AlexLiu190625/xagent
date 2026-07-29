@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -803,14 +804,20 @@ async def test_runner_post_user_message_deduplicates_explicit_turn_id_after_fail
         callbacks=[FailingUserMessageCallback()],
         workspace_manager=FakeWorkspaceManager(tmp_path),
     )
+    failing_runner.pause = MagicMock(return_value=True)
 
-    with pytest.raises(RuntimeError, match="trace callback failed"):
-        await failing_runner.post_user_message(
-            execution_id,
-            "Choose B",
-            turn_id="a2a:42:msg-1",
-            request_interrupt=False,
-        )
+    accepted = await failing_runner.post_user_message(
+        execution_id,
+        "Choose B",
+        turn_id="a2a:42:msg-1",
+        request_interrupt=True,
+    )
+
+    assert accepted is not None
+    failing_runner.pause.assert_called_once_with(
+        execution_id,
+        reason="new user message",
+    )
 
     failing_runner.context_manager.remove_context(execution_id)
     retry_runner = AgentRunner(
