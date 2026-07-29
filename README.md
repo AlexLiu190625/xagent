@@ -73,6 +73,10 @@ cp example.env .env        # optional: review settings
 docker compose up -d       # then open http://localhost:80
 ```
 
+Browser sign-in requires local browser storage and the Web Locks API for safe
+cross-tab session coordination. Deploy the UI over HTTPS; `localhost`,
+`127.0.0.1`, and `::1` are also secure-context forms for local development.
+
 On first startup, Xagent redirects to `/setup` to create the first administrator account. Forgot the admin password? Reset it:
 
 ```bash

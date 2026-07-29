@@ -8,6 +8,7 @@ const apiRequest = vi.hoisted(() => vi.fn())
 const claimAuthLoginIntent = vi.hoisted(() => vi.fn())
 const claimOidcAuthLoginIntent = vi.hoisted(() => vi.fn())
 const createAuthSession = vi.hoisted(() => vi.fn())
+const authMutationUnavailableMessage = vi.hoisted(() => vi.fn((reason: string) => `availability:${reason}`))
 
 vi.mock("@/components/auth/auth-form-card", () => ({
   AuthFormCard: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
@@ -28,7 +29,7 @@ vi.mock("@/hooks/use-setup-status", () => ({
   useSetupStatus: () => ({ isLoading: false, registrationEnabled: false }),
 }))
 vi.mock("@/lib/api-wrapper", () => ({ apiRequest }))
-vi.mock("@/lib/auth-cache", () => ({ claimAuthLoginIntent, claimOidcAuthLoginIntent, createAuthSession }))
+vi.mock("@/lib/auth-cache", () => ({ authMutationUnavailableMessage, claimAuthLoginIntent, claimOidcAuthLoginIntent, createAuthSession }))
 vi.mock("@/lib/branding", () => ({
   getBrandingFromEnv: () => ({ appName: "Xagent", logoPath: "/logo.svg", logoAlt: "Xagent", tagline: "Build agents" }),
 }))
@@ -111,5 +112,15 @@ describe("LoginPage auth-session creation", () => {
     expect(await screen.findByText("login.alerts.auth_failed")).toBeInTheDocument()
     expect(navigation.targets).toEqual([])
     navigation.restore()
+  })
+  it("uses the shared availability message when browser coordination is unavailable", async () => {
+    claimAuthLoginIntent.mockResolvedValue({ status: "unavailable", reason: "coordination_unavailable" })
+
+    renderLogin()
+    fireEvent.click(screen.getByRole("button", { name: "login.form.submit" }))
+
+    expect(await screen.findByText("availability:coordination_unavailable")).toBeInTheDocument()
+    expect(authMutationUnavailableMessage).toHaveBeenCalledWith("coordination_unavailable")
+    expect(apiRequest).not.toHaveBeenCalled()
   })
 })

@@ -56,17 +56,20 @@ export type AuthCredentialComparison =
   | { status: "exact_credentials"; projection: AuthSessionProjection }
   | { status: "credentials_advanced"; projection: AuthSessionProjection }
   | { status: "replaced" | "absent" | "expired" | "invalid"; projection: null }
+export type AuthMutationUnavailableReason = "storage_unavailable" | "coordination_unavailable" | "operation_failed"
 export type AuthMutationResult =
   | { status: "created" | "migrated" | "updated" | "advanced"; projection: AuthSessionProjection }
-  | { status: "replaced" | "absent" | "expired" | "invalid" | "superseded" | "unavailable" }
-export type AuthLogoutResult = {
-  status: "cleared" | "unavailable"
-  credentialsCleared: boolean
-  barrier: "installed" | "removed" | "revoked" | "unavailable"
-}
+  | { status: "replaced" | "absent" | "expired" | "invalid" | "superseded" }
+  | { status: "unavailable"; reason: AuthMutationUnavailableReason }
+export type AuthConditionalClearResult =
+  | { status: "cleared" | "not_current" }
+  | { status: "unavailable"; reason: AuthMutationUnavailableReason }
+export type AuthLogoutResult =
+  | { status: "cleared"; credentialsCleared: true; barrier: "installed" | "removed" | "revoked" }
+  | { status: "unavailable"; reason: Exclude<AuthMutationUnavailableReason, "coordination_unavailable">; credentialsCleared: boolean; barrier: "installed" | "removed" | "revoked" | "unavailable" }
 export type AuthIntentClaimResult =
   | { status: "claimed"; intent: AuthLoginIntent }
-  | { status: "unavailable" }
+  | { status: "unavailable"; reason: AuthMutationUnavailableReason }
 type AuthStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">
 
 const EMPTY_SNAPSHOT: AuthSessionSnapshot = {
@@ -82,11 +85,12 @@ function getAuthStorage(): AuthStorage | null {
     const storage: unknown = window.localStorage
     if (typeof storage !== "object" || storage === null) return null
     const candidate = storage as Partial<AuthStorage>
-    return typeof candidate.getItem === "function"
+    if (!(typeof candidate.getItem === "function"
       && typeof candidate.setItem === "function"
       && typeof candidate.removeItem === "function"
-      ? candidate as AuthStorage
-      : null
+    )) return null
+    candidate.getItem(AUTH_CACHE_KEY)
+    return candidate as AuthStorage
   } catch {
     return null
   }
@@ -103,8 +107,8 @@ function getSessionStorage(): Pick<Storage, "getItem" | "setItem" | "removeItem"
   } catch { return null }
 }
 
-function isFinitePositive(value: unknown): value is number {
-  return typeof value === "number" && Number.isFinite(value) && value > 0
+function isStrictPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0
 }
 function isSafeAbsoluteTimestamp(value: unknown): value is number {
   return typeof value === "number" && Number.isSafeInteger(value) && value > 0
@@ -128,7 +132,7 @@ function normalizeToken(value: unknown): string | null {
 }
 function normalizeExpiry(value: unknown): number | undefined | null {
   if (value === undefined) return undefined
-  return isFinitePositive(value) ? value : null
+  return isStrictPositiveInteger(value) ? value : null
 }
 function deadlineFromSeconds(now: number, seconds: number | undefined): number | undefined | null {
   if (seconds === undefined) return undefined
@@ -198,17 +202,17 @@ export function parseAuthTokenPayload(value: unknown): AuthTokenPayload | null {
     || deadlineFromSeconds(Date.now(), expiresIn) === null || deadlineFromSeconds(Date.now(), refreshExpiresIn) === null) return null
   return { user, access_token: accessToken, refresh_token: refresh, expires_in: expiresIn, refresh_expires_in: refreshExpiresIn }
 }
-function parseRefreshCommitPayload(value: unknown, fallbackRefresh: string | null): Omit<AuthTokenPayload, "user"> | null {
+function parseRefreshCommitPayload(value: unknown): Omit<AuthTokenPayload, "user"> | null {
   if (typeof value !== "object" || value === null) return null
   const data = value as Partial<Omit<AuthTokenPayload, "user">> & { success?: unknown }
   if (data.success !== true) return null
   const accessToken = normalizeToken(data.access_token)
-  const refresh = data.refresh_token === undefined ? fallbackRefresh : normalizeToken(data.refresh_token)
+  const refresh = normalizeToken(data.refresh_token)
   const expiresIn = normalizeExpiry(data.expires_in)
   const refreshExpiresIn = normalizeExpiry(data.refresh_expires_in)
-  if (!accessToken || refresh === null || expiresIn === null || refreshExpiresIn === null
+  if (!accessToken || !refresh || expiresIn === null || refreshExpiresIn === null
     || deadlineFromSeconds(Date.now(), expiresIn) === null || deadlineFromSeconds(Date.now(), refreshExpiresIn) === null) return null
-  return { access_token: accessToken, refresh_token: refresh ?? undefined, expires_in: expiresIn, refresh_expires_in: refreshExpiresIn }
+  return { access_token: accessToken, refresh_token: refresh, expires_in: expiresIn, refresh_expires_in: refreshExpiresIn }
 }
 function parseCanonical(raw: string): AuthCache | null {
   try {
@@ -342,29 +346,41 @@ function writeNewSession(storage: AuthStorage, payload: AuthTokenPayload, markAu
   persist(storage, cache, markAuthUpdated)
   return projectionFromCache(cache)
 }
-async function withMutationLock<T>(conditional: boolean, action: (context: AuthMutationContext) => Promise<T>): Promise<T | null> {
+type AuthMutationAttempt<T> =
+  | { status: "completed"; value: T }
+  | { status: "unavailable"; reason: AuthMutationUnavailableReason }
+async function withMutationLock<T>(conditional: boolean, action: (context: AuthMutationContext) => Promise<T>): Promise<AuthMutationAttempt<T>> {
   const storage = getAuthStorage()
-  if (!storage) return null
+  if (!storage) return { status: "unavailable", reason: "storage_unavailable" }
   const locks = typeof navigator === "undefined" ? undefined : navigator.locks
-  if (!locks && conditional) return null
+  if (!locks && conditional) return { status: "unavailable", reason: "coordination_unavailable" }
   let changed = false
   const context: AuthMutationContext = {
     storage,
     markAuthUpdated: () => { changed = true },
   }
   try {
-    return locks
+    const value = locks
       ? await locks.request(AUTH_MUTATION_LOCK, () => action(context))
       : await action(context)
+    return { status: "completed", value }
   } catch {
-    return null
+    return { status: "unavailable", reason: "operation_failed" }
   } finally {
     // A same-tab observer may synchronously read storage, so publication must
     // happen only after the Web Lock callback has returned.
     if (changed) dispatchAuthTokenUpdated(storage)
   }
 }
-function unavailable(): AuthMutationResult { return { status: "unavailable" } }
+function unavailable(reason: AuthMutationUnavailableReason): AuthMutationResult { return { status: "unavailable", reason } }
+/** The sole user-facing copy mapper for browser auth availability failures. */
+export function authMutationUnavailableMessage(reason: AuthMutationUnavailableReason): string {
+  switch (reason) {
+    case "storage_unavailable": return "Your browser is blocking local storage. Enable storage and try again."
+    case "coordination_unavailable": return "Your browser does not support the secure sign-in features this application requires."
+    case "operation_failed": return "Your sign-in session could not be updated. Please try again."
+  }
+}
 function nextRevision(value: number): number | null { return value < MAX_REVISION ? value + 1 : null }
 /** Claims exclusive user intent before a password request or OIDC redirect begins. */
 export async function claimAuthLoginIntent(): Promise<AuthIntentClaimResult> {
@@ -375,18 +391,18 @@ export async function claimAuthLoginIntent(): Promise<AuthIntentClaimResult> {
     try { storage.removeItem(AUTH_REVOKED_LOGIN_INTENT_KEY) } catch { /* stale tombstone remains safely scoped */ }
     return { status: "claimed" as const, intent }
   })
-  return result ?? { status: "unavailable" }
+  return result.status === "completed" ? result.value : result
 }
 /** Claims an intent and binds it to this tab before an OIDC full-page redirect. */
 export async function claimOidcAuthLoginIntent(): Promise<AuthIntentClaimResult> {
   const claim = await claimAuthLoginIntent()
   if (claim.status !== "claimed") return claim
   const storage = getSessionStorage()
-  if (!storage) return { status: "unavailable" }
+  if (!storage) return { status: "unavailable", reason: "storage_unavailable" }
   try {
     storage.setItem(AUTH_OIDC_INTENT_KEY, serializeAuthLoginIntent(claim.intent))
     return claim
-  } catch { return { status: "unavailable" } }
+  } catch { return { status: "unavailable", reason: "operation_failed" } }
 }
 /** Takes the OIDC intent created in this tab; callbacks cannot adopt a later intent. */
 export function takeOidcAuthLoginIntent(): AuthLoginIntent | null {
@@ -408,7 +424,7 @@ export async function createAuthSession(value: unknown, intent?: AuthLoginIntent
     replaceAuthLoginIntent(storage)
     return { status: "created" as const, projection: writeNewSession(storage, payload, markAuthUpdated) }
   })
-  return result ?? unavailable()
+  return result.status === "completed" ? result.value : unavailable(result.reason)
 }
 /** Legacy migration is conditional: no lock means no unsafe migration. */
 export async function migrateLegacyAuthSession(): Promise<AuthMutationResult> {
@@ -441,7 +457,7 @@ export async function migrateLegacyAuthSession(): Promise<AuthMutationResult> {
     storage.removeItem(LEGACY_AUTH_TOKEN_KEY); storage.removeItem(LEGACY_AUTH_USER_KEY)
     return { status: "migrated" as const, projection }
   })
-  return result ?? unavailable()
+  return result.status === "completed" ? result.value : unavailable(result.reason)
 }
 function advanceExact(storage: AuthStorage, cache: AuthCache, payload: Omit<AuthTokenPayload, "user">, markAuthUpdated: () => void): AuthMutationResult {
   const revision = nextRevision(cache.credentialRevision)
@@ -452,8 +468,8 @@ function advanceExact(storage: AuthStorage, cache: AuthCache, payload: Omit<Auth
   if (expiresAt === null || refreshExpiresAt === null) return { status: "invalid" }
   const updated: AuthCache = {
     ...cache, credentialRevision: revision, token: payload.access_token,
-    refreshToken: payload.refresh_token || cache.refreshToken, timestamp: now,
-    expiresAt,
+    refreshToken: payload.refresh_token!, timestamp: now,
+    expiresAt: expiresAt ?? cache.expiresAt,
     refreshExpiresAt: refreshExpiresAt ?? cache.refreshExpiresAt,
   }
   persist(storage, updated, markAuthUpdated); return { status: "updated", projection: projectionFromCache(updated) }
@@ -464,11 +480,11 @@ export async function commitAuthSessionRefresh(captured: AuthSessionSnapshot, va
     const comparison = compareCredentialSession(captured)
     if (isCredentialAdvanced(comparison)) return { status: "advanced" as const, projection: comparison.projection! }
     if (!isExactCredential(comparison)) return { status: comparison.status as "replaced" | "absent" | "expired" | "invalid" }
-    const payload = parseRefreshCommitPayload(value, comparison.projection!.cache.refreshToken)
+    const payload = parseRefreshCommitPayload(value)
     if (!payload) return { status: "invalid" as const }
     return advanceExact(storage, comparison.projection!.cache, payload, markAuthUpdated)
   })
-  return result ?? unavailable()
+  return result.status === "completed" ? result.value : unavailable(result.reason)
 }
 export async function updateAuthSessionUser(captured: AuthSessionSnapshot, next: AuthUser | AuthCacheUser): Promise<AuthMutationResult> {
   const user = normalizeUser(next)
@@ -483,15 +499,15 @@ export async function updateAuthSessionUser(captured: AuthSessionSnapshot, next:
     const updated = { ...cache, user: { ...cache.user, username: user.username, email: user.email, is_admin: user.is_admin }, profileRevision: revision }
     persist(storage, updated, markAuthUpdated); return { status: "updated" as const, projection: projectionFromCache(updated) }
   })
-  return result ?? unavailable()
+  return result.status === "completed" ? result.value : unavailable(result.reason)
 }
-export async function clearAuthSessionIfCurrent(captured: AuthSessionSnapshot): Promise<boolean> {
+export async function clearAuthSessionIfCurrent(captured: AuthSessionSnapshot): Promise<AuthConditionalClearResult> {
   const result = await withMutationLock(true, async ({ storage, markAuthUpdated }) => {
     const comparison = compareCredentialSession(captured)
-    if (!isExactCredential(comparison)) return false
-    storage.removeItem(AUTH_CACHE_KEY); markAuthUpdated(); return true
+    if (!isExactCredential(comparison)) return { status: "not_current" as const }
+    storage.removeItem(AUTH_CACHE_KEY); markAuthUpdated(); return { status: "cleared" as const }
   })
-  return result ?? false
+  return result.status === "completed" ? result.value : result
 }
 /** Explicit logout is serialized when possible, and remains available without Web Locks. */
 export async function clearStoredAuth(): Promise<AuthLogoutResult> {
@@ -533,11 +549,9 @@ export async function clearStoredAuth(): Promise<AuthLogoutResult> {
         credentialsCleared = false
       }
     }
-    return {
-      status: credentialsCleared && barrier !== "unavailable" ? "cleared" as const : "unavailable" as const,
-      credentialsCleared,
-      barrier,
-    }
+    if (credentialsCleared && barrier !== "unavailable") return { status: "cleared" as const, credentialsCleared: true as const, barrier }
+    return { status: "unavailable" as const, reason: "operation_failed" as const, credentialsCleared, barrier }
   })
-  return result ?? { status: "unavailable", credentialsCleared: false, barrier: "unavailable" }
+  if (result.status === "completed") return result.value
+  return { status: "unavailable", reason: result.reason === "storage_unavailable" ? result.reason : "operation_failed", credentialsCleared: false, barrier: "unavailable" }
 }

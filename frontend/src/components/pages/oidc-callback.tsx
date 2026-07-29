@@ -45,6 +45,10 @@ export function OidcCallbackPage() {
 
         const created = await createAuthSession(data, intent)
         if (created.status !== "created") {
+          if (created.status === "unavailable") {
+            window.location.href = `/login?auth_unavailable=${created.reason}`
+            return
+          }
           throw new Error("OIDC session storage failed")
         }
         window.location.href = "/"

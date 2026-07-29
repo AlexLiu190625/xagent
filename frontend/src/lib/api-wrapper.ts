@@ -3,6 +3,7 @@
 import { getApiUrl } from "@/lib/utils"
 import {
   type AuthSessionSnapshot,
+  type AuthMutationUnavailableReason,
   clearAuthSessionIfCurrent,
   compareAuthSession, compareCredentialSession,
   commitAuthSessionRefresh,
@@ -13,7 +14,7 @@ const AUTH_REFRESH_TIMEOUT_MS = 15_000
 const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
 export type AuthRefreshResult =
   | { accessToken: string; session: AuthSessionSnapshot }
-  | { accessToken: null; rejected: boolean }
+  | { accessToken: null; rejected: boolean; reason?: AuthMutationUnavailableReason }
 const refreshPromises = new Map<string, Promise<AuthRefreshResult>>()
 const REFRESH_EXCLUDED_AUTH_ENDPOINTS = ["/api/auth/login", "/api/auth/register", "/api/auth/setup-admin", "/api/auth/forgot-password", "/api/auth/reset-password"]
 
@@ -41,15 +42,36 @@ async function fetchWithRetry(url: string, options: RequestInit, maxRetries = 2)
 function refreshLockName(session: AuthSessionSnapshot): string | null {
   return session.sessionId ? `${AUTH_REFRESH_LOCK_PREFIX}${session.sessionId}` : null
 }
-async function withRefreshLock<T>(session: AuthSessionSnapshot, action: () => Promise<T>): Promise<T | null> {
+type RefreshLockAttempt<T> =
+  | { status: "completed"; value: T }
+  | { status: "unavailable"; reason: AuthMutationUnavailableReason }
+async function withRefreshLock<T>(session: AuthSessionSnapshot, action: () => Promise<T>): Promise<RefreshLockAttempt<T>> {
   const lockName = refreshLockName(session)
   const locks = typeof navigator === "undefined" ? undefined : navigator.locks
-  if (!lockName || !locks) return null
+  if (!lockName) return { status: "unavailable", reason: "operation_failed" }
+  if (!locks) return { status: "unavailable", reason: "coordination_unavailable" }
   try {
-    return await locks.request(lockName, action)
+    return { status: "completed", value: await locks.request(lockName, action) }
   } catch {
-    return null
+    return { status: "unavailable", reason: "operation_failed" }
   }
+}
+type StrictRefreshResponse = {
+  success: true
+  access_token: string
+  refresh_token: string
+  expires_in: number
+  refresh_expires_in: number
+}
+function parseStrictRefreshResponse(value: unknown): StrictRefreshResponse | null {
+  if (typeof value !== "object" || value === null) return null
+  const payload = value as Partial<StrictRefreshResponse>
+  const nonblank = (token: unknown): token is string => typeof token === "string" && token.trim().length > 0
+  const expiry = (seconds: unknown): seconds is number => typeof seconds === "number" && Number.isSafeInteger(seconds) && seconds > 0
+  return payload.success === true && nonblank(payload.access_token) && nonblank(payload.refresh_token)
+    && expiry(payload.expires_in) && expiry(payload.refresh_expires_in)
+    ? payload as StrictRefreshResponse
+    : null
 }
 async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRefreshResult> {
   const result = await withRefreshLock(session, async () => {
@@ -70,10 +92,13 @@ async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRe
         body: JSON.stringify({ refresh_token: before.projection.cache.refreshToken }), signal: controller.signal,
       })
       if (!response.ok) return { accessToken: null, rejected: response.status === 401 || response.status === 403 } satisfies AuthRefreshResult
-      const committed = await commitAuthSessionRefresh(session, await response.json())
+      const payload = parseStrictRefreshResponse(await response.json())
+      if (!payload) return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+      const committed = await commitAuthSessionRefresh(session, payload)
       if (committed.status === "updated" || committed.status === "advanced") {
         return { accessToken: committed.projection.snapshot.accessToken!, session: committed.projection.snapshot } satisfies AuthRefreshResult
       }
+      if (committed.status === "unavailable") return { accessToken: null, rejected: false, reason: committed.reason } satisfies AuthRefreshResult
       return { accessToken: null, rejected: false } satisfies AuthRefreshResult
     } catch (error) {
       console.error("Token refresh failed:", error)
@@ -82,7 +107,7 @@ async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRe
       clearTimeout(timeout)
     }
   })
-  return result ?? { accessToken: null, rejected: false }
+  return result.status === "completed" ? result.value : { accessToken: null, rejected: false, reason: result.reason }
 }
 /** Refreshes only the immutable snapshot captured by the caller. */
 export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): Promise<AuthRefreshResult> {
@@ -117,14 +142,14 @@ export async function apiRequest(url: string, options: RequestInit = {}): Promis
   if (afterResponse.status !== "exact" && afterResponse.status !== "profile_advanced") return response
   const errorType = response.headers.get("Error-Type")
   if (errorType && errorType !== "TokenExpired") {
-    if (await clearAuthSessionIfCurrent(session)) window.location.href = "/login"
+    if ((await clearAuthSessionIfCurrent(session)).status === "cleared") window.location.href = "/login"
     return response
   }
   const refreshed = await refreshStoredAccessToken(session)
   if (refreshed.accessToken !== null && compareCredentialSession(refreshed.session).status === "exact_credentials") {
     return fetch(url, withBearer(options, refreshed.accessToken))
   }
-  if (refreshed.accessToken === null && refreshed.rejected && await clearAuthSessionIfCurrent(session)) {
+  if (refreshed.accessToken === null && refreshed.rejected && (await clearAuthSessionIfCurrent(session)).status === "cleared") {
     console.error("Refresh token was rejected, redirecting to login")
     window.location.href = "/login"
   }
@@ -166,6 +191,6 @@ export const api = {
 export async function handleAuthError(response: Response): Promise<boolean> {
   if (response.status !== 401) return false
   const cleared = await clearAuthSessionIfCurrent(readAuthSessionSnapshot())
-  if (cleared) window.location.href = "/login"
-  return cleared
+  if (cleared.status === "cleared") window.location.href = "/login"
+  return cleared.status === "cleared"
 }

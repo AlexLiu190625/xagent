@@ -6,7 +6,7 @@ import { apiRequest, refreshStoredAccessToken } from "@/lib/api-wrapper"
 import {
   AUTH_CACHE_DURATION_MS, AUTH_CACHE_KEY, AUTH_TOKEN_UPDATED_EVENT,
   type AuthCacheUser, type AuthSessionProjection, type AuthSessionSnapshot,
-  clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
+  authMutationUnavailableMessage, clearAuthSessionIfCurrent, clearStoredAuth, compareAuthSession,
   claimAuthLoginIntent, createAuthSession, inspectAuthSession, migrateLegacyAuthSession,
 } from "@/lib/auth-cache"
 
@@ -135,7 +135,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         const cleared = await clearAuthSessionIfCurrent(captured)
         const after = currentProjection()
         if (mountedRef.current && operation === operationRef.current) setProjection(after)
-        return !cleared && Boolean(after?.snapshot.accessToken)
+        return cleared.status !== "cleared" && Boolean(after?.snapshot.accessToken)
       }
       return Boolean(current.snapshot.accessToken)
     } catch (error) {
@@ -152,6 +152,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     if (mountedRef.current && operation === operationRef.current) setProjection(current)
     if (result.accessToken !== null) return Boolean(current && current.snapshot.sessionId === expected.sessionId && current.snapshot.accessToken === result.accessToken)
     if (result.rejected) await clearAuthSessionIfCurrent(expected)
+    if (result.reason) console.error(authMutationUnavailableMessage(result.reason))
     const after = currentProjection()
     if (mountedRef.current && operation === operationRef.current) setProjection(after)
     return false

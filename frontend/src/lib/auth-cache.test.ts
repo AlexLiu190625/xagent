@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
   AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
   AUTH_TOKEN_UPDATED_EVENT, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, commitAuthSessionRefresh, compareAuthSession, createAuthSession,
-  inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, updateAuthSessionUser, type AuthTokenPayload,
+  authMutationUnavailableMessage, inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, updateAuthSessionUser, type AuthTokenPayload,
   takeOidcAuthLoginIntent,
 } from "@/lib/auth-cache"
 
@@ -39,13 +39,20 @@ describe("auth cache lineage", () => {
   ])("treats unavailable or malformed browser storage as absent and fails mutations safely", async storage => {
     vi.stubGlobal("localStorage", storage)
     expect(inspectAuthSession()).toEqual({ status: "absent", projection: null })
-    await expect(migrateLegacyAuthSession()).resolves.toEqual({ status: "unavailable" })
+    await expect(migrateLegacyAuthSession()).resolves.toEqual({ status: "unavailable", reason: "storage_unavailable" })
     expect(["superseded", "unavailable"]).toContain((await createAuthSession({ user, access_token: "access" })).status)
-    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", credentialsCleared: false })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", reason: "storage_unavailable", credentialsCleared: false })
   })
   it("does not create a bearer session without the login intent that authorized it", async () => {
     expect(await createAuthSession({ user, access_token: "late-access" })).toEqual({ status: "superseded" })
     expect(inspectAuthSession().status).toBe("absent")
+  })
+  it.each([
+    ["storage_unavailable", "Your browser is blocking local storage. Enable storage and try again."],
+    ["coordination_unavailable", "Your browser does not support the secure sign-in features this application requires."],
+    ["operation_failed", "Your sign-in session could not be updated. Please try again."],
+  ] as const)("maps %s through the single auth availability presentation mapper", (reason, expected) => {
+    expect(authMutationUnavailableMessage(reason)).toBe(expected)
   })
   it("consumes a claimed intent so its response cannot be committed twice", async () => {
     const claim = await claimAuthLoginIntent()
@@ -182,13 +189,14 @@ describe("auth cache lineage", () => {
     await updateAuthSessionUser(captured, { ...user, email: "profile@example.com" })
     expect(current().cache).toMatchObject({ token: "new", user: { email: "profile@example.com" }, credentialRevision: 1, profileRevision: 1 })
   })
-  it("keeps the exact in-lock refresh token when the server omits a replacement", async () => {
+  it("keeps existing expiry fields only when a lower-level refresh payload omits them", async () => {
     const captured = await created({ user, access_token: "old", refresh_token: "old-refresh" })
+    const before = current().cache
 
-    const committed = await commitAuthSessionRefresh(captured, { success: true, access_token: "new" })
+    const committed = await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })
 
-    expect(committed).toMatchObject({ status: "updated", projection: { snapshot: { accessToken: "new", refreshToken: "old-refresh" } } })
-    expect(current().cache.refreshToken).toBe("old-refresh")
+    expect(committed).toMatchObject({ status: "updated", projection: { snapshot: { accessToken: "new", refreshToken: "new-refresh" } } })
+    expect(current().cache).toMatchObject({ expiresAt: before.expiresAt, refreshExpiresAt: before.refreshExpiresAt })
   })
   it("rejects a refresh response that does not satisfy the refresh response contract", async () => {
     const captured = await created({ user, access_token: "old", refresh_token: "old-refresh" })
@@ -218,25 +226,53 @@ describe("auth cache lineage", () => {
     expect((await updateAuthSessionUser(zero, { id: "other", username: "other" })).status).toBe("invalid")
     expect((await updateAuthSessionUser(zero, { id: 0, username: "zero-2", email: null, is_admin: true })).status).toBe("updated")
   })
-  it("fails conditional operations and login commits closed without locks", async () => {
+  it("reports coordination_unavailable and makes zero storage mutations for conditional operations without locks", async () => {
     const captured = await created()
     const claim = await claimAuthLoginIntent()
     expect(claim.status).toBe("claimed")
     if (claim.status !== "claimed") throw new Error("expected login intent")
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
-    expect((await commitAuthSessionRefresh(captured, { success: true, access_token: "new" })).status).toBe("unavailable")
-    expect((await createAuthSession({ user, access_token: "late" }, claim.intent)).status).toBe("unavailable")
+    const before = localStorage.getItem(AUTH_CACHE_KEY)
+    expect(await commitAuthSessionRefresh(captured, { success: true, access_token: "new", refresh_token: "new-refresh" })).toEqual({ status: "unavailable", reason: "coordination_unavailable" })
+    expect(await createAuthSession({ user, access_token: "late" }, claim.intent)).toEqual({ status: "unavailable", reason: "coordination_unavailable" })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
     expect(current().snapshot.accessToken).toBe("access")
   })
   it("does not let old same-user lineage clear a replacement", async () => {
     const old = await created({ user, access_token: "old", refresh_token: "r" })
     const replacement = await created({ user, access_token: "new", refresh_token: "r2" })
-    expect(await clearAuthSessionIfCurrent(old)).toBe(false)
+    expect(await clearAuthSessionIfCurrent(old)).toEqual({ status: "not_current" })
     expect(readAuthSessionSnapshot().sessionId).toBe(replacement.sessionId)
   })
-  it("fails closed on lock rejection", async () => {
+  it("reports operation_failed for lock rejection without storage mutation", async () => {
+    const before = localStorage.getItem(AUTH_CACHE_KEY)
     Object.defineProperty(navigator, "locks", { configurable: true, value: { request: vi.fn(async () => { throw new Error("lock failed") }) } })
-    expect(await claimAuthLoginIntent()).toEqual({ status: "unavailable" })
+    expect(await claimAuthLoginIntent()).toEqual({ status: "unavailable", reason: "operation_failed" })
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
+  })
+  it("reports operation_failed and makes zero storage mutations when a conditional callback throws", async () => {
+    const claim = await claimAuthLoginIntent()
+    expect(claim.status).toBe("claimed")
+    if (claim.status !== "claimed") throw new Error("expected login intent")
+    const before = localStorage.getItem(AUTH_CACHE_KEY)
+    const originalSetItem = localStorage.setItem.bind(localStorage)
+    vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
+      if (key === AUTH_CACHE_KEY) throw new Error("write blocked")
+      originalSetItem(key, value)
+    })
+
+    expect(await createAuthSession({ user, access_token: "access" }, claim.intent)).toEqual({ status: "unavailable", reason: "operation_failed" })
+
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
+  })
+  it("returns discriminated conditional-clear outcomes", async () => {
+    const currentSession = await created()
+    await expect(clearAuthSessionIfCurrent(currentSession)).resolves.toEqual({ status: "cleared" })
+
+    const replacement = await created({ user, access_token: "replacement" })
+    await expect(clearAuthSessionIfCurrent(currentSession)).resolves.toEqual({ status: "not_current" })
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+    await expect(clearAuthSessionIfCurrent(replacement)).resolves.toEqual({ status: "unavailable", reason: "coordination_unavailable" })
   })
   it("rejects malformed login and refresh payloads without writing", async () => {
     const invalid = await createAuthSession({ user: { id: "", username: "alice" }, access_token: "access" })
@@ -294,7 +330,7 @@ describe("auth cache lineage", () => {
   it("does not clear storage when the logout lock is rejected", async () => {
     await created()
     Object.defineProperty(navigator, "locks", { configurable: true, value: { request: vi.fn(async () => { throw new Error("lock failed") }) } })
-    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", credentialsCleared: false })
+    await expect(clearStoredAuth()).resolves.toMatchObject({ status: "unavailable", reason: "operation_failed", credentialsCleared: false })
     expect(inspectAuthSession()).toMatchObject({ status: "valid", projection: { snapshot: { accessToken: "access" } } })
   })
   it("allows explicit logout without Web Locks", async () => {
@@ -369,7 +405,7 @@ describe("auth cache lineage", () => {
 
     const result = await clearStoredAuth()
 
-    expect(result).toMatchObject({ status: "unavailable", credentialsCleared: true, barrier: "unavailable" })
+    expect(result).toMatchObject({ status: "unavailable", reason: "operation_failed", credentialsCleared: true, barrier: "unavailable" })
     expect(inspectAuthSession().status).toBe("absent")
   })
   it("publishes credential deletion after lock release even when a later removal fails", async () => {
@@ -391,7 +427,7 @@ describe("auth cache lineage", () => {
 
     const result = await clearStoredAuth()
 
-    expect(result).toMatchObject({ status: "unavailable", credentialsCleared: false })
+    expect(result).toMatchObject({ status: "unavailable", reason: "operation_failed", credentialsCleared: false })
     expect(localStorage.getItem(AUTH_CACHE_KEY)).toBeNull()
     expect(observedWhileLocked).toEqual([false])
   })

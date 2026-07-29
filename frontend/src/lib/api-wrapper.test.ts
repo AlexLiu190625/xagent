@@ -220,7 +220,7 @@ describe("api-wrapper auth refresh", () => {
     window.addEventListener(AUTH_TOKEN_UPDATED_EVENT, updateProfileAfterRefresh)
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, options) => {
       if (String(input).endsWith("/api/auth/refresh")) {
-        return new Response(JSON.stringify({ success: true, access_token: "new-access", refresh_token: "new-refresh" }), {
+        return new Response(JSON.stringify({ success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 120, refresh_expires_in: 240 }), {
           headers: { "Content-Type": "application/json" },
         })
       }
@@ -338,9 +338,43 @@ describe("api-wrapper auth refresh", () => {
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
     const fetchMock = vi.spyOn(globalThis, "fetch")
 
-    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ accessToken: null, rejected: false })
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ accessToken: null, rejected: false, reason: "coordination_unavailable" })
     await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    {},
+    { success: false, access_token: "new-access", refresh_token: "new-refresh", expires_in: 60, refresh_expires_in: 120 },
+    { success: true, access_token: " ", refresh_token: "new-refresh", expires_in: 60, refresh_expires_in: 120 },
+    { success: true, access_token: "new-access", refresh_token: " ", expires_in: 60, refresh_expires_in: 120 },
+    { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 1.5, refresh_expires_in: 120 },
+    { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: true, refresh_expires_in: 120 },
+    { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: "60", refresh_expires_in: 120 },
+    { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 0, refresh_expires_in: 120 },
+    { success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 60, refresh_expires_in: -1 },
+  ])("rejects an incomplete or malformed refresh response without advancing cache lineage", async payload => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    const before = localStorage.getItem(AUTH_CACHE_KEY)
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(payload), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }))
+
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ accessToken: null, rejected: false })
+
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
+  })
+
+  it("persists opaque rotated refresh credentials exactly after a complete refresh response", async () => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      success: true, access_token: " new-access ", refresh_token: " new-refresh ", expires_in: 60, refresh_expires_in: 120,
+    }), { status: 200, headers: { "Content-Type": "application/json" } }))
+
+    const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
+
+    expect(result).toMatchObject({ accessToken: " new-access ", session: { accessToken: " new-access ", refreshToken: " new-refresh " } })
+    expect(JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")).toMatchObject({ token: " new-access ", refreshToken: " new-refresh " })
   })
 
   it("does not reuse a changed session while waiting for the lock", async () => {
@@ -377,6 +411,8 @@ describe("api-wrapper auth refresh", () => {
       success: true,
       access_token: "new-access",
       refresh_token: "new-refresh",
+      expires_in: 120,
+      refresh_expires_in: 240,
     }), {
       status: 200,
       headers: { "Content-Type": "application/json" },
@@ -403,6 +439,8 @@ describe("api-wrapper auth refresh", () => {
         success: true,
         access_token: "late-access",
         refresh_token: "late-refresh",
+        expires_in: 120,
+        refresh_expires_in: 240,
       }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
@@ -620,6 +658,8 @@ describe("api-wrapper auth refresh", () => {
           success: true,
           access_token: "shared-access",
           refresh_token: "refreshed-refresh",
+          expires_in: 120,
+          refresh_expires_in: 240,
         }), {
           status: 200,
           headers: { "Content-Type": "application/json" },
@@ -681,6 +721,8 @@ describe("api-wrapper auth refresh", () => {
             success: true,
             access_token: "late-access",
             refresh_token: "late-refresh",
+            expires_in: 120,
+            refresh_expires_in: 240,
           }), {
             status: 200,
             headers: { "Content-Type": "application/json" },

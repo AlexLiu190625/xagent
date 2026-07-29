@@ -22,7 +22,11 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useSetupStatus } from "@/hooks/use-setup-status"
 import { AuthPageShell } from "@/components/auth/auth-page-shell"
 import { AuthFormCard } from "@/components/auth/auth-form-card"
-import { claimAuthLoginIntent, claimOidcAuthLoginIntent, createAuthSession } from "@/lib/auth-cache"
+import { authMutationUnavailableMessage, claimAuthLoginIntent, claimOidcAuthLoginIntent, createAuthSession } from "@/lib/auth-cache"
+
+function isAuthMutationUnavailableReason(value: string | null): value is Parameters<typeof authMutationUnavailableMessage>[0] {
+  return value === "storage_unavailable" || value === "coordination_unavailable" || value === "operation_failed"
+}
 
 export function LoginPage() {
   const branding = getBrandingFromEnv()
@@ -42,8 +46,11 @@ export function LoginPage() {
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
+    const authUnavailable = params.get("auth_unavailable")
     const oidcError = params.get("oidc_error")
-    if (oidcError) {
+    if (isAuthMutationUnavailableReason(authUnavailable)) {
+      setError(authMutationUnavailableMessage(authUnavailable))
+    } else if (oidcError) {
       setError(
         tDynamic(
           `login.oidc_errors.${oidcError}`,
@@ -77,7 +84,7 @@ export function LoginPage() {
     try {
       const claimed = await claimAuthLoginIntent()
       if (claimed.status !== "claimed") {
-        setError(t("login.alerts.auth_failed"))
+        setError(authMutationUnavailableMessage(claimed.reason))
         return
       }
       const response = await apiRequest(`${getApiUrl()}/api/auth/login`, {
@@ -92,7 +99,7 @@ export function LoginPage() {
         const data = await response.json()
         const created = await createAuthSession(data, claimed.intent)
         if (created.status !== "created") {
-          setError(t("login.alerts.auth_failed"))
+          setError(created.status === "unavailable" ? authMutationUnavailableMessage(created.reason) : t("login.alerts.auth_failed"))
           return
         }
 
@@ -123,7 +130,7 @@ export function LoginPage() {
     setIsLoading(true)
     const claimed = await claimOidcAuthLoginIntent()
     if (claimed.status !== "claimed") {
-      setError(t("login.alerts.auth_failed"))
+      setError(authMutationUnavailableMessage(claimed.reason))
       setIsLoading(false)
       return
     }
