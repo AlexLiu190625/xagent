@@ -39,6 +39,7 @@ from xagent.web.api.websocket import (
     handle_chat_message,
     handle_pause_task,
     handle_resume_task,
+    send_message_delivery,
 )
 from xagent.web.models.chat_message import TaskChatMessage
 from xagent.web.models.database import Base, get_db, get_engine, init_db
@@ -95,6 +96,23 @@ def _task(db, owner_id: int, status: TaskStatus = TaskStatus.RUNNING) -> Task:
     db.commit()
     db.refresh(t)
     return t
+
+
+@pytest.mark.asyncio
+async def test_rejected_delivery_serializes_an_explicit_outcome() -> None:
+    ws_manager = MagicMock(send_personal_message=AsyncMock())
+    with patch("xagent.web.api.websocket.manager", ws_manager):
+        await send_message_delivery(
+            MagicMock(),
+            client_message_id="rejected-turn",
+            turn_id="rejected-turn",
+            accepted=False,
+            rejection_outcome="not_accepted",
+        )
+
+    payload = ws_manager.send_personal_message.await_args.args[0]
+    assert payload["type"] == "message_rejected"
+    assert payload["rejection_outcome"] == "not_accepted"
 
 
 @pytest.mark.asyncio
@@ -1667,6 +1685,7 @@ async def test_reusing_client_id_with_different_content_is_rejected(
     ]
     assert len(rejected) == 1
     assert rejected[0]["retry_with_new_id"] is True
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
 
 
 @pytest.mark.asyncio
@@ -1717,6 +1736,7 @@ async def test_failed_durable_delivery_is_not_silently_accepted(db_session) -> N
     ]
     assert len(rejected) == 1
     assert rejected[0]["retry_with_new_id"] is True
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
 
 
 @pytest.mark.asyncio

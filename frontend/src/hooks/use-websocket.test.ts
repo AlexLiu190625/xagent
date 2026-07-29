@@ -158,9 +158,10 @@ describe("useWebSocket message delivery", () => {
       autoConnect: false,
     }))
 
-    await expect(result.current.sendChatMessage("keep this draft")).rejects.toThrow(
-      "connection is not ready",
-    )
+    await expect(result.current.sendChatMessage("keep this draft")).rejects.toMatchObject({
+      message: "Message not sent: the connection is not ready.",
+      disposition: "not_sent",
+    })
   })
 
   it("returns not_sent when no current open socket owns a raw protocol write", async () => {
@@ -271,9 +272,13 @@ describe("useWebSocket message delivery", () => {
         type: "message_rejected",
         client_message_id: "stable-turn-1",
         message: "temporary failure",
+        rejection_outcome: "not_accepted",
       })
     })
-    await expect(first).rejects.toThrow("temporary failure")
+    await expect(first).rejects.toMatchObject({
+      message: "temporary failure",
+      disposition: "rejected",
+    })
 
     const retry = result.current.sendChatMessage(
       "retry me",
@@ -352,12 +357,14 @@ describe("useWebSocket message delivery", () => {
         client_message_id: "failed-turn-1",
         message: "previous delivery failed",
         retry_with_new_id: true,
+        rejection_outcome: "not_accepted",
       })
     })
 
     await expect(delivery).rejects.toMatchObject({
       message: "previous delivery failed",
       retryWithNewId: true,
+      disposition: "rejected",
     })
   })
 
@@ -407,7 +414,10 @@ describe("useWebSocket message delivery", () => {
     const delivery = result.current.sendChatMessage("keep after disconnect")
     act(() => socket.triggerClose())
 
-    await expect(delivery).rejects.toThrow("Connection closed")
+    await expect(delivery).rejects.toMatchObject({
+      message: "Connection closed before the message was accepted.",
+      disposition: "outcome_unknown",
+    })
   })
 
   it("rejects an unacknowledged delivery after 30 seconds", async () => {
@@ -423,7 +433,10 @@ describe("useWebSocket message delivery", () => {
 
     try {
       const delivery = result.current.sendChatMessage("timeout draft")
-      const rejection = expect(delivery).rejects.toThrow("not acknowledged")
+      const rejection = expect(delivery).rejects.toMatchObject({
+        message: "Message delivery was not acknowledged. Your draft was kept.",
+        disposition: "outcome_unknown",
+      })
       await act(async () => {
         vi.advanceTimersByTime(30000)
       })
@@ -431,6 +444,33 @@ describe("useWebSocket message delivery", () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it.each([
+    [undefined, "outcome_unknown"],
+    ["pending", "outcome_unknown"],
+    ["unexpected", "outcome_unknown"],
+  ])("fails closed for a rejected wire outcome of %s", async (rejectionOutcome, disposition) => {
+    const { result } = renderHook(() => useWebSocket({
+      url: "ws://localhost",
+      taskId: 1,
+    }))
+    await waitFor(() => expect(MockWebSocket.instances).toHaveLength(1))
+    const socket = MockWebSocket.instances[0]
+    act(() => socket.open())
+
+    const delivery = result.current.sendChatMessage("ambiguous draft", undefined, false, "ambiguous-turn")
+    act(() => socket.receive({
+      type: "message_rejected",
+      client_message_id: "ambiguous-turn",
+      message: "ambiguous delivery",
+      ...(rejectionOutcome === undefined ? {} : { rejection_outcome: rejectionOutcome }),
+    }))
+
+    await expect(delivery).rejects.toMatchObject({
+      message: "ambiguous delivery",
+      disposition,
+    })
   })
 })
 

@@ -5434,11 +5434,32 @@ export function AppProvider({
           if (!replacementSendStillOwned()) {
             throw error
           }
-          discardSessionPreAdoptionBuffer()
-          dispatchSessionConversation({
-            type: "SESSION_REPLACEMENT_REJECTED",
-            connectionIdentity: sessionDeliveryOwner.connectionIdentity,
-          })
+          const candidatePresent = sessionPreAdoptionBufferRef.current?.candidate != null
+          const disposition = (
+            error
+            && typeof error === "object"
+            && "disposition" in error
+            && (
+              error.disposition === "not_sent"
+              || error.disposition === "rejected"
+              || error.disposition === "outcome_unknown"
+            )
+          )
+            ? error.disposition
+            : "outcome_unknown"
+          if (disposition === "outcome_unknown" || candidatePresent) {
+            requireSessionReload(
+              error instanceof Error
+                ? error
+                : new Error("Conversation outcome is unknown; reload required."),
+            )
+          } else {
+            discardSessionPreAdoptionBuffer()
+            dispatchSessionConversation({
+              type: "SESSION_REPLACEMENT_REJECTED",
+              connectionIdentity: sessionDeliveryOwner.connectionIdentity,
+            })
+          }
         }
         throw error
       } finally {

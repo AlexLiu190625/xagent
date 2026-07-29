@@ -1277,6 +1277,7 @@ async def share_chat_websocket_endpoint(
                     turn_id=str(client_message_id or ""),
                     accepted=False,
                     message=rate_limited_message,
+                    rejection_outcome="not_accepted",
                 )
                 # send_message_delivery no-ops without a client_message_id, so
                 # a client that didn't tag the turn would otherwise get zero

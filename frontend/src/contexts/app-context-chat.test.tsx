@@ -2149,7 +2149,7 @@ describe("AppProvider websocket message routing", () => {
     })
   })
 
-  it("discards a pre-acceptance candidate when replacement delivery is rejected", async () => {
+  it("requires reload when a pre-acceptance candidate accompanies an untyped replacement failure", async () => {
     const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
     sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
     render(
@@ -2178,9 +2178,47 @@ describe("AppProvider websocket message routing", () => {
       await expect(replacement).rejects.toThrow("delivery rejected")
     })
 
-    expect(screen.getByTestId("session-conversation-state").textContent).toBe("replacement_ready")
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
     expect(screen.getByTestId("task-id").textContent).toBe("")
     expect(screen.getByTestId("messages").textContent).not.toContain("Rejected candidate output")
+  })
+
+  it.each([
+    ["not_sent", false, "replacement_ready"],
+    ["rejected", false, "replacement_ready"],
+    ["outcome_unknown", false, "reload_required"],
+    ["not_sent", true, "reload_required"],
+    ["rejected", true, "reload_required"],
+    ["outcome_unknown", true, "reload_required"],
+  ] as const)("settles replacement %s with candidate=%s as %s", async (disposition, candidatePresent, expectedPhase) => {
+    const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(190)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+
+    const replacement = getSessionControls().sendMessage("replacement", {
+      clientMessageId: `replacement-${disposition}-${String(candidatePresent)}`,
+    })
+    if (candidatePresent) {
+      act(() => onMessage?.(taskInfoMessage(191)))
+    }
+    const error = Object.assign(new Error(`replacement ${disposition}`), { disposition })
+    await act(async () => {
+      acknowledgement.reject(error)
+      await expect(replacement).rejects.toBe(error)
+    })
+
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe(expectedPhase)
   })
 
   it("fails closed when a bound Session receives a different task id", async () => {
@@ -2678,6 +2716,64 @@ describe("AppProvider websocket message routing", () => {
       onMessage?.(assistantMessage("x".repeat(256 * 1024), 81))
     })
     expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+  })
+
+  it("counts a task_info candidate in the bounded replacement buffer", async () => {
+    const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(82)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    const replacement = getSessionControls().sendMessage("Replacement", { clientMessageId: "candidate-budget" })
+    act(() => {
+      for (let index = 0; index < 63; index += 1) {
+        onMessage?.(assistantMessage(`Buffered ${index}`, 83))
+      }
+      onMessage?.(taskInfoMessage(83))
+      onMessage?.(assistantMessage("one frame too many", 83))
+    })
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    await act(async () => {
+      acknowledgement.reject(Object.assign(new Error("ambiguous replacement"), {
+        disposition: "outcome_unknown",
+      }))
+      await expect(replacement).rejects.toThrow("ambiguous replacement")
+    })
+  })
+
+  it("applies the byte cap to an oversized task_info candidate before acceptance", async () => {
+    const acknowledgement = deferred<{ client_message_id: string; turn_id: string }>()
+    sendChatMessageMock.mockReturnValueOnce(acknowledgement.promise)
+    render(
+      <AppProvider token="token" transport={makeSessionTransport()}>
+        <SessionControlsProbe />
+      </AppProvider>
+    )
+    const onMessage = webSocketOptions.current?.onMessage
+    act(() => onMessage?.(taskInfoMessage(84)))
+    const reset = getSessionControls().startNewConversation()
+    await act(async () => {
+      onMessage?.({ type: "conversation_reset", timestamp: "2026-05-27T05:00:03Z", data: {} })
+      await reset
+    })
+    const replacement = getSessionControls().sendMessage("Replacement", { clientMessageId: "oversized-candidate" })
+    act(() => onMessage?.(taskInfoMessage(85, { description: "x".repeat(256 * 1024) })))
+    expect(screen.getByTestId("session-conversation-state").textContent).toBe("reload_required")
+    await act(async () => {
+      acknowledgement.reject(Object.assign(new Error("ambiguous replacement"), {
+        disposition: "outcome_unknown",
+      }))
+      await expect(replacement).rejects.toThrow("ambiguous replacement")
+    })
   })
 
   it("expires an accepted replacement awaiting task_info instead of guessing after its deadline", async () => {

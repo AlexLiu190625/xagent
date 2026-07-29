@@ -292,9 +292,14 @@ async def send_message_delivery(
     accepted: bool,
     message: str | None = None,
     retry_with_new_id: bool = False,
+    rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
 ) -> None:
     if client_message_id is None:
         return
+    if not accepted and rejection_outcome is None:
+        raise ValueError("Rejected delivery requires an explicit rejection outcome")
+    if accepted and rejection_outcome is not None:
+        raise ValueError("Accepted delivery cannot include a rejection outcome")
     payload: dict[str, Any] = {
         "type": "message_accepted" if accepted else "message_rejected",
         "client_message_id": client_message_id,
@@ -305,6 +310,8 @@ async def send_message_delivery(
         payload["message"] = message
     if retry_with_new_id:
         payload["retry_with_new_id"] = True
+    if rejection_outcome is not None:
+        payload["rejection_outcome"] = rejection_outcome
     await manager.send_personal_message(payload, websocket)
 
 
@@ -2962,6 +2969,7 @@ async def execute_resume_background(
         message: str | None = None,
         *,
         retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
         if delivery_websocket is None or delivery_client_message_id is None:
             return
@@ -2973,6 +2981,7 @@ async def execute_resume_background(
                 accepted=accepted,
                 message=message,
                 retry_with_new_id=retry_with_new_id,
+                rejection_outcome=rejection_outcome,
             )
         except Exception:
             # Delivery state is durable; a disconnected client will retry the
@@ -3084,6 +3093,7 @@ async def execute_resume_background(
                         False,
                         "The deferred message could not be delivered. Please retry.",
                         retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
                     )
                 await manager.broadcast_to_task(
                     {
@@ -3375,6 +3385,7 @@ async def execute_resume_background(
                     False,
                     "The deferred message was cancelled. Please retry.",
                     retry_with_new_id=True,
+                    rejection_outcome="not_accepted",
                 )
         raise
     except Exception as e:
@@ -3417,6 +3428,7 @@ async def execute_resume_background(
                         False,
                         error_message,
                         retry_with_new_id=True,
+                        rejection_outcome="not_accepted",
                     )
             current_snapshot = None
             if (
@@ -4537,6 +4549,7 @@ async def handle_chat_message(
             turn_id=client_message_id or str(uuid.uuid4()),
             accepted=False,
             message=str(exc),
+            rejection_outcome="not_accepted",
         )
         await manager.send_personal_message(
             {"type": "error", "message": str(exc)}, websocket
@@ -4557,6 +4570,7 @@ async def handle_chat_message(
             accepted=False,
             message="Message id was already used for different content or files.",
             retry_with_new_id=True,
+            rejection_outcome="not_accepted",
         )
         return
     if enqueued.status == COMMAND_FAILED:
@@ -4567,6 +4581,7 @@ async def handle_chat_message(
             accepted=False,
             message="The previous delivery attempt failed. Please retry the draft.",
             retry_with_new_id=True,
+            rejection_outcome="not_accepted",
         )
         return
     await send_message_delivery(
@@ -5206,6 +5221,7 @@ async def _handle_chat_message_unserialized(
         message: str | None = None,
         *,
         retry_with_new_id: bool = False,
+        rejection_outcome: Literal["not_accepted", "outcome_unknown"] | None = None,
     ) -> None:
         nonlocal delivery_finished
         if delivery_finished:
@@ -5222,6 +5238,7 @@ async def _handle_chat_message_unserialized(
             accepted=accepted,
             message=message,
             retry_with_new_id=retry_with_new_id,
+            rejection_outcome=rejection_outcome,
         )
 
     async def finish_delivery_failure(message: str) -> bool:
@@ -5258,10 +5275,18 @@ async def _handle_chat_message_unserialized(
                     delivery_error,
                     exc_info=True,
                 )
-        await finish_delivery(
-            delivery_dispatched,
-            None if delivery_dispatched else message,
-        )
+        if delivery_dispatched:
+            await finish_delivery(True)
+        else:
+            await finish_delivery(
+                False,
+                message,
+                rejection_outcome=(
+                    "outcome_unknown"
+                    if delivery_failure_pool_timeout
+                    else "not_accepted"
+                ),
+            )
         return not delivery_failure_pool_timeout
 
     async def finish_existing_delivery(
@@ -5272,17 +5297,20 @@ async def _handle_chat_message_unserialized(
                 False,
                 "Message id was already used for different content or files.",
                 retry_with_new_id=True,
+                rejection_outcome="not_accepted",
             )
         elif claim.failed:
             await finish_delivery(
                 False,
                 "The previous delivery attempt failed. Please retry the draft.",
                 retry_with_new_id=True,
+                rejection_outcome="not_accepted",
             )
         elif claim.pending:
             await finish_delivery(
                 False,
                 "The message is still being applied. Please retry shortly.",
+                rejection_outcome="outcome_unknown",
             )
         else:
             await finish_delivery(True)
@@ -5452,6 +5480,7 @@ async def _handle_chat_message_unserialized(
                         False,
                         "A previous guidance message is still being applied. "
                         "Please wait for it to finish.",
+                        rejection_outcome="not_accepted",
                     )
                     return
                 # Pass the user-typed bubble text + display-safe file refs
@@ -5581,7 +5610,9 @@ async def _handle_chat_message_unserialized(
                     websocket,
                 )
                 await finish_delivery(
-                    False, "Task does not support message continuation."
+                    False,
+                    "Task does not support message continuation.",
+                    rejection_outcome="not_accepted",
                 )
                 return
             else:
@@ -5630,6 +5661,7 @@ async def _handle_chat_message_unserialized(
                         await finish_delivery(
                             False,
                             "Task pause is still being applied; please retry shortly.",
+                            rejection_outcome="not_accepted",
                         )
                         return
                     _clear_task_pause_accepted(task_id)
@@ -5721,7 +5753,9 @@ async def _handle_chat_message_unserialized(
                         task_id,
                     )
                     await finish_delivery(
-                        False, "Internal dispatch error; please retry."
+                        False,
+                        "Internal dispatch error; please retry.",
+                        rejection_outcome="not_accepted",
                     )
                     return
 
@@ -5766,7 +5800,11 @@ async def _handle_chat_message_unserialized(
                         },
                         task_id,
                     )
-                    await finish_delivery(False, "Task is no longer available.")
+                    await finish_delivery(
+                        False,
+                        "Task is no longer available.",
+                        rejection_outcome="not_accepted",
+                    )
                 except TaskTurnError as busy_err:
                     # begin_turn's atomic transaction rolls back on
                     # bg_inflight / busy — neither the status flip
@@ -5794,7 +5832,11 @@ async def _handle_chat_message_unserialized(
                         },
                         task_id,
                     )
-                    await finish_delivery(False, rejection_message)
+                    await finish_delivery(
+                        False,
+                        rejection_message,
+                        rejection_outcome="not_accepted",
+                    )
 
         except (ValueError, KeyError, TypeError) as e:
             # Data validation and format error

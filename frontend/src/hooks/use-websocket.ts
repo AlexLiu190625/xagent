@@ -49,6 +49,30 @@ interface MessageDeliveryAck {
   turn_id: string
 }
 
+export type MessageDeliveryDisposition = "not_sent" | "rejected" | "outcome_unknown"
+
+export class MessageDeliveryError extends Error {
+  readonly disposition: MessageDeliveryDisposition
+  readonly retryWithNewId: boolean
+
+  constructor(
+    message: string,
+    disposition: MessageDeliveryDisposition,
+    retryWithNewId = false,
+  ) {
+    super(message)
+    this.name = "MessageDeliveryError"
+    this.disposition = disposition
+    this.retryWithNewId = retryWithNewId
+  }
+}
+
+const deliveryError = (
+  message: string,
+  disposition: MessageDeliveryDisposition,
+  retryWithNewId = false,
+) => new MessageDeliveryError(message, disposition, retryWithNewId)
+
 export type WebSocketCredentialOwner =
   | {
     kind: "auth-context"
@@ -529,7 +553,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       invalidateLifecycle()
       if (previousDescriptorKey !== null) {
         rejectPreparations(
-          new Error("Message not sent: the connection changed before delivery."),
+          deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
           claim => claim.descriptorKey === previousDescriptorKey,
         )
       }
@@ -549,14 +573,14 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       && previousGeneration !== deliveryGeneration
     ) {
       rejectPendingDeliveries(
-        new Error("Message delivery generation changed before acknowledgement."),
+        deliveryError("Message delivery generation changed before acknowledgement.", "outcome_unknown"),
         pending => (
           pending.connectionIdentity === previousIdentity
           && pending.deliveryGeneration === previousGeneration
         ),
       )
       rejectPreparations(
-        new Error("Message delivery generation changed before preparation completed."),
+        deliveryError("Message delivery generation changed before preparation completed.", "not_sent"),
         claim => (
           claim.connectionIdentity === previousIdentity
           && claim.deliveryGeneration === previousGeneration
@@ -611,8 +635,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     const previousOwner = socketOwnerRef.current
     if (previousOwner) {
       retireOwner(previousOwner, {
-        pendingError: new Error("Connection replaced before the message was accepted."),
-        preparationError: new Error("Connection replaced before the message was prepared."),
+        pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+        preparationError: deliveryError("Connection replaced before the message was prepared.", "not_sent"),
         close: {
           code: 1000,
           reason: "Connection replaced",
@@ -653,8 +677,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (!isCurrentOwner(owner)) return
         const handshakeError = new Error("WebSocket connection handshake timed out.")
         const wasCurrent = retireOwner(owner, {
-          pendingError: new Error("Connection timed out before the message was accepted."),
-          preparationError: new Error("Connection timed out before the message was prepared."),
+          pendingError: deliveryError("Connection timed out before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Connection timed out before the message was prepared.", "not_sent"),
           close: { code: 1000, reason: "Handshake timeout" },
           notifyDisconnect: true,
         })
@@ -677,8 +701,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           // A protocol mismatch is reported as a terminal connection failure;
           // suppressing disconnect avoids starting a second recovery path.
           const wasCurrent = retireOwner(owner, {
-            pendingError: new Error("Connection closed before the message was accepted."),
-            preparationError: new Error("Connection closed before the message was prepared."),
+            pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
+            preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
             close: { code: 1002, reason: "WebSocket subprotocol mismatch" },
             notifyDisconnect: false,
           })
@@ -701,8 +725,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         if (!isCurrentOwner(owner)) return
 
         const wasCurrent = retireOwnerCore(owner, {
-          pendingError: new Error("Connection closed before the message was accepted."),
-          preparationError: new Error("Connection closed before the message was prepared."),
+          pendingError: deliveryError("Connection closed before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Connection closed before the message was prepared.", "not_sent"),
           notifyDisconnect: false,
         })
         if (!wasCurrent) return
@@ -817,8 +841,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         console.error("WebSocket error")
         const connectionError = new Error("WebSocket connection failed. The backend WebSocket endpoint may not be available.")
         const wasCurrent = retireOwner(owner, {
-          pendingError: new Error("Connection failed before the message was accepted."),
-          preparationError: new Error("Connection failed before the message was prepared."),
+          pendingError: deliveryError("Connection failed before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Connection failed before the message was prepared.", "not_sent"),
           close: { code: 1000, reason: "WebSocket transport error" },
           notifyDisconnect: true,
         })
@@ -857,11 +881,13 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
                   turn_id: typeof data.turn_id === 'string' ? data.turn_id : clientMessageId,
                 })
               } else {
-                const error = new Error(data.message || 'Message was rejected.')
-                Object.assign(error, {
-                  retryWithNewId: data.retry_with_new_id === true,
-                })
-                pending.reject(error)
+                pending.reject(deliveryError(
+                  data.message || "Message was rejected.",
+                  data.rejection_outcome === "not_accepted"
+                    ? "rejected"
+                    : "outcome_unknown",
+                  data.retry_with_new_id === true,
+                ))
               }
             }
             return
@@ -1021,17 +1047,17 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
     reconnectAttemptsRef.current = 0
     if (owner) {
       retireOwner(owner, {
-        pendingError: new Error("Disconnected before the message was accepted."),
-        preparationError: new Error("Disconnected before the message was prepared."),
+        pendingError: deliveryError("Disconnected before the message was accepted.", "outcome_unknown"),
+        preparationError: deliveryError("Disconnected before the message was prepared.", "not_sent"),
         close: {},
         notifyDisconnect: true,
       })
     } else {
       rejectPendingDeliveries(
-        new Error("Disconnected before the message was accepted."),
+        deliveryError("Disconnected before the message was accepted.", "outcome_unknown"),
       )
       rejectPreparations(
-        new Error("Disconnected before the message was prepared."),
+        deliveryError("Disconnected before the message was prepared.", "not_sent"),
       )
     }
     setIsConnected(false)
@@ -1080,10 +1106,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       || !isCurrentOwner(owner)
       || (connection.chatTaskIdMode === "required" && !connection.taskId)
     ) {
-      throw new Error('Message not sent: the connection is not ready.')
+      throw deliveryError("Message not sent: the connection is not ready.", "not_sent")
     }
     if (connection.chatTaskIdMode === "omit" && files && files.length > 0) {
-      throw new Error('File delivery is not supported for this connection.')
+      throw deliveryError("File delivery is not supported for this connection.", "not_sent")
     }
 
     const currentTaskId = connection.taskId
@@ -1096,7 +1122,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       pendingDeliveriesRef.current.has(clientMessageId)
       || preparationsRef.current.has(clientMessageId)
     ) {
-      throw new Error("Message not sent: the client message id is already pending.")
+      throw deliveryError("Message not sent: the client message id is already pending.", "not_sent")
     }
     const duplicateMessage = recentMessagesRef.current.find(
       msg => (
@@ -1113,7 +1139,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       ? pendingDeliveriesRef.current.has(duplicateMessage.clientMessageId)
       : false
     if (!force && duplicateIsPending) {
-      throw new Error('Duplicate message ignored while the previous send is pending.')
+      throw deliveryError("Duplicate message ignored while the previous send is pending.", "not_sent")
     }
 
     let rejectCancellation!: (error: Error) => void
@@ -1147,7 +1173,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
 
       if (files && files.length > 0) {
         if (!currentTaskId) {
-          throw new Error('File delivery requires a task-bound connection.')
+          throw deliveryError("File delivery requires a task-bound connection.", "not_sent")
         }
         type FileWithUploadId = File & { file_id?: string }
         const filesWithUploadIds = files as FileWithUploadId[]
@@ -1185,10 +1211,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
             })
             const parsed = await parseApiResponse(response)
             if (!response.ok || !isJsonRecord(parsed.data)) {
-              throw new Error(getUploadErrorMessage(response, parsed, {
+              throw deliveryError(getUploadErrorMessage(response, parsed, {
                 generic: 'Upload failed',
                 ...UPLOAD_ERROR_MESSAGES,
-              }))
+              }), "not_sent")
             }
             const data = parsed.data
             return data.success && Array.isArray(data.files)
@@ -1216,10 +1242,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         || !isCurrentOwner(owner)
         || deliveryGenerationRef.current !== currentDeliveryGeneration
       ) {
-        throw new Error("Message not sent: the connection changed before delivery.")
+        throw deliveryError("Message not sent: the connection changed before delivery.", "not_sent")
       }
       if (pendingDeliveriesRef.current.has(clientMessageId)) {
-        throw new Error("Message not sent: the client message id is already pending.")
+        throw deliveryError("Message not sent: the client message id is already pending.", "not_sent")
       }
 
       const delivery = new Promise<MessageDeliveryAck>((resolve, reject) => {
@@ -1229,7 +1255,7 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
           timeout: setTimeout(() => {
             if (pendingDeliveriesRef.current.get(clientMessageId) !== pendingDelivery) return
             pendingDeliveriesRef.current.delete(clientMessageId)
-            reject(new Error('Message delivery was not acknowledged. Your draft was kept.'))
+            reject(deliveryError("Message delivery was not acknowledged. Your draft was kept.", "outcome_unknown"))
           }, 30000),
           connectionIdentity: connection.identity,
           descriptorKey: currentDescriptorKey,
@@ -1257,7 +1283,10 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
         ) {
           clearTimeout(pending.timeout)
           pendingDeliveriesRef.current.delete(clientMessageId)
-          pending.reject(error instanceof Error ? error : new Error(String(error)))
+          pending.reject(deliveryError(
+            error instanceof Error ? error.message : String(error),
+            "not_sent",
+          ))
         }
         return delivery
       }
@@ -1283,6 +1312,12 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
 
       return delivery
+    } catch (error) {
+      if (error instanceof MessageDeliveryError) throw error
+      throw deliveryError(
+        error instanceof Error ? error.message : String(error),
+        "not_sent",
+      )
     } finally {
       if (preparationsRef.current.get(clientMessageId) === claim) {
         preparationsRef.current.delete(clientMessageId)
@@ -1366,8 +1401,8 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       )
       if (owner && ownsCurrentSocket) {
         retireOwner(owner, {
-          pendingError: new Error("Connection replaced before the message was accepted."),
-          preparationError: new Error("Message not sent: the connection changed before delivery."),
+          pendingError: deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
+          preparationError: deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
           close: {
             code: 1000,
             reason: "Component unmounting",
@@ -1377,11 +1412,11 @@ export function useWebSocket(options: UseWebSocketOptions = {}) {
       }
       if (ownedDescriptorKey !== null) {
         rejectPendingDeliveries(
-          new Error("Connection replaced before the message was accepted."),
+          deliveryError("Connection replaced before the message was accepted.", "outcome_unknown"),
           pending => pending.descriptorKey === ownedDescriptorKey,
         )
         rejectPreparations(
-          new Error("Message not sent: the connection changed before delivery."),
+          deliveryError("Message not sent: the connection changed before delivery.", "not_sent"),
           claim => claim.descriptorKey === ownedDescriptorKey,
         )
         clearRecentMessages(
