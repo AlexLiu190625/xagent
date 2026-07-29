@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable, Iterator
+from collections.abc import Iterator
 
 import pytest
 from sqlalchemy import create_engine
@@ -289,6 +289,53 @@ def test_selected_connector_resolver_returns_selected_mcp_without_runtime_declar
     assert resolved[ref] is server
 
 
+@pytest.mark.parametrize(
+    ("tool_categories", "selects_all"),
+    [
+        (None, True),
+        ([], False),
+    ],
+)
+def test_selected_connector_resolver_honors_all_and_none_sentinels(
+    db_session: Session,
+    tool_categories: list[str] | None,
+    selects_all: bool,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Sentinel Connector Agent",
+        description="shared",
+        instructions="Use selected connectors.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=tool_categories,
+    )
+    db_session.add(agent)
+    db_session.flush()
+    mcp_server = _create_runtime_mcp(db_session, user, "Records")
+    custom_api = _create_runtime_custom_api(db_session, user, "Records")
+
+    db_session.expire(agent, ["tool_categories"])
+    assert agent.tool_categories == tool_categories
+
+    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    expected = (
+        [
+            ConnectorRef("custom_api", int(custom_api.id)),
+            ConnectorRef("mcp", int(mcp_server.id)),
+        ]
+        if selects_all
+        else []
+    )
+    assert list(resolved) == expected
+
+
 def test_selected_connector_resolver_includes_owner_and_team_visible_connectors_only(
     db_session: Session,
 ) -> None:
@@ -306,8 +353,8 @@ def test_selected_connector_resolver_includes_owner_and_team_visible_connectors_
     )
     db_session.add(agent)
     db_session.flush()
-    owner_server = _create_runtime_mcp(db_session, viewer, "team-records")
     team_server = _create_runtime_mcp(db_session, other_user, "Team Records")
+    owner_server = _create_runtime_mcp(db_session, viewer, "team-records")
     hidden_server = _create_runtime_mcp(db_session, hidden_user, "TEAM_records")
     unselected_server = _create_runtime_mcp(db_session, viewer, "Billing")
 
@@ -328,7 +375,7 @@ def test_selected_connector_resolver_includes_owner_and_team_visible_connectors_
 
     owner_ref = ConnectorRef("mcp", int(owner_server.id))
     team_ref = ConnectorRef("mcp", int(team_server.id))
-    assert list(resolved) == [owner_ref, team_ref]
+    assert list(resolved) == [team_ref, owner_ref]
     assert ConnectorRef("mcp", int(hidden_server.id)) not in resolved
     assert ConnectorRef("mcp", int(unselected_server.id)) not in resolved
 
@@ -405,55 +452,36 @@ def test_selected_connector_resolver_normalizes_names_and_orders_refs(
     ]
 
 
-def test_selected_connector_resolver_filters_before_sorting_selected_refs(
+def test_create_plan_preserves_canonical_cross_type_connector_order(
     db_session: Session,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     user = _create_user(db_session, "owner")
     agent = Agent(
         user_id=user.id,
-        name="Filtered Connector Agent",
+        name="Ordered Connector Agent",
         description="shared",
         instructions="Use selected tools.",
         execution_mode="balanced",
         status=AgentStatus.PUBLISHED,
-        tool_categories=["mcp: Google Drive"],
+        tool_categories=["mcp: Records"],
     )
     db_session.add(agent)
     db_session.flush()
-    selected_mcp = _create_runtime_mcp(db_session, user, "Google-Drive")
-    selected_api = _create_runtime_custom_api(db_session, user, "google drive")
-    _create_runtime_mcp(db_session, user, "Billing")
-    _create_runtime_custom_api(db_session, user, "Invoices")
+    selected_mcp = _create_runtime_mcp(db_session, user, "Records")
+    selected_api = _create_runtime_custom_api(db_session, user, "records")
 
-    sort_inputs: list[frozenset[ConnectorRef]] = []
-    sort_refs = connector_runtime_service._sort_connector_refs
-
-    def record_sort_input(refs: Iterable[ConnectorRef]) -> tuple[ConnectorRef, ...]:
-        materialized = tuple(refs)
-        sort_inputs.append(frozenset(materialized))
-        return sort_refs(materialized)
-
-    monkeypatch.setattr(
-        connector_runtime_service,
-        "_sort_connector_refs",
-        record_sort_input,
-    )
-
-    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+    plan = prepare_create_connector_runtime(
         db=db_session,
         agent=agent,
         connector_user_id=int(user.id),
+        task_source="sdk",
+        payload_items=None,
     )
 
-    selected_refs = frozenset(
-        {
-            ConnectorRef("custom_api", int(selected_api.id)),
-            ConnectorRef("mcp", int(selected_mcp.id)),
-        }
+    assert plan.selected_refs == (
+        ConnectorRef("custom_api", int(selected_api.id)),
+        ConnectorRef("mcp", int(selected_mcp.id)),
     )
-    assert sort_inputs == [selected_refs]
-    assert list(resolved) == sorted(selected_refs)
 
 
 def test_selection_snapshot_uses_public_resolver_and_filters_runtime_declarations(
@@ -490,7 +518,6 @@ def test_selection_snapshot_uses_public_resolver_and_filters_runtime_declaration
         connector_runtime_service,
         "resolve_agent_selected_connectors",
         resolve_selected,
-        raising=False,
     )
 
     selected_refs = prepare_connector_runtime_selection_snapshot(

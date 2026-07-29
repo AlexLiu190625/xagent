@@ -366,7 +366,7 @@ def prepare_create_connector_runtime(
     return ConnectorRuntimeCreatePlan(
         task_source=task_source,
         connector_user_id=int(connector_user_id),
-        selected_refs=_sort_connector_refs(selected_refs),
+        selected_refs=selected_refs,
         context_by_ref=context_by_ref,
         ephemeral_by_ref=ephemeral_by_ref,
     )
@@ -396,11 +396,7 @@ def prepare_connector_runtime_selection_snapshot(
         agent=agent,
         connector_user_id=int(connector_user_id),
     )
-    return _sort_connector_refs(
-        ref
-        for ref, connector in selected.items()
-        if _has_runtime_declaration(connector)
-    )
+    return _runtime_declared_refs(selected)
 
 
 def bind_connector_runtime_selection_snapshot(
@@ -609,7 +605,11 @@ def _load_visible_runtime_connectors(
 def resolve_agent_selected_connectors(
     *, db: Session, agent: Agent, connector_user_id: int
 ) -> dict[ConnectorRef, Any]:
-    """Return visible connectors selected by ``agent`` for the supplied owner."""
+    """Return visible connectors selected by ``agent`` for the supplied owner.
+
+    Runtime-declaration filtering is intentionally left to consumers. Results
+    iterate deterministically by ``(connector_type, connector_id)``.
+    """
 
     visible = _load_visible_runtime_connectors(db, user_id=int(connector_user_id))
     return _select_agent_visible_connectors(agent, visible)
@@ -619,7 +619,18 @@ def _plan_selected_refs(
     agent: Agent, visible: dict[ConnectorRef, Any]
 ) -> tuple[ConnectorRef, ...]:
     selected = _select_agent_visible_connectors(agent, visible)
-    return _sort_connector_refs(
+    return _runtime_declared_refs(selected)
+
+
+def _runtime_declared_refs(
+    selected: dict[ConnectorRef, Any],
+) -> tuple[ConnectorRef, ...]:
+    """Project declared refs while preserving canonical selection order.
+
+    Callers provide the mapping ordered by the connector selection owner.
+    """
+
+    return tuple(
         ref
         for ref, connector in selected.items()
         if _has_runtime_declaration(connector)
