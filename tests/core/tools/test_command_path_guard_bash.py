@@ -3046,7 +3046,7 @@ class TestPathClassificationSubstrate:
         cwd = guard.execution_cwd
 
         with command_path_guard_module._validation_session_scope():
-            next_index = guard._parse_short_option_cluster(
+            next_index, matched_option, argument = guard._parse_short_option_cluster(
                 ["-nofile.txt"],
                 0,
                 cwd,
@@ -3054,6 +3054,8 @@ class TestPathClassificationSubstrate:
                 value_options={"o": "write"},
             )
         assert next_index == 1
+        assert matched_option == "o"
+        assert argument == "file.txt"
 
         with command_path_guard_module._validation_session_scope():
             with pytest.raises(CommandPathViolation) as exc_info:
@@ -4978,6 +4980,95 @@ class TestDdBase64GzipRemoteTransferCommand:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate("curl --location https://example.invalid/file")
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "curl -sD {path} https://example.invalid/file",
+            "curl -sLD {path} https://example.invalid/file",
+            "curl -sc {path} https://example.invalid/file",
+        ],
+    )
+    def test_curl_bundled_write_option_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        # `-D`/`-c` must still be recognized (and write-checked) when they
+        # are not the leading character of a bundled short-option cluster
+        # (e.g. `-sD` combines silent mode with dump-header); a hand-rolled
+        # leading-character-only match silently skips the whole token.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -sD headers.txt https://example.invalid/file",
+            "curl -sLD headers.txt https://example.invalid/file",
+            "curl -sc cookies.txt https://example.invalid/file",
+        ],
+    )
+    def test_curl_bundled_write_option_workspace_path_is_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "curl --libcurl {path} https://example.invalid/file",
+            "curl --hsts {path} https://example.invalid/file",
+            "curl --etag-save {path} https://example.invalid/file",
+        ],
+    )
+    def test_curl_new_write_options_reject_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "curl --dump-hea={path} https://example.invalid/file",
+            "curl --cookie-j={path} https://example.invalid/file",
+        ],
+    )
+    def test_curl_long_option_abbreviation_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    def test_curl_bundled_remote_output_flag_fails_closed(
+        self, scoped_command_workspace
+    ):
+        # `-sO` (silent + remote-name) is a common curl idiom; `-O`'s output
+        # filename is derived from the remote response and is never
+        # statically knowable, so this must fail closed even bundled behind
+        # another flag, not silently fall through as permissive.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("curl -sO https://example.invalid/file")
 
     # -- wget ------------------------------------------------------------
 

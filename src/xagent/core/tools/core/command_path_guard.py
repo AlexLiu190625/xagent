@@ -937,6 +937,68 @@ _GREP_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
 }
 _GREP_KNOWN_LONG_OPTIONS = frozenset({"--regexp", "--file", "--exclude-from"})
 
+# `curl`'s short options bundle into one token (e.g. `-sD file` combines the
+# `-s` flag with the `-D` write-path option), so its grammar is split into a
+# flag set and a value set for the short-option-cluster parser, the same
+# shape `sort`/`grep`/`install` use. `-d`'s value is only conditionally a
+# path (an `@file` payload), so it is modeled here as a plain (unchecked)
+# value and given its own `@`-prefix classification by the caller.
+_CURL_SHORT_FLAG_OPTIONS = frozenset("sSLkfiIvNgGq#")
+_CURL_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
+    "o": "write",
+    "D": "write",
+    "c": "write",
+    "T": "read",
+    "d": None,
+}
+_CURL_HARD_DENY_LONG_OPTIONS = frozenset({"--remote-name", "--remote-name-all"})
+_CURL_CONFIG_LONG_OPTIONS = frozenset({"--config"})
+_CURL_WRITE_LONG_OPTIONS = frozenset(
+    {
+        "--output",
+        "--output-dir",
+        "--dump-header",
+        "--cookie-jar",
+        "--trace",
+        "--trace-ascii",
+        "--stderr",
+        "--libcurl",
+        "--hsts",
+        "--etag-save",
+    }
+)
+_CURL_READ_LONG_OPTIONS = frozenset({"--upload-file", "--netrc-file"})
+_CURL_DATA_LONG_OPTIONS = frozenset({"--data", "--data-binary", "--data-raw"})
+_CURL_KNOWN_LONG_OPTIONS = frozenset(
+    _CURL_HARD_DENY_LONG_OPTIONS
+    | _CURL_CONFIG_LONG_OPTIONS
+    | _CURL_WRITE_LONG_OPTIONS
+    | _CURL_READ_LONG_OPTIONS
+    | _CURL_DATA_LONG_OPTIONS
+)
+
+# `wget`'s own short options never bundle a value-taking option behind a
+# flag in this family's existing tests or documented usage, but the same
+# split keeps its long-option handling consistent with curl/rsync/sort.
+_WGET_HARD_DENY_LONG_OPTIONS = frozenset({"--input-file"})
+_WGET_CONFIG_LONG_OPTIONS = frozenset({"--config"})
+_WGET_WRITE_LONG_OPTIONS = frozenset(
+    {
+        "--output-document",
+        "--directory-prefix",
+        "--output-file",
+        "--save-cookies",
+    }
+)
+_WGET_READ_LONG_OPTIONS = frozenset({"--post-file", "--body-file"})
+_WGET_KNOWN_LONG_OPTIONS = frozenset(
+    _WGET_HARD_DENY_LONG_OPTIONS
+    | _WGET_CONFIG_LONG_OPTIONS
+    | _WGET_WRITE_LONG_OPTIONS
+    | _WGET_READ_LONG_OPTIONS
+    | {"--spider"}
+)
+
 
 @dataclass(frozen=True)
 class _PathEvent:
@@ -1762,7 +1824,7 @@ class WorkspaceCommandPathGuard:
                 continue
 
             if value_text.startswith("-") and value_text != "-":
-                index = self._parse_short_option_cluster(
+                index, _, _ = self._parse_short_option_cluster(
                     values,
                     index,
                     cwd,
@@ -1941,7 +2003,7 @@ class WorkspaceCommandPathGuard:
                 cluster_chars = value_text[1:]
                 if "e" in cluster_chars or "f" in cluster_chars:
                     explicit_pattern = True
-                index = self._parse_short_option_cluster(
+                index, _, _ = self._parse_short_option_cluster(
                     values,
                     index,
                     cwd,
@@ -2211,7 +2273,7 @@ class WorkspaceCommandPathGuard:
                 # A bundled cluster (e.g. `-Dm755`): only the trailing
                 # value-taking character may carry an attached argument, so
                 # this shares the same GNU bundling contract as `sort`.
-                index = self._parse_short_option_cluster(
+                index, _, _ = self._parse_short_option_cluster(
                     values,
                     index,
                     cwd,
@@ -2857,7 +2919,7 @@ class WorkspaceCommandPathGuard:
         *,
         flag_options: frozenset[str],
         value_options: Mapping[str, PathAccess | None],
-    ) -> int:
+    ) -> tuple[int, str | None, str | None]:
         """Parse one bundled short-option token (e.g. `-no<file>`).
 
         GNU short options bundle into a single token where only the last
@@ -2865,7 +2927,11 @@ class WorkspaceCommandPathGuard:
         as the following token). Any character not recognized as a flag or a
         value option fails closed rather than being silently skipped, so an
         unmodeled option can never hide a path argument. Returns the index of
-        the next unconsumed token.
+        the next unconsumed token, plus the matched value option and its raw
+        argument (both `None` when the cluster was flags only) for callers
+        that need to act on which option fired — a `None` access here still
+        skips the path check but the caller can still see the raw argument,
+        e.g. to apply its own non-path classification to it.
         """
         source = values[index]
         options = str(source)[1:]
@@ -2890,8 +2956,8 @@ class WorkspaceCommandPathGuard:
             access = value_options[option]
             if access is not None:
                 self._check_path(argument, cwd, access)
-            return next_index
-        return index + 1
+            return next_index, option, argument
+        return index + 1, None, None
 
     @staticmethod
     def _resolve_long_option(value: str, known: Iterable[str]) -> str | None:
@@ -4160,147 +4226,124 @@ class WorkspaceCommandPathGuard:
         """`curl`: `-o`/`--output`/`--output-dir` write; `-T`/`--upload-file`/
         `--netrc-file` read; an `@file` payload to `-d`/`--data*` reads that
         file. `-D`/`--dump-header`, `-c`/`--cookie-jar`, `--trace`,
-        `--trace-ascii`, and `--stderr` also write to a filename argument.
-        `-K`/`--config` (arbitrary runtime options) and `-O`/
-        `--remote-name[-all]` (output filename derived from the remote URL
-        or response, not statically knowable) cannot be inspected safely and
-        fail closed. An unrecognized long option with an attached `=value`
-        also fails closed (mirroring `rsync`): curl accepts a value for many
-        long options this family does not model, so an unmodeled one cannot
-        be assumed to be a value-free flag once it visibly carries a value.
+        `--trace-ascii`, `--stderr`, `--libcurl`, `--hsts`, and
+        `--etag-save` also write to a filename argument. `-K`/`--config`
+        (arbitrary runtime options) and `-O`/`--remote-name[-all]` (output
+        filename derived from the remote URL or response, not statically
+        knowable) cannot be inspected safely and fail closed, including
+        bundled behind another short flag (e.g. `-sO`). Long options resolve
+        through `_resolve_long_option` (GNU unambiguous-prefix abbreviation,
+        e.g. `--dump-hea=` for `--dump-header`); an unrecognized long option
+        with an attached `=value` also fails closed (mirroring `rsync`):
+        curl accepts a value for many long options this family does not
+        model, so an unmodeled one cannot be assumed to be a value-free
+        flag once it visibly carries a value. Short options bundle through
+        the same `_parse_short_option_cluster` substrate `sort`/`grep`/
+        `install` use, so a value-taking option (`-o`/`-D`/`-c`/`-T`) still
+        consumes its argument even when it is not the leading character of
+        the cluster (e.g. `-sD`).
         """
         self._reject_dynamic_values("curl arguments", values)
         index = 0
         while index < len(values):
             value = values[index]
             text = str(value)
-            if text in {"-O", "--remote-name", "--remote-name-all"} or (
-                text.startswith("-O") and not text.startswith("--")
-            ):
-                raise CommandPolicyViolation(
-                    "cannot safely resolve curl remote output filename"
+            if text.startswith("--"):
+                raw_option, separator, attached_text = text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _CURL_KNOWN_LONG_OPTIONS
                 )
-            if (
-                text in {"-K", "--config"}
-                or text.startswith("--config=")
-                or (text.startswith("-K") and len(text) > 2)
-            ):
-                raise CommandPolicyViolation(
-                    "cannot safely inspect curl runtime configuration"
-                )
-            if text in {"-o", "--output", "--output-dir"} or text.startswith(
-                ("--output=", "--output-dir=")
-            ):
-                option, separator, attached_text = text.partition("=")
-                argument, index = self._take_option_argument(
-                    values,
-                    index,
-                    attached_argument=(
-                        self._derived_value(value, attached_text) if separator else None
-                    ),
-                    context=f"curl argument for {option}",
-                )
-                assert argument is not None
-                self._check_path(argument, cwd, "write")
-                continue
-            if text.startswith("-o") and len(text) > 2:
-                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
+                if resolved in _CURL_HARD_DENY_LONG_OPTIONS:
+                    raise CommandPolicyViolation(
+                        "cannot safely resolve curl remote output filename"
+                    )
+                if resolved in _CURL_CONFIG_LONG_OPTIONS:
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect curl runtime configuration"
+                    )
+                if resolved in _CURL_WRITE_LONG_OPTIONS or (
+                    resolved in _CURL_READ_LONG_OPTIONS
+                ):
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached_text)
+                            if separator
+                            else None
+                        ),
+                        context=f"curl argument for {resolved}",
+                    )
+                    assert argument is not None
+                    access: PathAccess = (
+                        "write" if resolved in _CURL_WRITE_LONG_OPTIONS else "read"
+                    )
+                    self._check_path(argument, cwd, access)
+                    continue
+                if resolved in _CURL_DATA_LONG_OPTIONS:
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached_text)
+                            if separator
+                            else None
+                        ),
+                        context=f"curl argument for {resolved}",
+                    )
+                    assert argument is not None
+                    if str(argument).startswith("@"):
+                        self._check_path(
+                            self._derived_value(argument, str(argument)[1:]),
+                            cwd,
+                            "read",
+                        )
+                    continue
+                # An unmodeled long option that visibly carries a value
+                # cannot be assumed to be a value-free flag; a bare
+                # unmodeled flag stays permissive.
+                if separator:
+                    raise CommandPolicyViolation(
+                        f"cannot safely inspect curl option {raw_option}"
+                    )
                 index += 1
                 continue
-            if text in {
-                "-D",
-                "--dump-header",
-                "-c",
-                "--cookie-jar",
-                "--trace",
-                "--trace-ascii",
-                "--stderr",
-            } or text.startswith(
-                (
-                    "--dump-header=",
-                    "--cookie-jar=",
-                    "--trace=",
-                    "--trace-ascii=",
-                    "--stderr=",
-                )
-            ):
-                option, separator, attached_text = text.partition("=")
-                argument, index = self._take_option_argument(
+            if text.startswith("-") and text != "-":
+                # `-O`/`-K` fail closed even bundled behind another flag
+                # (e.g. `-sO`); scanning stops at the first character that
+                # is not a known no-value flag, since anything past a
+                # value-taking option is that option's value, not another
+                # flag letter.
+                for character in text[1:]:
+                    if character in _CURL_SHORT_FLAG_OPTIONS:
+                        continue
+                    if character == "O":
+                        raise CommandPolicyViolation(
+                            "cannot safely resolve curl remote output filename"
+                        )
+                    if character == "K":
+                        raise CommandPolicyViolation(
+                            "cannot safely inspect curl runtime configuration"
+                        )
+                    break
+                index, matched_option, argument = self._parse_short_option_cluster(
                     values,
                     index,
-                    attached_argument=(
-                        self._derived_value(value, attached_text) if separator else None
-                    ),
-                    context=f"curl argument for {option}",
+                    cwd,
+                    flag_options=_CURL_SHORT_FLAG_OPTIONS,
+                    value_options=_CURL_SHORT_VALUE_OPTIONS,
                 )
-                assert argument is not None
-                self._check_path(argument, cwd, "write")
-                continue
-            if (
-                (text.startswith("-D") or text.startswith("-c"))
-                and not text.startswith("--")
-                and len(text) > 2
-            ):
-                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
-                index += 1
-                continue
-            if text in {"-T", "--upload-file", "--netrc-file"} or text.startswith(
-                ("--upload-file=", "--netrc-file=")
-            ):
-                option, separator, attached_text = text.partition("=")
-                argument, index = self._take_option_argument(
-                    values,
-                    index,
-                    attached_argument=(
-                        self._derived_value(value, attached_text) if separator else None
-                    ),
-                    context=f"curl argument for {option}",
-                )
-                assert argument is not None
-                self._check_path(argument, cwd, "read")
-                continue
-            if text.startswith("-T") and len(text) > 2:
-                self._check_path(self._derived_value(value, text[2:]), cwd, "read")
-                index += 1
-                continue
-            if text in {
-                "-d",
-                "--data",
-                "--data-binary",
-                "--data-raw",
-            } or text.startswith(("--data=", "--data-binary=", "--data-raw=")):
-                option, separator, attached_text = text.partition("=")
-                argument, index = self._take_option_argument(
-                    values,
-                    index,
-                    attached_argument=(
-                        self._derived_value(value, attached_text) if separator else None
-                    ),
-                    context=f"curl argument for {option}",
-                )
-                assert argument is not None
-                if str(argument).startswith("@"):
+                if (
+                    matched_option == "d"
+                    and argument is not None
+                    and str(argument).startswith("@")
+                ):
                     self._check_path(
                         self._derived_value(argument, str(argument)[1:]),
                         cwd,
                         "read",
                     )
                 continue
-            if text.startswith("-d") and len(text) > 2:
-                argument = self._derived_value(value, text[2:])
-                if str(argument).startswith("@"):
-                    self._check_path(
-                        self._derived_value(argument, str(argument)[1:]),
-                        cwd,
-                        "read",
-                    )
-                index += 1
-                continue
-            option, separator, _ = text.partition("=")
-            if text.startswith("--") and separator:
-                raise CommandPolicyViolation(
-                    f"cannot safely inspect curl option {option}"
-                )
             index += 1
 
     def _check_wget(self, values: Sequence[str], cwd: Path) -> None:
