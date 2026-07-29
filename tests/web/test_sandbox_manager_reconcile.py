@@ -23,9 +23,11 @@ import xagent.web.services.workspace_binding as workspace_binding_module
 from tests.web.sandbox_fakes import FakeSandboxService, _FakeReconcileContainer
 from xagent.core.execution_scope import ExecutionScope
 from xagent.sandbox.base import (
+    SPEC_CONTRACT_VERSION,
     ResolvedSandboxRuntimeSpec,
     SandboxAlreadyExistsError,
     SandboxConfig,
+    SandboxContractError,
     SandboxInfo,
     SandboxMountIntent,
     SandboxRecoveryRequiredError,
@@ -166,6 +168,39 @@ class TestReconcileMatrixMatch:
         service.persist_store_record.assert_awaited_once()
         assert "user::1" in service._store
         service.create.assert_awaited_once()  # only the original creation
+
+    @pytest.mark.asyncio
+    async def test_stopped_container_with_matching_label_is_started_not_rebuilt(
+        self, _env, tmp_path
+    ) -> None:
+        """The shape a process restart leaves behind: containers stopped,
+        specs unchanged. The first task after the restart must start the
+        container it finds, because rebuilding it would discard the sandbox
+        state a restart is not supposed to touch — and would do so for every
+        lifecycle at once, on the one code path where that is most expensive.
+        """
+        manager, service = _make_manager()
+        intent = _intent(tmp_path)
+        desired = manager._build_runtime_spec("user", "1", mount_intent=intent)
+        template, config = desired.to_backend_config()
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=desired,
+            fingerprint_label=desired.fingerprint(),
+            version_label=str(SPEC_CONTRACT_VERSION),
+        )
+        service._store["user::1"] = SandboxInfo(
+            name="user::1", state="stopped", template=template, config=config
+        )
+
+        sandbox = await manager.get_or_create_sandbox("user", "1", mount_intent=intent)
+
+        assert sandbox.name == "user::1"
+        service.start_existing.assert_awaited_once_with("user::1")
+        service.create.assert_not_awaited()
+        service.delete.assert_not_awaited()
+        # Reuse means the container is running afterwards, not merely spared.
+        assert service._containers["user::1"].state == "running"
 
 
 class TestReconcileMatrixUnverified:
@@ -476,8 +511,14 @@ class TestReconcileBudget:
         await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
         assert manager._reconcile_budget["user::1"] == 0
 
+        await manager.get_or_create_sandbox(
+            "user", "1::worker::0", mount_intent=_intent(tmp_path, "worker0")
+        )
+        assert "user::1::worker::0" in manager._cache
+
         await manager.delete_worker_sandboxes("user", "1")
 
+        assert "user::1::worker::0" not in manager._cache
         assert manager._reconcile_budget["user::1"] == 0
 
     @pytest.mark.asyncio
@@ -527,20 +568,49 @@ class TestReconcileBudget:
         assert sandbox.name == "user::1"
 
     @pytest.mark.asyncio
-    async def test_claim_idle_sandbox_clears_budget_in_isolation(self, _env) -> None:
-        """``_claim_idle_sandbox`` purges the in-process instance cache the
-        moment a lifecycle is selected for reclamation, before the physical
-        delete that follows (``_evict_idle_sandbox`` -> ``delete_sandbox``)
-        ever runs — this pins that the claim step itself drops the base
-        name's budget right then, independent of that later delete also
-        doing so."""
-        manager, _service = _make_manager()
+    async def test_failed_eviction_delete_leaves_budget_exhausted(
+        self, _env, tmp_path
+    ) -> None:
+        """A container that keeps mismatching survives its eviction attempt
+        (the backend delete raises), so its exhausted budget must survive
+        too -- popping it regardless of delete outcome would hand the same
+        still-live container a fresh rebuild allowance on every idle-sweep
+        pass instead of ever refusing it. The idle sweep evicts by
+        idleness alone, independent of the container's own match state, so
+        this pins the budget straight (an earlier mismatch rebuild already
+        spent it) rather than needing a second live mismatch to exercise
+        the eviction path."""
+        manager, service = _make_manager()
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
         manager._reconcile_budget["user::1"] = 0
 
-        claimed = await manager._claim_idle_sandbox("user::1")
+        # Idle since the dawn of time, same as the sibling eviction test.
+        manager._startup_monotonic = 0.0
+        service.delete.side_effect = RuntimeError("backend unreachable")
 
-        assert claimed is True
-        assert "user::1" not in manager._reconcile_budget
+        reclaimed = await manager.sweep_idle_sandboxes(idle_ttl=0)
+
+        assert reclaimed == ["user::1"]  # claim succeeded; the delete failed
+        assert manager._reconcile_budget["user::1"] == 0
+
+        # The failed delete left the container in place (the fake never ran
+        # its real delete body) and the instance cache was purged. Seed a
+        # fresh mismatch and retry: it must still be refused, not handed a
+        # fresh rebuild allowance for a container that never actually went
+        # away.
+        stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="stale:v0"
+        )
+        service._containers["user::1"] = _FakeReconcileContainer(
+            state="stopped",
+            spec=stale_spec,
+            fingerprint_label=stale_spec.fingerprint(),
+            version_label="1",
+        )
+        with pytest.raises(SandboxRuntimeConflictError):
+            await manager.get_or_create_sandbox(
+                "user", "1", mount_intent=_intent(tmp_path)
+            )
 
     @pytest.mark.asyncio
     async def test_cleanup_quiesce_resets_budget(self, _env, tmp_path) -> None:
@@ -786,9 +856,15 @@ class TestReadinessReservedUploadsSubtree:
                 await check_sandbox_static_readiness(manager)
 
     @pytest.mark.asyncio
-    async def test_rejects_mount_nested_inside_a_reserved_user_dir(
+    async def test_allows_mount_nested_inside_a_reserved_user_dir(
         self, tmp_path
     ) -> None:
+        """A mount nested *under* a reserved per-user directory is a
+        distinct guest path from the reserved directory itself: nested bind
+        mounts at different guest paths are legal -- the per-create check
+        (``_check_no_conflicting_volumes``) and Docker itself only flag
+        exact guest-path collisions, never parent/child nesting -- so this
+        deployment boots today and must keep booting."""
         uploads_dir = tmp_path / "uploads"
         with (
             patch.dict(
@@ -796,7 +872,8 @@ class TestReadinessReservedUploadsSubtree:
                 {
                     "XAGENT_UPLOADS_DIR": str(uploads_dir),
                     "SANDBOX_VOLUMES": (
-                        f"{tmp_path / 'host'}:{uploads_dir / 'user_5' / 'notes'}:rw"
+                        f"{tmp_path / 'host' / 'models'}:"
+                        f"{uploads_dir / 'user_1' / 'models'}:ro"
                     ),
                 },
                 clear=True,
@@ -807,8 +884,36 @@ class TestReadinessReservedUploadsSubtree:
             ),
         ):
             manager, _service = _make_manager()
-            with pytest.raises(SandboxRuntimeConflictError):
-                await check_sandbox_static_readiness(manager)
+            await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_allows_external_upload_dir_nested_inside_a_reserved_user_dir(
+        self, tmp_path
+    ) -> None:
+        """An operator-named ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry keeps its
+        own bind even when it lands under a reserved per-user directory
+        (see ``_MountCandidate``'s ``"deployment"`` provenance in
+        ``workspace_binding.py``) -- this is the deployment-named exception
+        ``_fold_mount_paths`` implements, and it must stay startable."""
+        uploads_dir = tmp_path / "uploads"
+        external_dir = uploads_dir / "user_5" / "shared"
+        external_dir.mkdir(parents=True)
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "XAGENT_EXTERNAL_UPLOAD_DIRS": str(external_dir),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            await check_sandbox_static_readiness(manager)
 
     @pytest.mark.asyncio
     async def test_allows_mount_elsewhere_under_uploads_root(self, tmp_path) -> None:
@@ -880,3 +985,43 @@ class TestReadinessReservedUploadsSubtree:
         ):
             manager, _service = _make_manager()
             await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_prefix_derivation_raises_on_incompatible_naming_scheme(
+        self, tmp_path
+    ) -> None:
+        """If the per-user naming scheme is ever changed so the id is not
+        the trailing token, deriving the reserved prefix from a single
+        sentinel silently produces a prefix that matches no real directory
+        -- protecting nothing without anyone noticing. Deriving it from two
+        sentinels and verifying the result actually reproduces both must
+        instead fail startup."""
+        uploads_dir = tmp_path / "uploads"
+
+        def _fake_scoped_user_root(base_dir, user_id, scope_segments=()):
+            root = Path(base_dir) if base_dir is not None else uploads_dir
+            return root / f"u{int(user_id)}-workspace"
+
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": (
+                        f"{tmp_path / 'host'}:{uploads_dir / 'u5-workspace'}:rw"
+                    ),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+            patch(
+                "xagent.web.sandbox_manager.scoped_user_root",
+                side_effect=_fake_scoped_user_root,
+            ),
+        ):
+            manager, _service = _make_manager()
+            with pytest.raises(SandboxContractError):
+                await check_sandbox_static_readiness(manager)

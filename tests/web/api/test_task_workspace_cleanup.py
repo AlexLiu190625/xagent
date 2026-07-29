@@ -1,12 +1,10 @@
 """Deleting a task's workspace finds it whichever spelling wrote it.
 
 ``_cleanup_workspace_directory`` runs when no agent is in memory, so it has
-to locate the workspace from configuration alone. Two things make that
-non-trivial: the uploads dir can be spelled so that the canonical path and
-the raw one name different directories (a symlink followed by ``..``), and
-``TaskWorkspace``'s constructor creates the tree it is pointed at -- so the
-candidate probe has to be side-effect free or the first candidate always
-"exists" and the real workspace is never touched.
+to locate the workspace from configuration alone, and ``TaskWorkspace``'s
+constructor creates the tree it is pointed at -- so the candidate probe has to
+be side-effect free, or the first candidate always "exists" and the real
+workspace is never touched.
 """
 
 from __future__ import annotations
@@ -49,31 +47,6 @@ def test_cleans_the_workspace_at_the_current_spelling(tmp_path, monkeypatch):
     AgentServiceManager()._cleanup_workspace_directory(TASK_ID, OWNER_ID)
 
     assert not workspace.exists()
-
-
-def test_cleans_a_workspace_written_under_the_pre_migration_spelling(
-    tmp_path, monkeypatch
-):
-    """Upgrade path: the files are where the raw spelling resolved to.
-
-    A deployment whose uploads dir is ``<base>/link/..`` wrote workspaces
-    under ``link``'s target, because every consumer resolved the raw spelling
-    itself. The canonical path names ``<base>`` instead, so cleanup that only
-    knows the current spelling would leave those files behind forever.
-    """
-    base = tmp_path / "base"
-    base.mkdir()
-    outside = tmp_path / "outside" / "nested"
-    outside.mkdir(parents=True)
-    (base / "link").symlink_to(outside, target_is_directory=True)
-    monkeypatch.setenv("XAGENT_UPLOADS_DIR", f"{base}/link/..")
-    legacy_workspace = _make_workspace(outside.parent / f"user_{OWNER_ID}")
-    canonical_root = base / f"user_{OWNER_ID}"
-
-    AgentServiceManager()._cleanup_workspace_directory(TASK_ID, OWNER_ID)
-
-    assert not legacy_workspace.exists()
-    assert not canonical_root.exists(), "no candidate may be created to be deleted"
 
 
 def test_probing_candidates_creates_nothing(tmp_path, monkeypatch):

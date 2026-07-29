@@ -298,21 +298,19 @@ async def test_unscoped_build_is_byte_identical_to_pre_757_behavior() -> None:
 async def test_tool_workspace_lives_inside_the_tree_the_sandbox_binds(
     tmp_path, monkeypatch
 ) -> None:
-    """The two path domains must not name different trees.
+    """One spelling reaches both the sandbox mount and the tool workspace.
 
     The sandbox binds a canonical, lexically normalized path -- the mount
     intent's own identity domain, since desired-vs-observed comparison has to
     be lexical -- while ``TaskWorkspace`` ``resolve()``s the base dir it is
-    handed. An uploads dir spelled with ``..`` after a symlink is where the
-    two answers part: the raw spelling resolves into the symlink's target, so
-    the task's file tools would work in a tree the container never mounted.
+    handed. A configured uploads dir carrying a ``..`` segment separates the
+    two: composing the tool base dir from the raw spelling hands the workspace
+    a path the mount intent never reports, and the desired spec then depends
+    on which producer wrote it.
     """
     base = tmp_path / "base"
     base.mkdir()
-    outside = tmp_path / "outside" / "nested"
-    outside.mkdir(parents=True)
-    (base / "link").symlink_to(outside, target_is_directory=True)
-    monkeypatch.setenv("XAGENT_UPLOADS_DIR", f"{base}/link/..")
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", f"{base}/nonexistent/..")
     set_execution_scope_resolver(lambda task_id: SCOPE_A)
 
     build = await _run_build(AgentServiceManager(), 42)
@@ -344,8 +342,13 @@ async def test_tool_workspace_lives_inside_the_tree_the_sandbox_binds(
             workspace_owner_id=1,
             scope=SCOPE_A,
         )
-    workspace = ToolFactory._create_workspace(tool_config.get_workspace_config())
+    workspace_config = tool_config.get_workspace_config()
+    workspace = ToolFactory._create_workspace(workspace_config)
 
+    # The spelling, not only the directory it happens to resolve to: the
+    # desired spec is compared byte-wise, so a base dir carrying a ``..``
+    # segment makes the same workspace look like a different configuration.
+    assert workspace_config["base_dir"] == str(base / "user_1" / "tenant-a")
     assert workspace is not None
     assert workspace.base_dir.is_relative_to(Path(mount_root).resolve())
 

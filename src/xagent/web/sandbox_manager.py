@@ -356,12 +356,13 @@ class SandboxManager:
       consumes it (never the absent-\\>create branch, and never the delete
       *inside* a mismatch rebuild — see ``_reconcile_delete`` — since that
       would erase the decrement this same rebuild just made); ``cleanup()``
-      resets it wholesale, and a full-lifecycle disposal (``_delete_sandbox_names``
-      deleting the primary, ``_claim_idle_sandbox``) drops the one entry for
-      that base name so a later, unrelated occupant of the same key starts
-      with a fresh budget instead of inheriting an exhausted one. A
-      worker-only disposal (``delete_worker_sandboxes`` / release-to-zero)
-      never touches it: the primary the budget is scoped to is still live.
+      resets it wholesale, and ``_delete_sandbox_names`` drops the one entry
+      for a base name once its delete for that name has actually succeeded
+      — a still-live container (delete failed) keeps its exhausted budget,
+      so a later occupant of the key only starts with a fresh budget once
+      the earlier container is confirmed gone. A worker-only disposal
+      (``delete_worker_sandboxes`` / release-to-zero) never touches it: the
+      primary the budget is scoped to is still live.
     - ``_locks`` / ``_locks_guard``: per-exact-name creation lock used only
       by the legacy (non-reconciling) backend route — see
       ``_legacy_get_or_create``. The reconciliation route never inserts
@@ -417,17 +418,21 @@ class SandboxManager:
     - ``_delete_sandbox_names`` (explicit ``delete_sandbox`` /
       ``delete_worker_sandboxes`` / sweep / capacity eviction): pops
       ``_cache``, ``_config_cache``, ``_locks``, ``_lease_providers``,
-      ``_activity`` for every deleted name, and additionally
-      ``_reconcile_budget`` for a name that is itself a base (primary) name
-      — i.e. only when ``delete_sandbox`` put the primary in the deleted
-      set, never for a worker-only ``delete_worker_sandboxes`` call, where
-      the primary the budget is scoped to is untouched.
+      ``_activity`` for every name whose backend delete was attempted
+      (even on failure — the instance may be in an unknown state), and
+      additionally ``_reconcile_budget`` for a name that is itself a base
+      (primary) name, but ONLY once that name's own delete succeeded — a
+      failed delete leaves the budget exhausted, since the same
+      mismatching container is still there. Never popped for a
+      worker-only ``delete_worker_sandboxes`` call, where the primary the
+      budget is scoped to is untouched regardless of outcome.
     - ``_claim_idle_sandbox`` (idle sweep / capacity eviction, ahead of the
       ``_delete_sandbox_names`` call that follows): pops the primary's and
       its workers' ``_cache``/``_config_cache`` entries plus
-      ``_lease_providers``, and also ``_reconcile_budget`` for the base
-      name, since claiming always disposes of the whole lifecycle group at
-      once.
+      ``_lease_providers``. It does not touch ``_reconcile_budget`` — the
+      physical delete has not run yet at this point, so whether the
+      container is actually gone is still unknown; that decision belongs
+      to ``_delete_sandbox_names`` above.
     - ``release`` (ref-count reaches zero): pops ``_lease_providers`` only
       (under ``_lifecycle_locked`` + ``_activity_guard``), then deletes
       worker sandboxes (which pops their ``_cache``/``_config_cache``
@@ -819,11 +824,18 @@ class SandboxManager:
                 and mount_intent is not None
                 # Identifies the mount-root entry (there is at most one) so
                 # ``prepare_root`` only redirects that path, never an
-                # extra/allowlist mount. Byte-equality here relies on
-                # ``mount_intent.mount_root`` always having passed through
-                # ``canonical_sandbox_path``, whose normalization is exactly
-                # what ``Path(s)`` on a POSIX path already produces — if that
-                # normalizer ever stops being a strict subset of ``Path``'s,
+                # extra/allowlist mount. ``backend_path`` here is exactly
+                # ``Path(mount_intent.mount_root)`` (see
+                # ``_workspace_mount_paths``), so this comparison reduces to
+                # ``str(Path(c)) == c`` for ``c = mount_intent.mount_root``.
+                # That holds because ``mount_intent.mount_root`` always
+                # passed through ``canonical_sandbox_path``, which is a
+                # fixed point of ``Path``: ``str(Path(canonical_sandbox_path(
+                # x))) == canonical_sandbox_path(x)`` — not because its
+                # normalization is a subset of ``Path``'s own (it is not:
+                # e.g. ``canonical_sandbox_path("/a/b/..") == "/a"`` while
+                # ``str(Path("/a/b/.."))`` leaves the ``..`` unresolved). If
+                # the normalizer ever stops being idempotent under ``Path``,
                 # this comparison can start missing the mount root.
                 and str(backend_path) == mount_intent.mount_root
             ):
@@ -1661,12 +1673,12 @@ class SandboxManager:
         through to the capacity gate and recreates only after the deletion
         has finished.
 
-        The whole lifecycle group (primary and workers) is claimed together
-        here, so the base name's reconcile budget is also dropped: nothing
-        of this key survives eviction for it to still be scoped to, and a
-        later, unrelated recreation of the same name deserves a fresh
-        rebuild allowance rather than inheriting the evicted container's
-        exhausted one.
+        This only claims the instance cache and lease provider; the base
+        name's reconcile budget is left untouched here. The physical
+        delete has not run yet, so the container this budget is scoped to
+        may still be there if that delete goes on to fail — see
+        ``_delete_sandbox_names``, which is what actually pops the budget,
+        and only once its own delete for the base name succeeds.
 
         Returns False when the lifecycle became active since selection.
         """
@@ -1681,7 +1693,6 @@ class SandboxManager:
             ]:
                 self._cache.pop(name, None)
                 self._config_cache.pop(name, None)
-            self._reconcile_budget.pop(base_name, None)
             return True
 
     async def _evict_idle_sandbox(self, base_name: str, *, reason: str) -> bool:
@@ -1886,9 +1897,11 @@ class SandboxManager:
 
     async def _delete_sandbox_names(self, sandbox_names: set[str]) -> None:
         for name in sorted(sandbox_names):
+            deleted = False
             try:
                 await self._service.delete(name)
                 logger.debug(f"Sandbox deleted: {name}")
+                deleted = True
             except Exception as e:
                 logger.error(f"Failed to delete sandbox {name}: {e}")
             finally:
@@ -1905,21 +1918,25 @@ class SandboxManager:
                 # await point.
                 self._lease_providers.pop(name, None)
                 self._activity.pop(name, None)
-                # The reconcile budget is keyed by base (primary) name and
-                # shared with every worker under it, so it is only dropped
-                # here when the primary itself is the name being deleted
-                # (``delete_sandbox``'s full-lifecycle set) — never on a
-                # worker-only delete (``delete_worker_sandboxes`` / release-
-                # to-zero), where the primary, and the budget scoped to it,
-                # is still live.
-                base_name = None
-                try:
-                    lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
-                    base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
-                except ValueError:
-                    pass
-                if base_name is not None and name == base_name:
-                    self._reconcile_budget.pop(name, None)
+            if not deleted:
+                # The backend delete failed, so the container this budget
+                # is scoped to is still live: leave the entry exhausted
+                # rather than granting the next mismatch a fresh rebuild
+                # allowance for a container that never actually went away.
+                continue
+            # The reconcile budget is keyed by base (primary) name and
+            # shared with every worker under it, so it is only dropped
+            # here when the primary itself is the name just deleted
+            # (``delete_sandbox``'s full-lifecycle set) — never on a
+            # worker-only delete (``delete_worker_sandboxes`` / release-
+            # to-zero), where the primary, and the budget scoped to it,
+            # is still live. Every name reaching this point came from
+            # ``make_sandbox_name``/a worker-prefix filter, so it always
+            # contains ``"::"`` and ``parse_sandbox_name`` cannot raise.
+            lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+            base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+            if name == base_name:
+                self._reconcile_budget.pop(base_name, None)
 
     async def sweep_idle_sandboxes(self, idle_ttl: float) -> list[str]:
         """Delete sandboxes with no attached tasks that are idle past the TTL.
@@ -2272,22 +2289,45 @@ def _reserved_uploads_user_subtree(
     both built on ``scoped_user_root``); the id is a runtime fact, not
     enumerable at startup, so readiness instead treats the whole
     ``<reserved_prefix>\\d+`` shape under the uploads guest root as reserved.
-    ``reserved_prefix`` is read off ``scoped_user_root``'s own output for a
-    sentinel id (never a hardcoded ``"user_"`` literal), so a rename of that
+    ``reserved_prefix`` is read off ``scoped_user_root``'s own output for two
+    sentinel ids (never a hardcoded ``"user_"`` literal), so a rename of that
     naming scheme cannot silently desync this check from the path it
-    protects. The uploads root is mapped into the same host/guest domain the
-    runtime mount-building path uses: ``absolute_backend_mount_path`` then
+    protects: a single sentinel cannot distinguish "the id is the trailing
+    token" from "the id happens to end in a digit that looks like part of
+    the prefix" (e.g. a zero-padded ``user_0000`` would strip only one
+    trailing ``"0"``), so two sentinels are compared and the derived prefix
+    is verified to actually reproduce both before it is trusted. The uploads
+    root is mapped into the same host/guest domain the runtime mount-
+    building path uses: ``absolute_backend_mount_path`` then
     ``SandboxPathMapper``.
+
+    Raises:
+        SandboxContractError: the derived prefix does not reproduce both
+            sentinel names, meaning the naming scheme no longer fits the
+            ``<prefix><id>`` shape this check assumes — better to fail
+            startup than silently protect nothing.
     """
     uploads_root = get_uploads_dir()
     backend_uploads_root = absolute_backend_mount_path(uploads_root)
     _host, guest_uploads_root, _mode = path_mapper.volume_for_backend_path(
         backend_uploads_root, "rw"
     )
-    sample_name = scoped_user_root(uploads_root, 0).name
-    reserved_prefix = (
-        sample_name[: -len("0")] if sample_name.endswith("0") else sample_name
-    )
+    sample_0 = scoped_user_root(uploads_root, 0).name
+    sample_1 = scoped_user_root(uploads_root, 1).name
+    common_len = 0
+    for a, b in zip(sample_0, sample_1):
+        if a != b:
+            break
+        common_len += 1
+    reserved_prefix = sample_0[:common_len]
+    if reserved_prefix + "0" != sample_0 or reserved_prefix + "1" != sample_1:
+        raise SandboxContractError(
+            "Cannot derive a reserved per-user uploads prefix from "
+            f"scoped_user_root output {sample_0!r} / {sample_1!r}: neither "
+            "reproduces from a common prefix plus its sentinel id. The "
+            "per-user naming scheme no longer fits the <prefix><id> shape "
+            "the reserved-uploads readiness check assumes."
+        )
     return canonical_sandbox_path(guest_uploads_root), reserved_prefix
 
 
@@ -2296,18 +2336,28 @@ def _check_no_reserved_uploads_conflict(
     guest_uploads_root: str,
     reserved_prefix: str,
 ) -> None:
-    """Reject a configured mount whose guest path lands in the per-user subtree.
+    """Reject a configured mount whose guest path IS a reserved per-user dir.
 
     The per-user workspace mount every task adds by default cannot be
-    enumerated here — user ids are runtime facts — so the whole
-    ``<guest_uploads_root>/<reserved_prefix><id>`` shape is treated as
-    reserved: a static mount whose guest path equals or is nested under one
-    of those directories collides with the mount every future task for that
-    user would need there, which today only surfaces as
-    ``SandboxRuntimeConflictError`` at that user's first task rather than
-    here at startup. A mount elsewhere under the uploads root (e.g. a shared
-    knowledge-base directory) does not match the reserved shape and still
-    passes.
+    enumerated here — user ids are runtime facts — so the exact
+    ``<guest_uploads_root>/<reserved_prefix><id>`` guest path is treated as
+    reserved: a static mount claiming that exact guest path collides with
+    the mount every future task for that user needs there, which today only
+    surfaces as ``SandboxRuntimeConflictError`` at that user's first task
+    rather than here at startup.
+
+    A mount nested *under* a reserved directory (e.g.
+    ``<uploads>/user_1/models``) is a distinct guest path and is NOT
+    rejected: nested bind mounts at different guest paths are legal —
+    ``_check_no_conflicting_volumes`` (the per-create check) and Docker
+    itself only flag exact guest-path collisions, never parent/child
+    nesting — and a deployment-named ``XAGENT_EXTERNAL_UPLOAD_DIRS`` entry
+    landing there is exactly the exception ``_fold_mount_paths`` implements
+    (see ``_MountCandidate``'s ``"deployment"`` provenance in
+    ``workspace_binding.py``): an operator-named mount keeps its own bind
+    regardless of where it falls relative to the reserved subtree. A mount
+    elsewhere under the uploads root (e.g. a shared knowledge-base
+    directory) does not match the reserved shape either and still passes.
     """
     reserved_re = re.compile(rf"^{re.escape(reserved_prefix)}\d+$")
     prefix_with_sep = guest_uploads_root + "/"
@@ -2315,14 +2365,17 @@ def _check_no_reserved_uploads_conflict(
         norm_guest = canonical_sandbox_path(guest_path)
         if not norm_guest.startswith(prefix_with_sep):
             continue
-        first_segment = norm_guest[len(prefix_with_sep) :].split("/", 1)[0]
-        if reserved_re.match(first_segment):
+        remainder = norm_guest[len(prefix_with_sep) :]
+        if "/" in remainder:
+            # Nested under a reserved directory, not the directory itself.
+            continue
+        if reserved_re.match(remainder):
             raise SandboxRuntimeConflictError(
                 f"Configured sandbox mount with guest path {guest_path!r} "
-                "collides with the reserved per-user uploads subtree "
+                "collides with the reserved per-user uploads path "
                 f"{guest_uploads_root!r}/{reserved_prefix}<id>: every task's "
-                "default workspace mount for that user would land at or "
-                "under this path."
+                "default workspace mount for that user needs that exact "
+                "guest path."
             )
 
 
@@ -2341,11 +2394,14 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     a live container, so there is nothing here for it to protect. Skipped
     entirely when neither ``SANDBOX_VOLUMES`` nor
     ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured — code mounts alone never
-    conflict with themselves, and with nothing operator-configured to check,
-    the per-user reserved-subtree check below has nothing to protect either
-    (a task's own per-user mount and its enclosing code mounts do not
-    collide with each other by construction); that is also why the reserved-
-    subtree check runs after this early return rather than before it.
+    conflict with themselves, and they never land under the uploads guest
+    root either (``build_code_mount_volumes`` mounts fixed ``/app/src`` and
+    ``/app/tests`` paths), so with nothing operator-configured the per-user
+    reserved-subtree check below has nothing to reject; that is also why the
+    reserved-subtree check runs after this early return rather than before
+    it. When the check does run, code mounts are still part of the scanned
+    volume list along with everything else — they are not specially
+    exempted, they simply do not match the reserved shape.
 
     Domain discipline: ``SANDBOX_VOLUMES`` (via ``get_sandbox_volumes``,
     using the same ``host_side_sources`` flag the runtime build path uses)

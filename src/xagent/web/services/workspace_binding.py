@@ -75,10 +75,9 @@ class ChatWorkspaceBinding:
     root computed *before* folding (``scoped_user_root`` at the scope's
     ``effective_mount_segments``), in the same canonical spelling the mount
     intent uses, so both name one directory. Folding can re-root
-    ``mount_intent`` onto
-    a covering ancestor already in the allowlist (see module docstring), but
-    the directory the task's own files actually live in is always
-    ``prepare_root`` -- that is the ``mkdir -p`` target, never
+    ``mount_intent`` onto a covering ancestor already in the allowlist (see
+    module docstring), but the directory the task's own files actually live
+    in is always ``prepare_root`` -- that is the ``mkdir -p`` target, never
     ``mount_intent.mount_root`` directly, because in the re-rooted case the
     ancestor may already exist while the deeper subtree does not.
     """
@@ -176,28 +175,23 @@ def canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str
     domain, because desired-vs-observed config comparison has to be lexical),
     while the file tools open it through ``TaskWorkspace``, which ``resolve()``s
     what it is handed (a physical domain, because files have to be found).
-    Those two only name the same directory when the path is already canonical:
-    an uploads dir spelled ``<base>/link/..`` binds ``<base>/user_7`` and
-    resolves to the symlink's target, so the task would write outside the tree
-    the sandbox mounted. Every producer of a backend workspace path composes it
-    through here so both consumers start from one spelling.
+
+    ``config.get_uploads_dir`` rejects an uploads *root* whose two readings
+    land in different directories, so for the root itself the remaining
+    difference is the spelling rather than the destination. That does not
+    extend to the segments composed onto it: a symlink planted inside the
+    uploads tree still resolves elsewhere, and only the fold's resolved-view
+    veto (:func:`_fold_relation`) speaks to that.
+
+    The spelling matters on its own: the desired spec is compared byte-wise
+    against what the backend reports, so a base dir carrying ``..`` or ``//``
+    makes one workspace look like two configurations depending on which
+    producer built it. Every producer of a backend workspace path composes it
+    here so they all emit the reported form.
     """
     return _canonical_mount_path(
         str(scoped_user_root(get_uploads_dir(), owner_id, tuple(segments)))
     )
-
-
-def pre_canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str:
-    """The spelling :func:`canonical_workspace_base` replaced. Deletion only.
-
-    Workspaces created while each producer normalized on its own live at the
-    raw spelling, which a symlinked uploads dir makes a different directory
-    from the canonical one. Cleanup has to look in both places, so this
-    reproduces the old spelling exactly. Nothing else may use it: a *new*
-    workspace or mount path in this spelling is the divergence
-    :func:`canonical_workspace_base` exists to prevent.
-    """
-    return str(scoped_user_root(get_uploads_dir(), owner_id, tuple(segments)))
 
 
 def _lexical_relation(root: str, path: str) -> str:

@@ -114,7 +114,6 @@ from ..services.workforce_runtime import (
 from ..services.workspace_binding import (
     build_chat_workspace_binding,
     canonical_workspace_base,
-    pre_canonical_workspace_base,
 )
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -1221,6 +1220,14 @@ class AgentServiceManager:
             # sandbox-service *unavailability*, not for a misconfigured or
             # conflicting spec. Silently running such a task on the host
             # would be a bigger surprise than failing the task outright.
+            #
+            # One documented exception, and it is not a downgrade: a *worker*
+            # slot that cannot be provisioned degrades to its own lifecycle's
+            # primary sandbox (``SandboxLeaseProvider.get_worker_sandbox``),
+            # the same correctly scoped container this task already holds.
+            # That costs a concurrency slot, never a trust boundary. What
+            # reaches this handler is the task's own sandbox, where there is
+            # nothing safe to degrade to.
             self._agent_sandbox_keys.pop(task_id, None)
             self._agent_sandbox_providers.pop(task_id, None)
             logger.error(
@@ -3076,11 +3083,14 @@ class AgentServiceManager:
 
         # Scoped workspace first (when a resolver maps this task to a scope),
         # then the user-isolated one, then the legacy uploads-root fallback.
-        # Each is tried in the current spelling and in the pre-migration one:
-        # a workspace created while producers normalized independently lives
-        # at the raw path, which a symlinked uploads dir makes a different
-        # directory, and deleting a task's files must not depend on which
-        # spelling was in force when they were written.
+        # One spelling per candidate: the uploads root is rejected at
+        # configuration time unless its two readings name the same directory
+        # (see ``config.get_uploads_dir``), so the canonical spelling and the
+        # raw one reach the same place and a second candidate would only
+        # re-probe what the first already probed. A tree written under a root
+        # spelling that configuration now refuses is not reachable from any
+        # spelling of the current value, so recovering it is an operator
+        # migration rather than a candidate this loop can enumerate.
         base_dirs: list[str] = []
         if user_id:
             # Contextvar-first for the same reason as get_agent_for_task:
@@ -3092,8 +3102,6 @@ class AgentServiceManager:
             for base_dir in (
                 canonical_workspace_base(user_id, segments),
                 canonical_workspace_base(user_id),
-                pre_canonical_workspace_base(user_id, segments),
-                pre_canonical_workspace_base(user_id),
             ):
                 if base_dir not in base_dirs:
                     base_dirs.append(base_dir)
