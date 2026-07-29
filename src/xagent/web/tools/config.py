@@ -2144,12 +2144,13 @@ class WebToolConfig(BaseToolConfig):
         return self.db
 
     def close(self) -> None:
-        """Terminally close factory/database-backed model state and resources.
+        """Finalize the current factory runtime generation and owned resources.
 
-        This discards prepared and retained factory state, closes any owned
-        lazy database session, and prevents later model getters from loading
-        or exposing factory/database-backed snapshots or caches. An explicit
-        constructor-supplied vision model is independent and remains
+        This discards the current prepared and retained factory state and
+        closes any owned lazy database session. Old factory/database-backed
+        media getters are neutral after close until a later
+        ``prepare_factory_runtime()`` installs the next generation. An
+        explicit constructor-supplied vision model is independent and remains
         authoritative after close.
         """
         try:

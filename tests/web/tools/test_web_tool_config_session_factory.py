@@ -1733,6 +1733,70 @@ async def test_factory_prepare_snapshots_selected_sync_factory_inputs(
 
 
 @pytest.mark.asyncio
+async def test_close_neutralizes_old_generation_before_public_prepare_installs_next(
+    monkeypatch,
+):
+    sessions: list[_TrackingSession] = []
+    generation_a_model = object()
+    generation_b_model = object()
+    cached_model = object()
+    current_model = generation_a_model
+
+    def session_factory() -> _TrackingSession:
+        session = _TrackingSession()
+        sessions.append(session)
+        return session
+
+    def load_image_models(*_args, **_kwargs):
+        return {"image": current_model}
+
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_image_models",
+        load_image_models,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_default_image_generate_model",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "xagent.web.services.model_service.get_default_image_edit_model",
+        lambda *_args, **_kwargs: None,
+    )
+    cfg = WebToolConfig(
+        db=None,
+        request=None,
+        db_factory=session_factory,
+        user_id=1,
+        include_mcp_tools=False,
+        tool_selection_spec=ToolSelectionSpec.from_raw(tool_categories=["image"]),
+    )
+
+    try:
+        await cfg.prepare_factory_runtime()
+        assert cfg.get_image_models()["image"] is generation_a_model
+        cfg.handoff_factory_runtime()
+        assert cfg.get_image_models()["image"] is generation_a_model
+
+        cfg._cached_image_configs = {"image": cached_model}
+        cfg.close()
+        assert cfg.get_image_models() == {}
+
+        current_model = generation_b_model
+        await cfg.prepare_factory_runtime()
+
+        prepared_models = cfg.get_image_models()
+        assert prepared_models["image"] is generation_b_model
+        assert prepared_models["image"] is not generation_a_model
+        assert prepared_models["image"] is not cached_model
+        cfg.handoff_factory_runtime()
+        assert cfg.get_image_models()["image"] is generation_b_model
+        assert sessions
+        assert all(session.closed for session in sessions)
+    finally:
+        cfg.close()
+
+
+@pytest.mark.asyncio
 async def test_factory_prefetch_isolates_later_read_from_swallowed_sql_failure(
     monkeypatch,
 ):
