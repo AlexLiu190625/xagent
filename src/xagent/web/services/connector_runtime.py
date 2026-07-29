@@ -645,7 +645,7 @@ def _is_agent_selected_connector(
     spec: ToolSelectionSpec, ref: ConnectorRef, connector: Any
 ) -> bool:
     scoped_mcp_servers = spec.scoped_mcp_servers()
-    name_key = normalize_mcp_server_name(str(connector.name or ""))
+    name_key = normalize_mcp_server_name(connector.name)
     if ref.connector_type == CONNECTOR_TYPE_MCP:
         if not spec.includes_mcp():
             return False
