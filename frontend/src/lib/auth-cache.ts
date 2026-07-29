@@ -57,6 +57,9 @@ export type AuthCredentialComparison =
   | { status: "credentials_advanced"; projection: AuthSessionProjection }
   | { status: "replaced" | "absent" | "expired" | "invalid"; projection: null }
 export type AuthMutationUnavailableReason = "storage_unavailable" | "coordination_unavailable" | "operation_failed"
+export type AuthStorageAvailability =
+  | { status: "available" }
+  | { status: "unavailable"; reason: "storage_unavailable" }
 export type AuthMutationResult =
   | { status: "created" | "migrated" | "updated" | "advanced"; projection: AuthSessionProjection }
   | { status: "replaced" | "absent" | "expired" | "invalid" | "superseded" }
@@ -70,7 +73,19 @@ export type AuthLogoutResult =
 export type AuthIntentClaimResult =
   | { status: "claimed"; intent: AuthLoginIntent }
   | { status: "unavailable"; reason: AuthMutationUnavailableReason }
+export type AuthOidcIntentResult =
+  | { status: "present"; intent: AuthLoginIntent }
+  | { status: "absent" }
+  | { status: "unavailable"; reason: Exclude<AuthMutationUnavailableReason, "coordination_unavailable"> }
 type AuthStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">
+type AuthSessionStorage = Pick<Storage, "getItem" | "setItem" | "removeItem">
+const AUTH_OWNED_LOCAL_STORAGE_KEYS = [
+  AUTH_CACHE_KEY,
+  AUTH_LOGIN_INTENT_KEY,
+  AUTH_REVOKED_LOGIN_INTENT_KEY,
+  LEGACY_AUTH_TOKEN_KEY,
+  LEGACY_AUTH_USER_KEY,
+] as const
 
 const EMPTY_SNAPSHOT: AuthSessionSnapshot = {
   sessionId: null, credentialRevision: null, profileRevision: null,
@@ -95,15 +110,18 @@ function getAuthStorage(): AuthStorage | null {
     return null
   }
 }
-function getSessionStorage(): Pick<Storage, "getItem" | "setItem" | "removeItem"> | null {
+export function getAuthStorageAvailability(): AuthStorageAvailability {
+  return getAuthStorage() ? { status: "available" } : { status: "unavailable", reason: "storage_unavailable" }
+}
+function getSessionStorage(): AuthSessionStorage | null {
   if (typeof window === "undefined") return null
   try {
     const storage: unknown = window.sessionStorage
     if (typeof storage !== "object" || storage === null) return null
-    const candidate = storage as Partial<Pick<Storage, "getItem" | "setItem" | "removeItem">>
-    return typeof candidate.getItem === "function" && typeof candidate.setItem === "function" && typeof candidate.removeItem === "function"
-      ? candidate as Pick<Storage, "getItem" | "setItem" | "removeItem">
-      : null
+    const candidate = storage as Partial<AuthSessionStorage>
+    if (!(typeof candidate.getItem === "function" && typeof candidate.setItem === "function" && typeof candidate.removeItem === "function")) return null
+    candidate.getItem(AUTH_OIDC_INTENT_KEY)
+    return candidate as AuthSessionStorage
   } catch { return null }
 }
 
@@ -325,6 +343,21 @@ function dispatchAuthTokenUpdated(storage: AuthStorage) {
     // Storage persistence owns correctness; cross-context notification is best effort.
   }
 }
+function snapshotAuthStorage(storage: AuthStorage): Map<string, string | null> {
+  return new Map(AUTH_OWNED_LOCAL_STORAGE_KEYS.map(key => [key, storage.getItem(key)]))
+}
+function restoreAuthStorage(storage: AuthStorage, snapshot: ReadonlyMap<string, string | null>) {
+  for (const [key, value] of snapshot) {
+    if (storage.getItem(key) === value) continue
+    if (value === null) storage.removeItem(key)
+    else storage.setItem(key, value)
+  }
+}
+function restoreSessionValue(storage: AuthSessionStorage, key: string, value: string | null) {
+  if (storage.getItem(key) === value) return
+  if (value === null) storage.removeItem(key)
+  else storage.setItem(key, value)
+}
 type AuthMutationContext = {
   storage: AuthStorage
   markAuthUpdated: () => void
@@ -354,22 +387,40 @@ async function withMutationLock<T>(conditional: boolean, action: (context: AuthM
   if (!storage) return { status: "unavailable", reason: "storage_unavailable" }
   const locks = typeof navigator === "undefined" ? undefined : navigator.locks
   if (!locks && conditional) return { status: "unavailable", reason: "coordination_unavailable" }
-  let changed = false
-  const context: AuthMutationContext = {
-    storage,
-    markAuthUpdated: () => { changed = true },
+  let shouldDispatch = false
+  const run = async (): Promise<AuthMutationAttempt<T>> => {
+    let snapshot: Map<string, string | null> | null = null
+    if (conditional) {
+      try {
+        snapshot = snapshotAuthStorage(storage)
+      } catch {
+        return { status: "unavailable", reason: "storage_unavailable" }
+      }
+    }
+    let changed = false
+    const context: AuthMutationContext = {
+      storage,
+      markAuthUpdated: () => { changed = true },
+    }
+    try {
+      const value = await action(context)
+      shouldDispatch = changed
+      return { status: "completed", value }
+    } catch {
+      if (snapshot) {
+        try { restoreAuthStorage(storage, snapshot) } catch { /* Storage remains unavailable to this operation. */ }
+      }
+      return { status: "unavailable", reason: "operation_failed" }
+    }
   }
   try {
-    const value = locks
-      ? await locks.request(AUTH_MUTATION_LOCK, () => action(context))
-      : await action(context)
-    return { status: "completed", value }
+    return locks ? await locks.request(AUTH_MUTATION_LOCK, run) : await run()
   } catch {
     return { status: "unavailable", reason: "operation_failed" }
   } finally {
     // A same-tab observer may synchronously read storage, so publication must
-    // happen only after the Web Lock callback has returned.
-    if (changed) dispatchAuthTokenUpdated(storage)
+    // happen only after the Web Lock callback has returned successfully.
+    if (shouldDispatch) dispatchAuthTokenUpdated(storage)
   }
 }
 function unavailable(reason: AuthMutationUnavailableReason): AuthMutationResult { return { status: "unavailable", reason } }
@@ -395,24 +446,35 @@ export async function claimAuthLoginIntent(): Promise<AuthIntentClaimResult> {
 }
 /** Claims an intent and binds it to this tab before an OIDC full-page redirect. */
 export async function claimOidcAuthLoginIntent(): Promise<AuthIntentClaimResult> {
-  const claim = await claimAuthLoginIntent()
-  if (claim.status !== "claimed") return claim
+  const sessionStorage = getSessionStorage()
+  if (!sessionStorage) return { status: "unavailable", reason: "storage_unavailable" }
+  const result = await withMutationLock(true, async ({ storage }) => {
+    const previousSessionIntent = sessionStorage.getItem(AUTH_OIDC_INTENT_KEY)
+    const intent = replaceAuthLoginIntent(storage)
+    try {
+      sessionStorage.setItem(AUTH_OIDC_INTENT_KEY, serializeAuthLoginIntent(intent))
+    } catch {
+      try { restoreSessionValue(sessionStorage, AUTH_OIDC_INTENT_KEY, previousSessionIntent) } catch { /* The failed session-storage owner remains unavailable. */ }
+      throw new Error("OIDC intent binding failed")
+    }
+    // Tombstones fence only their exact old capability. A later claim has a
+    // distinct id, so failure to prune an old tombstone cannot invalidate it.
+    try { storage.removeItem(AUTH_REVOKED_LOGIN_INTENT_KEY) } catch { /* stale tombstone remains safely scoped */ }
+    return { status: "claimed" as const, intent }
+  })
+  return result.status === "completed" ? result.value : result
+}
+/** Takes the OIDC intent created in this tab; callbacks cannot adopt a later intent. */
+export function takeOidcAuthLoginIntent(): AuthOidcIntentResult {
   const storage = getSessionStorage()
   if (!storage) return { status: "unavailable", reason: "storage_unavailable" }
   try {
-    storage.setItem(AUTH_OIDC_INTENT_KEY, serializeAuthLoginIntent(claim.intent))
-    return claim
-  } catch { return { status: "unavailable", reason: "operation_failed" } }
-}
-/** Takes the OIDC intent created in this tab; callbacks cannot adopt a later intent. */
-export function takeOidcAuthLoginIntent(): AuthLoginIntent | null {
-  const storage = getSessionStorage()
-  if (!storage) return null
-  try {
-    const intent = parseAuthLoginIntent(storage.getItem(AUTH_OIDC_INTENT_KEY))
+    const raw = storage.getItem(AUTH_OIDC_INTENT_KEY)
+    if (raw === null) return { status: "absent" }
+    const intent = parseAuthLoginIntent(raw)
     storage.removeItem(AUTH_OIDC_INTENT_KEY)
-    return intent
-  } catch { return null }
+    return intent ? { status: "present", intent } : { status: "absent" }
+  } catch { return { status: "unavailable", reason: "operation_failed" } }
 }
 /** Password/OIDC session creation validates its originating intent under the same lock as the write. */
 export async function createAuthSession(value: unknown, intent?: AuthLoginIntent | null): Promise<AuthMutationResult> {

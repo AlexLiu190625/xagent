@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
-  AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
+  AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, AUTH_OIDC_INTENT_KEY, AUTH_REVOKED_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY,
   AUTH_TOKEN_UPDATED_EVENT, claimAuthLoginIntent, claimOidcAuthLoginIntent, clearAuthSessionIfCurrent, clearStoredAuth, commitAuthSessionRefresh, compareAuthSession, createAuthSession,
   authMutationUnavailableMessage, inspectAuthSession, migrateLegacyAuthSession, readAuthSessionSnapshot, updateAuthSessionUser, type AuthTokenPayload,
   takeOidcAuthLoginIntent,
@@ -24,6 +24,10 @@ function current() {
   expect(inspection.status).toBe("valid")
   if (inspection.status !== "valid") throw new Error("expected session")
   return inspection.projection
+}
+const AUTH_OWNED_LOCAL_KEYS = [AUTH_CACHE_KEY, AUTH_LOGIN_INTENT_KEY, AUTH_REVOKED_LOGIN_INTENT_KEY, LEGACY_AUTH_TOKEN_KEY, LEGACY_AUTH_USER_KEY]
+function authStorageSnapshot() {
+  return Object.fromEntries(AUTH_OWNED_LOCAL_KEYS.map(key => [key, localStorage.getItem(key)]))
 }
 describe("auth cache lineage", () => {
   beforeEach(() => { localStorage.clear(); vi.restoreAllMocks(); installLock() })
@@ -66,8 +70,8 @@ describe("auth cache lineage", () => {
     const claim = await claimOidcAuthLoginIntent()
     expect(claim.status).toBe("claimed")
     if (claim.status !== "claimed") throw new Error("expected OIDC intent")
-    expect(takeOidcAuthLoginIntent()).toEqual(claim.intent)
-    expect(takeOidcAuthLoginIntent()).toBeNull()
+    expect(takeOidcAuthLoginIntent()).toEqual({ status: "present", intent: claim.intent })
+    expect(takeOidcAuthLoginIntent()).toEqual({ status: "absent" })
   })
   it("rejects a pending password response after explicit logout supersedes its intent", async () => {
     const claim = await claimAuthLoginIntent()
@@ -254,7 +258,7 @@ describe("auth cache lineage", () => {
     const claim = await claimAuthLoginIntent()
     expect(claim.status).toBe("claimed")
     if (claim.status !== "claimed") throw new Error("expected login intent")
-    const before = localStorage.getItem(AUTH_CACHE_KEY)
+    const before = authStorageSnapshot()
     const originalSetItem = localStorage.setItem.bind(localStorage)
     vi.spyOn(localStorage, "setItem").mockImplementation((key, value) => {
       if (key === AUTH_CACHE_KEY) throw new Error("write blocked")
@@ -263,7 +267,66 @@ describe("auth cache lineage", () => {
 
     expect(await createAuthSession({ user, access_token: "access" }, claim.intent)).toEqual({ status: "unavailable", reason: "operation_failed" })
 
-    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
+    expect(authStorageSnapshot()).toEqual(before)
+  })
+  it("does not supersede the local login intent when OIDC session binding is unavailable", async () => {
+    localStorage.setItem(AUTH_LOGIN_INTENT_KEY, JSON.stringify({ schemaVersion: 1, id: "existing-intent" }))
+    const before = authStorageSnapshot()
+    vi.stubGlobal("sessionStorage", undefined)
+
+    await expect(claimOidcAuthLoginIntent()).resolves.toEqual({ status: "unavailable", reason: "storage_unavailable" })
+
+    expect(authStorageSnapshot()).toEqual(before)
+  })
+  it("compensates the local and session OIDC intent state when session binding fails after the lock begins", async () => {
+    localStorage.setItem(AUTH_LOGIN_INTENT_KEY, JSON.stringify({ schemaVersion: 1, id: "existing-intent" }))
+    sessionStorage.setItem(AUTH_OIDC_INTENT_KEY, JSON.stringify({ schemaVersion: 1, id: "existing-oidc-intent" }))
+    const beforeLocal = authStorageSnapshot()
+    const beforeSession = sessionStorage.getItem(AUTH_OIDC_INTENT_KEY)
+    const browserSessionStorage = window.sessionStorage
+    const descriptor = Object.getOwnPropertyDescriptor(window, "sessionStorage")
+    Object.defineProperty(window, "sessionStorage", { configurable: true, value: {
+      getItem: browserSessionStorage.getItem.bind(browserSessionStorage),
+      removeItem: browserSessionStorage.removeItem.bind(browserSessionStorage),
+      setItem: (key: string, value: string) => {
+        if (key === AUTH_OIDC_INTENT_KEY) throw new Error("OIDC session write blocked")
+        browserSessionStorage.setItem(key, value)
+      },
+    } })
+    try {
+      await expect(claimOidcAuthLoginIntent()).resolves.toEqual({ status: "unavailable", reason: "operation_failed" })
+
+      expect(authStorageSnapshot()).toEqual(beforeLocal)
+      expect(browserSessionStorage.getItem(AUTH_OIDC_INTENT_KEY)).toBe(beforeSession)
+    } finally {
+      if (descriptor) Object.defineProperty(window, "sessionStorage", descriptor)
+    }
+  })
+  it("reports OIDC intent storage failures through the typed take result", () => {
+    vi.stubGlobal("sessionStorage", undefined)
+
+    expect(takeOidcAuthLoginIntent()).toEqual({ status: "unavailable", reason: "storage_unavailable" })
+  })
+  it.each(["claim", "oidc_claim", "create", "migrate", "refresh", "profile", "clear"] as const)("reports coordination_unavailable without changing any auth-owned key for %s", async operation => {
+    const captured = await created()
+    const pending = await claimAuthLoginIntent()
+    expect(pending.status).toBe("claimed")
+    if (pending.status !== "claimed") throw new Error("expected pending intent")
+    const before = authStorageSnapshot()
+    Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
+
+    const result = await ({
+      claim: () => claimAuthLoginIntent(),
+      oidc_claim: () => claimOidcAuthLoginIntent(),
+      create: () => createAuthSession({ user, access_token: "new-access" }, pending.intent),
+      migrate: () => migrateLegacyAuthSession(),
+      refresh: () => commitAuthSessionRefresh(captured, { success: true, access_token: "new-access", refresh_token: "new-refresh" }),
+      profile: () => updateAuthSessionUser(captured, { ...user, email: "new@example.com" }),
+      clear: () => clearAuthSessionIfCurrent(captured),
+    })[operation]()
+
+    expect(result).toEqual({ status: "unavailable", reason: "coordination_unavailable" })
+    expect(authStorageSnapshot()).toEqual(before)
   })
   it("returns discriminated conditional-clear outcomes", async () => {
     const currentSession = await created()

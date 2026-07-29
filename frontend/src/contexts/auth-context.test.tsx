@@ -334,8 +334,8 @@ describe("AuthProvider storage synchronization", () => {
       120,
       240
     )
-    let resolveRefresh!: (value: { accessToken: null; rejected: true }) => void
-    const refreshPromise = new Promise<{ accessToken: null; rejected: true }>((resolve) => {
+    let resolveRefresh!: (value: { status: "rejected"; accessToken: null }) => void
+    const refreshPromise = new Promise<{ status: "rejected"; accessToken: null }>((resolve) => {
       resolveRefresh = resolve
     })
     vi.mocked(refreshStoredAccessToken).mockReturnValue(refreshPromise)
@@ -373,7 +373,7 @@ describe("AuthProvider storage synchronization", () => {
     expect(screen.getByTestId("refresh-access-token")).toHaveTextContent("bob-access")
 
     await act(async () => {
-      resolveRefresh({ accessToken: null, rejected: true })
+      resolveRefresh({ status: "rejected", accessToken: null })
       await refreshPromise
     })
 
@@ -396,10 +396,7 @@ describe("AuthProvider storage synchronization", () => {
       120,
       240
     )
-    vi.mocked(refreshStoredAccessToken).mockResolvedValue({
-      accessToken: null,
-      rejected: true,
-    })
+    vi.mocked(refreshStoredAccessToken).mockResolvedValue({ status: "rejected", accessToken: null })
     vi.spyOn(console, "error").mockImplementation(() => {})
 
     render(

@@ -7,14 +7,19 @@ import {
   clearAuthSessionIfCurrent,
   compareAuthSession, compareCredentialSession,
   commitAuthSessionRefresh,
+  getAuthStorageAvailability,
   readAuthSessionSnapshot,
 } from "@/lib/auth-cache"
 
 const AUTH_REFRESH_TIMEOUT_MS = 15_000
 const AUTH_REFRESH_LOCK_PREFIX = "xagent-auth-refresh:"
 export type AuthRefreshResult =
-  | { accessToken: string; session: AuthSessionSnapshot }
-  | { accessToken: null; rejected: boolean; reason?: AuthMutationUnavailableReason }
+  | { status: "refreshed" | "advanced"; accessToken: string; session: AuthSessionSnapshot }
+  | { status: "rejected"; accessToken: null }
+  | { status: "not_current"; accessToken: null }
+  | { status: "invalid_response"; accessToken: null }
+  | { status: "transport_failed"; accessToken: null }
+  | { status: "unavailable"; accessToken: null; reason: AuthMutationUnavailableReason }
 const refreshPromises = new Map<string, Promise<AuthRefreshResult>>()
 const REFRESH_EXCLUDED_AUTH_ENDPOINTS = ["/api/auth/login", "/api/auth/register", "/api/auth/setup-admin", "/api/auth/forgot-password", "/api/auth/reset-password"]
 
@@ -77,12 +82,12 @@ async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRe
   const result = await withRefreshLock(session, async () => {
     const before = compareCredentialSession(session)
     if (before.status === "credentials_advanced") {
-      return { accessToken: before.projection.snapshot.accessToken!, session: before.projection.snapshot } satisfies AuthRefreshResult
+      return { status: "advanced", accessToken: before.projection.snapshot.accessToken!, session: before.projection.snapshot } satisfies AuthRefreshResult
     }
     if (before.status !== "exact_credentials") {
-      return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+      return { status: "not_current", accessToken: null } satisfies AuthRefreshResult
     }
-    if (!before.projection.cache.refreshToken) return { accessToken: null, rejected: true } satisfies AuthRefreshResult
+    if (!before.projection.cache.refreshToken) return { status: "rejected", accessToken: null } satisfies AuthRefreshResult
 
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), AUTH_REFRESH_TIMEOUT_MS)
@@ -91,31 +96,39 @@ async function performTokenRefresh(session: AuthSessionSnapshot): Promise<AuthRe
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ refresh_token: before.projection.cache.refreshToken }), signal: controller.signal,
       })
-      if (!response.ok) return { accessToken: null, rejected: response.status === 401 || response.status === 403 } satisfies AuthRefreshResult
+      if (!response.ok) return response.status === 401 || response.status === 403
+        ? { status: "rejected", accessToken: null } satisfies AuthRefreshResult
+        : { status: "transport_failed", accessToken: null } satisfies AuthRefreshResult
       const payload = parseStrictRefreshResponse(await response.json())
-      if (!payload) return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+      if (!payload) return { status: "invalid_response", accessToken: null } satisfies AuthRefreshResult
       const committed = await commitAuthSessionRefresh(session, payload)
       if (committed.status === "updated" || committed.status === "advanced") {
-        return { accessToken: committed.projection.snapshot.accessToken!, session: committed.projection.snapshot } satisfies AuthRefreshResult
+        return {
+          status: committed.status === "updated" ? "refreshed" : "advanced",
+          accessToken: committed.projection.snapshot.accessToken!,
+          session: committed.projection.snapshot,
+        } satisfies AuthRefreshResult
       }
-      if (committed.status === "unavailable") return { accessToken: null, rejected: false, reason: committed.reason } satisfies AuthRefreshResult
-      return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+      if (committed.status === "unavailable") return { status: "unavailable", accessToken: null, reason: committed.reason } satisfies AuthRefreshResult
+      return { status: "not_current", accessToken: null } satisfies AuthRefreshResult
     } catch (error) {
       console.error("Token refresh failed:", error)
-      return { accessToken: null, rejected: false } satisfies AuthRefreshResult
+      return { status: "transport_failed", accessToken: null } satisfies AuthRefreshResult
     } finally {
       clearTimeout(timeout)
     }
   })
-  return result.status === "completed" ? result.value : { accessToken: null, rejected: false, reason: result.reason }
+  return result.status === "completed" ? result.value : { status: "unavailable", accessToken: null, reason: result.reason }
 }
 /** Refreshes only the immutable snapshot captured by the caller. */
 export function refreshStoredAccessToken(expectedSession: AuthSessionSnapshot): Promise<AuthRefreshResult> {
+  const availability = getAuthStorageAvailability()
+  if (availability.status === "unavailable") return Promise.resolve({ status: "unavailable", accessToken: null, reason: availability.reason })
   const comparison = compareAuthSession(expectedSession)
   if (comparison.status === "credentials_advanced" || comparison.status === "credentials_and_profile_advanced") {
-    return Promise.resolve({ accessToken: comparison.projection.snapshot.accessToken!, session: comparison.projection.snapshot })
+    return Promise.resolve({ status: "advanced", accessToken: comparison.projection.snapshot.accessToken!, session: comparison.projection.snapshot })
   }
-  if (comparison.status !== "exact" && comparison.status !== "profile_advanced") return Promise.resolve({ accessToken: null, rejected: false })
+  if (comparison.status !== "exact" && comparison.status !== "profile_advanced") return Promise.resolve({ status: "not_current", accessToken: null })
   const key = `${expectedSession.sessionId}::${expectedSession.credentialRevision}::${expectedSession.accessToken}`
   const pending = refreshPromises.get(key)
   if (pending) return pending
@@ -146,14 +159,25 @@ export async function apiRequest(url: string, options: RequestInit = {}): Promis
     return response
   }
   const refreshed = await refreshStoredAccessToken(session)
-  if (refreshed.accessToken !== null && compareCredentialSession(refreshed.session).status === "exact_credentials") {
-    return fetch(url, withBearer(options, refreshed.accessToken))
+  switch (refreshed.status) {
+    case "refreshed":
+    case "advanced":
+      if (compareCredentialSession(refreshed.session).status === "exact_credentials") {
+        return fetch(url, withBearer(options, refreshed.accessToken))
+      }
+      return response
+    case "rejected":
+      if ((await clearAuthSessionIfCurrent(session)).status === "cleared") {
+        console.error("Refresh token was rejected, redirecting to login")
+        window.location.href = "/login"
+      }
+      return response
+    case "not_current":
+    case "invalid_response":
+    case "transport_failed":
+    case "unavailable":
+      return response
   }
-  if (refreshed.accessToken === null && refreshed.rejected && (await clearAuthSessionIfCurrent(session)).status === "cleared") {
-    console.error("Refresh token was rejected, redirecting to login")
-    window.location.href = "/login"
-  }
-  return response
 }
 
 const MAX_RAW_UPLOAD_MESSAGE_LENGTH = 200

@@ -215,6 +215,30 @@ class TestAuthAPI:
         )
         assert response.model_dump()["success"] is True
 
+    @pytest.mark.parametrize(
+        "field",
+        [
+            "success",
+            "access_token",
+            "refresh_token",
+            "expires_in",
+            "refresh_expires_in",
+        ],
+    )
+    def test_refresh_response_rejects_each_missing_required_field(self, field):
+        payload = {
+            "success": True,
+            "message": "ok",
+            "access_token": "access",
+            "refresh_token": "refresh",
+            "expires_in": 60,
+            "refresh_expires_in": 120,
+        }
+        del payload[field]
+
+        with pytest.raises(Exception):
+            RefreshTokenResponse.model_validate(payload)
+
     """Test authentication API endpoints"""
 
     def test_login_success(self, test_db, test_user_data):

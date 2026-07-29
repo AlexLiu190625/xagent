@@ -150,9 +150,21 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     const result = await refreshStoredAccessToken(expected)
     const current = currentProjection()
     if (mountedRef.current && operation === operationRef.current) setProjection(current)
-    if (result.accessToken !== null) return Boolean(current && current.snapshot.sessionId === expected.sessionId && current.snapshot.accessToken === result.accessToken)
-    if (result.rejected) await clearAuthSessionIfCurrent(expected)
-    if (result.reason) console.error(authMutationUnavailableMessage(result.reason))
+    switch (result.status) {
+      case "refreshed":
+      case "advanced":
+        return Boolean(current && current.snapshot.sessionId === expected.sessionId && current.snapshot.accessToken === result.accessToken)
+      case "rejected":
+        await clearAuthSessionIfCurrent(expected)
+        break
+      case "unavailable":
+        console.error(authMutationUnavailableMessage(result.reason))
+        break
+      case "not_current":
+      case "invalid_response":
+      case "transport_failed":
+        break
+    }
     const after = currentProjection()
     if (mountedRef.current && operation === operationRef.current) setProjection(after)
     return false

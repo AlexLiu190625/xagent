@@ -303,8 +303,8 @@ describe("api-wrapper auth refresh", () => {
       secondApi.refreshStoredAccessToken(snapshot),
     ])
 
-    expect(first).toMatchObject({ accessToken: "new-access" })
-    expect(second).toMatchObject({ accessToken: "new-access" })
+    expect(first).toMatchObject({ status: "refreshed", accessToken: "new-access" })
+    expect(second).toMatchObject({ status: "advanced", accessToken: "new-access" })
     expect(vi.mocked(globalThis.fetch).mock.calls.filter(([input]) => String(input).endsWith("/api/auth/refresh"))).toHaveLength(1)
     expect(readAuthCache()).toMatchObject({ token: "new-access", refreshToken: "new-refresh" })
   })
@@ -329,7 +329,7 @@ describe("api-wrapper auth refresh", () => {
     refreshResponse.resolve(new Response(JSON.stringify({ success: true, access_token: "late-access", refresh_token: "late-refresh" }), {
       status: 200, headers: { "Content-Type": "application/json" },
     }))
-    await expect(refresh).resolves.toEqual({ accessToken: null, rejected: false })
+    await expect(refresh).resolves.toEqual({ status: "invalid_response", accessToken: null })
     expect(readAuthCache()).toBeNull()
   })
 
@@ -338,8 +338,17 @@ describe("api-wrapper auth refresh", () => {
     Object.defineProperty(navigator, "locks", { configurable: true, value: undefined })
     const fetchMock = vi.spyOn(globalThis, "fetch")
 
-    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ accessToken: null, rejected: false, reason: "coordination_unavailable" })
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ status: "unavailable", accessToken: null, reason: "coordination_unavailable" })
     await expect(clearStoredAuth()).resolves.toMatchObject({ status: "cleared", credentialsCleared: true })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("returns rejected without making a refresh request when the captured session has no refresh credential", async () => {
+    writeAuthCache(user, "old-access")
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ status: "rejected", accessToken: null })
+
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -360,21 +369,52 @@ describe("api-wrapper auth refresh", () => {
       status: 200, headers: { "Content-Type": "application/json" },
     }))
 
-    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ accessToken: null, rejected: false })
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ status: "invalid_response", accessToken: null })
+
+    expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
+  })
+  it.each(["success", "access_token", "refresh_token", "expires_in", "refresh_expires_in"] as const)("rejects a refresh response missing required field %s", async field => {
+    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+    const payload: Record<string, unknown> = {
+      success: true, access_token: "new-access", refresh_token: "new-refresh", expires_in: 60, refresh_expires_in: 120,
+    }
+    delete payload[field]
+    const before = localStorage.getItem(AUTH_CACHE_KEY)
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify(payload), {
+      status: 200, headers: { "Content-Type": "application/json" },
+    }))
+
+    await expect(refreshStoredAccessToken(readAuthSessionSnapshot())).resolves.toEqual({ status: "invalid_response", accessToken: null })
 
     expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(before)
   })
 
   it("persists opaque rotated refresh credentials exactly after a complete refresh response", async () => {
-    writeAuthCache(user, "old-access", "old-refresh", 120, 240)
-    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
-      success: true, access_token: " new-access ", refresh_token: " new-refresh ", expires_in: 60, refresh_expires_in: 120,
-    }), { status: 200, headers: { "Content-Type": "application/json" } }))
+    vi.useFakeTimers()
+    vi.setSystemTime(new Date("2026-01-01T00:00:00.000Z"))
+    try {
+      writeAuthCache(user, "old-access", "old-refresh", 120, 240)
+      const before = JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+        success: true, access_token: " new-access ", refresh_token: " new-refresh ", expires_in: 60, refresh_expires_in: 120,
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
 
-    const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
+      const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
-    expect(result).toMatchObject({ accessToken: " new-access ", session: { accessToken: " new-access ", refreshToken: " new-refresh " } })
-    expect(JSON.parse(localStorage.getItem(AUTH_CACHE_KEY) || "{}")).toMatchObject({ token: " new-access ", refreshToken: " new-refresh " })
+      const expectedSnapshot = {
+        sessionId: before.sessionId, credentialRevision: 1, profileRevision: 0,
+        userId: "1", accessToken: " new-access ", refreshToken: " new-refresh ",
+        profileFingerprint: JSON.stringify(["alice", null, false]),
+      }
+      const expectedCache = {
+        ...before, credentialRevision: 1, token: " new-access ", refreshToken: " new-refresh ",
+        timestamp: Date.now(), expiresAt: Date.now() + 60_000, refreshExpiresAt: Date.now() + 120_000,
+      }
+      expect(result).toEqual({ status: "refreshed", accessToken: " new-access ", session: expectedSnapshot })
+      expect(localStorage.getItem(AUTH_CACHE_KEY)).toBe(JSON.stringify(expectedCache))
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it("does not reuse a changed session while waiting for the lock", async () => {
@@ -387,7 +427,7 @@ describe("api-wrapper auth refresh", () => {
 
     const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
-    expect(result).toEqual({ accessToken: null, rejected: false })
+    expect(result).toEqual({ status: "not_current", accessToken: null })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -401,7 +441,7 @@ describe("api-wrapper auth refresh", () => {
 
     const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
-    expect(result).toEqual({ accessToken: null, rejected: false })
+    expect(result).toEqual({ status: "not_current", accessToken: null })
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -421,6 +461,7 @@ describe("api-wrapper auth refresh", () => {
     const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
     expect(result).toMatchObject({
+      status: "refreshed",
       accessToken: "new-access",
       session: {
         accessToken: "new-access",
@@ -449,7 +490,7 @@ describe("api-wrapper auth refresh", () => {
 
     const result = await refreshStoredAccessToken(readAuthSessionSnapshot())
 
-    expect(result).toEqual({ accessToken: null, rejected: false })
+    expect(result).toEqual({ status: "not_current", accessToken: null })
     expect(readAuthCache()).toBeNull()
   })
 
@@ -763,10 +804,7 @@ describe("api-wrapper auth refresh", () => {
       const resultPromise = refreshStoredAccessToken(readAuthSessionSnapshot())
       await vi.advanceTimersByTimeAsync(15_000)
 
-      await expect(resultPromise).resolves.toEqual({
-        accessToken: null,
-        rejected: false,
-      })
+      await expect(resultPromise).resolves.toEqual({ status: "transport_failed", accessToken: null })
     } finally {
       vi.useRealTimers()
     }

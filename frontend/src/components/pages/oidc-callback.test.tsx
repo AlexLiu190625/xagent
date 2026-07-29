@@ -11,6 +11,16 @@ vi.mock("@/contexts/i18n-context", () => ({
 
 afterEach(cleanup)
 
+function captureNavigation() {
+  const implementation = (window.location as unknown as Record<symbol, unknown>)[
+    Object.getOwnPropertySymbols(window.location).find(symbol => String(symbol) === "Symbol(impl)")!
+  ] as { _locationObjectSetterNavigate: (url: { path: string[] }) => void }
+  const original = implementation._locationObjectSetterNavigate
+  const targets: string[] = []
+  implementation._locationObjectSetterNavigate = url => { targets.push(`/${url.path.join("/")}`) }
+  return { targets, restore: () => { implementation._locationObjectSetterNavigate = original } }
+}
+
 describe("OidcCallbackPage", () => {
   beforeEach(() => {
     localStorage.clear()
@@ -65,5 +75,17 @@ describe("OidcCallbackPage", () => {
 
     await waitFor(() => expect(vi.mocked(fetch)).toHaveBeenCalledOnce())
     expect(readAuthSessionSnapshot()).toMatchObject({ accessToken: "password-access", userId: "2" })
+  })
+  it("routes unavailable OIDC intent storage to login without attempting an exchange", async () => {
+    const navigation = captureNavigation()
+    vi.stubGlobal("sessionStorage", undefined)
+    const fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+
+    render(<OidcCallbackPage />)
+
+    await waitFor(() => expect(navigation.targets).toEqual(["/login"]))
+    expect(fetchMock).not.toHaveBeenCalled()
+    navigation.restore()
   })
 })
