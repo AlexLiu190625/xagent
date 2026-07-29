@@ -1005,6 +1005,20 @@ _WGET_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
     "o": "write",
 }
 
+# `base64`'s short options bundle into one token (e.g. `-di<file>` combines
+# the `-d` decode flag with the `-i` input-path option), so its grammar is
+# split into a flag set and a value set for the short-option-cluster parser,
+# the same shape `sort`/`grep`/`curl`/`wget` use. `-b`/`-w` take a scalar
+# column-width value that is never a path.
+_BASE64_SHORT_FLAG_OPTIONS = frozenset("dDh")
+_BASE64_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
+    "i": "read",
+    "o": "write",
+    "b": None,
+    "w": None,
+}
+_BASE64_KNOWN_LONG_OPTIONS = frozenset({"--input", "--output", "--break", "--wrap"})
+
 # `cp`/`mv`/`ln` share `_parse_target_directory`'s `-t`/`--target-directory`
 # extraction. Short options bundle into one token (e.g. `-rt` combines the
 # `-r` flag with the `-t` write-path option), so the grammar is split into a
@@ -2776,7 +2790,7 @@ class WorkspaceCommandPathGuard:
             and any(option in "cruAxtd" for option in str(values[0]))
         ):
             index, short_modes, short_events = self._parse_tar_short_events(
-                values, 0, values[0], allow_attached_value=False
+                values, 0, values[0]
             )
             modes.extend(short_modes)
             events.extend(short_events)
@@ -2895,25 +2909,26 @@ class WorkspaceCommandPathGuard:
         values: Sequence[str],
         index: int,
         options: str,
-        *,
-        allow_attached_value: bool = True,
     ) -> tuple[int, list[_TarMode], list[_TarEvent]]:
-        """Parse one traditional/bundled short-option token (e.g. `-xzf`).
+        """Parse one bundled short-option token (e.g. `-xzf`, `-xfC`, `xfC`).
 
-        Two distinct bundling conventions share this parser. The GNU
-        dash-prefixed cluster (`allow_attached_value=True`, e.g. `-xzf`,
-        `-farchive.tar`) only ever expects ONE argument-taking character per
-        token: once found, the rest of the token (if any) is its attached
-        value, or it takes the next whitespace-separated token; parsing then
-        stops, matching GNU getopt's own bundling contract. The historical
-        no-dash traditional "key" form (`allow_attached_value=False`, e.g.
-        `xfC archive.tar dir`) has no attached-value form at all: EVERY
-        argument-taking letter takes its OWN separate subsequent
-        whitespace-token, in the order the letters appear in the key, per
-        POSIX tar. Conflating the two would let a later letter in a
-        no-dash key (e.g. `C` in `xfC`) be misread as the earlier letter's
-        (`f`'s) attached value, leaving both the archive and that later
-        letter's real argument as unchecked positionals. Unrecognized
+        The GNU dash-prefixed cluster (`-xzf`, `-xfC`) and the historical
+        no-dash traditional "key" form (`xfC archive.tar dir`) share this
+        same walk. The no-dash form has no attached-value convention at
+        all: every argument-taking letter takes its OWN separate
+        subsequent whitespace token, in the order the letters appear, per
+        POSIX tar. The dash-prefixed form additionally allows a single
+        trailing argument-taking letter to carry its value attached to the
+        same token (e.g. `-farchive.tar`); once such a letter is found,
+        whatever follows it in the token is normally taken whole as that
+        value. But when that remainder itself STARTS with another
+        recognized tar option letter (e.g. `C` in `-xfC`, from tar's own
+        fixed short-option alphabet), attaching it as `f`'s value would
+        misread an active `-C` as an inert path suffix, leaving both the
+        archive and `-C`'s own directory argument as unchecked
+        positionals; in that ambiguous shape this letter instead takes its
+        own separate next token too, and scanning continues into the
+        remainder exactly as the no-dash form does. Unrecognized
         characters are silently skipped (compression/verbosity flags like
         `z`/`v` this guard does not need to model), consistent with the
         conservative flag-only treatment of unknown tar options elsewhere.
@@ -2937,6 +2952,9 @@ class WorkspaceCommandPathGuard:
             "F": "dangerous",
             "b": None,
         }
+        known_option_characters = (
+            frozenset(short_modes) | frozenset(argument_events) | {"P", "O"}
+        )
         modes: list[_TarMode] = []
         events: list[_TarEvent] = []
         cursor = 0
@@ -2959,32 +2977,29 @@ class WorkspaceCommandPathGuard:
                 cursor += 1
                 continue
 
-            if allow_attached_value:
-                attached = options[cursor + 1 :]
-                argument, next_index = self._take_option_argument(
-                    values,
-                    index,
-                    attached_argument=(
-                        self._derived_value(values[index], attached)
-                        if attached
-                        else None
-                    ),
-                    context=f"tar argument for -{option}",
-                )
-                assert argument is not None
+            attached = options[cursor + 1 :]
+            if not attached or attached[0] in known_option_characters:
+                if next_index >= len(values):
+                    raise CommandPolicyViolation(f"missing tar argument for -{option}")
+                argument: str | None = values[next_index]
+                next_index += 1
                 kind = argument_events[option]
                 if kind is not None:
                     events.append(_TarEvent(kind, argument))
-                break
+                cursor += 1
+                continue
 
-            if next_index >= len(values):
-                raise CommandPolicyViolation(f"missing tar argument for -{option}")
-            argument = values[next_index]
-            next_index += 1
+            argument, next_index = self._take_option_argument(
+                values,
+                index,
+                attached_argument=self._derived_value(values[index], attached),
+                context=f"tar argument for -{option}",
+            )
+            assert argument is not None
             kind = argument_events[option]
             if kind is not None:
                 events.append(_TarEvent(kind, argument))
-            cursor += 1
+            break
 
         return next_index, modes, events
 
@@ -3964,84 +3979,84 @@ class WorkspaceCommandPathGuard:
         """`base64`: `-i`/`--input` reads, `-o`/`--output` writes.
 
         `-b`/`--break` and `-w`/`--wrap` take a scalar column-width value
-        that is never a path.
+        that is never a path. Long options resolve through
+        `_resolve_long_option` (GNU unambiguous-prefix abbreviation, e.g.
+        `--outp=` for `--output`), so an abbreviated spelling is classified
+        identically to the full name instead of falling through as an
+        unrecognized option — which would silently skip the write check on
+        `--output`'s argument. An unrecognized long option with an attached
+        `=value` cannot be assumed to be a value-free flag once it visibly
+        carries a value, and fails closed (mirroring `curl`/`wget`); a bare
+        unmodeled flag (e.g. `--help`) stays permissive. Short options
+        bundle through the same `_parse_short_option_cluster` substrate
+        `sort`/`grep`/`curl`/`wget` use, so `-i`/`-o` still consume their
+        argument even when not the leading character of the cluster (e.g.
+        `-di`).
         """
         self._reject_dynamic_values("base64 arguments", values)
         inputs: list[str] = []
         index = 0
         while index < len(values):
             value = values[index]
-            if value == "--":
+            text = str(value)
+            if text == "--":
                 inputs.extend(values[index + 1 :])
                 break
-            if value in {"--input", "--output"}:
-                if index + 1 < len(values):
-                    self._check_path(
-                        values[index + 1],
-                        cwd,
-                        "read" if value == "--input" else "write",
-                    )
-                index += 2
-                continue
-            if value.startswith(("--input=", "--output=")):
-                self._check_path(
-                    value.split("=", 1)[1],
-                    cwd,
-                    "read" if value.startswith("--input=") else "write",
+            if text.startswith("--"):
+                raw_option, separator, attached_text = text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _BASE64_KNOWN_LONG_OPTIONS
                 )
+                if resolved in {"--input", "--output"}:
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached_text)
+                            if separator
+                            else None
+                        ),
+                        context=f"base64 argument for {resolved}",
+                    )
+                    assert argument is not None
+                    self._check_path(
+                        argument, cwd, "read" if resolved == "--input" else "write"
+                    )
+                    continue
+                if resolved in {"--break", "--wrap"}:
+                    _, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached_text)
+                            if separator
+                            else None
+                        ),
+                        context=f"base64 argument for {resolved}",
+                    )
+                    continue
+                # An unmodeled long option that visibly carries a value
+                # cannot be assumed to be a value-free flag; a bare
+                # unmodeled flag stays permissive.
+                if separator:
+                    raise CommandPolicyViolation(
+                        f"cannot safely resolve base64 option {raw_option}"
+                    )
                 index += 1
                 continue
-            if value in {"--break", "--wrap"}:
-                index += 2
-                continue
-            if value.startswith(("--break=", "--wrap=")):
-                index += 1
-                continue
-            if value.startswith("-") and not value.startswith("--") and value != "-":
-                index = self._check_base64_short_options(values, index, cwd)
+            if text.startswith("-") and text != "-":
+                index, _, _ = self._parse_short_option_cluster(
+                    values,
+                    index,
+                    cwd,
+                    flag_options=_BASE64_SHORT_FLAG_OPTIONS,
+                    value_options=_BASE64_SHORT_VALUE_OPTIONS,
+                )
                 continue
             inputs.append(value)
             index += 1
         for raw_path in inputs:
             self._check_path(raw_path, cwd, "read")
-
-    def _check_base64_short_options(
-        self,
-        values: Sequence[str],
-        index: int,
-        cwd: Path,
-    ) -> int:
-        """Parse one bundled base64 short-option token (e.g. `-di<file>`).
-
-        Only `i`/`o`/`b`/`w` take a value (attached, e.g. `-ifile`, or as the
-        following token); any other character in the cluster (`-d` decode,
-        etc.) is a flag and is skipped without consuming an argument.
-        """
-        value = values[index]
-        options = value[1:]
-        cursor = 0
-        while cursor < len(options):
-            option = options[cursor]
-            if option in {"i", "o", "b", "w"}:
-                attached = options[cursor + 1 :]
-                argument, next_index = self._take_option_argument(
-                    values,
-                    index,
-                    attached_argument=(
-                        self._derived_value(value, attached) if attached else None
-                    ),
-                    context=f"base64 argument for -{option}",
-                    required=False,
-                )
-                if argument is not None and option in {"i", "o"}:
-                    self._check_path(
-                        argument,
-                        cwd,
-                        "read" if option == "i" else "write",
-                    )
-                return next_index
-            cursor += 1
-        return index + 1
 
     def _check_gzip(self, values: Sequence[str], cwd: Path) -> None:
         """`gzip`: default mode replaces its operand with a derived `.gz` file.

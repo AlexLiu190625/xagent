@@ -4003,6 +4003,22 @@ class TestTarCommand:
 
         assert exc_info.value.access == "write"
 
+    def test_dash_prefixed_bundle_gives_each_argument_letter_its_own_token(
+        self, scoped_command_workspace
+    ):
+        # `-xfC archive.tar <dir>`: the GNU dash-prefixed cluster must give
+        # `C` the same own-token treatment the no-dash form gets above.
+        # Misreading `C` as `f`'s attached value would leave the archive and
+        # the directory as unchecked positionals.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside_dir = shlex.quote(str(sibling_file.parent))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"tar -xfC archive.tar {outside_dir}")
+
+        assert exc_info.value.access == "write"
+
     def test_rejects_dynamic_short_option_bundle(self, scoped_command_workspace):
         workspace, _, _ = scoped_command_workspace
         guard = WorkspaceCommandPathGuard(workspace)
@@ -4820,6 +4836,36 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         with pytest.raises(CommandPathViolation):
             guard.validate_argv(["base64", "-i", str(sibling_file)])
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "base64 --outp={path} own.txt",
+            "base64 --output={path} own.txt",
+        ],
+    )
+    def test_rejects_base64_output_abbreviation(
+        self, scoped_command_workspace, command_template
+    ):
+        # `--outp=`/`--output=` must resolve through the same GNU
+        # unambiguous-prefix matching `grep`/`curl`/`wget` use: an
+        # unresolved abbreviation must not silently skip the write check.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    def test_base64_benign_invocations_are_allowed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("base64 own.txt")
+        guard.validate("base64 -w0 own.txt")
 
     # -- gzip ----------------------------------------------------------------
 
