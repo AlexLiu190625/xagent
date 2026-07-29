@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 
 import pytest
 from sqlalchemy import create_engine
@@ -403,6 +403,57 @@ def test_selected_connector_resolver_normalizes_names_and_orders_refs(
         ConnectorRef("custom_api", int(custom_api.id)),
         ConnectorRef("mcp", int(mcp_server.id)),
     ]
+
+
+def test_selected_connector_resolver_filters_before_sorting_selected_refs(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Filtered Connector Agent",
+        description="shared",
+        instructions="Use selected tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp: Google Drive"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    selected_mcp = _create_runtime_mcp(db_session, user, "Google-Drive")
+    selected_api = _create_runtime_custom_api(db_session, user, "google drive")
+    _create_runtime_mcp(db_session, user, "Billing")
+    _create_runtime_custom_api(db_session, user, "Invoices")
+
+    sort_inputs: list[frozenset[ConnectorRef]] = []
+    sort_refs = connector_runtime_service._sort_connector_refs
+
+    def record_sort_input(refs: Iterable[ConnectorRef]) -> tuple[ConnectorRef, ...]:
+        materialized = tuple(refs)
+        sort_inputs.append(frozenset(materialized))
+        return sort_refs(materialized)
+
+    monkeypatch.setattr(
+        connector_runtime_service,
+        "_sort_connector_refs",
+        record_sort_input,
+    )
+
+    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    selected_refs = frozenset(
+        {
+            ConnectorRef("custom_api", int(selected_api.id)),
+            ConnectorRef("mcp", int(selected_mcp.id)),
+        }
+    )
+    assert sort_inputs == [selected_refs]
+    assert list(resolved) == sorted(selected_refs)
 
 
 def test_selection_snapshot_uses_public_resolver_and_filters_runtime_declarations(

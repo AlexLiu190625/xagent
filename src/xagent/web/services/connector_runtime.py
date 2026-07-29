@@ -634,11 +634,10 @@ def _select_agent_visible_connectors(
     )
     spec = ToolSelectionSpec.from_raw(tool_categories=tool_categories)
     selected: dict[ConnectorRef, Any] = {}
-    for ref in _sort_connector_refs(visible):
-        connector = visible[ref]
+    for ref, connector in visible.items():
         if _is_agent_selected_connector(spec, ref, connector):
             selected[ref] = connector
-    return selected
+    return {ref: selected[ref] for ref in _sort_connector_refs(selected)}
 
 
 def _is_agent_selected_connector(
