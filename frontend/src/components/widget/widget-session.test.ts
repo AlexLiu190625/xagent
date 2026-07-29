@@ -517,6 +517,9 @@ describe("widget session mode", () => {
     fetchMock
       .mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
       .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_second", reconnect_token: "rt_second" })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_third", reconnect_token: "rt_third" })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_fourth", reconnect_token: "rt_fourth" })))
+      .mockResolvedValueOnce(jsonResponse(200, exchangeBody({ session_token: "st_fifth", reconnect_token: "rt_fifth" })))
     runWidget({ "data-encrypted-context": GRANT })
     const post = spyOnIframePostMessage()
     await vi.advanceTimersByTimeAsync(0)
@@ -532,15 +535,29 @@ describe("widget session mode", () => {
     expect(vi.getTimerCount()).toBe(0)
     fromIframe("session_connection_open", { session_delivery_id: deliveryB })
     expect(vi.getTimerCount()).toBe(1)
+    await vi.advanceTimersByTimeAsync(10_000)
     fromIframe("session_connection_open", { session_delivery_id: deliveryB })
     expect(vi.getTimerCount()).toBe(1)
-    await vi.advanceTimersByTimeAsync(15_000)
+    await vi.advanceTimersByTimeAsync(5_000)
     expect(vi.getTimerCount()).toBe(0)
     fromIframe("ready")
     await vi.advanceTimersByTimeAsync(0)
     expect(vi.getTimerCount()).toBe(0)
     fromIframe("session_connection_open", { session_delivery_id: deliveryB })
     expect(vi.getTimerCount()).toBe(0)
+
+    for (let recovery = 0; recovery < 3; recovery += 1) {
+      fromIframe("reconnect_request", { reason: "ws_closed" })
+      await vi.advanceTimersByTimeAsync(0)
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    fromIframe("reconnect_request", { reason: "ws_closed" })
+    await vi.advanceTimersByTimeAsync(0)
+    expect(fetchMock).toHaveBeenCalledTimes(5)
+    expect(post).toHaveBeenCalledWith(
+      expect.objectContaining({ type: "session_terminal", code: "network_unavailable" }),
+      HOST,
+    )
   })
 
   it("a recovery at 14,999 ms invalidates the old stability callback before it can reset rapid count", async () => {
