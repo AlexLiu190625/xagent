@@ -65,11 +65,11 @@ describe("files-disabled presentation", () => {
     )
   })
 
-  it("redacts prose labels after a colon and preserves URI schemes", () => {
+  it("redacts local paths after compact prose labels without changing URLs or ordinary slash text", () => {
     expect(sanitizeFilesDisabledPresentationText(
-      "Label:/private/tenant/one.txt and Label: /private/tenant/two.txt; keep urn:/private/tenant/urn.txt, VSCODE:/private/tenant/code.txt, custom+tool:/private/tenant/custom.txt, http:/private/tenant/http.txt, and https:/private/tenant/https.txt.",
+      "Saved to:/private/tenant/reported.txt; Label:/private/tenant/one.txt and Label: /private/tenant/two.txt; keep custom+tool:/private/tenant/custom.txt, http:/private/tenant/http.txt, and https:/private/tenant/https.txt. Keep http://example.com/a/b, https://example.com/a/b, 1/2, and/or, and prose/path.",
     )).toBe(
-      "Label:/private/tenant/one.txt and Label: two.txt; keep urn:/private/tenant/urn.txt, VSCODE:/private/tenant/code.txt, custom+tool:/private/tenant/custom.txt, http:/private/tenant/http.txt, and https:/private/tenant/https.txt.",
+      "Saved to:reported.txt; Label:one.txt and Label: two.txt; keep custom+tool:custom.txt, http:http.txt, and https:https.txt. Keep http://example.com/a/b, https://example.com/a/b, 1/2, and/or, and prose/path.",
     )
   })
 
@@ -257,13 +257,13 @@ describe("files-disabled presentation", () => {
     })
   })
 
-  it("preserves URI schemes when a known local root would otherwise match", () => {
+  it("redacts known local roots after scheme-like prefixes", () => {
     expect(projectFilesDisabledPresentation({
       files: [{ file_name: "report.pdf", output_dir: "/private/reports" }],
       message: "Open urn:/private/reports/urn.txt and vscode:/private/reports/code.txt",
     })).toEqual({
       files: [{ file_name: "report.pdf" }],
-      message: "Open urn:/private/reports/urn.txt and vscode:/private/reports/code.txt",
+      message: "Open urn:urn.txt and vscode:code.txt",
     })
   })
 
