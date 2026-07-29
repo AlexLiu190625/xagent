@@ -607,6 +607,10 @@ def resolve_agent_selected_connectors(
 ) -> dict[ConnectorRef, Any]:
     """Return visible connectors selected by ``agent`` for the supplied owner.
 
+    Selection derives only from ``Agent.tool_categories``; task-level runtime
+    overlays are not applied. Callers that need the effective per-task tool set
+    must apply those policies at the task-selection boundary.
+
     Runtime-declaration filtering is intentionally left to consumers. Results
     iterate deterministically by ``(connector_type, connector_id)``.
     """
@@ -640,6 +644,8 @@ def _runtime_declared_refs(
 def _select_agent_visible_connectors(
     agent: Agent, visible: dict[ConnectorRef, Any]
 ) -> dict[ConnectorRef, Any]:
+    """Select visible connectors and establish canonical ref iteration order."""
+
     tool_categories = (
         list(agent.tool_categories) if isinstance(agent.tool_categories, list) else None
     )

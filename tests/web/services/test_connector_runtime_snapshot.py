@@ -469,6 +469,7 @@ def test_create_plan_preserves_canonical_cross_type_connector_order(
     db_session.flush()
     selected_mcp = _create_runtime_mcp(db_session, user, "Records")
     selected_api = _create_runtime_custom_api(db_session, user, "records")
+    unselected_mcp = _create_runtime_mcp(db_session, user, "Billing")
 
     plan = prepare_create_connector_runtime(
         db=db_session,
@@ -482,6 +483,7 @@ def test_create_plan_preserves_canonical_cross_type_connector_order(
         ConnectorRef("custom_api", int(selected_api.id)),
         ConnectorRef("mcp", int(selected_mcp.id)),
     )
+    assert ConnectorRef("mcp", int(unselected_mcp.id)) not in plan.selected_refs
 
 
 def test_selection_snapshot_uses_public_resolver_and_filters_runtime_declarations(
