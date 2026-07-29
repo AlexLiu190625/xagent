@@ -333,6 +333,48 @@ def test_selected_connector_resolver_includes_owner_and_team_visible_connectors_
     assert ConnectorRef("mcp", int(unselected_server.id)) not in resolved
 
 
+def test_selected_connector_resolver_skips_name_normalization_without_server_scope(
+    db_session: Session,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    user = _create_user(db_session, "owner")
+    agent = Agent(
+        user_id=user.id,
+        name="Unscoped Connector Agent",
+        description="shared",
+        instructions="Use MCP tools.",
+        execution_mode="balanced",
+        status=AgentStatus.PUBLISHED,
+        tool_categories=["mcp"],
+    )
+    db_session.add(agent)
+    db_session.flush()
+    selected_mcp = _create_runtime_mcp(db_session, user, "Records")
+    _create_runtime_custom_api(db_session, user, "Billing")
+
+    normalization_calls: list[str] = []
+    normalize_name = connector_runtime_service.normalize_mcp_server_name
+
+    def record_normalization(name: str) -> str:
+        normalization_calls.append(name)
+        return normalize_name(name)
+
+    monkeypatch.setattr(
+        connector_runtime_service,
+        "normalize_mcp_server_name",
+        record_normalization,
+    )
+
+    resolved = connector_runtime_service.resolve_agent_selected_connectors(
+        db=db_session,
+        agent=agent,
+        connector_user_id=int(user.id),
+    )
+
+    assert list(resolved) == [ConnectorRef("mcp", int(selected_mcp.id))]
+    assert normalization_calls == []
+
+
 def test_selected_connector_resolver_normalizes_names_and_orders_refs(
     db_session: Session,
 ) -> None:

@@ -644,17 +644,20 @@ def _select_agent_visible_connectors(
 def _is_agent_selected_connector(
     spec: ToolSelectionSpec, ref: ConnectorRef, connector: Any
 ) -> bool:
-    scoped_mcp_servers = spec.scoped_mcp_servers()
-    name_key = normalize_mcp_server_name(connector.name)
     if ref.connector_type == CONNECTOR_TYPE_MCP:
         if not spec.includes_mcp():
             return False
-        return scoped_mcp_servers is None or name_key in scoped_mcp_servers
-    if ref.connector_type == CONNECTOR_TYPE_CUSTOM_API:
+    elif ref.connector_type == CONNECTOR_TYPE_CUSTOM_API:
         if not spec.includes_custom_api():
             return False
-        return scoped_mcp_servers is None or name_key in scoped_mcp_servers
-    return False
+    else:
+        return False
+
+    scoped_mcp_servers = spec.scoped_mcp_servers()
+    if scoped_mcp_servers is None:
+        return True
+    name_key = normalize_mcp_server_name(connector.name)
+    return name_key in scoped_mcp_servers
 
 
 def _sort_connector_refs(refs: Iterable[ConnectorRef]) -> tuple[ConnectorRef, ...]:
