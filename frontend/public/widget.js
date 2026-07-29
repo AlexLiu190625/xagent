@@ -875,6 +875,8 @@
         return inflightPromise('reconnect') || inflightPromise('exchange') || Promise.resolve();
       }
       var reconnectToken = state.reconnectToken;
+      // Defense in depth: every internal reconnect caller must revalidate the
+      // rotate-on-use credential immediately before constructing the request.
       if (!isNonBlankString(reconnectToken)) {
         recordFailure('reconnect_invalid');
         return Promise.resolve();
