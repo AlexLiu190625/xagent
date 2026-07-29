@@ -5334,3 +5334,87 @@ class TestDdBase64GzipRemoteTransferCommand:
             guard.validate(f"rsync {shlex.quote(str(sibling_file))} copied.txt")
 
         assert exc_info.value.access == "read"
+
+
+class TestBundledAndAbbreviatedPathOptionCoverage:
+    """Recurrence guard for the two bug classes this module's hand-rolled
+    option parsers kept reintroducing: a value-taking option not recognized
+    when bundled behind another short flag (tar's `xfC`, curl's `-sD`,
+    wget's `-qO`, cp/mv/ln's `-rt`), and a GNU-abbreviated long option not
+    resolved to the option it stands for (grep's `--fil=`, cp/mv/ln's
+    `--targ=`, curl's `--dump-hea=`, wget's `--output-docu=`).
+
+    Each row names one path-bearing option a command owns and drives BOTH
+    a bundled-short-cluster form and a GNU-abbreviated long-option form of
+    it against an out-of-workspace path. A command added later that owns a
+    path-bearing option without an entry here has no guarantee either bug
+    class was ever checked for it — that gap is the point of this table,
+    not an oversight to silently fill in.
+    """
+
+    # (label, bundled-short-form template, GNU-abbreviated-long-form template)
+    _BUNDLED_AND_ABBREVIATED_PATH_OPTIONS: list[tuple[str, str, str, str]] = [
+        ("sort -o", "sort -ro{path} own.txt", "sort --out={path} own.txt", "write"),
+        ("sort -T", "sort -rT{path} own.txt", "sort --temp={path} own.txt", "write"),
+        ("grep -f", "grep -vf {path} own.txt", "grep --fil={path} own.txt", "read"),
+        ("cp -t", "cp -rt {path} own.txt", "cp own.txt --targ={path}", "write"),
+        ("mv -t", "mv -vt {path} own.txt", "mv own.txt --targ={path}", "write"),
+        ("ln -t", "ln -st {path} own.txt", "ln own.txt --targ={path}", "write"),
+        (
+            "curl -D",
+            "curl -sD {path} https://example.invalid/file",
+            "curl --dump-hea={path} https://example.invalid/file",
+            "write",
+        ),
+        (
+            "curl -c",
+            "curl -sc {path} https://example.invalid/file",
+            "curl --cookie-j={path} https://example.invalid/file",
+            "write",
+        ),
+        (
+            "wget -O",
+            "wget -qO {path} https://example.invalid/file",
+            "wget --output-docu={path} https://example.invalid/file",
+            "write",
+        ),
+        (
+            "wget -P",
+            "wget -qP {path} https://example.invalid/file",
+            "wget --directory-p={path} https://example.invalid/file",
+            "write",
+        ),
+        (
+            "wget -o",
+            "wget -O keep -qo {path} https://example.invalid/file",
+            "wget -O keep --output-fi={path} https://example.invalid/file",
+            "write",
+        ),
+    ]
+
+    @pytest.mark.parametrize(
+        ("label", "bundled_template", "abbreviated_template", "expected_access"),
+        _BUNDLED_AND_ABBREVIATED_PATH_OPTIONS,
+        ids=[row[0] for row in _BUNDLED_AND_ABBREVIATED_PATH_OPTIONS],
+    )
+    def test_bundled_and_abbreviated_forms_both_reject_out_of_workspace(
+        self,
+        scoped_command_workspace,
+        label,
+        bundled_template,
+        abbreviated_template,
+        expected_access,
+    ):
+        del label  # only used as the parametrize id
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as bundled_exc:
+            guard.validate(bundled_template.format(path=outside))
+        assert bundled_exc.value.access == expected_access
+
+        with pytest.raises(CommandPathViolation) as abbreviated_exc:
+            guard.validate(abbreviated_template.format(path=outside))
+        assert abbreviated_exc.value.access == expected_access
