@@ -182,9 +182,9 @@ class SandboxLeaseProvider:
         The worker's desired spec is derived from the same ``mount_intent``
         the primary sandbox was built from (same physical mount set, a
         different name) — routed through the manager's per-lifecycle-key
-        gate (``get_or_create_worker_sandbox``), the same gate provider
-        creation and release-to-zero use, so a worker can never be created
-        while its primary is mid-release or mid-reconcile.
+        gate (``get_or_create_sandbox``), the same gate provider creation and
+        release-to-zero use, so a worker can never be created while its
+        primary is mid-release or mid-reconcile.
 
         When the container cap leaves no room for a worker, or the worker's
         own reconciliation is rejected (e.g. a same-key runtime-config
@@ -205,7 +205,12 @@ class SandboxLeaseProvider:
             if slot in self._workers:
                 return self._workers[slot]
             try:
-                worker = await self._manager.get_or_create_worker_sandbox(
+                # Resolved through the manager's locked entry point, not the
+                # unlocked resolver: it takes this worker's *primary*
+                # lifecycle gate -- the same lock provider creation and
+                # release-to-zero use -- so a worker cannot be created
+                # while its primary is mid-release or mid-reconcile.
+                worker = await self._manager.get_or_create_sandbox(
                     self._lifecycle_type,
                     f"{self._lifecycle_id}::worker::{slot}",
                     mount_intent=self._mount_intent,
@@ -979,9 +984,8 @@ class SandboxManager:
     #
     # Entry points, all funneling through ``_lifecycle_locked(base_name)``
     # exactly once before reaching the unlocked internal resolver:
-    # ``get_or_create_sandbox`` (direct primary/worker retrieval — mainly a
-    # test seam today; no production caller bypasses the lease provider),
-    # ``get_or_create_worker_sandbox`` (used by ``SandboxLeaseProvider``),
+    # ``get_or_create_sandbox`` (one exact name, primary or worker: the
+    # lease provider's worker path uses it, and it is otherwise a test seam)
     # and ``get_or_create_lease_provider`` (the production entry point).
 
     async def get_or_create_sandbox(
@@ -1007,25 +1011,6 @@ class SandboxManager:
             return await self._get_or_create_sandbox_locked(
                 lifecycle_type, lifecycle_id, mount_intent=mount_intent
             )
-
-    async def get_or_create_worker_sandbox(
-        self,
-        lifecycle_type: str,
-        lifecycle_id: str,
-        *,
-        mount_intent: SandboxMountIntent | None = None,
-    ) -> Sandbox:
-        """Gated entry point for worker-sandbox creation.
-
-        Used by ``SandboxLeaseProvider.get_worker_sandbox``. Acquires the
-        primary's ``_lifecycle_locked`` gate — the same lock provider
-        creation and release-to-zero use — before delegating to the
-        unlocked internal resolver, so a worker can never be created while
-        its primary is mid-release or mid-reconcile.
-        """
-        return await self.get_or_create_sandbox(
-            lifecycle_type, lifecycle_id, mount_intent=mount_intent
-        )
 
     async def _get_or_create_sandbox_locked(
         self,
@@ -2320,12 +2305,20 @@ def _reserved_uploads_user_subtree(
             break
         common_len += 1
     reserved_prefix = sample_0[:common_len]
-    if reserved_prefix + "0" != sample_0 or reserved_prefix + "1" != sample_1:
+    # An empty prefix satisfies the reproduction check below trivially and
+    # leaves a bare ``\d+`` pattern that claims every numeric directory name
+    # under the uploads root -- the silent mismatch this derivation exists to
+    # prevent, arising at its own boundary.
+    if (
+        not reserved_prefix
+        or reserved_prefix + "0" != sample_0
+        or reserved_prefix + "1" != sample_1
+    ):
         raise SandboxContractError(
             "Cannot derive a reserved per-user uploads prefix from "
-            f"scoped_user_root output {sample_0!r} / {sample_1!r}: neither "
-            "reproduces from a common prefix plus its sentinel id. The "
-            "per-user naming scheme no longer fits the <prefix><id> shape "
+            f"scoped_user_root output {sample_0!r} / {sample_1!r}: they do not "
+            "reproduce from a non-empty common prefix plus their sentinel id. "
+            "The per-user naming scheme no longer fits the <prefix><id> shape "
             "the reserved-uploads readiness check assumes."
         )
     return canonical_sandbox_path(guest_uploads_root), reserved_prefix

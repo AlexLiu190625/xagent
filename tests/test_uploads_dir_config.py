@@ -99,18 +99,35 @@ def test_unambiguous_spellings_are_accepted(tmp_path, monkeypatch, spelling):
     get_uploads_dir()
 
 
-def test_relative_and_home_spellings_are_accepted(tmp_path, monkeypatch):
-    """The guard resolves the value the way the mount path builder does.
+def test_relative_and_home_spellings_are_accepted_as_what_was_checked(
+    tmp_path, monkeypatch
+):
+    """Callers get the absolutized value, i.e. the one that was validated.
 
-    A relative or ``~``-prefixed value is absolutized before comparison, so
-    configuration that predates any absolutization requirement still starts.
+    A relative or ``~``-prefixed value is accepted -- configuration that
+    predates any absolutization requirement still starts -- but it is resolved
+    here rather than handed on unresolved: the Python execution tool calls
+    ``os.chdir`` process-wide while a task runs, so a relative value returned
+    verbatim could later name a directory this check never examined.
     """
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", "relative/uploads")
-    assert get_uploads_dir() == Path("relative/uploads")
+    assert get_uploads_dir() == tmp_path / "relative" / "uploads"
 
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", "~/uploads")
-    assert get_uploads_dir() == Path("~/uploads")
+    assert get_uploads_dir() == Path.home() / "uploads"
+
+
+def test_a_later_chdir_cannot_move_the_validated_root(tmp_path, monkeypatch):
+    """The returned root is fixed at validation, not re-resolved per caller."""
+    (tmp_path / "elsewhere").mkdir()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", "relative/uploads")
+
+    before = get_uploads_dir()
+    os.chdir(tmp_path / "elsewhere")
+
+    assert get_uploads_dir() == before
 
 
 def test_unset_falls_back_to_the_packaged_directory(monkeypatch):

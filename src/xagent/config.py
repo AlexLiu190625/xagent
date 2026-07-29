@@ -1015,10 +1015,19 @@ def get_web_dir() -> Path:
 class UploadsDirConfigurationError(Exception):
     """The configured uploads directory has no single physical meaning.
 
-    Deliberately not a ``RuntimeError``: request paths catch that broadly, and
-    a deployment configured this way must not be reported as a transient
-    failure of whichever request happened to touch it first.
+    Raised where the value is read, which for the web app is
+    ``app.py``'s module body: the failure lands during import, before the
+    application object exists, so no request-handling frame is on the stack to
+    swallow it and the process simply refuses to start. That -- not this
+    exception's place in the hierarchy -- is what keeps a misconfigured
+    deployment from being reported as a transient per-request failure.
     """
+
+
+# First absolutized reading of each cwd-dependent uploads root, kept so the
+# root cannot move mid-process (see _require_unambiguous_uploads_dir). Keyed by
+# the configured spelling, so changing the configuration still takes effect.
+_pinned_relative_uploads_roots: dict[str, Path] = {}
 
 
 def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
@@ -1044,12 +1053,27 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
 
     An ordinary symlink is untouched -- following one is not a disagreement,
     both spellings still name a single directory.
+
+    Returns the absolutized value rather than the configured one, so callers
+    receive the path this check actually examined. A relative or
+    ``~``/``$VAR``-prefixed value is resolved against the environment as it
+    stands here; returning it unresolved would let a later ``os.chdir`` (the
+    Python execution tool does exactly that, process-wide, while a task runs)
+    move the directory out from under the guarantee.
     """
     from .sandbox.base import canonical_sandbox_path
 
-    absolute = Path(os.path.expandvars(str(uploads_dir))).expanduser()
-    if not absolute.is_absolute():
-        absolute = Path.cwd() / absolute
+    raw = str(uploads_dir)
+    expanded = Path(os.path.expandvars(raw)).expanduser()
+    if expanded.is_absolute():
+        absolute = expanded
+    else:
+        # A relative value means whatever the working directory says, and this
+        # process changes it: the Python execution tool chdirs process-wide for
+        # the duration of a task's code. Pinning the first reading keeps one
+        # root for the process, so two callers cannot compose paths from two
+        # different directories depending on when they asked.
+        absolute = _pinned_relative_uploads_roots.setdefault(raw, Path.cwd() / expanded)
     canonical = canonical_sandbox_path(str(absolute))
     if os.path.realpath(canonical) != os.path.realpath(absolute):
         # Name whichever variable actually produced this root, so the
@@ -1064,7 +1088,7 @@ def _require_unambiguous_uploads_dir(uploads_dir: Path) -> Path:
             "segment after a symlink does that. Configure the directory you "
             "actually mean."
         )
-    return uploads_dir
+    return absolute
 
 
 def get_uploads_dir() -> Path:
