@@ -2576,7 +2576,7 @@ class WorkspaceCommandPathGuard:
             and any(option in "cruAxtd" for option in str(values[0]))
         ):
             index, short_modes, short_events = self._parse_tar_short_events(
-                values, 0, values[0]
+                values, 0, values[0], allow_attached_value=False
             )
             modes.extend(short_modes)
             events.extend(short_events)
@@ -2695,12 +2695,25 @@ class WorkspaceCommandPathGuard:
         values: Sequence[str],
         index: int,
         options: str,
+        *,
+        allow_attached_value: bool = True,
     ) -> tuple[int, list[_TarMode], list[_TarEvent]]:
         """Parse one traditional/bundled short-option token (e.g. `-xzf`).
 
-        Only the last argument-taking character in the cluster may carry a
-        value (attached, e.g. `-fname`, or as the following token); this
-        matches GNU tar's own traditional-syntax parser. Unrecognized
+        Two distinct bundling conventions share this parser. The GNU
+        dash-prefixed cluster (`allow_attached_value=True`, e.g. `-xzf`,
+        `-farchive.tar`) only ever expects ONE argument-taking character per
+        token: once found, the rest of the token (if any) is its attached
+        value, or it takes the next whitespace-separated token; parsing then
+        stops, matching GNU getopt's own bundling contract. The historical
+        no-dash traditional "key" form (`allow_attached_value=False`, e.g.
+        `xfC archive.tar dir`) has no attached-value form at all: EVERY
+        argument-taking letter takes its OWN separate subsequent
+        whitespace-token, in the order the letters appear in the key, per
+        POSIX tar. Conflating the two would let a later letter in a
+        no-dash key (e.g. `C` in `xfC`) be misread as the earlier letter's
+        (`f`'s) attached value, leaving both the archive and that later
+        letter's real argument as unchecked positionals. Unrecognized
         characters are silently skipped (compression/verbosity flags like
         `z`/`v` this guard does not need to model), consistent with the
         conservative flag-only treatment of unknown tar options elsewhere.
@@ -2746,20 +2759,32 @@ class WorkspaceCommandPathGuard:
                 cursor += 1
                 continue
 
-            attached = options[cursor + 1 :]
-            argument, next_index = self._take_option_argument(
-                values,
-                index,
-                attached_argument=(
-                    self._derived_value(values[index], attached) if attached else None
-                ),
-                context=f"tar argument for -{option}",
-            )
-            assert argument is not None
+            if allow_attached_value:
+                attached = options[cursor + 1 :]
+                argument, next_index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(values[index], attached)
+                        if attached
+                        else None
+                    ),
+                    context=f"tar argument for -{option}",
+                )
+                assert argument is not None
+                kind = argument_events[option]
+                if kind is not None:
+                    events.append(_TarEvent(kind, argument))
+                break
+
+            if next_index >= len(values):
+                raise CommandPolicyViolation(f"missing tar argument for -{option}")
+            argument = values[next_index]
+            next_index += 1
             kind = argument_events[option]
             if kind is not None:
                 events.append(_TarEvent(kind, argument))
-            break
+            cursor += 1
 
         return next_index, modes, events
 

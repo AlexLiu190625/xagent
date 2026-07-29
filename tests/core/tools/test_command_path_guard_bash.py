@@ -3860,6 +3860,23 @@ class TestTarCommand:
         with pytest.raises(CommandPathViolation):
             guard.validate(f"tar -xzf {outside}")
 
+    def test_traditional_bundle_gives_each_argument_letter_its_own_token(
+        self, scoped_command_workspace
+    ):
+        # `xfC archive.tar <dir>`: traditional (no-dash) bundled tar syntax
+        # gives each argument-taking letter its own subsequent whitespace
+        # token, in the order the letters appear — `f` takes the archive,
+        # `C` takes the directory. Misreading `C` as `f`'s attached value
+        # would leave the archive and the directory as unchecked positionals.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside_dir = shlex.quote(str(sibling_file.parent))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"tar xfC archive.tar {outside_dir}")
+
+        assert exc_info.value.access == "write"
+
     def test_rejects_dynamic_short_option_bundle(self, scoped_command_workspace):
         workspace, _, _ = scoped_command_workspace
         guard = WorkspaceCommandPathGuard(workspace)
