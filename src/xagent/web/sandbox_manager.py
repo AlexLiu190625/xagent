@@ -5,6 +5,7 @@ Sandbox management in application layer.
 import asyncio
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import AsyncIterator, Callable
@@ -352,8 +353,15 @@ class SandboxManager:
       The single source of truth reclamation decisions are made from.
     - ``_reconcile_budget``: remaining mismatch-triggered rebuilds, per base
       lifecycle name. Only the reconciliation route's mismatch branch
-      consumes it (never the absent-\\>create branch); only ``cleanup()``
-      resets it; no delete or claim path touches it otherwise.
+      consumes it (never the absent-\\>create branch, and never the delete
+      *inside* a mismatch rebuild — see ``_reconcile_delete`` — since that
+      would erase the decrement this same rebuild just made); ``cleanup()``
+      resets it wholesale, and a full-lifecycle disposal (``_delete_sandbox_names``
+      deleting the primary, ``_claim_idle_sandbox``) drops the one entry for
+      that base name so a later, unrelated occupant of the same key starts
+      with a fresh budget instead of inheriting an exhausted one. A
+      worker-only disposal (``delete_worker_sandboxes`` / release-to-zero)
+      never touches it: the primary the budget is scoped to is still live.
     - ``_locks`` / ``_locks_guard``: per-exact-name creation lock used only
       by the legacy (non-reconciling) backend route — see
       ``_legacy_get_or_create``. The reconciliation route never inserts
@@ -409,18 +417,33 @@ class SandboxManager:
     - ``_delete_sandbox_names`` (explicit ``delete_sandbox`` /
       ``delete_worker_sandboxes`` / sweep / capacity eviction): pops
       ``_cache``, ``_config_cache``, ``_locks``, ``_lease_providers``,
-      ``_activity`` for every deleted name.
+      ``_activity`` for every deleted name, and additionally
+      ``_reconcile_budget`` for a name that is itself a base (primary) name
+      — i.e. only when ``delete_sandbox`` put the primary in the deleted
+      set, never for a worker-only ``delete_worker_sandboxes`` call, where
+      the primary the budget is scoped to is untouched.
+    - ``_claim_idle_sandbox`` (idle sweep / capacity eviction, ahead of the
+      ``_delete_sandbox_names`` call that follows): pops the primary's and
+      its workers' ``_cache``/``_config_cache`` entries plus
+      ``_lease_providers``, and also ``_reconcile_budget`` for the base
+      name, since claiming always disposes of the whole lifecycle group at
+      once.
     - ``release`` (ref-count reaches zero): pops ``_lease_providers`` only
       (under ``_lifecycle_locked`` + ``_activity_guard``), then deletes
       worker sandboxes (which pops their ``_cache``/``_config_cache``
       through the path above). The primary's own ``_cache``/
-      ``_config_cache``/``_activity`` entries are deliberately left alone —
-      the primary container itself is not deleted on release, only its
-      provider and workers.
+      ``_config_cache``/``_activity``/``_reconcile_budget`` entries are
+      deliberately left alone — the primary container itself is not deleted
+      on release, only its provider and workers.
     - ``_reconcile_delete`` (mismatch rebuild, reconciliation route only):
       pops ``_cache``, ``_config_cache``, ``_lease_providers``,
       ``_activity`` for the one name being rebuilt — never ``_locks``
-      (the reconciliation route never inserts into it in the first place).
+      (the reconciliation route never inserts into it in the first place)
+      and never ``_reconcile_budget``: this delete is immediately followed,
+      in the same call, by ``_reconcile_create`` re-populating the same
+      name, so popping the budget here would erase the very decrement
+      ``_reconcile_mismatch`` just made and let the same base name rebuild
+      without limit.
     - ``cleanup()`` (both routes): clears ``_cache``, ``_config_cache``,
       ``_lease_providers``, ``_activity`` wholesale; the reconciling
       route's ``_quiesce`` additionally clears ``_reconcile_budget``
@@ -794,6 +817,14 @@ class SandboxManager:
                 should_create
                 and prepare_root is not None
                 and mount_intent is not None
+                # Identifies the mount-root entry (there is at most one) so
+                # ``prepare_root`` only redirects that path, never an
+                # extra/allowlist mount. Byte-equality here relies on
+                # ``mount_intent.mount_root`` always having passed through
+                # ``canonical_sandbox_path``, whose normalization is exactly
+                # what ``Path(s)`` on a POSIX path already produces — if that
+                # normalizer ever stops being a strict subset of ``Path``'s,
+                # this comparison can start missing the mount root.
                 and str(backend_path) == mount_intent.mount_root
             ):
                 target = Path(prepare_root)
@@ -1336,23 +1367,26 @@ class SandboxManager:
         stopped. The publish itself runs under ``_capacity_gate`` exactly
         like ``_reconcile_create``/``_legacy_get_or_create`` (only when a
         cap is configured — with no cap there is no eviction to race in the
-        first place): capacity eviction's claim-then-delete of an unrelated
-        key also always runs under that same gate (see
-        ``_ensure_capacity_for``), so this reuse and that claim+delete can
-        never interleave against the sandbox service, only serialize. This
-        is the one case ``_pick_eviction_victim``'s lifecycle-lock skip does
-        not cover: this call's own ``base_name`` only starts holding
-        ``_lifecycle_locked`` once reuse is already underway, so an
-        eviction pass for a *different* key can pick this idle container as
-        its LRU victim before that lock is taken, then race this call's
-        ``start_existing`` against its own ``delete`` — the gate is what
-        forces one to fully finish before the other proceeds, instead of
-        the lock (which only protects same-key callers from each other).
-        If the evictor wins the gate first, ``start_existing`` raises
-        ``SandboxNotFoundError``; that is not surfaced to this call's
-        caller as a failure, it converges to the ordinary absent-\\>create
-        path instead, re-inspecting under the now-free gate and creating
-        the (confirmed-absent) sandbox fresh.
+        first place), the same gate capacity eviction's claim-then-delete
+        of an unrelated key always runs under (see ``_ensure_capacity_for``).
+
+        A *same-process* eviction pass can never pick this call's own
+        ``base_name`` as its LRU victim while this runs: the caller
+        (``get_or_create_sandbox`` / ``_create_lease_provider_locked``) has
+        held ``_lifecycle_locked(base_name)`` since before ``_reconcile_sandbox``
+        was ever entered, so ``_pick_eviction_victim``'s lock-skip already
+        excludes this key for this call's entire duration, not just from
+        some later point once reuse is "underway". What the gate and the
+        ``SandboxNotFoundError`` handling below actually guard against is
+        an actor the in-process lock cannot see at all: another process
+        sharing the same backend (its own independent capacity eviction, or
+        a cross-process mismatch rebuild) or a manual/administrative
+        removal against the backend directly. If the container vanishes
+        between the inspect that chose this reuse and this
+        ``start_existing`` call, the raised ``SandboxNotFoundError`` is not
+        surfaced to this call's caller as a failure — it converges to the
+        ordinary absent-\\>create path instead, re-inspecting under the
+        now-free gate and creating the (confirmed-absent) sandbox fresh.
         """
         cap = get_sandbox_max_containers()
         try:
@@ -1627,6 +1661,13 @@ class SandboxManager:
         through to the capacity gate and recreates only after the deletion
         has finished.
 
+        The whole lifecycle group (primary and workers) is claimed together
+        here, so the base name's reconcile budget is also dropped: nothing
+        of this key survives eviction for it to still be scoped to, and a
+        later, unrelated recreation of the same name deserves a fresh
+        rebuild allowance rather than inheriting the evicted container's
+        exhausted one.
+
         Returns False when the lifecycle became active since selection.
         """
         worker_prefix = base_name + _WORKER_LIFECYCLE_MARKER
@@ -1640,6 +1681,7 @@ class SandboxManager:
             ]:
                 self._cache.pop(name, None)
                 self._config_cache.pop(name, None)
+            self._reconcile_budget.pop(base_name, None)
             return True
 
     async def _evict_idle_sandbox(self, base_name: str, *, reason: str) -> bool:
@@ -1863,6 +1905,21 @@ class SandboxManager:
                 # await point.
                 self._lease_providers.pop(name, None)
                 self._activity.pop(name, None)
+                # The reconcile budget is keyed by base (primary) name and
+                # shared with every worker under it, so it is only dropped
+                # here when the primary itself is the name being deleted
+                # (``delete_sandbox``'s full-lifecycle set) — never on a
+                # worker-only delete (``delete_worker_sandboxes`` / release-
+                # to-zero), where the primary, and the budget scoped to it,
+                # is still live.
+                base_name = None
+                try:
+                    lifecycle_type, lifecycle_id = self.parse_sandbox_name(name)
+                    base_name = self._base_sandbox_name(lifecycle_type, lifecycle_id)
+                except ValueError:
+                    pass
+                if base_name is not None and name == base_name:
+                    self._reconcile_budget.pop(name, None)
 
     async def sweep_idle_sandboxes(self, idle_ttl: float) -> list[str]:
         """Delete sandboxes with no attached tasks that are idle past the TTL.
@@ -2204,6 +2261,71 @@ def _check_no_conflicting_readiness_volumes(
         seen_by_guest[norm_guest] = guest_key
 
 
+def _reserved_uploads_user_subtree(
+    path_mapper: "SandboxPathMapper",
+) -> tuple[str, str]:
+    """Return ``(guest_uploads_root, reserved_prefix)`` for the per-user subtree.
+
+    Every task's default volumes reserve
+    ``<guest_uploads_root>/<reserved_prefix><user_id>`` for that user's own
+    workspace mount (see ``_workspace_mount_paths`` / ``_make_default_volumes``,
+    both built on ``scoped_user_root``); the id is a runtime fact, not
+    enumerable at startup, so readiness instead treats the whole
+    ``<reserved_prefix>\\d+`` shape under the uploads guest root as reserved.
+    ``reserved_prefix`` is read off ``scoped_user_root``'s own output for a
+    sentinel id (never a hardcoded ``"user_"`` literal), so a rename of that
+    naming scheme cannot silently desync this check from the path it
+    protects. The uploads root is mapped into the same host/guest domain the
+    runtime mount-building path uses: ``absolute_backend_mount_path`` then
+    ``SandboxPathMapper``.
+    """
+    uploads_root = get_uploads_dir()
+    backend_uploads_root = absolute_backend_mount_path(uploads_root)
+    _host, guest_uploads_root, _mode = path_mapper.volume_for_backend_path(
+        backend_uploads_root, "rw"
+    )
+    sample_name = scoped_user_root(uploads_root, 0).name
+    reserved_prefix = (
+        sample_name[: -len("0")] if sample_name.endswith("0") else sample_name
+    )
+    return canonical_sandbox_path(guest_uploads_root), reserved_prefix
+
+
+def _check_no_reserved_uploads_conflict(
+    volumes: list[tuple[str, str, str]],
+    guest_uploads_root: str,
+    reserved_prefix: str,
+) -> None:
+    """Reject a configured mount whose guest path lands in the per-user subtree.
+
+    The per-user workspace mount every task adds by default cannot be
+    enumerated here — user ids are runtime facts — so the whole
+    ``<guest_uploads_root>/<reserved_prefix><id>`` shape is treated as
+    reserved: a static mount whose guest path equals or is nested under one
+    of those directories collides with the mount every future task for that
+    user would need there, which today only surfaces as
+    ``SandboxRuntimeConflictError`` at that user's first task rather than
+    here at startup. A mount elsewhere under the uploads root (e.g. a shared
+    knowledge-base directory) does not match the reserved shape and still
+    passes.
+    """
+    reserved_re = re.compile(rf"^{re.escape(reserved_prefix)}\d+$")
+    prefix_with_sep = guest_uploads_root + "/"
+    for _host_path, guest_path, _mode in volumes:
+        norm_guest = canonical_sandbox_path(guest_path)
+        if not norm_guest.startswith(prefix_with_sep):
+            continue
+        first_segment = norm_guest[len(prefix_with_sep) :].split("/", 1)[0]
+        if reserved_re.match(first_segment):
+            raise SandboxRuntimeConflictError(
+                f"Configured sandbox mount with guest path {guest_path!r} "
+                "collides with the reserved per-user uploads subtree "
+                f"{guest_uploads_root!r}/{reserved_prefix}<id>: every task's "
+                "default workspace mount for that user would land at or "
+                "under this path."
+            )
+
+
 async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     """Validate static sandbox mount configuration before serving traffic.
 
@@ -2219,7 +2341,11 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     a live container, so there is nothing here for it to protect. Skipped
     entirely when neither ``SANDBOX_VOLUMES`` nor
     ``XAGENT_EXTERNAL_UPLOAD_DIRS`` is configured — code mounts alone never
-    conflict with themselves.
+    conflict with themselves, and with nothing operator-configured to check,
+    the per-user reserved-subtree check below has nothing to protect either
+    (a task's own per-user mount and its enclosing code mounts do not
+    collide with each other by construction); that is also why the reserved-
+    subtree check runs after this early return rather than before it.
 
     Domain discipline: ``SANDBOX_VOLUMES`` (via ``get_sandbox_volumes``,
     using the same ``host_side_sources`` flag the runtime build path uses)
@@ -2235,9 +2361,19 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
     detection itself always runs in the post-mapper host domain, over the
     combined triple set from all three sources.
 
+    Beyond mutual conflicts among the configured mounts, one configured
+    mount can also collide with a mount that does not exist yet: every
+    task's per-user uploads mount (see ``_workspace_mount_paths`` /
+    ``_make_default_volumes``), whose user id is a runtime fact this
+    startup step cannot enumerate. ``_check_no_reserved_uploads_conflict``
+    catches that case instead by treating the whole per-user subtree shape
+    under the uploads guest root as reserved, so a configured mount landing
+    there fails now instead of at that user's first task.
+
     Raises:
         SandboxRuntimeConflictError: Two configured mounts disagree at a
-            shared host or guest path.
+            shared host or guest path, or a configured mount lands inside
+            the reserved per-user uploads subtree.
     """
     if not await sandbox_mgr._resolve_backend_probe():
         return
@@ -2259,6 +2395,8 @@ async def check_sandbox_static_readiness(sandbox_mgr: "SandboxManager") -> None:
         volumes.append(path_mapper.volume_for_backend_path(backend_dir, "rw"))
 
     _check_no_conflicting_readiness_volumes(volumes)
+    guest_uploads_root, reserved_prefix = _reserved_uploads_user_subtree(path_mapper)
+    _check_no_reserved_uploads_conflict(volumes, guest_uploads_root, reserved_prefix)
 
 
 # Global sandbox manager instance

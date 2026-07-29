@@ -33,7 +33,7 @@ from xagent.sandbox.base import (
     SandboxTemplate,
 )
 from xagent.web.sandbox_keys import USER_LIFECYCLE_TYPE, make_user_lifecycle_id
-from xagent.web.sandbox_manager import SandboxManager
+from xagent.web.sandbox_manager import SandboxManager, check_sandbox_static_readiness
 from xagent.web.services.workspace_binding import build_chat_workspace_binding
 
 
@@ -415,7 +415,54 @@ class TestReconcileBudget:
         assert "user::1" not in manager._reconcile_budget
 
     @pytest.mark.asyncio
-    async def test_delete_does_not_reset_budget(self, _env, tmp_path) -> None:
+    async def test_full_lifecycle_delete_clears_budget_and_allows_rebuild_again(
+        self, _env, tmp_path
+    ) -> None:
+        """``delete_sandbox`` disposes of the whole lifecycle (primary +
+        workers), so its exhausted budget must not linger to reject a
+        later, unrelated occupant of the same base name — only a restart
+        used to clear it, forcing every subsequent mismatch for that key to
+        fail even though the earlier container is long gone."""
+        manager, service = _make_manager()
+        stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="stale:v0"
+        )
+
+        def _seed_stale() -> None:
+            service._containers["user::1"] = _FakeReconcileContainer(
+                state="stopped",
+                spec=stale_spec,
+                fingerprint_label=stale_spec.fingerprint(),
+                version_label="1",
+            )
+
+        _seed_stale()
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+        assert manager._reconcile_budget["user::1"] == 0
+
+        await manager.delete_sandbox("user", "1")
+        assert "user::1" not in manager._reconcile_budget
+
+        # A fresh mismatch for the same base name after the delete gets its
+        # own rebuild allowance rather than inheriting the deleted
+        # lifecycle's exhausted one.
+        manager._cache.pop("user::1", None)
+        manager._config_cache.pop("user::1", None)
+        _seed_stale()
+
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+        assert sandbox.name == "user::1"
+        assert service.create.await_count == 2  # both mismatches actually rebuilt
+
+    @pytest.mark.asyncio
+    async def test_worker_only_delete_does_not_touch_primary_budget(
+        self, _env, tmp_path
+    ) -> None:
+        """``delete_worker_sandboxes`` (also release-to-zero's own cleanup)
+        never disposes of the primary itself, so the base name's budget —
+        still scoped to a live primary — must survive it."""
         manager, service = _make_manager()
         stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
             template_type="image", image="stale:v0"
@@ -429,10 +476,71 @@ class TestReconcileBudget:
         await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
         assert manager._reconcile_budget["user::1"] == 0
 
-        # An unrelated deletion of the same name must not reset the budget.
-        await manager.delete_sandbox("user", "1")
+        await manager.delete_worker_sandboxes("user", "1")
 
         assert manager._reconcile_budget["user::1"] == 0
+
+    @pytest.mark.asyncio
+    async def test_idle_eviction_clears_budget_and_allows_rebuild_again(
+        self, _env, tmp_path
+    ) -> None:
+        """Idle reclamation claims (``_claim_idle_sandbox``) the whole
+        lifecycle group atomically before the underlying delete even runs,
+        so the claim itself must drop the base name's budget too — the same
+        unbounded-key / stale-rejection defect as an explicit delete, just
+        reached through the sweep instead."""
+        manager, service = _make_manager()
+        stale_spec = ResolvedSandboxRuntimeSpec.from_parts(
+            template_type="image", image="stale:v0"
+        )
+
+        def _seed_stale() -> None:
+            service._containers["user::1"] = _FakeReconcileContainer(
+                state="stopped",
+                spec=stale_spec,
+                fingerprint_label=stale_spec.fingerprint(),
+                version_label="1",
+            )
+
+        _seed_stale()
+        await manager.get_or_create_sandbox("user", "1", mount_intent=_intent(tmp_path))
+        assert manager._reconcile_budget["user::1"] == 0
+
+        # Force the lifecycle to read as idle since the dawn of time (the
+        # mismatch rebuild above already dropped its own activity entry —
+        # see ``_reconcile_delete`` — so idleness falls back to this
+        # startup timestamp).
+        manager._startup_monotonic = 0.0
+
+        reclaimed = await manager.sweep_idle_sandboxes(idle_ttl=0)
+
+        assert reclaimed == ["user::1"]
+        assert "user::1" not in manager._reconcile_budget
+
+        # A fresh mismatch for the same base name after reclamation gets its
+        # own rebuild allowance rather than inheriting the reclaimed
+        # lifecycle's exhausted one.
+        _seed_stale()
+        sandbox = await manager.get_or_create_sandbox(
+            "user", "1", mount_intent=_intent(tmp_path)
+        )
+        assert sandbox.name == "user::1"
+
+    @pytest.mark.asyncio
+    async def test_claim_idle_sandbox_clears_budget_in_isolation(self, _env) -> None:
+        """``_claim_idle_sandbox`` purges the in-process instance cache the
+        moment a lifecycle is selected for reclamation, before the physical
+        delete that follows (``_evict_idle_sandbox`` -> ``delete_sandbox``)
+        ever runs — this pins that the claim step itself drops the base
+        name's budget right then, independent of that later delete also
+        doing so."""
+        manager, _service = _make_manager()
+        manager._reconcile_budget["user::1"] = 0
+
+        claimed = await manager._claim_idle_sandbox("user::1")
+
+        assert claimed is True
+        assert "user::1" not in manager._reconcile_budget
 
     @pytest.mark.asyncio
     async def test_cleanup_quiesce_resets_budget(self, _env, tmp_path) -> None:
@@ -643,3 +751,132 @@ class TestProviderCacheMountIntentGate:
 
         assert second is first
         assert set(service._containers) == {"user::1"}
+
+
+class TestReadinessReservedUploadsSubtree:
+    """``check_sandbox_static_readiness`` must also reject a static mount
+    landing in the per-user uploads subtree every task's default workspace
+    mount reserves (see ``_workspace_mount_paths`` / ``_make_default_volumes``),
+    even though no single user id is enumerable at startup. Uses the same
+    manager fixture as the rest of this module (real
+    ``_resolve_backend_probe()`` against ``FakeSandboxService(
+    runtime_spec_supported=True)``) rather than duplicating the ``_ProbeStub``
+    from ``test_sandbox_manager_readiness.py``.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rejects_mount_exactly_at_a_reserved_user_dir(self, tmp_path) -> None:
+        uploads_dir = tmp_path / "uploads"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{uploads_dir / 'user_5'}:rw",
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            with pytest.raises(SandboxRuntimeConflictError):
+                await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_rejects_mount_nested_inside_a_reserved_user_dir(
+        self, tmp_path
+    ) -> None:
+        uploads_dir = tmp_path / "uploads"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": (
+                        f"{tmp_path / 'host'}:{uploads_dir / 'user_5' / 'notes'}:rw"
+                    ),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            with pytest.raises(SandboxRuntimeConflictError):
+                await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_allows_mount_elsewhere_under_uploads_root(self, tmp_path) -> None:
+        """A shared, non-per-user directory under the uploads root is not
+        reserved and must still pass."""
+        uploads_dir = tmp_path / "uploads"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": (
+                        f"{tmp_path / 'host'}:{uploads_dir / 'shared-kb'}:rw"
+                    ),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_allows_mount_with_non_numeric_suffix(self, tmp_path) -> None:
+        """``user_5abc`` is not a per-user directory ``scoped_user_root``
+        would ever produce (ids are always ``int``), so it is not reserved."""
+        uploads_dir = tmp_path / "uploads"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": (
+                        f"{tmp_path / 'host'}:{uploads_dir / 'user_5abc'}:rw"
+                    ),
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            await check_sandbox_static_readiness(manager)
+
+    @pytest.mark.asyncio
+    async def test_allows_mounting_the_uploads_root_itself(self, tmp_path) -> None:
+        """The uploads root itself is an ancestor of every per-user
+        directory, not one of them, so mounting it directly is not a
+        reserved-subtree conflict."""
+        uploads_dir = tmp_path / "uploads"
+        with (
+            patch.dict(
+                "os.environ",
+                {
+                    "XAGENT_UPLOADS_DIR": str(uploads_dir),
+                    "SANDBOX_VOLUMES": f"{tmp_path / 'host'}:{uploads_dir}:rw",
+                },
+                clear=True,
+            ),
+            patch(
+                "xagent.web.sandbox_manager.build_code_mount_volumes",
+                return_value=[],
+            ),
+        ):
+            manager, _service = _make_manager()
+            await check_sandbox_static_readiness(manager)
