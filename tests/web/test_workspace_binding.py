@@ -30,7 +30,6 @@ import xagent.web.services.workspace_binding as workspace_binding
 from xagent.core.execution_scope import ExecutionScope
 from xagent.core.workspace import scoped_user_root
 from xagent.sandbox import SandboxContractError, SandboxMountEscapeError
-from xagent.web.sandbox_manager import SandboxManager
 from xagent.web.services.workspace_binding import (
     ChatWorkspaceBinding,
     build_chat_workspace_binding,
@@ -101,13 +100,6 @@ def _new_physical_paths(binding: ChatWorkspaceBinding) -> set[str]:
     intent = binding.mount_intent
     assert intent.mount_root is not None
     return {intent.mount_root} | set(intent.extra_mounts)
-
-
-def _spec_mount_paths(binding: ChatWorkspaceBinding) -> list[tuple[Path, bool]]:
-    """The mount list this binding's intent puts in the runtime spec."""
-    return SandboxManager._workspace_mount_paths(
-        "user", str(OWNER_ID), binding.mount_intent
-    )
 
 
 class TestUnscopedRow:
@@ -506,21 +498,16 @@ class TestDeploymentAuthorizationIdentityDomain:
             isolate_external_dirs=True,
         )
 
-        def build(spelling: str) -> ChatWorkspaceBinding:
-            monkeypatch.setattr(
-                workspace_binding,
-                "get_external_upload_dirs",
-                lambda: [Path(spelling)],
-            )
-            return build_chat_workspace_binding(OWNER_ID, scope)
+        monkeypatch.setattr(
+            workspace_binding,
+            "get_external_upload_dirs",
+            lambda: [Path(f"{user_root}/link/..")],
+        )
 
-        aliased = build(f"{user_root}/link/..")
-        plain = build(str(user_root))
+        binding = build_chat_workspace_binding(OWNER_ID, scope)
 
-        assert aliased.mount_intent == plain.mount_intent
-        assert aliased.mount_intent.mount_root == str(user_root)
-        assert aliased.mount_intent.extra_mounts == ()
-        assert _spec_mount_paths(aliased) == _spec_mount_paths(plain)
+        assert binding.mount_intent.mount_root == str(user_root)
+        assert binding.mount_intent.extra_mounts == ()
 
 
 class TestInternalScopedRow:
@@ -760,6 +747,32 @@ class TestBackendPathDomain:
         expected = str(Path.cwd() / "up" / f"user_{OWNER_ID}")
         assert binding.mount_intent.mount_root == expected
         assert binding.prepare_root == expected
+
+    def test_uploads_dir_spelled_through_a_symlink_prepares_the_bound_root(
+        self, tmp_path, monkeypatch
+    ):
+        """The mkdir target must be the directory that gets bind-mounted.
+
+        ``prepare_root`` is the pre-fold root, deeper than the folded mount
+        root but the same path domain: the mount intent canonicalizes what it
+        binds, so an uploads dir spelled ``<base>/link/..`` binds ``<base>``
+        while a raw-spelled preparation target would create the tree under
+        ``link``'s target instead, leaving the real mount source empty.
+        """
+        base = tmp_path / "base"
+        base.mkdir()
+        outside = tmp_path / "outside" / "nested"
+        outside.mkdir(parents=True)
+        (base / "link").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setattr(
+            workspace_binding, "get_uploads_dir", lambda: Path(f"{base}/link/..")
+        )
+        monkeypatch.setattr(workspace_binding, "get_external_upload_dirs", lambda: [])
+
+        binding = build_chat_workspace_binding(OWNER_ID, None)
+
+        assert binding.prepare_root == binding.mount_intent.mount_root
+        assert binding.prepare_root == str(base / f"user_{OWNER_ID}")
 
     def test_symlink_escaping_the_root_keeps_its_own_mount(
         self, _uploads_dir, tmp_path, monkeypatch

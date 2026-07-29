@@ -73,7 +73,9 @@ class ChatWorkspaceBinding:
     ``mount_intent`` is the folded set actually handed to the sandbox
     manager. ``prepare_root`` is deliberately a separate field: the mount
     root computed *before* folding (``scoped_user_root`` at the scope's
-    ``effective_mount_segments``). Folding can re-root ``mount_intent`` onto
+    ``effective_mount_segments``), in the same canonical spelling the mount
+    intent uses, so both name one directory. Folding can re-root
+    ``mount_intent`` onto
     a covering ancestor already in the allowlist (see module docstring), but
     the directory the task's own files actually live in is always
     ``prepare_root`` -- that is the ``mkdir -p`` target, never
@@ -314,12 +316,15 @@ def build_chat_workspace_binding(
 
     external_allowlist = _build_external_allowlist(owner_id, scope)
 
-    prepare_root = absolute_backend_mount_path(
-        scoped_user_root(get_uploads_dir(), owner_id, mount_segments)
+    # One canonical pre-fold root for both consumers: it is the mkdir target
+    # and the root folding starts from, and the two have to name the same
+    # directory on disk. A raw spelling would not -- ``<base>/link/..`` with
+    # ``link`` a symlink creates under the symlink's target while the bind
+    # source, canonicalized by ``SandboxMountIntent``, stays ``<base>``.
+    prepare_root = _canonical_mount_path(
+        str(scoped_user_root(get_uploads_dir(), owner_id, mount_segments))
     )
-    folded_root, folded_extras = _fold_mount_paths(
-        str(prepare_root), external_allowlist
-    )
+    folded_root, folded_extras = _fold_mount_paths(prepare_root, external_allowlist)
 
     # Known limitation (pending PR-2 scope authority): a suffix-less scope
     # shares the unscoped sandbox lifecycle key (``user:{owner}``) purely
@@ -371,7 +376,4 @@ def build_chat_workspace_binding(
     mount_intent = SandboxMountIntent(
         mount_root=folded_root, extra_mounts=folded_extras
     )
-    return ChatWorkspaceBinding(
-        mount_intent=mount_intent,
-        prepare_root=str(prepare_root),
-    )
+    return ChatWorkspaceBinding(mount_intent=mount_intent, prepare_root=prepare_root)
