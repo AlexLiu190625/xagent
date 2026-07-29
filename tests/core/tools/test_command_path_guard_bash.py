@@ -2863,6 +2863,8 @@ class TestCommandCoverage:
         "shred": "_check_destructive_file_command",
         "find": "_check_find",
         "tar": "_check_tar",
+        "sed": "_check_script_command",
+        "awk": "_check_script_command",
     }
     _DEDICATED_HANDLER_COMMANDS = frozenset(_DEDICATED_HANDLER_METHODS)
     _S1_COMMANDS = frozenset({"sort", "uniq", "diff", "grep"}) | _READ_FAMILY_COMMANDS
@@ -2871,7 +2873,10 @@ class TestCommandCoverage:
     )
     _S3_COMMANDS = frozenset({"find"})
     _S4_COMMANDS = frozenset({"tar"})
-    _ALL_COMMANDS = _S1_COMMANDS | _S2_COMMANDS | _S3_COMMANDS | _S4_COMMANDS
+    _S5_COMMANDS = frozenset({"sed", "awk"})
+    _ALL_COMMANDS = (
+        _S1_COMMANDS | _S2_COMMANDS | _S3_COMMANDS | _S4_COMMANDS | _S5_COMMANDS
+    )
 
     # Each entry: (positive command, negative command template with `{outside}`).
     _REGISTRY: dict[str, tuple[str, str]] = {
@@ -2905,6 +2910,11 @@ class TestCommandCoverage:
         "shred": ("shred own.txt", "shred {outside}"),
         "find": ("find own.txt -print", "find {outside}"),
         "tar": ("tar -cf archive.tar own.txt", "tar -cf archive.tar {outside}"),
+        "sed": ("sed 's/a/b/' own.txt", "sed 'w {outside}' own.txt"),
+        "awk": (
+            "awk '{print $0}' own.txt",
+            "awk '{{print $0 > \"{outside}\"}}' own.txt",
+        ),
     }
 
     def test_registry_covers_every_classified_command(self):
@@ -3628,3 +3638,404 @@ class TestTarCommand:
 
         with pytest.raises(CommandPathViolation):
             guard.validate_argv(["tar", "-tf", str(sibling_file)])
+
+
+class TestSedAwkCommand:
+    """`sed`/`awk`: command-slot lexer over the embedded program (I8/I9).
+
+    sed's `r`/`R`/`w`/`W`/`s///w` file commands and awk's `print`/`printf`
+    redirection and `getline` are path-checked through the same containment
+    every other family uses; `e`/`s///e` and any awk pipe I/O execute an
+    arbitrary shell command and always fail closed. `-f`/`--file` script
+    reads route through `_read_policy_script` (M4), the same unknown_effect
+    gate, non-regular-file rejection, and bounded read every other script
+    read uses.
+    """
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "sed 'r {path}' own.txt",
+            "sed 'R {path}' own.txt",
+            "sed '/own/r {path}' own.txt",
+        ],
+    )
+    def test_sed_read_commands_target_out_of_workspace_rejected(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "sed 'w {path}' own.txt",
+            "sed 'W {path}' own.txt",
+            "sed 's/a/b/w {path}' own.txt",
+        ],
+    )
+    def test_sed_write_commands_target_out_of_workspace_rejected(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    def test_sed_write_commands_inside_workspace_are_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("sed 'w own_out.txt' own.txt")
+        guard.validate("sed 's/a/b/w own_out.txt' own.txt")
+
+    def test_sed_braces_in_pattern_are_data(self, scoped_command_workspace):
+        # `{`/`}`/`/` inside a delimited pattern or replacement are DATA, not
+        # block/command structure; a benign program using them must be
+        # allowed, not misparsed as an unterminated or unsafe command.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(r"sed 's/a\/b{}/x/' own.txt")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "sed 'e cmd' own.txt",
+            "sed '1e' own.txt",
+        ],
+    )
+    def test_sed_execute_command_fails_closed(self, scoped_command_workspace, command):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_sed_substitution_execute_flag_fails_closed(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(f"sed 's#.*#cat {outside}#e' own.txt")
+
+    def test_sed_script_file_read_out_of_workspace_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(f"{sibling_file}.sed")
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"sed -f {outside} own.txt")
+
+        assert exc_info.value.access == "read"
+
+    def test_sed_script_file_inside_workspace_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "safe.sed").write_text(
+            "s/own/safe/\n", encoding="utf-8"
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("sed -f safe.sed own.txt")
+
+    @pytest.mark.parametrize("command_name", ["sed", "awk"])
+    def test_unknown_effect_poisons_script_file_inspection(
+        self, scoped_command_workspace, command_name
+    ):
+        # M4: `-f`/`--file` script reads route through the same shared
+        # `_read_policy_script` every other family uses, so an unclassified
+        # command earlier in the same chain (poisoning `unknown_effect`)
+        # blocks the later script read exactly like it would for `bash`.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "prog").write_text(
+            "s/own/safe/\n" if command_name == "sed" else "{ print $0 }\n",
+            encoding="utf-8",
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate(f"python -c pass; {command_name} -f prog own.txt")
+
+    def test_sed_in_place_switches_file_operand_to_write(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("sed -i 's/a/b/' own.txt")
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"sed -i 's/a/b/' {shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "awk '{{print $0 > \"{path}\"}}' own.txt",
+            'awk \'{{printf "%s", $0 > "{path}"}}\' own.txt',
+            "awk '{{print $0 >> \"{path}\"}}' own.txt",
+        ],
+    )
+    def test_awk_print_redirect_out_of_workspace_rejected(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=str(sibling_file)))
+
+        assert exc_info.value.access == "write"
+
+    def test_awk_print_redirect_inside_workspace_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("awk '{print $0 > \"own_out.txt\"}' own.txt")
+
+    def test_awk_system_call_fails_closed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("awk '{system(\"rm x\")}' own.txt")
+
+    def test_awk_getline_redirect_out_of_workspace_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"awk '{{getline < \"{sibling_file}\"}}' own.txt")
+
+        assert exc_info.value.access == "read"
+
+    def test_awk_getline_inside_workspace_is_allowed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "feed.txt").write_text("data\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("awk '{getline < \"feed.txt\"}' own.txt")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk '\"cmd\" | getline' own.txt",
+            "awk '{print | \"cmd\"}' own.txt",
+        ],
+    )
+    def test_awk_pipe_io_fails_closed(self, scoped_command_workspace, command):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_awk_comparison_operator_is_not_misread_as_redirect(
+        self, scoped_command_workspace
+    ):
+        # `print (2 > 1)`: the `>` is a comparison inside parens, not a
+        # redirect, so paren-depth tracking must keep this from being
+        # misread as file I/O.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("awk 'BEGIN { print (2 > 1) }'")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk '{print > $1}' own.txt",
+            "awk -v target=out.txt '{print $0 > target}' own.txt",
+            "awk -v target=out.txt '{print $0 > (target)}' own.txt",
+        ],
+    )
+    def test_awk_dynamic_redirect_target_rejected(
+        self, scoped_command_workspace, command
+    ):
+        # A redirect target is only statically resolvable as a double-quoted
+        # string literal; a field reference (`$1`), a bareword variable, or
+        # a parenthesized expression is dynamic from the lexer's point of
+        # view and must fail closed rather than being silently skipped.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_awk_script_file_inside_workspace_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "safe.awk").write_text(
+            "{ print $0 }\n", encoding="utf-8"
+        )
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("awk -f safe.awk own.txt")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            'PROGRAM=\'BEGIN { system("cat own.txt") }\' awk "$PROGRAM"',
+            "PROGRAM='e cat own.txt' sed -e \"$PROGRAM\" own.txt",
+        ],
+    )
+    def test_rejects_dynamic_sed_and_awk_programs(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        ("script_name", "script_template", "invocation"),
+        [
+            ("dynamic.sed", "w {path}", "sed -f dynamic.sed own.txt"),
+            (
+                "dynamic.awk",
+                '{{print $0 > "{path}"}}',
+                "awk -f dynamic.awk own.txt",
+            ),
+        ],
+    )
+    def test_rejects_scripts_created_earlier_in_the_same_chain(
+        self,
+        scoped_command_workspace,
+        script_name,
+        script_template,
+        invocation,
+    ):
+        # A script written earlier in the same command chain registers a
+        # write on its own path; M4's shared `_read_policy_script` then
+        # refuses to inspect it, exactly like `bash`'s own script reads.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        script = script_template.format(path=sibling_file)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate(
+                f"printf '%s\\n' {shlex.quote(script)} > {script_name} && {invocation}"
+            )
+
+    @pytest.mark.parametrize(
+        ("script_name", "safe_script", "unsafe_script", "invocation"),
+        [
+            (
+                "replace.sed",
+                "s/own/own/",
+                "w {path}",
+                "sed -f replace.sed own.txt",
+            ),
+            (
+                "replace.awk",
+                "{ print $0 }",
+                '{{print $0 > "{path}"}}',
+                "awk -f replace.awk own.txt",
+            ),
+        ],
+    )
+    def test_rejects_script_overwritten_before_inspection(
+        self,
+        scoped_command_workspace,
+        script_name,
+        safe_script,
+        unsafe_script,
+        invocation,
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        script_path = workspace.output_dir / script_name
+        script_path.write_text(safe_script, encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+        replacement = unsafe_script.format(path=sibling_file)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate(
+                f"printf '%s\\n' {shlex.quote(replacement)} > {script_name} "
+                f"&& {invocation}"
+            )
+
+        assert script_path.read_text(encoding="utf-8") == safe_script
+
+    def test_script_write_tracking_is_scoped_to_one_validation(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "safe.sed").write_text("s/own/safe/", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("printf replacement > safe.sed")
+        guard.validate("sed -f safe.sed own.txt")
+
+    def test_script_inspection_rejects_oversized_regular_file(
+        self, scoped_command_workspace
+    ):
+        # M4: routes through the shared `_read_policy_script`, whose byte
+        # budget (`_MAX_INSPECTED_SCRIPT_BYTES`) and `CommandPolicyViolation`
+        # (not `CommandPathViolation`, reserved for non-regular files) this
+        # test confirms sed/awk inherit rather than reimplement.
+        workspace, _, _ = scoped_command_workspace
+        limit = command_path_guard_module._MAX_INSPECTED_SCRIPT_BYTES
+        script_path = workspace.output_dir / "large.sed"
+        script_path.write_bytes(b"#" * (limit + 1))
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with command_path_guard_module._validation_session_scope():
+            with pytest.raises(
+                CommandPolicyViolation,
+                match=rf"shell policy script exceeds the {limit}-byte inspection limit",
+            ):
+                guard._inspect_script_file(
+                    "sed", str(script_path), workspace.output_dir
+                )

@@ -630,6 +630,27 @@ class _CommandWrapperGrammar:
 
 
 @dataclass(frozen=True)
+class _ScriptCommandGrammar:
+    """`sed`/`awk` argv shape: script source options plus file operands."""
+
+    language: Literal["sed", "awk"]
+    expression_long_option: str
+    value_options: frozenset[str] = frozenset()
+    ignores_assignment_arguments: bool = False
+    short_flag_options: frozenset[str] = frozenset()
+    short_value_options: frozenset[str] = frozenset()
+    in_place_short_option: str | None = None
+    in_place_long_option: str | None = None
+
+
+@dataclass(frozen=True)
+class _ScriptShortOptionResult:
+    next_index: int
+    explicit_script: bool = False
+    requests_in_place: bool = False
+
+
+@dataclass(frozen=True)
 class _BashInvocation:
     initialization_files: tuple[str, ...]
     command_text: str | None = None
@@ -734,6 +755,35 @@ _COMMAND_WRAPPER_GRAMMARS = {
     ),
 }
 
+# `-l`/`--line-length` (sed) and `-F`/`-v` (awk) take a scalar value that is
+# never a path, so they are skipped rather than routed through the file-
+# operand check. sed's short options additionally bundle (e.g. `-ne`,
+# `-i.bak`), which `awk` does not, so `short_flag_options` stays empty for awk
+# and its `-e`/`-f` are only ever standalone or attached without bundling.
+_SED_GRAMMAR = _ScriptCommandGrammar(
+    language="sed",
+    expression_long_option="--expression",
+    value_options=frozenset({"-l", "--line-length"}),
+    short_flag_options=frozenset({"E", "n", "r", "s", "u", "z"}),
+    short_value_options=frozenset({"l"}),
+    in_place_short_option="i",
+    in_place_long_option="--in-place",
+)
+_AWK_GRAMMAR = _ScriptCommandGrammar(
+    language="awk",
+    expression_long_option="--source",
+    value_options=frozenset({"-F", "-v"}),
+    ignores_assignment_arguments=True,
+)
+# `system(...)` always executes an arbitrary shell command; `print`/`printf`
+# redirection and `getline` I/O are located structurally instead (see
+# `_check_awk_program`), since their file targets must be classified as a
+# read or write path rather than a blanket rejection.
+_AWK_SYSTEM_CALL_PATTERN = re.compile(r"\bsystem\s*\(")
+_AWK_PRINT_PATTERN = re.compile(r"\b(?:print|printf)\b")
+_AWK_GETLINE_PATTERN = re.compile(r"\bgetline\b")
+_AWK_IDENTIFIER_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
 _CLASSIFIED_EXECUTABLE_COMMANDS = {
     *_READ_COMMANDS,
     *_WRITE_COMMANDS,
@@ -750,6 +800,8 @@ _CLASSIFIED_EXECUTABLE_COMMANDS = {
     "install",
     "mv",
     "ln",
+    "sed",
+    "awk",
     "unlink",
     "shred",
     "find",
@@ -1223,6 +1275,10 @@ class WorkspaceCommandPathGuard:
             self._check_find(args, state)
         elif command_name == "tar":
             self._check_tar(args, state.cwd)
+        elif command_name == "sed":
+            self._check_script_command(_SED_GRAMMAR, args, state.cwd)
+        elif command_name == "awk":
+            self._check_script_command(_AWK_GRAMMAR, args, state.cwd)
         elif command_name in _SHELL_COMMANDS:
             self._check_nested_shell(command_name, args, state)
         elif command_name in _UNSUPPORTED_SHELL_COMMANDS:
@@ -2746,6 +2802,570 @@ class WorkspaceCommandPathGuard:
             if descriptor is not None:
                 os.close(descriptor)
         return script
+
+    def _check_script_command(
+        self,
+        grammar: _ScriptCommandGrammar,
+        values: Sequence[str],
+        cwd: Path,
+    ) -> None:
+        """Classify `sed`/`awk`'s script source(s) and file operand access.
+
+        Every `-e`/`--expression` (sed) or `--source` (awk) argument and,
+        absent an explicit script, the leading positional program are
+        inspected through the family's command-slot lexer (`_check_sed_program`
+        / `_check_awk_program`). `-f`/`--file` script files route through
+        `_read_policy_script` (M4: the same `unknown_effect` gate, non-regular-
+        file rejection, and bounded read every other script read uses) before
+        the same lexer, rather than a parallel copy. sed's `-i`/`--in-place`
+        switches the remaining file operands from read to write.
+        """
+        positionals: list[str] = []
+        explicit_script = False
+        file_access: PathAccess = "read"
+        index = 0
+        while index < len(values):
+            value = values[index]
+            if value == "--":
+                positionals.extend(values[index + 1 :])
+                break
+            value_text = str(value)
+            if value_text in {"-f", "--file"}:
+                explicit_script = True
+                if index + 1 < len(values):
+                    self._inspect_script_file(grammar.language, values[index + 1], cwd)
+                index += 2
+                continue
+            if value_text.startswith("--file="):
+                explicit_script = True
+                self._inspect_script_file(
+                    grammar.language,
+                    self._derived_value(value, value_text[len("--file=") :]),
+                    cwd,
+                )
+                index += 1
+                continue
+            if value_text.startswith("-f") and not value_text.startswith("--f"):
+                explicit_script = True
+                self._inspect_script_file(
+                    grammar.language, self._derived_value(value, value_text[2:]), cwd
+                )
+                index += 1
+                continue
+            if value_text in {"-e", grammar.expression_long_option}:
+                explicit_script = True
+                if index + 1 < len(values):
+                    self._check_script_expression(
+                        grammar.language, values[index + 1], cwd
+                    )
+                index += 2
+                continue
+            if value_text.startswith(f"{grammar.expression_long_option}="):
+                explicit_script = True
+                self._check_script_expression(
+                    grammar.language,
+                    self._derived_value(
+                        value,
+                        value_text[len(grammar.expression_long_option) + 1 :],
+                    ),
+                    cwd,
+                )
+                index += 1
+                continue
+            if value_text.startswith("-e") and not value_text.startswith("--"):
+                explicit_script = True
+                self._check_script_expression(
+                    grammar.language, self._derived_value(value, value_text[2:]), cwd
+                )
+                index += 1
+                continue
+            if grammar.in_place_long_option is not None and (
+                value_text == grammar.in_place_long_option
+                or value_text.startswith(f"{grammar.in_place_long_option}=")
+            ):
+                file_access = "write"
+                index += 1
+                continue
+            if (
+                grammar.short_flag_options
+                and value_text.startswith("-")
+                and not value_text.startswith("--")
+                and value_text != "-"
+            ):
+                option_result = self._consume_script_short_options(
+                    grammar, values, index, cwd
+                )
+                explicit_script = explicit_script or option_result.explicit_script
+                if option_result.requests_in_place:
+                    file_access = "write"
+                index = option_result.next_index
+                continue
+            if value_text in grammar.value_options:
+                index += 2
+                continue
+            if value_text.startswith("-") and value_text != "-":
+                index += 1
+                continue
+            if not grammar.ignores_assignment_arguments or "=" not in value_text:
+                positionals.append(value)
+            index += 1
+
+        if not explicit_script and positionals:
+            self._check_script_expression(grammar.language, positionals[0], cwd)
+        file_operands = positionals if explicit_script else positionals[1:]
+        for raw_path in file_operands:
+            self._check_path(raw_path, cwd, file_access)
+
+    def _consume_script_short_options(
+        self,
+        grammar: _ScriptCommandGrammar,
+        values: Sequence[str],
+        index: int,
+        cwd: Path,
+    ) -> _ScriptShortOptionResult:
+        token = values[index]
+        if isinstance(token, _CommandValue) and not token.is_static:
+            raise CommandPolicyViolation(
+                f"cannot inspect dynamic {grammar.language} options"
+            )
+
+        cursor = 1
+        token_text = str(token)
+        while cursor < len(token_text):
+            option = token_text[cursor]
+            if option in grammar.short_flag_options:
+                cursor += 1
+                continue
+            if option == grammar.in_place_short_option:
+                # GNU sed treats the remainder of this token as the optional
+                # backup suffix, so no later character is another option.
+                return _ScriptShortOptionResult(
+                    next_index=index + 1,
+                    requests_in_place=True,
+                )
+            if option in {"e", "f"} or option in grammar.short_value_options:
+                attached_text = token_text[cursor + 1 :]
+                argument, next_index = self._take_option_argument(
+                    values,
+                    index,
+                    attached_argument=(
+                        self._derived_value(token, attached_text)
+                        if attached_text
+                        else None
+                    ),
+                    context=f"{grammar.language} argument for -{option}",
+                )
+                assert argument is not None
+
+                if option == "e":
+                    self._check_script_expression(grammar.language, argument, cwd)
+                elif option == "f":
+                    self._inspect_script_file(grammar.language, argument, cwd)
+                return _ScriptShortOptionResult(
+                    next_index=next_index,
+                    explicit_script=option in {"e", "f"},
+                )
+            raise CommandPolicyViolation(
+                f"cannot safely inspect {grammar.language} option -{option}"
+            )
+
+        return _ScriptShortOptionResult(next_index=index + 1)
+
+    def _inspect_script_file(
+        self,
+        language: Literal["sed", "awk"],
+        raw_path: str,
+        cwd: Path,
+    ) -> None:
+        script = self._read_policy_script(raw_path, cwd)
+        self._check_script_program(language, script, cwd)
+
+    def _check_script_expression(
+        self,
+        language: Literal["sed", "awk"],
+        script: str,
+        cwd: Path,
+    ) -> None:
+        """Classify an inline `-e`/positional sed|awk program (I8/I9/I13)."""
+        if isinstance(script, _CommandValue) and not script.is_static:
+            raise CommandPolicyViolation(f"cannot inspect dynamic {language} program")
+        self._check_script_program(language, str(script), cwd)
+
+    def _check_script_program(
+        self,
+        language: Literal["sed", "awk"],
+        script: str,
+        cwd: Path,
+    ) -> None:
+        if language == "awk":
+            self._check_awk_program(script, cwd)
+        else:
+            self._check_sed_program(script, cwd)
+
+    def _check_sed_program(self, script: str, cwd: Path) -> None:
+        """Walk a sed program one command slot at a time (I8).
+
+        Traverses blocks (`{`/`}`), addresses/ranges, and repeated `!`
+        negation before classifying the command letter; braces/delimiters
+        inside patterns, replacements, addresses, `y///` transliterations,
+        `#` comments, and `a`/`i`/`c` text payloads are DATA and are never
+        re-entered as structure. `r`/`R` read a filename that runs to the end
+        of the line (read); `w`/`W` and the `s///w` flag write one (write);
+        `e` (bare, or `s///e`) executes an arbitrary shell command and always
+        fails closed, since its argument cannot be inspected safely.
+        """
+        index = 0
+        while index < len(script):
+            while index < len(script) and script[index] in " \t;\n}":
+                index += 1
+            if index >= len(script):
+                break
+
+            index = self._skip_sed_addresses(script, index)
+            while index < len(script) and script[index] in " \t":
+                index += 1
+            # BSD sed accepts repeated negation operators, so command
+            # discovery must consume the complete prefix before classifying.
+            while index < len(script) and script[index] == "!":
+                index += 1
+                while index < len(script) and script[index] in " \t":
+                    index += 1
+            if index >= len(script):
+                raise CommandPolicyViolation("cannot safely inspect sed program")
+
+            command = script[index]
+            index += 1
+            if command in "rR":
+                index, raw_path = self._scan_sed_filename(script, index)
+                self._check_path(raw_path, cwd, "read")
+                continue
+            if command in "wW":
+                index, raw_path = self._scan_sed_filename(script, index)
+                self._check_path(raw_path, cwd, "write")
+                continue
+            if command == "e":
+                raise CommandPolicyViolation(
+                    "sed 'e' command executes an arbitrary shell command and "
+                    "cannot be inspected safely"
+                )
+            if command == "{":
+                continue
+            if command == "#":
+                index = self._skip_sed_to_boundary(script, index, boundaries="\n")
+                continue
+            if command == "s":
+                index = self._scan_sed_substitution(script, index, cwd)
+                continue
+            if command == "y":
+                index = self._scan_sed_transliteration(script, index)
+                continue
+            if command in "aic":
+                index = self._skip_sed_to_boundary(script, index, boundaries="\n")
+                continue
+            if command in "bTt:":
+                index = self._skip_sed_to_boundary(script, index, boundaries=";\n")
+                continue
+            index = self._skip_sed_to_boundary(script, index, boundaries=";\n}")
+
+    @staticmethod
+    def _skip_sed_addresses(script: str, index: int) -> int:
+        first_end = WorkspaceCommandPathGuard._skip_sed_address(
+            script, index, allow_relative=False
+        )
+        if first_end is None:
+            return index
+
+        cursor = first_end
+        while cursor < len(script) and script[cursor] in " \t":
+            cursor += 1
+        if cursor >= len(script) or script[cursor] != ",":
+            return cursor
+
+        cursor += 1
+        while cursor < len(script) and script[cursor] in " \t":
+            cursor += 1
+        second_end = WorkspaceCommandPathGuard._skip_sed_address(
+            script, cursor, allow_relative=True
+        )
+        if second_end is None:
+            raise CommandPolicyViolation("cannot safely inspect sed address range")
+        return second_end
+
+    @staticmethod
+    def _skip_sed_address(
+        script: str,
+        index: int,
+        *,
+        allow_relative: bool,
+    ) -> int | None:
+        if index >= len(script):
+            return None
+        character = script[index]
+        if character.isdigit():
+            cursor = index + 1
+            while cursor < len(script) and script[cursor].isdigit():
+                cursor += 1
+            if cursor < len(script) and script[cursor] == "~":
+                cursor += 1
+                step_start = cursor
+                while cursor < len(script) and script[cursor].isdigit():
+                    cursor += 1
+                if cursor == step_start:
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect sed step address"
+                    )
+            return cursor
+        if character == "$":
+            return index + 1
+        if character == "/":
+            return WorkspaceCommandPathGuard._scan_sed_delimited(
+                script, delimiter_index=index
+            )
+        if character == "\\" and index + 1 < len(script):
+            return WorkspaceCommandPathGuard._scan_sed_delimited(
+                script, delimiter_index=index + 1
+            )
+        if allow_relative and character in {"+", "~"}:
+            cursor = index + 1
+            number_start = cursor
+            while cursor < len(script) and script[cursor].isdigit():
+                cursor += 1
+            if cursor == number_start:
+                raise CommandPolicyViolation(
+                    "cannot safely inspect sed relative address"
+                )
+            return cursor
+        return None
+
+    @staticmethod
+    def _scan_sed_delimited(
+        script: str,
+        *,
+        delimiter_index: int,
+    ) -> int:
+        delimiter = script[delimiter_index]
+        if delimiter == "\n":
+            raise CommandPolicyViolation("cannot safely inspect sed delimiter")
+        cursor = delimiter_index + 1
+        escaped = False
+        while cursor < len(script):
+            character = script[cursor]
+            cursor += 1
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == delimiter:
+                return cursor
+            elif character == "\n":
+                raise CommandPolicyViolation("cannot safely inspect sed expression")
+        raise CommandPolicyViolation(
+            "cannot safely inspect unterminated sed expression"
+        )
+
+    def _scan_sed_substitution(self, script: str, index: int, cwd: Path) -> int:
+        if index >= len(script):
+            raise CommandPolicyViolation("cannot safely inspect sed substitution")
+        delimiter = script[index]
+        if delimiter.isalnum() or delimiter.isspace() or delimiter == "\\":
+            raise CommandPolicyViolation("cannot safely inspect sed substitution")
+
+        cursor = self._scan_sed_fields(script, index, field_count=2)
+
+        while cursor < len(script) and script[cursor] not in ";\n}":
+            if script[cursor] == "e":
+                raise CommandPolicyViolation(
+                    "sed 's///e' executes an arbitrary shell command and "
+                    "cannot be inspected safely"
+                )
+            if script[cursor] == "w":
+                cursor, raw_path = self._scan_sed_filename(script, cursor + 1)
+                self._check_path(raw_path, cwd, "write")
+                return cursor
+            cursor += 1
+        return cursor
+
+    @staticmethod
+    def _scan_sed_transliteration(script: str, index: int) -> int:
+        if index >= len(script):
+            raise CommandPolicyViolation("cannot safely inspect sed transliteration")
+        delimiter = script[index]
+        if delimiter.isalnum() or delimiter.isspace() or delimiter == "\\":
+            raise CommandPolicyViolation("cannot safely inspect sed transliteration")
+
+        cursor = WorkspaceCommandPathGuard._scan_sed_fields(
+            script,
+            index,
+            field_count=2,
+        )
+        return WorkspaceCommandPathGuard._skip_sed_to_boundary(
+            script, cursor, boundaries=";\n}"
+        )
+
+    @staticmethod
+    def _scan_sed_fields(
+        script: str,
+        delimiter_index: int,
+        *,
+        field_count: int,
+    ) -> int:
+        cursor = delimiter_index
+        for _ in range(field_count):
+            cursor = WorkspaceCommandPathGuard._scan_sed_delimited(
+                script,
+                delimiter_index=cursor,
+            )
+            # The next field reuses the delimiter that closed this one.
+            cursor -= 1
+        return cursor + 1
+
+    @staticmethod
+    def _skip_sed_to_boundary(script: str, index: int, *, boundaries: str) -> int:
+        escaped = False
+        while index < len(script):
+            character = script[index]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character in boundaries:
+                return index
+            index += 1
+        return index
+
+    @staticmethod
+    def _scan_sed_filename(script: str, index: int) -> tuple[int, str]:
+        """Read a `r`/`R`/`w`/`W` command's filename argument (I8).
+
+        Sed's file-command filename is the remainder of the script line
+        verbatim after any leading whitespace (an embedded `;` is part of
+        the filename, not a command separator), so it runs to the next
+        newline or the end of the script, never to `;`/`}`.
+        """
+        cursor = index
+        while cursor < len(script) and script[cursor] in " \t":
+            cursor += 1
+        start = cursor
+        end = WorkspaceCommandPathGuard._skip_sed_to_boundary(
+            script, cursor, boundaries="\n"
+        )
+        filename = script[start:end]
+        if not filename:
+            raise CommandPolicyViolation("missing sed file command filename")
+        return end, filename
+
+    def _check_awk_program(self, script: str, cwd: Path) -> None:
+        """Classify awk's unsafe I/O forms (I9).
+
+        `system(...)` always executes an arbitrary shell command and fails
+        closed unconditionally. `print`/`printf` redirection (`>`, `>>`) and
+        `getline < FILE` are located structurally and path-checked instead;
+        a redirect target that is not a double-quoted string literal cannot
+        be resolved statically (e.g. a field/variable like `$1`) and is
+        rejected rather than silently skipped. Piping to or from a command
+        (`| "cmd"`, `"cmd" | getline`) always executes an arbitrary shell
+        command and fails closed unconditionally.
+        """
+        if _AWK_SYSTEM_CALL_PATTERN.search(script):
+            raise CommandPolicyViolation(
+                "awk 'system' call executes an arbitrary shell command and "
+                "cannot be inspected safely"
+            )
+        for match in _AWK_PRINT_PATTERN.finditer(script):
+            self._scan_awk_print_redirect(script, match.end(), cwd)
+        self._scan_awk_getline_io(script, cwd)
+
+    def _scan_awk_print_redirect(self, script: str, start: int, cwd: Path) -> None:
+        index = start
+        depth = 0
+        quote: str | None = None
+        escaped = False
+        while index < len(script):
+            char = script[index]
+            if quote is not None:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == quote:
+                    quote = None
+                index += 1
+                continue
+            if char in {"'", '"'}:
+                quote = char
+                index += 1
+                continue
+            if char == "(":
+                depth += 1
+                index += 1
+                continue
+            if char == ")" and depth:
+                depth -= 1
+                index += 1
+                continue
+            if char in ";\n}" and depth == 0:
+                return
+            if char == "|" and depth == 0:
+                raise CommandPolicyViolation(
+                    "awk pipe output executes an arbitrary shell command and "
+                    "cannot be inspected safely"
+                )
+            if char == ">" and depth == 0:
+                index += 1
+                if index < len(script) and script[index] == ">":
+                    index += 1
+                target = self._scan_awk_redirect_target(script, index)
+                self._check_path(target, cwd, "write")
+                return
+            index += 1
+
+    def _scan_awk_getline_io(self, script: str, cwd: Path) -> None:
+        for match in _AWK_GETLINE_PATTERN.finditer(script):
+            prefix = script[: match.start()].rstrip()
+            if prefix.endswith("|"):
+                raise CommandPolicyViolation(
+                    "awk pipe input to 'getline' executes an arbitrary shell "
+                    "command and cannot be inspected safely"
+                )
+            cursor = match.end()
+            while cursor < len(script) and script[cursor] in " \t":
+                cursor += 1
+            identifier = _AWK_IDENTIFIER_PATTERN.match(script, cursor)
+            if identifier is not None:
+                cursor = identifier.end()
+                while cursor < len(script) and script[cursor] in " \t":
+                    cursor += 1
+            if cursor < len(script) and script[cursor] == "<":
+                target = self._scan_awk_redirect_target(script, cursor + 1)
+                self._check_path(target, cwd, "read")
+
+    @staticmethod
+    def _scan_awk_redirect_target(script: str, index: int) -> str:
+        """Read a quoted-string-literal redirect target (I9/I13).
+
+        Only a double-quoted string literal can be resolved to a concrete
+        path statically; any other form (a bareword, a field reference like
+        `$1`, a variable, a parenthesized expression) is dynamic from this
+        lexer's point of view and is rejected rather than silently skipped.
+        """
+        cursor = index
+        while cursor < len(script) and script[cursor] in " \t":
+            cursor += 1
+        if cursor >= len(script) or script[cursor] != '"':
+            raise CommandPolicyViolation("cannot resolve dynamic awk redirect target")
+        start = cursor + 1
+        cursor = start
+        escaped = False
+        while cursor < len(script):
+            character = script[cursor]
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                return script[start:cursor]
+            cursor += 1
+        raise CommandPolicyViolation("cannot safely inspect awk redirect target")
 
     def _inspect_shell_script(
         self,
