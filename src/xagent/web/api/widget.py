@@ -27,6 +27,10 @@ from ..models.user import User
 from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
+from ..services.share_rate_limit import (
+    get_share_rate_limiter,
+    remote_ip_from_request,
+)
 from ..services.widget_domains import (
     origin_to_domain,
     require_domain_allowed,
@@ -419,6 +423,7 @@ get_current_widget_user_dep = build_public_chat_dependency("widget")
 
 @widget_router.post("/files/upload")
 async def upload_widget_file(
+    request: Request,
     file: UploadFile | None = File(None),
     files: list[UploadFile] | None = File(None),
     task_type: str = Form(...),
@@ -428,6 +433,20 @@ async def upload_widget_file(
     widget_info: PublicChatAccessContext = Depends(get_current_widget_user_dep),
     db: Session = Depends(get_db),
 ) -> Any:
+    # Abuse control (#973): mirror of the share upload throttle. Keyed on the
+    # widget entity + caller IP, NOT the widget guest_id — unlike share, the
+    # widget guest_id is client-supplied, so a guest-keyed bucket is
+    # rotatable at will. Matters most for the task-less workforce branch,
+    # where each admitted request can mint orphan rows until GC catches up.
+    entity_key = (
+        f"workforce:{widget_info.widget_workforce_id}"
+        if widget_info.widget_workforce_id is not None
+        else f"agent:{widget_info.widget_agent_id}"
+    )
+    if not get_share_rate_limiter().allow_widget_upload(
+        entity_key, remote_ip_from_request(request)
+    ):
+        raise HTTPException(status_code=429, detail="Too many requests")
     return await upload_public_chat_files(
         file=file,
         files=files,
