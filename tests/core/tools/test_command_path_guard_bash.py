@@ -2900,14 +2900,15 @@ class TestCopyInstallMoveLinkDestructive:
         with pytest.raises(CommandPolicyViolation, match="symbolic links"):
             guard.validate(command)
 
-    def test_cp_target_directory_with_recursive_still_rejects_out_of_workspace(
+    def test_cp_target_directory_bundled_behind_recursive_is_write_checked(
         self, scoped_command_workspace
     ):
-        # Pin: `cp -rt <out> own.txt` already rejects today. `-t` bundled
-        # behind `-r` (`-rt`) is not recognized as `--target-directory` (only
-        # a standalone or `-t`-leading token is), so `<out>` instead falls
-        # through as an ordinary source operand and is read-checked; this
-        # must stay a rejection, not be "fixed" into a silent ALLOW.
+        # `-t` bundled behind `-r` (`-rt`) must be recognized as
+        # `--target-directory` through the same bundled-cluster contract
+        # every other family uses, so the directory argument is
+        # write-checked as the actual destination — not misread as an
+        # ordinary source operand and merely read-checked (an inverted,
+        # under-strict classification of the real write target).
         workspace, _, sibling_file = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
         guard = WorkspaceCommandPathGuard(workspace)
@@ -2915,7 +2916,65 @@ class TestCopyInstallMoveLinkDestructive:
         with pytest.raises(CommandPathViolation) as exc_info:
             guard.validate(f"cp -rt {shlex.quote(str(sibling_file))} own.txt")
 
-        assert exc_info.value.access == "read"
+        assert exc_info.value.access == "write"
+
+    def test_cp_target_directory_bundled_behind_recursive_workspace_path_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "out").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("cp -rt out own.txt")
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "cp own.txt --targ={path}",
+            "mv own.txt --targ={path}",
+            "ln own.txt --targ={path}",
+        ],
+    )
+    def test_target_directory_long_option_abbreviation_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        # `--targ=` is the GNU unambiguous-prefix abbreviation of
+        # `--target-directory`.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        ["cp own.txt --targ=out", "mv own.txt --targ=out", "ln own.txt --targ=out"],
+    )
+    def test_target_directory_long_option_abbreviation_workspace_path_is_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "out").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_mv_target_directory_bundled_behind_verbose_is_write_checked(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"mv -vt {shlex.quote(str(sibling_file))} own.txt")
+
+        assert exc_info.value.access == "write"
 
     def test_shred_scalar_options_are_not_treated_as_paths(
         self, scoped_command_workspace

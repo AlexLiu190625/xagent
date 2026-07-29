@@ -1005,6 +1005,55 @@ _WGET_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
     "o": "write",
 }
 
+# `cp`/`mv`/`ln` share `_parse_target_directory`'s `-t`/`--target-directory`
+# extraction. Short options bundle into one token (e.g. `-rt` combines the
+# `-r` flag with the `-t` write-path option), so the grammar is split into a
+# flag set and a value set for the short-option-cluster parser, the union of
+# the three commands' real GNU short options (over-permissive for any one of
+# them is safe here: none of these carry a path this parser would otherwise
+# miss). `-S`'s value is a scalar backup suffix, never a path.
+_TARGET_DIR_SHORT_FLAG_OPTIONS = frozenset("abdfFHilLnPprRsuvxZ")
+_TARGET_DIR_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
+    "t": "write",
+    "S": None,
+}
+_TARGET_DIR_LONG_FLAG_OPTIONS = frozenset(
+    {
+        "--archive",
+        "--attributes-only",
+        "--backup",
+        "--copy-contents",
+        "--dereference",
+        "--follow-command-line-symlink",
+        "--force",
+        "--help",
+        "--interactive",
+        "--link",
+        "--logical",
+        "--no-clobber",
+        "--no-dereference",
+        "--no-target-directory",
+        "--one-file-system",
+        "--parents",
+        "--physical",
+        "--preserve",
+        "--recursive",
+        "--relative",
+        "--remove-destination",
+        "--strip-trailing-slashes",
+        "--symbolic-link",
+        "--update",
+        "--verbose",
+        "--version",
+    }
+)
+_TARGET_DIR_LONG_SCALAR_OPTIONS = frozenset({"--suffix", "--sparse", "--context"})
+_TARGET_DIR_KNOWN_LONG_OPTIONS = frozenset(
+    {"--target-directory"}
+    | _TARGET_DIR_LONG_FLAG_OPTIONS
+    | _TARGET_DIR_LONG_SCALAR_OPTIONS
+)
+
 
 @dataclass(frozen=True)
 class _PathEvent:
@@ -2096,14 +2145,27 @@ class WorkspaceCommandPathGuard:
     def _parse_target_directory(
         self,
         values: Sequence[str],
-    ) -> tuple[str | None, list[str]]:
+        cwd: Path,
+    ) -> tuple[bool, list[str]]:
         """Split a `-t`/`--target-directory VALUE` destination from operands.
 
         Shared by `cp` and `mv`/`ln`: when present, every remaining operand is
         a source and the target directory is the sole write destination;
         otherwise the caller treats the last operand as the destination.
+        `-t`/`--target-directory` resolve through the same bundled-cluster
+        (`_parse_short_option_cluster`) and GNU-abbreviation
+        (`_resolve_long_option`) substrates every other family uses, so a
+        bundled form (`-rt`, `-vt`) or an abbreviated long form (`--targ=`)
+        is classified identically to the standalone/full-name form instead
+        of falling through as an ordinary operand — for `cp` that would
+        misclassify the real write destination as an under-strict
+        read-checked source. The target directory is write-checked here
+        (every caller treats it as the write destination), so the return
+        value is only whether one was found, not the raw string. `cp`/`mv`/
+        `ln` own a write slot, so an option this parser cannot resolve fails
+        closed.
         """
-        target_dir: str | None = None
+        found_target_dir = False
         operands: list[str] = []
         options_done = False
         index = 0
@@ -2114,26 +2176,54 @@ class WorkspaceCommandPathGuard:
                 options_done = True
                 index += 1
                 continue
-            if not options_done and text in {"-t", "--target-directory"}:
-                if index + 1 >= len(values):
-                    raise CommandPolicyViolation(f"missing argument for {text}")
-                target_dir = values[index + 1]
-                index += 2
-                continue
-            if not options_done and text.startswith("--target-directory="):
-                target_dir = self._derived_value(value, text.split("=", 1)[1])
+            if options_done or not text.startswith("-") or text == "-":
+                operands.append(value)
                 index += 1
                 continue
-            if not options_done and text.startswith("-t") and len(text) > 2:
-                target_dir = self._derived_value(value, text[2:])
-                index += 1
-                continue
-            if not options_done and text.startswith("-") and text != "-":
-                index += 1
-                continue
-            operands.append(value)
-            index += 1
-        return target_dir, operands
+            if text.startswith("--"):
+                raw_option, separator, attached = text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _TARGET_DIR_KNOWN_LONG_OPTIONS
+                )
+                if resolved == "--target-directory":
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"argument for {resolved}",
+                    )
+                    assert argument is not None
+                    self._check_path(argument, cwd, "write")
+                    found_target_dir = True
+                    continue
+                if resolved in _TARGET_DIR_LONG_SCALAR_OPTIONS:
+                    _, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"argument for {resolved}",
+                    )
+                    continue
+                if resolved in _TARGET_DIR_LONG_FLAG_OPTIONS:
+                    index += 1
+                    continue
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect option {raw_option}"
+                )
+            index, matched_option, _ = self._parse_short_option_cluster(
+                values,
+                index,
+                cwd,
+                flag_options=_TARGET_DIR_SHORT_FLAG_OPTIONS,
+                value_options=_TARGET_DIR_SHORT_VALUE_OPTIONS,
+            )
+            if matched_option == "t":
+                found_target_dir = True
+        return found_target_dir, operands
 
     def _check_copy(self, values: Sequence[str], cwd: Path) -> None:
         """`cp`: sources read, destination (or `-t` target directory) write.
@@ -2163,11 +2253,10 @@ class WorkspaceCommandPathGuard:
                 "cannot safely inspect recursive copying that follows symbolic links"
             )
 
-        target_dir, operands = self._parse_target_directory(values)
-        if target_dir is not None:
+        found_target_dir, operands = self._parse_target_directory(values, cwd)
+        if found_target_dir:
             for raw_path in operands:
                 self._check_path(raw_path, cwd, "read")
-            self._check_path(target_dir, cwd, "write")
             return
         if len(operands) < 2:
             return
@@ -2310,13 +2399,12 @@ class WorkspaceCommandPathGuard:
         A hard link inside the workspace aliases its source inode; later path
         resolution sees only the workspace-side alias, so an external
         read-only source must be write-checked here rather than read-checked,
-        or it would stay silently mutable through the link.
+        or it would stay silently mutable through the link. `_parse_target_directory`
+        already write-checks a `-t`/`--target-directory` destination inline.
         """
-        target_dir, operands = self._parse_target_directory(values)
+        _, operands = self._parse_target_directory(values, cwd)
         for raw_path in operands:
             self._check_path(raw_path, cwd, "write")
-        if target_dir is not None:
-            self._check_path(target_dir, cwd, "write")
 
     def _check_destructive_file_command(
         self,
