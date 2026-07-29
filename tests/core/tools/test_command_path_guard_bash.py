@@ -5141,6 +5141,84 @@ class TestDdBase64GzipRemoteTransferCommand:
                 "https://example.invalid/file"
             )
 
+    def test_wget_save_cookies_write_checked_when_output_is_given(
+        self, scoped_command_workspace
+    ):
+        # With an explicit `-O` the "no output filename" fail-closed reason
+        # above no longer applies; `--save-cookies` must be write-checked
+        # in its own right rather than silently falling through as an
+        # unmodeled option.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"wget -O keep --save-cookies {shlex.quote(str(sibling_file))} "
+                "https://example.invalid/file"
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_wget_save_cookies_workspace_path_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            "wget -O keep --save-cookies cookies.txt https://example.invalid/file"
+        )
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "wget --output-docu={path} https://example.invalid/file",
+            "wget --directory-p={path} https://example.invalid/file",
+            "wget -O keep --output-fi={path} https://example.invalid/file",
+        ],
+    )
+    def test_wget_long_option_abbreviation_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    def test_wget_bundled_output_option_rejects_out_of_workspace(
+        self, scoped_command_workspace
+    ):
+        # `-qO` (quiet + output-document) is a common wget idiom; `-O`'s
+        # write-path argument must still be recognized (and write-checked)
+        # when it is not the leading character of a bundled short-option
+        # cluster.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"wget -qO {outside} https://example.invalid/file")
+
+        assert exc_info.value.access == "write"
+
+    def test_wget_bundled_output_option_workspace_path_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("wget -qO out.txt https://example.invalid/file")
+
+    def test_wget_bundled_input_file_flag_fails_closed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("wget -qi urls.txt")
+
     # -- path-classification bypass regressions -------------------------
 
     @pytest.mark.parametrize(

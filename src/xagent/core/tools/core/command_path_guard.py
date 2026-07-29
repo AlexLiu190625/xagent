@@ -998,6 +998,12 @@ _WGET_KNOWN_LONG_OPTIONS = frozenset(
     | _WGET_READ_LONG_OPTIONS
     | {"--spider"}
 )
+_WGET_SHORT_FLAG_OPTIONS = frozenset("bqvcNSdF")
+_WGET_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
+    "O": "write",
+    "P": "write",
+    "o": "write",
+}
 
 
 @dataclass(frozen=True)
@@ -4349,13 +4355,20 @@ class WorkspaceCommandPathGuard:
     def _check_wget(self, values: Sequence[str], cwd: Path) -> None:
         """`wget`: `-O`/`--output-document` write; `-P`/`--directory-prefix`
         write directory; `-o`/`--output-file` (log file) write;
-        `--post-file`/`--body-file` read. `--config` and `-i`/`--input-file`
-        (a runtime URL list) cannot be inspected safely and fail closed. A
-        URL operand with no explicit `-O` output (and not `--spider`, which
-        fetches nothing to disk) resolves its output filename from the
-        remote response, which is not statically knowable, so that
-        combination fails closed too. An unrecognized long option with an
-        attached `=value` also fails closed (mirroring `rsync`/`curl`).
+        `--save-cookies` write; `--post-file`/`--body-file` read. `--config`
+        and `-i`/`--input-file` (a runtime URL list) cannot be inspected
+        safely and fail closed, including bundled behind another short flag
+        (e.g. `-qi`). A URL operand with no explicit `-O` output (and not
+        `--spider`, which fetches nothing to disk) resolves its output
+        filename from the remote response, which is not statically
+        knowable, so that combination fails closed too. Long options resolve
+        through `_resolve_long_option` (GNU unambiguous-prefix abbreviation,
+        e.g. `--output-docu=` for `--output-document`); an unrecognized long
+        option with an attached `=value` also fails closed (mirroring
+        `rsync`/`curl`). Short options bundle through the same
+        `_parse_short_option_cluster` substrate `curl`/`sort`/`grep`/
+        `install` use, so `-O`/`-P`/`-o` still consume their argument even
+        when not the leading character of the cluster (e.g. `-qO`).
         """
         self._reject_dynamic_values("wget arguments", values)
         has_explicit_output = False
@@ -4365,87 +4378,74 @@ class WorkspaceCommandPathGuard:
         while index < len(values):
             value = values[index]
             text = str(value)
-            if text == "--config" or text.startswith("--config="):
-                raise CommandPolicyViolation(
-                    "cannot safely inspect wget runtime configuration"
+            if text.startswith("--"):
+                raw_option, separator, attached_text = text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _WGET_KNOWN_LONG_OPTIONS
                 )
-            if text in {"-i", "--input-file"} or text.startswith(
-                ("-i", "--input-file=")
-            ):
-                raise CommandPolicyViolation(
-                    "cannot safely inspect wget runtime URL list"
-                )
-            if text == "--spider":
-                spider_mode = True
-                index += 1
-                continue
-            if text in {"-O", "--output-document", "-P", "--directory-prefix"} or (
-                text.startswith("--output-document=")
-                or text.startswith("--directory-prefix=")
-            ):
-                option, separator, attached_text = text.partition("=")
-                argument, index = self._take_option_argument(
-                    values,
-                    index,
-                    attached_argument=(
-                        self._derived_value(value, attached_text) if separator else None
-                    ),
-                    context=f"wget argument for {option}",
-                )
-                assert argument is not None
-                self._check_path(argument, cwd, "write")
-                if text in {"-O", "--output-document"} or text.startswith(
-                    "--output-document="
+                if resolved in _WGET_CONFIG_LONG_OPTIONS:
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect wget runtime configuration"
+                    )
+                if resolved in _WGET_HARD_DENY_LONG_OPTIONS:
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect wget runtime URL list"
+                    )
+                if resolved == "--spider":
+                    spider_mode = True
+                    index += 1
+                    continue
+                if resolved in _WGET_WRITE_LONG_OPTIONS or (
+                    resolved in _WGET_READ_LONG_OPTIONS
                 ):
-                    has_explicit_output = True
-                continue
-            if (text.startswith("-O") or text.startswith("-P")) and len(text) > 2:
-                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
-                if text.startswith("-O"):
-                    has_explicit_output = True
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached_text)
+                            if separator
+                            else None
+                        ),
+                        context=f"wget argument for {resolved}",
+                    )
+                    assert argument is not None
+                    access: PathAccess = (
+                        "write" if resolved in _WGET_WRITE_LONG_OPTIONS else "read"
+                    )
+                    self._check_path(argument, cwd, access)
+                    if resolved == "--output-document":
+                        has_explicit_output = True
+                    continue
+                if separator:
+                    raise CommandPolicyViolation(
+                        f"cannot safely inspect wget option {raw_option}"
+                    )
                 index += 1
                 continue
-            if text in {"--post-file", "--body-file"} or text.startswith(
-                ("--post-file=", "--body-file=")
-            ):
-                option, separator, attached_text = text.partition("=")
-                argument, index = self._take_option_argument(
+            if text.startswith("-") and text != "-":
+                # `-i` fails closed even bundled behind another flag (e.g.
+                # `-qi`); scanning stops at the first character that is not
+                # a known no-value flag, since anything past a value-taking
+                # option is that option's value, not another flag letter.
+                for character in text[1:]:
+                    if character in _WGET_SHORT_FLAG_OPTIONS:
+                        continue
+                    if character == "i":
+                        raise CommandPolicyViolation(
+                            "cannot safely inspect wget runtime URL list"
+                        )
+                    break
+                index, matched_option, _ = self._parse_short_option_cluster(
                     values,
                     index,
-                    attached_argument=(
-                        self._derived_value(value, attached_text) if separator else None
-                    ),
-                    context=f"wget argument for {option}",
+                    cwd,
+                    flag_options=_WGET_SHORT_FLAG_OPTIONS,
+                    value_options=_WGET_SHORT_VALUE_OPTIONS,
                 )
-                assert argument is not None
-                self._check_path(argument, cwd, "read")
+                if matched_option == "O":
+                    has_explicit_output = True
                 continue
-            if text in {"-o", "--output-file"} or text.startswith("--output-file="):
-                option, separator, attached_text = text.partition("=")
-                argument, index = self._take_option_argument(
-                    values,
-                    index,
-                    attached_argument=(
-                        self._derived_value(value, attached_text) if separator else None
-                    ),
-                    context=f"wget argument for {option}",
-                )
-                assert argument is not None
-                self._check_path(argument, cwd, "write")
-                continue
-            if text.startswith("-o") and not text.startswith("--") and len(text) > 2:
-                self._check_path(self._derived_value(value, text[2:]), cwd, "write")
-                index += 1
-                continue
-            if not text.startswith("-"):
-                has_url_operand = True
-                index += 1
-                continue
-            option, separator, _ = text.partition("=")
-            if text.startswith("--") and separator:
-                raise CommandPolicyViolation(
-                    f"cannot safely inspect wget option {option}"
-                )
+            has_url_operand = True
             index += 1
         if has_url_operand and not has_explicit_output and not spider_mode:
             raise CommandPolicyViolation(
