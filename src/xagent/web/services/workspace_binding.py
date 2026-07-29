@@ -187,6 +187,19 @@ def canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str
     )
 
 
+def pre_canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str:
+    """The spelling :func:`canonical_workspace_base` replaced. Deletion only.
+
+    Workspaces created while each producer normalized on its own live at the
+    raw spelling, which a symlinked uploads dir makes a different directory
+    from the canonical one. Cleanup has to look in both places, so this
+    reproduces the old spelling exactly. Nothing else may use it: a *new*
+    workspace or mount path in this spelling is the divergence
+    :func:`canonical_workspace_base` exists to prevent.
+    """
+    return str(scoped_user_root(get_uploads_dir(), owner_id, tuple(segments)))
+
+
 def _lexical_relation(root: str, path: str) -> str:
     """``SandboxMountIntent``'s verdict for one path against one root."""
     probe = SandboxMountIntent(mount_root=root, extra_mounts=(path,))

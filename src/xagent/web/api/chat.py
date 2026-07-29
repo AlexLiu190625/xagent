@@ -114,6 +114,7 @@ from ..services.workforce_runtime import (
 from ..services.workspace_binding import (
     build_chat_workspace_binding,
     canonical_workspace_base,
+    pre_canonical_workspace_base,
 )
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -3071,10 +3072,16 @@ class AgentServiceManager:
         """Clean up workspace directory for a task when agent is not in memory"""
         from ...core.workspace import TaskWorkspace
 
-        # Try the scoped workspace first (when a resolver maps this task to
-        # a scope), then the user-isolated workspace, then the legacy
-        # uploads-root fallback.
-        workspace_ids = []
+        workspace_id = f"web_task_{task_id}"
+
+        # Scoped workspace first (when a resolver maps this task to a scope),
+        # then the user-isolated one, then the legacy uploads-root fallback.
+        # Each is tried in the current spelling and in the pre-migration one:
+        # a workspace created while producers normalized independently lives
+        # at the raw path, which a symlinked uploads dir makes a different
+        # directory, and deleting a task's files must not depend on which
+        # spelling was in force when they were written.
+        base_dirs: list[str] = []
         if user_id:
             # Contextvar-first for the same reason as get_agent_for_task:
             # cleanup inside an activated turn reuses the turn's resolution.
@@ -3082,20 +3089,17 @@ class AgentServiceManager:
             if scope is None:
                 scope = resolve_execution_scope(task_id)
             segments = scope.workspace_segments if scope is not None else ()
-            if segments:
-                workspace_ids.append(
-                    (
-                        f"web_task_{task_id}",
-                        canonical_workspace_base(user_id, segments),
-                    )
-                )
-            workspace_ids.append(
-                (
-                    f"web_task_{task_id}",
-                    canonical_workspace_base(user_id),
-                )
-            )
-        workspace_ids.append((f"web_task_{task_id}", str(get_uploads_dir())))
+            for base_dir in (
+                canonical_workspace_base(user_id, segments),
+                canonical_workspace_base(user_id),
+                pre_canonical_workspace_base(user_id, segments),
+                pre_canonical_workspace_base(user_id),
+            ):
+                if base_dir not in base_dirs:
+                    base_dirs.append(base_dir)
+        legacy_root = str(get_uploads_dir())
+        if legacy_root not in base_dirs:
+            base_dirs.append(legacy_root)
 
         # Build allowed external directories (user's upload directory for knowledge base files).
         # Use only_existing=True here because cleanup runs against on-disk state.
@@ -3103,21 +3107,26 @@ class AgentServiceManager:
             user_id, only_existing=True
         )
 
-        for workspace_id, base_dir in workspace_ids:
+        for base_dir in base_dirs:
+            # Probed before constructing: TaskWorkspace's constructor creates
+            # the workspace tree, so building one per candidate would make
+            # every probe succeed and delete a directory it had just created,
+            # leaving the task's real workspace untouched.
+            if not (Path(base_dir) / workspace_id).exists():
+                continue
+
             workspace = TaskWorkspace(
                 workspace_id, base_dir, allowed_external_dirs=allowed_external_dirs
             )
             workspace_path = str(workspace.workspace_dir)
-
-            if workspace.workspace_dir.exists():
-                logger.info(
-                    f"Found existing workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-                )
-                workspace.cleanup()
-                logger.info(
-                    f"Cleaned up workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-                )
-                break
+            logger.info(
+                f"Found existing workspace directory for task {task_id} (user {user_id}): {workspace_path}"
+            )
+            workspace.cleanup()
+            logger.info(
+                f"Cleaned up workspace directory for task {task_id} (user {user_id}): {workspace_path}"
+            )
+            break
         else:
             logger.info(
                 f"No workspace directory found for task {task_id} (user {user_id})"

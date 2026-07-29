@@ -32,9 +32,10 @@ from xagent.core.execution_scope import (
     set_execution_scope_resolver,
     set_execution_scope_snapshot_loader,
 )
-from xagent.core.workspace import TaskWorkspace, scoped_user_root
+from xagent.core.tools.adapters.vibe.factory import ToolFactory
+from xagent.core.workspace import scoped_user_root
 from xagent.sandbox.base import SandboxMountIntent
-from xagent.web.api.chat import AgentServiceManager
+from xagent.web.api.chat import AgentServiceManager, create_default_tools
 from xagent.web.models.agent import AgentStatus
 from xagent.web.models.task import Task, TaskStatus
 from xagent.web.models.user import User
@@ -315,14 +316,38 @@ async def test_tool_workspace_lives_inside_the_tree_the_sandbox_binds(
     set_execution_scope_resolver(lambda task_id: SCOPE_A)
 
     build = await _run_build(AgentServiceManager(), 42)
-
     mount_root = build.sandbox_mount_intent.mount_root
-    workspace_base = build.agent_service_kwargs["workspace_base_dir"]
     assert mount_root == str(base / "user_1")
-    assert workspace_base == str(base / "user_1" / "tenant-a")
-    # Through TaskWorkspace's own normalization, not only as strings.
-    tool_workspace = TaskWorkspace("web_task_42", base_dir=workspace_base)
-    assert tool_workspace.base_dir.is_relative_to(Path(mount_root).resolve())
+    assert build.agent_service_kwargs["workspace_base_dir"] == str(
+        base / "user_1" / "tenant-a"
+    )
+
+    # The tool side through its own production path: the real
+    # create_default_tools composes the config and the real factory
+    # materializes the workspace from it. Only the tool creation itself and
+    # the session factory are mocked -- what the workspace is rooted at is
+    # not.
+    with ExitStack() as stack:
+        stack.enter_context(
+            patch(
+                "xagent.core.tools.adapters.vibe.factory.ToolFactory.create_all_tools",
+                new=AsyncMock(return_value=[]),
+            )
+        )
+        stack.enter_context(
+            patch("xagent.web.models.database.get_session_local", return_value=None)
+        )
+        _tools, tool_config = await create_default_tools(
+            db=None,
+            user=_make_user(),
+            task_id="web_task_42",
+            workspace_owner_id=1,
+            scope=SCOPE_A,
+        )
+    workspace = ToolFactory._create_workspace(tool_config.get_workspace_config())
+
+    assert workspace is not None
+    assert workspace.base_dir.is_relative_to(Path(mount_root).resolve())
 
 
 @pytest.mark.asyncio
