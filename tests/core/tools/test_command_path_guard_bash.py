@@ -2862,6 +2862,7 @@ class TestCommandCoverage:
         "unlink": "_check_destructive_file_command",
         "shred": "_check_destructive_file_command",
         "find": "_check_find",
+        "tar": "_check_tar",
     }
     _DEDICATED_HANDLER_COMMANDS = frozenset(_DEDICATED_HANDLER_METHODS)
     _S1_COMMANDS = frozenset({"sort", "uniq", "diff", "grep"}) | _READ_FAMILY_COMMANDS
@@ -2869,7 +2870,8 @@ class TestCommandCoverage:
         {"cp", "install", "mv", "ln", "unlink", "shred"}
     )
     _S3_COMMANDS = frozenset({"find"})
-    _ALL_COMMANDS = _S1_COMMANDS | _S2_COMMANDS | _S3_COMMANDS
+    _S4_COMMANDS = frozenset({"tar"})
+    _ALL_COMMANDS = _S1_COMMANDS | _S2_COMMANDS | _S3_COMMANDS | _S4_COMMANDS
 
     # Each entry: (positive command, negative command template with `{outside}`).
     _REGISTRY: dict[str, tuple[str, str]] = {
@@ -2902,6 +2904,7 @@ class TestCommandCoverage:
         "unlink": ("unlink own.txt", "unlink {outside}"),
         "shred": ("shred own.txt", "shred {outside}"),
         "find": ("find own.txt -print", "find {outside}"),
+        "tar": ("tar -cf archive.tar own.txt", "tar -cf archive.tar {outside}"),
     }
 
     def test_registry_covers_every_classified_command(self):
@@ -3384,3 +3387,244 @@ class TestFindCommand:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate("find . -exec cat {} \\;")
+
+
+class TestTarCommand:
+    """`tar`: archive/control paths anchored to cwd; `-C` scopes only members;
+
+    extract poisons `unknown_effect` (M2 additive) in addition to a real
+    containment check on its extraction root; remote/stdin archives and
+    executable hooks fail closed.
+    """
+
+    def test_extract_change_directory_outside_workspace_rejected(
+        self, scoped_command_workspace
+    ):
+        # M2 containment: `-C`'s extraction root is still write-checked even
+        # though extract also poisons `unknown_effect` for its members.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(external_file.parent))
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"tar -x -C {outside} -f a.tar")
+
+        assert exc_info.value.access == "write"
+
+    def test_extract_write_root_poisons_later_script_inspection(
+        self, scoped_command_workspace
+    ):
+        # Extraction targets are non-enumerable per-match children, so the
+        # `-C` write-check alone cannot capture them; `unknown_effect` must
+        # additionally poison later script inspection in the same chain.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own_dir").mkdir()
+        (workspace.output_dir / "own_dir" / "x.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate("tar -x -C own_dir -f a.tar ; bash own_dir/x.sh")
+
+    def test_create_archive_write_outside_workspace_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own_dir").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside_archive = shlex.quote(f"{sibling_file}.tar")
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"tar -c -f {outside_archive} own_dir")
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -xf host:a.tar",
+            "tar --file=host:a.tar --list",
+            "tar -xf user@host:a.tar",
+        ],
+    )
+    def test_remote_archive_fails_closed(self, scoped_command_workspace, command):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -xf -",
+            "tar --file - --list",
+        ],
+    )
+    def test_stdin_archive_fails_closed(self, scoped_command_workspace, command):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar --to-command=sh -xf a.tar",
+            "tar -I sh -cf archive.tar own.txt",
+            "tar --use-compress-program=sh -xf a.tar",
+        ],
+    )
+    def test_executable_hooks_rejected(self, scoped_command_workspace, command):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("data", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -x --absolute-names -f a.tar",
+            "tar -xPf a.tar",
+        ],
+    )
+    def test_rejects_absolute_extraction(self, scoped_command_workspace, command):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_list_with_change_directory_inside_workspace_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own_dir").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("tar -C own_dir -tf a.tar")
+
+    def test_change_directory_scope_applies_to_extract_destination(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own_dir").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("tar -xzf a.tgz -C own_dir")
+
+    def test_change_directory_scope_does_not_reanchor_the_archive_path(
+        self, scoped_command_workspace
+    ):
+        # `-C sub` shifts member resolution to `own_dir/sub`, but the archive
+        # path is anchored to the unshifted process cwd: from `sub`, "../.."
+        # would still land inside the workspace, but from the real cwd it
+        # escapes. A wrong implementation that resolves the archive against
+        # `-C`'s directory would let this pass instead of rejecting it.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "sub").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate("tar -c -C sub -f ../../escape.tar file")
+
+    def test_delete_and_compare_keep_distinct_archive_access(
+        self, scoped_command_workspace
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(external_file))
+
+        # Compare only reads the archive, so an approved external read-only
+        # path is fine.
+        guard.validate(f"tar -df {outside}")
+        # Delete rewrites the archive in place, so the same path must now be
+        # rejected as a write, not silently reused as a read.
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"tar --delete -f {outside} member")
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -tf own.tar ../../member",
+            "tar -xf own.tar ../../member -C extracted",
+        ],
+    )
+    def test_member_selectors_are_not_local_paths(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "tar -f{path} -t",
+            "tar --file {path} --list",
+            "tar tf {path}",
+            "tar cf archive.tar {path}",
+            "tar --add-file={path} -cf archive.tar",
+            "tar -cf archive.tar @{path}",
+        ],
+    )
+    def test_rejects_read_path_variants(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "tar -cf archive.tar -T file-list.txt",
+            "tar --create --files-from=file-list.txt -f archive.tar",
+            "tar -cf archive.tar --checkpoint-action=exec=sh own.txt",
+            "tar -cf archive.tar --checkpoint-action exec=sh own.txt",
+            "tar -cf archive.tar -F hook.sh own.txt",
+        ],
+    )
+    def test_rejects_indirect_or_executable_path_sources(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("data", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_short_option_bundle_consumes_archive_value(self, scoped_command_workspace):
+        # `-xzf archive.tgz`: `x`=extract, `z`=unrecognized flag (skipped),
+        # `f`=archive (consumes the next token), all in one bundled token.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+        outside = shlex.quote(str(sibling_file))
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate(f"tar -xzf {outside}")
+
+    def test_rejects_dynamic_short_option_bundle(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate('OPTION=farchive.tar; tar -c"$OPTION" own.txt')
+
+    def test_added_command_argv_uses_same_path_policy(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation):
+            guard.validate_argv(["tar", "-tf", str(sibling_file)])

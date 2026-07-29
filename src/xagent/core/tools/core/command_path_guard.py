@@ -11,6 +11,7 @@ from __future__ import annotations
 import errno
 import logging
 import os
+import re
 import shutil
 import stat
 from contextlib import contextmanager
@@ -22,6 +23,7 @@ from typing import (
     Callable,
     Iterable,
     Iterator,
+    Literal,
     Mapping,
     Sequence,
     SupportsIndex,
@@ -751,6 +753,7 @@ _CLASSIFIED_EXECUTABLE_COMMANDS = {
     "unlink",
     "shred",
     "find",
+    "tar",
     *(
         name
         for name in _COMMAND_WRAPPER_GRAMMARS
@@ -857,6 +860,45 @@ _FIND_OUTPUT_ACTIONS: dict[str, int] = {
 }
 _FIND_REFERENCE_PREDICATES = frozenset({"-newer", "-anewer", "-cnewer", "-samefile"})
 _FIND_EXEC_MARKERS = frozenset({"-exec", "-execdir", "-ok", "-okdir"})
+
+_TarMode = Literal[
+    "create",
+    "append",
+    "update",
+    "concatenate",
+    "delete",
+    "extract",
+    "list",
+    "compare",
+]
+
+# Every parsed tar argument's role in path classification. `positional`
+# members are only local paths in create/append/update/concatenate/compare
+# mode (list/extract members are in-archive selectors, not filesystem paths).
+_TarEventKind = Literal[
+    "archive",
+    "directory",
+    "files_from",
+    "exclude_from",
+    "incremental",
+    "add_file",
+    "positional",
+    "dangerous",
+    "absolute_names",
+]
+
+
+@dataclass(frozen=True)
+class _TarEvent:
+    kind: _TarEventKind
+    value: str | None = None
+
+
+@dataclass(frozen=True)
+class _TarInvocation:
+    mode: _TarMode
+    events: tuple[_TarEvent, ...]
+    remove_files: bool = False
 
 
 class WorkspaceCommandPathGuard:
@@ -1179,6 +1221,8 @@ class WorkspaceCommandPathGuard:
             self._check_destructive_file_command(command_name, args, state.cwd)
         elif command_name == "find":
             self._check_find(args, state)
+        elif command_name == "tar":
+            self._check_tar(args, state.cwd)
         elif command_name in _SHELL_COMMANDS:
             self._check_nested_shell(command_name, args, state)
         elif command_name in _UNSUPPORTED_SHELL_COMMANDS:
@@ -2177,6 +2221,324 @@ class WorkspaceCommandPathGuard:
                 _CommandValue(word, is_static=is_static, find_placeholder_cwd=cwd)
             )
         return tuple(tagged)
+
+    def _check_tar(self, values: Sequence[str], cwd: Path) -> None:
+        """Classify `tar`'s archive/control/member paths.
+
+        The archive path (`-f`/`--file`) and the two control-file options
+        (`-T`/`--files-from`, `-X`/`--exclude-from`) stay anchored to the
+        process `cwd`; only `-C`/`--directory` shifts the active directory,
+        and only for later source/destination member operands, never for the
+        archive itself. Extract mode additionally poisons the session
+        (`unknown_effect`): per-member extracted children are not
+        individually enumerable, so the `-C`/default extraction root's own
+        write-containment check (below, via the `directory` event) cannot by
+        itself capture them — the poison is additive to that check, not a
+        replacement for it (M2).
+        """
+        self._reject_dynamic_values("tar arguments", values)
+        invocation = self._parse_tar(values)
+        archive_access: PathAccess = (
+            "write"
+            if invocation.mode
+            in {"create", "append", "update", "concatenate", "delete"}
+            else "read"
+        )
+        source_access: PathAccess = "write" if invocation.remove_files else "read"
+        active_cwd = cwd
+
+        if invocation.mode == "extract":
+            _active_validation_session().effects.unknown_effect = True
+
+        for event in invocation.events:
+            if event.kind == "dangerous":
+                raise CommandPolicyViolation(
+                    "tar command hooks cannot be inspected safely"
+                )
+            if event.kind == "absolute_names":
+                if invocation.mode == "extract":
+                    raise CommandPolicyViolation(
+                        "tar absolute extraction paths cannot be inspected safely"
+                    )
+                continue
+            if event.value is None:
+                continue
+
+            if event.kind == "archive":
+                self._check_tar_archive_path(event.value, cwd, archive_access)
+            elif event.kind == "directory":
+                active_cwd = self._check_path(
+                    event.value,
+                    active_cwd,
+                    "write" if invocation.mode == "extract" else "read",
+                )
+            elif event.kind == "files_from":
+                raise CommandPolicyViolation(
+                    "tar file lists cannot be inspected safely"
+                )
+            elif event.kind == "exclude_from":
+                self._check_path(event.value, cwd, "read")
+            elif event.kind == "incremental":
+                # The snapshot file can be updated even when the archive
+                # itself is only read (e.g. listing against a snapshot).
+                self._check_path(event.value, cwd, "write")
+            elif event.kind == "add_file":
+                self._check_path(event.value, active_cwd, source_access)
+            elif event.kind == "positional" and invocation.mode in {
+                "create",
+                "append",
+                "update",
+                "concatenate",
+                "compare",
+            }:
+                # List/extract positionals are in-archive member selectors,
+                # not local filesystem paths, and are intentionally not
+                # checked here. `@file` includes another archive/file-list in
+                # place of a literal member; the same source access applies.
+                raw_path = (
+                    event.value[1:] if event.value.startswith("@") else event.value
+                )
+                self._check_path(raw_path, active_cwd, source_access)
+
+    def _check_tar_archive_path(
+        self,
+        raw_path: str,
+        cwd: Path,
+        access: PathAccess,
+    ) -> None:
+        """Reject stdin/stdout and remote archive forms; else check normally.
+
+        `-f -` streams the archive through standard input/output, and a
+        `host:path` (or `user@host:path`) form delegates to a remote `rsh`
+        transfer; neither is a local path this guard can inspect statically.
+        """
+        if raw_path == "-":
+            raise CommandPolicyViolation(
+                "tar archive on standard input/output cannot be inspected safely"
+            )
+        if ":" in raw_path:
+            raise CommandPolicyViolation(
+                "remote tar archives cannot be inspected safely"
+            )
+        self._check_path(raw_path, cwd, access)
+
+    def _parse_tar(self, values: Sequence[str]) -> _TarInvocation:
+        """Parse tar's argv once into its operation mode and typed events.
+
+        Traditional syntax omits the leading dash on the first argument
+        (`tar cf archive.tar file`); GNU long/short syntax may follow.
+        Exactly one mode letter must be present across the whole invocation
+        (POSIX tar requires exactly one of create/append/update/concatenate/
+        delete/extract/list/compare) or the operation cannot be resolved.
+        """
+        long_modes: dict[str, _TarMode] = {
+            "--create": "create",
+            "--append": "append",
+            "--update": "update",
+            "--concatenate": "concatenate",
+            "--catenate": "concatenate",
+            "--delete": "delete",
+            "--extract": "extract",
+            "--get": "extract",
+            "--list": "list",
+            "--compare": "compare",
+            "--diff": "compare",
+        }
+        modes: list[_TarMode] = []
+        events: list[_TarEvent] = []
+        remove_files = False
+        options_done = False
+        index = 0
+
+        if (
+            values
+            and re.fullmatch(r"[A-Za-z]+", str(values[0]))
+            and any(option in "cruAxtd" for option in str(values[0]))
+        ):
+            index, short_modes, short_events = self._parse_tar_short_events(
+                values, 0, values[0]
+            )
+            modes.extend(short_modes)
+            events.extend(short_events)
+
+        while index < len(values):
+            value = values[index]
+            text = str(value)
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not text.startswith("-") or text == "-":
+                events.append(_TarEvent("positional", value))
+                index += 1
+                continue
+            if text in long_modes:
+                modes.append(long_modes[text])
+                index += 1
+                continue
+            if text == "--remove-files":
+                remove_files = True
+                index += 1
+                continue
+            if text in {"--to-stdout", "-O"}:
+                index += 1
+                continue
+            if text in {"--absolute-names", "--absolute-paths"}:
+                events.append(_TarEvent("absolute_names"))
+                index += 1
+                continue
+            if text.startswith("--"):
+                index, event = self._parse_tar_long_event(values, index)
+                if event is not None:
+                    events.append(event)
+                continue
+
+            index, short_modes, short_events = self._parse_tar_short_events(
+                values, index, value[1:]
+            )
+            modes.extend(short_modes)
+            events.extend(short_events)
+
+        unique_modes = set(modes)
+        if len(unique_modes) != 1:
+            raise CommandPolicyViolation("cannot safely resolve tar operation")
+        return _TarInvocation(
+            mode=unique_modes.pop(),
+            events=tuple(events),
+            remove_files=remove_files,
+        )
+
+    def _parse_tar_long_event(
+        self,
+        values: Sequence[str],
+        index: int,
+    ) -> tuple[int, _TarEvent | None]:
+        value = values[index]
+        text = str(value)
+        path_options: dict[str, _TarEventKind] = {
+            "--file": "archive",
+            "--directory": "directory",
+            "--files-from": "files_from",
+            "--exclude-from": "exclude_from",
+            "--listed-incremental": "incremental",
+            "--add-file": "add_file",
+        }
+        dangerous_options = {
+            "--use-compress-program",
+            "--to-command",
+            "--checkpoint-action",
+            "--info-script",
+            "--new-volume-script",
+            "--rsh-command",
+        }
+        option, separator, attached = text.partition("=")
+        kind = path_options.get(option)
+        is_dangerous = option in dangerous_options
+        if kind is None and not is_dangerous:
+            return index + 1, None
+
+        argument, next_index = self._take_option_argument(
+            values,
+            index,
+            attached_argument=(
+                self._derived_value(value, attached) if separator else None
+            ),
+            context=f"tar argument for {option}",
+        )
+
+        if is_dangerous:
+            return next_index, _TarEvent("dangerous", argument)
+        return next_index, _TarEvent(cast(_TarEventKind, kind), argument)
+
+    def _parse_tar_short_events(
+        self,
+        values: Sequence[str],
+        index: int,
+        options: str,
+    ) -> tuple[int, list[_TarMode], list[_TarEvent]]:
+        """Parse one traditional/bundled short-option token (e.g. `-xzf`).
+
+        Only the last argument-taking character in the cluster may carry a
+        value (attached, e.g. `-fname`, or as the following token); this
+        matches GNU tar's own traditional-syntax parser. Unrecognized
+        characters are silently skipped (compression/verbosity flags like
+        `z`/`v` this guard does not need to model), consistent with the
+        conservative flag-only treatment of unknown tar options elsewhere.
+        """
+        short_modes: dict[str, _TarMode] = {
+            "c": "create",
+            "r": "append",
+            "u": "update",
+            "A": "concatenate",
+            "x": "extract",
+            "t": "list",
+            "d": "compare",
+        }
+        argument_events: dict[str, _TarEventKind | None] = {
+            "f": "archive",
+            "C": "directory",
+            "T": "files_from",
+            "X": "exclude_from",
+            "g": "incremental",
+            "I": "dangerous",
+            "F": "dangerous",
+            "b": None,
+        }
+        modes: list[_TarMode] = []
+        events: list[_TarEvent] = []
+        cursor = 0
+        next_index = index + 1
+
+        while cursor < len(options):
+            option = options[cursor]
+            if option in short_modes:
+                modes.append(short_modes[option])
+                cursor += 1
+                continue
+            if option == "P":
+                events.append(_TarEvent("absolute_names"))
+                cursor += 1
+                continue
+            if option == "O":
+                cursor += 1
+                continue
+            if option not in argument_events:
+                cursor += 1
+                continue
+
+            attached = options[cursor + 1 :]
+            argument, next_index = self._take_option_argument(
+                values,
+                index,
+                attached_argument=(
+                    self._derived_value(values[index], attached) if attached else None
+                ),
+                context=f"tar argument for -{option}",
+            )
+            assert argument is not None
+            kind = argument_events[option]
+            if kind is not None:
+                events.append(_TarEvent(kind, argument))
+            break
+
+        return next_index, modes, events
+
+    @staticmethod
+    def _take_option_argument(
+        values: Sequence[str],
+        index: int,
+        *,
+        attached_argument: str | None,
+        context: str,
+        required: bool = True,
+    ) -> tuple[str | None, int]:
+        if attached_argument is not None:
+            return attached_argument, index + 1
+        if index + 1 < len(values):
+            return values[index + 1], index + 2
+        if required:
+            raise CommandPolicyViolation(f"missing {context}")
+        return None, index + 1
 
     def _parse_short_option_cluster(
         self,
