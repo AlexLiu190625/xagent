@@ -321,7 +321,7 @@ describe("useWidgetSession", () => {
     },
   )
 
-  it("terminalizes a current-owner normal WebSocket close without reconnecting", () => {
+  it.each([1000, 1001])("terminalizes a current-owner standard WebSocket close %s without reconnecting", (code) => {
     const postMessage = vi.spyOn(window, "postMessage")
     const { result } = renderHook(() => useWidgetSession())
     dispatchFromParent(updateMessage())
@@ -330,7 +330,7 @@ describe("useWidgetSession", () => {
     let disposition: "handled" | "default" | undefined
     act(() => {
       disposition = result.current.handleConnectionClose(
-        new CloseEvent("close", { code: 1000 }),
+        new CloseEvent("close", { code }),
       )
     })
 
@@ -338,7 +338,8 @@ describe("useWidgetSession", () => {
     expect(result.current.status).toBe("terminal")
     expect(result.current.terminalCode).toBe("unexpected_error")
     expect(result.current.session).toBeNull()
-    expect(postMessage).not.toHaveBeenCalled()
+    expect(result.current.agent).toBeNull()
+    expect(postMessage.mock.calls.filter((call) => call[0]?.type === "reconnect_request")).toHaveLength(0)
   })
 
   it("does nothing when a retained reconnect callback runs after unmount", () => {

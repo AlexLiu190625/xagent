@@ -213,7 +213,7 @@ export function useWidgetSession() {
     connectionIdentity?: string,
   ): "handled" => {
     if (!isActiveConnection(connectionIdentity)) return "handled"
-    if (event.code === 1000) {
+    if (event.code === 1000 || event.code === 1001) {
       transitionTerminal("unexpected_error")
       return "handled"
     }
