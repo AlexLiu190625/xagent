@@ -2284,7 +2284,28 @@ class TestSortUniqDiffGrepHandlers:
         guard = WorkspaceCommandPathGuard(workspace)
 
         with pytest.raises(CommandPolicyViolation):
-            guard.validate("uniq --count own.txt")
+            guard.validate("uniq --not-a-uniq-option own.txt")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "uniq --count own.txt",
+            "uniq --repeated own.txt",
+            "uniq --all-repeated own.txt",
+            "uniq --ignore-case own.txt",
+            "uniq --unique own.txt",
+            "uniq --zero-terminated own.txt",
+            "uniq --group own.txt",
+        ],
+    )
+    def test_uniq_allows_recognized_flag_options(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
 
     def test_diff_output_option_registers_write(self, scoped_command_workspace):
         workspace, _, sibling_file = scoped_command_workspace
@@ -2312,7 +2333,29 @@ class TestSortUniqDiffGrepHandlers:
         guard = WorkspaceCommandPathGuard(workspace)
 
         with pytest.raises(CommandPolicyViolation):
-            guard.validate("diff --brief own.txt own.txt")
+            guard.validate("diff --not-a-diff-option own.txt own.txt")
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "diff --brief own.txt own.txt",
+            "diff --unified own.txt own.txt",
+            "diff --recursive own.txt own.txt",
+            "diff --ignore-case own.txt own.txt",
+            "diff --color own.txt own.txt",
+            "diff --color=always own.txt own.txt",
+            "diff --side-by-side own.txt own.txt",
+            "diff --new-file own.txt own.txt",
+        ],
+    )
+    def test_diff_allows_recognized_flag_options(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
 
     @pytest.mark.parametrize(
         "command_template",
@@ -2362,6 +2405,50 @@ class TestSortUniqDiffGrepHandlers:
             guard.validate(f"grep -r needle {shlex.quote(str(sibling_file.parent))}")
 
         assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "grep -if {path} own.txt",
+            "grep -vf {path} own.txt",
+            "grep -nf {path} own.txt",
+        ],
+    )
+    def test_grep_bundled_pattern_file_option_is_read_checked(
+        self, scoped_command_workspace, command_template
+    ):
+        # `-f`'s pattern-file argument must still be read-checked when it is
+        # not the leading character of a bundled short-option cluster.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command",
+        ["grep -if pattern.txt own.txt", "grep -vf pattern.txt own.txt"],
+    )
+    def test_grep_bundled_pattern_file_workspace_path_is_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "pattern.txt").write_text("needle", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_grep_rejects_unmodeled_short_option(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("grep -@ needle own.txt")
 
 
 def _trust_locally_shadowed_ownership_commands(monkeypatch):
@@ -2506,6 +2593,68 @@ class TestWriteCreateFamily:
 
         guard.validate("chmod --reference=mode.ref own.txt")
 
+    @pytest.mark.parametrize(
+        "command_template",
+        ["touch --reference={path} own.txt", "touch -r {path} own.txt"],
+    )
+    def test_touch_reference_file_is_read_checked(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
+
+    def test_touch_reference_file_workspace_path_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "time.ref").write_text("", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("touch --reference=time.ref own.txt")
+        guard.validate("touch -r time.ref own.txt")
+
+    def test_touch_reference_external_read_only_file_is_allowed(
+        self, scoped_command_workspace
+    ):
+        # `-r`/`--reference` only reads the reference file's timestamps, so
+        # a read-only external directory authorizes it even though the same
+        # command's own operand is a write.
+        workspace, external_file, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"touch -r {shlex.quote(str(external_file))} own.txt")
+
+    def test_truncate_reference_file_is_read_checked(self, scoped_command_workspace):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"truncate --reference={shlex.quote(str(sibling_file))} own.txt"
+            )
+
+        assert exc_info.value.access == "read"
+
+    def test_truncate_reference_file_workspace_path_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "size.ref").write_text("", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("truncate --reference=size.ref own.txt")
+        guard.validate("truncate -r size.ref own.txt")
+
 
 class TestCopyInstallMoveLinkDestructive:
     """Dedicated handlers for cp/install/mv/ln/unlink/shred.
@@ -2619,6 +2768,42 @@ class TestCopyInstallMoveLinkDestructive:
 
         assert exc_info.value.access == "write"
 
+    def test_install_bundled_flag_and_mode_short_options_are_allowed(
+        self, scoped_command_workspace
+    ):
+        # `-Dm755` bundles the no-value `-D` flag with `-m`'s attached mode
+        # value; only the trailing character may carry a value, matching the
+        # `sort`/`grep` short-option-cluster contract.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("install -Dm755 own.txt dest.txt")
+
+    def test_install_bundled_mode_value_is_not_treated_as_a_path(
+        self, scoped_command_workspace
+    ):
+        # The `-m` mode value is a scalar even when it looks like a path and
+        # even when bundled behind `-D`; an out-of-workspace-looking mode
+        # value does not cause a spurious rejection.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"install -Dm{shlex.quote(str(sibling_file))} own.txt dest.txt")
+
+    def test_install_bundled_flag_and_mode_real_destination_still_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"install -Dm755 own.txt {shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "write"
+
     def test_ln_source_inside_workspace_aliasing_external_read_only_dir_is_rejected(
         self, scoped_command_workspace
     ):
@@ -2649,6 +2834,23 @@ class TestCopyInstallMoveLinkDestructive:
 
         with pytest.raises(CommandPolicyViolation, match="symbolic links"):
             guard.validate(command)
+
+    def test_cp_target_directory_with_recursive_still_rejects_out_of_workspace(
+        self, scoped_command_workspace
+    ):
+        # Pin: `cp -rt <out> own.txt` already rejects today. `-t` bundled
+        # behind `-r` (`-rt`) is not recognized as `--target-directory` (only
+        # a standalone or `-t`-leading token is), so `<out>` instead falls
+        # through as an ordinary source operand and is read-checked; this
+        # must stay a rejection, not be "fixed" into a silent ALLOW.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"cp -rt {shlex.quote(str(sibling_file))} own.txt")
+
+        assert exc_info.value.access == "read"
 
     def test_shred_scalar_options_are_not_treated_as_paths(
         self, scoped_command_workspace
@@ -2820,36 +3022,21 @@ class TestPathClassificationSubstrate:
 class TestCommandCoverage:
     """Mutation-sensitive coverage gate for every classified command.
 
-    Reflects over the guard's live classification sets so a command dropped
-    from dispatch, from the shadow-script set, or left without a test is
-    caught here rather than by chance in an unrelated test.
+    `_ALL_COMMANDS` is derived from the guard's OWN live classification sets
+    (`_READ_COMMANDS`, `_WRITE_COMMANDS`, `_DEDICATED_HANDLER_COMMANDS`),
+    read through the module reference (not a top-level `from ... import`,
+    which would bind an independent copy and stop reflecting a later
+    monkeypatch) so a command added to any of them without a registry entry
+    fails `test_registry_covers_every_classified_command` instead of being
+    silently untested. `test_registry_coverage_is_mutation_sensitive_to_live_classification`
+    proves that sensitivity directly.
     """
 
-    _READ_FAMILY_COMMANDS = frozenset(
-        {
-            "cmp",
-            "file",
-            "head",
-            "less",
-            "ls",
-            "more",
-            "stat",
-            "tac",
-            "tail",
-            "wc",
-            "cut",
-        }
-    )
-    # Flat write/create family: every operand is a plain workspace write, with
-    # at most an option-keyed scalar value skipped (`_COMMAND_VALUE_OPTIONS`)
-    # or, for chmod/chown/chgrp, a leading non-path positional.
-    _WRITE_CREATE_FAMILY_COMMANDS = frozenset(
-        {"chmod", "chown", "chgrp", "rmdir", "tee", "touch", "truncate"}
-    )
-    # Dedicated handlers: each owns a slot (write/read split, target-directory,
-    # every-operand-write-sensitivity, ...) a flat classification cannot
-    # express. Maps command name to the guard method that classifies it; a
-    # method may serve more than one command name (`mv`/`ln`, `unlink`/`shred`).
+    # Maps each dedicated-handler command to the guard method that classifies
+    # it; a method may serve more than one command name (`mv`/`ln`,
+    # `unlink`/`shred`). The key set must equal the live
+    # `_DEDICATED_HANDLER_COMMANDS` (checked below), not be hand-duplicated
+    # against it.
     _DEDICATED_HANDLER_METHODS: dict[str, str] = {
         "sort": "_check_sort",
         "uniq": "_check_uniq",
@@ -2872,26 +3059,10 @@ class TestCommandCoverage:
         "curl": "_check_curl",
         "wget": "_check_wget",
     }
-    _DEDICATED_HANDLER_COMMANDS = frozenset(_DEDICATED_HANDLER_METHODS)
-    _S1_COMMANDS = frozenset({"sort", "uniq", "diff", "grep"}) | _READ_FAMILY_COMMANDS
-    _S2_COMMANDS = _WRITE_CREATE_FAMILY_COMMANDS | frozenset(
-        {"cp", "install", "mv", "ln", "unlink", "shred"}
-    )
-    _S3_COMMANDS = frozenset({"find"})
-    _S4_COMMANDS = frozenset({"tar"})
-    _S5_COMMANDS = frozenset({"sed", "awk"})
-    _S6_COMMANDS = frozenset({"dd", "base64", "gzip", "rsync", "curl", "wget"})
-    _ALL_COMMANDS = (
-        _S1_COMMANDS
-        | _S2_COMMANDS
-        | _S3_COMMANDS
-        | _S4_COMMANDS
-        | _S5_COMMANDS
-        | _S6_COMMANDS
-    )
 
     # Each entry: (positive command, negative command template with `{outside}`).
     _REGISTRY: dict[str, tuple[str, str]] = {
+        "cat": ("cat own.txt", "cat {outside}"),
         "cmp": ("cmp own.txt own.txt", "cmp own.txt {outside}"),
         "file": ("file own.txt", "file {outside}"),
         "head": ("head -n 1 own.txt", "head -n 1 {outside}"),
@@ -2910,6 +3081,8 @@ class TestCommandCoverage:
         "chmod": ("chmod 755 own.txt", "chmod 755 {outside}"),
         "chown": ("chown owner own.txt", "chown owner {outside}"),
         "chgrp": ("chgrp staff own.txt", "chgrp staff {outside}"),
+        "mkdir": ("mkdir own_new_dir", "mkdir {outside}"),
+        "rm": ("rm own.txt", "rm {outside}"),
         "rmdir": ("rmdir own_dir", "rmdir {outside}"),
         "tee": ("tee own.txt", "tee {outside}"),
         "touch": ("touch own.txt", "touch {outside}"),
@@ -2944,16 +3117,34 @@ class TestCommandCoverage:
         ),
     }
 
+    @staticmethod
+    def _all_commands() -> frozenset:
+        """Recompute the live-classified command set from the module.
+
+        Re-reads the module's sets on every call (not a cached class
+        constant) so a test can mutate them first (via `monkeypatch`) and
+        observe the effect, proving the coverage gate actually depends on
+        live classification rather than a frozen snapshot taken at import.
+        """
+        return (
+            frozenset(command_path_guard_module._READ_COMMANDS)
+            | frozenset(command_path_guard_module._WRITE_COMMANDS)
+            | frozenset(command_path_guard_module._DEDICATED_HANDLER_COMMANDS)
+        )
+
+    # A fixed snapshot for parametrization, which pytest evaluates at
+    # collection time; the mutation-sensitivity test below re-derives the
+    # live set independently rather than relying on this constant.
+    _ALL_COMMANDS = _all_commands()
+
     def test_registry_covers_every_classified_command(self):
-        assert set(self._REGISTRY) == self._ALL_COMMANDS
+        assert set(self._REGISTRY) == self._all_commands()
 
-    def test_read_family_commands_are_classified_as_read(self):
-        for command_name in self._READ_FAMILY_COMMANDS:
-            assert command_name in command_path_guard_module._READ_COMMANDS
-
-    def test_write_create_family_commands_are_classified_as_write(self):
-        for command_name in self._WRITE_CREATE_FAMILY_COMMANDS:
-            assert command_name in command_path_guard_module._WRITE_COMMANDS
+    def test_dedicated_handler_registry_matches_live_classification(self):
+        assert (
+            set(self._DEDICATED_HANDLER_METHODS)
+            == command_path_guard_module._DEDICATED_HANDLER_COMMANDS
+        )
 
     def test_dedicated_handlers_are_not_flat_read_or_write(self):
         for command_name, method_name in self._DEDICATED_HANDLER_METHODS.items():
@@ -2962,11 +3153,28 @@ class TestCommandCoverage:
             assert hasattr(WorkspaceCommandPathGuard, method_name)
 
     def test_every_command_is_shadow_script_classified(self):
-        for command_name in self._ALL_COMMANDS:
+        for command_name in self._all_commands():
             assert (
                 command_name
                 in command_path_guard_module._CLASSIFIED_EXECUTABLE_COMMANDS
             )
+
+    def test_registry_coverage_is_mutation_sensitive_to_live_classification(
+        self, monkeypatch
+    ):
+        # Prove the coverage gate actually depends on the live module sets:
+        # injecting a fake command into `_READ_COMMANDS` must desynchronize
+        # it from the (unchanged) registry, which is exactly the condition
+        # `test_registry_covers_every_classified_command` asserts does not
+        # hold. If this stayed equal, that test would stay silently green
+        # after a real command were added without a registry entry.
+        monkeypatch.setattr(
+            command_path_guard_module,
+            "_READ_COMMANDS",
+            command_path_guard_module._READ_COMMANDS | {"__not_a_real_command__"},
+        )
+
+        assert set(self._REGISTRY) != self._all_commands()
 
     @pytest.mark.parametrize("command_name", sorted(_ALL_COMMANDS))
     def test_registry_positive_case_is_accepted(
@@ -3666,6 +3874,66 @@ class TestTarCommand:
         with pytest.raises(CommandPathViolation):
             guard.validate_argv(["tar", "-tf", str(sibling_file)])
 
+    def test_index_file_option_writes_the_verbose_listing(
+        self, scoped_command_workspace
+    ):
+        # `--index-file`'s separated argument must be write-checked, not
+        # returned as an unchecked in-archive member selector.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"tar --index-file {shlex.quote(str(sibling_file))} -xf a.tar"
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_index_file_option_workspace_path_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("tar --index-file listing.txt -xf a.tar")
+
+    @pytest.mark.parametrize("mode_flag", ["-xf", "-tf"])
+    def test_unrecognized_long_option_fails_closed_in_extract_and_list_mode(
+        self, scoped_command_workspace, mode_flag
+    ):
+        # An unrecognized long option with no attached value is ambiguous:
+        # it may take a separated argument this parser cannot identify,
+        # which would otherwise become an unchecked member-selector
+        # positional in extract/list mode.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(f"tar --not-a-tar-option {mode_flag} a.tar")
+
+    def test_unrecognized_long_option_with_value_fails_closed_regardless_of_mode(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("tar --not-a-tar-option=value -cf archive.tar own.txt")
+
+    def test_unrecognized_bare_long_option_is_allowed_outside_extract_and_list_mode(
+        self, scoped_command_workspace
+    ):
+        # Create/append/update/concatenate/compare mode already path-checks
+        # every positional as a source, so a bare (argument-free) unmodeled
+        # long option there is not the exploitable ambiguity extract/list
+        # mode has and stays permissive.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("tar --not-a-tar-option -cf archive.tar own.txt")
+
 
 class TestSedAwkCommand:
     """`sed`/`awk`: command-slot lexer over the embedded program (I8/I9).
@@ -3823,6 +4091,51 @@ class TestSedAwkCommand:
 
         assert exc_info.value.access == "write"
 
+    def test_sed_long_option_abbreviation_is_resolved(self, scoped_command_workspace):
+        # GNU unambiguous-prefix abbreviation must resolve `--expr=` to
+        # `--expression=` and still write-check its `w` file command, not
+        # silently skip the option as unrecognized.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("sed --expr='w own_out.txt' own.txt")
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"sed --expr='w {sibling_file}' own.txt")
+
+        assert exc_info.value.access == "write"
+
+    def test_sed_in_place_long_option_abbreviation_switches_to_write(
+        self, scoped_command_workspace
+    ):
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"sed --in-pl -e 's/a/b/' {shlex.quote(str(external_file))}")
+
+        assert exc_info.value.access == "write"
+
+    def test_sed_script_file_long_option_abbreviation_is_read_checked(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"sed --fil={shlex.quote(str(sibling_file))} own.txt")
+
+        assert exc_info.value.access == "read"
+
+    def test_sed_rejects_unrecognized_long_option(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("sed --not-a-sed-option 's/a/b/' own.txt")
+
     @pytest.mark.parametrize(
         "command_template",
         [
@@ -3879,6 +4192,47 @@ class TestSedAwkCommand:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate("awk '{getline < \"feed.txt\"}' own.txt")
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "awk '{{getline $0 < \"{path}\"}}' own.txt",
+            "awk '{{getline $1 < \"{path}\"}}' own.txt",
+            "awk '{{getline arr[1] < \"{path}\"}}' own.txt",
+        ],
+    )
+    def test_awk_getline_field_and_subscript_targets_are_read_checked(
+        self, scoped_command_workspace, command_template
+    ):
+        # A field reference (`$0`/`$1`) or an array subscript (`arr[1]`)
+        # receiving target must not make the following `< FILE` source
+        # invisible to the read check.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=str(sibling_file)))
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk '{getline $0 < \"feed.txt\"}' own.txt",
+            "awk '{getline $1 < \"feed.txt\"}' own.txt",
+            "awk '{getline arr[1] < \"feed.txt\"}' own.txt",
+        ],
+    )
+    def test_awk_getline_field_and_subscript_targets_workspace_path_is_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "feed.txt").write_text("data\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
 
     @pytest.mark.parametrize(
         "command",
@@ -3939,6 +4293,105 @@ class TestSedAwkCommand:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate("awk -f safe.awk own.txt")
+
+    def test_awk_long_option_abbreviation_is_resolved(self, scoped_command_workspace):
+        # GNU unambiguous-prefix abbreviation must resolve `--sour=` to
+        # `--source=` and still classify its print-redirect write, not
+        # silently skip the option as unrecognized. The whole `--sour=...`
+        # argument is quoted as one shell word (matching how a caller would
+        # protect an embedded double-quoted redirect target).
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("awk '--sour={print $0 > \"own_out.txt\"}' own.txt")
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"awk '--sour={{print $0 > \"{sibling_file}\"}}' own.txt")
+
+        assert exc_info.value.access == "write"
+
+    def test_awk_rejects_unrecognized_long_option(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("awk --not-an-awk-option '{print}' own.txt")
+
+    def test_awk_rejects_unmodeled_short_option(self, scoped_command_workspace):
+        # `-Z` is not a real gawk option; an unmodeled short option must fail
+        # closed rather than being silently skipped.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(
+                f"awk -Z {shlex.quote(str(sibling_file))} '{{print}}' own.txt"
+            )
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "awk -o{path} '{{print}}' own.txt",
+            "awk --pretty-print={path} '{{print}}' own.txt",
+            "awk -p{path} '{{print}}' own.txt",
+            "awk --profile={path} '{{print}}' own.txt",
+            "awk -d{path} '{{print}}' own.txt",
+            "awk --dump-variables={path} '{{print}}' own.txt",
+        ],
+    )
+    def test_awk_optional_write_options_reject_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk -oprof.out '{print}' own.txt",
+            "awk --pretty-print=prof.out '{print}' own.txt",
+            "awk -pprof.out '{print}' own.txt",
+            "awk --profile=prof.out '{print}' own.txt",
+            "awk -dvars.out '{print}' own.txt",
+            "awk --dump-variables=vars.out '{print}' own.txt",
+        ],
+    )
+    def test_awk_optional_write_options_workspace_paths_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "awk -o '{print}' own.txt",
+            "awk --pretty-print '{print}' own.txt",
+        ],
+    )
+    def test_awk_optional_write_option_default_filename_is_write_checked(
+        self, scoped_command_workspace, command
+    ):
+        # With no attached argument, gawk writes the fixed default filename
+        # (`awkprof.out`) in the current directory; that default is a
+        # workspace-relative path, so it is allowed without needing an
+        # explicit operand for it.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
 
     @pytest.mark.parametrize(
         "command",
@@ -4187,6 +4640,16 @@ class TestDdBase64GzipRemoteTransferCommand:
         guard.validate(f"gzip -c {shlex.quote(str(external_file))}")
         guard.validate(f"gzip -lt {shlex.quote(str(external_file))}")
 
+    @pytest.mark.parametrize("command", ["gzip --best own.txt", "gzip --fast own.txt"])
+    def test_gzip_allows_recognized_compression_level_flags(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
     def test_gzip_default_mode_poisons_later_script_inspection(
         self, scoped_command_workspace
     ):
@@ -4251,6 +4714,23 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         assert exc_info.value.access == "write"
 
+    def test_rsync_log_file_option_still_rejects_out_of_workspace(
+        self, scoped_command_workspace
+    ):
+        # Pin: `rsync --log-file <out> ...` already rejects today (the
+        # unconsumed value becomes an extra read-checked source operand);
+        # this must stay a rejection, not be "fixed" into an ALLOW.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"rsync --log-file {shlex.quote(str(sibling_file))} own.txt dest.txt"
+            )
+
+        assert exc_info.value.access == "read"
+
     # -- curl/wget/rsync shared uninspectable-option pins -----------------
 
     @pytest.mark.parametrize(
@@ -4294,6 +4774,70 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         assert exc_info.value.access == "write"
 
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "curl -D {path} https://example.invalid/file",
+            "curl --dump-header {path} https://example.invalid/file",
+            "curl -c {path} https://example.invalid/file",
+            "curl --cookie-jar {path} https://example.invalid/file",
+            "curl --trace {path} https://example.invalid/file",
+            "curl --trace-ascii {path} https://example.invalid/file",
+            "curl --stderr {path} https://example.invalid/file",
+        ],
+    )
+    def test_curl_write_output_options_reject_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "curl -D headers.txt https://example.invalid/file",
+            "curl --dump-header headers.txt https://example.invalid/file",
+            "curl -c cookies.txt https://example.invalid/file",
+            "curl --cookie-jar cookies.txt https://example.invalid/file",
+            "curl --trace trace.txt https://example.invalid/file",
+            "curl --trace-ascii trace.txt https://example.invalid/file",
+            "curl --stderr err.txt https://example.invalid/file",
+        ],
+    )
+    def test_curl_write_output_options_workspace_paths_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_curl_rejects_unrecognized_long_option_with_value(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(
+                "curl --not-a-curl-option=value https://example.invalid/file"
+            )
+
+    def test_curl_allows_unrecognized_bare_long_flag(self, scoped_command_workspace):
+        # A long flag with no attached value cannot be told apart from a
+        # real curl flag this family does not model, so it stays permissive
+        # (over-checked, never under-checked) — only an unmodeled option that
+        # visibly carries a value fails closed.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("curl --location https://example.invalid/file")
+
     # -- wget ------------------------------------------------------------
 
     def test_wget_output_outside_workspace_rejected(self, scoped_command_workspace):
@@ -4305,6 +4849,65 @@ class TestDdBase64GzipRemoteTransferCommand:
             guard.validate(f"wget -O {outside} https://example.invalid/file")
 
         assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "wget -O keep -o {path} https://example.invalid/file",
+            "wget -O keep --output-file {path} https://example.invalid/file",
+        ],
+    )
+    def test_wget_log_file_option_rejects_out_of_workspace(
+        self, scoped_command_workspace, command_template
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "wget -O keep -o log.txt https://example.invalid/file",
+            "wget -O keep --output-file log.txt https://example.invalid/file",
+        ],
+    )
+    def test_wget_log_file_option_workspace_path_is_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_wget_rejects_unrecognized_long_option_with_value(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(
+                "wget --not-a-wget-option=value https://example.invalid/file"
+            )
+
+    def test_wget_save_cookies_still_rejected(self, scoped_command_workspace):
+        # `--save-cookies` is not modeled as a write option; it must not be
+        # "fixed" into an ALLOW. It rejects today because the whole
+        # invocation has no explicit `-O` output, so the remote-derived
+        # output filename fails closed — that reason must not regress into
+        # a silent ALLOW even once `--save-cookies` itself is modeled.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(
+                f"wget --save-cookies {shlex.quote(str(sibling_file))} "
+                "https://example.invalid/file"
+            )
 
     # -- path-classification bypass regressions -------------------------
 
