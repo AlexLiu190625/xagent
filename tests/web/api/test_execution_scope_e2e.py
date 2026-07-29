@@ -19,6 +19,7 @@ likewise disjoint through the same contextvar mechanism is pinned in
 from __future__ import annotations
 
 from contextlib import ExitStack
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -31,7 +32,7 @@ from xagent.core.execution_scope import (
     set_execution_scope_resolver,
     set_execution_scope_snapshot_loader,
 )
-from xagent.core.workspace import scoped_user_root
+from xagent.core.workspace import TaskWorkspace, scoped_user_root
 from xagent.sandbox.base import SandboxMountIntent
 from xagent.web.api.chat import AgentServiceManager
 from xagent.web.models.agent import AgentStatus
@@ -290,6 +291,38 @@ async def test_unscoped_build_is_byte_identical_to_pre_757_behavior() -> None:
     assert build.agent_service_kwargs["workspace_base_dir"] == legacy_base
     assert build.agent_service_kwargs["scope_segments"] == ()
     assert build.recorded_fingerprint is None
+
+
+@pytest.mark.asyncio
+async def test_tool_workspace_lives_inside_the_tree_the_sandbox_binds(
+    tmp_path, monkeypatch
+) -> None:
+    """The two path domains must not name different trees.
+
+    The sandbox binds a canonical, lexically normalized path -- the mount
+    intent's own identity domain, since desired-vs-observed comparison has to
+    be lexical -- while ``TaskWorkspace`` ``resolve()``s the base dir it is
+    handed. An uploads dir spelled with ``..`` after a symlink is where the
+    two answers part: the raw spelling resolves into the symlink's target, so
+    the task's file tools would work in a tree the container never mounted.
+    """
+    base = tmp_path / "base"
+    base.mkdir()
+    outside = tmp_path / "outside" / "nested"
+    outside.mkdir(parents=True)
+    (base / "link").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setenv("XAGENT_UPLOADS_DIR", f"{base}/link/..")
+    set_execution_scope_resolver(lambda task_id: SCOPE_A)
+
+    build = await _run_build(AgentServiceManager(), 42)
+
+    mount_root = build.sandbox_mount_intent.mount_root
+    workspace_base = build.agent_service_kwargs["workspace_base_dir"]
+    assert mount_root == str(base / "user_1")
+    assert workspace_base == str(base / "user_1" / "tenant-a")
+    # Through TaskWorkspace's own normalization, not only as strings.
+    tool_workspace = TaskWorkspace("web_task_42", base_dir=workspace_base)
+    assert tool_workspace.base_dir.is_relative_to(Path(mount_root).resolve())
 
 
 @pytest.mark.asyncio

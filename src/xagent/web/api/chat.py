@@ -40,7 +40,6 @@ from ...core.tools.adapters.vibe.config import (
     RequiredMCPUnavailableError,
 )
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
-from ...core.workspace import scoped_user_root
 from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
@@ -112,7 +111,10 @@ from ..services.workforce_runtime import (
     resolve_workforce_task_runtime,
     sync_workforce_run_status_for_task_id_isolated,
 )
-from ..services.workspace_binding import build_chat_workspace_binding
+from ..services.workspace_binding import (
+    build_chat_workspace_binding,
+    canonical_workspace_base,
+)
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
 from ..utils.db_timezone import format_datetime_for_api, safe_timestamp_to_unix
@@ -503,9 +505,12 @@ def _build_allowed_external_dirs(
             if scope is not None and scope.isolate_external_dirs
             else ()
         )
-        user_upload_dir = scoped_user_root(get_uploads_dir(), user_id, segments)
-        if not only_existing or user_upload_dir.exists():
-            dirs.append(str(user_upload_dir))
+        # Probe the same spelling that gets appended: with a symlinked
+        # uploads dir the raw and canonical spellings can name different
+        # directories, and the gate has to answer for the one handed on.
+        user_upload_dir = canonical_workspace_base(user_id, segments)
+        if not only_existing or Path(user_upload_dir).exists():
+            dirs.append(user_upload_dir)
     dirs.extend([str(d) for d in get_external_upload_dirs()])
     return dirs
 
@@ -598,9 +603,7 @@ async def create_default_tools(
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
         workspace_config={
-            "base_dir": str(
-                scoped_user_root(get_uploads_dir(), owner_id, scope_segments)
-            ),
+            "base_dir": canonical_workspace_base(owner_id, scope_segments),
             "task_id": task_id,
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
@@ -2454,10 +2457,8 @@ class AgentServiceManager:
                         pattern=task_pattern,  # Use pattern instead of use_dag_pattern
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
-                        workspace_base_dir=str(
-                            scoped_user_root(
-                                get_uploads_dir(), workspace_owner_id, scope_segments
-                            )
+                        workspace_base_dir=canonical_workspace_base(
+                            workspace_owner_id, scope_segments
                         ),  # Use user- (and scope-) isolated base directory
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
                         scope_segments=scope_segments,
@@ -3085,13 +3086,13 @@ class AgentServiceManager:
                 workspace_ids.append(
                     (
                         f"web_task_{task_id}",
-                        str(scoped_user_root(get_uploads_dir(), user_id, segments)),
+                        canonical_workspace_base(user_id, segments),
                     )
                 )
             workspace_ids.append(
                 (
                     f"web_task_{task_id}",
-                    str(scoped_user_root(get_uploads_dir(), user_id)),
+                    canonical_workspace_base(user_id),
                 )
             )
         workspace_ids.append((f"web_task_{task_id}", str(get_uploads_dir())))
@@ -3236,8 +3237,8 @@ class AgentServiceManager:
                     tracer=tracer,
                     system_prompt=system_prompt,
                     enable_workspace=True,
-                    workspace_base_dir=str(
-                        scoped_user_root(get_uploads_dir(), user_id, scope_segments)
+                    workspace_base_dir=canonical_workspace_base(
+                        user_id, scope_segments
                     ),
                     allowed_external_dirs=allowed_external_dirs,
                     scope_segments=scope_segments,

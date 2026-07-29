@@ -168,6 +168,25 @@ def _canonical_mount_path(path: str) -> str:
     return canonical_sandbox_path(str(absolute_backend_mount_path(path)))
 
 
+def canonical_workspace_base(owner_id: int, segments: Sequence[str] = ()) -> str:
+    """One owner's workspace root at ``segments``, in the mount identity domain.
+
+    The same directory has two consumers with two different normalizations:
+    the sandbox binds it (canonicalized by ``SandboxMountIntent``, a lexical
+    domain, because desired-vs-observed config comparison has to be lexical),
+    while the file tools open it through ``TaskWorkspace``, which ``resolve()``s
+    what it is handed (a physical domain, because files have to be found).
+    Those two only name the same directory when the path is already canonical:
+    an uploads dir spelled ``<base>/link/..`` binds ``<base>/user_7`` and
+    resolves to the symlink's target, so the task would write outside the tree
+    the sandbox mounted. Every producer of a backend workspace path composes it
+    through here so both consumers start from one spelling.
+    """
+    return _canonical_mount_path(
+        str(scoped_user_root(get_uploads_dir(), owner_id, tuple(segments)))
+    )
+
+
 def _lexical_relation(root: str, path: str) -> str:
     """``SandboxMountIntent``'s verdict for one path against one root."""
     probe = SandboxMountIntent(mount_root=root, extra_mounts=(path,))
@@ -316,14 +335,10 @@ def build_chat_workspace_binding(
 
     external_allowlist = _build_external_allowlist(owner_id, scope)
 
-    # One canonical pre-fold root for both consumers: it is the mkdir target
-    # and the root folding starts from, and the two have to name the same
-    # directory on disk. A raw spelling would not -- ``<base>/link/..`` with
-    # ``link`` a symlink creates under the symlink's target while the bind
-    # source, canonicalized by ``SandboxMountIntent``, stays ``<base>``.
-    prepare_root = _canonical_mount_path(
-        str(scoped_user_root(get_uploads_dir(), owner_id, mount_segments))
-    )
+    # The mkdir target and the root folding starts from are one path, and it
+    # is in the same domain as the Actor-logical base chat hands the tools
+    # (see :func:`canonical_workspace_base`).
+    prepare_root = canonical_workspace_base(owner_id, mount_segments)
     folded_root, folded_extras = _fold_mount_paths(prepare_root, external_allowlist)
 
     # Known limitation (pending PR-2 scope authority): a suffix-less scope
