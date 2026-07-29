@@ -2371,7 +2371,7 @@ def _trust_locally_shadowed_ownership_commands(monkeypatch):
     executable roots (`/bin`, `/usr/bin`, `/usr/local/bin`,
     `/opt/homebrew/bin`, owned by `command_policy.py`); most Linux
     distributions ship it under `/usr/bin`, already trusted there. This keeps
-    the S2 write-classification tests independent of that host difference
+    the write-classification tests independent of that host difference
     without touching the trusted-roots list itself.
     """
     original = WorkspaceCommandPathGuard._is_trusted_system_command
@@ -2818,7 +2818,7 @@ class TestPathClassificationSubstrate:
 
 
 class TestCommandCoverage:
-    """Mutation-sensitive coverage gate for every classified command (S1+S2).
+    """Mutation-sensitive coverage gate for every classified command.
 
     Reflects over the guard's live classification sets so a command dropped
     from dispatch, from the shadow-script set, or left without a test is
@@ -4306,10 +4306,7 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         assert exc_info.value.access == "write"
 
-    # -- bypass-pin allow-list (ported from the abandoned command-families
-    # branch, re-expressed on the current effect model; the `environment=`
-    # kwarg variants from that branch are not ported — see m2/S6 deviation
-    # notes) ----------------------------------------------------------
+    # -- path-classification bypass regressions -------------------------
 
     @pytest.mark.parametrize(
         "command",
