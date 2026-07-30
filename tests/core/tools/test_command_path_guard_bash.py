@@ -3252,62 +3252,90 @@ class TestCommandCoverage:
         "wget": "_check_wget",
     }
 
-    # Each entry: (positive command, negative command template with `{outside}`).
-    _REGISTRY: dict[str, tuple[str, str]] = {
-        "cat": ("cat own.txt", "cat {outside}"),
-        "cmp": ("cmp own.txt own.txt", "cmp own.txt {outside}"),
-        "file": ("file own.txt", "file {outside}"),
-        "head": ("head -n 1 own.txt", "head -n 1 {outside}"),
-        "less": ("less own.txt", "less {outside}"),
-        "ls": ("ls own.txt", "ls {outside}"),
-        "more": ("more own.txt", "more {outside}"),
-        "stat": ("stat own.txt", "stat {outside}"),
-        "tac": ("tac -s , own.txt", "tac -s , {outside}"),
-        "tail": ("tail -n 1 own.txt", "tail -n 1 {outside}"),
-        "wc": ("wc own.txt", "wc {outside}"),
-        "cut": ("cut -d , -f 1 own.txt", "cut -d , -f 1 {outside}"),
-        "sort": ("sort own.txt", "sort {outside}"),
-        "uniq": ("uniq own.txt", "uniq {outside}"),
-        "diff": ("diff own.txt own.txt", "diff own.txt {outside}"),
-        "grep": ("grep pattern own.txt", "grep pattern {outside}"),
-        "chmod": ("chmod 755 own.txt", "chmod 755 {outside}"),
-        "chown": ("chown owner own.txt", "chown owner {outside}"),
-        "chgrp": ("chgrp staff own.txt", "chgrp staff {outside}"),
-        "mkdir": ("mkdir own_new_dir", "mkdir {outside}"),
-        "rm": ("rm own.txt", "rm {outside}"),
-        "rmdir": ("rmdir own_dir", "rmdir {outside}"),
-        "tee": ("tee own.txt", "tee {outside}"),
-        "touch": ("touch own.txt", "touch {outside}"),
-        "truncate": ("truncate -s 1 own.txt", "truncate -s 1 {outside}"),
-        "cp": ("cp own.txt dest.txt", "cp own.txt {outside}"),
-        "install": ("install own.txt dest.txt", "install own.txt {outside}"),
-        "mv": ("mv own.txt dest.txt", "mv own.txt {outside}"),
-        "ln": ("ln own.txt dest.txt", "ln own.txt {outside}"),
-        "unlink": ("unlink own.txt", "unlink {outside}"),
-        "shred": ("shred own.txt", "shred {outside}"),
-        "find": ("find own.txt -print", "find {outside}"),
-        "tar": ("tar -cf archive.tar own.txt", "tar -cf archive.tar {outside}"),
-        "sed": ("sed 's/a/b/' own.txt", "sed 'w {outside}' own.txt"),
+    # Each entry: (positive command, negative command template with
+    # `{outside}`, expected `CommandPathViolation.access` the negative
+    # template's out-of-workspace target is checked as). The expected access
+    # is asserted by both negative-case tests below so a write silently
+    # downgraded to a read (or vice versa) fails the gate mechanically
+    # instead of only being caught by exception type.
+    _REGISTRY: dict[str, tuple[str, str, str]] = {
+        "cat": ("cat own.txt", "cat {outside}", "read"),
+        "cmp": ("cmp own.txt own.txt", "cmp own.txt {outside}", "read"),
+        "file": ("file own.txt", "file {outside}", "read"),
+        "head": ("head -n 1 own.txt", "head -n 1 {outside}", "read"),
+        "less": ("less own.txt", "less {outside}", "read"),
+        "ls": ("ls own.txt", "ls {outside}", "read"),
+        "more": ("more own.txt", "more {outside}", "read"),
+        "stat": ("stat own.txt", "stat {outside}", "read"),
+        "tac": ("tac -s , own.txt", "tac -s , {outside}", "read"),
+        "tail": ("tail -n 1 own.txt", "tail -n 1 {outside}", "read"),
+        "wc": ("wc own.txt", "wc {outside}", "read"),
+        "cut": ("cut -d , -f 1 own.txt", "cut -d , -f 1 {outside}", "read"),
+        "sort": ("sort own.txt", "sort {outside}", "read"),
+        "uniq": ("uniq own.txt", "uniq {outside}", "read"),
+        "diff": ("diff own.txt own.txt", "diff own.txt {outside}", "read"),
+        "grep": ("grep pattern own.txt", "grep pattern {outside}", "read"),
+        "chmod": ("chmod 755 own.txt", "chmod 755 {outside}", "write"),
+        "chown": ("chown owner own.txt", "chown owner {outside}", "write"),
+        "chgrp": ("chgrp staff own.txt", "chgrp staff {outside}", "write"),
+        "mkdir": ("mkdir own_new_dir", "mkdir {outside}", "write"),
+        "rm": ("rm own.txt", "rm {outside}", "write"),
+        "rmdir": ("rmdir own_dir", "rmdir {outside}", "write"),
+        "tee": ("tee own.txt", "tee {outside}", "write"),
+        "touch": ("touch own.txt", "touch {outside}", "write"),
+        "truncate": ("truncate -s 1 own.txt", "truncate -s 1 {outside}", "write"),
+        "cp": ("cp own.txt dest.txt", "cp own.txt {outside}", "write"),
+        "install": (
+            "install own.txt dest.txt",
+            "install own.txt {outside}",
+            "write",
+        ),
+        "mv": ("mv own.txt dest.txt", "mv own.txt {outside}", "write"),
+        "ln": ("ln own.txt dest.txt", "ln own.txt {outside}", "write"),
+        "unlink": ("unlink own.txt", "unlink {outside}", "write"),
+        "shred": ("shred own.txt", "shred {outside}", "write"),
+        "find": ("find own.txt -print", "find {outside}", "read"),
+        "tar": (
+            "tar -cf archive.tar own.txt",
+            "tar -cf archive.tar {outside}",
+            "read",
+        ),
+        "sed": ("sed 's/a/b/' own.txt", "sed 'w {outside}' own.txt", "write"),
         "awk": (
             "awk '{print $0}' own.txt",
             "awk '{{print $0 > \"{outside}\"}}' own.txt",
+            "write",
         ),
-        "dd": ("dd if=own.txt of=dest.bin", "dd if=own.txt of={outside}"),
+        "dd": ("dd if=own.txt of=dest.bin", "dd if=own.txt of={outside}", "write"),
         "base64": (
             "base64 -i own.txt -o own.b64",
             "base64 -i own.txt -o {outside}",
+            "write",
         ),
-        "gzip": ("gzip own.txt", "gzip {outside}"),
-        "rsync": ("rsync own.txt dest.txt", "rsync own.txt {outside}"),
+        "gzip": ("gzip own.txt", "gzip {outside}", "write"),
+        "rsync": ("rsync own.txt dest.txt", "rsync own.txt {outside}", "write"),
         "curl": (
             "curl -o out.bin https://example.invalid/file",
             "curl -o {outside} https://example.invalid/file",
+            "write",
         ),
         "wget": (
             "wget -O out.bin https://example.invalid/file",
             "wget -O {outside} https://example.invalid/file",
+            "write",
         ),
     }
+
+    # Registry entries whose negative case exercises a write-owning slot;
+    # these are also probed against a read-ALLOWED external directory (not
+    # only a fully-out-of-workspace sibling) so a write silently downgraded
+    # to read cannot hide behind a target that both classifications would
+    # reject anyway.
+    _WRITE_ACCESS_COMMANDS = frozenset(
+        command_name
+        for command_name, (_, _, access) in _REGISTRY.items()
+        if access == "write"
+    )
 
     @staticmethod
     def _all_commands() -> frozenset:
@@ -3376,7 +3404,7 @@ class TestCommandCoverage:
         (workspace.output_dir / "own.txt").write_text("data\n", encoding="utf-8")
         _trust_locally_shadowed_ownership_commands(monkeypatch)
         guard = WorkspaceCommandPathGuard(workspace)
-        positive_command, _ = self._REGISTRY[command_name]
+        positive_command, _, _ = self._REGISTRY[command_name]
 
         guard.validate(positive_command)
 
@@ -3388,12 +3416,40 @@ class TestCommandCoverage:
         (workspace.output_dir / "own.txt").write_text("data\n", encoding="utf-8")
         _trust_locally_shadowed_ownership_commands(monkeypatch)
         guard = WorkspaceCommandPathGuard(workspace)
-        _, negative_template = self._REGISTRY[command_name]
+        _, negative_template, expected_access = self._REGISTRY[command_name]
 
-        with pytest.raises(CommandPathViolation):
+        with pytest.raises(CommandPathViolation) as exc_info:
             guard.validate(
                 negative_template.format(outside=shlex.quote(str(sibling_file)))
             )
+
+        # A write silently downgraded to a read (or vice versa) must not
+        # pass this gate merely because SOME violation was raised.
+        assert exc_info.value.access == expected_access
+
+    @pytest.mark.parametrize("command_name", sorted(_WRITE_ACCESS_COMMANDS))
+    def test_registry_negative_case_rejects_read_allowed_external_dir_as_write(
+        self, scoped_command_workspace, command_name, monkeypatch
+    ):
+        # A write-owning option's target must be rejected even when pointed
+        # at a directory the workspace approves for READ (`external_file`),
+        # not only a fully-out-of-workspace sibling both read and write
+        # already reject alike. This is the read/write-confusion case a
+        # target that is universally denied can never exercise: a write
+        # silently downgraded to a read would otherwise still raise here
+        # (external reads are allowed) and the gate would stay green.
+        workspace, external_file, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("data\n", encoding="utf-8")
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
+        guard = WorkspaceCommandPathGuard(workspace)
+        _, negative_template, _ = self._REGISTRY[command_name]
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                negative_template.format(outside=shlex.quote(str(external_file)))
+            )
+
+        assert exc_info.value.access == "write"
 
 
 class TestCdSymlinkTraversal:
