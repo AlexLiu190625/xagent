@@ -28,6 +28,7 @@
     identity_mismatch: true,
     rate_limited: true
   };
+  // Only diagnostic reasons defined by public issue #983 may be logged.
   var SESSION_ERROR_REASONS = {
     agent_not_granted: {
       origin_not_allowed: true
@@ -57,7 +58,7 @@
   }
 
   function isPlainSessionErrorObject(value) {
-    if (!value || Object.prototype.toString.call(value) !== '[object Object]') return false;
+    if (!value || typeof value !== 'object') return false;
     var prototype = Object.getPrototypeOf(value);
     return prototype === Object.prototype || prototype === null;
   }
@@ -69,9 +70,7 @@
   }
 
   function sessionErrorEnvelope(result) {
-    if (!isPlainSessionErrorObject(result) ||
-        !Object.prototype.hasOwnProperty.call(result, 'data') ||
-        !isPlainSessionErrorObject(result.data) ||
+    if (!isPlainSessionErrorObject(result.data) ||
         !Object.prototype.hasOwnProperty.call(result.data, 'error') ||
         !isPlainSessionErrorObject(result.data.error)) {
       return { code: null, reason: null };
@@ -754,7 +753,8 @@
     }
 
     function classifySessionFailure(result) {
-      if (result && result.syntheticCode) return { code: result.syntheticCode, reason: null };
+      var syntheticCode = ownSessionErrorString(result, 'syntheticCode');
+      if (syntheticCode) return { code: syntheticCode, reason: null };
       var envelope = sessionErrorEnvelope(result);
       if (isKnownSessionErrorCode(envelope.code)) return envelope;
       if (result.status >= 500) return { code: 'network_unavailable', reason: null };

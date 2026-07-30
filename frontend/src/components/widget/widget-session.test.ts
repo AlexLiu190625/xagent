@@ -17,12 +17,7 @@ const RECONNECT_URL = `${HOST}/v1/external/chat/sessions/reconnect`
 
 const fetchMock = vi.fn()
 
-type SessionFailureTestSeam = {
-  parse: (result: unknown) => { code: string | null; reason: string | null }
-  classify: (result: unknown) => { code: string; reason: string | null }
-}
-
-function runWidget(attributes: Record<string, string>, exposeClassifier = false) {
+function runWidget(attributes: Record<string, string>) {
   const script = document.createElement("script")
   script.src = `${HOST}/widget.js`
   for (const [name, value] of Object.entries(attributes)) {
@@ -30,13 +25,7 @@ function runWidget(attributes: Record<string, string>, exposeClassifier = false)
   }
   document.body.appendChild(script)
   Object.defineProperty(document, "currentScript", { configurable: true, value: script })
-  const executable = exposeClassifier
-    ? widgetScript.replace(
-      "    return { attach: attach };",
-      "    window.__xagentWidgetTestSessionFailure = { parse: sessionErrorEnvelope, classify: classifySessionFailure };\n    return { attach: attach };",
-    )
-    : widgetScript
-  window.eval(`${executable}\n//# sourceURL=${widgetScriptUrl}`)
+  window.eval(`${widgetScript}\n//# sourceURL=${widgetScriptUrl}`)
   return script
 }
 
@@ -104,14 +93,6 @@ function directJsonResponse(status: number, data: unknown): Response {
     headers: new Headers(),
     json: () => Promise.resolve(data),
   } as Response
-}
-
-function exposedSessionFailureTestSeam(): SessionFailureTestSeam {
-  const seam = (window as unknown as {
-    __xagentWidgetTestSessionFailure?: SessionFailureTestSeam
-  }).__xagentWidgetTestSessionFailure
-  if (!seam) throw new Error("session failure test seam was not exposed")
-  return seam
 }
 
 function proxyWithInheritedValue(target: Record<string, unknown>, key: string, value: unknown) {
@@ -194,7 +175,6 @@ describe("widget session mode", () => {
     localStorage.clear()
     // The grant dedupe registry lives on window and survives between tests in a file.
     Reflect.deleteProperty(window as unknown as Record<string, unknown>, "__xagentWidgetGrants")
-    Reflect.deleteProperty(window as unknown as Record<string, unknown>, "__xagentWidgetTestSessionFailure")
     vi.stubGlobal("fetch", fetchMock)
     fetchMock.mockReset()
 
@@ -219,8 +199,6 @@ describe("widget session mode", () => {
       window.removeEventListener(type, listener)
     }
     windowListeners = []
-    Reflect.deleteProperty(window as unknown as Record<string, unknown>, "__xagentWidgetTestSessionFailure")
-
     if (currentScriptDescriptor) {
       Object.defineProperty(document, "currentScript", currentScriptDescriptor)
     } else {
@@ -818,6 +796,70 @@ describe("widget session mode", () => {
     })
   })
 
+  it("ignores an inherited synthetic session failure code", async () => {
+    const syntheticCodeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, "syntheticCode")
+    Object.defineProperty(Object.prototype, "syntheticCode", {
+      configurable: true,
+      value: "network_unavailable",
+    })
+    try {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(jsonResponse(403, {
+        error: {
+          code: "agent_not_granted",
+          reason: "origin_not_allowed",
+        },
+      }))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+        "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
+      ))
+      fromIframe("ready")
+
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "agent_not_granted" })
+    } finally {
+      if (syntheticCodeDescriptor) {
+        Object.defineProperty(Object.prototype, "syntheticCode", syntheticCodeDescriptor)
+      } else {
+        Reflect.deleteProperty(Object.prototype, "syntheticCode")
+      }
+    }
+  })
+
+  it("keeps a registered diagnostic intact when Object.prototype has a toString tag", async () => {
+    const toStringTagDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, Symbol.toStringTag)
+    Object.defineProperty(Object.prototype, Symbol.toStringTag, {
+      configurable: true,
+      value: "polluted",
+    })
+    try {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(jsonResponse(403, {
+        error: {
+          code: "agent_not_granted",
+          reason: "origin_not_allowed",
+        },
+      }))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+        "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
+      ))
+      fromIframe("ready")
+
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "agent_not_granted" })
+    } finally {
+      if (toStringTagDescriptor) {
+        Object.defineProperty(Object.prototype, Symbol.toStringTag, toStringTagDescriptor)
+      } else {
+        Reflect.deleteProperty(Object.prototype, Symbol.toStringTag)
+      }
+    }
+  })
+
   it("keeps the existing exchange diagnostic unchanged when the reason is absent", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
     fetchMock.mockResolvedValueOnce(errorResponse(403, "agent_not_granted"))
@@ -859,117 +901,79 @@ describe("widget session mode", () => {
   })
 
   it.each([
+    ["root array", () => ["agent_not_granted", "origin_not_allowed"], "unexpected_error"],
+    ["missing error", () => ({}), "unexpected_error"],
+    ["null error", () => ({ error: null }), "unexpected_error"],
+    ["error array", () => ({ error: ["agent_not_granted", "origin_not_allowed"] }), "unexpected_error"],
+    ["non-string code", () => ({ error: { code: 42, reason: "origin_not_allowed", message: "sentinel" } }), "unexpected_error"],
+    ["non-string code array", () => ({ error: { code: ["agent_not_granted"], reason: "origin_not_allowed", message: "sentinel" } }), "unexpected_error"],
     ["missing reason", () => ({ error: { code: "agent_not_granted", message: "sentinel" } }), "agent_not_granted"],
     ["null reason", () => ({ error: { code: "agent_not_granted", reason: null, message: "sentinel" } }), "agent_not_granted"],
     ["non-string reason", () => ({ error: { code: "agent_not_granted", reason: 42, message: "sentinel" } }), "agent_not_granted"],
+    ["non-string reason array", () => ({ error: { code: "agent_not_granted", reason: ["origin_not_allowed"], message: "sentinel" } }), "agent_not_granted"],
     ["unregistered reason", () => ({ error: { code: "agent_not_granted", reason: "future_reason", message: "sentinel" } }), "agent_not_granted"],
     ["prototype-key reason", () => ({ error: { code: "agent_not_granted", reason: "toString", message: "sentinel" } }), "agent_not_granted"],
-    ["malformed error", () => ({ error: ["agent_not_granted", "origin_not_allowed"] }), "unexpected_error"],
-  ])("suppresses an untrusted %s diagnostic component", async (_case, makeData, expectedCode) => {
+  ])("suppresses an untrusted %s diagnostic component from a JSON response", async (_case, makeData, expectedCode) => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-    fetchMock.mockResolvedValueOnce(directJsonResponse(403, makeData()))
+    fetchMock.mockResolvedValueOnce(jsonResponse(403, makeData()))
     runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
 
     await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
       `Xagent Widget: chat unavailable [${expectedCode}] (HTTP 403).`,
     ))
     expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("origin_not_allowed"))
     expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("sentinel"))
-  })
+    fromIframe("ready")
 
-  it("accepts the registered diagnostic pair from null-prototype envelope objects", async () => {
-    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-    const error = Object.assign(Object.create(null), {
-      code: "agent_not_granted",
-      reason: "origin_not_allowed",
-    })
-    const data = Object.assign(Object.create(null), { error })
-    fetchMock.mockResolvedValueOnce(directJsonResponse(403, data))
-    runWidget({ "data-encrypted-context": GRANT })
-
-    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
-      "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
-    ))
-  })
-
-  it("gives synthetic session failures precedence over a registered server diagnostic", () => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
-    runWidget({ "data-encrypted-context": GRANT }, true)
-    const { classify } = exposedSessionFailureTestSeam()
-
-    expect(classify({
-      syntheticCode: "network_unavailable",
-      status: 403,
-      data: { error: { code: "agent_not_granted", reason: "origin_not_allowed" } },
-    })).toEqual({ code: "network_unavailable", reason: null })
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: expectedCode })
   })
 
   it.each([
     [
-      "result.data",
-      () => proxyWithInheritedValue(
-        { status: 403 },
-        "data",
-        { error: { code: "agent_not_granted", reason: "origin_not_allowed" } },
-      ),
-      { code: null, reason: null },
-    ],
-    [
       "data.error",
-      () => ({
-        status: 403,
-        data: proxyWithInheritedValue(
-          {},
-          "error",
-          { code: "agent_not_granted", reason: "origin_not_allowed" },
-        ),
-      }),
-      { code: null, reason: null },
+      () => proxyWithInheritedValue(
+        {},
+        "error",
+        { code: "agent_not_granted", reason: "origin_not_allowed" },
+      ),
+      "unexpected_error",
     ],
     [
       "error.code",
       () => ({
-        status: 403,
-        data: {
-          error: proxyWithInheritedValue(
-            { reason: "origin_not_allowed" },
-            "code",
-            "agent_not_granted",
-          ),
-        },
+        error: proxyWithInheritedValue(
+          { reason: "origin_not_allowed" },
+          "code",
+          "agent_not_granted",
+        ),
       }),
-      { code: null, reason: null },
+      "unexpected_error",
     ],
     [
       "error.reason",
       () => ({
-        status: 403,
-        data: {
-          error: proxyWithInheritedValue(
-            { code: "agent_not_granted" },
-            "reason",
-            "origin_not_allowed",
-          ),
-        },
+        error: proxyWithInheritedValue(
+          { code: "agent_not_granted" },
+          "reason",
+          "origin_not_allowed",
+        ),
       }),
-      { code: "agent_not_granted", reason: null },
+      "agent_not_granted",
     ],
-  ])("rejects the inherited %s boundary without short-circuiting an outer parser guard", (_boundary, makeResult, expected) => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
-    runWidget({ "data-encrypted-context": GRANT }, true)
+  ])("suppresses an inherited %s diagnostic component", async (_boundary, makeData, expectedCode) => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(directJsonResponse(403, makeData()))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
 
-    expect(exposedSessionFailureTestSeam().parse(makeResult())).toEqual(expected)
-  })
+    await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      `Xagent Widget: chat unavailable [${expectedCode}] (HTTP 403).`,
+    ))
+    expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("origin_not_allowed"))
+    fromIframe("ready")
 
-  it.each([
-    ["missing error", { status: 403, data: {} }],
-    ["null error", { status: 403, data: { error: null } }],
-    ["non-string code", { status: 403, data: { error: { code: 42, reason: "origin_not_allowed" } } }],
-  ])("rejects a %s envelope component", (_case, result) => {
-    fetchMock.mockResolvedValueOnce(jsonResponse(200, exchangeBody()))
-    runWidget({ "data-encrypted-context": GRANT }, true)
-
-    expect(exposedSessionFailureTestSeam().parse(result)).toEqual({ code: null, reason: null })
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: expectedCode })
   })
 
   it("does not retry a coded 4xx and reports unexpected_error for an uncoded one", async () => {
