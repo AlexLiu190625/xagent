@@ -7,7 +7,6 @@ from sqlalchemy.orm import Session
 
 from xagent.core.execution_scope import (
     EXECUTION_SCOPE_AGENT_CONFIG_KEY,
-    EXECUTION_SCOPE_SHAPE_VERSION,
     get_execution_scope,
 )
 from xagent.core.tools.adapters.vibe.agent_tool_names import (
@@ -379,17 +378,10 @@ def build_workforce_task_config(
     # authoritative only when a resolver defers to it or none is registered,
     # and is ignored when its version predates the current shape -- so the
     # run stays scoped across a process restart without ever overriding a
-    # registered resolver's answer.
+    # registered resolver's answer. ``to_dict()`` always stamps the current
+    # shape version, regardless of whether the in-context scope was itself
+    # decoded from an older persisted snapshot.
     scope = get_execution_scope()
     if scope is not None:
-        snapshot_data = scope.to_dict()
-        # Stamp the current shape version rather than propagating
-        # ``scope.version``: the dict below is being constructed *now*, in
-        # the current shape, regardless of whether the in-context scope was
-        # itself decoded from an older persisted snapshot (which would carry
-        # a stale/low version). Propagating that stale value here would let
-        # a decoded-then-re-persisted scope masquerade as pre-dating fields
-        # it actually has, permanently ignoring it as a candidate.
-        snapshot_data["version"] = EXECUTION_SCOPE_SHAPE_VERSION
-        config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = snapshot_data
+        config[EXECUTION_SCOPE_AGENT_CONFIG_KEY] = scope.to_dict()
     return config

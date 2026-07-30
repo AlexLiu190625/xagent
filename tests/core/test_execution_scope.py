@@ -1,12 +1,9 @@
 """Unit tests for core/execution_scope.py.
 
-Slice 1 of #757: the ExecutionScope skeleton carries no consumers yet, so
-these tests cover the value type, the contextvar helpers, the resolver hook,
-and the per-turn activation contract (including restart/resume re-resolution).
-
-The resolver is authoritative
-over a persisted snapshot rather than always losing to it. The resolver
-fixtures below register through
+Covers the value type, the contextvar helpers, the resolver hook, and the
+per-turn activation contract (including restart/resume re-resolution). The
+resolver is authoritative over a persisted snapshot rather than always
+losing to it. The resolver fixtures below register through
 ``acknowledges_snapshot_candidate_contract=True`` -- see
 ``TestSnapshotCandidateAuthority`` for the full resolver/snapshot precedence
 matrix and ``tests/web/test_execution_scope_delegation.py`` for the
@@ -477,7 +474,7 @@ class TestTurnExecutionScope:
 
 
 class TestDeferToSnapshot:
-    """The carrier for a resolver's explicit abstention ."""
+    """The carrier for a resolver's explicit abstention."""
 
     def test_requires_an_execution_scope_fallback(self):
         with pytest.raises(TypeError):
@@ -542,6 +539,46 @@ class TestExecutionScopeAuthorityErrorInheritance:
     def test_is_a_plain_exception(self):
         assert issubclass(ExecutionScopeAuthorityError, Exception)
 
+    def test_str_carries_task_id_and_field_names_never_values(self):
+        """``str()`` on this exception ends up in ``task.error_message`` and
+        in the client's terminal error event (see this class's docstring for
+        the exact surfacing sites), so it must never leak the scope values
+        -- e.g. ``sandbox_key_suffix``/``workspace_segments``/
+        ``memory_dimensions`` -- which can carry end-user/client
+        identifiers. Only the task id and the mismatched field *names* are
+        safe to include."""
+        resolver_scope = ExecutionScope(
+            sandbox_key_suffix="resolver-secret-suffix",
+            workspace_segments=("resolver-secret-segment",),
+        )
+        snapshot_scope = ExecutionScope(
+            sandbox_key_suffix="snapshot-secret-suffix",
+            workspace_segments=("snapshot-secret-segment",),
+        )
+        exc = ExecutionScopeAuthorityError(
+            "task-123",
+            resolver_scope=resolver_scope,
+            snapshot_scope=snapshot_scope,
+            mismatched_fields={
+                "sandbox_key_suffix": (
+                    snapshot_scope.sandbox_key_suffix,
+                    resolver_scope.sandbox_key_suffix,
+                ),
+                "workspace_segments": (
+                    snapshot_scope.workspace_segments,
+                    resolver_scope.workspace_segments,
+                ),
+            },
+        )
+        message = str(exc)
+        assert "task-123" in message
+        assert "sandbox_key_suffix" in message
+        assert "workspace_segments" in message
+        assert "resolver-secret-suffix" not in message
+        assert "snapshot-secret-suffix" not in message
+        assert "resolver-secret-segment" not in message
+        assert "snapshot-secret-segment" not in message
+
 
 class TestExecutionScopeResolverContractErrorInheritance:
     """Pin: the resolve-boundary "unknown return type" error
@@ -578,7 +615,7 @@ class TestExecutionScopeResolverContractErrorInheritance:
 
 
 class TestExecutionScopeShapeVersionAlignment:
-    """``to_dict``'s key set must track every dataclass field (1a precedent:
+    """``to_dict``'s key set must track every dataclass field (precedent:
     test_runtime_spec.py:315) so a newly added field cannot silently miss
     persistence -- which would make a historical snapshot indistinguishable
     from a current one that simply left the field at its default."""
@@ -595,6 +632,18 @@ class TestExecutionScopeShapeVersionAlignment:
         del data["version"]
         assert ExecutionScope.from_dict(data).version == 0
 
+    def test_from_dict_string_version_is_coerced_to_int(self):
+        """A JSON-decoded snapshot carries ``version`` as whatever type the
+        wire format gave it; ``from_dict`` must coerce it to ``int`` so a
+        stringly-typed ``"1"`` still compares equal to
+        ``EXECUTION_SCOPE_SHAPE_VERSION`` in ``resolve_execution_scope``
+        instead of being silently treated as a shape mismatch."""
+        data = ExecutionScope(sandbox_key_suffix="x").to_dict()
+        data["version"] = str(EXECUTION_SCOPE_SHAPE_VERSION)
+        decoded = ExecutionScope.from_dict(data)
+        assert decoded.version == EXECUTION_SCOPE_SHAPE_VERSION
+        assert isinstance(decoded.version, int)
+
     def test_version_is_excluded_from_equality(self):
         current = ExecutionScope(sandbox_key_suffix="x")
         legacy_data = current.to_dict()
@@ -602,6 +651,44 @@ class TestExecutionScopeShapeVersionAlignment:
         legacy = ExecutionScope.from_dict(legacy_data)
         assert legacy.version == 0
         assert legacy == current
+
+    def test_to_dict_stamps_current_version_even_from_a_stale_scope(self):
+        """``to_dict()`` always stamps :data:`EXECUTION_SCOPE_SHAPE_VERSION`,
+        never ``self.version``: the dict it returns is being built *now*, in
+        the current shape, regardless of whether ``self`` was itself decoded
+        from an older snapshot (stale ``.version``). Propagating that stale
+        value would let a decoded-then-re-persisted scope masquerade as
+        pre-dating fields it actually has, permanently ignoring it as a
+        candidate in ``resolve_execution_scope``."""
+        stale_data = ExecutionScope(sandbox_key_suffix="x").to_dict()
+        stale_data["version"] = 0
+        stale_scope = ExecutionScope.from_dict(stale_data)
+        assert stale_scope.version == 0
+        assert stale_scope.to_dict()["version"] == EXECUTION_SCOPE_SHAPE_VERSION
+
+    def test_shape_version_bump_requires_touching_this_pin(self):
+        """Pins the exact field set ``EXECUTION_SCOPE_SHAPE_VERSION`` == 1
+        was cut for. A namespace-affecting field can be added --
+        wired into ``to_dict``/``from_dict``/
+        ``_EXECUTION_SCOPE_NAMESPACE_FIELDS``/``scope_fingerprint`` -- and
+        pass the rest of the suite without bumping the shape version, which
+        would make every already-persisted snapshot compare against a wider
+        shape it never had a chance to opt into, and
+        ``resolve_execution_scope`` would fail every turn touching one until
+        the version is bumped. This test forces the field set to be
+        re-affirmed (and the version bumped) on the next field addition
+        instead of drifting unnoticed."""
+        field_names = {f.name for f in dataclasses.fields(ExecutionScope)}
+        assert field_names == {
+            "sandbox_key_suffix",
+            "workspace_segments",
+            "sandbox_mount_segments",
+            "memory_dimensions",
+            "strict_memory_isolation",
+            "isolate_external_dirs",
+            "version",
+        }
+        assert EXECUTION_SCOPE_SHAPE_VERSION == 1
 
 
 class TestSnapshotCandidateAuthority:
@@ -727,6 +814,18 @@ class TestSnapshotCandidateAuthority:
         self._register(lambda task_id: self.RESOLVER_SCOPE, boom)
         assert resolve_execution_scope("1") == self.RESOLVER_SCOPE
 
+    def test_snapshot_wrong_type_raises_contract_error_not_attribute_error(self):
+        """A snapshot loader is held to the same return-type discipline as
+        the resolver. Without the shared validation funnel, a non-scope
+        candidate would reach the ``.version`` comparison below and raise a
+        bare, undiagnosable ``AttributeError`` instead."""
+        self._register(
+            lambda task_id: self.RESOLVER_SCOPE,
+            lambda task_id: {"not": "a scope"},
+        )
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope("1")
+
     # --- resolver returns DeferToSnapshot -----------------------------------
     def test_defer_uses_snapshot_when_present(self):
         snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
@@ -744,13 +843,157 @@ class TestSnapshotCandidateAuthority:
         )
         assert resolve_execution_scope("1") == fallback
 
-    def test_defer_uses_fallback_when_loader_is_broken(self):
+    def test_defer_loader_exception_propagates(self):
+        """Unlike the authoritative branch (``test_broken_snapshot_loader_
+        does_not_veto_resolver_scope`` above), a broken loader here must fail
+        the turn: the resolver has just said it does not know this task's
+        scope, so a broken candidate means nobody knows, and turn faces that
+        reach this branch must fail closed rather than silently proceed
+        under a possibly-wrong fallback."""
+
         def boom(task_id):
             raise RuntimeError("db down")
 
         fallback = ExecutionScope(strict_memory_isolation=True)
         self._register(lambda task_id: defer_to_snapshot(fallback), boom)
-        assert resolve_execution_scope("1") == fallback
+        with pytest.raises(RuntimeError, match="db down"):
+            resolve_execution_scope("1")
+
+    def test_defer_snapshot_wrong_type_raises_contract_error(self):
+        """A snapshot loader is held to the same return-type discipline as
+        the resolver: it must return an ExecutionScope or None."""
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: {"not": "a scope"},
+        )
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope("1")
+
+    def test_defer_snapshot_carrier_from_loader_raises_contract_error(self):
+        """A loader returning a DeferToSnapshot (instead of an actual
+        snapshot) is exactly as invalid as a raw dict -- both fail the same
+        isinstance(ExecutionScope) gate."""
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: defer_to_snapshot(ExecutionScope()),
+        )
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope("1")
+
+    def test_defer_stale_version_snapshot_is_ignored_falls_back(self, caplog):
+        fallback = ExecutionScope(sandbox_key_suffix="fallback")
+        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+        del stale_data["version"]
+        stale_snapshot = ExecutionScope.from_dict(stale_data)
+        assert stale_snapshot.version == 0
+
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: stale_snapshot,
+        )
+        with caplog.at_level(logging.WARNING, logger="xagent.core.execution_scope"):
+            assert resolve_execution_scope("1") == fallback
+        assert any(
+            "shape" in r.message and "sandbox_key_suffix" in r.message
+            for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        "field_name,fallback_kwargs,snapshot_kwargs",
+        [
+            (
+                "sandbox_key_suffix",
+                {"sandbox_key_suffix": "fallback-suffix"},
+                {"sandbox_key_suffix": "different-suffix"},
+            ),
+            (
+                "workspace_segments",
+                {"workspace_segments": ("tenant-a", "b")},
+                {"workspace_segments": ("tenant-a",)},
+            ),
+            (
+                "sandbox_mount_segments",
+                {
+                    "workspace_segments": ("tenant-a", "b", "c"),
+                    "sandbox_mount_segments": ("tenant-a", "b", "c"),
+                },
+                {
+                    "workspace_segments": ("tenant-a", "b", "c"),
+                    "sandbox_mount_segments": ("tenant-a",),
+                },
+            ),
+            (
+                "isolate_external_dirs",
+                {"isolate_external_dirs": True},
+                {"isolate_external_dirs": False},
+            ),
+            (
+                "memory_dimensions",
+                {"memory_dimensions": {"k": "v"}},
+                {"memory_dimensions": {}},
+            ),
+        ],
+    )
+    def test_defer_snapshot_widening_fallback_fails_the_turn(
+        self, field_name, fallback_kwargs, snapshot_kwargs
+    ):
+        """A snapshot that is *wider* than the resolver's mandatory fallback
+        on any namespace field must fail the turn: the snapshot is
+        client-influenceable (an ``execution_scope`` key inside a
+        client-supplied ``agent_config``), so an unchecked snapshot here
+        would let a caller widen its own namespace past the resolver's own
+        most conservative answer."""
+        fallback = ExecutionScope(**fallback_kwargs)
+        snapshot = ExecutionScope(**snapshot_kwargs)
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: snapshot,
+        )
+
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
+            resolve_execution_scope("1")
+        assert field_name in exc_info.value.mismatched_fields
+        assert exc_info.value.resolver_scope == fallback
+        assert exc_info.value.snapshot_scope == snapshot
+
+    @pytest.mark.parametrize(
+        "fallback_kwargs,snapshot_kwargs",
+        [
+            ({}, {"sandbox_key_suffix": "narrower"}),
+            (
+                {"workspace_segments": ("tenant-a",)},
+                {"workspace_segments": ("tenant-a", "sub")},
+            ),
+            (
+                {"isolate_external_dirs": False},
+                {"isolate_external_dirs": True},
+            ),
+            (
+                {"memory_dimensions": {"k": "v"}},
+                {"memory_dimensions": {"k": "v", "k2": "v2"}},
+            ),
+            (
+                {"sandbox_key_suffix": "same"},
+                {"sandbox_key_suffix": "same"},
+            ),
+        ],
+    )
+    def test_defer_snapshot_narrowing_fallback_is_accepted(
+        self, fallback_kwargs, snapshot_kwargs
+    ):
+        """The mirror of the widening cases above: a snapshot that only
+        narrows the fallback (equal, a deeper workspace path, external dirs
+        going shared->scope-local, or extra memory dimensions) is accepted
+        and used as the resolved scope."""
+        fallback = ExecutionScope(**fallback_kwargs)
+        snapshot = ExecutionScope(**snapshot_kwargs)
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: snapshot,
+        )
+        assert resolve_execution_scope("1") == snapshot
 
     # --- boundary judgment / resolver misbehavior ---------------------------
     def test_resolver_returning_unexpected_type_raises_contract_error(self):

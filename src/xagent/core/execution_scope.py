@@ -206,7 +206,15 @@ class ExecutionScope:
             "memory_dimensions": dict(self.memory_dimensions),
             "strict_memory_isolation": self.strict_memory_isolation,
             "isolate_external_dirs": self.isolate_external_dirs,
-            "version": self.version,
+            # Always the current constant, never ``self.version``: this
+            # dict is being built *now*, in the current shape, regardless of
+            # whether ``self`` was itself decoded from an older persisted
+            # snapshot (which would carry a stale/low ``self.version``).
+            # Propagating that stale value here would let a
+            # decoded-then-re-persisted scope masquerade as pre-dating
+            # fields it actually has, permanently ignoring it as a
+            # candidate in resolve_execution_scope.
+            "version": EXECUTION_SCOPE_SHAPE_VERSION,
         }
 
     @classmethod
@@ -452,13 +460,18 @@ class ExecutionScopeContext:
 class DeferToSnapshot:
     """Resolver return value meaning "defer to the persisted snapshot".
 
-    Not an :class:`ExecutionScope`: it never enters
-    :func:`resolve_execution_scope`'s return value directly, is never
-    activated on the ``current_execution_scope`` contextvar, and carries no
-    scope attributes of its own. Construct via :func:`defer_to_snapshot`;
-    the ``fallback`` is used only when no snapshot is persisted for the
-    task (a task id the resolver's embedder does not itself recognize, with
-    no Task-table snapshot either).
+    Not an :class:`ExecutionScope`: the carrier itself never enters
+    :func:`resolve_execution_scope`'s return value or reaches the
+    ``current_execution_scope`` contextvar, and carries no scope attributes
+    of its own. What the carrier *resolves to* -- a validated snapshot that
+    narrows ``fallback``, or ``fallback`` itself when none is persisted (or
+    the persisted one fails validation) -- is exactly what gets returned and
+    activated instead, the same as any other resolved scope. Construct via
+    :func:`defer_to_snapshot`; ``fallback`` doubles as the mandatory floor a
+    persisted snapshot must narrow (see :func:`resolve_execution_scope`'s
+    abstention-branch validation) as well as the answer used when no
+    snapshot is persisted for the task (a task id the resolver's embedder
+    does not itself recognize, with no Task-table snapshot either).
     """
 
     __slots__ = ("fallback",)
@@ -589,30 +602,40 @@ def set_execution_scope_snapshot_loader(
     :func:`resolve_execution_scope`); with no resolver registered, it is the
     sole answer -- this is what keeps internally created tasks (workforce
     runs, whose ids the embedder's resolver cannot map) scoped across
-    process restarts. Loader exceptions fail the turn when no resolver is
-    registered; otherwise a broken candidate is logged and ignored rather
-    than vetoing the resolver's already-given authoritative answer.
+    process restarts. Loader exceptions fail the turn, except on the
+    branch where the resolver already returned a real ``ExecutionScope``:
+    there, a broken candidate is logged and ignored rather than vetoing an
+    authoritative answer that already exists. With no resolver registered,
+    or when the resolver abstained via :func:`defer_to_snapshot`, nobody has
+    an authoritative answer yet, so a broken loader fails the turn instead
+    of silently proceeding unscoped or under a stale fallback.
     """
     global _execution_scope_snapshot_loader
     _execution_scope_snapshot_loader = loader
 
 
 class ExecutionScopeResolverContractError(Exception):
-    """A registered resolver returned something outside its three-valued contract.
+    """A registered resolver or snapshot loader returned something outside its contract.
 
     Deliberately not a subclass of ``RuntimeError``, ``ValueError``, or
     ``TypeError``: several websocket handlers catch
     ``except (ValueError, KeyError, TypeError)`` around the turn-execution
     path and fold anything in that tuple into a generic "client message
-    format error" response. A resolver author's bug at the ``resolve_execution_scope``
-    boundary is a server-side contract violation, not a malformed client
-    message, and must not be swallowed by that handler as if it were one.
+    format error" response. A resolver or loader author's bug at the
+    ``resolve_execution_scope`` boundary is a server-side contract
+    violation, not a malformed client message, and must not be swallowed by
+    that handler as if it were one.
 
-    Only used for the return-type check inside ``resolve_execution_scope``
-    itself. The ``TypeError`` that :func:`set_execution_scope_resolver`
-    raises for a missing acknowledgment token is unrelated -- that happens
-    at registration time (embedder import/startup, before any request
-    handler exists) and is intentionally left as a plain ``TypeError``.
+    Used for two return-type checks inside ``resolve_execution_scope``: the
+    resolver's three-valued return, and a loaded snapshot that is neither
+    ``None`` nor an ``ExecutionScope`` -- a snapshot loader is held to the
+    same discipline as the resolver, since its output reaches the turn
+    contextvar on both branches (see
+    ``_validate_execution_scope_snapshot_candidate``). The ``TypeError``
+    that :func:`set_execution_scope_resolver` raises for a missing
+    acknowledgment token is unrelated -- that happens at registration time
+    (embedder import/startup, before any request handler exists) and is
+    intentionally left as a plain ``TypeError``.
     """
 
 
@@ -634,10 +657,14 @@ class ExecutionScopeAuthorityError(Exception):
     ``str()`` on this exception deliberately carries only the ``task_id``
     and the names of the mismatched fields, never the scope values: it
     ends up in ``task.error_message`` and in the client's terminal error
-    event (see ``task_orchestrator``'s setup/run failure handling, which
-    formats durable/broadcast error strings from ``str(exc)``), and the
-    scope values include ``sandbox_key_suffix``, ``workspace_segments``,
-    and ``memory_dimensions`` -- namespace components that can carry
+    event. Both surfacing sites format that durable/broadcast string
+    straight from ``str(exc)``: ``task_orchestrator``'s per-turn background
+    runner (``_schedule_bg``'s ``_runner``, which resolves the scope for a
+    fresh turn before calling ``execute_task_background``) and
+    ``websocket.execute_resume_background`` (which resolves its own scope
+    for a resumed turn instead of receiving one pre-resolved). The scope
+    values include ``sandbox_key_suffix``, ``workspace_segments``, and
+    ``memory_dimensions`` -- namespace components that can carry
     end-user/client identifiers. The full scopes and the field-level value
     diff are logged via ``logger.error`` at the raise site instead, which
     stays server-side.
@@ -696,6 +723,77 @@ def _execution_scope_field_diff(
     return diff
 
 
+def _execution_scope_narrowing_violations(
+    snapshot: ExecutionScope, fallback: ExecutionScope
+) -> dict[str, tuple[Any, Any]]:
+    """Namespace fields where ``snapshot`` is not a narrowing of ``fallback``.
+
+    Used only on :func:`resolve_execution_scope`'s resolver-abstention
+    branch, where the resolver has supplied a mandatory *fallback* instead
+    of an authoritative answer: a persisted snapshot is
+    client-influenceable (a client-supplied ``agent_config`` can carry an
+    ``execution_scope`` key that reaches the persisted snapshot -- see
+    :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`), so an unchecked snapshot here
+    would let a caller widen its own namespace past the resolver's own most
+    conservative answer for the task. Returns an empty dict when ``snapshot``
+    narrows (or matches) ``fallback`` on every field below.
+
+    "Narrowing" per field, in terms of what it does to a namespace:
+
+    - ``sandbox_key_suffix``: equal, or ``fallback`` has none and
+      ``snapshot`` sets one -- appending a sub-key to a bare owner-level
+      sandbox lifecycle key only ever narrows it, never widens it.
+    - ``workspace_segments``: ``snapshot``'s tuple starts with
+      ``fallback``'s -- extra trailing path segments only ever place a scope
+      deeper inside ``fallback``'s directory tree, never outside it.
+    - ``sandbox_mount_segments``: the same prefix test, compared via
+      ``effective_mount_segments`` so an unset field (mount covers the full
+      ``workspace_segments``) compares like its expanded form rather than
+      bypassing the check.
+    - ``isolate_external_dirs``: may flip False -> True (shared external
+      dirs becoming scope-local narrows what a scope can read) but never
+      True -> False (that would widen a scope-local namespace back to
+      shared).
+    - ``memory_dimensions``: ``snapshot``'s mapping must be a superset of
+      ``fallback``'s -- extra dimensions only ever narrow which notes a
+      scoped search sees; a missing or changed dimension from ``fallback``
+      would widen it.
+
+    ``strict_memory_isolation`` (policy, not namespace) is intentionally
+    excluded, matching :data:`_EXECUTION_SCOPE_POLICY_FIELDS` -- narrowing
+    is about the namespace a scope selects, not post-filter policy on it.
+    """
+    violations: dict[str, tuple[Any, Any]] = {}
+
+    fallback_suffix = fallback.sandbox_key_suffix
+    snapshot_suffix = snapshot.sandbox_key_suffix
+    if fallback_suffix is not None and snapshot_suffix != fallback_suffix:
+        violations["sandbox_key_suffix"] = (snapshot_suffix, fallback_suffix)
+
+    fallback_ws = fallback.workspace_segments
+    snapshot_ws = snapshot.workspace_segments
+    if snapshot_ws[: len(fallback_ws)] != fallback_ws:
+        violations["workspace_segments"] = (snapshot_ws, fallback_ws)
+
+    fallback_mount = fallback.effective_mount_segments
+    snapshot_mount = snapshot.effective_mount_segments
+    if snapshot_mount[: len(fallback_mount)] != fallback_mount:
+        violations["sandbox_mount_segments"] = (snapshot_mount, fallback_mount)
+
+    if fallback.isolate_external_dirs and not snapshot.isolate_external_dirs:
+        violations["isolate_external_dirs"] = (
+            snapshot.isolate_external_dirs,
+            fallback.isolate_external_dirs,
+        )
+
+    fallback_dims = fallback.memory_dimensions
+    snapshot_dims = snapshot.memory_dimensions
+    if any(snapshot_dims.get(key) != value for key, value in fallback_dims.items()):
+        violations["memory_dimensions"] = (dict(snapshot_dims), dict(fallback_dims))
+
+    return violations
+
+
 def _load_execution_scope_snapshot(
     task_id: str | int,
     persisted_snapshot: ExecutionScopeInput,
@@ -715,6 +813,62 @@ def _load_execution_scope_snapshot(
     return cast(Optional[ExecutionScope], persisted_snapshot)
 
 
+def _validate_execution_scope_snapshot_candidate(
+    task_id: str | int,
+    snapshot: Optional[ExecutionScope],
+    diff_target: ExecutionScope,
+) -> Optional[ExecutionScope]:
+    """Shared shape gate a loaded snapshot must pass before either branch uses it.
+
+    Both the authoritative and resolver-abstention branches of
+    :func:`resolve_execution_scope` route a freshly loaded snapshot through
+    this one check rather than duplicating it. ``_load_execution_scope_snapshot``
+    only ``cast()``s the loader's return (a static type hint, not a runtime
+    check), so nothing upstream of this function enforces that the loader
+    actually honored its contract -- without this gate, a loader returning a
+    raw dict, a stray :class:`DeferToSnapshot`, or any other object would
+    reach the turn contextvar unchecked, or (on the branch that compares
+    fields) raise an unrelated ``AttributeError`` at the first ``.version``
+    access instead of a diagnosable contract error.
+
+    A snapshot whose shape version does not match
+    :data:`EXECUTION_SCOPE_SHAPE_VERSION` (older, missing entirely, or --
+    during a mixed-version rollout -- newer) cannot be safely compared
+    field-by-field against ``diff_target``: a field the current shape added
+    or changed always looks "different" from a scope built under a
+    different shape, and that is not a real conflict. Such a snapshot is
+    logged with a field-level diff against ``diff_target`` and treated as
+    absent (``None``) rather than raised on.
+
+    Returns:
+        The snapshot unchanged when it is a current-shape ``ExecutionScope``;
+        ``None`` when there was no snapshot to begin with, or it was
+        shape-gated away.
+
+    Raises:
+        ExecutionScopeResolverContractError: ``snapshot`` is neither
+            ``None`` nor an ``ExecutionScope``.
+    """
+    if snapshot is None:
+        return None
+    if not isinstance(snapshot, ExecutionScope):
+        raise ExecutionScopeResolverContractError(
+            f"execution scope snapshot loader returned {snapshot!r} for "
+            f"task {task_id!r}; expected an ExecutionScope or None"
+        )
+    if snapshot.version != EXECUTION_SCOPE_SHAPE_VERSION:
+        logger.warning(
+            "Ignoring execution scope snapshot candidate for task %s: shape "
+            "version %s does not match the current version %s; diff=%s",
+            task_id,
+            snapshot.version,
+            EXECUTION_SCOPE_SHAPE_VERSION,
+            _execution_scope_field_diff(snapshot, diff_target),
+        )
+        return None
+    return snapshot
+
+
 def resolve_execution_scope(
     task_id: str | int,
     *,
@@ -727,26 +881,35 @@ def resolve_execution_scope(
     byte-identical to the pre-authority behavior standalone/workforce
     deployments rely on for restart/resume. With a resolver registered, the
     resolver is authoritative and runs first; the snapshot (when the
-    resolver's answer needs one) is a corroborating candidate only:
+    resolver's answer needs one) is a corroborating candidate only. Whenever
+    a snapshot is loaded, both branches below route it through the same
+    :func:`_validate_execution_scope_snapshot_candidate` gate before using
+    it -- neither branch compares against, or activates, a snapshot that
+    hasn't passed that check:
 
     - Resolver raises: propagates immediately: the snapshot is not consulted.
     - Resolver returns ``None``: authoritative unscoped; the snapshot is not
       consulted.
-    - Resolver returns :func:`defer_to_snapshot`'s carrier: the snapshot is
-      used if present, else the carrier's fallback. A broken snapshot loader
-      here is logged and treated as absent (falls back), matching the
-      principle below that a broken candidate cannot veto an answer the
-      resolver has already committed to (the fallback *is* that answer).
+    - Resolver returns :func:`defer_to_snapshot`'s carrier: the resolver does
+      not know this task's scope, so a snapshot-loader exception here
+      propagates instead of being swallowed -- "the resolver abstained"
+      means nobody has an authoritative answer for this turn, and turn
+      callers must fail closed rather than silently proceed unscoped or
+      under a stale fallback (contrast the authoritative branch below,
+      which already has a real answer and can afford to ignore a broken
+      candidate). A present, shape-valid snapshot is used only if it is a
+      *narrowing* of the carrier's ``fallback`` (see
+      :func:`_execution_scope_narrowing_violations`) -- a snapshot is
+      client-influenceable (a client-supplied ``agent_config`` can carry an
+      ``execution_scope`` key that reaches the persisted snapshot), so an
+      unchecked snapshot here would let a caller widen its own namespace
+      past the resolver's own conservative fallback. A non-narrowing
+      snapshot raises :class:`ExecutionScopeAuthorityError`; an absent or
+      shape-gated snapshot falls back to the carrier's ``fallback``.
     - Resolver returns an ``ExecutionScope``: authoritative. A snapshot
       loader exception is logged and ignored (the candidate is corrupt, but
-      an authoritative answer already exists). A snapshot whose shape
-      version does not match the current one (:data:`EXECUTION_SCOPE_SHAPE_VERSION`,
-      including one missing the field entirely, and also a snapshot stamped
-      by a *newer* process during a mixed-version rollout) is logged
-      (field-level diff) and ignored rather than compared -- a field the
-      current shape added or changed always looks "different" from a
-      freshly-resolved scope built against a different shape, and that is
-      not a real conflict. Otherwise: a namespace-affecting difference (see
+      an authoritative answer already exists). Otherwise: a
+      namespace-affecting difference (see
       :data:`_EXECUTION_SCOPE_NAMESPACE_FIELDS`) raises
       :class:`ExecutionScopeAuthorityError`; a policy-only difference (see
       :data:`_EXECUTION_SCOPE_POLICY_FIELDS`) is logged and the resolver's
@@ -764,7 +927,10 @@ def resolve_execution_scope(
             that as unscoped themselves instead of passing None.
         ExecutionScopeAuthorityError: a persisted snapshot disagrees with
             the resolver's authoritative scope on a namespace-affecting
-            field.
+            field, or -- on the resolver-abstention branch -- is not a
+            narrowing of the resolver's fallback.
+        ExecutionScopeResolverContractError: the resolver, or a registered
+            snapshot loader, returned something outside its contract.
     """
     if task_id is None:
         raise ValueError(
@@ -778,17 +944,32 @@ def resolve_execution_scope(
     resolved = _execution_scope_resolver(str(task_id))
 
     if isinstance(resolved, DeferToSnapshot):
-        try:
-            snapshot = _load_execution_scope_snapshot(task_id, persisted_snapshot)
-        except Exception:
-            logger.warning(
-                "Snapshot loader failed while resolver deferred for task %s; "
-                "using the resolver's fallback",
-                task_id,
-                exc_info=True,
-            )
+        # No try/except here: the resolver has just said it does not know
+        # this task's scope, so a broken loader means nobody knows, and the
+        # turn faces that reach this branch must fail closed rather than
+        # silently proceed unscoped or under a stale fallback.
+        snapshot = _load_execution_scope_snapshot(task_id, persisted_snapshot)
+        snapshot = _validate_execution_scope_snapshot_candidate(
+            task_id, snapshot, resolved.fallback
+        )
+        if snapshot is None:
             return resolved.fallback
-        return snapshot if snapshot is not None else resolved.fallback
+
+        violations = _execution_scope_narrowing_violations(snapshot, resolved.fallback)
+        if violations:
+            logger.error(
+                "Execution scope snapshot for task %s widens the resolver's "
+                "fallback instead of narrowing it: %s",
+                task_id,
+                violations,
+            )
+            raise ExecutionScopeAuthorityError(
+                str(task_id),
+                resolver_scope=resolved.fallback,
+                snapshot_scope=snapshot,
+                mismatched_fields=violations,
+            )
+        return snapshot
 
     if resolved is None:
         return None
@@ -810,23 +991,8 @@ def resolve_execution_scope(
         )
         return resolved
 
+    snapshot = _validate_execution_scope_snapshot_candidate(task_id, snapshot, resolved)
     if snapshot is None:
-        return resolved
-
-    if snapshot.version != EXECUTION_SCOPE_SHAPE_VERSION:
-        # Not just "older": a mixed-version rollout can also see a snapshot
-        # stamped by a newer process than this one. Either direction means
-        # the snapshot's shape cannot be safely compared field-by-field
-        # against a freshly-resolved scope built against *this* process's
-        # shape, so the candidate is ignored rather than raised on.
-        logger.warning(
-            "Ignoring execution scope snapshot candidate for task %s: shape "
-            "version %s does not match the current version %s; diff=%s",
-            task_id,
-            snapshot.version,
-            EXECUTION_SCOPE_SHAPE_VERSION,
-            _execution_scope_field_diff(snapshot, resolved),
-        )
         return resolved
 
     diff = _execution_scope_field_diff(snapshot, resolved)
