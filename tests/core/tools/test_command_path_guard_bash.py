@@ -2894,6 +2894,33 @@ class TestCopyInstallMoveLinkDestructive:
 
         assert exc_info.value.access == "write"
 
+    def test_install_bundled_target_directory_short_option_is_allowed(
+        self, scoped_command_workspace
+    ):
+        # `-Dt` bundles the no-value `-D` flag with `-t`'s target-directory
+        # write destination, the same bundling contract `-Dm755` already
+        # covers for the scalar `-m` value.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "destdir").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("install -Dt destdir own.txt")
+
+    def test_install_bundled_target_directory_short_option_outside_workspace_is_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"install -Dt {shlex.quote(str(sibling_file.parent))} own.txt"
+            )
+
+        assert exc_info.value.access == "write"
+
     def test_ln_source_inside_workspace_aliasing_external_read_only_dir_is_rejected(
         self, scoped_command_workspace
     ):
@@ -4573,6 +4600,52 @@ class TestSedAwkCommand:
 
         with pytest.raises(CommandPolicyViolation):
             guard.validate("sed --not-a-sed-option 's/a/b/' own.txt")
+
+    @pytest.mark.parametrize(
+        "flag",
+        [
+            "--quiet",
+            "--silent",
+            "--posix",
+            "--sandbox",
+            "--separate",
+            "--null-data",
+            "--zero-terminated",
+            "--unbuffered",
+            "--regexp-extended",
+            "--debug",
+            "--follow-symlinks",
+            "--help",
+            "--version",
+        ],
+    )
+    def test_sed_flag_only_long_options_are_allowed(
+        self, scoped_command_workspace, flag
+    ):
+        # These GNU sed long options never consume a value and never name a
+        # path; before `flag_long_options` existed they fell through to the
+        # unrecognized-long-option fail-closed path (`_check_script_command`
+        # raised on every one of them).
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"sed {flag} 's/x/y/' own.txt")
+
+    def test_sed_unrecognized_long_option_still_fails_closed_ahead_of_a_path(
+        self, scoped_command_workspace
+    ):
+        # `flag_long_options` must only resolve the specific GNU flags it
+        # lists; a genuinely unmodeled long option must still fail closed
+        # instead of the addition making the unknown-long-option path
+        # permissive and letting the following out-of-workspace operand
+        # slip through unclassified.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(f"sed --bogus {shlex.quote(str(sibling_file))} own.txt")
 
     @pytest.mark.parametrize(
         "command_template",

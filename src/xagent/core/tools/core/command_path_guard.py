@@ -640,7 +640,10 @@ class _ScriptCommandGrammar:
     short (`-x`) and long (`--xxx`) spelling, mapped to the fixed filename
     gawk uses when no explicit argument is given; unlike `value_options`,
     these never consume a separate token (GNU optional-argument
-    convention: the value, if given, must be attached).
+    convention: the value, if given, must be attached). `flag_long_options`
+    holds long options that take NO value and name NO path at all (sed's
+    `--quiet`/`--posix`/etc.); each is consumed as an inert flag, unlike
+    `value_options`, which always consumes a following/attached token.
     """
 
     language: Literal["sed", "awk"]
@@ -652,6 +655,7 @@ class _ScriptCommandGrammar:
     in_place_short_option: str | None = None
     in_place_long_option: str | None = None
     optional_write_options: Mapping[str, str] = field(default_factory=dict)
+    flag_long_options: frozenset[str] = frozenset()
 
 
 @dataclass(frozen=True)
@@ -771,7 +775,10 @@ _COMMAND_WRAPPER_GRAMMARS = {
 # never a path, so they are skipped rather than routed through the file-
 # operand check. Both families bundle short options (e.g. sed's `-ne`,
 # `-i.bak`; awk's `-Fx`, gawk's `-o[file]`), so both list at least one
-# `short_value_options`/`optional_write_options` entry.
+# `short_value_options`/`optional_write_options` entry. The long-only flags
+# below take no value and name no path (verified against GNU sed's own
+# option list); `--line-length` already has a value entry above and stays
+# there — it is the one long option in this family that does carry a value.
 _SED_GRAMMAR = _ScriptCommandGrammar(
     language="sed",
     expression_long_option="--expression",
@@ -780,6 +787,23 @@ _SED_GRAMMAR = _ScriptCommandGrammar(
     short_value_options=frozenset({"l"}),
     in_place_short_option="i",
     in_place_long_option="--in-place",
+    flag_long_options=frozenset(
+        {
+            "--quiet",
+            "--silent",
+            "--posix",
+            "--sandbox",
+            "--separate",
+            "--null-data",
+            "--zero-terminated",
+            "--unbuffered",
+            "--regexp-extended",
+            "--debug",
+            "--follow-symlinks",
+            "--help",
+            "--version",
+        }
+    ),
 )
 _AWK_GRAMMAR = _ScriptCommandGrammar(
     language="awk",
@@ -2408,7 +2432,10 @@ class WorkspaceCommandPathGuard:
         Scalar options (`-g/-m/-o/-S/--context`) never carry a path, and the
         delegated `--strip-program` is a hard denial; an unrecognized option
         fails closed rather than silently letting one shift the destination
-        slot.
+        slot. `-t` also resolves when bundled behind another short flag
+        (`-Dt destdir`), sharing the bundled-cluster parser `-Dm755` already
+        uses; its value is write-checked below alongside every other
+        `target_dir` spelling.
         """
         target_dir: str | None = None
         operands: list[str] = []
@@ -2505,14 +2532,28 @@ class WorkspaceCommandPathGuard:
             if not text.startswith("--"):
                 # A bundled cluster (e.g. `-Dm755`): only the trailing
                 # value-taking character may carry an attached argument, so
-                # this shares the same GNU bundling contract as `sort`.
-                index, _, _ = self._parse_short_option_cluster(
+                # this shares the same GNU bundling contract as `sort`. `-t`
+                # bundles the same way (`-Dt destdir`); its value is deferred
+                # to the same `target_dir` slot the standalone `-t`/
+                # `--target-directory` forms populate above, so the single
+                # write check at the bottom of this method covers every
+                # spelling instead of a second inline check here.
+                index, matched_option, argument = self._parse_short_option_cluster(
                     values,
                     index,
                     cwd,
                     flag_options=frozenset("bcCDpsTv"),
-                    value_options={"g": None, "m": None, "o": None, "S": None},
+                    value_options={
+                        "g": None,
+                        "m": None,
+                        "o": None,
+                        "S": None,
+                        "t": None,
+                    },
                 )
+                if matched_option == "t":
+                    assert argument is not None
+                    target_dir = argument
                 continue
             raise CommandPolicyViolation(f"cannot safely inspect install option {text}")
 
@@ -3460,6 +3501,7 @@ class WorkspaceCommandPathGuard:
                 for option in grammar.optional_write_options
                 if option.startswith("--")
             }
+            | grammar.flag_long_options
         )
         index = 0
         while index < len(values):
@@ -3520,6 +3562,12 @@ class WorkspaceCommandPathGuard:
                         else _CommandValue(grammar.optional_write_options[resolved])
                     )
                     self._check_path(argument, cwd, "write")
+                    index += 1
+                    continue
+                if resolved in grammar.flag_long_options:
+                    # Takes no value and names no path (e.g. sed's
+                    # `--quiet`/`--posix`): consumed as an inert flag, never
+                    # routed through `_take_option_argument`.
                     index += 1
                     continue
                 # The remaining known long options are mandatory scalar
