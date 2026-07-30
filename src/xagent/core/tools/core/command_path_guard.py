@@ -3762,12 +3762,18 @@ class WorkspaceCommandPathGuard:
         if character == "$":
             return index + 1
         if character == "/":
-            return WorkspaceCommandPathGuard._scan_sed_delimited(
-                script, delimiter_index=index
+            return WorkspaceCommandPathGuard._skip_sed_address_modifiers(
+                script,
+                WorkspaceCommandPathGuard._scan_sed_delimited(
+                    script, delimiter_index=index
+                ),
             )
         if character == "\\" and index + 1 < len(script):
-            return WorkspaceCommandPathGuard._scan_sed_delimited(
-                script, delimiter_index=index + 1
+            return WorkspaceCommandPathGuard._skip_sed_address_modifiers(
+                script,
+                WorkspaceCommandPathGuard._scan_sed_delimited(
+                    script, delimiter_index=index + 1
+                ),
             )
         if allow_relative and character in {"+", "~"}:
             cursor = index + 1
@@ -3780,6 +3786,24 @@ class WorkspaceCommandPathGuard:
                 )
             return cursor
         return None
+
+    @staticmethod
+    def _skip_sed_address_modifiers(script: str, index: int) -> int:
+        """Consume a regex address's trailing `I`/`M` modifiers (C3).
+
+        GNU sed allows either modifier, in either order and repeated, right
+        after a `/regexp/` or `\\%regexp%` address (`/re/I`, `/re/MI`, ...).
+        Neither letter is ever a valid sed command name on its own, so
+        consuming them here cannot swallow a real command; skipping this
+        step left the command-letter scan land on the modifier itself,
+        misreading it as the command and treating everything after it
+        (including a following `w`/`W` write clause) as opaque trailing
+        text of a fallback command it never was.
+        """
+        cursor = index
+        while cursor < len(script) and script[cursor] in "IM":
+            cursor += 1
+        return cursor
 
     @staticmethod
     def _scan_sed_delimited(

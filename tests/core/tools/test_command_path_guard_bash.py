@@ -4240,6 +4240,43 @@ class TestSedAwkCommand:
         guard.validate("sed 'w own_out.txt' own.txt")
         guard.validate("sed 's/a/b/w own_out.txt' own.txt")
 
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "sed -n '/x/Iw {path}' own.txt",
+            "sed '/x/M w {path}' own.txt",
+            "sed -n '/x/IMw {path}' own.txt",
+            "sed -n '/x/MIw {path}' own.txt",
+            "sed -n '1,/x/Iw {path}' own.txt",
+        ],
+    )
+    def test_sed_regex_address_modifier_does_not_hide_write_command(
+        self, scoped_command_workspace, command_template
+    ):
+        # C3: a trailing `I`/`M` regex-address modifier (in either order or
+        # combination, on either address of a range) must be consumed as
+        # part of the address, not misread as the command letter itself --
+        # otherwise the real `w` command and its filename are swallowed
+        # whole as opaque trailing text and never path-checked.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "write"
+
+    def test_sed_regex_address_modifier_write_command_inside_workspace_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("sed -n '/x/Iw own_out.txt' own.txt")
+        guard.validate("sed '/x/M w own_out.txt' own.txt")
+
     def test_sed_braces_in_pattern_are_data(self, scoped_command_workspace):
         # `{`/`}`/`/` inside a delimited pattern or replacement are DATA, not
         # block/command structure; a benign program using them must be
