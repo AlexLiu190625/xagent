@@ -143,14 +143,18 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-describe("BuildsPage Agent deletion", () => {
+function resetMocks() {
+  apiRequestMock.mockReset()
+  routerPushMock.mockReset()
+  routerReplaceMock.mockReset()
+  toastErrorMock.mockReset()
+  renderAgentCardSupplementMock.mockClear()
+  useBuildPageExtensionMock.mockClear()
+}
+
+describe("BuildsPage rendering", () => {
   beforeEach(() => {
-    apiRequestMock.mockReset()
-    routerPushMock.mockReset()
-    routerReplaceMock.mockReset()
-    toastErrorMock.mockReset()
-    renderAgentCardSupplementMock.mockClear()
-    useBuildPageExtensionMock.mockClear()
+    resetMocks()
   })
 
   afterEach(() => cleanup())
@@ -245,6 +249,14 @@ describe("BuildsPage Agent deletion", () => {
       name: "builds.list.actions.edit",
     })).not.toBeInTheDocument()
   })
+})
+
+describe("BuildsPage Agent deletion", () => {
+  beforeEach(() => {
+    resetMocks()
+  })
+
+  afterEach(() => cleanup())
 
   it("discards an eligible draft but waits for explicit Retry Delete", async () => {
     let listRequests = 0
