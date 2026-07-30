@@ -16,6 +16,7 @@ import asyncio
 import contextvars
 import dataclasses
 import logging
+from contextlib import contextmanager
 
 import pytest
 
@@ -40,6 +41,35 @@ from xagent.core.execution_scope import (
     turn_execution_scope,
     validate_scope_component,
 )
+
+
+@contextmanager
+def scope_log_records(level: int = logging.WARNING):
+    """Collect this module's log records independently of global logging config.
+
+    ``caplog`` installs its handler on the root logger, so an assertion built on
+    it only holds while records propagate there. Whether they do is decided by
+    whatever else configured logging in the same process -- which under parallel
+    test execution is whatever module happens to share the worker. Attaching to
+    the logger that emits makes the assertion depend on the code under test
+    instead.
+    """
+    logger = logging.getLogger("xagent.core.execution_scope")
+    records: list[logging.LogRecord] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            records.append(record)
+
+    handler = _Collect(level)
+    previous_level = logger.level
+    logger.addHandler(handler)
+    logger.setLevel(level)
+    try:
+        yield records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
 
 
 class TestValidateScopeComponent:
@@ -68,12 +98,12 @@ class TestValidateScopeComponent:
         with pytest.raises(InvalidScopeComponentError):
             validate_scope_component(value)
 
-    def test_rejects_without_sanitizing(self, caplog):
+    def test_rejects_without_sanitizing(self):
         """Invalid input raises and logs; it is never rewritten to a valid form."""
-        with caplog.at_level("ERROR"):
+        with scope_log_records(logging.ERROR) as records:
             with pytest.raises(InvalidScopeComponentError):
                 validate_scope_component("bad:name", field_name="sandbox_key_suffix")
-        assert any("sandbox_key_suffix" in r.message for r in caplog.records)
+        assert any("sandbox_key_suffix" in r.getMessage() for r in records)
 
 
 class TestExecutionScope:
@@ -760,7 +790,7 @@ class TestSnapshotCandidateAuthority:
         assert exc_info.value.resolver_scope == resolver_scope
         assert exc_info.value.snapshot_scope == snapshot_scope
 
-    def test_policy_only_mismatch_does_not_fail_the_turn(self, caplog):
+    def test_policy_only_mismatch_does_not_fail_the_turn(self):
         """strict_memory_isolation is a policy field: a disagreement there
         does not change which key/path is touched, so the resolver's value
         wins without raising. The disagreement must still be observable --
@@ -769,15 +799,15 @@ class TestSnapshotCandidateAuthority:
         snapshot_scope = ExecutionScope(strict_memory_isolation=True)
         self._register(lambda task_id: resolver_scope, lambda task_id: snapshot_scope)
 
-        with caplog.at_level(logging.WARNING, logger="xagent.core.execution_scope"):
+        with scope_log_records() as records:
             assert resolve_execution_scope("1") == resolver_scope
         assert any(
-            "policy-only mismatch" in r.message
-            and "strict_memory_isolation" in r.message
-            for r in caplog.records
+            "policy-only mismatch" in r.getMessage()
+            and "strict_memory_isolation" in r.getMessage()
+            for r in records
         )
 
-    def test_stale_version_snapshot_is_ignored_even_if_it_would_mismatch(self, caplog):
+    def test_stale_version_snapshot_is_ignored_even_if_it_would_mismatch(self):
         resolver_scope = ExecutionScope()
         stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
         del stale_data["version"]  # predates EXECUTION_SCOPE_SHAPE_VERSION
@@ -785,11 +815,11 @@ class TestSnapshotCandidateAuthority:
         assert stale_snapshot.version == 0
 
         self._register(lambda task_id: resolver_scope, lambda task_id: stale_snapshot)
-        with caplog.at_level(logging.WARNING, logger="xagent.core.execution_scope"):
+        with scope_log_records() as records:
             assert resolve_execution_scope("1") == resolver_scope
         assert any(
-            "shape" in r.message and "sandbox_key_suffix" in r.message
-            for r in caplog.records
+            "shape" in r.getMessage() and "sandbox_key_suffix" in r.getMessage()
+            for r in records
         )
 
     def test_newer_version_snapshot_is_ignored_too(self):
@@ -882,7 +912,7 @@ class TestSnapshotCandidateAuthority:
         with pytest.raises(ExecutionScopeResolverContractError):
             resolve_execution_scope("1")
 
-    def test_defer_stale_version_snapshot_is_ignored_falls_back(self, caplog):
+    def test_defer_stale_version_snapshot_is_ignored_falls_back(self):
         fallback = ExecutionScope(sandbox_key_suffix="fallback")
         stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
         del stale_data["version"]
@@ -893,11 +923,11 @@ class TestSnapshotCandidateAuthority:
             lambda task_id: defer_to_snapshot(fallback),
             lambda task_id: stale_snapshot,
         )
-        with caplog.at_level(logging.WARNING, logger="xagent.core.execution_scope"):
+        with scope_log_records() as records:
             assert resolve_execution_scope("1") == fallback
         assert any(
-            "shape" in r.message and "sandbox_key_suffix" in r.message
-            for r in caplog.records
+            "shape" in r.getMessage() and "sandbox_key_suffix" in r.getMessage()
+            for r in records
         )
 
     @pytest.mark.parametrize(
@@ -1040,7 +1070,7 @@ class TestResolveExecutionScopeOffTurn:
         )
         assert resolve_execution_scope_off_turn("1") == scope
 
-    def test_namespace_mismatch_downgrades_to_resolver_value_with_warning(self, caplog):
+    def test_namespace_mismatch_downgrades_to_resolver_value_with_warning(self):
         resolver_scope = ExecutionScope(sandbox_key_suffix="from-resolver")
         snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
         set_execution_scope_resolver(
@@ -1049,11 +1079,11 @@ class TestResolveExecutionScopeOffTurn:
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot_scope)
 
-        with caplog.at_level("WARNING"):
+        with scope_log_records() as records:
             result = resolve_execution_scope_off_turn("1")
 
         assert result == resolver_scope
-        assert any("authority mismatch" in r.message.lower() for r in caplog.records)
+        assert any("authority mismatch" in r.getMessage().lower() for r in records)
 
     def test_other_exceptions_still_propagate(self):
         def boom(task_id):
