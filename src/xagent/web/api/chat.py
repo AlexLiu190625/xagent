@@ -40,7 +40,7 @@ from ...core.tools.adapters.vibe.config import (
     RequiredMCPUnavailableError,
 )
 from ...core.tools.adapters.vibe.selection_spec import should_load_mcp_server_configs
-from ...core.workspace import scoped_user_root
+from ...sandbox import SandboxMountIntent
 from ..auth_dependencies import get_current_user
 from ..dynamic_memory_store import get_memory_store
 from ..models.agent import Agent, AgentStatus, is_workforce_generated_manager_agent
@@ -110,6 +110,10 @@ from ..services.workforce_runtime import (
     release_task_lease_with_workforce_sync,
     resolve_workforce_task_runtime,
     sync_workforce_run_status_for_task_id_isolated,
+)
+from ..services.workspace_binding import (
+    build_chat_workspace_binding,
+    canonical_workspace_base,
 )
 from ..tracing import create_task_tracer
 from ..user_isolated_memory import UserContext
@@ -501,9 +505,12 @@ def _build_allowed_external_dirs(
             if scope is not None and scope.isolate_external_dirs
             else ()
         )
-        user_upload_dir = scoped_user_root(get_uploads_dir(), user_id, segments)
-        if not only_existing or user_upload_dir.exists():
-            dirs.append(str(user_upload_dir))
+        # Probe the same spelling that gets appended: with a symlinked
+        # uploads dir the raw and canonical spellings can name different
+        # directories, and the gate has to answer for the one handed on.
+        user_upload_dir = canonical_workspace_base(user_id, segments)
+        if not only_existing or Path(user_upload_dir).exists():
+            dirs.append(user_upload_dir)
     dirs.extend([str(d) for d in get_external_upload_dirs()])
     return dirs
 
@@ -596,9 +603,7 @@ async def create_default_tools(
         user_id=int(user.id),
         is_admin=bool(user.is_admin),
         workspace_config={
-            "base_dir": str(
-                scoped_user_root(get_uploads_dir(), owner_id, scope_segments)
-            ),
+            "base_dir": canonical_workspace_base(owner_id, scope_segments),
             "task_id": task_id,
             "user_id": owner_id,
             "allowed_external_dirs": allowed_external_dirs,
@@ -961,6 +966,15 @@ class AgentServiceManager:
         # under a different user (e.g. once built with the wrong identity).
         self._agent_owner_ids: Dict[int, Optional[int]] = {}
         self._agent_sandbox_keys: Dict[int, str] = {}
+        # Lease provider each cached AgentService's sandbox tools were built
+        # against, keyed the same as ``_agent_sandbox_keys`` (same lifetime,
+        # always written/popped together). Lets ``_acquire_sandbox_task``
+        # attach by object identity (``SandboxManager.attach_provider``)
+        # instead of by key existence alone, so a provider that was replaced
+        # by a rebuild (mismatch reconcile, sweep, capacity eviction,
+        # release-to-zero) is caught even though the key still resolves to a
+        # live -- but different -- provider (ABA).
+        self._agent_sandbox_providers: Dict[int, Any] = {}
         # ExecutionScope fingerprint each cached AgentService was built
         # under (None sentinel = unscoped). Sandbox keys and workspace
         # paths are baked in at build time, so a task reassigned to a
@@ -1000,13 +1014,24 @@ class AgentServiceManager:
         owner-only key would silently miss a scope-suffixed sandbox and
         skip the ref-count attach.
 
+        When a lease provider was recorded alongside the key, attaches by
+        object identity (``SandboxManager.attach_provider``) rather than
+        key existence alone: the key can still resolve to a live provider
+        after the original one was replaced by a rebuild (mismatch
+        reconcile, sweep, capacity eviction, release-to-zero), and identity
+        is the only way to catch that the cached agent's tools were built
+        against the now-superseded object (ABA). Falls back to the
+        existence-only ``attach()`` when no provider was recorded (e.g. a
+        cache entry from before this field existed).
+
         Raises:
             RuntimeError: The task's agent was built with a sandbox lease
-                provider (recorded key) that has since been reclaimed by
-                the idle sweep or capacity eviction. Running anyway would
-                hit deleted containers with cryptic tool errors; failing
-                clearly lets a retry rebuild the agent and transparently
-                recreate the sandbox.
+                provider (recorded key, or key+provider) that has since
+                been reclaimed or replaced by the idle sweep, capacity
+                eviction, or a reconcile rebuild. Running anyway would hit
+                deleted containers or a torn-down provider with cryptic
+                tool errors; failing clearly lets a retry rebuild the agent
+                and transparently recreate the sandbox.
         """
         if task_id is None:
             return None
@@ -1026,7 +1051,14 @@ class AgentServiceManager:
             return None
 
         lifecycle_type, lifecycle_id = self._parse_sandbox_key(sandbox_key)
-        if await sandbox_mgr.attach(lifecycle_type, lifecycle_id):
+        provider = self._agent_sandbox_providers.get(task_key)
+        if provider is not None:
+            attached = await sandbox_mgr.attach_provider(
+                lifecycle_type, lifecycle_id, provider
+            )
+        else:
+            attached = await sandbox_mgr.attach(lifecycle_type, lifecycle_id)
+        if attached:
             return sandbox_key
 
         # Evict the stale cached agent so a retry rebuilds its tools
@@ -1034,6 +1066,7 @@ class AgentServiceManager:
         self._agents.pop(task_key, None)
         self._agent_owner_ids.pop(task_key, None)
         self._agent_sandbox_keys.pop(task_key, None)
+        self._agent_sandbox_providers.pop(task_key, None)
         self._agent_scope_fingerprints.pop(task_key, None)
         raise RuntimeError(
             f"The sandbox for task {task_key} was reclaimed before "
@@ -1063,6 +1096,7 @@ class AgentServiceManager:
             self._agents.pop(task_key, None)
             self._agent_owner_ids.pop(task_key, None)
             self._agent_sandbox_keys.pop(task_key, None)
+            self._agent_sandbox_providers.pop(task_key, None)
             self._agent_scope_fingerprints.pop(task_key, None)
             logger.info(
                 "Evicted cached AgentService for task %s after releasing sandbox %s",
@@ -1075,8 +1109,9 @@ class AgentServiceManager:
         *,
         task_id: int,
         workspace_owner_id: int,
-        workspace_config: Mapping[str, Any],
+        mount_intent: Optional[SandboxMountIntent],
         scope: Optional[ExecutionScope] = None,
+        prepare_root: Optional[str] = None,
     ) -> Any | None:
         """Get the task's sandbox lease provider, or None for local execution.
 
@@ -1085,11 +1120,25 @@ class AgentServiceManager:
         scope under the same platform user. Unscoped execution keeps
         producing ``user:{owner}`` and reuses today's containers untouched.
 
-        Capacity exhaustion and sandbox-service unavailability are distinct
-        failure classes. For **unscoped** execution the historical behavior is
-        kept: a ``SandboxCapacityError`` rejects the task by default (opt-in
-        local fallback via XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY),
-        and any other sandbox failure falls back to local execution.
+        ``prepare_root`` (``ChatWorkspaceBinding.prepare_root``) is the
+        on-host directory that must exist for this task's own files — the
+        pre-fold mount root, which folding may have re-rooted ``mount_intent``
+        onto a shallower, shared ancestor (see ``build_chat_workspace_binding``).
+
+        Capacity exhaustion, sandbox lifecycle contract violations, and
+        general sandbox-service unavailability are distinct failure classes.
+        For **unscoped** execution the historical behavior is kept for the
+        latter two: a ``SandboxCapacityError`` rejects the task by default
+        (opt-in local fallback via
+        XAGENT_SANDBOX_ALLOW_LOCAL_FALLBACK_ON_CAPACITY), and a non-contract
+        sandbox failure falls back to local execution. A ``SandboxContractError``
+        (runtime-config conflict, recovery-required state, or any other
+        explicit lifecycle contract violation) never falls back to local
+        execution for either scoped or unscoped tasks: it means the desired
+        mount/runtime spec could not be honored as requested, and running
+        the task unsandboxed on the host would silently defeat that request
+        rather than surface it — the observable outcome is a failed task,
+        not a quiet downgrade.
 
         A scope that carries a ``sandbox_key_suffix`` isolates an untrusted /
         third-party workload in a per-scope container; running it outside that
@@ -1099,20 +1148,31 @@ class AgentServiceManager:
         with the opt-in flag on) nor a sandbox-service failure may downgrade
         such a task to local execution. A scope *without* a suffix shares the
         unscoped ``user:{owner}`` container and thus has no isolation to
-        protect; it keeps the unscoped fallback behavior.
+        protect; it keeps the unscoped fallback behavior for non-contract
+        failures.
 
         Raises:
             SandboxCapacityError: The container cap is reached, nothing is
                 evictable, and (for a task with no scope suffix) local fallback
                 on capacity is not enabled, or the scope carries a suffix.
-            Exception: A suffix-scoped execution hit a non-capacity sandbox
-                failure; re-raised instead of falling back to local execution.
+            SandboxContractError: The sandbox lifecycle contract was violated
+                (e.g. a runtime-config conflict or a container that needs
+                recovery before use); re-raised for both scoped and unscoped
+                tasks, never downgraded to local execution.
+            Exception: A suffix-scoped execution hit a non-capacity,
+                non-contract sandbox failure; re-raised instead of falling
+                back to local execution.
         """
-        from ..sandbox_manager import SandboxCapacityError, get_sandbox_manager
+        from ..sandbox_manager import (
+            SandboxCapacityError,
+            SandboxContractError,
+            get_sandbox_manager,
+        )
 
         sandbox_mgr = get_sandbox_manager()
         if not sandbox_mgr:
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             return None
 
         # The isolation boundary is the per-scope key suffix, not
@@ -1127,10 +1187,12 @@ class AgentServiceManager:
             sandbox = await sandbox_mgr.get_or_create_lease_provider(
                 USER_LIFECYCLE_TYPE,
                 make_user_lifecycle_id(workspace_owner_id, suffix),
-                workspace_config=workspace_config,
+                mount_intent=mount_intent,
+                prepare_root=prepare_root,
             )
         except SandboxCapacityError as e:
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             from ...config import get_sandbox_allow_local_fallback_on_capacity
 
             if not scoped and get_sandbox_allow_local_fallback_on_capacity():
@@ -1151,8 +1213,36 @@ class AgentServiceManager:
                 e,
             )
             raise
+        except SandboxContractError as e:
+            # Fail closed for scoped and unscoped tasks alike: a contract
+            # violation means the desired mount/runtime spec could not be
+            # honored, and the local-execution fallback below exists for
+            # sandbox-service *unavailability*, not for a misconfigured or
+            # conflicting spec. Silently running such a task on the host
+            # would be a bigger surprise than failing the task outright.
+            #
+            # One documented exception, and it is not a downgrade: a *worker*
+            # slot that cannot be provisioned degrades to its own lifecycle's
+            # primary sandbox (``SandboxLeaseProvider.get_worker_sandbox``),
+            # the same correctly scoped container this task already holds.
+            # That costs a concurrency slot, never a trust boundary. What
+            # reaches this handler is the task's own sandbox, where there is
+            # nothing safe to degrade to.
+            self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
+            logger.error(
+                "Sandbox lifecycle contract violated for task %s (workspace "
+                "owner %s, scoped=%s); failing closed instead of falling "
+                "back to local execution: %s",
+                task_id,
+                workspace_owner_id,
+                scoped,
+                e,
+            )
+            raise
         except Exception as e:
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             if scoped:
                 logger.error(
                     "Sandbox creation failed for scoped task %s (workspace "
@@ -1174,6 +1264,7 @@ class AgentServiceManager:
         self._agent_sandbox_keys[task_id] = make_user_sandbox_key(
             workspace_owner_id, suffix
         )
+        self._agent_sandbox_providers[task_id] = sandbox
         return sandbox
 
     async def _release_sandbox_task(self, sandbox_key: Optional[str]) -> None:
@@ -1603,25 +1694,10 @@ class AgentServiceManager:
             agent_config, workforce_runtime, task_id=task_id
         )
         workspace_owner_id = int(task.user_id)
-        scope_segments = scope.workspace_segments if scope is not None else ()
-        # The sandbox bind mount covers the scope's mount prefix (the full
-        # workspace_segments when no prefix is declared); the deeper
-        # workspace subtree lives inside it but is NOT isolated from a
-        # co-mounted sibling — the rw mount and the code-execution tools
-        # bypass scoped_user_root, so a mount prefix must only group scopes
-        # of the same trust principal (see ExecutionScope.sandbox_mount_segments).
-        mount_segments = scope.effective_mount_segments if scope is not None else ()
-        sandbox_workspace_config = {
-            "base_dir": str(
-                scoped_user_root(get_uploads_dir(), workspace_owner_id, mount_segments)
-            ),
-            "task_id": f"web_task_{task_id}",
-            "user_id": workspace_owner_id,
-            "allowed_external_dirs": _build_allowed_external_dirs(
-                workspace_owner_id, scope=scope
-            ),
-            "scope_segments": scope_segments,
-        }
+        # Actor-logical access policy + CA-physical mount intent, built by
+        # the single shared projection (see build_chat_workspace_binding's
+        # docstring for the covered/covering/disjoint folding it applies).
+        workspace_binding = build_chat_workspace_binding(workspace_owner_id, scope)
 
         # Sandbox startup is container/network work that can take seconds;
         # don't hold this session's read transaction (and its pool slot)
@@ -1631,8 +1707,9 @@ class AgentServiceManager:
         sandbox = await self._get_or_create_task_sandbox(
             task_id=task_id,
             workspace_owner_id=workspace_owner_id,
-            workspace_config=sandbox_workspace_config,
+            mount_intent=workspace_binding.mount_intent,
             scope=scope,
+            prepare_root=workspace_binding.prepare_root,
         )
 
         return await create_default_tools(
@@ -1839,6 +1916,7 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
 
         # Scope invariant: the cached instance baked its sandbox key (and,
@@ -1879,6 +1957,7 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
 
         if task_id not in self._agents:
@@ -2004,6 +2083,7 @@ class AgentServiceManager:
                         self._agents.pop(task_id, None)
                         self._agent_owner_ids.pop(task_id, None)
                         self._agent_sandbox_keys.pop(task_id, None)
+                        self._agent_sandbox_providers.pop(task_id, None)
                         self._agent_scope_fingerprints.pop(task_id, None)
                         raise
                     except Exception as e:
@@ -2015,6 +2095,7 @@ class AgentServiceManager:
                             del self._agents[task_id]
                             self._agent_owner_ids.pop(task_id, None)
                             self._agent_sandbox_keys.pop(task_id, None)
+                            self._agent_sandbox_providers.pop(task_id, None)
                             self._agent_scope_fingerprints.pop(task_id, None)
                         if is_database_pool_timeout(e):
                             raise
@@ -2263,28 +2344,13 @@ class AgentServiceManager:
                     else int(runtime_user.id)
                 )
                 scope_segments = scope.workspace_segments if scope is not None else ()
-                # Sandbox mount covers the scope's mount prefix (full
-                # workspace_segments when no prefix is declared); the deeper
-                # subtree is NOT isolated from a co-mounted sibling (rw mount,
-                # code-execution tools bypass scoped_user_root), so a mount
-                # prefix must only group scopes of the same trust principal
-                # (see ExecutionScope.sandbox_mount_segments).
-                mount_segments = (
-                    scope.effective_mount_segments if scope is not None else ()
+                # Actor-logical access policy + CA-physical mount intent,
+                # built by the single shared projection (see
+                # build_chat_workspace_binding's docstring for the
+                # covered/covering/disjoint folding it applies).
+                workspace_binding = build_chat_workspace_binding(
+                    workspace_owner_id, scope
                 )
-                sandbox_workspace_config = {
-                    "base_dir": str(
-                        scoped_user_root(
-                            get_uploads_dir(), workspace_owner_id, mount_segments
-                        )
-                    ),
-                    "task_id": f"web_task_{task_id}",
-                    "user_id": workspace_owner_id,
-                    "allowed_external_dirs": _build_allowed_external_dirs(
-                        workspace_owner_id, scope=scope
-                    ),
-                    "scope_segments": scope_segments,
-                }
 
                 # Sandbox startup is container/network work that can take
                 # seconds; don't hold this session's read transaction (and
@@ -2294,8 +2360,9 @@ class AgentServiceManager:
                 sandbox = await self._get_or_create_task_sandbox(
                     task_id=task_id,
                     workspace_owner_id=workspace_owner_id,
-                    workspace_config=sandbox_workspace_config,
+                    mount_intent=workspace_binding.mount_intent,
                     scope=scope,
+                    prepare_root=workspace_binding.prepare_root,
                 )
 
                 tool_selection_spec = _build_tool_selection_spec_for_task(
@@ -2398,10 +2465,8 @@ class AgentServiceManager:
                         pattern=task_pattern,  # Use pattern instead of use_dag_pattern
                         tracer=tracer,
                         enable_workspace=True,  # Enable workspace functionality
-                        workspace_base_dir=str(
-                            scoped_user_root(
-                                get_uploads_dir(), workspace_owner_id, scope_segments
-                            )
+                        workspace_base_dir=canonical_workspace_base(
+                            workspace_owner_id, scope_segments
                         ),  # Use user- (and scope-) isolated base directory
                         allowed_external_dirs=allowed_external_dirs,  # Add allowed external directories
                         scope_segments=scope_segments,
@@ -2527,6 +2592,7 @@ class AgentServiceManager:
             del self._agents[task_id]
             self._agent_owner_ids.pop(task_id, None)
             self._agent_sandbox_keys.pop(task_id, None)
+            self._agent_sandbox_providers.pop(task_id, None)
             self._agent_scope_fingerprints.pop(task_id, None)
             self._agent_evicted_scope_fingerprints.pop(task_id, None)
             logger.info(f"Removed AgentService for task {task_id}")
@@ -3013,10 +3079,19 @@ class AgentServiceManager:
         """Clean up workspace directory for a task when agent is not in memory"""
         from ...core.workspace import TaskWorkspace
 
-        # Try the scoped workspace first (when a resolver maps this task to
-        # a scope), then the user-isolated workspace, then the legacy
-        # uploads-root fallback.
-        workspace_ids = []
+        workspace_id = f"web_task_{task_id}"
+
+        # Scoped workspace first (when a resolver maps this task to a scope),
+        # then the user-isolated one, then the legacy uploads-root fallback.
+        # One spelling per candidate: the uploads root is rejected at
+        # configuration time unless its two readings name the same directory
+        # (see ``config.get_uploads_dir``), so the canonical spelling and the
+        # raw one reach the same place and a second candidate would only
+        # re-probe what the first already probed. A tree written under a root
+        # spelling that configuration now refuses is not reachable from any
+        # spelling of the current value, so recovering it is an operator
+        # migration rather than a candidate this loop can enumerate.
+        base_dirs: list[str] = []
         if user_id:
             # Contextvar-first for the same reason as get_agent_for_task:
             # cleanup inside an activated turn reuses the turn's resolution.
@@ -3024,20 +3099,15 @@ class AgentServiceManager:
             if scope is None:
                 scope = resolve_execution_scope(task_id)
             segments = scope.workspace_segments if scope is not None else ()
-            if segments:
-                workspace_ids.append(
-                    (
-                        f"web_task_{task_id}",
-                        str(scoped_user_root(get_uploads_dir(), user_id, segments)),
-                    )
-                )
-            workspace_ids.append(
-                (
-                    f"web_task_{task_id}",
-                    str(scoped_user_root(get_uploads_dir(), user_id)),
-                )
-            )
-        workspace_ids.append((f"web_task_{task_id}", str(get_uploads_dir())))
+            for base_dir in (
+                canonical_workspace_base(user_id, segments),
+                canonical_workspace_base(user_id),
+            ):
+                if base_dir not in base_dirs:
+                    base_dirs.append(base_dir)
+        legacy_root = str(get_uploads_dir())
+        if legacy_root not in base_dirs:
+            base_dirs.append(legacy_root)
 
         # Build allowed external directories (user's upload directory for knowledge base files).
         # Use only_existing=True here because cleanup runs against on-disk state.
@@ -3045,21 +3115,26 @@ class AgentServiceManager:
             user_id, only_existing=True
         )
 
-        for workspace_id, base_dir in workspace_ids:
+        for base_dir in base_dirs:
+            # Probed before constructing: TaskWorkspace's constructor creates
+            # the workspace tree, so building one per candidate would make
+            # every probe succeed and delete a directory it had just created,
+            # leaving the task's real workspace untouched.
+            if not (Path(base_dir) / workspace_id).exists():
+                continue
+
             workspace = TaskWorkspace(
                 workspace_id, base_dir, allowed_external_dirs=allowed_external_dirs
             )
             workspace_path = str(workspace.workspace_dir)
-
-            if workspace.workspace_dir.exists():
-                logger.info(
-                    f"Found existing workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-                )
-                workspace.cleanup()
-                logger.info(
-                    f"Cleaned up workspace directory for task {task_id} (user {user_id}): {workspace_path}"
-                )
-                break
+            logger.info(
+                f"Found existing workspace directory for task {task_id} (user {user_id}): {workspace_path}"
+            )
+            workspace.cleanup()
+            logger.info(
+                f"Cleaned up workspace directory for task {task_id} (user {user_id}): {workspace_path}"
+            )
+            break
         else:
             logger.info(
                 f"No workspace directory found for task {task_id} (user {user_id})"
@@ -3179,8 +3254,8 @@ class AgentServiceManager:
                     tracer=tracer,
                     system_prompt=system_prompt,
                     enable_workspace=True,
-                    workspace_base_dir=str(
-                        scoped_user_root(get_uploads_dir(), user_id, scope_segments)
+                    workspace_base_dir=canonical_workspace_base(
+                        user_id, scope_segments
                     ),
                     allowed_external_dirs=allowed_external_dirs,
                     scope_segments=scope_segments,
