@@ -1005,6 +1005,20 @@ _WGET_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
     "o": "write",
 }
 
+# `rsync` has no short-option grammar today beyond a crude bundled-character
+# scan for the highest-risk options; this builds one. `-T`/`--temp-dir` is
+# the only short option that carries a path. `-K`/`--keep-dirlinks` and
+# `-k`/`--copy-dirlinks` let rsync write through (or read through) an
+# existing destination/source-side symlink instead of the literal directory
+# entry, which can escape the intended root, so both are denied outright —
+# matching `--keep-dirlinks`'s existing long-option denial — rather than
+# access-classified. `-e`/`-f`/`-L`/`-H` mirror the long options already
+# denied below (`--rsh`, `--filter`, `--copy-links`; `-H`/`--hard-links` is
+# conservatively denied too, matching this family's pre-existing posture).
+_RSYNC_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {"T": "write"}
+_RSYNC_SHORT_DENIED_OPTIONS = frozenset("efLHKk")
+_RSYNC_SHORT_FLAG_OPTIONS = frozenset("vqarRbudlpAXogDtOJnWxzCIm8h4y6sP")
+
 # `base64`'s short options bundle into one token (e.g. `-do<file>` combines
 # the `-d` decode flag with the `-o` output-path option), so its grammar is
 # split into a flag set and a value set for the short-option-cluster parser,
@@ -4283,26 +4297,33 @@ class WorkspaceCommandPathGuard:
         unchanged files from that tree straight into the destination, so a
         read-only external root is not sufficient authorization for it.
         `--log-file`/`--write-batch`/`--only-write-batch` also write to a
-        filename argument; `--read-batch` reads one (the batched changes it
-        replays are still bounded by the invocation's own destination
-        operand, so its file argument is a plain read, not a write slot).
-        `--files-from`/`--include-from`/`--exclude-from`/`-f`/`--filter`/
-        `-e`/`--rsh`/... delegate to an external file list or shell command
-        this guard cannot inspect safely and fail closed unconditionally
-        rather than access-checking their own argument: the file's
-        *contents* can name further paths this guard never sees, so a
-        plain read check of the file itself would not bound what rsync
-        actually touches.
+        filename argument. `--files-from`/`--include-from`/`--exclude-from`/
+        `--read-batch`/`-f`/`--filter`/`-e`/`--rsh`/... delegate to an
+        external file list or shell command this guard cannot inspect safely
+        and fail closed unconditionally rather than access-checking their
+        own argument: the file's *contents* can name further paths this
+        guard never sees (`--read-batch`'s replayed changes are not bounded
+        by the invocation's own destination operand the way a plain file
+        argument would be), so a plain read check of the file itself would
+        not bound what rsync actually touches.
+
+        Short options bundle into one token (e.g. `-avz`); `-T`/`--temp-dir`
+        is the only short option that carries a path (write). `-K`/
+        `-k` (`--keep-dirlinks`/`--copy-dirlinks`) let rsync write through
+        (or read through) an existing symlink at the destination/source
+        instead of the literal directory entry, which can escape the
+        intended root, so both fail closed regardless of position in a
+        bundle, matching `--keep-dirlinks`'s long-option denial (see
+        `_RSYNC_SHORT_DENIED_OPTIONS`).
 
         Long options resolve through `_resolve_long_option` (GNU
         unambiguous-prefix abbreviation, e.g. `--link-des=`/`--link-des ` for
         `--link-dest`), so an abbreviation of any modeled option — write,
         read, scalar, or denied — is classified identically to its full
-        name in both the `=`-attached and space-separated spelling. An
-        option this map cannot resolve (a typo, an unsupported flag, or an
-        ambiguous abbreviation) fails closed when it visibly carries a
-        value (`=`-attached); a bare unmodeled long option is still assumed
-        to be a value-free flag, matching curl/wget.
+        name in both the `=`-attached and space-separated spelling. Module
+        invariant: any option (short or long, bare or `=value`-attached)
+        this allowlist cannot resolve fails closed rather than being treated
+        as an operand or a value-free flag.
         """
         self._reject_dynamic_values("rsync arguments", values)
         denied_options = {
@@ -4313,11 +4334,13 @@ class WorkspaceCommandPathGuard:
             "--files-from",
             "--include-from",
             "--exclude-from",
+            "--read-batch",
             "--password-file",
             "--rsync-path",
             "--copy-links",
             "--copy-unsafe-links",
             "--keep-dirlinks",
+            "--copy-dirlinks",
         }
         path_options: dict[str, PathAccess] = {
             "--backup-dir": "write",
@@ -4329,7 +4352,6 @@ class WorkspaceCommandPathGuard:
             "--log-file": "write",
             "--write-batch": "write",
             "--only-write-batch": "write",
-            "--read-batch": "read",
         }
         scalar_options = {
             "--block-size",
@@ -4369,22 +4391,40 @@ class WorkspaceCommandPathGuard:
                 operands.append(value)
                 index += 1
                 continue
+            if not text.startswith("--"):
+                # Scan leading flag characters; stop at the first one that
+                # is not a plain flag (a denied character, `-T`'s value
+                # slot, or an unmodeled character `_parse_short_option_cluster`
+                # itself will fail closed on) rather than scanning past it,
+                # since any remainder past a value-taking option's letter is
+                # that option's own value, not another flag character.
+                for character in text[1:]:
+                    if character in _RSYNC_SHORT_FLAG_OPTIONS:
+                        continue
+                    if character in _RSYNC_SHORT_DENIED_OPTIONS:
+                        raise CommandPolicyViolation(
+                            f"cannot safely inspect rsync option -{character}"
+                        )
+                    break
+                index, _, _ = self._parse_short_option_cluster(
+                    values,
+                    index,
+                    cwd,
+                    flag_options=_RSYNC_SHORT_FLAG_OPTIONS,
+                    value_options=_RSYNC_SHORT_VALUE_OPTIONS,
+                )
+                continue
             option, separator, attached_text = text.partition("=")
             resolved_option = option
             if (
-                text.startswith("--")
-                and option not in path_options
+                option not in path_options
                 and option not in scalar_options
                 and option not in denied_options
             ):
                 candidate = self._resolve_long_option(option, known_long_options)
                 if candidate is not None:
                     resolved_option = candidate
-            if resolved_option in denied_options or (
-                text.startswith("-")
-                and not text.startswith("--")
-                and any(flag in text[1:] for flag in {"e", "f", "L", "H"})
-            ):
+            if resolved_option in denied_options:
                 raise CommandPolicyViolation(
                     f"cannot safely inspect rsync option {option}"
                 )
@@ -4410,23 +4450,21 @@ class WorkspaceCommandPathGuard:
                     context=f"rsync argument for {resolved_option}",
                 )
                 continue
-            if text.startswith("--"):
-                # Long flag options are argument-free here. An option this
-                # map cannot resolve fails closed instead of shifting
-                # operands when it visibly carries a value.
-                if separator:
-                    raise CommandPolicyViolation(
-                        f"cannot safely inspect rsync option {option}"
-                    )
-                index += 1
-                continue
-            # Common short flags may be bundled (for example -avz).
-            index += 1
+            # Module invariant: an unresolved long option fails closed, bare
+            # or `=value`-attached alike.
+            raise CommandPolicyViolation(f"cannot safely inspect rsync option {option}")
 
-        if len(operands) < 2:
-            return
+        # N1: the remote-operand check must run regardless of operand count
+        # — a single-operand invocation is not exempt from it — and a sole
+        # local operand still gets contained as an ordinary read instead of
+        # skipping containment entirely for lack of a second operand.
         if any(self._is_remote_transfer_operand(operand) for operand in operands):
             raise CommandPolicyViolation("cannot safely inspect remote rsync operands")
+        if not operands:
+            return
+        if len(operands) == 1:
+            self._check_path(operands[0], cwd, "read")
+            return
         for operand in operands[:-1]:
             self._check_path(operand, cwd, "read")
         self._check_path(operands[-1], cwd, "write")

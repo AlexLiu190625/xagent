@@ -5172,6 +5172,55 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         assert exc_info.value.access == "write"
 
+    def test_rsync_short_temp_dir_option_requires_write_authorization(
+        self, scoped_command_workspace
+    ):
+        # C2/M4: `-T`/`--temp-dir` had no short-option grammar at all, so
+        # `-T` silently fell through as an unmodeled (ignored) short flag
+        # instead of write-checking its directory argument.
+        workspace, external_file, _ = scoped_command_workspace
+        (workspace.output_dir / "src.txt").write_text("src\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"rsync -T {shlex.quote(str(external_file.parent))} src.txt dst.txt"
+            )
+
+        assert exc_info.value.access == "write"
+
+    @pytest.mark.parametrize(
+        "command", ["rsync -K src.txt dst.txt", "rsync -k src.txt dst.txt"]
+    )
+    def test_rsync_keep_or_copy_dirlinks_short_option_fails_closed(
+        self, scoped_command_workspace, command
+    ):
+        # M4: `-K`/`--keep-dirlinks` and `-k`/`--copy-dirlinks` let rsync
+        # write through (or read through) an existing symlink at the
+        # destination/source instead of the literal directory entry, which
+        # can escape the intended root; both must deny outright, matching
+        # `--keep-dirlinks`'s existing long-option denial, instead of
+        # silently falling through as an unmodeled short flag.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "src.txt").write_text("src\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command)
+
+    def test_rsync_single_operand_is_still_read_checked(self, scoped_command_workspace):
+        # N1: `len(operands) < 2` used to skip ALL containment (including
+        # the remote-operand check) for a single-operand invocation; a lone
+        # local operand must still be read-checked, not silently exempted
+        # for lack of a second (destination) operand.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"rsync {shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "read"
+
     # -- curl/wget/rsync shared uninspectable-option pins -----------------
 
     @pytest.mark.parametrize(
