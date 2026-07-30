@@ -1935,10 +1935,17 @@ class WorkspaceCommandPathGuard:
         path (a pattern/magic file, or a NUL-delimited file-of-filenames), so
         they are partitioned through the access-map substrate first; every
         other read command is a flat operand check with only skip-valued
-        options (`_COMMAND_VALUE_OPTIONS`).
+        options (`_COMMAND_VALUE_OPTIONS`). `_partition_path_options` already
+        consumes/discards a `--` operand separator and returns pure operands
+        (some legitimately starting with `-` if they followed `--`); feeding
+        that result back through `_check_operands`/`_operands` would re-apply
+        `_operands`'s own `-`-prefix filter with no memory of the `--` it
+        already passed, silently dropping (and never read-checking) such an
+        operand a second time (R1). So `file`/`wc` check their partitioned
+        operands directly here instead of routing through `_check_operands`.
         """
         if command_name == "file":
-            values = self._partition_path_options(
+            operands = self._partition_path_options(
                 values,
                 cwd,
                 option_access={
@@ -1948,13 +1955,36 @@ class WorkspaceCommandPathGuard:
                     "--magic-file": "read",
                 },
                 attached_short_options=frozenset({"-f", "-m"}),
+                flag_short_options=frozenset(
+                    {
+                        "-b",
+                        "-i",
+                        "-h",
+                        "-L",
+                        "-s",
+                        "-z",
+                        "-k",
+                        "-n",
+                        "-p",
+                        "-r",
+                        "-v",
+                        "-0",
+                    }
+                ),
             )
-        elif command_name == "wc":
-            values = self._partition_path_options(
+            for raw_path in operands:
+                self._check_path(raw_path, cwd, "read")
+            return
+        if command_name == "wc":
+            operands = self._partition_path_options(
                 values,
                 cwd,
                 option_access={"--files0-from": "read"},
+                flag_short_options=frozenset({"-l", "-c", "-w", "-m", "-L"}),
             )
+            for raw_path in operands:
+                self._check_path(raw_path, cwd, "read")
+            return
         self._check_operands(
             values,
             cwd,

@@ -2081,6 +2081,84 @@ class TestReadCommandFamily:
 
         guard.validate(command)
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "wc -l own.txt",
+            "wc -c own.txt",
+            "wc -w own.txt",
+            "wc -m own.txt",
+            "wc -L own.txt",
+            "file -b own.txt",
+            "file -i own.txt",
+            "file -h own.txt",
+            "file -L own.txt",
+            "file -s own.txt",
+            "file -z own.txt",
+            "file -k own.txt",
+            "file -n own.txt",
+            "file -p own.txt",
+            "file -r own.txt",
+            "file -v own.txt",
+            "file -0 own.txt",
+        ],
+    )
+    def test_file_and_wc_common_flags_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        # R11: the fail-closed short-option flip left `file`/`wc` with an
+        # empty `flag_short_options`, rejecting their own ordinary GNU flags.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_file_rejects_unrecognized_short_option(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("file -@ own.txt")
+
+    def test_wc_rejects_unrecognized_short_option(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("wc -@ own.txt")
+
+    @pytest.mark.parametrize("command_name", ["file", "wc"])
+    def test_file_and_wc_post_terminator_operand_is_still_read_checked(
+        self, scoped_command_workspace, command_name
+    ):
+        # R1: `_partition_path_options` consumes `--` and returns a plain
+        # operand list; routing that list back through `_check_operands`/
+        # `_operands` re-applied `_operands`'s own `-`-prefix filter with no
+        # memory of the `--` it already passed, silently dropping (and never
+        # read-checking) a post-`--` operand that happens to start with `-`.
+        workspace, _, sibling_file = scoped_command_workspace
+        cwd = workspace.resolve_path("")
+        relative_escape = os.path.relpath(str(sibling_file), start=str(cwd))
+        disguised = f"-x/{relative_escape}"
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"{command_name} -- {shlex.quote(disguised)}")
+
+        assert exc_info.value.access == "read"
+
+    def test_file_post_terminator_workspace_operand_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "-x").write_text("dashed name", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("file -- -x")
+
 
 class TestSortUniqDiffGrepHandlers:
     """Dedicated handlers for commands that own a write or read-control slot.
