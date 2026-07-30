@@ -2353,7 +2353,12 @@ class WorkspaceCommandPathGuard:
         `--dereference`, `-H`) can read arbitrarily deep external content
         through a single approved read boundary, which cannot be bounded
         statically, so that combination is a hard denial regardless of the
-        actual paths involved. `--recursive`/`--dereference`/
+        actual paths involved. `-a`/`--archive` implies `-r` (GNU documents
+        it as `-dR --preserve=all`) and therefore counts as recursive for
+        this denial too (M1), even though it also implies `-d`/no-dereference
+        on its own — `-a` combined with an explicit `-L`/`--dereference`
+        still overrides that default and follows symlinks, so the denial
+        must still fire. `--recursive`/`--archive`/`--dereference`/
         `--follow-command-line-symlink` resolve through `_resolve_long_option`
         against the same `_TARGET_DIR_KNOWN_LONG_OPTIONS` set
         `_parse_target_directory` uses for this family, so a GNU-abbreviated
@@ -2371,13 +2376,13 @@ class WorkspaceCommandPathGuard:
                 resolved = self._resolve_long_option(
                     raw_option, _TARGET_DIR_KNOWN_LONG_OPTIONS
                 )
-                if resolved == "--recursive":
+                if resolved in {"--recursive", "--archive"}:
                     recursive = True
                 elif resolved in {"--dereference", "--follow-command-line-symlink"}:
                     dereferences_links = True
             elif text.startswith("-") and not text.startswith("--"):
                 flags = text[1:]
-                recursive = recursive or "r" in flags or "R" in flags
+                recursive = recursive or "r" in flags or "R" in flags or "a" in flags
                 dereferences_links = dereferences_links or "L" in flags or "H" in flags
         if recursive and dereferences_links:
             raise CommandPolicyViolation(

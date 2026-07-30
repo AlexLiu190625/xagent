@@ -2918,6 +2918,10 @@ class TestCopyInstallMoveLinkDestructive:
             "cp -r --derefe . copied",
             "cp --recurs --dereference . copied",
             "cp -r --follow-comm . copied",
+            "cp -aL . copied",
+            "cp -a -L . copied",
+            "cp --archive --dereference . copied",
+            "cp --archive -L . copied",
         ],
     )
     def test_copy_recursive_symlink_dereference_is_rejected(
@@ -2927,7 +2931,10 @@ class TestCopyInstallMoveLinkDestructive:
         # abbreviations of `--dereference`/`--recursive`/
         # `--follow-command-line-symlink`; an abbreviated spelling of
         # either flag must be classified identically to the full name so
-        # this hard denial still fires.
+        # this hard denial still fires. `-a`/`--archive` implies `-r`
+        # (GNU cp documents `-a` as `-dR --preserve=all`), so it must be
+        # treated as recursive for this denial too, not only the literal
+        # `-r`/`-R`/`--recursive` spellings (M1).
         workspace, _, _ = scoped_command_workspace
         guard = WorkspaceCommandPathGuard(workspace)
 
@@ -2945,6 +2952,19 @@ class TestCopyInstallMoveLinkDestructive:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate("cp --derefe own.txt copied.txt")
+
+    def test_copy_archive_alone_without_dereference_is_allowed(
+        self, scoped_command_workspace
+    ):
+        # `-a`/`--archive` implies recursive, but the hard denial only fires
+        # for recursive+dereference together; `-a` alone (no `-L`/`-H`/
+        # `--dereference`) must not be misclassified as triggering it.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("cp -a own.txt copied.txt")
+        guard.validate("cp --archive own.txt copied.txt")
 
     def test_cp_target_directory_bundled_behind_recursive_is_write_checked(
         self, scoped_command_workspace
