@@ -33,7 +33,7 @@ import contextvars
 import logging
 import re
 from contextlib import contextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 from typing import Any, Callable, Iterator, Mapping, Optional, Union, cast
 
@@ -95,6 +95,81 @@ def validate_scope_component(value: Any, *, field_name: str = "scope component")
             "must be a string matching [a-zA-Z0-9_-]{1,63}"
         )
     return value
+
+
+def _coerce_scope_sequence(value: Any, *, field_name: str) -> tuple[Any, ...]:
+    """Coerce a raw ``from_dict`` sequence field, never silently misreading it.
+
+    A falsy value (``None``, ``""``, ``[]``, ``0``, ``False``) means "absent"
+    and becomes ``()``. Anything else must already be a ``list``/``tuple``:
+    ``tuple(value)`` on a bare string or mapping does not raise, it silently
+    iterates characters/keys into single-character "segments" that then pass
+    per-segment validation, and on a non-iterable it raises a bare
+    ``TypeError`` outside this module's error taxonomy. Both failure modes are
+    closed here instead of deferring to ``tuple()``.
+
+    Raises:
+        InvalidScopeComponentError: ``value`` is truthy and not a list/tuple.
+    """
+    if not value:
+        return ()
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    logger.error("Invalid %s %r: must be a list or tuple", field_name, value)
+    raise InvalidScopeComponentError(
+        f"invalid {field_name} {value!r}: must be a list or tuple"
+    )
+
+
+def _coerce_scope_mapping(value: Any, *, field_name: str) -> dict[str, Any]:
+    """Coerce a raw ``from_dict`` mapping field, never silently misreading it.
+
+    Mirrors :func:`_coerce_scope_sequence` for the one mapping-shaped field
+    (``memory_dimensions``): a falsy value means "absent" and becomes ``{}``;
+    anything else must already be a ``Mapping``, since ``dict(value)`` on an
+    iterable of 2-character strings (e.g. ``["ab"]``) silently reinterprets
+    each as a key/value pair instead of raising.
+
+    Raises:
+        InvalidScopeComponentError: ``value`` is truthy and not a ``Mapping``.
+    """
+    if not value:
+        return {}
+    if isinstance(value, Mapping):
+        return dict(value)
+    logger.error("Invalid %s %r: must be a mapping", field_name, value)
+    raise InvalidScopeComponentError(
+        f"invalid {field_name} {value!r}: must be a mapping"
+    )
+
+
+def _coerce_snapshot_version(raw_version: Any) -> int:
+    """Coerce ``from_dict``'s ``version`` field without raising or truncating.
+
+    ``version`` reaches here from a snapshot that can originate in a client-
+    supplied ``Task.agent_config`` (see :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`),
+    so it is untrusted input. A missing or malformed value is treated exactly
+    like a snapshot that pre-dates this field: coerced to ``0``, which
+    downstream ``_validate_execution_scope_snapshot_candidate`` already
+    recognizes as "not the current shape" and logs + ignores as a candidate.
+    That existing tolerance is the correct home for "we cannot trust this
+    value" — inventing a second, raising code path for the same trust level
+    would just be a different way of not trusting it.
+
+    Accepts an ``int`` or a string of digits (the shape a JSON-decoded
+    snapshot's ``version`` can arrive as); anything else -- including a
+    ``float``, which ``int()`` would otherwise silently truncate -- coerces to
+    ``0`` rather than raising a bare ``ValueError``/``TypeError`` that a
+    generic ``except (ValueError, ..., TypeError)`` clause elsewhere would
+    fold into an unrelated "malformed client message" response.
+    """
+    if isinstance(raw_version, bool):
+        return 0
+    if isinstance(raw_version, int):
+        return raw_version
+    if isinstance(raw_version, str) and raw_version.isdigit():
+        return int(raw_version)
+    return 0
 
 
 # Shape version stamped by ``to_dict`` / read back by ``from_dict``. Bump
@@ -221,20 +296,44 @@ class ExecutionScope:
     def from_dict(cls, data: Mapping[str, Any]) -> "ExecutionScope":
         """Rebuild a scope from :meth:`to_dict` output (re-validated).
 
+        ``data`` reaches here from a client-influenceable source (a
+        snapshot embedded in ``Task.agent_config``, see
+        :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`), so every field is coerced
+        defensively rather than trusted to already have the shape
+        ``to_dict`` produces: ``sandbox_key_suffix`` and the segment/mapping
+        fields are re-validated by the constructor
+        (:meth:`__post_init__`) or by :func:`_coerce_scope_sequence` /
+        :func:`_coerce_scope_mapping` before reaching it, and ``version`` is
+        coerced by :func:`_coerce_snapshot_version` -- never a raw
+        ``int()``/``tuple()``/``dict()`` call that could raise a bare
+        stdlib error outside this module's error taxonomy or silently
+        misread/truncate the value.
+
         ``version`` defaults to ``0`` (not
-        :data:`EXECUTION_SCOPE_SHAPE_VERSION`) when the key is absent: a
-        snapshot persisted before this field existed must decode as
-        distinguishably older, not silently pass as current-shape.
+        :data:`EXECUTION_SCOPE_SHAPE_VERSION`) when the key is absent or
+        unparsable: a snapshot persisted before this field existed, or one
+        carrying a malformed value, must both decode as distinguishably
+        older rather than silently passing as current-shape.
         """
         raw_mount = data.get("sandbox_mount_segments")
         return cls(
             sandbox_key_suffix=data.get("sandbox_key_suffix"),
-            workspace_segments=tuple(data.get("workspace_segments") or ()),
-            sandbox_mount_segments=(None if raw_mount is None else tuple(raw_mount)),
-            memory_dimensions=dict(data.get("memory_dimensions") or {}),
+            workspace_segments=_coerce_scope_sequence(
+                data.get("workspace_segments"), field_name="workspace_segments"
+            ),
+            sandbox_mount_segments=(
+                None
+                if raw_mount is None
+                else _coerce_scope_sequence(
+                    raw_mount, field_name="sandbox_mount_segments"
+                )
+            ),
+            memory_dimensions=_coerce_scope_mapping(
+                data.get("memory_dimensions"), field_name="memory_dimensions"
+            ),
             strict_memory_isolation=bool(data.get("strict_memory_isolation", False)),
             isolate_external_dirs=bool(data.get("isolate_external_dirs", False)),
-            version=int(data.get("version") or 0),
+            version=_coerce_snapshot_version(data.get("version")),
         )
 
     def __post_init__(self) -> None:
@@ -738,22 +837,39 @@ def _execution_scope_narrowing_violations(
     conservative answer for the task. Returns an empty dict when ``snapshot``
     narrows (or matches) ``fallback`` on every field below.
 
-    "Narrowing" per field, in terms of what it does to a namespace:
+    The governing rule, per field: narrowing can only extend scoping the
+    fallback *already committed to*. If ``fallback``'s value for a field is
+    that field's own no-scoping identity (``None`` for ``sandbox_key_suffix``,
+    ``()`` for ``workspace_segments``/the mount, ``False`` for
+    ``isolate_external_dirs``, ``{}`` for ``memory_dimensions``), the
+    resolver has claimed *no* authority in that dimension for this task, so
+    ``snapshot`` may not introduce any there either -- only an exact match is
+    accepted, regardless of whether the introduced value would, taken alone,
+    look like it "only narrows". Concretely, this means an all-default
+    ``fallback`` (the natural value for a resolver with "no opinion" on this
+    task) accepts nothing but an all-default snapshot: there is no scoping
+    to narrow into, so every field falls back to equality. This is what
+    closes the case a purely-relative, per-field prefix/superset test cannot:
+    such a test is vacuously satisfied by *any* snapshot value once the
+    fallback's own field sits at its identity element.
 
-    - ``sandbox_key_suffix``: equal, or ``fallback`` has none and
-      ``snapshot`` sets one -- appending a sub-key to a bare owner-level
-      sandbox lifecycle key only ever narrows it, never widens it.
-    - ``workspace_segments``: ``snapshot``'s tuple starts with
-      ``fallback``'s -- extra trailing path segments only ever place a scope
-      deeper inside ``fallback``'s directory tree, never outside it.
+    When ``fallback``'s value for a field is *not* at that identity, the
+    field's specific narrowing relation applies:
+
+    - ``sandbox_key_suffix``: no partial order beyond equality -- a suffix is
+      an opaque, validated string, not something one value can be "deeper
+      inside" another. Equal is the only accepted relation once ``fallback``
+      has committed to a specific value.
+    - ``workspace_segments``: ``snapshot``'s tuple starts with ``fallback``'s
+      -- extra trailing path segments only ever place a scope deeper inside
+      ``fallback``'s already-claimed directory tree, never outside it.
     - ``sandbox_mount_segments``: the same prefix test, compared via
       ``effective_mount_segments`` so an unset field (mount covers the full
       ``workspace_segments``) compares like its expanded form rather than
       bypassing the check.
-    - ``isolate_external_dirs``: may flip False -> True (shared external
-      dirs becoming scope-local narrows what a scope can read) but never
-      True -> False (that would widen a scope-local namespace back to
-      shared).
+    - ``isolate_external_dirs``: a boolean has no state narrower than
+      ``True``, so once ``fallback`` is already ``True`` only ``True`` is
+      accepted -- equality, same as ``sandbox_key_suffix``.
     - ``memory_dimensions``: ``snapshot``'s mapping must be a superset of
       ``fallback``'s -- extra dimensions only ever narrow which notes a
       scoped search sees; a missing or changed dimension from ``fallback``
@@ -761,26 +877,39 @@ def _execution_scope_narrowing_violations(
 
     ``strict_memory_isolation`` (policy, not namespace) is intentionally
     excluded, matching :data:`_EXECUTION_SCOPE_POLICY_FIELDS` -- narrowing
-    is about the namespace a scope selects, not post-filter policy on it.
+    is about the namespace a scope selects, not post-filter policy on it. A
+    policy-only disagreement between ``snapshot`` and ``fallback`` is
+    handled separately by the caller (see the abstention branch of
+    :func:`resolve_execution_scope`), not by this function.
     """
     violations: dict[str, tuple[Any, Any]] = {}
 
     fallback_suffix = fallback.sandbox_key_suffix
     snapshot_suffix = snapshot.sandbox_key_suffix
-    if fallback_suffix is not None and snapshot_suffix != fallback_suffix:
+    if snapshot_suffix != fallback_suffix:
         violations["sandbox_key_suffix"] = (snapshot_suffix, fallback_suffix)
 
     fallback_ws = fallback.workspace_segments
     snapshot_ws = snapshot.workspace_segments
-    if snapshot_ws[: len(fallback_ws)] != fallback_ws:
+    workspace_ok = (
+        snapshot_ws[: len(fallback_ws)] == fallback_ws
+        if fallback_ws
+        else snapshot_ws == fallback_ws
+    )
+    if not workspace_ok:
         violations["workspace_segments"] = (snapshot_ws, fallback_ws)
 
     fallback_mount = fallback.effective_mount_segments
     snapshot_mount = snapshot.effective_mount_segments
-    if snapshot_mount[: len(fallback_mount)] != fallback_mount:
+    mount_ok = (
+        snapshot_mount[: len(fallback_mount)] == fallback_mount
+        if fallback_mount
+        else snapshot_mount == fallback_mount
+    )
+    if not mount_ok:
         violations["sandbox_mount_segments"] = (snapshot_mount, fallback_mount)
 
-    if fallback.isolate_external_dirs and not snapshot.isolate_external_dirs:
+    if snapshot.isolate_external_dirs != fallback.isolate_external_dirs:
         violations["isolate_external_dirs"] = (
             snapshot.isolate_external_dirs,
             fallback.isolate_external_dirs,
@@ -788,7 +917,12 @@ def _execution_scope_narrowing_violations(
 
     fallback_dims = fallback.memory_dimensions
     snapshot_dims = snapshot.memory_dimensions
-    if any(snapshot_dims.get(key) != value for key, value in fallback_dims.items()):
+    dims_ok = (
+        all(snapshot_dims.get(key) == value for key, value in fallback_dims.items())
+        if fallback_dims
+        else not snapshot_dims
+    )
+    if not dims_ok:
         violations["memory_dimensions"] = (dict(snapshot_dims), dict(fallback_dims))
 
     return violations
@@ -905,7 +1039,11 @@ def resolve_execution_scope(
       unchecked snapshot here would let a caller widen its own namespace
       past the resolver's own conservative fallback. A non-narrowing
       snapshot raises :class:`ExecutionScopeAuthorityError`; an absent or
-      shape-gated snapshot falls back to the carrier's ``fallback``.
+      shape-gated snapshot falls back to the carrier's ``fallback``. Once
+      the namespace is settled, a policy-only difference (``strict_
+      memory_isolation``) between the snapshot and the fallback is logged
+      and the fallback's value wins -- symmetric with the authoritative
+      branch below, where the resolver's policy value wins the same way.
     - Resolver returns an ``ExecutionScope``: authoritative. A snapshot
       loader exception is logged and ignored (the candidate is corrupt, but
       an authoritative answer already exists). Otherwise: a
@@ -968,6 +1106,33 @@ def resolve_execution_scope(
                 resolver_scope=resolved.fallback,
                 snapshot_scope=snapshot,
                 mismatched_fields=violations,
+            )
+        if (
+            snapshot.strict_memory_isolation
+            != resolved.fallback.strict_memory_isolation
+        ):
+            # Symmetric with the authoritative branch's policy-only-mismatch
+            # handling below: the namespace is settled (validated above as a
+            # narrowing of resolved.fallback), but the policy field is not
+            # part of that check, so an unlogged pass-through here would
+            # silently let a client-influenceable snapshot flip it. The
+            # fallback plays the authoritative role on this branch, so its
+            # policy value wins, the same way the resolver's value wins on
+            # the authoritative branch.
+            logger.warning(
+                "Execution scope policy-only mismatch for task %s on the "
+                "resolver-abstention branch (fallback wins): %s",
+                task_id,
+                {
+                    "strict_memory_isolation": (
+                        snapshot.strict_memory_isolation,
+                        resolved.fallback.strict_memory_isolation,
+                    )
+                },
+            )
+            return replace(
+                snapshot,
+                strict_memory_isolation=resolved.fallback.strict_memory_isolation,
             )
         return snapshot
 

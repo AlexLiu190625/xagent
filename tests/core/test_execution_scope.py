@@ -579,8 +579,40 @@ class TestExecutionScopeAuthorityErrorInheritance:
     def test_not_a_value_error(self):
         assert not issubclass(ExecutionScopeAuthorityError, ValueError)
 
+    def test_not_a_type_error(self):
+        assert not issubclass(ExecutionScopeAuthorityError, TypeError)
+
+    def test_not_a_key_error(self):
+        assert not issubclass(ExecutionScopeAuthorityError, KeyError)
+
     def test_is_a_plain_exception(self):
         assert issubclass(ExecutionScopeAuthorityError, Exception)
+
+    def test_not_folded_by_the_websocket_validation_except_tuple(self):
+        """Reproduces the exact tuple websocket.py catches around the
+        turn-execution path (see
+        TestExecutionScopeResolverContractErrorInheritance's sibling test
+        for the exact line numbers): the resolver's per-turn call to
+        resolve_execution_scope sits inside that same try block, so an
+        authority conflict raised there must fall through this tuple and
+        propagate instead of being reported as a malformed client message."""
+        resolver_scope = ExecutionScope(sandbox_key_suffix="from-resolver")
+        snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
+        folded = False
+        try:
+            raise ExecutionScopeAuthorityError(
+                "task-123",
+                resolver_scope=resolver_scope,
+                snapshot_scope=snapshot_scope,
+                mismatched_fields={
+                    "sandbox_key_suffix": ("from-snapshot", "from-resolver")
+                },
+            )
+        except (ValueError, KeyError, TypeError):
+            folded = True
+        except ExecutionScopeAuthorityError:
+            pass
+        assert not folded
 
     def test_str_carries_task_id_and_field_names_never_values(self):
         """``str()`` on this exception ends up in ``task.error_message`` and
@@ -734,6 +766,109 @@ class TestExecutionScopeShapeVersionAlignment:
         assert EXECUTION_SCOPE_SHAPE_VERSION == 1
 
 
+class TestFromDictUntrustedFieldCoercion:
+    """FIX 3: ``from_dict`` decodes a mapping that can originate in a
+    client-influenceable ``Task.agent_config`` (see
+    :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`), so every field it reads must
+    be coerced defensively -- never a raw ``int()``/``tuple()``/``dict()``
+    call that can raise a bare stdlib error (swallowed by generic ``except
+    (ValueError, KeyError, TypeError)`` handlers elsewhere) or silently
+    misread/truncate the value.
+    """
+
+    # --- version: never raises, never truncates ---------------------------
+
+    @pytest.mark.parametrize("raw_version", ["abc", {"a": 1}, [1], object()])
+    def test_from_dict_malformed_version_is_treated_as_stale_not_raised(
+        self, raw_version
+    ):
+        data = ExecutionScope(sandbox_key_suffix="x").to_dict()
+        data["version"] = raw_version
+        assert ExecutionScope.from_dict(data).version == 0
+
+    def test_from_dict_float_version_is_treated_as_stale_not_truncated(self):
+        """1.5 must not silently become 1 (a plausible-looking but wrong
+        current-version claim) via a bare ``int()`` truncation."""
+        data = ExecutionScope(sandbox_key_suffix="x").to_dict()
+        data["version"] = 1.5
+        assert ExecutionScope.from_dict(data).version == 0
+
+    def test_from_dict_bool_version_is_treated_as_stale(self):
+        data = ExecutionScope(sandbox_key_suffix="x").to_dict()
+        data["version"] = True
+        assert ExecutionScope.from_dict(data).version == 0
+
+    # --- workspace_segments / sandbox_mount_segments: no silent str/dict
+    # iteration, no bare TypeError on a non-iterable ----------------------
+
+    def test_from_dict_string_workspace_segments_raises_instead_of_splitting_chars(
+        self,
+    ):
+        """``tuple("ab")`` would silently become ``("a", "b")`` -- two valid-
+        looking single-character segments that pass per-segment validation
+        with no signal that the input was never a sequence."""
+        data = ExecutionScope().to_dict()
+        data["workspace_segments"] = "ab"
+        with pytest.raises(InvalidScopeComponentError):
+            ExecutionScope.from_dict(data)
+
+    def test_from_dict_non_iterable_workspace_segments_raises_domain_error(self):
+        """``tuple(5)`` raises a bare ``TypeError`` outside this module's
+        error taxonomy; the coercion guard must raise
+        ``InvalidScopeComponentError`` before reaching that call."""
+        data = ExecutionScope().to_dict()
+        data["workspace_segments"] = 5
+        with pytest.raises(InvalidScopeComponentError):
+            ExecutionScope.from_dict(data)
+
+    def test_from_dict_falsy_workspace_segments_still_defaults_to_empty(self):
+        """Falsy-but-absent-shaped values (``None``, ``""``, ``0``, ``False``)
+        keep meaning "no segments supplied" rather than becoming a coercion
+        error -- only a truthy non-sequence is a real contract violation."""
+        for raw in (None, "", 0, False, []):
+            data = ExecutionScope().to_dict()
+            data["workspace_segments"] = raw
+            assert ExecutionScope.from_dict(data).workspace_segments == ()
+
+    def test_from_dict_string_sandbox_mount_segments_raises(self):
+        data = ExecutionScope(workspace_segments=("a", "b")).to_dict()
+        data["sandbox_mount_segments"] = "ab"
+        with pytest.raises(InvalidScopeComponentError):
+            ExecutionScope.from_dict(data)
+
+    def test_from_dict_none_sandbox_mount_segments_stays_none_not_coerced(self):
+        """``None`` is a load-bearing sentinel (mount == full
+        workspace_segments), distinct from an explicit ``[]`` (rooted
+        mount) -- the coercion guard must preserve that distinction rather
+        than routing ``None`` through the same falsy-default path as
+        ``workspace_segments``."""
+        data = ExecutionScope(workspace_segments=("a", "b")).to_dict()
+        assert data["sandbox_mount_segments"] is None
+        assert ExecutionScope.from_dict(data).sandbox_mount_segments is None
+
+    # --- memory_dimensions: no silent pair-splitting of a bad iterable ----
+
+    def test_from_dict_string_memory_dimensions_raises_instead_of_dict_of_chars(self):
+        """``dict(["ab"])`` would silently reinterpret ``"ab"`` as the
+        key/value pair ``{"a": "b"}``."""
+        data = ExecutionScope().to_dict()
+        data["memory_dimensions"] = ["ab"]
+        with pytest.raises(InvalidScopeComponentError):
+            ExecutionScope.from_dict(data)
+
+    def test_from_dict_non_mapping_memory_dimensions_raises_domain_error(self):
+        data = ExecutionScope().to_dict()
+        data["memory_dimensions"] = 5
+        with pytest.raises(InvalidScopeComponentError):
+            ExecutionScope.from_dict(data)
+
+    def test_from_dict_falsy_memory_dimensions_still_defaults_to_empty(self):
+        for raw in (None, "", 0, False, {}):
+            data = ExecutionScope().to_dict()
+            data["memory_dimensions"] = raw
+            assert dict(ExecutionScope.from_dict(data).memory_dimensions) == {}
+
+
 class TestSnapshotCandidateAuthority:
     """Full resolver x snapshot precedence matrix (#296).
 
@@ -867,8 +1002,54 @@ class TestSnapshotCandidateAuthority:
 
     # --- resolver returns DeferToSnapshot -----------------------------------
     def test_defer_uses_snapshot_when_present(self):
-        snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
+        """A snapshot that narrows a *scoped* fallback (not an all-default
+        one -- see TestDeferSnapshotAllDefaultFallback below) is used as-is.
+        Namespace and policy fields are varied independently elsewhere
+        (test_defer_snapshot_policy_only_disagreement_fallback_wins) so this
+        case stays a clean single-variable proof of "narrowing snapshot
+        wins"."""
+        fallback = ExecutionScope(workspace_segments=("tenant-a",))
+        snapshot_scope = ExecutionScope(workspace_segments=("tenant-a", "sub"))
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: snapshot_scope,
+        )
+        assert resolve_execution_scope("1") == snapshot_scope
+
+    def test_defer_snapshot_policy_only_disagreement_fallback_wins(self):
+        """FIX 2 coverage: on the abstention branch, the namespace fields
+        agree (both all-default -- no narrowing violation), but
+        strict_memory_isolation differs. The fallback plays the
+        authoritative role here, so its policy value must win, logged, the
+        same way the resolver's policy value wins on the authoritative
+        branch (test_policy_only_mismatch_does_not_fail_the_turn above)."""
         fallback = ExecutionScope(strict_memory_isolation=True)
+        snapshot_scope = ExecutionScope(strict_memory_isolation=False)
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: snapshot_scope,
+        )
+
+        with scope_log_records() as records:
+            result = resolve_execution_scope("1")
+        assert result.strict_memory_isolation is True
+        assert result.sandbox_key_suffix is None
+        assert any(
+            "policy-only mismatch" in r and "strict_memory_isolation" in r
+            for r in records
+        )
+
+    def test_defer_current_shape_version_snapshot_is_used_not_shape_gated(self):
+        """The positive mirror of
+        test_defer_stale_version_snapshot_is_ignored_falls_back: a snapshot
+        carrying the current shape version (as a real persisted snapshot
+        would, round-tripped through to_dict/from_dict) is not shape-gated
+        away and is used when it narrows the fallback."""
+        fallback = ExecutionScope(workspace_segments=("tenant-a",))
+        snapshot_data = ExecutionScope(workspace_segments=("tenant-a", "sub")).to_dict()
+        assert snapshot_data["version"] == EXECUTION_SCOPE_SHAPE_VERSION
+        snapshot_scope = ExecutionScope.from_dict(snapshot_data)
+
         self._register(
             lambda task_id: defer_to_snapshot(fallback),
             lambda task_id: snapshot_scope,
@@ -970,6 +1151,14 @@ class TestSnapshotCandidateAuthority:
                 {"memory_dimensions": {"k": "v"}},
                 {"memory_dimensions": {}},
             ),
+            # All-default fallback: the resolver has claimed no authority in
+            # any dimension, so introducing scoping the fallback never
+            # committed to is rejected even though, taken alone, it would
+            # look like a narrowing (null -> set; False -> True). See
+            # TestDeferSnapshotAllDefaultFallback for the combined-fields
+            # reproduction of the original vacuous-predicate report.
+            ("sandbox_key_suffix", {}, {"sandbox_key_suffix": "attacker-chosen"}),
+            ("isolate_external_dirs", {}, {"isolate_external_dirs": True}),
         ],
     )
     def test_defer_snapshot_widening_fallback_fails_the_turn(
@@ -997,14 +1186,19 @@ class TestSnapshotCandidateAuthority:
     @pytest.mark.parametrize(
         "fallback_kwargs,snapshot_kwargs",
         [
-            ({}, {"sandbox_key_suffix": "narrower"}),
             (
                 {"workspace_segments": ("tenant-a",)},
                 {"workspace_segments": ("tenant-a", "sub")},
             ),
             (
-                {"isolate_external_dirs": False},
-                {"isolate_external_dirs": True},
+                {
+                    "workspace_segments": ("tenant-a", "b", "c"),
+                    "sandbox_mount_segments": ("tenant-a",),
+                },
+                {
+                    "workspace_segments": ("tenant-a", "b", "c"),
+                    "sandbox_mount_segments": ("tenant-a", "b"),
+                },
             ),
             (
                 {"memory_dimensions": {"k": "v"}},
@@ -1020,9 +1214,12 @@ class TestSnapshotCandidateAuthority:
         self, fallback_kwargs, snapshot_kwargs
     ):
         """The mirror of the widening cases above: a snapshot that only
-        narrows the fallback (equal, a deeper workspace path, external dirs
-        going shared->scope-local, or extra memory dimensions) is accepted
-        and used as the resolved scope."""
+        extends scoping the fallback already committed to (a deeper
+        workspace path, a deeper mount prefix within one, or extra memory
+        dimensions) is accepted and used as the resolved scope. Every case
+        here has a non-default fallback for the field under test -- see
+        TestDeferSnapshotAllDefaultFallback for why an all-default fallback
+        accepts nothing but an equal snapshot instead."""
         fallback = ExecutionScope(**fallback_kwargs)
         snapshot = ExecutionScope(**snapshot_kwargs)
         self._register(
@@ -1064,6 +1261,87 @@ class TestSnapshotCandidateAuthority:
         with pytest.raises(RuntimeError, match="db down"):
             resolve_execution_scope("1")
 
+    def test_no_resolver_registered_stale_version_snapshot_is_used_as_is(self):
+        """The no-resolver branch returns whatever the loader returns
+        directly (see resolve_execution_scope's ``if
+        _execution_scope_resolver is None`` branch) -- it never routes
+        through ``_validate_execution_scope_snapshot_candidate``, so a
+        stale-shape snapshot is not shape-gated here the way it is on the
+        other two branches. This pins that pre-existing, byte-identical-to-
+        pre-authority behavior; it is not a new contract."""
+        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+        del stale_data["version"]
+        stale_snapshot = ExecutionScope.from_dict(stale_data)
+        assert stale_snapshot.version == 0
+
+        set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
+        assert resolve_execution_scope("1") == stale_snapshot
+
+    def test_no_resolver_registered_non_scope_loader_output_passes_through(self):
+        """Same branch, same absence of validation: a loader returning
+        something other than an ExecutionScope is not caught here (unlike
+        the resolver-registered branches, which route every loaded
+        candidate through ``_validate_execution_scope_snapshot_candidate``
+        and raise ExecutionScopeResolverContractError for exactly this
+        input). Pinned as a known, pre-existing gap on this branch rather
+        than asserted correct."""
+        set_execution_scope_snapshot_loader(lambda task_id: {"not": "a scope"})
+        assert resolve_execution_scope("1") == {"not": "a scope"}
+
+
+class TestDeferSnapshotAllDefaultFallback:
+    """FIX for the vacuous-narrowing report: every per-field narrowing check
+    in ``_execution_scope_narrowing_violations`` used to be evaluated purely
+    relative to the fallback's own value, so it was trivially satisfied by
+    any snapshot value once the fallback's field sat at that field's own
+    no-scoping default -- an all-default ``ExecutionScope()`` fallback (the
+    natural value for a resolver with "no opinion" on a task) made every
+    check pass regardless of the snapshot. The fixed rule: a field at its
+    own identity default admits no narrowing, only an exact match, because
+    there is no scoping there for the snapshot to narrow into.
+    """
+
+    def test_all_default_fallback_rejects_a_snapshot_widening_every_field_at_once(
+        self,
+    ):
+        """Reproduces the original report's proof-of-concept: a fully
+        unscoped fallback plus a snapshot that sets every namespace field
+        simultaneously. Every field is out-of-authority for this fallback,
+        so all five must be reported."""
+        fallback = ExecutionScope()
+        snapshot = ExecutionScope(
+            sandbox_key_suffix="attacker-chosen",
+            workspace_segments=("other", "tenant"),
+            sandbox_mount_segments=("other", "tenant"),
+            isolate_external_dirs=True,
+            memory_dimensions={"tenant": "other"},
+        )
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot)
+
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
+            resolve_execution_scope("1")
+        assert set(exc_info.value.mismatched_fields) == {
+            "sandbox_key_suffix",
+            "workspace_segments",
+            "sandbox_mount_segments",
+            "isolate_external_dirs",
+            "memory_dimensions",
+        }
+
+    def test_all_default_fallback_accepts_only_an_equal_snapshot(self):
+        fallback = ExecutionScope()
+        snapshot = ExecutionScope()
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot)
+        assert resolve_execution_scope("1") == fallback
+
 
 class TestResolveExecutionScopeOffTurn:
     """Off-turn consumers (websocket ``_scope_segments_for_task``,
@@ -1091,32 +1369,11 @@ class TestResolveExecutionScopeOffTurn:
         with pytest.raises(ExecutionScopeAuthorityError):
             resolve_execution_scope("1")
 
-        # Measured, not assumed: which module instance the function under test
-        # reads its globals from, and whether the hooks this test installed are
-        # the ones it sees. A capture that stays empty while the behavior is
-        # correct means one of these disagrees.
-        fn_globals = resolve_execution_scope_off_turn.__globals__
-        seen = {
-            "fn_module": fn_globals.get("__name__"),
-            "fn_logger_id": id(fn_globals.get("logger")),
-            "fn_resolver": fn_globals.get("_execution_scope_resolver") is not None,
-            "fn_loader": fn_globals.get("_execution_scope_snapshot_loader") is not None,
-        }
-
         with scope_log_records() as records:
             result = resolve_execution_scope_off_turn("1")
-            # Does the same call still disagree at this point in the test?
-            try:
-                resolve_execution_scope("1")
-                seen["second_direct_call"] = "returned"
-            except ExecutionScopeAuthorityError:
-                seen["second_direct_call"] = "raised"
 
         assert result == resolver_scope
-        assert any("authority mismatch" in r.lower() for r in records), (
-            f"no authority-mismatch record; function sees {seen}; "
-            f"capture state: {getattr(records, 'diagnostics', None)}"
-        )
+        assert any("authority mismatch" in r.lower() for r in records)
 
     def test_other_exceptions_still_propagate(self):
         def boom(task_id):
@@ -1196,34 +1453,85 @@ class TestExecutionScopeFieldClassificationCompleteness:
         )
         assert classified == field_names
 
-    def test_fingerprint_tracks_exactly_the_namespace_fields(self):
-        """``scope_fingerprint``'s tuple corresponds 1:1 to the
-        namespace-field bucket -- ``sandbox_mount_segments`` is represented
-        via the derived ``effective_mount_segments`` rather than the raw
-        field (two scopes with an unset vs. full-length
-        ``sandbox_mount_segments`` that select the identical mount must
-        still fingerprint identically), and ``version`` is excluded from
-        both (bookkeeping, not a namespace/policy field; see
-        ``ExecutionScope.version``'s docstring).
-
-        No namespace field is currently exempted from the fingerprint. If
-        one ever needs to be, it must be added to
-        ``exempted_from_fingerprint`` below with a comment explaining why
-        the cache doesn't need to evict on that field changing -- not
-        silently dropped from the set comparison.
-        """
+    def test_namespace_field_classification_is_complete_and_disjoint_from_policy(
+        self,
+    ):
+        """Static classification-completeness check only -- this does not
+        call ``scope_fingerprint`` at all. Real per-field fingerprint
+        behavior is covered by ``TestScopeFingerprintFieldCoverage`` below,
+        which does call it. (Renamed from the former
+        ``test_fingerprint_tracks_exactly_the_namespace_fields``: that name
+        claimed fingerprint coverage that a set-vs-hardcoded-set comparison
+        never exercised.)"""
         from xagent.core import execution_scope as scope_module
 
         namespace_fields = set(scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS)
-        fingerprint_represented_fields = {
-            "sandbox_key_suffix",
-            "workspace_segments",
-            "sandbox_mount_segments",  # via effective_mount_segments
-            "memory_dimensions",
-            "isolate_external_dirs",
+        policy_fields = set(scope_module._EXECUTION_SCOPE_POLICY_FIELDS)
+        assert namespace_fields.isdisjoint(policy_fields)
+        assert namespace_fields | policy_fields | {"version"} == {
+            f.name for f in dataclasses.fields(ExecutionScope)
         }
-        exempted_from_fingerprint: set[str] = set()  # none today
-        assert (
-            namespace_fields - exempted_from_fingerprint
-            == fingerprint_represented_fields
+
+
+# One (base_kwargs, changed_kwargs) probe per namespace field: constructing
+# ExecutionScope(**base_kwargs) and ExecutionScope(**changed_kwargs) changes
+# only that field's contribution to scope_fingerprint(). Keyed by field name
+# so TestScopeFingerprintFieldCoverage can assert this dict's keys track
+# _EXECUTION_SCOPE_NAMESPACE_FIELDS exactly -- a namespace field added
+# without a probe here fails loudly instead of being silently skipped.
+_NAMESPACE_FIELD_FINGERPRINT_PROBES: dict[str, tuple[dict, dict]] = {
+    "sandbox_key_suffix": ({}, {"sandbox_key_suffix": "probe-suffix"}),
+    "workspace_segments": ({}, {"workspace_segments": ("probe",)}),
+    "sandbox_mount_segments": (
+        {"workspace_segments": ("probe", "deep")},
+        {
+            "workspace_segments": ("probe", "deep"),
+            "sandbox_mount_segments": ("probe",),
+        },
+    ),
+    "memory_dimensions": ({}, {"memory_dimensions": {"k": "v"}}),
+    "isolate_external_dirs": ({}, {"isolate_external_dirs": True}),
+}
+
+# Same idea for the one field the fingerprint deliberately excludes.
+_POLICY_FIELD_FINGERPRINT_PROBES: dict[str, tuple[dict, dict]] = {
+    "strict_memory_isolation": ({}, {"strict_memory_isolation": True}),
+}
+
+
+class TestScopeFingerprintFieldCoverage:
+    """Behavior-derived replacement for the set-comparison-only test above:
+    calls ``scope_fingerprint()`` itself, per field, rather than comparing
+    two hand-maintained collections against each other. Reverting
+    ``scope_fingerprint()`` to drop any namespace field's contribution fails
+    the corresponding parametrized case here directly.
+    """
+
+    def test_probes_cover_exactly_the_classified_fields(self):
+        """Fixture completeness: every namespace/policy field must have a
+        probe pair here, so a newly added field can't be silently skipped.
+        Which bucket a field belongs to is separately pinned by
+        TestExecutionScopeFieldClassificationCompleteness above; this only
+        checks the probe tables track that bucketing."""
+        from xagent.core import execution_scope as scope_module
+
+        assert set(_NAMESPACE_FIELD_FINGERPRINT_PROBES) == set(
+            scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS
         )
+        assert set(_POLICY_FIELD_FINGERPRINT_PROBES) == set(
+            scope_module._EXECUTION_SCOPE_POLICY_FIELDS
+        )
+
+    @pytest.mark.parametrize("field_name", list(_NAMESPACE_FIELD_FINGERPRINT_PROBES))
+    def test_namespace_field_change_changes_the_fingerprint(self, field_name):
+        base_kwargs, changed_kwargs = _NAMESPACE_FIELD_FINGERPRINT_PROBES[field_name]
+        base = ExecutionScope(**base_kwargs)
+        changed = ExecutionScope(**changed_kwargs)
+        assert scope_fingerprint(base) != scope_fingerprint(changed)
+
+    @pytest.mark.parametrize("field_name", list(_POLICY_FIELD_FINGERPRINT_PROBES))
+    def test_policy_field_change_does_not_change_the_fingerprint(self, field_name):
+        base_kwargs, changed_kwargs = _POLICY_FIELD_FINGERPRINT_PROBES[field_name]
+        base = ExecutionScope(**base_kwargs)
+        changed = ExecutionScope(**changed_kwargs)
+        assert scope_fingerprint(base) == scope_fingerprint(changed)
