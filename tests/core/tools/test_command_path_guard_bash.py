@@ -2642,6 +2642,58 @@ class TestSortUniqDiffGrepHandlers:
         with pytest.raises(CommandPolicyViolation):
             guard.validate("grep -@ needle own.txt")
 
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "grep --label {path} needle own.txt",
+            "grep --label={path} needle own.txt",
+            "grep --include={path} needle own.txt",
+            "grep --context 3 needle own.txt",
+        ],
+    )
+    def test_grep_long_value_option_argument_is_not_treated_as_a_path(
+        self, scoped_command_workspace, command_template
+    ):
+        # R6: `--label`'s (and `--include`'s/`--context`'s) argument is
+        # never a filesystem path (a label, glob pattern, or count); an
+        # out-of-workspace-looking value must not cause a spurious
+        # rejection, and it must not shift the real file operand's
+        # classification either.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    def test_grep_label_value_does_not_spuriously_reject_with_explicit_pattern(
+        self, scoped_command_workspace
+    ):
+        # Before `--label` was modeled, an unrecognized long option was
+        # skipped whole, leaving its own argument in the token stream; once
+        # an explicit `-e` pattern is already present, that stray argument
+        # was misclassified as a file operand and spuriously rejected even
+        # though grep never reads it from disk.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"grep -e needle --label {shlex.quote(str(sibling_file))} own.txt"
+        )
+
+    def test_grep_real_file_operand_after_long_value_option_is_still_read_checked(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"grep --label harmless needle {shlex.quote(str(sibling_file))}"
+            )
+
+        assert exc_info.value.access == "read"
+
 
 def _trust_locally_shadowed_ownership_commands(monkeypatch):
     """Treat `chown` as a trusted system command regardless of its host path.

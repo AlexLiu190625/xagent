@@ -960,7 +960,28 @@ _GREP_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
     "D": None,
     "d": None,
 }
-_GREP_KNOWN_LONG_OPTIONS = frozenset({"--regexp", "--file", "--exclude-from"})
+# grep long options that consume a value which is never a path (a pattern,
+# label, count, or action keyword), so the value must be skipped as a unit
+# rather than left in the token stream for `--label`'s argument (e.g., a real
+# path) to slide into the implicit-pattern positional slot (R6).
+_GREP_LONG_VALUE_OPTIONS = frozenset(
+    {
+        "--label",
+        "--include",
+        "--exclude",
+        "--exclude-dir",
+        "--binary-files",
+        "--context",
+        "--after-context",
+        "--before-context",
+        "--max-count",
+        "--directories",
+        "--devices",
+    }
+)
+_GREP_KNOWN_LONG_OPTIONS = (
+    frozenset({"--regexp", "--file", "--exclude-from"}) | _GREP_LONG_VALUE_OPTIONS
+)
 
 # A `curl`/`wget` positional operand is a URL, not a bare filesystem path,
 # EXCEPT when its scheme is `file:`, which is a real local filesystem
@@ -2179,10 +2200,21 @@ class WorkspaceCommandPathGuard:
         `--file`/`--exclude-from` that would silently skip the read check
         on the pattern-file argument, and for `--regexp` it would leave
         `explicit_pattern` unset, misreading the real first file operand as
-        the (excluded) pattern positional. An option this family does not
-        recognize stays permissive (an ordinary, over-checked-never-
-        under-checked operand) rather than failing closed, matching grep's
-        existing pure-read classification.
+        the (excluded) pattern positional. `_GREP_LONG_VALUE_OPTIONS`
+        (`--label`, `--include`, `--context`, etc.) resolve the same way and
+        have their own value consumed as a unit for the same reason: leaving
+        the value in the token stream (the old skip-the-flag-only treatment)
+        makes its classification depend on unrelated context — with no
+        explicit pattern elsewhere it lands in the excluded (never
+        checked) implicit-pattern slot, but once an explicit `-e`/`-f`/
+        `--regexp` pattern IS present it instead lands in the checked file
+        operands, spuriously rejecting an ordinary out-of-workspace-looking
+        label/glob/count value that is never actually read from disk (R6).
+        Consuming the value up front makes the classification of every
+        other positional deterministic regardless of that context. An
+        option this family does not otherwise recognize stays permissive
+        (an ordinary, over-checked-never-under-checked operand) rather than
+        failing closed, matching grep's existing pure-read classification.
         """
         positionals: list[str] = []
         explicit_pattern = False
@@ -2248,6 +2280,25 @@ class WorkspaceCommandPathGuard:
                     )
                     assert argument is not None
                     self._check_path(argument, cwd, "read")
+                    continue
+                if resolved in _GREP_LONG_VALUE_OPTIONS:
+                    # `--label`, `--include`, `--context`, etc. take a value
+                    # that is never a path (a label, glob pattern, or count),
+                    # but it must still be consumed as a unit: skipping only
+                    # the option token would leave the argument in the
+                    # stream as an ordinary positional, whose classification
+                    # then depends on unrelated context (R6) — misread as
+                    # the excluded implicit-pattern slot with no explicit
+                    # pattern elsewhere, or spuriously checked (and
+                    # rejected) as a file operand once one is present.
+                    _, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"grep argument for {resolved}",
+                    )
                     continue
                 # Long flag options this family does not model (e.g.
                 # `--color=auto`) carry no path, so they are skipped rather
