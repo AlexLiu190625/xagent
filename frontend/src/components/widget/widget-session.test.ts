@@ -95,14 +95,6 @@ function directJsonResponse(status: number, data: unknown): Response {
   } as Response
 }
 
-function proxyWithInheritedValue(target: Record<string, unknown>, key: string, value: unknown) {
-  return new Proxy(target, {
-    get(current, property, receiver) {
-      return property === key ? value : Reflect.get(current, property, receiver)
-    },
-  })
-}
-
 function errorResponse(status: number, code: string) {
   return jsonResponse(status, { error: { code, message: "nope" } })
 }
@@ -813,9 +805,9 @@ describe("widget session mode", () => {
       runWidget({ "data-encrypted-context": GRANT })
       const post = spyOnIframePostMessage()
 
-      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+      await vi.waitFor(() => expect(errorSpy.mock.calls).toEqual([[
         "Xagent Widget: chat unavailable [agent_not_granted/origin_not_allowed] (HTTP 403).",
-      ))
+      ]]))
       fromIframe("ready")
 
       expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "agent_not_granted" })
@@ -929,51 +921,81 @@ describe("widget session mode", () => {
     expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: expectedCode })
   })
 
-  it.each([
-    [
-      "data.error",
-      () => proxyWithInheritedValue(
-        {},
-        "error",
-        { code: "agent_not_granted", reason: "origin_not_allowed" },
-      ),
-      "unexpected_error",
-    ],
-    [
-      "error.code",
-      () => ({
-        error: proxyWithInheritedValue(
-          { reason: "origin_not_allowed" },
-          "code",
-          "agent_not_granted",
-        ),
-      }),
-      "unexpected_error",
-    ],
-    [
-      "error.reason",
-      () => ({
-        error: proxyWithInheritedValue(
-          { code: "agent_not_granted" },
-          "reason",
-          "origin_not_allowed",
-        ),
-      }),
-      "agent_not_granted",
-    ],
-  ])("suppresses an inherited %s diagnostic component", async (_boundary, makeData, expectedCode) => {
+  it("fails closed on null-prototype response objects", async () => {
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-    fetchMock.mockResolvedValueOnce(directJsonResponse(403, makeData()))
+    const error = Object.assign(Object.create(null), {
+      code: "agent_not_granted",
+      reason: "origin_not_allowed",
+    })
+    const data = Object.assign(Object.create(null), { error })
+    fetchMock.mockResolvedValueOnce(directJsonResponse(403, data))
     runWidget({ "data-encrypted-context": GRANT })
     const post = spyOnIframePostMessage()
 
     await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
-      `Xagent Widget: chat unavailable [${expectedCode}] (HTTP 403).`,
+      "Xagent Widget: chat unavailable [unexpected_error] (HTTP 403).",
     ))
     expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("origin_not_allowed"))
     fromIframe("ready")
 
-    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: expectedCode })
+    expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: "unexpected_error" })
+  })
+
+  it.each([
+    [
+      "data.error",
+      "error",
+      { code: "agent_not_granted", reason: "origin_not_allowed" },
+      () => ({}),
+      "unexpected_error",
+    ],
+    [
+      "error.code",
+      "code",
+      "agent_not_granted",
+      () => ({ error: { reason: "origin_not_allowed" } }),
+      "unexpected_error",
+    ],
+    [
+      "error.reason",
+      "reason",
+      "origin_not_allowed",
+      () => ({ error: { code: "agent_not_granted" } }),
+      "agent_not_granted",
+    ],
+  ])("suppresses an inherited %s diagnostic component from Object.prototype", async (
+    _boundary,
+    property,
+    inheritedValue,
+    makeData,
+    expectedCode,
+  ) => {
+    const descriptor = Object.getOwnPropertyDescriptor(Object.prototype, property)
+    Object.defineProperty(Object.prototype, property, {
+      configurable: true,
+      writable: true,
+      value: inheritedValue,
+    })
+    try {
+      const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      fetchMock.mockResolvedValueOnce(jsonResponse(403, makeData()))
+      runWidget({ "data-encrypted-context": GRANT })
+      const post = spyOnIframePostMessage()
+
+      await vi.waitFor(() => expect(errorSpy).toHaveBeenCalledWith(
+        `Xagent Widget: chat unavailable [${expectedCode}] (HTTP 403).`,
+      ))
+      expect(errorSpy).not.toHaveBeenCalledWith(expect.stringContaining("origin_not_allowed"))
+      fromIframe("ready")
+
+      expect(post.mock.calls[0][0]).toMatchObject({ type: "session_terminal", code: expectedCode })
+    } finally {
+      if (descriptor) {
+        Object.defineProperty(Object.prototype, property, descriptor)
+      } else {
+        Reflect.deleteProperty(Object.prototype, property)
+      }
+    }
   })
 
   it("does not retry a coded 4xx and reports unexpected_error for an uncoded one", async () => {

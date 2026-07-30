@@ -59,8 +59,9 @@
 
   function isPlainSessionErrorObject(value) {
     if (!value || typeof value !== 'object') return false;
+    // Prototype identity is not affected by host-page Symbol.toStringTag pollution.
     var prototype = Object.getPrototypeOf(value);
-    return prototype === Object.prototype || prototype === null;
+    return prototype === Object.prototype;
   }
 
   function ownSessionErrorString(value, key) {
