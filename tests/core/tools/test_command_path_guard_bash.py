@@ -5412,6 +5412,75 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         guard.validate(command)
 
+    def test_curl_cookie_option_is_read_checked_not_write(
+        self, scoped_command_workspace
+    ):
+        # N2: `--cookie` is a real, distinct curl option (a file curl
+        # *reads* cookies from to send, or an inline `name=value` cookie
+        # list) that this family did not model; before it was added, its
+        # unambiguous-prefix match against the modeled `--cookie-jar` (a
+        # write path) made `_resolve_long_option` snap `--cookie` to
+        # `--cookie-jar` and write-check the argument. A read-only cookie
+        # file the invocation may only read (an approved external
+        # directory) must be allowed, not rejected as a write.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"curl --cookie {shlex.quote(str(external_file))} "
+            "https://example.invalid/file"
+        )
+
+    def test_curl_cookie_abbreviation_is_ambiguous_and_fails_closed(
+        self, scoped_command_workspace
+    ):
+        # Every strict abbreviation of `--cookie` is also a prefix of the
+        # longer `--cookie-jar`, so once both are modeled, only the exact
+        # `--cookie` spelling is unambiguous; a truncated spelling must fail
+        # closed rather than silently snapping to either candidate.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("curl --cooki somefile https://example.invalid/file")
+
+    def test_curl_cookie_option_rejects_out_of_workspace_read(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"curl --cookie {shlex.quote(str(sibling_file))} "
+                "https://example.invalid/file"
+            )
+
+        assert exc_info.value.access == "read"
+
+    def test_curl_cookie_jar_still_write_checked_after_cookie_is_modeled(
+        self, scoped_command_workspace
+    ):
+        # Modeling the exact `--cookie` spelling must not regress
+        # `--cookie-jar`'s own (real write path) check, including its own
+        # unambiguous-prefix abbreviation.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"curl --cookie-jar {shlex.quote(str(sibling_file))} "
+                "https://example.invalid/file"
+            )
+        assert exc_info.value.access == "write"
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"curl --cookie-j={shlex.quote(str(sibling_file))} "
+                "https://example.invalid/file"
+            )
+        assert exc_info.value.access == "write"
+
     def test_curl_rejects_unrecognized_long_option_with_value(
         self, scoped_command_workspace
     ):

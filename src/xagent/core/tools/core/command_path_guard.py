@@ -978,7 +978,7 @@ _CURL_WRITE_LONG_OPTIONS = frozenset(
         "--etag-save",
     }
 )
-_CURL_READ_LONG_OPTIONS = frozenset({"--upload-file", "--netrc-file"})
+_CURL_READ_LONG_OPTIONS = frozenset({"--upload-file", "--netrc-file", "--cookie"})
 _CURL_DATA_LONG_OPTIONS = frozenset({"--data", "--data-binary", "--data-raw"})
 # Long-form spellings of `_CURL_SHORT_FLAG_OPTIONS`'s no-value flags, so the
 # common long spelling of an already-modeled short flag is not rejected
@@ -4606,22 +4606,30 @@ class WorkspaceCommandPathGuard:
 
     def _check_curl(self, values: Sequence[str], cwd: Path) -> None:
         """`curl`: `-o`/`--output`/`--output-dir` write; `-T`/`--upload-file`/
-        `--netrc-file` read; an `@file` payload to `-d`/`--data*` reads that
-        file. `-D`/`--dump-header`, `-c`/`--cookie-jar`, `--trace`,
-        `--trace-ascii`, `--stderr`, `--libcurl`, `--hsts`, and
-        `--etag-save` also write to a filename argument. `-K`/`--config`
-        (arbitrary runtime options) and `-O`/`--remote-name[-all]` (output
-        filename derived from the remote URL or response, not statically
-        knowable) cannot be inspected safely and fail closed, including
-        bundled behind another short flag (e.g. `-sO`). Long options resolve
-        through `_resolve_long_option` (GNU unambiguous-prefix abbreviation,
-        e.g. `--dump-hea=` for `--dump-header`). Module invariant: any
-        option (short or long, bare or `=value`-attached) this allowlist
-        cannot resolve fails closed. Short options bundle through the same
-        `_parse_short_option_cluster` substrate `sort`/`grep`/`install` use,
-        so a value-taking option (`-o`/`-D`/`-c`/`-T`) still consumes its
-        argument even when it is not the leading character of the cluster
-        (e.g. `-sD`). A literal `--` ends option parsing.
+        `--netrc-file`/`--cookie` read; an `@file` payload to `-d`/`--data*`
+        reads that file. `--cookie` is modeled explicitly (not left to
+        prefix-abbreviation) because it is a real, distinct option from
+        `--cookie-jar`: leaving it unresolved let its own unambiguous-prefix
+        match snap to `--cookie-jar` (a write path) and write-check a file
+        the invocation only ever reads (N2). `-D`/`--dump-header`,
+        `-c`/`--cookie-jar`, `--trace`, `--trace-ascii`, `--stderr`,
+        `--libcurl`, `--hsts`, and `--etag-save` also write to a filename
+        argument. `-K`/`--config` (arbitrary runtime options) and
+        `-O`/`--remote-name[-all]` (output filename derived from the remote
+        URL or response, not statically knowable) cannot be inspected safely
+        and fail closed, including bundled behind another short flag (e.g.
+        `-sO`). Long options resolve through `_resolve_long_option` (GNU
+        unambiguous-prefix abbreviation, e.g. `--dump-hea=` for
+        `--dump-header`); every strict abbreviation of `--cookie` is also a
+        prefix of `--cookie-jar`, so once both are modeled only the exact
+        `--cookie` spelling resolves and a truncated one is ambiguous and
+        fails closed, as this family's invariant requires. Module invariant:
+        any option (short or long, bare or `=value`-attached) this
+        allowlist cannot resolve fails closed. Short options bundle through
+        the same `_parse_short_option_cluster` substrate `sort`/`grep`/
+        `install` use, so a value-taking option (`-o`/`-D`/`-c`/`-T`) still
+        consumes its argument even when it is not the leading character of
+        the cluster (e.g. `-sD`). A literal `--` ends option parsing.
 
         The positional URL/operand (T3) is classified through
         `_classify_url_operand`: a `file:` URL is a real filesystem channel
