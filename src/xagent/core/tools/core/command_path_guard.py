@@ -1219,6 +1219,34 @@ _TARGET_DIR_KNOWN_LONG_OPTIONS = frozenset(
     | _TARGET_DIR_LONG_SCALAR_OPTIONS
 )
 
+# `install` owns its own short/long grammar (`-d`/`--directory`,
+# `-g`/`-m`/`-o`/`-S` scalar owner/mode/suffix options, etc.), distinct from
+# `cp`/`mv`/`ln`'s, so it cannot share `_TARGET_DIR_KNOWN_LONG_OPTIONS`
+# wholesale; only `_resolve_long_option` itself (the GNU unambiguous-prefix
+# abbreviation resolver) is reused, against this dedicated known-option set,
+# so `--target-dir=`/`--targ=` resolves to `--target-directory` exactly like
+# `cp`'s `--targ=` does (R9), instead of a literal-prefix-only string match.
+_INSTALL_SCALAR_LONG_OPTIONS = frozenset(
+    {"--group", "--mode", "--owner", "--suffix", "--context"}
+)
+_INSTALL_FLAG_LONG_OPTIONS = frozenset(
+    {
+        "--backup",
+        "--compare",
+        "--preserve-timestamps",
+        "--strip",
+        "--no-target-directory",
+        "--verbose",
+        "--help",
+        "--version",
+    }
+)
+_INSTALL_KNOWN_LONG_OPTIONS = (
+    frozenset({"--target-directory", "--directory", "--strip-program"})
+    | _INSTALL_SCALAR_LONG_OPTIONS
+    | _INSTALL_FLAG_LONG_OPTIONS
+)
+
 
 @dataclass(frozen=True)
 class _PathEvent:
@@ -2553,6 +2581,13 @@ class WorkspaceCommandPathGuard:
                 self._check_path(raw_path, cwd, "read")
             return
         if len(operands) < 2:
+            # A single (or zero) operand has no destination slot to split
+            # off, but a lone operand is still a real source and must still
+            # be read-checked (R9), not silently exempted for lack of a
+            # second (destination) operand — the same fix `rsync` already
+            # applies to its own single-operand invocation (N1).
+            for raw_path in operands:
+                self._check_path(raw_path, cwd, "read")
             return
         for raw_path in operands[:-1]:
             self._check_path(raw_path, cwd, "read")
@@ -2567,45 +2602,19 @@ class WorkspaceCommandPathGuard:
         slot. `-t` also resolves when bundled behind another short flag
         (`-Dt destdir`), sharing the bundled-cluster parser `-Dm755` already
         uses; its value is write-checked below alongside every other
-        `target_dir` spelling.
+        `target_dir` spelling. Long options resolve through
+        `_resolve_long_option` against `_INSTALL_KNOWN_LONG_OPTIONS` (GNU
+        unambiguous-prefix abbreviation, e.g. `--target-dir=` for
+        `--target-directory`, matching `cp`'s `--targ=`), instead of a
+        literal-prefix-only string match that only recognized the full
+        spelling (R9).
         """
         target_dir: str | None = None
         operands: list[str] = []
         directory_mode = False
         options_done = False
-        scalar_options = frozenset(
-            {
-                "-g",
-                "--group",
-                "-m",
-                "--mode",
-                "-o",
-                "--owner",
-                "-S",
-                "--suffix",
-                "--context",
-            }
-        )
-        flag_options = frozenset(
-            {
-                "-b",
-                "--backup",
-                "-c",
-                "-C",
-                "--compare",
-                "-D",
-                "-p",
-                "--preserve-timestamps",
-                "-s",
-                "--strip",
-                "-T",
-                "--no-target-directory",
-                "-v",
-                "--verbose",
-                "--help",
-                "--version",
-            }
-        )
+        scalar_options = frozenset({"-g", "-m", "-o", "-S"})
+        flag_options = frozenset({"-b", "-c", "-C", "-D", "-p", "-s", "-T", "-v"})
         index = 0
         while index < len(values):
             value = values[index]
@@ -2618,76 +2627,102 @@ class WorkspaceCommandPathGuard:
                 operands.append(value)
                 index += 1
                 continue
-            if text in {"-d", "--directory"}:
+            if text.startswith("--"):
+                raw_option, separator, attached = text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _INSTALL_KNOWN_LONG_OPTIONS
+                )
+                if resolved is None:
+                    raise CommandPolicyViolation(
+                        f"cannot safely inspect install option {raw_option}"
+                    )
+                if resolved == "--target-directory":
+                    argument, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"install argument for {resolved}",
+                    )
+                    assert argument is not None
+                    target_dir = argument
+                    continue
+                if resolved == "--directory":
+                    directory_mode = True
+                    index += 1
+                    continue
+                if resolved == "--strip-program":
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect install delegated strip program"
+                    )
+                if resolved in _INSTALL_SCALAR_LONG_OPTIONS:
+                    _, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached) if separator else None
+                        ),
+                        context=f"install argument for {resolved}",
+                    )
+                    continue
+                # The remaining recognized long options
+                # (`_INSTALL_FLAG_LONG_OPTIONS`) take no separate argument.
+                index += 1
+                continue
+            if text == "-d":
                 directory_mode = True
                 index += 1
                 continue
-            if text in {"-t", "--target-directory"}:
+            if text == "-t":
                 if index + 1 >= len(values):
                     raise CommandPolicyViolation(f"missing install argument for {text}")
                 target_dir = values[index + 1]
                 index += 2
                 continue
-            if text.startswith("--target-directory="):
-                target_dir = self._derived_value(value, text.split("=", 1)[1])
-                index += 1
-                continue
             if text.startswith("-t") and len(text) > 2:
                 target_dir = self._derived_value(value, text[2:])
                 index += 1
                 continue
-            if text == "--strip-program" or text.startswith("--strip-program="):
-                raise CommandPolicyViolation(
-                    "cannot safely inspect install delegated strip program"
-                )
             if text in scalar_options:
                 if index + 1 >= len(values):
                     raise CommandPolicyViolation(f"missing install argument for {text}")
                 index += 2
                 continue
             if any(
-                text.startswith(f"{option}=")
-                for option in scalar_options
-                if option.startswith("--")
-            ):
-                index += 1
-                continue
-            if any(
                 text.startswith(option) and len(text) > len(option)
-                for option in {"-g", "-m", "-o", "-S"}
+                for option in scalar_options
             ):
                 index += 1
                 continue
             if text in flag_options:
                 index += 1
                 continue
-            if not text.startswith("--"):
-                # A bundled cluster (e.g. `-Dm755`): only the trailing
-                # value-taking character may carry an attached argument, so
-                # this shares the same GNU bundling contract as `sort`. `-t`
-                # bundles the same way (`-Dt destdir`); its value is deferred
-                # to the same `target_dir` slot the standalone `-t`/
-                # `--target-directory` forms populate above, so the single
-                # write check at the bottom of this method covers every
-                # spelling instead of a second inline check here.
-                index, matched_option, argument = self._parse_short_option_cluster(
-                    values,
-                    index,
-                    cwd,
-                    flag_options=frozenset("bcCDpsTv"),
-                    value_options={
-                        "g": None,
-                        "m": None,
-                        "o": None,
-                        "S": None,
-                        "t": None,
-                    },
-                )
-                if matched_option == "t":
-                    assert argument is not None
-                    target_dir = argument
-                continue
-            raise CommandPolicyViolation(f"cannot safely inspect install option {text}")
+            # A bundled cluster (e.g. `-Dm755`): only the trailing
+            # value-taking character may carry an attached argument, so this
+            # shares the same GNU bundling contract as `sort`. `-t` bundles
+            # the same way (`-Dt destdir`); its value is deferred to the same
+            # `target_dir` slot the standalone `-t`/`--target-directory`
+            # forms populate above, so the single write check at the bottom
+            # of this method covers every spelling instead of a second
+            # inline check here.
+            index, matched_option, argument = self._parse_short_option_cluster(
+                values,
+                index,
+                cwd,
+                flag_options=frozenset("bcCDpsTv"),
+                value_options={
+                    "g": None,
+                    "m": None,
+                    "o": None,
+                    "S": None,
+                    "t": None,
+                },
+            )
+            if matched_option == "t":
+                assert argument is not None
+                target_dir = argument
+            continue
 
         if directory_mode:
             for operand in operands:
@@ -2699,6 +2734,12 @@ class WorkspaceCommandPathGuard:
             self._check_path(target_dir, cwd, "write")
             return
         if len(operands) < 2:
+            # A single (or zero) operand has no destination slot to split
+            # off, but a lone operand is still a real source and must still
+            # be read-checked (R9), not silently exempted for lack of a
+            # second (destination) operand.
+            for operand in operands:
+                self._check_path(operand, cwd, "read")
             return
         for operand in operands[:-1]:
             self._check_path(operand, cwd, "read")

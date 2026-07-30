@@ -3096,6 +3096,32 @@ class TestCopyInstallMoveLinkDestructive:
 
         assert exc_info.value.access == "read"
 
+    @pytest.mark.parametrize("command_template", ["cp {path}", "install {path}"])
+    def test_single_operand_is_still_read_checked(
+        self, scoped_command_workspace, command_template
+    ):
+        # R9: `len(operands) < 2` used to skip ALL containment for a
+        # single-operand invocation; a lone operand is still a real source
+        # and must still be read-checked, matching the fix `rsync` already
+        # applies to its own single-operand invocation (N1).
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
+
+    @pytest.mark.parametrize("command", ["cp own.txt", "install own.txt"])
+    def test_single_operand_workspace_path_is_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
     @pytest.mark.parametrize(
         "command_template",
         [
@@ -3204,6 +3230,35 @@ class TestCopyInstallMoveLinkDestructive:
         with pytest.raises(CommandPathViolation) as exc_info:
             guard.validate(
                 f"install -Dt {shlex.quote(str(sibling_file.parent))} own.txt"
+            )
+
+        assert exc_info.value.access == "write"
+
+    def test_install_target_directory_long_option_abbreviation_is_allowed(
+        self, scoped_command_workspace
+    ):
+        # R9: `_check_install`'s target-directory extraction used to match
+        # `--target-directory=` as a literal prefix, so a valid GNU
+        # unambiguous-prefix abbreviation like `--target-dir=` fell through
+        # to the unrecognized-option fail-closed path instead of resolving
+        # like `cp`'s `--targ=` does.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        (workspace.output_dir / "out").mkdir()
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("install own.txt --target-dir=out")
+
+    def test_install_target_directory_long_option_abbreviation_rejects_out_of_workspace(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"install own.txt --target-dir={shlex.quote(str(sibling_file))}"
             )
 
         assert exc_info.value.access == "write"
