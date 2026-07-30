@@ -3377,6 +3377,41 @@ class TestCopyInstallMoveLinkDestructive:
 
         assert exc_info.value.access == "read"
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "shred -f own.txt",
+            "shred -u own.txt",
+            "shred -v own.txt",
+            "shred -x own.txt",
+            "shred -z own.txt",
+        ],
+    )
+    def test_shred_common_short_flags_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        # R11: the fail-closed short-option flip left `shred` with an empty
+        # `flag_short_options`, rejecting its own ordinary GNU flags.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_unlink_rejects_unrecognized_short_option(self, scoped_command_workspace):
+        # R3: `unlink` used to route through the permissive `_operands`
+        # helper (unlike `shred`'s fail-closed `_partition_path_options`),
+        # so an unrecognized short option carrying a path (e.g. `-X<path>`)
+        # was silently skipped as an ordinary token instead of failing
+        # closed — the same class of bypass the fail-closed flip already
+        # closed for `shred`.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(f"unlink -X{shlex.quote(str(sibling_file))} own.txt")
+
 
 class TestPathClassificationSubstrate:
     """Unit tests for the shared option-classification substrate itself.

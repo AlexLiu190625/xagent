@@ -2727,7 +2727,17 @@ class WorkspaceCommandPathGuard:
 
         `shred` additionally accepts `--random-source=FILE` (itself a read
         path) and scalar `-n`/`--iterations`, `-s`/`--size` options whose
-        value must not be misread as a path operand.
+        value must not be misread as a path operand, plus its remaining
+        no-value short options (`-f`/`-u`/`-v`/`-x`/`-z`, R11). Both commands
+        route through the same fail-closed `_partition_path_options`
+        substrate (R3): `unlink` previously used the permissive `_operands`
+        helper, which silently skips any unrecognized short option (and its
+        attached suffix) as an ordinary token, letting a path hide behind an
+        unmodeled option (e.g. `-X<path>`) go completely unchecked — the
+        same class of bypass the fail-closed flip already closed for
+        `shred`. `unlink` takes no short options of its own in real GNU
+        coreutils, so its `flag_short_options` is empty: every short option
+        fails closed.
         """
         if command_name == "shred":
             operands = self._partition_path_options(
@@ -2741,9 +2751,15 @@ class WorkspaceCommandPathGuard:
                     "--size": None,
                 },
                 attached_short_options=frozenset({"-n", "-s"}),
+                flag_short_options=frozenset({"-f", "-u", "-v", "-x", "-z"}),
             )
         else:
-            operands = self._operands(values)
+            operands = self._partition_path_options(
+                values,
+                cwd,
+                option_access={},
+                flag_long_options=frozenset({"--help", "--version"}),
+            )
         for raw_path in operands:
             self._check_path(raw_path, cwd, "write")
 
