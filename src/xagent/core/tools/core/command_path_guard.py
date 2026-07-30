@@ -1005,19 +1005,27 @@ _WGET_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
     "o": "write",
 }
 
-# `base64`'s short options bundle into one token (e.g. `-di<file>` combines
-# the `-d` decode flag with the `-i` input-path option), so its grammar is
+# `base64`'s short options bundle into one token (e.g. `-do<file>` combines
+# the `-d` decode flag with the `-o` output-path option), so its grammar is
 # split into a flag set and a value set for the short-option-cluster parser,
 # the same shape `sort`/`grep`/`curl`/`wget` use. `-b`/`-w` take a scalar
-# column-width value that is never a path.
-_BASE64_SHORT_FLAG_OPTIONS = frozenset("dDh")
+# column-width value that is never a path. `-i`/`--ignore-garbage` is a
+# BOOLEAN flag (GNU coreutils: discard non-alphabet input when decoding
+# instead of erroring), never value-taking: modeling it as value-taking
+# would let it silently swallow the NEXT token as its own (read-checked)
+# argument even when that token is itself another option (e.g. `-o`'s own
+# write-path flag), so `-o`'s real argument would fall through unclassified
+# as a plain read operand instead of being write-checked.
+_BASE64_SHORT_FLAG_OPTIONS = frozenset("dDhi")
 _BASE64_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
-    "i": "read",
     "o": "write",
     "b": None,
     "w": None,
 }
-_BASE64_KNOWN_LONG_OPTIONS = frozenset({"--input", "--output", "--break", "--wrap"})
+_BASE64_LONG_FLAG_OPTIONS = frozenset({"--ignore-garbage"})
+_BASE64_KNOWN_LONG_OPTIONS = frozenset(
+    {"--output", "--break", "--wrap"} | _BASE64_LONG_FLAG_OPTIONS
+)
 
 # `cp`/`mv`/`ln` share `_parse_target_directory`'s `-t`/`--target-directory`
 # extraction. Short options bundle into one token (e.g. `-rt` combines the
@@ -4023,38 +4031,47 @@ class WorkspaceCommandPathGuard:
                 self._check_path(value.split("=", 1)[1], cwd, "write")
 
     def _check_base64(self, values: Sequence[str], cwd: Path) -> None:
-        """`base64`: `-i`/`--input` reads, `-o`/`--output` writes.
+        """`base64`: `-o`/`--output` writes; every remaining operand reads.
 
+        `-i`/`--ignore-garbage` is a boolean flag (see `_BASE64_SHORT_FLAG_OPTIONS`);
         `-b`/`--break` and `-w`/`--wrap` take a scalar column-width value
         that is never a path. Long options resolve through
         `_resolve_long_option` (GNU unambiguous-prefix abbreviation, e.g.
         `--outp=` for `--output`), so an abbreviated spelling is classified
         identically to the full name instead of falling through as an
         unrecognized option — which would silently skip the write check on
-        `--output`'s argument. An unrecognized long option with an attached
-        `=value` cannot be assumed to be a value-free flag once it visibly
-        carries a value, and fails closed (mirroring `curl`/`wget`); a bare
-        unmodeled flag (e.g. `--help`) stays permissive. Short options
-        bundle through the same `_parse_short_option_cluster` substrate
-        `sort`/`grep`/`curl`/`wget` use, so `-i`/`-o` still consume their
+        `--output`'s argument. Module invariant: ANY long option this
+        allowlist cannot resolve fails closed, bare or `=value`-attached
+        alike — an unmodeled flag is not assumed value-free, since one could
+        otherwise consume (and hide) a later option's real path argument.
+        Short options bundle through the same `_parse_short_option_cluster`
+        substrate `sort`/`grep`/`curl`/`wget` use, so `-o` still consumes its
         argument even when not the leading character of the cluster (e.g.
-        `-di`).
+        `-do`); an unrecognized short option fails closed the same way. A
+        literal `--` ends option parsing; every token after it is a plain
+        (read) operand even if it looks like an option.
         """
         self._reject_dynamic_values("base64 arguments", values)
         inputs: list[str] = []
+        options_done = False
         index = 0
         while index < len(values):
             value = values[index]
             text = str(value)
-            if text == "--":
-                inputs.extend(values[index + 1 :])
-                break
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not text.startswith("-") or text == "-":
+                inputs.append(value)
+                index += 1
+                continue
             if text.startswith("--"):
                 raw_option, separator, attached_text = text.partition("=")
                 resolved = self._resolve_long_option(
                     raw_option, _BASE64_KNOWN_LONG_OPTIONS
                 )
-                if resolved in {"--input", "--output"}:
+                if resolved == "--output":
                     argument, index = self._take_option_argument(
                         values,
                         index,
@@ -4066,9 +4083,7 @@ class WorkspaceCommandPathGuard:
                         context=f"base64 argument for {resolved}",
                     )
                     assert argument is not None
-                    self._check_path(
-                        argument, cwd, "read" if resolved == "--input" else "write"
-                    )
+                    self._check_path(argument, cwd, "write")
                     continue
                 if resolved in {"--break", "--wrap"}:
                     _, index = self._take_option_argument(
@@ -4082,26 +4097,23 @@ class WorkspaceCommandPathGuard:
                         context=f"base64 argument for {resolved}",
                     )
                     continue
-                # An unmodeled long option that visibly carries a value
-                # cannot be assumed to be a value-free flag; a bare
-                # unmodeled flag stays permissive.
-                if separator:
-                    raise CommandPolicyViolation(
-                        f"cannot safely resolve base64 option {raw_option}"
-                    )
-                index += 1
-                continue
-            if text.startswith("-") and text != "-":
-                index, _, _ = self._parse_short_option_cluster(
-                    values,
-                    index,
-                    cwd,
-                    flag_options=_BASE64_SHORT_FLAG_OPTIONS,
-                    value_options=_BASE64_SHORT_VALUE_OPTIONS,
+                if resolved in _BASE64_LONG_FLAG_OPTIONS:
+                    if separator:
+                        raise CommandPolicyViolation(
+                            f"cannot safely resolve base64 option {raw_option}"
+                        )
+                    index += 1
+                    continue
+                raise CommandPolicyViolation(
+                    f"cannot safely resolve base64 option {raw_option}"
                 )
-                continue
-            inputs.append(value)
-            index += 1
+            index, _, _ = self._parse_short_option_cluster(
+                values,
+                index,
+                cwd,
+                flag_options=_BASE64_SHORT_FLAG_OPTIONS,
+                value_options=_BASE64_SHORT_VALUE_OPTIONS,
+            )
         for raw_path in inputs:
             self._check_path(raw_path, cwd, "read")
 

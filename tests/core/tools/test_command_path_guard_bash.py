@@ -4886,10 +4886,6 @@ class TestDdBase64GzipRemoteTransferCommand:
     @pytest.mark.parametrize(
         "command_template",
         [
-            "base64 -i{path}",
-            "base64 --input {path}",
-            "base64 --input={path}",
-            "base64 -di{path}",
             "base64 -o{path}",
             "base64 --output {path}",
             "base64 --output={path}",
@@ -4903,6 +4899,32 @@ class TestDdBase64GzipRemoteTransferCommand:
         guard = WorkspaceCommandPathGuard(workspace)
 
         with pytest.raises(CommandPathViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "base64 -i{path}",
+            "base64 --input {path}",
+            "base64 --input={path}",
+            "base64 -di{path}",
+        ],
+    )
+    def test_base64_ignore_garbage_is_boolean_not_a_path_option(
+        self, scoped_command_workspace, command_template
+    ):
+        # `-i`/`--ignore-garbage` is a boolean flag (GNU coreutils), not a
+        # value-taking `--input` option: this family no longer models a
+        # "-i"-consumes-a-path grammar at all, so a value attempted against
+        # it (attached, or `--input`, which base64 does not actually have)
+        # fails closed as an unrecognized option rather than being
+        # write/read-classified — still a REJECT, just not a path-specific
+        # one, since `-i` never carries a path to classify in the first
+        # place.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
             guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
 
     def test_base64_workspace_input_and_output_are_allowed(
