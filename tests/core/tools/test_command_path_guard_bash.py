@@ -4539,9 +4539,15 @@ class TestSedAwkCommand:
         [
             "awk '\"cmd\" | getline' own.txt",
             "awk '{print | \"cmd\"}' own.txt",
+            "awk '\"cmd\" |& getline' own.txt",
+            "awk 'BEGIN{ \"cat /etc/passwd\" |& getline l }' own.txt",
         ],
     )
     def test_awk_pipe_io_fails_closed(self, scoped_command_workspace, command):
+        # M5: a two-way coprocess pipe (`|&`) reads from and writes to an
+        # arbitrary shell command exactly like a plain `|` pipe and must
+        # fail closed the same way, not be silently missed because the
+        # detection only recognized a prefix ending in a bare `|`.
         workspace, _, _ = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
         guard = WorkspaceCommandPathGuard(workspace)

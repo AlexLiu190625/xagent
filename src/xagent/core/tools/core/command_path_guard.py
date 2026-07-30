@@ -4000,11 +4000,14 @@ class WorkspaceCommandPathGuard:
         the optional `< FILE` clause; `_skip_awk_getline_target` advances
         past whichever form is present so the `<` is still found instead of
         the read check being silently skipped when the target is not a bare
-        identifier.
+        identifier. A prefix ending in `|&` (gawk's two-way coprocess pipe)
+        executes a shell command exactly like a plain `|` and fails closed
+        the same way (M5): checking `endswith("|")` alone missed it, since
+        `&` — not `|` — is the trailing character.
         """
         for match in _AWK_GETLINE_PATTERN.finditer(script):
             prefix = script[: match.start()].rstrip()
-            if prefix.endswith("|"):
+            if prefix.endswith("|") or prefix.endswith("|&"):
                 raise CommandPolicyViolation(
                     "awk pipe input to 'getline' executes an arbitrary shell "
                     "command and cannot be inspected safely"
