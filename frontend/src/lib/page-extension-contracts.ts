@@ -4,6 +4,7 @@ import type { ComponentType, ReactNode } from "react"
 export type HomePageExtensionComponent = ComponentType
 
 export interface BuildAgentCardExtensionProps {
+  // Stable key for joining Provider-owned page data to an Agent card.
   agentId: number
 }
 

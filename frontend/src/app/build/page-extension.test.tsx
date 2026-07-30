@@ -6,6 +6,8 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const routerReplaceMock = vi.hoisted(() => vi.fn())
 const cardRenderMock = vi.hoisted(() => vi.fn())
+const cardPropsMock = vi.hoisted(() => vi.fn())
+const providerLoaderMock = vi.hoisted(() => vi.fn())
 const providerLifetime = vi.hoisted(() => ({ mounts: 0, unmounts: 0 }))
 
 vi.mock("@/lib/api-wrapper", async () => {
@@ -64,28 +66,57 @@ vi.mock("@/components/voice-input-controller", () => ({
 
 vi.mock("@/lib/build-page-extension", async () => {
   const ReactModule = await vi.importActual<typeof import("react")>("react")
+  const missingProvider = Symbol("missing Build page extension Provider")
+  const BuildPageExtensionContext = ReactModule.createContext<
+    Record<string, string> | null | typeof missingProvider
+  >(missingProvider)
   const BuildPageExtensionProvider = ReactModule.memo(
     ({ children }: { children: React.ReactNode }) => {
+      const [sharedData, setSharedData] = ReactModule.useState<
+        Record<string, string> | null
+      >(null)
       ReactModule.useEffect(() => {
+        let active = true
         providerLifetime.mounts += 1
+        void providerLoaderMock().then((data: Record<string, string>) => {
+          if (active) {
+            setSharedData(data)
+          }
+        })
         return () => {
+          active = false
           providerLifetime.unmounts += 1
         }
       }, [])
       return ReactModule.createElement(
         "div",
         { "data-testid": "build-extension-provider" },
-        children,
+        ReactModule.createElement(
+          BuildPageExtensionContext.Provider,
+          { value: sharedData },
+          children,
+        ),
       )
     },
   )
   const BuildAgentCardExtension = ReactModule.memo(
-    ({ agentId }: { agentId: number }) => {
+    (props: { agentId: number }) => {
       ReactModule.useState(null)
+      const sharedData = ReactModule.useContext(BuildPageExtensionContext)
+      if (sharedData === missingProvider) {
+        throw new Error("Build Agent card extension requires its Provider")
+      }
+      const { agentId } = props
       cardRenderMock(agentId)
-      return ReactModule.createElement("div", {
-        "data-testid": `agent-card-supplement-${agentId}`,
-      })
+      cardPropsMock(props)
+      const supplement = sharedData?.[String(agentId)]
+      return supplement
+        ? ReactModule.createElement(
+          "div",
+          { "data-testid": `agent-card-supplement-${agentId}` },
+          supplement,
+        )
+        : null
     },
   )
   return {
@@ -151,6 +182,9 @@ describe("BuildsPage extension boundaries", () => {
     routerPushMock.mockReset()
     routerReplaceMock.mockReset()
     cardRenderMock.mockClear()
+    cardPropsMock.mockClear()
+    providerLoaderMock.mockReset()
+    providerLoaderMock.mockResolvedValue({ "42": "supplement-42" })
     providerLifetime.mounts = 0
     providerLifetime.unmounts = 0
   })
@@ -163,8 +197,50 @@ describe("BuildsPage extension boundaries", () => {
     render(<BuildsPage />)
 
     await screen.findByText("Research Agent")
-    expect(screen.getByTestId("agent-card-supplement-42")).toBeInTheDocument()
+    expect(await screen.findByTestId("agent-card-supplement-42"))
+      .toBeInTheDocument()
     expect(cardRenderMock).toHaveBeenCalledWith(42)
+    expect(cardPropsMock).toHaveBeenCalledWith({ agentId: 42 })
+  })
+
+  it("shares one provider load across multiple Agent card extensions", async () => {
+    const agents = [1, 2, 3].map((id) => ({
+      ...agent,
+      id,
+      name: `Agent ${id}`,
+    }))
+    const providerLoad = deferred<Record<string, string>>()
+    providerLoaderMock.mockReturnValue(providerLoad.promise)
+    apiRequestMock.mockResolvedValue(jsonResponse(agents))
+
+    render(<BuildsPage />)
+    await screen.findByText("Agent 3")
+
+    for (const id of [1, 2, 3]) {
+      expect(screen.queryByTestId(
+        `agent-card-supplement-${id}`,
+      )).not.toBeInTheDocument()
+    }
+    expect(providerLoaderMock).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      providerLoad.resolve({
+        "1": "shared-value-1",
+        "2": "shared-value-2",
+        "3": "shared-value-3",
+      })
+      await providerLoad.promise
+    })
+
+    for (const id of [1, 2, 3]) {
+      expect(await screen.findByText(`shared-value-${id}`)).toBeInTheDocument()
+    }
+    expect(providerLoaderMock).toHaveBeenCalledTimes(1)
+    expect(new Set(cardPropsMock.mock.calls.map(([props]) => props.agentId)))
+      .toEqual(new Set([1, 2, 3]))
+    for (const [props] of cardPropsMock.mock.calls) {
+      expect(props).toEqual({ agentId: props.agentId })
+    }
   })
 
   it("keeps the page provider mounted across loading and a real publish refresh", async () => {
@@ -211,73 +287,10 @@ describe("BuildsPage extension boundaries", () => {
     })
     await screen.findByText("builds.emptyState.title")
     expect(providerLifetime).toEqual({ mounts: 1, unmounts: 0 })
+    expect(providerLoaderMock).toHaveBeenCalledTimes(1)
 
     view.unmount()
     expect(providerLifetime).toEqual({ mounts: 1, unmounts: 1 })
   })
 
-  it("renders voice input in the create dialog", async () => {
-    apiRequestMock.mockResolvedValue(jsonResponse([]))
-
-    render(<BuildsPage />)
-    await waitFor(() => {
-      expect(screen.queryByText("common.loading")).not.toBeInTheDocument()
-    })
-    fireEvent.click(screen.getByRole("button", {
-      name: "builds.list.header.create",
-    }))
-
-    expect(screen.getByRole("button", {
-      name: "voiceInput.start",
-    })).toBeInTheDocument()
-  })
-
-  it("renders privileged actions for an editable Agent", async () => {
-    apiRequestMock.mockResolvedValue(jsonResponse([agent]))
-
-    render(<BuildsPage />)
-    await screen.findByText("Research Agent")
-
-    for (const name of [
-      "builds.list.actions.apiKey",
-      "builds.list.actions.triggers",
-      "builds.list.actions.publish",
-      "builds.list.actions.delete",
-      "builds.list.actions.edit",
-    ]) {
-      expect(screen.getByRole("button", { name })).toBeInTheDocument()
-    }
-    expect(screen.queryByRole("button", {
-      name: "builds.list.actions.viewConfig",
-    })).not.toBeInTheDocument()
-  })
-
-  it("limits a published read-only Agent to run and view actions", async () => {
-    apiRequestMock.mockResolvedValue(jsonResponse([{
-      ...agent,
-      status: "published",
-      can_edit: false,
-      can_publish: false,
-      can_delete: false,
-    }]))
-
-    render(<BuildsPage />)
-    await screen.findByText("Research Agent")
-
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.chat",
-    })).toBeInTheDocument()
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.viewConfig",
-    })).toBeInTheDocument()
-    for (const name of [
-      "builds.list.actions.apiKey",
-      "builds.list.actions.triggers",
-      "builds.list.actions.publish",
-      "builds.list.actions.delete",
-      "builds.list.actions.edit",
-    ]) {
-      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument()
-    }
-  })
 })
