@@ -4676,6 +4676,42 @@ class TestTarCommand:
         assert exc_info.value.access == "read"
 
     @pytest.mark.parametrize(
+        "command_template",
+        [
+            "tar -x -N {path} -f a.tar",
+            "tar --newer-mtime {path} -xf a.tar",
+            "tar --after-date={path} -xf a.tar",
+        ],
+    )
+    def test_newer_mtime_option_is_read_checked(
+        self, scoped_command_workspace, command_template
+    ):
+        # R2: `-N`/`--newer-mtime`/`--after-date`'s DATE-OR-FILE argument can
+        # name a reference file; before this letter was modeled,
+        # `_parse_tar_short_events` silently treated an unmodeled short
+        # letter as a bare flag, so `-N`'s own argument fell through as an
+        # unchecked positional (extract mode never path-checks a
+        # positional).
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "a.tar").write_text("tar", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
+        assert exc_info.value.access == "read"
+
+    def test_newer_mtime_option_workspace_path_is_allowed(
+        self, scoped_command_workspace
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "a.tar").write_text("tar", encoding="utf-8")
+        (workspace.output_dir / "reference.txt").write_text("", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("tar -x -N reference.txt -f a.tar")
+
+    @pytest.mark.parametrize(
         "mode_flag", ["-xf", "-tf", "-cf", "-rf", "-uf", "-Af", "-df"]
     )
     def test_unrecognized_bare_long_option_fails_closed_in_every_mode(

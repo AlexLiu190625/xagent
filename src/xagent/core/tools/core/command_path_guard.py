@@ -1311,6 +1311,7 @@ _TarEventKind = Literal[
     "verbose_output",
     "unresolved_option",
     "pattern",
+    "newer_mtime",
 ]
 
 
@@ -3067,6 +3068,13 @@ class WorkspaceCommandPathGuard:
                 )
             elif event.kind == "exclude_from":
                 self._check_path(event.value, cwd, "read")
+            elif event.kind == "newer_mtime":
+                # `-N`/`--newer-mtime`/`--after-date`'s DATE-OR-FILE argument
+                # can name a reference file whose mtime is read (R2); model
+                # it as a read path rather than leaving it as an unmodeled
+                # bare flag, which would let its argument fall through as an
+                # unchecked positional.
+                self._check_path(event.value, cwd, "read")
             elif event.kind == "pattern":
                 # `--exclude`'s argument is a glob PATTERN matched against
                 # in-archive member names, never a local filesystem path;
@@ -3252,6 +3260,10 @@ class WorkspaceCommandPathGuard:
             "--listed-incremental": "incremental",
             "--add-file": "add_file",
             "--index-file": "verbose_output",
+            # `-N`'s two long spellings (R2); both name the same
+            # DATE-OR-FILE argument, so both resolve to the same read path.
+            "--newer-mtime": "newer_mtime",
+            "--after-date": "newer_mtime",
         }
         dangerous_options = {
             "--use-compress-program",
@@ -3333,6 +3345,12 @@ class WorkspaceCommandPathGuard:
             "I": "dangerous",
             "F": "dangerous",
             "b": None,
+            # `-N`/`--newer-mtime`/`--after-date`: a DATE-OR-FILE argument
+            # (R2). Modeling it here means its argument always takes its own
+            # token/attached-value slot like every other argument-taking
+            # short letter, so it can never fall through as an unmodeled
+            # bare flag whose argument becomes an unchecked positional.
+            "N": "newer_mtime",
         }
         known_option_characters = (
             frozenset(short_modes) | frozenset(argument_events) | {"P", "O"}
