@@ -2385,6 +2385,35 @@ class TestSortUniqDiffGrepHandlers:
 
         guard.validate(command)
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "uniq -c own.txt",
+            "uniq -i own.txt",
+            "uniq -u own.txt",
+            "uniq -d own.txt",
+            "uniq -z own.txt",
+        ],
+    )
+    def test_uniq_allows_recognized_short_flag_options(
+        self, scoped_command_workspace, command
+    ):
+        # R11: the fail-closed short-option flip left `uniq` with an empty
+        # `flag_short_options`, rejecting its own ordinary GNU short flags.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_uniq_rejects_unrecognized_short_option(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("uniq -@ own.txt")
+
     def test_diff_output_option_registers_write(self, scoped_command_workspace):
         workspace, _, sibling_file = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
@@ -2434,6 +2463,46 @@ class TestSortUniqDiffGrepHandlers:
         guard = WorkspaceCommandPathGuard(workspace)
 
         guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "diff -u own.txt own.txt",
+            "diff -r own.txt own.txt",
+            "diff -q own.txt own.txt",
+            "diff -i own.txt own.txt",
+            "diff -w own.txt own.txt",
+            "diff -b own.txt own.txt",
+            "diff -B own.txt own.txt",
+            "diff -c own.txt own.txt",
+            "diff -y own.txt own.txt",
+            "diff -a own.txt own.txt",
+            "diff -t own.txt own.txt",
+            "diff -T own.txt own.txt",
+            "diff -p own.txt own.txt",
+            "diff -s own.txt own.txt",
+            "diff -e own.txt own.txt",
+            "diff -n own.txt own.txt",
+        ],
+    )
+    def test_diff_allows_recognized_short_flag_options(
+        self, scoped_command_workspace, command
+    ):
+        # R11: the fail-closed short-option flip left `diff` with only `-N`
+        # in `flag_short_options`, rejecting its other ordinary GNU flags.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_diff_rejects_unrecognized_short_option(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("diff -@ own.txt own.txt")
 
     @pytest.mark.parametrize(
         "command_template",

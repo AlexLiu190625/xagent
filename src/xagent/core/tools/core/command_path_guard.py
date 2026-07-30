@@ -2076,7 +2076,10 @@ class WorkspaceCommandPathGuard:
         `--ignore-case`, `--unique`, `--zero-terminated`, `--group`) never
         consume an argument, so listing them separately keeps an
         unrecognized `--`-option failing closed rather than silently
-        shifting the positional write slot.
+        shifting the positional write slot. `-c`/`-i`/`-u`/`-d`/`-z` are the
+        short-spelling equivalents of those same no-value long options and
+        are listed in `flag_short_options` for the same reason (R11): an
+        unrecognized short option still fails closed.
         """
         scalar_options = frozenset(
             {"-f", "--skip-fields", "-s", "--skip-chars", "-w", "--check-chars"}
@@ -2097,6 +2100,7 @@ class WorkspaceCommandPathGuard:
                     "--group",
                 }
             ),
+            flag_short_options=frozenset({"-c", "-i", "-u", "-d", "-z"}),
             fail_closed_on_unknown_long_option=True,
         )
         if operands:
@@ -2111,10 +2115,13 @@ class WorkspaceCommandPathGuard:
         (`--brief`, `--unified`, `--recursive`, `--ignore-case`, `--color`,
         `--side-by-side`) never consume an argument, so listing them
         separately keeps the module's fail-closed-on-unrecognized-option
-        invariant from rejecting ordinary read-only usage. `-N`'s short
-        spelling is listed in `flag_short_options` (not `option_access`), the
-        same no-value/no-bundling short-option allowlist `_partition_path_options`
-        offers, since it takes no value either.
+        invariant from rejecting ordinary read-only usage. `flag_short_options`
+        is the short-spelling analogue (R11): `-u`/`-c`/`-y`/`-e`/`-n` are
+        alternate output-format flags, `-r`/`-q`/`-i`/`-w`/`-b`/`-B`/`-a`/
+        `-t`/`-T`/`-p`/`-s` are the remaining common no-value short options,
+        and `-N` is `--new-file`'s short spelling — none of them take a
+        value, so listing them keeps an unrecognized short option failing
+        closed instead of rejecting this ordinary usage.
         """
         for raw_path in self._partition_path_options(
             values,
@@ -2135,7 +2142,27 @@ class WorkspaceCommandPathGuard:
                     "--new-file",
                 }
             ),
-            flag_short_options=frozenset({"-N"}),
+            flag_short_options=frozenset(
+                {
+                    "-u",
+                    "-r",
+                    "-q",
+                    "-N",
+                    "-i",
+                    "-w",
+                    "-b",
+                    "-B",
+                    "-c",
+                    "-y",
+                    "-a",
+                    "-t",
+                    "-T",
+                    "-p",
+                    "-s",
+                    "-e",
+                    "-n",
+                }
+            ),
         ):
             self._check_path(raw_path, cwd, "read")
 
