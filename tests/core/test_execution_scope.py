@@ -54,7 +54,13 @@ def scope_log_records(level: int = logging.WARNING):
     the logger that emits makes the assertion depend on the code under test
     instead.
     """
-    logger = logging.getLogger("xagent.core.execution_scope")
+    from xagent.core import execution_scope as scope_module
+
+    # The logger object the module logs through, not a name this test assumes
+    # resolves to it: under parallel execution the module can be imported under
+    # more than one name, and a handler bound by name would then watch a logger
+    # nothing writes to.
+    logger = scope_module.logger
     records: list[logging.LogRecord] = []
 
     class _Collect(logging.Handler):
@@ -1078,6 +1084,12 @@ class TestResolveExecutionScopeOffTurn:
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot_scope)
+
+        # A real disagreement: the fail-closed entry point must reject it, or
+        # the downgrade below would be indistinguishable from "nothing
+        # disagreed" -- which also returns the resolver's scope.
+        with pytest.raises(ExecutionScopeAuthorityError):
+            resolve_execution_scope("1")
 
         with scope_log_records() as records:
             result = resolve_execution_scope_off_turn("1")
