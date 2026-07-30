@@ -5126,6 +5126,39 @@ class TestSedAwkCommand:
 
         guard.validate("awk '{getline < \"feed.txt\"}' own.txt")
 
+    def test_awk_parenthesized_getline_read_loop_is_allowed(
+        self, scoped_command_workspace
+    ):
+        # R13: `while ((getline line < "file") > 0)` is the idiomatic awk
+        # file-read loop; the redirect-target trailing-terminator set
+        # previously recognized only `;`, `\n`, `}` after the closing quote,
+        # so the `)` closing the parenthesized `getline` expression fell
+        # through as an unresolvable concatenated remainder and was
+        # rejected outright.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "feed.txt").write_text("data\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            "awk 'BEGIN{while ((getline line < \"feed.txt\") > 0) print line}' own.txt"
+        )
+
+    def test_awk_parenthesized_getline_read_loop_out_of_workspace_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                "awk 'BEGIN{while ((getline line < "
+                f'"{sibling_file}") > 0) print line}}\' own.txt'
+            )
+
+        assert exc_info.value.access == "read"
+
     @pytest.mark.parametrize(
         "command_template",
         [

@@ -4408,7 +4408,11 @@ class WorkspaceCommandPathGuard:
         ...) means the true runtime target is this literal PLUS more text
         this lexer cannot resolve; that must fail closed too, rather than
         validating only the leading literal while the concatenated
-        remainder silently escapes containment.
+        remainder silently escapes containment. `)` is also a valid
+        terminator (R13): the idiomatic `while ((getline line < "file") > 0)`
+        read loop closes the parenthesized `getline` expression right after
+        the quoted target, and that closing paren is not itself part of a
+        concatenated expression.
         """
         cursor = index
         while cursor < len(script) and script[cursor] in " \t":
@@ -4429,7 +4433,7 @@ class WorkspaceCommandPathGuard:
                 trailer = cursor + 1
                 while trailer < len(script) and script[trailer] in " \t":
                     trailer += 1
-                if trailer < len(script) and script[trailer] not in ";\n}":
+                if trailer < len(script) and script[trailer] not in ";\n})":
                     raise CommandPolicyViolation(
                         "cannot resolve dynamic awk redirect target"
                     )
