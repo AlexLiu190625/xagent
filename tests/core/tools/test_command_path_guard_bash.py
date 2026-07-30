@@ -4994,6 +4994,24 @@ class TestDdBase64GzipRemoteTransferCommand:
         guard.validate(f"gzip -c {shlex.quote(str(external_file))}")
         guard.validate(f"gzip -lt {shlex.quote(str(external_file))}")
 
+    def test_gzip_suffix_value_is_not_misread_as_read_only_mode(
+        self, scoped_command_workspace
+    ):
+        # M3: `-S`'s own (attached-or-separate) suffix argument must not be
+        # misread as the `-t`/`-l`/`-c` read-only-mode flag merely because
+        # it contains that character. `-S -t <path>` here is "-S" with a
+        # SEPARATE suffix argument of literally "-t" — the read-only-mode
+        # classification is option-aware (which characters were parsed as
+        # flags), not a position-independent scan of the raw token text, so
+        # this stays the DEFAULT write-checked mode, not read-only.
+        workspace, external_file, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"gzip -S -t {shlex.quote(str(external_file))}")
+
+        assert exc_info.value.access == "write"
+
     @pytest.mark.parametrize("command", ["gzip --best own.txt", "gzip --fast own.txt"])
     def test_gzip_allows_recognized_compression_level_flags(
         self, scoped_command_workspace, command

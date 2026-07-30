@@ -1027,6 +1027,43 @@ _BASE64_KNOWN_LONG_OPTIONS = frozenset(
     {"--output", "--break", "--wrap"} | _BASE64_LONG_FLAG_OPTIONS
 )
 
+# `gzip`'s short options bundle into one token (e.g. `-lt`, `-9v`); unlike
+# the other bundled-cluster families, more than one character in the bundle
+# is independently meaningful for the read-only-mode classification, so
+# gzip owns its own cluster parser (`_parse_gzip_short_cluster`) instead of
+# `_parse_short_option_cluster`. `-S`/`--suffix` takes a scalar value that is
+# never a path. `-c`/`--stdout`/`--to-stdout`, `-l`/`--list`, and
+# `-t`/`--test` never create or remove a file, so they keep the operand a
+# plain read instead of the default mode's write.
+_GZIP_SHORT_FLAG_OPTIONS = frozenset("acdfhklnNqrtvV123456789")
+_GZIP_READ_ONLY_SHORT_FLAGS = frozenset("clt")
+_GZIP_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {"S": None}
+_GZIP_LONG_FLAG_OPTIONS = frozenset(
+    {
+        "--ascii",
+        "--decompress",
+        "--uncompress",
+        "--force",
+        "--help",
+        "--keep",
+        "--no-name",
+        "--name",
+        "--quiet",
+        "--recursive",
+        "--verbose",
+        "--version",
+        "--fast",
+        "--best",
+    }
+)
+_GZIP_READ_ONLY_LONG_OPTIONS = frozenset(
+    {"--stdout", "--to-stdout", "--list", "--test"}
+)
+_GZIP_SCALAR_LONG_OPTIONS = frozenset({"--suffix"})
+_GZIP_KNOWN_LONG_OPTIONS = frozenset(
+    _GZIP_LONG_FLAG_OPTIONS | _GZIP_READ_ONLY_LONG_OPTIONS | _GZIP_SCALAR_LONG_OPTIONS
+)
+
 # `cp`/`mv`/`ln` share `_parse_target_directory`'s `-t`/`--target-directory`
 # extraction. Short options bundle into one token (e.g. `-rt` combines the
 # `-r` flag with the `-t` write-path option), so the grammar is split into a
@@ -4127,100 +4164,23 @@ class WorkspaceCommandPathGuard:
         derived compressed file — additive to, not a replacement for, the
         operand's own containment check (M2). `-c`/`--stdout`/`-l`/`--list`/
         `-t`/`--test` never create or remove a file, so the operand stays a
-        plain read in those modes.
+        plain read in those modes — but that classification MUST be
+        option-aware, not a position-independent character scan: `-S` takes
+        a value (its own suffix argument, e.g. the `-t` in `-S -t <path>`),
+        so a bare `t`/`c`/`l` character occurring as another option's
+        consumed value must not be misread as the read-only mode flag
+        (`_parse_gzip_short_cluster` tracks which characters were actually
+        parsed as flags, not merely present in the token stream). Long
+        options resolve through `_resolve_long_option` (GNU unambiguous-
+        prefix abbreviation); module invariant: any option (short or long,
+        bare or `=value`-attached) this allowlist cannot resolve fails
+        closed rather than being treated as an operand or skipped.
         """
         self._reject_dynamic_values("gzip arguments", values)
-        read_only_mode = any(
-            value
-            in {
-                "-c",
-                "--stdout",
-                "--to-stdout",
-                "-l",
-                "--list",
-                "-t",
-                "--test",
-            }
-            or (
-                str(value).startswith("-")
-                and not str(value).startswith("--")
-                and any(flag in str(value)[1:] for flag in {"c", "l", "t"})
-            )
-            for value in values
-        )
-        operands = self._strict_simple_operands(
-            "gzip",
-            values,
-            flag_options={
-                "-a",
-                "--ascii",
-                "-c",
-                "--stdout",
-                "--to-stdout",
-                "-d",
-                "--decompress",
-                "--uncompress",
-                "-f",
-                "--force",
-                "-h",
-                "--help",
-                "-k",
-                "--keep",
-                "-l",
-                "--list",
-                "-n",
-                "--no-name",
-                "-N",
-                "--name",
-                "-q",
-                "--quiet",
-                "-r",
-                "--recursive",
-                "-t",
-                "--test",
-                "-v",
-                "--verbose",
-                "-V",
-                "--version",
-                "--fast",
-                "--best",
-                *{f"-{level}" for level in range(1, 10)},
-            },
-            scalar_options={"-S", "--suffix"},
-            allow_short_bundles=True,
-        )
-        access: PathAccess = "read" if read_only_mode else "write"
-        if not read_only_mode:
-            _active_validation_session().effects.unknown_effect = True
-        for operand in operands:
-            self._check_path(operand, cwd, access)
-
-    def _strict_simple_operands(
-        self,
-        command_name: str,
-        values: Sequence[str],
-        *,
-        flag_options: set[str],
-        scalar_options: set[str] | frozenset[str] = frozenset(),
-        allow_short_bundles: bool = False,
-    ) -> list[str]:
-        """Parse a simple GNU-style argv into flag/scalar options and operands.
-
-        An option this family does not recognize fails closed rather than
-        being silently treated as an operand or skipped, so an unmodeled
-        option can never hide (or misclassify) a path argument. Only used by
-        families narrow enough that every option is either a no-value flag
-        or a single-scalar-value option (gzip); families with path-bearing
-        options use `_partition_path_options` instead.
-        """
         operands: list[str] = []
+        read_only_mode = False
         options_done = False
         index = 0
-        short_flags = {
-            option[1:]
-            for option in flag_options
-            if option.startswith("-") and not option.startswith("--")
-        }
         while index < len(values):
             value = values[index]
             text = str(value)
@@ -4232,35 +4192,87 @@ class WorkspaceCommandPathGuard:
                 operands.append(value)
                 index += 1
                 continue
-            if text in flag_options:
-                index += 1
-                continue
-            if text in scalar_options:
-                if index + 1 >= len(values):
-                    raise CommandPolicyViolation(
-                        f"missing {command_name} argument for {text}"
+            if text.startswith("--"):
+                raw_option, separator, attached_text = text.partition("=")
+                resolved = self._resolve_long_option(
+                    raw_option, _GZIP_KNOWN_LONG_OPTIONS
+                )
+                if resolved in _GZIP_SCALAR_LONG_OPTIONS:
+                    _, index = self._take_option_argument(
+                        values,
+                        index,
+                        attached_argument=(
+                            self._derived_value(value, attached_text)
+                            if separator
+                            else None
+                        ),
+                        context=f"gzip argument for {resolved}",
                     )
-                index += 2
+                    continue
+                if resolved in _GZIP_READ_ONLY_LONG_OPTIONS:
+                    if separator:
+                        raise CommandPolicyViolation(
+                            f"cannot safely resolve gzip option {raw_option}"
+                        )
+                    read_only_mode = True
+                    index += 1
+                    continue
+                if resolved in _GZIP_LONG_FLAG_OPTIONS:
+                    if separator:
+                        raise CommandPolicyViolation(
+                            f"cannot safely resolve gzip option {raw_option}"
+                        )
+                    index += 1
+                    continue
+                raise CommandPolicyViolation(
+                    f"cannot safely resolve gzip option {raw_option}"
+                )
+            index, matched_flags = self._parse_gzip_short_cluster(values, index)
+            if matched_flags & _GZIP_READ_ONLY_SHORT_FLAGS:
+                read_only_mode = True
+        access: PathAccess = "read" if read_only_mode else "write"
+        if not read_only_mode:
+            _active_validation_session().effects.unknown_effect = True
+        for operand in operands:
+            self._check_path(operand, cwd, access)
+
+    @staticmethod
+    def _parse_gzip_short_cluster(
+        values: Sequence[str], index: int
+    ) -> tuple[int, frozenset[str]]:
+        """Parse one bundled gzip short-option token, e.g. `-lt`/`-9v`.
+
+        Unlike `_parse_short_option_cluster`, this returns EVERY flag
+        character actually consumed as a flag (not just the last
+        value-option match), since `-c`/`-l`/`-t`'s read-only-mode
+        classification depends on which characters were parsed as flags —
+        `-S`'s own attached/separate suffix argument (e.g. the `-t` in
+        `-S -t <path>`) must not count, even though it contains the same
+        character. An unrecognized character fails closed.
+        """
+        source = values[index]
+        options = str(source)[1:]
+        seen_flags: set[str] = set()
+        cursor = 0
+        while cursor < len(options):
+            option = options[cursor]
+            if option in _GZIP_SHORT_FLAG_OPTIONS:
+                seen_flags.add(option)
+                cursor += 1
                 continue
-            if any(
-                text.startswith(f"{option}=")
-                for option in scalar_options
-                if option.startswith("--")
-            ):
-                index += 1
-                continue
-            if (
-                allow_short_bundles
-                and text.startswith("-")
-                and not text.startswith("--")
-                and set(text[1:]).issubset(short_flags)
-            ):
-                index += 1
-                continue
-            raise CommandPolicyViolation(
-                f"cannot safely inspect {command_name} option {text}"
-            )
-        return operands
+            if option not in _GZIP_SHORT_VALUE_OPTIONS:
+                raise CommandPolicyViolation(
+                    f"cannot safely resolve gzip option -{option}"
+                )
+            attached = options[cursor + 1 :]
+            if attached:
+                next_index = index + 1
+            elif index + 1 < len(values):
+                next_index = index + 2
+            else:
+                raise CommandPolicyViolation(f"missing gzip argument for -{option}")
+            return next_index, frozenset(seen_flags)
+        return index + 1, frozenset(seen_flags)
 
     def _check_rsync(self, values: Sequence[str], cwd: Path) -> None:
         """`rsync`: any remote operand rejects the WHOLE invocation (M5).
