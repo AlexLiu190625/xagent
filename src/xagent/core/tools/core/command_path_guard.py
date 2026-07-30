@@ -1236,6 +1236,7 @@ _TarEventKind = Literal[
     "absolute_names",
     "verbose_output",
     "unresolved_option",
+    "pattern",
 ]
 
 
@@ -2835,6 +2836,12 @@ class WorkspaceCommandPathGuard:
                 )
             elif event.kind == "exclude_from":
                 self._check_path(event.value, cwd, "read")
+            elif event.kind == "pattern":
+                # `--exclude`'s argument is a glob PATTERN matched against
+                # in-archive member names, never a local filesystem path;
+                # its argument is already consumed by the parser, so there
+                # is nothing left to check here (N2).
+                continue
             elif event.kind == "incremental":
                 # The snapshot file can be updated even when the archive
                 # itself is only read (e.g. listing against a snapshot).
@@ -2979,15 +2986,20 @@ class WorkspaceCommandPathGuard:
         The option resolves through `_resolve_long_option` (GNU
         unambiguous-prefix abbreviation, e.g. `--listed-incr` for
         `--listed-incremental`, `--files-fr` for `--files-from`) against
-        this family's known path-bearing and dangerous long options, so an
-        abbreviated spelling is classified identically to the full name
-        instead of falling through as unmodeled. An unrecognized long
-        option with an attached `=value` unambiguously carries a value this
-        family does not model, and fails closed immediately regardless of
-        mode (mirroring `rsync`/`curl`/`wget`). An unrecognized option with
-        NO attached value is ambiguous: it may be a bare flag (common; e.g.
-        `--gzip`), or it may take a separate following token this parser
-        cannot identify as its argument, which would otherwise be
+        this family's known path-bearing, pattern, and dangerous long
+        options, so an abbreviated spelling is classified identically to
+        the full name instead of falling through as unmodeled. `--exclude`
+        (kind `pattern`) consumes its glob-PATTERN argument without a path
+        check: it is a real, distinct tar option from `--exclude-from`, and
+        omitting it from this set previously let its own unambiguous-prefix
+        match snap to `--exclude-from` (a real path option) and misclassify
+        an ordinary pattern as a file to read-check (N2). An unrecognized
+        long option with an attached `=value` unambiguously carries a value
+        this family does not model, and fails closed immediately regardless
+        of mode (mirroring `rsync`/`curl`/`wget`). An unrecognized option
+        with NO attached value is ambiguous: it may be a bare flag (common;
+        e.g. `--gzip`), or it may take a separate following token this
+        parser cannot identify as its argument, which would otherwise be
         misclassified as an unchecked archive-member positional in
         extract/list mode (never path-checked there) or as an unchecked
         source/destination positional in the other modes (source_access-
@@ -3005,6 +3017,7 @@ class WorkspaceCommandPathGuard:
             "--directory": "directory",
             "--files-from": "files_from",
             "--exclude-from": "exclude_from",
+            "--exclude": "pattern",
             "--listed-incremental": "incremental",
             "--add-file": "add_file",
             "--index-file": "verbose_output",

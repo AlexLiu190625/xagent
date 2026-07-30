@@ -4165,6 +4165,47 @@ class TestTarCommand:
 
         guard.validate("tar --index-file listing.txt -xf a.tar")
 
+    def test_exclude_pattern_is_not_misresolved_as_exclude_from_path(
+        self, scoped_command_workspace
+    ):
+        # N2: `--exclude` is a real, distinct tar option (a glob PATTERN
+        # matched against member names, never a local path) that this
+        # family did not model; before it was added, its unambiguous-prefix
+        # match against the modeled `--exclude-from` (a real path option)
+        # made `_resolve_long_option` snap `--exclude` to `--exclude-from`
+        # and read-check the pattern as if it were a file. An out-of-
+        # workspace-looking pattern must not be rejected as a path, since
+        # it is never opened as one.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(
+            f"tar -cf archive.tar --exclude={shlex.quote(str(sibling_file))} own.txt"
+        )
+
+    def test_exclude_from_still_read_checked_after_exclude_is_modeled(
+        self, scoped_command_workspace
+    ):
+        # Modeling the exact `--exclude` spelling must not regress
+        # `--exclude-from`'s own (real path) read check, including its own
+        # unambiguous-prefix abbreviation.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"tar -cf archive.tar --exclude-from={shlex.quote(str(sibling_file))} own.txt"
+            )
+        assert exc_info.value.access == "read"
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(
+                f"tar -cf archive.tar --exclude-fr={shlex.quote(str(sibling_file))} own.txt"
+            )
+        assert exc_info.value.access == "read"
+
     @pytest.mark.parametrize(
         "mode_flag", ["-xf", "-tf", "-cf", "-rf", "-uf", "-Af", "-df"]
     )
