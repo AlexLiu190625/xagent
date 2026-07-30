@@ -1949,9 +1949,11 @@ class WorkspaceCommandPathGuard:
         `-N`/`--new-file` and diff's other common no-value long options
         (`--brief`, `--unified`, `--recursive`, `--ignore-case`, `--color`,
         `--side-by-side`) never consume an argument, so listing them
-        separately keeps the write-slot fail-closed rule below (which only
-        gates `--`-prefixed options that would otherwise consume an
-        argument silently) from rejecting ordinary read-only usage.
+        separately keeps the module's fail-closed-on-unrecognized-option
+        invariant from rejecting ordinary read-only usage. `-N`'s short
+        spelling is listed in `flag_short_options` (not `option_access`), the
+        same no-value/no-bundling short-option allowlist `_partition_path_options`
+        offers, since it takes no value either.
         """
         for raw_path in self._partition_path_options(
             values,
@@ -1972,7 +1974,7 @@ class WorkspaceCommandPathGuard:
                     "--new-file",
                 }
             ),
-            fail_closed_on_unknown_long_option=True,
+            flag_short_options=frozenset({"-N"}),
         ):
             self._check_path(raw_path, cwd, "read")
 
@@ -3119,9 +3121,20 @@ class WorkspaceCommandPathGuard:
         option_access: Mapping[str, PathAccess | None],
         attached_short_options: frozenset[str] = frozenset(),
         flag_long_options: frozenset[str] = frozenset(),
-        fail_closed_on_unknown_long_option: bool = False,
+        flag_short_options: frozenset[str] = frozenset(),
+        fail_closed_on_unknown_long_option: bool = True,
     ) -> list[str]:
         """Split path-bearing options from operands using a per-option access map.
+
+        Module invariant: an option grammar this family does not explicitly
+        model FAILS CLOSED rather than being silently skipped or treated as
+        an ordinary operand, for BOTH short and long options. Over-rejecting
+        an unmodeled legitimate option is acceptable; silently letting an
+        unmodeled option hide a path argument is not. This applies uniformly
+        — there is no pure-read exemption — so `fail_closed_on_unknown_long_option`
+        defaults to `True` for every caller; a caller may only pass `False`
+        when it has an independent, equally strict reason to trust an
+        unresolved long option cannot carry a path (rare, and must say why).
 
         Each key in `option_access` consumes exactly one following or attached
         token; a `None` access consumes it without a path check (a scalar
@@ -3130,15 +3143,18 @@ class WorkspaceCommandPathGuard:
         with an optional attached `=value` this family ignores); listing a
         long option there instead of in `option_access` is required for any
         option that owns no value slot, since `option_access` always consumes
-        a following/attached token. Long options resolve through
-        `_resolve_long_option` first, so an accepted abbreviation (`--out=`
-        for `--output`) is classified identically to the full name. A family
-        that owns a write slot must set `fail_closed_on_unknown_long_option`
-        so a long option this map cannot resolve — a typo, an unsupported
-        flag, or an ambiguous abbreviation — cannot silently bypass write
-        containment; pure-read families leave it unset and such an option is
-        left in place as an ordinary (over-checked, never under-checked)
-        operand, matching the family's existing single-access classification.
+        a following/attached token. `flag_short_options` is the short-option
+        analogue: a bare (never bundled, never valued) single-dash token this
+        family recognizes as a no-op flag, e.g. `-N`. Long options resolve
+        through `_resolve_long_option` first, so an accepted abbreviation
+        (`--out=` for `--output`) is classified identically to the full name.
+        A single-dash token that is not an exact `option_access` key, not an
+        `attached_short_options` prefix carrying a value, and not an exact
+        `flag_short_options` member fails closed: this substrate has no
+        bundled short-option-cluster grammar of its own (see
+        `_parse_short_option_cluster` for families that need one), so it
+        cannot tell a genuinely unknown flag apart from one hiding a path
+        argument and must not guess by skipping it.
         """
         known_long_options = (
             frozenset(option for option in option_access if option.startswith("--"))
@@ -3224,8 +3240,13 @@ class WorkspaceCommandPathGuard:
                     )
                 index += 1
                 continue
-            # Unknown short options are not paths for these simple grammars.
-            index += 1
+            if value_text in flag_short_options:
+                index += 1
+                continue
+            # Module invariant (see docstring): an unrecognized short option
+            # fails closed rather than being silently skipped, so it can
+            # never hide a path argument behind it.
+            raise CommandPolicyViolation(f"cannot safely resolve option {value_text}")
         return remaining
 
     def _read_policy_script(self, raw_path: str, cwd: Path) -> str:

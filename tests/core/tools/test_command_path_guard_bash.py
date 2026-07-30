@@ -2616,6 +2616,31 @@ class TestWriteCreateFamily:
         with pytest.raises(CommandPathViolation):
             guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
 
+    @pytest.mark.parametrize(
+        "command_template",
+        [
+            "chmod -X{path} 644 f",
+            "chown -X{path} owner f",
+            "chgrp -X{path} staff f",
+            "touch -X{path} f",
+        ],
+    )
+    def test_ownership_and_touch_reject_unrecognized_short_option(
+        self, scoped_command_workspace, command_template, monkeypatch
+    ):
+        # D1: an unrecognized short option must fail closed instead of being
+        # silently skipped — `_partition_path_options` used to skip any
+        # short option it didn't model by exact match, so a path embedded in
+        # an unmodeled option's own token (e.g. `-X<path>`) went completely
+        # unchecked. `f` itself need not exist for this: the invocation must
+        # never get far enough to check it.
+        workspace, _, sibling_file = scoped_command_workspace
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
+
     def test_chmod_reference_file_is_read_checked(self, scoped_command_workspace):
         workspace, _, sibling_file = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
