@@ -166,14 +166,19 @@ def ensure_widget_agent_available(
     Mirrors :func:`ensure_share_agent_available` for the widget channel. The
     guest JWT is long-lived (30-day TTL), so access is re-derived from the
     agent's *current* widget state on every request rather than trusted from
-    the token alone: disabling the widget (``widget_enabled = False``) or
-    rotating ``widget_key`` cuts off outstanding guest tokens on their next
-    request.
+    the token alone. Three owner-side levers cut off outstanding guest tokens
+    on their next request: disabling the widget (``widget_enabled = False``),
+    rotating ``widget_key``, and unpublishing the agent (#1055).
+
+    Publication is checked here rather than by having ``unpublish_agent`` clear
+    ``widget_enabled``, so that the gate is re-derived per request and covers
+    every code path that takes an agent out of ``PUBLISHED`` — and so that
+    re-publishing restores the widget without the owner re-deploying it.
 
     ``expected_widget_key`` is the key carried by the guest JWT; when present
     it must still match the agent's live key. Tokens minted before the key was
     embedded carry no key and skip that comparison — they stay gated on
-    ``widget_enabled`` so the disable path still revokes them.
+    ``widget_enabled`` and publication so those paths still revoke them.
     """
     agent = db.query(Agent).filter(Agent.id == widget_agent_id).first()
     if (
@@ -182,6 +187,7 @@ def ensure_widget_agent_available(
         or agent.user_id != user_id
         or not agent.widget_enabled
         or not agent.widget_key
+        or agent.status != AgentStatus.PUBLISHED
         or (expected_widget_key is not None and agent.widget_key != expected_widget_key)
     ):
         raise HTTPException(status_code=403, detail="Widget is unavailable")
