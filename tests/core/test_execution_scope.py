@@ -45,62 +45,44 @@ from xagent.core.execution_scope import (
 
 @contextmanager
 def scope_log_records(level: int = logging.WARNING):
-    """Collect this module's log records independently of global logging config.
+    """Record what this module logs, without going through logging config.
 
-    ``caplog`` installs its handler on the root logger, so an assertion built on
-    it only holds while records propagate there. Whether they do is decided by
-    whatever else configured logging in the same process -- which under parallel
-    test execution is whatever module happens to share the worker. Attaching to
-    the logger that emits makes the assertion depend on the code under test
-    instead.
+    Asserting on log *content* through ``caplog`` or an attached handler makes
+    the assertion depend on the level, the global disable threshold, the handler
+    set and which module instance owns the logger -- none of which the code
+    under test decides. Swapping the ``logger`` binding in the namespace the
+    functions actually read it from observes the call itself, so what is
+    asserted is that the code logs, not that a particular logging setup
+    delivers it.
     """
-    from xagent.core import execution_scope as scope_module
+    del level  # every recorded call is returned; the caller filters
 
-    # The logger object the module logs through, not a name this test assumes
-    # resolves to it: under parallel execution the module can be imported under
-    # more than one name, and a handler bound by name would then watch a logger
-    # nothing writes to.
-    logger = scope_module.logger
+    class _Recorder:
+        def __init__(self, wrapped: logging.Logger) -> None:
+            self._wrapped = wrapped
+            self.records: list[str] = []
 
-    class _Records(list):
-        """A list that can carry the diagnostics a failure needs."""
+        def warning(self, msg: str, *args: object, **kwargs: object) -> None:
+            self.records.append(msg % args if args else msg)
+            self._wrapped.warning(msg, *args, **kwargs)
 
-        diagnostics: dict[str, object] = {}
+        def error(self, msg: str, *args: object, **kwargs: object) -> None:
+            self.records.append(msg % args if args else msg)
+            self._wrapped.error(msg, *args, **kwargs)
 
-    records: list[logging.LogRecord] = _Records()
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._wrapped, name)
 
-    class _Collect(logging.Handler):
-        def emit(self, record: logging.LogRecord) -> None:
-            records.append(record)
-
-    handler = _Collect(level)
-    previous_level = logger.level
-    # ``logging.disable`` suppresses record *creation* process-wide, below any
-    # handler or level this context sets: a library that calls it at import
-    # time -- which happens once the full suite is loaded -- would otherwise
-    # make this capture silently empty while the code under test behaves
-    # correctly. Lift it for the duration and put it back.
-    previous_disable = logging.root.manager.disable
-    logging.disable(logging.NOTSET)
-    logger.addHandler(handler)
-    logger.setLevel(level)
+    # The function's own globals: the binding it resolves `logger` against at
+    # call time, whichever module instance that turns out to be.
+    namespace = resolve_execution_scope.__globals__
+    original = namespace["logger"]
+    recorder = _Recorder(original)
+    namespace["logger"] = recorder
     try:
-        yield records
+        yield recorder.records
     finally:
-        # Snapshot what decided whether a record could exist at all, so a
-        # failing assertion reports the reason instead of an empty list.
-        records.diagnostics = {  # type: ignore[attr-defined]
-            "logger": logger.name,
-            "logger_id": id(logger),
-            "effective_level": logger.getEffectiveLevel(),
-            "manager_disable": logging.root.manager.disable,
-            "handlers": [type(h).__name__ for h in logger.handlers],
-            "propagate": logger.propagate,
-            "captured": [r.getMessage() for r in records],
-        }
-        logger.removeHandler(handler)
-        logger.setLevel(previous_level)
-        logging.disable(previous_disable)
+        namespace["logger"] = original
 
 
 class TestValidateScopeComponent:
@@ -134,7 +116,7 @@ class TestValidateScopeComponent:
         with scope_log_records(logging.ERROR) as records:
             with pytest.raises(InvalidScopeComponentError):
                 validate_scope_component("bad:name", field_name="sandbox_key_suffix")
-        assert any("sandbox_key_suffix" in r.getMessage() for r in records)
+        assert any("sandbox_key_suffix" in r for r in records)
 
 
 class TestExecutionScope:
@@ -833,8 +815,7 @@ class TestSnapshotCandidateAuthority:
         with scope_log_records() as records:
             assert resolve_execution_scope("1") == resolver_scope
         assert any(
-            "policy-only mismatch" in r.getMessage()
-            and "strict_memory_isolation" in r.getMessage()
+            "policy-only mismatch" in r and "strict_memory_isolation" in r
             for r in records
         )
 
@@ -848,10 +829,7 @@ class TestSnapshotCandidateAuthority:
         self._register(lambda task_id: resolver_scope, lambda task_id: stale_snapshot)
         with scope_log_records() as records:
             assert resolve_execution_scope("1") == resolver_scope
-        assert any(
-            "shape" in r.getMessage() and "sandbox_key_suffix" in r.getMessage()
-            for r in records
-        )
+        assert any("shape" in r and "sandbox_key_suffix" in r for r in records)
 
     def test_newer_version_snapshot_is_ignored_too(self):
         """A mixed-version rollout can also see a snapshot stamped by a
@@ -956,10 +934,7 @@ class TestSnapshotCandidateAuthority:
         )
         with scope_log_records() as records:
             assert resolve_execution_scope("1") == fallback
-        assert any(
-            "shape" in r.getMessage() and "sandbox_key_suffix" in r.getMessage()
-            for r in records
-        )
+        assert any("shape" in r and "sandbox_key_suffix" in r for r in records)
 
     @pytest.mark.parametrize(
         "field_name,fallback_kwargs,snapshot_kwargs",
@@ -1138,7 +1113,7 @@ class TestResolveExecutionScopeOffTurn:
                 seen["second_direct_call"] = "raised"
 
         assert result == resolver_scope
-        assert any("authority mismatch" in r.getMessage().lower() for r in records), (
+        assert any("authority mismatch" in r.lower() for r in records), (
             f"no authority-mismatch record; function sees {seen}; "
             f"capture state: {getattr(records, 'diagnostics', None)}"
         )
