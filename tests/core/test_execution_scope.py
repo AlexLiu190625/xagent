@@ -1116,13 +1116,31 @@ class TestResolveExecutionScopeOffTurn:
         with pytest.raises(ExecutionScopeAuthorityError):
             resolve_execution_scope("1")
 
+        # Measured, not assumed: which module instance the function under test
+        # reads its globals from, and whether the hooks this test installed are
+        # the ones it sees. A capture that stays empty while the behavior is
+        # correct means one of these disagrees.
+        fn_globals = resolve_execution_scope_off_turn.__globals__
+        seen = {
+            "fn_module": fn_globals.get("__name__"),
+            "fn_logger_id": id(fn_globals.get("logger")),
+            "fn_resolver": fn_globals.get("_execution_scope_resolver") is not None,
+            "fn_loader": fn_globals.get("_execution_scope_snapshot_loader") is not None,
+        }
+
         with scope_log_records() as records:
             result = resolve_execution_scope_off_turn("1")
+            # Does the same call still disagree at this point in the test?
+            try:
+                resolve_execution_scope("1")
+                seen["second_direct_call"] = "returned"
+            except ExecutionScopeAuthorityError:
+                seen["second_direct_call"] = "raised"
 
         assert result == resolver_scope
         assert any("authority mismatch" in r.getMessage().lower() for r in records), (
-            f"no authority-mismatch record; capture state: "
-            f"{getattr(records, 'diagnostics', None)}"
+            f"no authority-mismatch record; function sees {seen}; "
+            f"capture state: {getattr(records, 'diagnostics', None)}"
         )
 
     def test_other_exceptions_still_propagate(self):
