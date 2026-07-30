@@ -659,6 +659,7 @@ class _ScriptShortOptionResult:
     next_index: int
     explicit_script: bool = False
     requests_in_place: bool = False
+    has_backup_suffix: bool = False
 
 
 @dataclass(frozen=True)
@@ -3430,8 +3431,11 @@ class WorkspaceCommandPathGuard:
         `_read_policy_script` (M4: the same `unknown_effect` gate, non-regular-
         file rejection, and bounded read every other script read uses) before
         the same lexer, rather than a parallel copy. sed's `-i`/`--in-place`
-        switches the remaining file operands from read to write. Long options
-        resolve through `_resolve_long_option` (GNU unambiguous-prefix
+        switches the remaining file operands from read to write; a backup
+        suffix (`-i.bak`, `--in-place=.bak`) additionally poisons
+        `unknown_effect`, since the derived backup file it also writes is
+        never itself path-checked (N3). Long options resolve through
+        `_resolve_long_option` (GNU unambiguous-prefix
         abbreviation, e.g. `--expr=` for `--expression`); an option this
         family does not recognize fails closed instead of being silently
         skipped, since a write-owning spelling (`--file`, `--in-place`, awk's
@@ -3499,6 +3503,14 @@ class WorkspaceCommandPathGuard:
                     continue
                 if resolved == grammar.in_place_long_option:
                     file_access = "write"
+                    if separator and attached:
+                        # A backup suffix (`--in-place=.bak`) derives a
+                        # second write target (the backup file) whose exact
+                        # name this guard never computes; poison the same
+                        # way find/tar/gzip's other non-enumerable derived
+                        # writes do (N3), additive to the operand's own
+                        # write check above, not a replacement for it.
+                        _active_validation_session().effects.unknown_effect = True
                     index += 1
                     continue
                 if resolved in grammar.optional_write_options:
@@ -3536,6 +3548,11 @@ class WorkspaceCommandPathGuard:
                 explicit_script = explicit_script or option_result.explicit_script
                 if option_result.requests_in_place:
                     file_access = "write"
+                    if option_result.has_backup_suffix:
+                        # See the `--in-place=SUFFIX` branch above (N3): the
+                        # same non-enumerable derived backup write applies
+                        # to the short-option form (`-i.bak`).
+                        _active_validation_session().effects.unknown_effect = True
                 index = option_result.next_index
                 continue
             if value_text.startswith("-") and value_text != "-":
@@ -3591,6 +3608,7 @@ class WorkspaceCommandPathGuard:
                 return _ScriptShortOptionResult(
                     next_index=index + 1,
                     requests_in_place=True,
+                    has_backup_suffix=bool(token_text[cursor + 1 :]),
                 )
             if option in {"e", "f"} or option in grammar.short_value_options:
                 attached_text = token_text[cursor + 1 :]

@@ -4432,6 +4432,47 @@ class TestSedAwkCommand:
 
         assert exc_info.value.access == "write"
 
+    @pytest.mark.parametrize(
+        "in_place_option",
+        ["-i.bak", "-i.orig", "--in-place=.bak", "--in-place=bak"],
+    )
+    def test_sed_in_place_backup_suffix_poisons_unknown_effect(
+        self, scoped_command_workspace, in_place_option
+    ):
+        # N3: `-i`/`--in-place` with a backup suffix derives a second write
+        # target (the backup file) whose exact name this guard never
+        # computes and never path-checks, unlike find/tar/gzip's other
+        # poisoning sites for a non-enumerable derived write. It must
+        # poison `unknown_effect` the same way, so a later, unrelated
+        # script inspection in the same chain fails closed instead of
+        # silently ignoring the untracked backup write.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "other_safe.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(
+            CommandPolicyViolation,
+            match="cannot inspect a script affected by an earlier command",
+        ):
+            guard.validate(
+                f"sed {in_place_option} 's/a/b/' own.txt; bash other_safe.sh"
+            )
+
+    def test_sed_in_place_without_backup_suffix_does_not_poison_unknown_effect(
+        self, scoped_command_workspace
+    ):
+        # The no-suffix form (`-i`/`--in-place` alone) only ever writes the
+        # operand itself, which is already write-checked per-path; it must
+        # not poison unrelated later script inspection.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        (workspace.output_dir / "other_safe.sh").write_text(":\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("sed -i 's/a/b/' own.txt; bash other_safe.sh")
+        guard.validate("sed --in-place 's/a/b/' own.txt; bash other_safe.sh")
+
     def test_sed_long_option_abbreviation_is_resolved(self, scoped_command_workspace):
         # GNU unambiguous-prefix abbreviation must resolve `--expr=` to
         # `--expression=` and still write-check its `w` file command, not
