@@ -69,6 +69,13 @@ def scope_log_records(level: int = logging.WARNING):
 
     handler = _Collect(level)
     previous_level = logger.level
+    # ``logging.disable`` suppresses record *creation* process-wide, below any
+    # handler or level this context sets: a library that calls it at import
+    # time -- which happens once the full suite is loaded -- would otherwise
+    # make this capture silently empty while the code under test behaves
+    # correctly. Lift it for the duration and put it back.
+    previous_disable = logging.root.manager.disable
+    logging.disable(logging.NOTSET)
     logger.addHandler(handler)
     logger.setLevel(level)
     try:
@@ -76,6 +83,7 @@ def scope_log_records(level: int = logging.WARNING):
     finally:
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
+        logging.disable(previous_disable)
 
 
 class TestValidateScopeComponent:
