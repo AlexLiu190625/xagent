@@ -1,5 +1,13 @@
 import React from "react"
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+  within,
+} from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
@@ -233,7 +241,11 @@ describe("BuildsPage extension boundaries", () => {
     })
 
     for (const id of [1, 2, 3]) {
-      expect(await screen.findByText(`shared-value-${id}`)).toBeInTheDocument()
+      const supplement = await screen.findByTestId(
+        `agent-card-supplement-${id}`,
+      )
+      expect(within(supplement).getByText(`shared-value-${id}`))
+        .toBeInTheDocument()
     }
     expect(providerLoaderMock).toHaveBeenCalledTimes(1)
     expect(new Set(cardPropsMock.mock.calls.map(([props]) => props.agentId)))
