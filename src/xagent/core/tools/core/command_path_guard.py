@@ -3269,10 +3269,15 @@ class WorkspaceCommandPathGuard:
         always wins; otherwise a prefix must match exactly one candidate.
         Ambiguous or unmatched prefixes return None so the caller decides
         whether that is a benign skip (pure-read families) or a fail-closed
-        violation (families that own a write slot).
+        violation (families that own a write slot). A bare `--` is the
+        argument-list terminator, never an abbreviation: every candidate
+        starts with `--`, so it would otherwise "unambiguously" prefix-match
+        a known set containing exactly one option (R7).
         """
         if value in known:
             return value
+        if value == "--":
+            return None
         matches = [candidate for candidate in known if candidate.startswith(value)]
         if len(matches) == 1:
             return matches[0]

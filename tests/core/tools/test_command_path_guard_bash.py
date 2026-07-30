@@ -2683,6 +2683,23 @@ class TestWriteCreateFamily:
 
         assert exc_info.value.access == "write"
 
+    def test_chmod_bare_terminator_does_not_spuriously_match_reference(
+        self, scoped_command_workspace
+    ):
+        # R7: `_resolve_long_option` would previously prefix-match a bare
+        # `--` (the operand terminator, not an abbreviation of anything)
+        # against the sole `--reference` candidate, so the `has_reference`
+        # presence check spuriously believed `--reference` was given. That
+        # left the leading MODE positional un-stripped and write-checked as
+        # if it were a path, spuriously rejecting an ordinary
+        # `chmod -- MODE file` invocation whose MODE happens to resolve
+        # outside the workspace.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"chmod -- {shlex.quote(str(sibling_file))} own.txt")
+
     @pytest.mark.parametrize(
         "command_template",
         ["touch --reference={path} own.txt", "touch -r {path} own.txt"],
@@ -3126,6 +3143,15 @@ class TestPathClassificationSubstrate:
             WorkspaceCommandPathGuard._resolve_long_option("--nonexistent", known)
             is None
         )
+
+    def test_resolve_long_option_bare_terminator_returns_none(self):
+        # R7: every known long option starts with `--`, so a bare `--` (the
+        # argument-list terminator, never an abbreviation of anything) would
+        # otherwise "unambiguously" prefix-match a known set containing
+        # exactly one candidate.
+        known = frozenset({"--reference"})
+
+        assert WorkspaceCommandPathGuard._resolve_long_option("--", known) is None
 
     def test_partition_path_options_drives_the_access_map(
         self, scoped_command_workspace
