@@ -2840,6 +2840,77 @@ class TestWriteCreateFamily:
         with pytest.raises(CommandPolicyViolation):
             guard.validate(command_template.format(path=shlex.quote(str(sibling_file))))
 
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "chmod -R 644 own.txt",
+            "chmod -v 644 own.txt",
+            "chmod -c 644 own.txt",
+            "chmod -f 644 own.txt",
+            "chown -R owner own.txt",
+            "chown -H owner own.txt",
+            "chown -L owner own.txt",
+            "chown -P owner own.txt",
+            "chgrp -R staff own.txt",
+            "touch -a own.txt",
+            "touch -c own.txt",
+            "touch -m own.txt",
+        ],
+    )
+    def test_ownership_and_touch_common_short_flags_are_allowed(
+        self, scoped_command_workspace, command, monkeypatch
+    ):
+        # R11: the fail-closed short-option flip left `chmod`/`chown`/
+        # `chgrp`/`touch` with an empty (or narrower) `flag_short_options`,
+        # rejecting their own ordinary GNU flags.
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        _trust_locally_shadowed_ownership_commands(monkeypatch)
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "truncate -c -s 10 own.txt",
+            "truncate -o -s 10 own.txt",
+        ],
+    )
+    def test_truncate_common_short_flags_are_allowed(
+        self, scoped_command_workspace, command
+    ):
+        workspace, _, _ = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(command)
+
+    def test_touch_date_option_value_is_not_treated_as_a_path(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        # `-t`/`-d`/`--date`'s value is a timestamp/date string, never a
+        # path, so an out-of-workspace-looking value does not cause a
+        # spurious rejection; the real operand is still write-checked.
+        guard.validate("touch -t 202601010000 own.txt")
+        guard.validate('touch -d "yesterday" own.txt')
+        guard.validate(f"touch -d {shlex.quote(str(sibling_file))} own.txt")
+
+    def test_touch_date_option_real_operand_still_rejected(
+        self, scoped_command_workspace
+    ):
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"touch -c {shlex.quote(str(sibling_file))}")
+
+        assert exc_info.value.access == "write"
+
     def test_chmod_reference_file_is_read_checked(self, scoped_command_workspace):
         workspace, _, sibling_file = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")

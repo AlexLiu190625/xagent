@@ -2344,7 +2344,10 @@ class WorkspaceCommandPathGuard:
         `touch`/`truncate` own their own `-r`/`--reference` read slot (the
         reference file's timestamps/size are read, never written) plus, for
         `truncate`, the `-s`/`--size` scalar; every other write command in
-        this family has no non-path positional.
+        this family has no non-path positional. `flag_short_options` lists
+        each command's remaining common no-value short options (R11) so an
+        unrecognized short option still fails closed without over-rejecting
+        ordinary usage.
         """
         if command_name in _OWNERSHIP_MODE_COMMANDS:
             reference_options = frozenset({"--reference"})
@@ -2352,6 +2355,14 @@ class WorkspaceCommandPathGuard:
                 values,
                 cwd,
                 option_access={"--reference": "read"},
+                # `-R`/`--recursive`, `-v`/`--verbose`, `-c`/`--changes`,
+                # `-f`/`--silent`/`--quiet`, and `-H`/`-L`/`-P` (symlink-
+                # traversal mode for `chown`/`chgrp`'s recursive walk) are the
+                # GNU short options shared across chmod/chown/chgrp; none of
+                # them carry a value.
+                flag_short_options=frozenset(
+                    {"-R", "-v", "-c", "-f", "-H", "-L", "-P"}
+                ),
             )
             # Must resolve through the same `_resolve_long_option` set the
             # partitioning pass above uses for this option, not an
@@ -2378,14 +2389,27 @@ class WorkspaceCommandPathGuard:
                 "--reference": "read",
             }
             attached_short_options = {"-r"}
+            flag_short_options: set[str] = set()
             if command_name == "truncate":
+                # `-s`/`--size` is already a non-path scalar; `-c`/`--no-create`
+                # and `-o`/`--io-blocks` are truncate's remaining no-value
+                # short options.
                 option_access.update({"-s": None, "--size": None})
                 attached_short_options.add("-s")
+                flag_short_options.update({"-c", "-o"})
+            else:
+                # `-t STAMP` and `-d`/`--date DATE` are non-path scalar
+                # values (a timestamp/date string, never a filesystem path);
+                # `-a`/`-c`/`-m` are touch's remaining no-value short options.
+                option_access.update({"-t": None, "-d": None, "--date": None})
+                attached_short_options.update({"-t", "-d"})
+                flag_short_options.update({"-a", "-c", "-m"})
             operands = self._partition_path_options(
                 values,
                 cwd,
                 option_access=option_access,
                 attached_short_options=frozenset(attached_short_options),
+                flag_short_options=frozenset(flag_short_options),
             )
             for raw_path in operands:
                 self._check_path(raw_path, cwd, "write")
