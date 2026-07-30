@@ -1,3 +1,3 @@
-import type { HomePageExtension } from "@/lib/page-extension-contracts"
+import type { HomePageExtensionComponent } from "@/lib/page-extension-contracts"
 
-export const homePageExtension = (() => null) satisfies HomePageExtension
+export const HomePageExtension: HomePageExtensionComponent = () => null

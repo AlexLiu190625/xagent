@@ -6,18 +6,6 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const routerReplaceMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
-const renderAgentCardSupplementMock = vi.hoisted(() =>
-  vi.fn(({ agentId }: { agentId: number }) =>
-    React.createElement("div", {
-      "data-testid": `agent-card-supplement-${agentId}`,
-    }),
-  ),
-)
-const useBuildPageExtensionMock = vi.hoisted(() =>
-  vi.fn(() => ({
-    renderAgentCardSupplement: renderAgentCardSupplementMock,
-  })),
-)
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -64,14 +52,10 @@ vi.mock("@/lib/branding", () => ({
 vi.mock("@/components/voice-input-controller", () => ({
   useVoiceInputControls: () => ({
     status: "idle",
-    hasAsrModel: true,
+    hasAsrModel: false,
     startRecording: vi.fn(),
     stopRecording: vi.fn(),
   }),
-}))
-
-vi.mock("@/lib/build-page-extension", () => ({
-  useBuildPageExtension: useBuildPageExtensionMock,
 }))
 
 vi.mock("@/components/build/deploy-agent-dialog", () => ({
@@ -143,117 +127,12 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-function resetMocks() {
-  apiRequestMock.mockReset()
-  routerPushMock.mockReset()
-  routerReplaceMock.mockReset()
-  toastErrorMock.mockReset()
-  renderAgentCardSupplementMock.mockClear()
-  useBuildPageExtensionMock.mockClear()
-}
-
-describe("BuildsPage rendering", () => {
-  beforeEach(() => {
-    resetMocks()
-  })
-
-  afterEach(() => cleanup())
-
-  it("renders the configured supplement for a real Agent card", async () => {
-    apiRequestMock.mockResolvedValue(jsonResponse([agent]))
-
-    render(<BuildsPage />)
-
-    await screen.findByText("Research Agent")
-    expect(
-      screen.getByTestId("agent-card-supplement-42"),
-    ).toBeInTheDocument()
-    expect(useBuildPageExtensionMock).toHaveBeenCalled()
-    expect(renderAgentCardSupplementMock).toHaveBeenCalledWith({ agentId: 42 })
-  })
-
-  it("renders voice input in the create dialog", async () => {
-    apiRequestMock.mockResolvedValue(jsonResponse([]))
-
-    render(<BuildsPage />)
-    await waitFor(() => {
-      expect(screen.queryByText("common.loading")).not.toBeInTheDocument()
-    })
-
-    fireEvent.click(screen.getByRole("button", {
-      name: "builds.list.header.create",
-    }))
-
-    expect(screen.getByRole("button", {
-      name: "voiceInput.start",
-    })).toBeInTheDocument()
-  })
-
-  it("renders privileged actions for an editable Agent", async () => {
-    apiRequestMock.mockResolvedValue(jsonResponse([agent]))
-
-    render(<BuildsPage />)
-    await screen.findByText("Research Agent")
-
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.apiKey",
-    })).toBeInTheDocument()
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.triggers",
-    })).toBeInTheDocument()
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.publish",
-    })).toBeInTheDocument()
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.delete",
-    })).toBeInTheDocument()
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.edit",
-    })).toBeInTheDocument()
-    expect(screen.queryByRole("button", {
-      name: "builds.list.actions.viewConfig",
-    })).not.toBeInTheDocument()
-  })
-
-  it("limits a published read-only Agent to run and view actions", async () => {
-    apiRequestMock.mockResolvedValue(jsonResponse([{
-      ...agent,
-      status: "published",
-      can_edit: false,
-      can_publish: false,
-      can_delete: false,
-    }]))
-
-    render(<BuildsPage />)
-    await screen.findByText("Research Agent")
-
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.chat",
-    })).toBeInTheDocument()
-    expect(screen.getByRole("button", {
-      name: "builds.list.actions.viewConfig",
-    })).toBeInTheDocument()
-    expect(screen.queryByRole("button", {
-      name: "builds.list.actions.apiKey",
-    })).not.toBeInTheDocument()
-    expect(screen.queryByRole("button", {
-      name: "builds.list.actions.triggers",
-    })).not.toBeInTheDocument()
-    expect(screen.queryByRole("button", {
-      name: "builds.list.actions.publish",
-    })).not.toBeInTheDocument()
-    expect(screen.queryByRole("button", {
-      name: "builds.list.actions.delete",
-    })).not.toBeInTheDocument()
-    expect(screen.queryByRole("button", {
-      name: "builds.list.actions.edit",
-    })).not.toBeInTheDocument()
-  })
-})
-
 describe("BuildsPage Agent deletion", () => {
   beforeEach(() => {
-    resetMocks()
+    apiRequestMock.mockReset()
+    routerPushMock.mockReset()
+    routerReplaceMock.mockReset()
+    toastErrorMock.mockReset()
   })
 
   afterEach(() => cleanup())

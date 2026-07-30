@@ -668,7 +668,7 @@ jobs:
 
       - name: Run Home and Build page tests
         working-directory: ./frontend
-        run: npm run test:app-pages
+        run: npm run test:home-build-pages
 
       # Static export is the default build (served by FastAPI in the pip/uvx
       # deployment). Verify it produces a servable bundle: index shell plus the

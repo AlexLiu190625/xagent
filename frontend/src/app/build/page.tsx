@@ -39,7 +39,10 @@ import {
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { useVoiceInputControls } from "@/components/voice-input-controller"
-import { useBuildPageExtension } from "@/lib/build-page-extension"
+import {
+  BuildAgentCardExtension,
+  BuildPageExtensionProvider,
+} from "@/lib/build-page-extension"
 
 interface LlmModel {
   model_id: string
@@ -83,7 +86,6 @@ export default function BuildsPage() {
   const { dispatch, setTaskId, setPendingMessage } = useApp()
   const router = useRouter()
   const searchParams = useSearchParams()
-  const buildPageExtension = useBuildPageExtension()
   const hasAutoOpenedCreateRef = useRef(false)
   const createPromptRef = useRef<HTMLTextAreaElement | null>(null)
   const isMountedRef = useRef(false)
@@ -464,7 +466,8 @@ export default function BuildsPage() {
   }
 
   return (
-    <div className="flex flex-col h-full bg-background">
+    <BuildPageExtensionProvider>
+      <div className="flex flex-col h-full bg-background">
       {/* Header */}
       <PageHeader
         title={t("builds.list.header.title")}
@@ -653,9 +656,7 @@ export default function BuildsPage() {
                           {t('builds.card.updatedAt')}: {formatDate(agent.updated_at || agent.created_at)}
                         </div>
                       </div>
-                      {buildPageExtension.renderAgentCardSupplement({
-                        agentId: agent.id,
-                      })}
+                      <BuildAgentCardExtension agentId={agent.id} />
                       <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
                         {agent.status === 'published' ? (
                           <>
@@ -893,6 +894,7 @@ export default function BuildsPage() {
           </div>
         </DialogContent>
       </Dialog>
-    </div>
+      </div>
+    </BuildPageExtensionProvider>
   )
 }

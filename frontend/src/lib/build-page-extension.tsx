@@ -1,11 +1,13 @@
+import React from "react"
+
 import type {
-  BuildAgentCardExtensionProps,
-  UseBuildPageExtension,
+  BuildAgentCardExtensionComponent,
+  BuildPageExtensionProviderComponent,
 } from "@/lib/page-extension-contracts"
 
-export const useBuildPageExtension = (() => ({
-  renderAgentCardSupplement: (props: BuildAgentCardExtensionProps) => {
-    void props
-    return null
-  },
-})) satisfies UseBuildPageExtension
+export const BuildPageExtensionProvider: BuildPageExtensionProviderComponent = ({
+  children,
+}) => <>{children}</>
+
+export const BuildAgentCardExtension: BuildAgentCardExtensionComponent =
+  () => null

@@ -28,7 +28,7 @@ import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
-import { homePageExtension } from "@/lib/home-page-extension";
+import { HomePageExtension } from "@/lib/home-page-extension";
 
 interface RecentTask {
   task_id: number | string;
@@ -538,7 +538,7 @@ export default function Home() {
 
         </div>
       </div>
-      {homePageExtension()}
+      <HomePageExtension />
     </div>
   );
 }

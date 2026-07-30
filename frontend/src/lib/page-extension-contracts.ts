@@ -1,14 +1,18 @@
-import type { ReactNode } from "react"
+import type { ComponentType, ReactNode } from "react"
 
-export type HomePageExtension = () => ReactNode
+// Embedding distributions may replace default implementation modules during frontend composition.
+export type HomePageExtensionComponent = ComponentType
 
 export interface BuildAgentCardExtensionProps {
   agentId: number
 }
 
-export interface BuildPageExtension {
-  renderAgentCardSupplement:
-    (props: BuildAgentCardExtensionProps) => ReactNode
+export interface BuildPageExtensionProviderProps {
+  children: ReactNode
 }
 
-export type UseBuildPageExtension = () => BuildPageExtension
+export type BuildPageExtensionProviderComponent =
+  ComponentType<BuildPageExtensionProviderProps>
+
+export type BuildAgentCardExtensionComponent =
+  ComponentType<BuildAgentCardExtensionProps>
