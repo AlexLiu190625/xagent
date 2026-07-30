@@ -963,7 +963,7 @@ _GREP_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
 # grep long options that consume a value which is never a path (a pattern,
 # label, count, or action keyword), so the value must be skipped as a unit
 # rather than left in the token stream for `--label`'s argument (e.g., a real
-# path) to slide into the implicit-pattern positional slot (R6).
+# path) to slide into the implicit-pattern positional slot.
 _GREP_LONG_VALUE_OPTIONS = frozenset(
     {
         "--label",
@@ -1225,7 +1225,7 @@ _TARGET_DIR_KNOWN_LONG_OPTIONS = frozenset(
 # wholesale; only `_resolve_long_option` itself (the GNU unambiguous-prefix
 # abbreviation resolver) is reused, against this dedicated known-option set,
 # so `--target-dir=`/`--targ=` resolves to `--target-directory` exactly like
-# `cp`'s `--targ=` does (R9), instead of a literal-prefix-only string match.
+# `cp`'s `--targ=` does, instead of a literal-prefix-only string match.
 _INSTALL_SCALAR_LONG_OPTIONS = frozenset(
     {"--group", "--mode", "--owner", "--suffix", "--context"}
 )
@@ -1991,7 +1991,7 @@ class WorkspaceCommandPathGuard:
         that result back through `_check_operands`/`_operands` would re-apply
         `_operands`'s own `-`-prefix filter with no memory of the `--` it
         already passed, silently dropping (and never read-checking) such an
-        operand a second time (R1). So `file`/`wc` check their partitioned
+        operand a second time. So `file`/`wc` check their partitioned
         operands directly here instead of routing through `_check_operands`.
         """
         if command_name == "file":
@@ -2128,7 +2128,7 @@ class WorkspaceCommandPathGuard:
         unrecognized `--`-option failing closed rather than silently
         shifting the positional write slot. `-c`/`-i`/`-u`/`-d`/`-z` are the
         short-spelling equivalents of those same no-value long options and
-        are listed in `flag_short_options` for the same reason (R11): an
+        are listed in `flag_short_options` for the same reason: an
         unrecognized short option still fails closed.
         """
         scalar_options = frozenset(
@@ -2166,7 +2166,7 @@ class WorkspaceCommandPathGuard:
         `--side-by-side`) never consume an argument, so listing them
         separately keeps the module's fail-closed-on-unrecognized-option
         invariant from rejecting ordinary read-only usage. `flag_short_options`
-        is the short-spelling analogue (R11): `-u`/`-c`/`-y`/`-e`/`-n` are
+        is the short-spelling analogue: `-u`/`-c`/`-y`/`-e`/`-n` are
         alternate output-format flags, `-r`/`-q`/`-i`/`-w`/`-b`/`-B`/`-a`/
         `-t`/`-T`/`-p`/`-s` are the remaining common no-value short options,
         and `-N` is `--new-file`'s short spelling — none of them take a
@@ -2238,7 +2238,7 @@ class WorkspaceCommandPathGuard:
         checked) implicit-pattern slot, but once an explicit `-e`/`-f`/
         `--regexp` pattern IS present it instead lands in the checked file
         operands, spuriously rejecting an ordinary out-of-workspace-looking
-        label/glob/count value that is never actually read from disk (R6).
+        label/glob/count value that is never actually read from disk.
         Consuming the value up front makes the classification of every
         other positional deterministic regardless of that context. An
         option this family does not otherwise recognize stays permissive
@@ -2316,7 +2316,7 @@ class WorkspaceCommandPathGuard:
                     # but it must still be consumed as a unit: skipping only
                     # the option token would leave the argument in the
                     # stream as an ordinary positional, whose classification
-                    # then depends on unrelated context (R6) — misread as
+                    # then depends on unrelated context — misread as
                     # the excluded implicit-pattern slot with no explicit
                     # pattern elsewhere, or spuriously checked (and
                     # rejected) as a file operand once one is present.
@@ -2374,7 +2374,7 @@ class WorkspaceCommandPathGuard:
         reference file's timestamps/size are read, never written) plus, for
         `truncate`, the `-s`/`--size` scalar; every other write command in
         this family has no non-path positional. `flag_short_options` lists
-        each command's remaining common no-value short options (R11) so an
+        each command's remaining common no-value short options so an
         unrecognized short option still fails closed without over-rejecting
         ordinary usage.
         """
@@ -2584,7 +2584,7 @@ class WorkspaceCommandPathGuard:
         if len(operands) < 2:
             # A single (or zero) operand has no destination slot to split
             # off, but a lone operand is still a real source and must still
-            # be read-checked (R9), not silently exempted for lack of a
+            # be read-checked, not silently exempted for lack of a
             # second (destination) operand — the same fix `rsync` already
             # applies to its own single-operand invocation (N1).
             for raw_path in operands:
@@ -2608,7 +2608,7 @@ class WorkspaceCommandPathGuard:
         unambiguous-prefix abbreviation, e.g. `--target-dir=` for
         `--target-directory`, matching `cp`'s `--targ=`), instead of a
         literal-prefix-only string match that only recognized the full
-        spelling (R9).
+        spelling.
         """
         target_dir: str | None = None
         operands: list[str] = []
@@ -2737,7 +2737,7 @@ class WorkspaceCommandPathGuard:
         if len(operands) < 2:
             # A single (or zero) operand has no destination slot to split
             # off, but a lone operand is still a real source and must still
-            # be read-checked (R9), not silently exempted for lack of a
+            # be read-checked, not silently exempted for lack of a
             # second (destination) operand.
             for operand in operands:
                 self._check_path(operand, cwd, "read")
@@ -2770,9 +2770,9 @@ class WorkspaceCommandPathGuard:
         `shred` additionally accepts `--random-source=FILE` (itself a read
         path) and scalar `-n`/`--iterations`, `-s`/`--size` options whose
         value must not be misread as a path operand, plus its remaining
-        no-value short options (`-f`/`-u`/`-v`/`-x`/`-z`, R11). Both commands
+        no-value short options (`-f`/`-u`/`-v`/`-x`/`-z`). Both commands
         route through the same fail-closed `_partition_path_options`
-        substrate (R3): `unlink` previously used the permissive `_operands`
+        substrate: `unlink` previously used the permissive `_operands`
         helper, which silently skips any unrecognized short option (and its
         attached suffix) as an ordinary token, letting a path hide behind an
         unmodeled option (e.g. `-X<path>`) go completely unchecked — the
@@ -3070,7 +3070,7 @@ class WorkspaceCommandPathGuard:
                 self._check_path(event.value, cwd, "read")
             elif event.kind == "newer_mtime":
                 # `-N`/`--newer-mtime`/`--after-date`'s DATE-OR-FILE argument
-                # can name a reference file whose mtime is read (R2); model
+                # can name a reference file whose mtime is read; model
                 # it as a read path rather than leaving it as an unmodeled
                 # bare flag, which would let its argument fall through as an
                 # unchecked positional.
@@ -3260,7 +3260,7 @@ class WorkspaceCommandPathGuard:
             "--listed-incremental": "incremental",
             "--add-file": "add_file",
             "--index-file": "verbose_output",
-            # `-N`'s two long spellings (R2); both name the same
+            # `-N`'s two long spellings; both name the same
             # DATE-OR-FILE argument, so both resolve to the same read path.
             "--newer-mtime": "newer_mtime",
             "--after-date": "newer_mtime",
@@ -3346,7 +3346,7 @@ class WorkspaceCommandPathGuard:
             "F": "dangerous",
             "b": None,
             # `-N`/`--newer-mtime`/`--after-date`: a DATE-OR-FILE argument
-            # (R2). Modeling it here means its argument always takes its own
+            # . Modeling it here means its argument always takes its own
             # token/attached-value slot like every other argument-taking
             # short letter, so it can never fall through as an unmodeled
             # bare flag whose argument becomes an unchecked positional.
@@ -3479,7 +3479,7 @@ class WorkspaceCommandPathGuard:
         violation (families that own a write slot). A bare `--` is the
         argument-list terminator, never an abbreviation: every candidate
         starts with `--`, so it would otherwise "unambiguously" prefix-match
-        a known set containing exactly one option (R7).
+        a known set containing exactly one option.
         """
         if value in known:
             return value
@@ -4409,7 +4409,7 @@ class WorkspaceCommandPathGuard:
         this lexer cannot resolve; that must fail closed too, rather than
         validating only the leading literal while the concatenated
         remainder silently escapes containment. `)` is also a valid
-        terminator (R13): the idiomatic `while ((getline line < "file") > 0)`
+        terminator: the idiomatic `while ((getline line < "file") > 0)`
         read loop closes the parenthesized `getline` expression right after
         the quoted target, and that closing paren is not itself part of a
         concatenated expression.

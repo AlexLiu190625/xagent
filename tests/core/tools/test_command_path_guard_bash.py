@@ -2106,7 +2106,7 @@ class TestReadCommandFamily:
     def test_file_and_wc_common_flags_are_allowed(
         self, scoped_command_workspace, command
     ):
-        # R11: the fail-closed short-option flip left `file`/`wc` with an
+        # the fail-closed short-option flip left `file`/`wc` with an
         # empty `flag_short_options`, rejecting their own ordinary GNU flags.
         workspace, _, _ = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
@@ -2134,7 +2134,7 @@ class TestReadCommandFamily:
     def test_file_and_wc_post_terminator_operand_is_still_read_checked(
         self, scoped_command_workspace, command_name
     ):
-        # R1: `_partition_path_options` consumes `--` and returns a plain
+        # `_partition_path_options` consumes `--` and returns a plain
         # operand list; routing that list back through `_check_operands`/
         # `_operands` re-applied `_operands`'s own `-`-prefix filter with no
         # memory of the `--` it already passed, silently dropping (and never
@@ -2398,7 +2398,7 @@ class TestSortUniqDiffGrepHandlers:
     def test_uniq_allows_recognized_short_flag_options(
         self, scoped_command_workspace, command
     ):
-        # R11: the fail-closed short-option flip left `uniq` with an empty
+        # the fail-closed short-option flip left `uniq` with an empty
         # `flag_short_options`, rejecting its own ordinary GNU short flags.
         workspace, _, _ = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
@@ -2488,7 +2488,7 @@ class TestSortUniqDiffGrepHandlers:
     def test_diff_allows_recognized_short_flag_options(
         self, scoped_command_workspace, command
     ):
-        # R11: the fail-closed short-option flip left `diff` with only `-N`
+        # the fail-closed short-option flip left `diff` with only `-N`
         # in `flag_short_options`, rejecting its other ordinary GNU flags.
         workspace, _, _ = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
@@ -2654,7 +2654,7 @@ class TestSortUniqDiffGrepHandlers:
     def test_grep_long_value_option_argument_is_not_treated_as_a_path(
         self, scoped_command_workspace, command_template
     ):
-        # R6: `--label`'s (and `--include`'s/`--context`'s) argument is
+        # `--label`'s (and `--include`'s/`--context`'s) argument is
         # never a filesystem path (a label, glob pattern, or count); an
         # out-of-workspace-looking value must not cause a spurious
         # rejection, and it must not shift the real file operand's
@@ -2860,7 +2860,7 @@ class TestWriteCreateFamily:
     def test_ownership_and_touch_common_short_flags_are_allowed(
         self, scoped_command_workspace, command, monkeypatch
     ):
-        # R11: the fail-closed short-option flip left `chmod`/`chown`/
+        # the fail-closed short-option flip left `chmod`/`chown`/
         # `chgrp`/`touch` with an empty (or narrower) `flag_short_options`,
         # rejecting their own ordinary GNU flags.
         workspace, _, _ = scoped_command_workspace
@@ -2956,7 +2956,7 @@ class TestWriteCreateFamily:
     def test_chmod_bare_terminator_does_not_spuriously_match_reference(
         self, scoped_command_workspace
     ):
-        # R7: `_resolve_long_option` would previously prefix-match a bare
+        # `_resolve_long_option` would previously prefix-match a bare
         # `--` (the operand terminator, not an abbreviation of anything)
         # against the sole `--reference` candidate, so the `has_reference`
         # presence check spuriously believed `--reference` was given. That
@@ -3100,7 +3100,7 @@ class TestCopyInstallMoveLinkDestructive:
     def test_single_operand_is_still_read_checked(
         self, scoped_command_workspace, command_template
     ):
-        # R9: `len(operands) < 2` used to skip ALL containment for a
+        # `len(operands) < 2` used to skip ALL containment for a
         # single-operand invocation; a lone operand is still a real source
         # and must still be read-checked, matching the fix `rsync` already
         # applies to its own single-operand invocation (N1).
@@ -3237,7 +3237,7 @@ class TestCopyInstallMoveLinkDestructive:
     def test_install_target_directory_long_option_abbreviation_is_allowed(
         self, scoped_command_workspace
     ):
-        # R9: `_check_install`'s target-directory extraction used to match
+        # `_check_install`'s target-directory extraction used to match
         # `--target-directory=` as a literal prefix, so a valid GNU
         # unambiguous-prefix abbreviation like `--target-dir=` fell through
         # to the unrecognized-option fail-closed path instead of resolving
@@ -3445,7 +3445,7 @@ class TestCopyInstallMoveLinkDestructive:
     def test_shred_common_short_flags_are_allowed(
         self, scoped_command_workspace, command
     ):
-        # R11: the fail-closed short-option flip left `shred` with an empty
+        # the fail-closed short-option flip left `shred` with an empty
         # `flag_short_options`, rejecting its own ordinary GNU flags.
         workspace, _, _ = scoped_command_workspace
         (workspace.output_dir / "own.txt").write_text("own", encoding="utf-8")
@@ -3454,7 +3454,7 @@ class TestCopyInstallMoveLinkDestructive:
         guard.validate(command)
 
     def test_unlink_rejects_unrecognized_short_option(self, scoped_command_workspace):
-        # R3: `unlink` used to route through the permissive `_operands`
+        # `unlink` used to route through the permissive `_operands`
         # helper (unlike `shred`'s fail-closed `_partition_path_options`),
         # so an unrecognized short option carrying a path (e.g. `-X<path>`)
         # was silently skipped as an ordinary token instead of failing
@@ -3505,7 +3505,7 @@ class TestPathClassificationSubstrate:
         )
 
     def test_resolve_long_option_bare_terminator_returns_none(self):
-        # R7: every known long option starts with `--`, so a bare `--` (the
+        # every known long option starts with `--`, so a bare `--` (the
         # argument-list terminator, never an abbreviation of anything) would
         # otherwise "unambiguously" prefix-match a known set containing
         # exactly one candidate.
@@ -4686,7 +4686,7 @@ class TestTarCommand:
     def test_newer_mtime_option_is_read_checked(
         self, scoped_command_workspace, command_template
     ):
-        # R2: `-N`/`--newer-mtime`/`--after-date`'s DATE-OR-FILE argument can
+        # `-N`/`--newer-mtime`/`--after-date`'s DATE-OR-FILE argument can
         # name a reference file; before this letter was modeled,
         # `_parse_tar_short_events` silently treated an unmodeled short
         # letter as a bare flag, so `-N`'s own argument fell through as an
@@ -5129,7 +5129,7 @@ class TestSedAwkCommand:
     def test_awk_parenthesized_getline_read_loop_is_allowed(
         self, scoped_command_workspace
     ):
-        # R13: `while ((getline line < "file") > 0)` is the idiomatic awk
+        # `while ((getline line < "file") > 0)` is the idiomatic awk
         # file-read loop; the redirect-target trailing-terminator set
         # previously recognized only `;`, `\n`, `}` after the closing quote,
         # so the `)` closing the parenthesized `getline` expression fell
