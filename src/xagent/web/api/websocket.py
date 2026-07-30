@@ -7407,12 +7407,15 @@ async def _handle_resume_task_unserialized(
         task_owner_user_id = int(task_fields.user_id)
         task_status = cast(TaskStatus, task_fields.status)
         # Off-turn: this only locates the paused task's existing
-        # workspace/sandbox to resume it, it never selects a namespace for
-        # new bytes -- the resumed turn re-resolves fail-closed on its own at
-        # the orchestrator's turn boundary. A control operation on an
+        # workspace/sandbox for ``get_agent_for_task`` below, it never
+        # selects a namespace for new bytes. A control operation on an
         # already-running (or resumable) task must stay available even under
         # a resolver/snapshot dispute, so a mismatch downgrades to the
-        # resolver's answer instead of blocking the resume.
+        # resolver's answer instead of blocking the resume. The turn this
+        # handler schedules is a different consumer: it is passed
+        # ``EXECUTION_SCOPE_NOT_PROVIDED`` instead of this value below so
+        # ``execute_resume_background`` performs its own fail-closed
+        # resolution for the new turn rather than inheriting this downgrade.
         resolved_execution_scope = await run_db_io_cancellation_safe(
             lambda: resolve_execution_scope_off_turn(task_id)
         )
@@ -7477,7 +7480,14 @@ async def _handle_resume_task_unserialized(
                         task_owner_user_id=task_owner_user_id,
                         expected_run_id=resume_snapshot.run_id,
                         previous_task=previous_task,
-                        resolved_execution_scope=resolved_execution_scope,
+                        # Not `resolved_execution_scope`: that value is the
+                        # off-turn downgrade used above only to locate the
+                        # existing agent. The scheduled turn selects a
+                        # namespace for new bytes, so it explicitly gets
+                        # `EXECUTION_SCOPE_NOT_PROVIDED` and runs its own
+                        # fail-closed resolution instead of inheriting a
+                        # disputed answer.
+                        resolved_execution_scope=EXECUTION_SCOPE_NOT_PROVIDED,
                     )
                 )
                 background_task_manager.register_reserved_resume(task_id, bg_task)

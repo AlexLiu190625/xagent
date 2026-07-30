@@ -147,7 +147,7 @@ class ManagedFileRef:
         # explicit arg -> ambient turn contextvar -> the per-task
         # resolver/snapshot keyed on the record's ``task_id``. The last step
         # matters on off-turn paths (bot/builder-chat handlers never enter
-        # ``turn_execution_scope``, so the contextvar is None): a workforce
+        # an ``ExecutionScopeContext``, so the contextvar is None): a workforce
         # sub-task carries its scope only in the persisted snapshot, and
         # without recovering it here ``sync_to_durable`` would write a new
         # file under the owner root instead of the sub-task's scoped subtree.
@@ -173,6 +173,28 @@ class ManagedFileRef:
                     # would make an already-legitimate key look foreign to a
                     # narrower re-derived scope (see ``storage`` binding
                     # below).
+                    #
+                    # Skipping this branch leaves ``scope`` at ``None``, so
+                    # ``self._scope_segments`` below is ``()`` and
+                    # ``self.storage`` binds to the owner root
+                    # (``get_user_file_storage(user_id, scope_segments=())``)
+                    # rather than the narrower scoped subtree. Every
+                    # operation on this ref -- ``ensure_local``/
+                    # ``materialize`` (read), ``signed_access_url`` (sign),
+                    # ``delete_durable`` (delete),
+                    # ``_verify_durable_checksum_for_direct_access``
+                    # (integrity check) -- goes through that same
+                    # ``self.storage`` with the fixed ``self.storage_key``,
+                    # so none of them get ``ScopedFileStorage``'s
+                    # prefix-containment narrowing to the scope subtree; they
+                    # are only constrained to the owner's key space. That is
+                    # safe here because ``storage_key`` is an absolute key
+                    # already chosen under the writing scope -- these
+                    # operations address a fixed object rather than
+                    # constructing a new key relative to a prefix, so a
+                    # containment check against a re-derived (and possibly
+                    # drifted) scope would add no protection, only risk
+                    # rejecting an already-legitimate key.
                     scope = resolve_execution_scope(task_id)
         else:
             scope = cast(ExecutionScope | None, scope_input)

@@ -16,7 +16,6 @@ import pytest
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
-    set_execution_scope_resolver,
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.chat import AgentServiceManager
@@ -24,15 +23,6 @@ from xagent.web.api.chat import AgentServiceManager
 OWNER_ID = 7
 TASK_ID = 42
 WORKSPACE_ID = f"web_task_{TASK_ID}"
-
-
-@pytest.fixture(autouse=True)
-def _no_resolver():
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
-    yield
-    set_execution_scope_resolver(None)
-    set_execution_scope_snapshot_loader(None)
 
 
 @pytest.fixture(autouse=True)

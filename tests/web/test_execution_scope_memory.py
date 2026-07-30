@@ -94,13 +94,6 @@ class FakeBaseStore(MemoryStore):
         return {"total_count": len(self.notes), "memory_store_type": "fake"}
 
 
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    register_scope_resolver(None)
-    yield
-    register_scope_resolver(None)
-
-
 @pytest.fixture
 def store() -> UserIsolatedMemoryStore:
     return UserIsolatedMemoryStore(FakeBaseStore())

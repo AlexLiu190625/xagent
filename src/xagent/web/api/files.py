@@ -408,8 +408,9 @@ async def store_uploaded_files(
     completed = False
 
     try:
-        # Off-turn (this runs outside turn_execution_scope, from the upload
-        # HTTP endpoint) but a write path: the resolved scope selects the
+        # Off-turn (this runs outside the ExecutionScopeContext/
+        # resolve_execution_scope turn boundary, from the upload HTTP
+        # endpoint) but a write path: the resolved scope selects the
         # namespace (workspace segments / storage key) these bytes are
         # written under. Unlike the off-turn *read* paths that call
         # resolve_execution_scope_off_turn() and downgrade an authority
