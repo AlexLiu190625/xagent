@@ -5418,6 +5418,80 @@ class TestDdBase64GzipRemoteTransferCommand:
         with pytest.raises(CommandPolicyViolation):
             guard.validate("curl -sO https://example.invalid/file")
 
+    def test_curl_file_url_output_source_is_read_checked(
+        self, scoped_command_workspace
+    ):
+        # T3/C1: a `file:` URL is a real filesystem channel, not a network
+        # transfer; the positional URL operand was never inspected at all
+        # (a bare `index += 1`), so this used to ALLOW unconditionally.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"curl -o out.txt file://{sibling_file}")
+
+        assert exc_info.value.access == "read"
+
+    def test_curl_upload_to_file_url_is_write_checked(self, scoped_command_workspace):
+        # T3/C1: `-T`/`--upload-file` turns the request into an upload whose
+        # DESTINATION is the URL operand, so a `file:` URL there is a write
+        # target, not a read source.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"curl -T own.txt file://{sibling_file}")
+
+        assert exc_info.value.access == "write"
+
+    def test_curl_upload_target_classification_is_order_independent(
+        self, scoped_command_workspace
+    ):
+        # `-T` need not precede the URL operand for curl's own option
+        # parsing; the guard's write-vs-read classification of the URL must
+        # not depend on argv order either.
+        workspace, _, sibling_file = scoped_command_workspace
+        (workspace.output_dir / "own.txt").write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"curl file://{sibling_file} -T own.txt")
+
+        assert exc_info.value.access == "write"
+
+    def test_curl_file_url_workspace_path_is_allowed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        own_file = workspace.output_dir / "own.txt"
+        own_file.write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"curl -o out.txt file://{own_file}")
+
+    @pytest.mark.parametrize(
+        "scheme", ["gopher", "smb", "dict", "ldap", "unknown-scheme"]
+    )
+    def test_curl_unrecognized_url_scheme_fails_closed(
+        self, scoped_command_workspace, scheme
+    ):
+        # Any scheme this family does not explicitly recognize as network
+        # transfer fails closed rather than being assumed non-local.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate(f"curl -o out.txt {scheme}://example.invalid/file")
+
+    def test_curl_end_of_options_marker_stops_option_parsing(
+        self, scoped_command_workspace
+    ):
+        # A literal `--` ends option parsing; a URL-shaped token after it is
+        # still a plain operand, not silently reinterpreted as an option.
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate("curl -o out.txt -- https://example.invalid/file")
+
     # -- wget ------------------------------------------------------------
 
     def test_wget_output_outside_workspace_rejected(self, scoped_command_workspace):
@@ -5566,6 +5640,33 @@ class TestDdBase64GzipRemoteTransferCommand:
 
         with pytest.raises(CommandPolicyViolation):
             guard.validate("wget -qi urls.txt")
+
+    def test_wget_file_url_source_is_read_checked(self, scoped_command_workspace):
+        # T3/C1: a `file:` URL is a real filesystem channel; wget's URL
+        # operand was never inspected at all, so this used to ALLOW
+        # unconditionally.
+        workspace, _, sibling_file = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPathViolation) as exc_info:
+            guard.validate(f"wget -O out.txt file://{sibling_file}")
+
+        assert exc_info.value.access == "read"
+
+    def test_wget_file_url_workspace_path_is_allowed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        own_file = workspace.output_dir / "own.txt"
+        own_file.write_text("own\n", encoding="utf-8")
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        guard.validate(f"wget -O out.txt file://{own_file}")
+
+    def test_wget_unrecognized_url_scheme_fails_closed(self, scoped_command_workspace):
+        workspace, _, _ = scoped_command_workspace
+        guard = WorkspaceCommandPathGuard(workspace)
+
+        with pytest.raises(CommandPolicyViolation):
+            guard.validate("wget -O out.txt gopher://example.invalid/file")
 
     # -- path-classification bypass regressions -------------------------
 

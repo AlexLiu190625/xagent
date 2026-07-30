@@ -937,6 +937,17 @@ _GREP_SHORT_VALUE_OPTIONS: dict[str, PathAccess | None] = {
 }
 _GREP_KNOWN_LONG_OPTIONS = frozenset({"--regexp", "--file", "--exclude-from"})
 
+# A `curl`/`wget` positional operand is a URL, not a bare filesystem path,
+# EXCEPT when its scheme is `file:`, which is a real local filesystem
+# channel. These are the network schemes this family recognizes as
+# definitely non-local; any other or unparsable scheme fails closed rather
+# than being assumed safe, since an exotic scheme this map does not model
+# could still resolve to a local resource.
+_CURL_WGET_NETWORK_URL_SCHEMES = frozenset(
+    {"http", "https", "ftp", "ftps", "sftp", "scp"}
+)
+_URL_SCHEME_PATTERN = re.compile(r"^([A-Za-z][A-Za-z0-9+.\-]*):(//)?(.*)\Z", re.DOTALL)
+
 # `curl`'s short options bundle into one token (e.g. `-sD file` combines the
 # `-s` flag with the `-D` write-path option), so its grammar is split into a
 # flag set and a value set for the short-option-cluster parser, the same
@@ -969,12 +980,32 @@ _CURL_WRITE_LONG_OPTIONS = frozenset(
 )
 _CURL_READ_LONG_OPTIONS = frozenset({"--upload-file", "--netrc-file"})
 _CURL_DATA_LONG_OPTIONS = frozenset({"--data", "--data-binary", "--data-raw"})
+# Long-form spellings of `_CURL_SHORT_FLAG_OPTIONS`'s no-value flags, so the
+# common long spelling of an already-modeled short flag is not rejected
+# merely for being spelled out.
+_CURL_KNOWN_LONG_FLAG_OPTIONS = frozenset(
+    {
+        "--silent",
+        "--show-error",
+        "--location",
+        "--insecure",
+        "--fail",
+        "--include",
+        "--head",
+        "--verbose",
+        "--no-buffer",
+        "--globoff",
+        "--get",
+        "--progress-bar",
+    }
+)
 _CURL_KNOWN_LONG_OPTIONS = frozenset(
     _CURL_HARD_DENY_LONG_OPTIONS
     | _CURL_CONFIG_LONG_OPTIONS
     | _CURL_WRITE_LONG_OPTIONS
     | _CURL_READ_LONG_OPTIONS
     | _CURL_DATA_LONG_OPTIONS
+    | _CURL_KNOWN_LONG_FLAG_OPTIONS
 )
 
 # `wget`'s own short options never bundle a value-taking option behind a
@@ -991,11 +1022,26 @@ _WGET_WRITE_LONG_OPTIONS = frozenset(
     }
 )
 _WGET_READ_LONG_OPTIONS = frozenset({"--post-file", "--body-file"})
+# Long-form spellings of `_WGET_SHORT_FLAG_OPTIONS`'s no-value flags, for the
+# same reason `_CURL_KNOWN_LONG_FLAG_OPTIONS` exists.
+_WGET_KNOWN_LONG_FLAG_OPTIONS = frozenset(
+    {
+        "--background",
+        "--quiet",
+        "--verbose",
+        "--continue",
+        "--timestamping",
+        "--server-response",
+        "--debug",
+        "--force-html",
+    }
+)
 _WGET_KNOWN_LONG_OPTIONS = frozenset(
     _WGET_HARD_DENY_LONG_OPTIONS
     | _WGET_CONFIG_LONG_OPTIONS
     | _WGET_WRITE_LONG_OPTIONS
     | _WGET_READ_LONG_OPTIONS
+    | _WGET_KNOWN_LONG_FLAG_OPTIONS
     | {"--spider"}
 )
 _WGET_SHORT_FLAG_OPTIONS = frozenset("bqvcNSdF")
@@ -4478,6 +4524,41 @@ class WorkspaceCommandPathGuard:
         text = str(value)
         return text.startswith("rsync://") or ":" in text
 
+    def _classify_url_operand(self, value: str, cwd: Path, access: PathAccess) -> None:
+        """Classify a curl/wget positional URL operand (T3).
+
+        A `file:` scheme is a real local filesystem channel — not a network
+        transfer — so it is resolved to a path and checked with `access`
+        (the caller decides read vs. write: a plain source URL is a read;
+        curl's upload target when `-T`/`--upload-file` is in play is a
+        write). A recognized network scheme
+        (`_CURL_WGET_NETWORK_URL_SCHEMES`) is not a local path and is
+        allowed through unchecked. Module invariant: any other or
+        unparsable scheme fails closed — this family cannot assume an
+        exotic/unmodeled scheme (some of which, e.g. `smb:`/`scp:`-like
+        variants, can themselves resolve to local or attacker-controlled
+        resources) is safely non-local.
+        """
+        text = str(value)
+        match = _URL_SCHEME_PATTERN.match(text)
+        if match is None:
+            raise CommandPolicyViolation(
+                f"cannot safely resolve operand {text} as a URL"
+            )
+        scheme = match.group(1).lower()
+        has_authority_separator = match.group(2) == "//"
+        remainder = match.group(3)
+        if scheme == "file":
+            if has_authority_separator and not remainder.startswith("/"):
+                raise CommandPolicyViolation(
+                    "cannot safely resolve a file:// URL host component"
+                )
+            self._check_path(self._derived_value(value, remainder), cwd, access)
+            return
+        if scheme in _CURL_WGET_NETWORK_URL_SCHEMES:
+            return
+        raise CommandPolicyViolation(f"cannot safely resolve URL scheme {scheme}:")
+
     def _check_curl(self, values: Sequence[str], cwd: Path) -> None:
         """`curl`: `-o`/`--output`/`--output-dir` write; `-T`/`--upload-file`/
         `--netrc-file` read; an `@file` payload to `-d`/`--data*` reads that
@@ -4489,21 +4570,39 @@ class WorkspaceCommandPathGuard:
         knowable) cannot be inspected safely and fail closed, including
         bundled behind another short flag (e.g. `-sO`). Long options resolve
         through `_resolve_long_option` (GNU unambiguous-prefix abbreviation,
-        e.g. `--dump-hea=` for `--dump-header`); an unrecognized long option
-        with an attached `=value` also fails closed (mirroring `rsync`):
-        curl accepts a value for many long options this family does not
-        model, so an unmodeled one cannot be assumed to be a value-free
-        flag once it visibly carries a value. Short options bundle through
-        the same `_parse_short_option_cluster` substrate `sort`/`grep`/
-        `install` use, so a value-taking option (`-o`/`-D`/`-c`/`-T`) still
-        consumes its argument even when it is not the leading character of
-        the cluster (e.g. `-sD`).
+        e.g. `--dump-hea=` for `--dump-header`). Module invariant: any
+        option (short or long, bare or `=value`-attached) this allowlist
+        cannot resolve fails closed. Short options bundle through the same
+        `_parse_short_option_cluster` substrate `sort`/`grep`/`install` use,
+        so a value-taking option (`-o`/`-D`/`-c`/`-T`) still consumes its
+        argument even when it is not the leading character of the cluster
+        (e.g. `-sD`). A literal `--` ends option parsing.
+
+        The positional URL/operand (T3) is classified through
+        `_classify_url_operand`: a `file:` URL is a real filesystem channel
+        (read by default; write when `-T`/`--upload-file` is anywhere in the
+        invocation, since that turns the request into an upload whose
+        destination is the URL — `has_upload_target` is computed by a
+        presence-only pre-scan so the classification does not depend on
+        argv order, matching curl's own order-independent option parsing).
         """
         self._reject_dynamic_values("curl arguments", values)
+        has_upload_target = self._curl_has_upload_target(values)
+        options_done = False
         index = 0
         while index < len(values):
             value = values[index]
             text = str(value)
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not text.startswith("-") or text == "-":
+                self._classify_url_operand(
+                    value, cwd, "write" if has_upload_target else "read"
+                )
+                index += 1
+                continue
             if text.startswith("--"):
                 raw_option, separator, attached_text = text.partition("=")
                 resolved = self._resolve_long_option(
@@ -4555,52 +4654,91 @@ class WorkspaceCommandPathGuard:
                             "read",
                         )
                     continue
-                # An unmodeled long option that visibly carries a value
-                # cannot be assumed to be a value-free flag; a bare
-                # unmodeled flag stays permissive.
-                if separator:
+                if resolved in _CURL_KNOWN_LONG_FLAG_OPTIONS:
+                    if separator:
+                        raise CommandPolicyViolation(
+                            f"cannot safely inspect curl option {raw_option}"
+                        )
+                    index += 1
+                    continue
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect curl option {raw_option}"
+                )
+            # `-O`/`-K` fail closed even bundled behind another flag
+            # (e.g. `-sO`); scanning stops at the first character that
+            # is not a known no-value flag, since anything past a
+            # value-taking option is that option's value, not another
+            # flag letter.
+            for character in text[1:]:
+                if character in _CURL_SHORT_FLAG_OPTIONS:
+                    continue
+                if character == "O":
                     raise CommandPolicyViolation(
-                        f"cannot safely inspect curl option {raw_option}"
+                        "cannot safely resolve curl remote output filename"
                     )
+                if character == "K":
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect curl runtime configuration"
+                    )
+                break
+            index, matched_option, argument = self._parse_short_option_cluster(
+                values,
+                index,
+                cwd,
+                flag_options=_CURL_SHORT_FLAG_OPTIONS,
+                value_options=_CURL_SHORT_VALUE_OPTIONS,
+            )
+            if (
+                matched_option == "d"
+                and argument is not None
+                and str(argument).startswith("@")
+            ):
+                self._check_path(
+                    self._derived_value(argument, str(argument)[1:]),
+                    cwd,
+                    "read",
+                )
+
+    @staticmethod
+    def _curl_has_upload_target(values: Sequence[str]) -> bool:
+        """Detect `-T`/`--upload-file` anywhere in argv (presence only).
+
+        curl's own option parsing does not require `-T` to precede the URL
+        operand, so the URL's read-vs-write classification must not depend
+        on argv order either: this mirrors the same short-cluster and
+        long-option resolution `_check_curl`'s real pass uses, but only
+        checks presence — it performs no path checks of its own.
+        """
+        options_done = False
+        index = 0
+        while index < len(values):
+            text = str(values[index])
+            if not options_done and text == "--":
+                options_done = True
                 index += 1
                 continue
-            if text.startswith("-") and text != "-":
-                # `-O`/`-K` fail closed even bundled behind another flag
-                # (e.g. `-sO`); scanning stops at the first character that
-                # is not a known no-value flag, since anything past a
-                # value-taking option is that option's value, not another
-                # flag letter.
-                for character in text[1:]:
-                    if character in _CURL_SHORT_FLAG_OPTIONS:
-                        continue
-                    if character == "O":
-                        raise CommandPolicyViolation(
-                            "cannot safely resolve curl remote output filename"
-                        )
-                    if character == "K":
-                        raise CommandPolicyViolation(
-                            "cannot safely inspect curl runtime configuration"
-                        )
-                    break
-                index, matched_option, argument = self._parse_short_option_cluster(
-                    values,
-                    index,
-                    cwd,
-                    flag_options=_CURL_SHORT_FLAG_OPTIONS,
-                    value_options=_CURL_SHORT_VALUE_OPTIONS,
-                )
-                if (
-                    matched_option == "d"
-                    and argument is not None
-                    and str(argument).startswith("@")
-                ):
-                    self._check_path(
-                        self._derived_value(argument, str(argument)[1:]),
-                        cwd,
-                        "read",
-                    )
+            if options_done or not text.startswith("-") or text == "-":
+                index += 1
                 continue
+            if text.startswith("--"):
+                raw_option = text.partition("=")[0]
+                if (
+                    WorkspaceCommandPathGuard._resolve_long_option(
+                        raw_option, _CURL_KNOWN_LONG_OPTIONS
+                    )
+                    == "--upload-file"
+                ):
+                    return True
+                index += 1
+                continue
+            for character in text[1:]:
+                if character in _CURL_SHORT_FLAG_OPTIONS:
+                    continue
+                if character == "T":
+                    return True
+                break
             index += 1
+        return False
 
     def _check_wget(self, values: Sequence[str], cwd: Path) -> None:
         """`wget`: `-O`/`--output-document` write; `-P`/`--directory-prefix`
@@ -4613,21 +4751,36 @@ class WorkspaceCommandPathGuard:
         filename from the remote response, which is not statically
         knowable, so that combination fails closed too. Long options resolve
         through `_resolve_long_option` (GNU unambiguous-prefix abbreviation,
-        e.g. `--output-docu=` for `--output-document`); an unrecognized long
-        option with an attached `=value` also fails closed (mirroring
-        `rsync`/`curl`). Short options bundle through the same
-        `_parse_short_option_cluster` substrate `curl`/`sort`/`grep`/
-        `install` use, so `-O`/`-P`/`-o` still consume their argument even
-        when not the leading character of the cluster (e.g. `-qO`).
+        e.g. `--output-docu=` for `--output-document`). Module invariant:
+        any option (short or long, bare or `=value`-attached) this
+        allowlist cannot resolve fails closed. Short options bundle through
+        the same `_parse_short_option_cluster` substrate `curl`/`sort`/
+        `grep`/`install` use, so `-O`/`-P`/`-o` still consume their argument
+        even when not the leading character of the cluster (e.g. `-qO`). A
+        literal `--` ends option parsing.
+
+        The positional URL/operand (T3) is classified through
+        `_classify_url_operand` as a plain read: wget's URL is always the
+        fetch source, never an upload target.
         """
         self._reject_dynamic_values("wget arguments", values)
         has_explicit_output = False
         spider_mode = False
         has_url_operand = False
+        options_done = False
         index = 0
         while index < len(values):
             value = values[index]
             text = str(value)
+            if not options_done and text == "--":
+                options_done = True
+                index += 1
+                continue
+            if options_done or not text.startswith("-") or text == "-":
+                self._classify_url_operand(value, cwd, "read")
+                has_url_operand = True
+                index += 1
+                continue
             if text.startswith("--"):
                 raw_option, separator, attached_text = text.partition("=")
                 resolved = self._resolve_long_option(
@@ -4666,37 +4819,37 @@ class WorkspaceCommandPathGuard:
                     if resolved == "--output-document":
                         has_explicit_output = True
                     continue
-                if separator:
-                    raise CommandPolicyViolation(
-                        f"cannot safely inspect wget option {raw_option}"
-                    )
-                index += 1
-                continue
-            if text.startswith("-") and text != "-":
-                # `-i` fails closed even bundled behind another flag (e.g.
-                # `-qi`); scanning stops at the first character that is not
-                # a known no-value flag, since anything past a value-taking
-                # option is that option's value, not another flag letter.
-                for character in text[1:]:
-                    if character in _WGET_SHORT_FLAG_OPTIONS:
-                        continue
-                    if character == "i":
+                if resolved in _WGET_KNOWN_LONG_FLAG_OPTIONS:
+                    if separator:
                         raise CommandPolicyViolation(
-                            "cannot safely inspect wget runtime URL list"
+                            f"cannot safely inspect wget option {raw_option}"
                         )
-                    break
-                index, matched_option, _ = self._parse_short_option_cluster(
-                    values,
-                    index,
-                    cwd,
-                    flag_options=_WGET_SHORT_FLAG_OPTIONS,
-                    value_options=_WGET_SHORT_VALUE_OPTIONS,
+                    index += 1
+                    continue
+                raise CommandPolicyViolation(
+                    f"cannot safely inspect wget option {raw_option}"
                 )
-                if matched_option == "O":
-                    has_explicit_output = True
-                continue
-            has_url_operand = True
-            index += 1
+            # `-i` fails closed even bundled behind another flag (e.g.
+            # `-qi`); scanning stops at the first character that is not
+            # a known no-value flag, since anything past a value-taking
+            # option is that option's value, not another flag letter.
+            for character in text[1:]:
+                if character in _WGET_SHORT_FLAG_OPTIONS:
+                    continue
+                if character == "i":
+                    raise CommandPolicyViolation(
+                        "cannot safely inspect wget runtime URL list"
+                    )
+                break
+            index, matched_option, _ = self._parse_short_option_cluster(
+                values,
+                index,
+                cwd,
+                flag_options=_WGET_SHORT_FLAG_OPTIONS,
+                value_options=_WGET_SHORT_VALUE_OPTIONS,
+            )
+            if matched_option == "O":
+                has_explicit_output = True
         if has_url_operand and not has_explicit_output and not spider_mode:
             raise CommandPolicyViolation(
                 "cannot safely resolve wget remote output filename"
