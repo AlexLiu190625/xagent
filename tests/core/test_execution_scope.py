@@ -61,7 +61,13 @@ def scope_log_records(level: int = logging.WARNING):
     # more than one name, and a handler bound by name would then watch a logger
     # nothing writes to.
     logger = scope_module.logger
-    records: list[logging.LogRecord] = []
+
+    class _Records(list):
+        """A list that can carry the diagnostics a failure needs."""
+
+        diagnostics: dict[str, object] = {}
+
+    records: list[logging.LogRecord] = _Records()
 
     class _Collect(logging.Handler):
         def emit(self, record: logging.LogRecord) -> None:
@@ -81,6 +87,17 @@ def scope_log_records(level: int = logging.WARNING):
     try:
         yield records
     finally:
+        # Snapshot what decided whether a record could exist at all, so a
+        # failing assertion reports the reason instead of an empty list.
+        records.diagnostics = {  # type: ignore[attr-defined]
+            "logger": logger.name,
+            "logger_id": id(logger),
+            "effective_level": logger.getEffectiveLevel(),
+            "manager_disable": logging.root.manager.disable,
+            "handlers": [type(h).__name__ for h in logger.handlers],
+            "propagate": logger.propagate,
+            "captured": [r.getMessage() for r in records],
+        }
         logger.removeHandler(handler)
         logger.setLevel(previous_level)
         logging.disable(previous_disable)
@@ -1103,7 +1120,10 @@ class TestResolveExecutionScopeOffTurn:
             result = resolve_execution_scope_off_turn("1")
 
         assert result == resolver_scope
-        assert any("authority mismatch" in r.getMessage().lower() for r in records)
+        assert any("authority mismatch" in r.getMessage().lower() for r in records), (
+            f"no authority-mismatch record; capture state: "
+            f"{getattr(records, 'diagnostics', None)}"
+        )
 
     def test_other_exceptions_still_propagate(self):
         def boom(task_id):
