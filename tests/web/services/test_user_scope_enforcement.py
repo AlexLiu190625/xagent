@@ -12,6 +12,7 @@ import pytest
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     reset_execution_scope,
     set_execution_scope,
     set_execution_scope_snapshot_loader,
@@ -365,17 +366,22 @@ def test_existing_storage_key_binding_tolerates_resolver_snapshot_mismatch(
     assert ManagedFileRef(record).storage.prefix == "users/7"
 
 
-def test_new_object_write_path_still_resolves_off_turn_on_mismatch(
-    storage_env, tmp_path
-):
-    """No storage_key yet (a fresh upload): the write path still resolves
-    off-turn, and a namespace-affecting authority mismatch downgrades to the
-    resolver's own answer instead of raising (see
-    ``resolve_execution_scope_off_turn``)."""
+def test_new_object_write_path_fails_closed_on_mismatch(storage_env, tmp_path):
+    """No storage_key yet (a fresh upload): choosing the namespace new bytes
+    land under is an authority decision, so a resolver/snapshot mismatch
+    fails closed instead of downgrading to either side's guess -- getting it
+    wrong would silently and durably place the object under the wrong
+    tenant's subtree. No object may be written under either candidate
+    prefix."""
     register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
     set_execution_scope_snapshot_loader(
         lambda task_id: ExecutionScope(workspace_segments=("other-tenant",))
     )
     record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
 
-    assert ManagedFileRef(record).storage.prefix == "users/7/clients/3/end_users/7"
+    with pytest.raises(ExecutionScopeAuthorityError):
+        ManagedFileRef(record)
+
+    objects_root = tmp_path / "objects" / "users" / "7"
+    assert not (objects_root / "clients").exists()
+    assert not (objects_root / "other-tenant").exists()

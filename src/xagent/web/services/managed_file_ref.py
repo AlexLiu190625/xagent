@@ -15,7 +15,7 @@ from ...core.execution_scope import (
     ExecutionScope,
     ExecutionScopeInput,
     get_execution_scope,
-    resolve_execution_scope_off_turn,
+    resolve_execution_scope,
 )
 from ...core.file_storage import (
     FsspecFileStorage,
@@ -161,15 +161,19 @@ class ManagedFileRef:
                 if task_id is not None and not self.storage_key:
                     # A record with no durable key yet is the write path: a
                     # fresh object is about to be placed under this scope's
-                    # subtree, so off-turn resolution matters. A record that
-                    # already has a durable key is the read (or
+                    # subtree. Choosing that namespace is an authority
+                    # decision -- getting it wrong silently and durably
+                    # writes one tenant's bytes under another tenant's
+                    # subtree -- so this fails closed rather than downgrading
+                    # a resolver/snapshot mismatch to a warning. A record
+                    # that already has a durable key is the read (or
                     # rewrite-in-place) path: that key already fixes the
                     # object's location, off-turn re-resolution is
                     # unnecessary, and -- on a resolver/snapshot drift --
                     # would make an already-legitimate key look foreign to a
                     # narrower re-derived scope (see ``storage`` binding
                     # below).
-                    scope = resolve_execution_scope_off_turn(task_id)
+                    scope = resolve_execution_scope(task_id)
         else:
             scope = cast(ExecutionScope | None, scope_input)
         self._scope_segments = (

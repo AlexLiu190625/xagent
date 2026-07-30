@@ -5,10 +5,11 @@ scope-local under ``isolate_external_dirs``) and the websocket
 output-path task-scope check tolerating scope segments between the user
 root and the task dir.
 
-``_scope_segments_for_task`` resolves off-turn (#296): it
-composes a storage key outside any turn, so a resolver/snapshot authority
-mismatch there is downgraded to the resolver's answer plus a warning
-instead of failing (see ``TestScopeSegmentsForTask``).
+``_scope_segments_for_task`` composes the storage key for a brand-new
+durable object (its only caller stages a fresh upload), so it fails closed:
+a resolver/snapshot authority mismatch there raises
+``ExecutionScopeAuthorityError`` instead of being downgraded (see
+``TestScopeSegmentsForTask``).
 """
 
 import pytest
@@ -16,6 +17,7 @@ import pytest
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.api.chat import _build_allowed_external_dirs
@@ -24,13 +26,6 @@ from xagent.web.api.websocket import (
     _scope_segments_for_task,
 )
 from xagent.web.services.workspace_binding import _build_external_allowlist
-
-
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    register_scope_resolver(None)
-    yield
-    register_scope_resolver(None)
 
 
 class TestAllowedExternalDirs:
@@ -149,17 +144,18 @@ class TestScopeSegmentsForTask:
         )
         assert _scope_segments_for_task(42) == ("tenant-a",)
 
-    def test_namespace_mismatch_downgrades_to_resolver_segments_without_raising(self):
-        """Off-turn: an authority mismatch must not raise (it would surface
-        as a misleading "file not found" or bulk-endpoint 500); it downgrades
-        to the resolver's own segments instead."""
+    def test_namespace_mismatch_fails_closed(self):
+        """These segments compose the storage key for a brand-new durable
+        object, so an authority mismatch must not be downgraded to either
+        side's guess -- it fails closed instead."""
         register_scope_resolver(
             lambda task_id: ExecutionScope(workspace_segments=("tenant-a",)),
         )
         set_execution_scope_snapshot_loader(
             lambda task_id: ExecutionScope(workspace_segments=("tenant-b",))
         )
-        assert _scope_segments_for_task(42) == ("tenant-a",)
+        with pytest.raises(ExecutionScopeAuthorityError):
+            _scope_segments_for_task(42)
 
 
 class TestOutputPathTaskScopeCheck:

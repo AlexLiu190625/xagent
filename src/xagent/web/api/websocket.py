@@ -1170,14 +1170,15 @@ def _scope_segments_for_task(task_id: Any) -> tuple[str, ...]:
     inference may find a user but no task) means there is no task identity
     to resolve a scope from — unscoped, never the string ``"None"``.
 
-    Resolves off-turn (see ``resolve_execution_scope_off_turn``): this
-    composes a storage key outside any turn, so a resolver/snapshot
-    authority mismatch is downgraded to the resolver's answer plus a
-    warning instead of raising.
+    Fails closed (its only caller, ``_register_legacy_preview_isolated``,
+    uses these segments to compose the storage key for a brand-new durable
+    object): choosing that namespace is an authority decision, and a
+    resolver/snapshot mismatch here must not be downgraded to either side's
+    guess -- ``ExecutionScopeAuthorityError`` propagates instead.
     """
     if task_id is None:
         return ()
-    scope = resolve_execution_scope_off_turn(task_id)
+    scope = resolve_execution_scope(task_id)
     return scope.workspace_segments if scope is not None else ()
 
 
@@ -7215,8 +7216,13 @@ async def _handle_pause_task_unserialized(
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         expected_run_id = task_fields.run_id
+        # Off-turn: this only locates the already-running agent's existing
+        # workspace/sandbox to pause it, it never selects a namespace for new
+        # bytes. A control operation on an already-running task must stay
+        # available even under a resolver/snapshot dispute, so a mismatch
+        # downgrades to the resolver's answer instead of blocking the pause.
         execution_scope = await run_db_io_cancellation_safe(
-            lambda: resolve_execution_scope(task_id)
+            lambda: resolve_execution_scope_off_turn(task_id)
         )
 
         # Get agent service (as the task owner)
@@ -7400,8 +7406,15 @@ async def _handle_resume_task_unserialized(
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         task_status = cast(TaskStatus, task_fields.status)
+        # Off-turn: this only locates the paused task's existing
+        # workspace/sandbox to resume it, it never selects a namespace for
+        # new bytes -- the resumed turn re-resolves fail-closed on its own at
+        # the orchestrator's turn boundary. A control operation on an
+        # already-running (or resumable) task must stay available even under
+        # a resolver/snapshot dispute, so a mismatch downgrades to the
+        # resolver's answer instead of blocking the resume.
         resolved_execution_scope = await run_db_io_cancellation_safe(
-            lambda: resolve_execution_scope(task_id)
+            lambda: resolve_execution_scope_off_turn(task_id)
         )
         raw_control_state = task_fields.control_state
         try:

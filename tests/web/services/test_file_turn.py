@@ -12,6 +12,7 @@ from sqlalchemy.pool import QueuePool
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     set_execution_scope_snapshot_loader,
 )
 from xagent.web.models import database as database_module
@@ -332,4 +333,84 @@ def test_resolve_preserves_registered_scope_fallback_without_nested_checkout(
     finally:
         register_scope_resolver(None)
         set_execution_scope_snapshot_loader(None)
+        engine.dispose()
+
+
+def test_resolve_fails_closed_on_registered_scope_authority_mismatch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A turn face: the resolved scope selects the namespace files are read
+    back from, and this call passes the persisted snapshot it already read
+    in its own Session explicitly via ``persisted_snapshot``, so a
+    disagreement between the registered resolver and that snapshot must
+    propagate ``ExecutionScopeAuthorityError`` instead of being downgraded,
+    and no file may be materialized on the mismatched path."""
+
+    engine = create_engine(
+        f"sqlite:///{tmp_path / 'authority-mismatch.db'}",
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(bind=engine)
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    local_path = tmp_path / "disputed.txt"
+    local_path.write_text("payload")
+
+    register_scope_resolver(
+        lambda _task_id: ExecutionScope(workspace_segments=("resolver-tenant",))
+    )
+    try:
+        with SessionLocal() as db:
+            user = User(username="disputed-owner", password_hash="hash", is_admin=False)
+            db.add(user)
+            db.flush()
+            task = Task(
+                user_id=int(user.id),
+                title="disputed task",
+                description="disputed task",
+                status=TaskStatus.COMPLETED,
+                source="sdk",
+                agent_config={
+                    "execution_scope": ExecutionScope(
+                        workspace_segments=("snapshot-tenant",),
+                    ).to_dict()
+                },
+            )
+            db.add(task)
+            db.flush()
+            db.add(
+                UploadedFile(
+                    file_id="disputed",
+                    user_id=int(user.id),
+                    task_id=int(task.id),
+                    filename="disputed.txt",
+                    storage_path=str(local_path),
+                    file_size=local_path.stat().st_size,
+                )
+            )
+            db.commit()
+            user_id = int(user.id)
+            task_id = int(task.id)
+
+        materialize_calls: list[str] = []
+        original_ensure_local = ManagedFileRef.ensure_local
+
+        def track_materialize(self: ManagedFileRef) -> Path:
+            materialize_calls.append(self.storage_key)
+            return original_ensure_local(self)
+
+        monkeypatch.setattr(ManagedFileRef, "ensure_local", track_materialize)
+
+        with SessionLocal() as db:
+            with pytest.raises(ExecutionScopeAuthorityError):
+                resolve_turn_file_infos(
+                    file_ids=["disputed"],
+                    owner_user_id=user_id,
+                    task_id=task_id,
+                    db=db,
+                )
+
+        assert materialize_calls == []
+    finally:
+        register_scope_resolver(None)
         engine.dispose()
