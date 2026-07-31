@@ -1165,7 +1165,7 @@ describe("widget session mode", () => {
     vi.useFakeTimers()
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined)
     const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
-    fetchMock.mockImplementation(() => Promise.resolve(directJsonResponse(503, {
+    fetchMock.mockImplementation(() => Promise.resolve(jsonResponse(503, {
       error: {
         code: "future_server_code",
         reason: "origin_not_allowed",
