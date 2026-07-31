@@ -32,10 +32,9 @@ from xagent.sandbox.base import SandboxRuntimeConflictError
 
 
 def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Avoid Telegram/Feishu startup errors when optional deps are missing.
+    """Avoid chat-channel startup work in migration tests.
 
-    ``startup_event`` optionally starts the Telegram and Feishu channel managers.
-    These managers pull optional dependencies (aiogram, feishu) that CI may omit.
+    ``startup_event`` optionally starts the Telegram, Feishu, and Slack managers.
 
     We inject lightweight stub modules into ``sys.modules`` instead of
     ``monkeypatch.setattr("...telegram.bot...", ...)``, because importing the real
@@ -51,7 +50,7 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
         async def stop(self) -> None:
             return None
 
-    class _FakeFeishuChannel:
+    class _FakeChannelManager:
         enabled = False  # Disabled to prevent task creation in tests
 
         async def start(self) -> None:
@@ -69,8 +68,12 @@ def _patch_channel_modules_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
     # Create fake feishu.bot module
     fake_feishu_bot = ModuleType("xagent.web.channels.feishu.bot")
-    fake_feishu_bot.get_feishu_channel = lambda: _FakeFeishuChannel()
+    fake_feishu_bot.get_feishu_channel = lambda: _FakeChannelManager()
     monkeypatch.setitem(sys.modules, "xagent.web.channels.feishu.bot", fake_feishu_bot)
+
+    fake_slack_bot = ModuleType("xagent.web.channels.slack.bot")
+    fake_slack_bot.get_slack_channel = lambda: _FakeChannelManager()
+    monkeypatch.setitem(sys.modules, "xagent.web.channels.slack.bot", fake_slack_bot)
 
 
 def _patch_task_command_dispatcher_disabled(
