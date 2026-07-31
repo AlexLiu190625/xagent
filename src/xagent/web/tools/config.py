@@ -1135,6 +1135,8 @@ class WebToolConfig(BaseToolConfig):
         self._mcp_failure_policy = mcp_failure_policy
         self._mcp_load_summary_tracer = mcp_load_summary_tracer
         self._mcp_load_summary_trace_task_id = mcp_load_summary_trace_task_id
+        self._task_runtime_contribution: Any = None
+        self._task_runtime_workspace: Any = None
         self._live_db = db
         self._db_factory = db_factory
         self._lazy_db = None
@@ -1162,7 +1164,7 @@ class WebToolConfig(BaseToolConfig):
         # Use uploads dir if workspace_base_dir not explicitly provided
         if workspace_base_dir is None:
             workspace_base_dir = str(get_uploads_dir())
-        # Ensure base_dir is in workspace_config (required by ToolFactory._create_workspace)
+        # Ensure base_dir is in workspace_config (required by ToolFactory.create_workspace)
         if "base_dir" not in workspace_config:
             workspace_config["base_dir"] = workspace_base_dir
         if self._user_id is not None and "user_id" not in workspace_config:
@@ -1705,6 +1707,26 @@ class WebToolConfig(BaseToolConfig):
     def get_browser_tools_enabled(self) -> bool:
         """Whether to include browser automation tools."""
         return self._browser_tools_enabled
+
+    def set_task_runtime_contribution(self, contribution: Any) -> None:
+        """Attach the detached contribution built for this task."""
+
+        self._task_runtime_contribution = contribution
+
+    def get_task_runtime_contribution(self) -> Any:
+        """Return the contribution consumed while building ``AgentService``."""
+
+        return self._task_runtime_contribution
+
+    def set_task_runtime_workspace(self, workspace: Any) -> None:
+        """Retain the workspace already prepared for runtime providers."""
+
+        self._task_runtime_workspace = workspace
+
+    def get_task_runtime_workspace(self) -> Any:
+        """Return the workspace shared by providers and sandbox setup."""
+
+        return self._task_runtime_workspace
 
     def get_task_id(self) -> Optional[str]:
         """Get task ID for session tracking."""
