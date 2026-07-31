@@ -191,6 +191,7 @@ describe("widget session mode", () => {
       window.removeEventListener(type, listener)
     }
     windowListeners = []
+
     if (currentScriptDescriptor) {
       Object.defineProperty(document, "currentScript", currentScriptDescriptor)
     } else {
