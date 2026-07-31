@@ -17,7 +17,6 @@ from tests.web.sandbox_fakes import FakeSandboxService
 from xagent.core.execution_scope import (
     ExecutionScope,
     InvalidScopeComponentError,
-    set_execution_scope_resolver,
 )
 from xagent.sandbox.base import SandboxMountIntent
 from xagent.web.api.chat import AgentServiceManager
@@ -28,13 +27,6 @@ from xagent.web.sandbox_keys import (
     parse_user_sandbox_key,
 )
 from xagent.web.sandbox_manager import SandboxManager
-
-
-@pytest.fixture(autouse=True)
-def _clear_resolver():
-    set_execution_scope_resolver(None)
-    yield
-    set_execution_scope_resolver(None)
 
 
 class TestSandboxKeyHelpers:

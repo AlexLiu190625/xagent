@@ -262,7 +262,7 @@ def test_isolated_handle_rejects_sibling_end_user_key(storage_env, tmp_path):
 
 
 # --- resolver/snapshot fallback when the turn contextvar is absent ----------
-# Off-turn paths (bot/builder-chat handlers) never enter turn_execution_scope,
+# Off-turn paths (bot/builder-chat handlers) never enter an ExecutionScopeContext,
 # so the ambient contextvar is None while a workforce sub-task's scope is still
 # recoverable from the per-task resolver/snapshot keyed on record.task_id.
 

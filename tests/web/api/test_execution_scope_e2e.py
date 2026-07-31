@@ -259,40 +259,31 @@ async def test_two_scopes_under_one_user_are_disjoint_everywhere() -> None:
 
 @pytest.mark.asyncio
 async def test_delegated_task_builds_scoped_from_persisted_snapshot() -> None:
-    """A delegated (workforce) task id is one the resolver's embedder does
-    not own; it defers (:func:`defer_to_snapshot`), and the persisted
-    snapshot -- not the fallback -- drives the whole build (#757).
+    """A delegated task the embedder does not own: the snapshot drives the build.
 
-    The fallback claims the tenant-level namespace the resolver's embedder
-    does commit to (it is not the identity/no-scoping value on those
-    fields), so the per-task snapshot is free to narrow deeper inside it
-    (extra workspace segment, extra memory dimension) without that narrowing
-    being rejected as introducing scoping the fallback claimed no authority
-    over.
+    This is what :func:`defer_to_snapshot` exists for. The resolver cannot
+    supply the namespace because it does not know it -- that is why it defers
+    -- so its fallback claims no scoping at all, and it says so explicitly
+    with ``snapshot_defines_namespace=True``. Without that declaration the
+    same abstention fails closed, because an abstention that claims no
+    namespace authority must not hand one out (see
+    ``tests/core/test_execution_scope.py``).
     """
-    fallback = ExecutionScope(
-        sandbox_key_suffix="tenant-a",
-        workspace_segments=("tenant-a",),
-        memory_dimensions={"tenant": "a"},
-        strict_memory_isolation=True,
-    )
-    delegated_scope = ExecutionScope(
-        sandbox_key_suffix="tenant-a",
-        workspace_segments=("tenant-a", "task-42"),
-        memory_dimensions={"tenant": "a", "task": "42"},
-    )
     register_scope_resolver(
-        lambda task_id: defer_to_snapshot(fallback=fallback),
-    )  # embedder doesn't own this task id; defers to the persisted snapshot
+        lambda task_id: defer_to_snapshot(
+            fallback=ExecutionScope(strict_memory_isolation=True),
+            snapshot_defines_namespace=True,
+        ),
+    )
     set_execution_scope_snapshot_loader(
-        lambda task_id: delegated_scope if task_id == "42" else None
+        lambda task_id: SCOPE_A if task_id == "42" else None
     )
     build = await _run_build(AgentServiceManager(), 42)
 
     assert build.sandbox_lifecycle == ("user", "1:tenant-a")
     assert build.recorded_sandbox_key == "user:1:tenant-a"
-    assert build.agent_service_kwargs["scope_segments"] == ("tenant-a", "task-42")
-    assert build.recorded_fingerprint == scope_fingerprint(delegated_scope)
+    assert build.agent_service_kwargs["scope_segments"] == ("tenant-a",)
+    assert build.recorded_fingerprint == scope_fingerprint(SCOPE_A)
 
 
 @pytest.mark.asyncio
