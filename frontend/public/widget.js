@@ -28,7 +28,7 @@
     identity_mismatch: true,
     rate_limited: true
   };
-  // Only diagnostic reasons defined by public issue #983 may be logged.
+  // Only diagnostic reasons registered for their session error code may be logged.
   var SESSION_ERROR_REASONS = {
     agent_not_granted: {
       origin_not_allowed: true

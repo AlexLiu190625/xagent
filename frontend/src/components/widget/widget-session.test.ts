@@ -788,6 +788,30 @@ describe("widget session mode", () => {
     })
   })
 
+  it("scopes a registered diagnostic reason to its owning terminal code", async () => {
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    fetchMock.mockResolvedValueOnce(jsonResponse(401, {
+      error: {
+        code: "session_expired",
+        reason: "origin_not_allowed",
+      },
+    }))
+    runWidget({ "data-encrypted-context": GRANT })
+    const post = spyOnIframePostMessage()
+
+    await vi.waitFor(() => expect(errorSpy.mock.calls).toEqual([[
+      "Xagent Widget: chat unavailable [session_expired] (HTTP 401).",
+    ]]))
+    fromIframe("ready")
+
+    expect(post.mock.calls[0][0]).toEqual({
+      xagent: true,
+      v: 1,
+      type: "session_terminal",
+      code: "session_expired",
+    })
+  })
+
   it("ignores an inherited synthetic session failure code", async () => {
     const syntheticCodeDescriptor = Object.getOwnPropertyDescriptor(Object.prototype, "syntheticCode")
     Object.defineProperty(Object.prototype, "syntheticCode", {
