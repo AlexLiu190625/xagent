@@ -560,7 +560,12 @@ async def refresh_oauth_token_if_needed(
             )
             return False
 
-        if provider_name == "meta":
+        # Normalize once for the special-case comparisons below; DB lookups
+        # and log messages above/below keep using the original provider_name
+        # so an admin-created provider's display casing is unaffected.
+        normalized_provider = provider_name.lower()
+
+        if normalized_provider == "meta":
             async with httpx.AsyncClient() as client:
                 response = await client.get(
                     provider_config.token_url,
@@ -603,17 +608,31 @@ async def refresh_oauth_token_if_needed(
         data = {
             "grant_type": "refresh_token",
             "refresh_token": oauth_account.refresh_token,
-            "client_id": client_id,
-            "client_secret": client_secret,
         }
+        post_kwargs: dict[str, Any] = {}
+        # Matches the code-exchange branch in api/auth.py: an admin-created
+        # provider named "Zoom" would otherwise connect fine but silently
+        # fail every refresh an hour later.
+        if normalized_provider == "zoom":
+            # Zoom's token endpoint requires HTTP Basic Auth for client
+            # credentials (client_id:client_secret, base64) on every refresh,
+            # same as the initial code exchange.
+            post_kwargs["auth"] = httpx.BasicAuth(client_id, client_secret)
+        else:
+            data["client_id"] = client_id
+            data["client_secret"] = client_secret
 
         headers = {}
-        if provider_name == "linkedin":
+        if normalized_provider == "linkedin":
             headers["Content-Type"] = "application/x-www-form-urlencoded"
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                provider_config.token_url, data=data, headers=headers, timeout=10.0
+                provider_config.token_url,
+                data=data,
+                headers=headers,
+                timeout=10.0,
+                **post_kwargs,
             )
 
         if response.status_code == 200:

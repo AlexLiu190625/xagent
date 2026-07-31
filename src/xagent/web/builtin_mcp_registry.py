@@ -130,6 +130,28 @@ def get_builtin_oauth_provider_rows() -> list[dict[str, Any]]:
             "email_path": "team",
             "default_scopes": ["chat:write", "chat:write.public", "channels:read"],
         },
+        {
+            "provider_name": "zoom",
+            "name": "Zoom",
+            "client_id": os.environ.get("ZOOM_CLIENT_ID", ""),
+            "client_secret": os.environ.get("ZOOM_CLIENT_SECRET", ""),
+            "auth_url": "https://zoom.us/oauth/authorize",
+            "token_url": "https://zoom.us/oauth/token",
+            "redirect_uri": os.environ.get("ZOOM_REDIRECT_URI", ""),
+            "userinfo_url": "https://api.zoom.us/v2/users/me",
+            "user_id_path": "id",
+            "email_path": "email",
+            # Identity-only for this connector, similar in spirit to google
+            # (userinfo.email/profile) and meta (public_profile) — though
+            # it isn't a strict rule across every provider here (linkedin's
+            # default_scopes includes the functional w_member_social write
+            # scope). The functional scopes this connector actually calls
+            # live on the app row's oauth_scopes below and are merged in at
+            # authorize time by _merge_oauth_scopes, so listing them here
+            # too would just be a second place scope changes have to be
+            # kept in sync.
+            "default_scopes": ["user:read:user"],
+        },
     ]
 
 
@@ -394,6 +416,29 @@ def get_builtin_public_mcp_app_rows() -> list[dict[str, Any]]:
                 "command": "python",
                 "args": ["-m", "xagent.web.tools.mcp.instagram"],
                 "env_mapping": {"META_ACCESS_TOKEN": "access_token"},
+            },
+        },
+        {
+            "app_id": "zoom",
+            "name": "Zoom",
+            "description": "Connect to Zoom to look up meetings, and read cloud recordings and transcripts.",
+            "icon": "https://www.google.com/s2/favicons?domain=zoom.us&sz=128",
+            "transport": "oauth",
+            "provider_name": "zoom",
+            "category": "Scheduling",
+            "oauth_scopes": [
+                "meeting:read:meeting",
+                "meeting:read:list_meetings",
+                "meeting:read:past_meeting",
+                "cloud_recording:read:list_recording_files",
+                "cloud_recording:read:meeting_transcript",
+                "user:read:user",
+            ],
+            "is_visible_in_connector": True,
+            "launch_config": {
+                "command": "python",
+                "args": ["-m", "xagent.web.tools.mcp.zoom"],
+                "env_mapping": {"ZOOM_ACCESS_TOKEN": "access_token"},
             },
         },
         {
