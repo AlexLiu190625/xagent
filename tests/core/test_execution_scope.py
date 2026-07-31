@@ -1343,6 +1343,138 @@ class TestDeferSnapshotAllDefaultFallback:
         assert resolve_execution_scope("1") == fallback
 
 
+class TestDeferSnapshotDefinesNamespaceOptIn:
+    """``defer_to_snapshot(fallback, snapshot_defines_namespace=True)``: the
+    resolver states it does not own this task and the persisted snapshot is
+    the intended namespace authority (the workforce/delegated-task shape).
+    An all-default ``fallback`` cannot itself claim a namespace -- if the
+    resolver knew the namespace it would return an authoritative
+    ``ExecutionScope`` instead of deferring -- so the strict narrowing rule
+    in ``TestDeferSnapshotAllDefaultFallback`` above must be skippable for
+    namespace fields on this opt-in, while everything else (type check,
+    shape-version gate, mandatory fallback, policy symmetry) still applies.
+    """
+
+    def test_opt_in_with_all_default_fallback_uses_snapshot_verbatim(self):
+        """The workforce shape: the resolver has no opinion (all-default
+        fallback) but explicitly hands namespace authority to the snapshot."""
+        fallback = ExecutionScope()
+        snapshot = ExecutionScope(
+            sandbox_key_suffix="workforce-task",
+            workspace_segments=("workforce", "task-7"),
+            memory_dimensions={"tenant": "acme"},
+        )
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(
+                fallback, snapshot_defines_namespace=True
+            ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot)
+        assert resolve_execution_scope("1") == snapshot
+
+    def test_without_opt_in_the_same_snapshot_fails_closed(self):
+        """The security half: the identical snapshot/fallback pair, without
+        the opt-in, must still fail closed under the strict narrowing rule
+        -- the opt-in is what changes the outcome, not the snapshot shape."""
+        fallback = ExecutionScope()
+        snapshot = ExecutionScope(
+            sandbox_key_suffix="workforce-task",
+            workspace_segments=("workforce", "task-7"),
+            memory_dimensions={"tenant": "acme"},
+        )
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot)
+
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
+            resolve_execution_scope("1")
+        assert set(exc_info.value.mismatched_fields) == {
+            "sandbox_key_suffix",
+            "workspace_segments",
+            "sandbox_mount_segments",
+            "memory_dimensions",
+        }
+
+    def test_opt_in_does_not_bypass_the_shape_version_gate(self):
+        """A stale-version snapshot is still shape-gated away even with the
+        opt-in set -- the gate runs before the narrowing check is even
+        reached, so there is nothing for the opt-in to skip past."""
+        fallback = ExecutionScope(sandbox_key_suffix="fallback")
+        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+        del stale_data["version"]
+        stale_snapshot = ExecutionScope.from_dict(stale_data)
+        assert stale_snapshot.version == 0
+
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(
+                fallback, snapshot_defines_namespace=True
+            ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
+        with scope_log_records() as records:
+            assert resolve_execution_scope("1") == fallback
+        assert any("shape" in r and "sandbox_key_suffix" in r for r in records)
+
+    def test_opt_in_does_not_bypass_the_type_check(self):
+        """A snapshot loader that returns a non-ExecutionScope candidate
+        still raises the contract error, opt-in or not."""
+        fallback = ExecutionScope()
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(
+                fallback, snapshot_defines_namespace=True
+            ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: {"not": "a scope"})
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope("1")
+
+    def test_opt_in_still_honours_policy_field_symmetry(self):
+        """Namespace fields agree (both all-default), only
+        strict_memory_isolation differs: the fallback's policy value still
+        wins and the disagreement is still logged, exactly as on the
+        default (narrowing) branch."""
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        snapshot = ExecutionScope(strict_memory_isolation=False)
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(
+                fallback, snapshot_defines_namespace=True
+            ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot)
+
+        with scope_log_records() as records:
+            result = resolve_execution_scope("1")
+        assert result.strict_memory_isolation is True
+        assert any(
+            "policy-only mismatch" in r and "strict_memory_isolation" in r
+            for r in records
+        )
+
+    def test_flag_does_not_make_the_fallback_optional(self):
+        """The opt-in changes what a present snapshot is checked against,
+        not whether a fallback is required at all: ``defer_to_snapshot``
+        still rejects a non-ExecutionScope fallback even with the flag set,
+        and the mandatory fallback still applies on a snapshot miss."""
+        with pytest.raises(TypeError):
+            defer_to_snapshot("not-a-scope", snapshot_defines_namespace=True)
+
+        fallback = ExecutionScope(sandbox_key_suffix="fallback")
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(
+                fallback, snapshot_defines_namespace=True
+            ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: None)
+        assert resolve_execution_scope("1") == fallback
+
+
 class TestResolveExecutionScopeOffTurn:
     """Off-turn consumers (websocket ``_scope_segments_for_task``,
     ``ManagedFileRef``) downgrade a namespace mismatch instead of failing."""

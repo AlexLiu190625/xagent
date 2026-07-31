@@ -16,8 +16,9 @@ all-or-nothing switch — a scope may set any subset of its fields.
 Two activation mechanisms:
 
 1. **Resolver hook** (primary): the embedding application registers a
-   resolver via :func:`set_execution_scope_resolver`; the task orchestrator
-   enters :func:`turn_execution_scope` at the start of every turn — the same
+   resolver via :func:`set_execution_scope_resolver`; callers resolve the
+   scope with :func:`resolve_execution_scope` and activate it via
+   :class:`ExecutionScopeContext` at the start of every turn — the same
    place the acting user is resolved — so process restart and task
    resumption re-derive the scope from the embedder's own persistent data
    keyed by ``task_id`` rather than from a long-gone request context.
@@ -562,42 +563,89 @@ class DeferToSnapshot:
     Not an :class:`ExecutionScope`: the carrier itself never enters
     :func:`resolve_execution_scope`'s return value or reaches the
     ``current_execution_scope`` contextvar, and carries no scope attributes
-    of its own. What the carrier *resolves to* -- a validated snapshot that
-    narrows ``fallback``, or ``fallback`` itself when none is persisted (or
-    the persisted one fails validation) -- is exactly what gets returned and
-    activated instead, the same as any other resolved scope. Construct via
-    :func:`defer_to_snapshot`; ``fallback`` doubles as the mandatory floor a
-    persisted snapshot must narrow (see :func:`resolve_execution_scope`'s
-    abstention-branch validation) as well as the answer used when no
-    snapshot is persisted for the task (a task id the resolver's embedder
-    does not itself recognize, with no Task-table snapshot either).
+    of its own. What the carrier *resolves to* -- a validated snapshot, or
+    ``fallback`` itself when none is persisted (or the persisted one fails
+    validation) -- is exactly what gets returned and activated instead, the
+    same as any other resolved scope. Construct via :func:`defer_to_snapshot`;
+    ``fallback`` doubles as the answer used when no snapshot is persisted for
+    the task (a task id the resolver's embedder does not itself recognize,
+    with no Task-table snapshot either) and, when ``snapshot_defines_namespace``
+    is ``False`` (the default), as the mandatory floor a persisted snapshot
+    must narrow (see :func:`resolve_execution_scope`'s abstention-branch
+    validation). See :func:`defer_to_snapshot` for what
+    ``snapshot_defines_namespace`` changes.
     """
 
-    __slots__ = ("fallback",)
+    __slots__ = ("fallback", "snapshot_defines_namespace")
 
-    def __init__(self, fallback: ExecutionScope) -> None:
+    def __init__(
+        self,
+        fallback: ExecutionScope,
+        *,
+        snapshot_defines_namespace: bool = False,
+    ) -> None:
         if not isinstance(fallback, ExecutionScope):
             raise TypeError(
                 "defer_to_snapshot(fallback) requires an ExecutionScope, "
                 f"got {fallback!r}"
             )
         self.fallback = fallback
+        self.snapshot_defines_namespace = snapshot_defines_namespace
 
 
-def defer_to_snapshot(fallback: ExecutionScope) -> DeferToSnapshot:
+def defer_to_snapshot(
+    fallback: ExecutionScope,
+    *,
+    snapshot_defines_namespace: bool = False,
+) -> DeferToSnapshot:
     """Build a resolver return value that defers to the persisted snapshot.
 
     ``fallback`` is mandatory (not ``Optional``, no default): it is the
-    scope used when the task carries no persisted snapshot, and must be the
-    resolver's own most conservative answer for that task (e.g. today's
-    creator-direct scope) so a defer never resolves *wider* than the
-    resolver's own answer would have. This cannot be enforced by
-    ``resolve_execution_scope`` itself (a resolver can pass anything as
-    ``fallback``); it is the resolver author's obligation. An implicit
-    ``None`` fallback would silently mean "authoritative unscoped on a
-    snapshot miss" and must instead be spelled out explicitly by the caller.
+    scope used when the task carries no persisted snapshot. This cannot be
+    enforced by ``resolve_execution_scope`` itself (a resolver can pass
+    anything as ``fallback``); supplying a real fallback for the no-snapshot
+    case is the resolver author's obligation. An implicit ``None`` fallback
+    would silently mean "authoritative unscoped on a snapshot miss" and must
+    instead be spelled out explicitly by the caller.
+
+    ``snapshot_defines_namespace`` picks which of two abstention shapes this
+    call is:
+
+    - ``False`` (the default): the resolver has its own opinion of this
+      task's namespace -- expressed as ``fallback`` -- and a persisted
+      snapshot may only *narrow* it further (see
+      :func:`_execution_scope_narrowing_violations`). ``fallback`` must be
+      the resolver's own most conservative answer for the task (e.g. today's
+      creator-direct scope), so the resolved value never ends up wider than
+      that answer would have been. Use this when the resolver *owns* the
+      task but wants a corroborating/narrowing snapshot to have a say.
+    - ``True``: the resolver does not own this task and does not know its
+      namespace -- the workforce/delegated-task pattern, where a task is
+      created and scoped entirely by the persisted snapshot and the
+      resolver's embedder has no record mapping that task id to a namespace
+      of its own. In that shape ``fallback`` cannot pre-commit to the
+      namespace (if it could, the resolver would return an authoritative
+      ``ExecutionScope`` instead of deferring), so the narrowing check is
+      skipped for namespace fields and a present, shape-valid snapshot's
+      namespace fields are used verbatim. This opt-in declares the snapshot
+      is the namespace authority for tasks this resolver does not own; it
+      does not make an untrusted snapshot safe, and it does not skip the
+      type check, the shape-version gate, the mandatory ``fallback`` for a
+      snapshot miss, or policy-field symmetry (a ``strict_memory_isolation``
+      difference is still logged and ``fallback``'s value still wins) --
+      only namespace narrowing is skipped.
+
+    Neither value distinguishes a snapshot that arrived inside a
+    client-supplied ``Task.agent_config`` from one written server-side out of
+    an already-resolved scope -- those are different trust tiers, and this
+    contract cannot tell them apart at read time. Closing that gap is
+    tracked separately (issue #1016); until then, ``snapshot_defines_namespace
+    =True`` should only be used by a resolver whose embedder controls how
+    that task's snapshot was written.
     """
-    return DeferToSnapshot(fallback)
+    return DeferToSnapshot(
+        fallback, snapshot_defines_namespace=snapshot_defines_namespace
+    )
 
 
 # The embedding application injects a scope resolver via
@@ -1031,19 +1079,29 @@ def resolve_execution_scope(
       callers must fail closed rather than silently proceed unscoped or
       under a stale fallback (contrast the authoritative branch below,
       which already has a real answer and can afford to ignore a broken
-      candidate). A present, shape-valid snapshot is used only if it is a
-      *narrowing* of the carrier's ``fallback`` (see
-      :func:`_execution_scope_narrowing_violations`) -- a snapshot is
-      client-influenceable (a client-supplied ``agent_config`` can carry an
-      ``execution_scope`` key that reaches the persisted snapshot), so an
-      unchecked snapshot here would let a caller widen its own namespace
-      past the resolver's own conservative fallback. A non-narrowing
-      snapshot raises :class:`ExecutionScopeAuthorityError`; an absent or
-      shape-gated snapshot falls back to the carrier's ``fallback``. Once
-      the namespace is settled, a policy-only difference (``strict_
-      memory_isolation``) between the snapshot and the fallback is logged
-      and the fallback's value wins -- symmetric with the authoritative
-      branch below, where the resolver's policy value wins the same way.
+      candidate). An absent or shape-gated snapshot falls back to the
+      carrier's ``fallback``. Otherwise, whether a present, shape-valid
+      snapshot's namespace fields are checked against ``fallback`` depends
+      on the carrier's ``snapshot_defines_namespace`` (see
+      :func:`defer_to_snapshot`):
+
+      - ``False`` (the default): the snapshot is used only if it is a
+        *narrowing* of the carrier's ``fallback`` (see
+        :func:`_execution_scope_narrowing_violations`) -- a snapshot is
+        client-influenceable (a client-supplied ``agent_config`` can carry
+        an ``execution_scope`` key that reaches the persisted snapshot), so
+        an unchecked snapshot here would let a caller widen its own
+        namespace past the resolver's own conservative fallback. A
+        non-narrowing snapshot raises :class:`ExecutionScopeAuthorityError`.
+      - ``True``: the resolver has stated it does not own this task and the
+        snapshot is the namespace authority; the narrowing check is skipped
+        and the snapshot's namespace fields are used verbatim.
+
+      Once the namespace is settled either way, a policy-only difference
+      (``strict_memory_isolation``) between the snapshot and the fallback is
+      logged and the fallback's value wins -- symmetric with the
+      authoritative branch below, where the resolver's policy value wins the
+      same way.
     - Resolver returns an ``ExecutionScope``: authoritative. A snapshot
       loader exception is logged and ignored (the candidate is corrupt, but
       an authoritative answer already exists). Otherwise: a
@@ -1065,8 +1123,9 @@ def resolve_execution_scope(
             that as unscoped themselves instead of passing None.
         ExecutionScopeAuthorityError: a persisted snapshot disagrees with
             the resolver's authoritative scope on a namespace-affecting
-            field, or -- on the resolver-abstention branch -- is not a
-            narrowing of the resolver's fallback.
+            field, or -- on the resolver-abstention branch, unless the
+            carrier opted into ``snapshot_defines_namespace=True`` -- is not
+            a narrowing of the resolver's fallback.
         ExecutionScopeResolverContractError: the resolver, or a registered
             snapshot loader, returned something outside its contract.
     """
@@ -1093,20 +1152,23 @@ def resolve_execution_scope(
         if snapshot is None:
             return resolved.fallback
 
-        violations = _execution_scope_narrowing_violations(snapshot, resolved.fallback)
-        if violations:
-            logger.error(
-                "Execution scope snapshot for task %s widens the resolver's "
-                "fallback instead of narrowing it: %s",
-                task_id,
-                violations,
+        if not resolved.snapshot_defines_namespace:
+            violations = _execution_scope_narrowing_violations(
+                snapshot, resolved.fallback
             )
-            raise ExecutionScopeAuthorityError(
-                str(task_id),
-                resolver_scope=resolved.fallback,
-                snapshot_scope=snapshot,
-                mismatched_fields=violations,
-            )
+            if violations:
+                logger.error(
+                    "Execution scope snapshot for task %s widens the resolver's "
+                    "fallback instead of narrowing it: %s",
+                    task_id,
+                    violations,
+                )
+                raise ExecutionScopeAuthorityError(
+                    str(task_id),
+                    resolver_scope=resolved.fallback,
+                    snapshot_scope=snapshot,
+                    mismatched_fields=violations,
+                )
         if (
             snapshot.strict_memory_isolation
             != resolved.fallback.strict_memory_isolation
@@ -1219,10 +1281,11 @@ def resolve_execution_scope_off_turn(task_id: str | int) -> Optional[ExecutionSc
 def turn_execution_scope(task_id: str | int) -> Iterator[Optional[ExecutionScope]]:
     """Resolve and activate the execution scope for one turn of ``task_id``.
 
-    The task orchestrator enters this at the start of every turn, at the
-    same place the acting user is resolved, so restart/resume re-derive the
-    scope correctly. The scope (or explicit None) is set for the duration of
-    the turn and restored on exit.
+    A convenience wrapper combining :func:`resolve_execution_scope` with
+    :class:`ExecutionScopeContext`: entering it at the start of a turn, at
+    the same place the acting user is resolved, makes restart/resume
+    re-derive the scope correctly. The scope (or explicit None) is set for
+    the duration of the turn and restored on exit.
     """
     scope = resolve_execution_scope(task_id)
     token = set_execution_scope(scope)
