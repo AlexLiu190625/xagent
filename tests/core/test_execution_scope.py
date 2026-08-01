@@ -601,32 +601,6 @@ class TestExecutionScopeAuthorityErrorInheritance:
     def test_is_a_plain_exception(self):
         assert issubclass(ExecutionScopeAuthorityError, Exception)
 
-    def test_not_folded_by_the_websocket_validation_except_tuple(self):
-        """Reproduces the exact tuple websocket.py catches around the
-        turn-execution path (see
-        TestExecutionScopeResolverContractErrorInheritance's sibling test
-        for the exact line numbers): the resolver's per-turn call to
-        resolve_execution_scope sits inside that same try block, so an
-        authority conflict raised there must fall through this tuple and
-        propagate instead of being reported as a malformed client message."""
-        resolver_scope = ExecutionScope(sandbox_key_suffix="from-resolver")
-        snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
-        folded = False
-        try:
-            raise ExecutionScopeAuthorityError(
-                "task-123",
-                resolver_scope=resolver_scope,
-                snapshot_scope=snapshot_scope,
-                mismatched_fields={
-                    "sandbox_key_suffix": ("from-snapshot", "from-resolver")
-                },
-            )
-        except (ValueError, KeyError, TypeError):
-            folded = True
-        except ExecutionScopeAuthorityError:
-            pass
-        assert not folded
-
     def test_str_carries_task_id_and_field_names_never_values(self):
         """``str()`` on this exception ends up in ``task.error_message`` and
         in the client's terminal error event (see this class's docstring for
@@ -657,6 +631,7 @@ class TestExecutionScopeAuthorityErrorInheritance:
                     resolver_scope.workspace_segments,
                 ),
             },
+            resolver_scope_is_authoritative=True,
         )
         message = str(exc)
         assert "task-123" in message
@@ -685,21 +660,11 @@ class TestExecutionScopeResolverContractErrorInheritance:
     def test_not_a_type_error(self):
         assert not issubclass(ExecutionScopeResolverContractError, TypeError)
 
+    def test_not_a_key_error(self):
+        assert not issubclass(ExecutionScopeResolverContractError, KeyError)
+
     def test_is_a_plain_exception(self):
         assert issubclass(ExecutionScopeResolverContractError, Exception)
-
-    def test_not_folded_by_the_websocket_validation_except_tuple(self):
-        """Reproduces the exact tuple websocket.py catches around the
-        turn-execution path (e.g. lines ~5802/5864/7029/7257): the new
-        error must fall through it and propagate."""
-        folded = False
-        try:
-            raise ExecutionScopeResolverContractError("boom")
-        except (ValueError, KeyError, TypeError):
-            folded = True
-        except ExecutionScopeResolverContractError:
-            pass
-        assert not folded
 
 
 class TestExecutionScopeShapeVersionAlignment:
@@ -957,29 +922,46 @@ class TestSnapshotCandidateAuthority:
         assert "sandbox_mount_segments" in exc_info.value.mismatched_fields
 
     @pytest.mark.parametrize(
-        "field_name,snapshot_kwargs",
+        "field_name,resolver_kwargs,snapshot_kwargs",
         [
-            ("sandbox_key_suffix", {"sandbox_key_suffix": "other"}),
-            ("workspace_segments", {"workspace_segments": ("other",)}),
+            ("sandbox_key_suffix", {}, {"sandbox_key_suffix": "other"}),
+            # workspace_segments alone would also move the *effective* mount
+            # (``None`` means "the full segments"), reporting two fields; both
+            # sides pin the mount at the user root so only the segments vary.
+            (
+                "workspace_segments",
+                {"workspace_segments": ("a",), "sandbox_mount_segments": ()},
+                {"workspace_segments": ("b",), "sandbox_mount_segments": ()},
+            ),
             (
                 "sandbox_mount_segments",
+                {
+                    "workspace_segments": ("a", "b"),
+                    "sandbox_mount_segments": ("a", "b"),
+                },
                 {
                     "workspace_segments": ("a", "b"),
                     "sandbox_mount_segments": ("a",),
                 },
             ),
-            ("memory_dimensions", {"memory_dimensions": {"k": "v"}}),
-            ("isolate_external_dirs", {"isolate_external_dirs": True}),
+            ("memory_dimensions", {}, {"memory_dimensions": {"k": "v"}}),
+            ("isolate_external_dirs", {}, {"isolate_external_dirs": True}),
         ],
     )
-    def test_namespace_field_mismatch_fails_the_turn(self, field_name, snapshot_kwargs):
-        resolver_scope = ExecutionScope()
+    def test_namespace_field_mismatch_fails_the_turn(
+        self, field_name, resolver_kwargs, snapshot_kwargs
+    ):
+        """Each case varies exactly one namespace field, so the reported
+        mismatch set pins that field alone rather than merely containing it --
+        a diff loop that dropped a field would otherwise still pass on a case
+        whose second, incidentally-varied field kept the set non-empty."""
+        resolver_scope = ExecutionScope(**resolver_kwargs)
         snapshot_scope = ExecutionScope(**snapshot_kwargs)
         self._register(lambda task_id: resolver_scope, lambda task_id: snapshot_scope)
 
         with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
             resolve_execution_scope("1")
-        assert field_name in exc_info.value.mismatched_fields
+        assert set(exc_info.value.mismatched_fields) == {field_name}
         assert exc_info.value.resolver_scope == resolver_scope
         assert exc_info.value.snapshot_scope == snapshot_scope
 
@@ -1103,6 +1085,72 @@ class TestSnapshotCandidateAuthority:
             "policy-only mismatch" in r and "strict_memory_isolation" in r
             for r in records
         )
+
+    def test_defer_policy_overlay_keeps_the_snapshot_narrowed_namespace(self):
+        """The policy overlay must be applied *onto the snapshot*, not
+        satisfied by returning the fallback. Here the snapshot legitimately
+        narrows the fallback's namespace and also disagrees on policy: both
+        halves have to survive, so the resolved scope is the snapshot's
+        namespace carrying the fallback's policy value. Returning
+        ``fallback`` instead would silently throw the narrowing away, which
+        every all-default-namespace policy test is blind to."""
+        fallback = ExecutionScope(
+            workspace_segments=("tenant-a",), strict_memory_isolation=True
+        )
+        snapshot_scope = ExecutionScope(
+            workspace_segments=("tenant-a", "sub"), strict_memory_isolation=False
+        )
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: snapshot_scope,
+        )
+
+        result = resolve_execution_scope("1")
+        assert result.workspace_segments == ("tenant-a", "sub")
+        assert result.strict_memory_isolation is True
+
+    def test_defer_every_policy_field_is_taken_from_the_fallback(self, monkeypatch):
+        """Generic over ``_EXECUTION_SCOPE_POLICY_FIELDS``: the abstention
+        branch must compare and carry over every field the table lists, not a
+        field it names literally. With one policy field in production those
+        two implementations are indistinguishable, so this reclassifies a
+        second real field into the policy bucket for the duration of the test
+        and checks that it is honoured too.
+        """
+        from xagent.core import execution_scope as scope_module
+
+        borrowed = "isolate_external_dirs"
+        monkeypatch.setattr(
+            scope_module,
+            "_EXECUTION_SCOPE_NAMESPACE_FIELDS",
+            tuple(
+                name
+                for name in scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS
+                if name != borrowed
+            ),
+        )
+        monkeypatch.setattr(
+            scope_module,
+            "_EXECUTION_SCOPE_POLICY_FIELDS",
+            scope_module._EXECUTION_SCOPE_POLICY_FIELDS + (borrowed,),
+        )
+        policy_fields = scope_module._EXECUTION_SCOPE_POLICY_FIELDS
+        assert len(policy_fields) > 1
+
+        fallback = ExecutionScope(strict_memory_isolation=True, **{borrowed: True})
+        snapshot_scope = ExecutionScope(
+            strict_memory_isolation=False, **{borrowed: False}
+        )
+        self._register(
+            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: snapshot_scope,
+        )
+
+        with scope_log_records() as records:
+            result = resolve_execution_scope("1")
+        for name in policy_fields:
+            assert getattr(result, name) == getattr(fallback, name), name
+            assert any("policy-only mismatch" in r and name in r for r in records), name
 
     def test_defer_current_shape_version_snapshot_is_used_not_shape_gated(self):
         """The positive mirror of
@@ -1397,27 +1445,39 @@ class TestDeferSnapshotAllDefaultFallback:
             "memory_dimensions",
         }
 
-    def test_all_default_fallback_accepts_only_an_equal_snapshot(self):
+    def test_all_default_fallback_accepts_an_equal_snapshot(self):
+        """The permissive half: an all-default snapshot introduces no scoping,
+        so it passes the identity rule and is what gets returned.
+
+        Asserted by identity, not equality: an all-default fallback and an
+        all-default snapshot compare equal, so ``== fallback`` would hold
+        whichever of the two the function returned -- and would keep holding
+        if the snapshot were rejected or shape-gated away. ``is snapshot``
+        distinguishes the accept path from both."""
         fallback = ExecutionScope()
         snapshot = ExecutionScope()
+        assert snapshot is not fallback
         set_execution_scope_resolver(
             lambda task_id: defer_to_snapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot)
-        assert resolve_execution_scope("1") == fallback
+        assert resolve_execution_scope("1") is snapshot
 
 
 class TestDeferSnapshotDefinesNamespaceOptIn:
     """``defer_to_snapshot(fallback, snapshot_defines_namespace=True)``: the
     resolver states it does not own this task and the persisted snapshot is
     the intended namespace authority (the workforce/delegated-task shape).
-    An all-default ``fallback`` cannot itself claim a namespace -- if the
+    A conforming ``fallback`` claims no namespace of its own -- if the
     resolver knew the namespace it would return an authoritative
-    ``ExecutionScope`` instead of deferring -- so the strict narrowing rule
-    in ``TestDeferSnapshotAllDefaultFallback`` above must be skippable for
-    namespace fields on this opt-in, while everything else (type check,
-    shape-version gate, mandatory fallback, policy symmetry) still applies.
+    ``ExecutionScope`` instead of deferring -- which is enforced at
+    construction, so the strict narrowing rule in
+    ``TestDeferSnapshotAllDefaultFallback`` above has nothing left to protect
+    and is skipped for namespace fields here. Everything else still applies:
+    the type check, the mandatory fallback, policy symmetry, and the
+    newer-shape half of the version gate. Only the older-shape half is
+    relaxed, since this branch compares nothing.
     """
 
     def test_opt_in_with_all_default_fallback_uses_snapshot_verbatim(self):
@@ -1463,25 +1523,20 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             "memory_dimensions",
         }
 
-    def test_opt_in_skips_the_shape_version_gate_snapshot_data_survives(self):
-        """The shape-version gate exists to protect a *comparison*: it
-        guards the default (narrowing) abstention branch and the
-        authoritative branch, both of which compare the snapshot against
-        something. The opt-in branch never compares -- it uses the
-        snapshot verbatim -- so there is nothing for the gate to protect
-        here, and a pre-existing (unversioned) snapshot's real data must
-        survive rather than being silently discarded back to the fallback.
-        This was previously pinned the other way (discarding real data as
-        "correct"), which is exactly the de-scoping bug this test now
-        proves is fixed: an unversioned workforce sub-task snapshot must
-        not be de-scoped just because it predates the version field."""
+    def test_opt_in_accepts_an_older_shape_snapshot_and_keeps_its_data(self):
+        """The older half of the asymmetric shape gate. Every field an
+        older-shape snapshot carries is decodable here and the ones it lacks
+        take current defaults, so the only thing its version breaks is a
+        field-by-field comparison -- and this branch performs none. Gating it
+        away would de-scope a workforce sub-task purely because its snapshot
+        predates the version field."""
         fallback = ExecutionScope()
-        stale_data = ExecutionScope(
-            sandbox_key_suffix="stale", workspace_segments=("workforce", "task-7")
+        older_data = ExecutionScope(
+            sandbox_key_suffix="older", workspace_segments=("workforce", "task-7")
         ).to_dict()
-        del stale_data["version"]
-        stale_snapshot = ExecutionScope.from_dict(stale_data)
-        assert stale_snapshot.version == 0
+        del older_data["version"]
+        older_snapshot = ExecutionScope.from_dict(older_data)
+        assert older_snapshot.version == 0
 
         set_execution_scope_resolver(
             lambda task_id: defer_to_snapshot(
@@ -1489,15 +1544,57 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             ),
             acknowledges_snapshot_candidate_contract=True,
         )
-        set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
-        assert resolve_execution_scope("1") == stale_snapshot
+        set_execution_scope_snapshot_loader(lambda task_id: older_snapshot)
+        assert resolve_execution_scope("1") == older_snapshot
+
+    def test_opt_in_still_refuses_a_newer_shape_snapshot(self):
+        """The newer half, which the opt-in does *not* relax.
+        ``from_dict`` drops keys this shape does not know, so a snapshot
+        written by a newer process arrives partially decoded -- possibly with
+        a namespace-narrowing field gone -- and "used verbatim" would mean
+        activating that truncated namespace. ``to_dict`` then stamps the
+        current constant, so accepting it would also re-persist the
+        truncation as if it were current."""
+        fallback = ExecutionScope()
+        newer_data = ExecutionScope(
+            sandbox_key_suffix="newer", workspace_segments=("workforce", "task-7")
+        ).to_dict()
+        newer_data["version"] = EXECUTION_SCOPE_SHAPE_VERSION + 1
+        newer_data["a_field_this_shape_does_not_know"] = "dropped-on-decode"
+        newer_snapshot = ExecutionScope.from_dict(newer_data)
+        assert newer_snapshot.version == EXECUTION_SCOPE_SHAPE_VERSION + 1
+
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(
+                fallback, snapshot_defines_namespace=True
+            ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: newer_snapshot)
+        with scope_log_records() as records:
+            assert resolve_execution_scope("1") == fallback
+        assert any("shape" in r and "sandbox_key_suffix" in r for r in records)
+
+    def test_default_abstention_path_refuses_a_newer_shape_snapshot(self):
+        """The same newer-shape refusal on the comparing abstention path,
+        where the fallback's own namespace is what the snapshot would have
+        had to narrow."""
+        fallback = ExecutionScope(workspace_segments=("tenant-a",))
+        newer_data = ExecutionScope(workspace_segments=("tenant-a", "sub")).to_dict()
+        newer_data["version"] = EXECUTION_SCOPE_SHAPE_VERSION + 1
+        newer_snapshot = ExecutionScope.from_dict(newer_data)
+
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: newer_snapshot)
+        assert resolve_execution_scope("1") == fallback
 
     def test_opt_in_still_type_gates_a_non_scope_snapshot(self):
-        """The shape-version gate is skipped on the opt-in branch, but the
-        type check is not -- a candidate that isn't even an ExecutionScope
-        still raises, opt-in or not (see also
-        test_opt_in_does_not_bypass_the_type_check below, which reproduces
-        the same rule via the snapshot loader instead of from_dict)."""
+        """The older-shape relaxation does not extend to the type check -- a
+        candidate that isn't even an ExecutionScope still raises, opt-in or
+        not."""
         fallback = ExecutionScope()
         set_execution_scope_resolver(
             lambda task_id: defer_to_snapshot(
@@ -1509,41 +1606,91 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         with pytest.raises(ExecutionScopeResolverContractError):
             resolve_execution_scope("1")
 
-    def test_gate_still_applies_on_the_default_abstention_comparing_path(self):
-        """Mirror of the opt-in case above: without the opt-in, the
-        abstention branch narrows against ``fallback`` -- a comparison --
-        so the shape-version gate still applies and a stale snapshot is
-        still ignored. (Same behavior as
-        test_defer_stale_version_snapshot_is_ignored_falls_back; restated
-        here to sit next to the opt-in test for contrast.)"""
-        fallback = ExecutionScope(sandbox_key_suffix="fallback")
-        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
-        del stale_data["version"]
-        stale_snapshot = ExecutionScope.from_dict(stale_data)
-        assert stale_snapshot.version == 0
-
-        set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
-            acknowledges_snapshot_candidate_contract=True,
+    def test_opt_in_rejects_a_namespace_committed_fallback_at_construction(self):
+        """The opt-in's precondition is machine-checked, not prose. This
+        branch hands the namespace to the snapshot verbatim, so a fallback
+        that already committed to one would have it *replaced* rather than
+        treated as a floor -- silent de-tenanting. A resolver that knows the
+        namespace must return an authoritative scope instead of deferring,
+        so the carrier refuses to exist."""
+        committed = ExecutionScope(
+            sandbox_key_suffix="tenant-a",
+            workspace_segments=("tenant-a",),
+            memory_dimensions={"tenant": "a"},
         )
-        set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
-        with scope_log_records() as records:
-            assert resolve_execution_scope("1") == fallback
-        assert any("shape" in r and "sandbox_key_suffix" in r for r in records)
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            defer_to_snapshot(committed, snapshot_defines_namespace=True)
+        message = str(exc_info.value)
+        for name in ("sandbox_key_suffix", "workspace_segments", "memory_dimensions"):
+            assert name in message
+        # The same pair is accepted without the opt-in, where the snapshot is
+        # held to the narrowing rule instead: it is the flag that is refused,
+        # not the fallback.
+        assert defer_to_snapshot(committed).fallback == committed
 
-    def test_opt_in_does_not_bypass_the_type_check(self):
-        """A snapshot loader that returns a non-ExecutionScope candidate
-        still raises the contract error, opt-in or not."""
-        fallback = ExecutionScope()
+    @pytest.mark.parametrize(
+        "field_name,committed_kwargs",
+        [
+            ("sandbox_key_suffix", {"sandbox_key_suffix": "tenant-a"}),
+            ("workspace_segments", {"workspace_segments": ("tenant-a",)}),
+            (
+                "sandbox_mount_segments",
+                {
+                    "workspace_segments": ("tenant-a",),
+                    "sandbox_mount_segments": ("tenant-a",),
+                },
+            ),
+            ("memory_dimensions", {"memory_dimensions": {"tenant": "a"}}),
+            ("isolate_external_dirs", {"isolate_external_dirs": True}),
+        ],
+    )
+    def test_opt_in_rejects_a_commitment_on_any_single_namespace_field(
+        self, field_name, committed_kwargs
+    ):
+        """Per-field, so the precondition cannot be satisfied by checking only
+        the obvious fields. Each case commits exactly one field of the
+        fallback (the mount case necessarily carries the workspace segments
+        it must prefix, and reports both)."""
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            defer_to_snapshot(
+                ExecutionScope(**committed_kwargs), snapshot_defines_namespace=True
+            )
+        assert field_name in str(exc_info.value)
+
+    def test_opt_in_with_a_policy_only_fallback_is_accepted(self):
+        """Policy fields are not part of the precondition: the fallback still
+        owns those on this branch (see
+        test_opt_in_still_honours_policy_field_symmetry), so committing one
+        must not be mistaken for claiming a namespace."""
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        carrier = defer_to_snapshot(fallback, snapshot_defines_namespace=True)
+        assert carrier.snapshot_defines_namespace is True
+        assert carrier.fallback == fallback
+
+    def test_opt_in_with_a_conforming_fallback_and_a_present_snapshot(self):
+        """The whole conforming shape end to end: a fallback that claims no
+        namespace but does set a policy field, plus a present snapshot that
+        supplies the namespace. The snapshot's namespace is adopted and the
+        fallback's policy value is kept."""
+        fallback = ExecutionScope(strict_memory_isolation=True)
+        snapshot = ExecutionScope(
+            sandbox_key_suffix="workforce-task",
+            workspace_segments=("workforce", "task-7"),
+            memory_dimensions={"tenant": "acme"},
+        )
         set_execution_scope_resolver(
             lambda task_id: defer_to_snapshot(
                 fallback, snapshot_defines_namespace=True
             ),
             acknowledges_snapshot_candidate_contract=True,
         )
-        set_execution_scope_snapshot_loader(lambda task_id: {"not": "a scope"})
-        with pytest.raises(ExecutionScopeResolverContractError):
-            resolve_execution_scope("1")
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot)
+
+        result = resolve_execution_scope("1")
+        assert result.sandbox_key_suffix == "workforce-task"
+        assert result.workspace_segments == ("workforce", "task-7")
+        assert dict(result.memory_dimensions) == {"tenant": "acme"}
+        assert result.strict_memory_isolation is True
 
     def test_opt_in_still_honours_policy_field_symmetry(self):
         """Namespace fields agree (both all-default), only
@@ -1572,11 +1719,15 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         """The opt-in changes what a present snapshot is checked against,
         not whether a fallback is required at all: ``defer_to_snapshot``
         still rejects a non-ExecutionScope fallback even with the flag set,
-        and the mandatory fallback still applies on a snapshot miss."""
+        and the mandatory fallback still applies on a snapshot miss.
+
+        The fallback here commits no namespace (the opt-in's precondition) but
+        does set a policy field, which keeps it distinguishable from the
+        all-default scope an unscoped resolution would return."""
         with pytest.raises(TypeError):
             defer_to_snapshot("not-a-scope", snapshot_defines_namespace=True)
 
-        fallback = ExecutionScope(sandbox_key_suffix="fallback")
+        fallback = ExecutionScope(strict_memory_isolation=True)
         set_execution_scope_resolver(
             lambda task_id: defer_to_snapshot(
                 fallback, snapshot_defines_namespace=True
@@ -1726,33 +1877,42 @@ class TestExecutionScopeAbstentionMismatchErrorIsDistinguishable:
             ExecutionScopeAbstentionMismatchError, ExecutionScopeAuthorityError
         )
 
-    def test_base_class_except_clause_still_catches_it(self):
-        """A caller that widens its except clause to the base class (rather
-        than special-casing the subclass) still catches it -- the subclass
-        only prevents *accidental* downgrading via a bare ``except
-        ExecutionScopeAuthorityError`` that assumes ``resolver_scope`` is
-        always authoritative; it does not make the mismatch uncatchable."""
-        caught = None
-        try:
-            raise ExecutionScopeAbstentionMismatchError(
-                "task-1",
-                resolver_scope=ExecutionScope(),
-                snapshot_scope=ExecutionScope(sandbox_key_suffix="x"),
-                mismatched_fields={"sandbox_key_suffix": ("x", None)},
-            )
-        except ExecutionScopeAuthorityError as exc:
-            caught = exc
-        assert isinstance(caught, ExecutionScopeAbstentionMismatchError)
+    def test_abstention_raise_site_declares_no_authoritative_value(self):
+        """The attribute, not the class, is what blocks the off-turn
+        downgrade (see ``resolve_execution_scope_off_turn``), so the
+        abstention branch's raise site must declare ``False`` for it."""
+        fallback = ExecutionScope()
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(
+            lambda task_id: ExecutionScope(sandbox_key_suffix="attacker-chosen")
+        )
+        with pytest.raises(ExecutionScopeAbstentionMismatchError) as exc_info:
+            resolve_execution_scope("1")
+        assert exc_info.value.resolver_scope_is_authoritative is False
+
+    def test_authoritative_raise_site_declares_an_authoritative_value(self):
+        """The mirror: the branch that really has an answer says so, which is
+        what licenses the off-turn downgrade."""
+        resolver_scope = ExecutionScope(sandbox_key_suffix="from-resolver")
+        set_execution_scope_resolver(
+            lambda task_id: resolver_scope,
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(
+            lambda task_id: ExecutionScope(sandbox_key_suffix="from-snapshot")
+        )
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
+            resolve_execution_scope("1")
+        assert exc_info.value.resolver_scope_is_authoritative is True
 
 
 class TestDeferCarrierNeverActivated:
     """The carrier is never mistaken for a real scope, and the turn
     contextvar only ever holds the resolved fallback/snapshot, never the
     carrier itself."""
-
-    def test_carrier_is_not_an_execution_scope_instance(self):
-        carrier = defer_to_snapshot(ExecutionScope())
-        assert isinstance(carrier, ExecutionScope) is False
 
     def test_turn_activates_the_fallback_not_the_carrier(self):
         fallback = ExecutionScope(sandbox_key_suffix="fallback")
@@ -1765,31 +1925,6 @@ class TestDeferCarrierNeverActivated:
             current = get_execution_scope()
             assert isinstance(current, ExecutionScope)
             assert isinstance(current, DeferToSnapshot) is False
-
-
-class TestScopeFingerprintCoversIsolateExternalDirs:
-    """(#296) ``isolate_external_dirs`` is baked into the
-    cached ``AgentService``'s ``Workspace.allowed_external_dirs`` at build
-    time (see ``AgentServiceManager.get_agent_for_task`` ->
-    ``_build_allowed_external_dirs``), so an isolate_external_dirs-only
-    change must change the fingerprint or the cache never evicts and the
-    stale allowed-dirs list keeps being enforced."""
-
-    def test_isolate_external_dirs_only_change_changes_the_fingerprint(self):
-        base = ExecutionScope(workspace_segments=("tenant-a",))
-        isolated = ExecutionScope(
-            workspace_segments=("tenant-a",), isolate_external_dirs=True
-        )
-        assert scope_fingerprint(base) != scope_fingerprint(isolated)
-
-    def test_strict_memory_isolation_only_change_does_not_change_the_fingerprint(
-        self,
-    ):
-        """Read fresh from the contextvar on every memory operation
-        (``UserIsolatedMemoryStore``); nothing cached here goes stale."""
-        relaxed = ExecutionScope(strict_memory_isolation=False)
-        strict = ExecutionScope(strict_memory_isolation=True)
-        assert scope_fingerprint(relaxed) == scope_fingerprint(strict)
 
 
 class TestExecutionScopeFieldClassificationCompleteness:
@@ -1876,11 +2011,22 @@ _POLICY_FIELD_FINGERPRINT_PROBES: dict[str, tuple[dict, dict]] = {
 
 
 class TestScopeFingerprintFieldCoverage:
-    """Behavior-derived replacement for the set-comparison-only test above:
+    """Behavior-derived counterpart to the set-comparison-only test above:
     calls ``scope_fingerprint()`` itself, per field, rather than comparing
     two hand-maintained collections against each other. Reverting
     ``scope_fingerprint()`` to drop any namespace field's contribution fails
     the corresponding parametrized case here directly.
+
+    Why each bucket matters to the fingerprint: a namespace field is baked
+    into per-task cached state at build time -- ``isolate_external_dirs``, for
+    instance, into the cached ``AgentService``'s
+    ``Workspace.allowed_external_dirs`` via
+    ``AgentServiceManager.get_agent_for_task`` ->
+    ``_build_allowed_external_dirs`` -- so a change there must evict the cache
+    or the stale value keeps being enforced. A policy field like
+    ``strict_memory_isolation`` is read fresh from the contextvar on every
+    operation (``UserIsolatedMemoryStore``), so nothing cached goes stale and
+    including it would only cause needless rebuilds.
     """
 
     def test_probes_cover_exactly_the_classified_fields(self):
