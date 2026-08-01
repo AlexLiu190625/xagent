@@ -366,22 +366,32 @@ def test_existing_storage_key_binding_tolerates_resolver_snapshot_mismatch(
     assert ManagedFileRef(record).storage.prefix == "users/7"
 
 
-def test_new_object_write_path_fails_closed_on_mismatch(storage_env, tmp_path):
-    """No storage_key yet (a fresh upload): choosing the namespace new bytes
-    land under is an authority decision, so a resolver/snapshot mismatch
-    fails closed instead of downgrading to either side's guess -- getting it
-    wrong would silently and durably place the object under the wrong
-    tenant's subtree. No object may be written under either candidate
-    prefix."""
+def test_sync_to_durable_fails_closed_on_mismatch_for_recovered_scope(
+    storage_env, tmp_path
+):
+    """No storage_key yet (a fresh upload): construction always recovers the
+    scope off-turn (see ``__post_init__``) and never raises here, since a
+    keyless ref might just as well be serving a read. Choosing the namespace
+    new bytes land under is the actual authority decision, so
+    ``sync_to_durable`` re-resolves fail-closed right before composing the
+    key -- getting it wrong would silently and durably place the object
+    under the wrong tenant's subtree. No object may be written under either
+    candidate prefix."""
     register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
     set_execution_scope_snapshot_loader(
         lambda task_id: ExecutionScope(workspace_segments=("other-tenant",))
     )
-    record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
+    source = tmp_path / "uploads" / "source.txt"
+    source.parent.mkdir()
+    source.write_text("data", encoding="utf-8")
+    record = _record(source, task_id=99, storage_status="pending")
+
+    ref = ManagedFileRef(record)  # construction downgrades, does not raise
 
     with pytest.raises(ExecutionScopeAuthorityError):
-        ManagedFileRef(record)
+        ref.sync_to_durable()
 
+    assert record.storage_status == "pending"
     objects_root = tmp_path / "objects" / "users" / "7"
     assert not (objects_root / "clients").exists()
     assert not (objects_root / "other-tenant").exists()
@@ -389,11 +399,12 @@ def test_new_object_write_path_fails_closed_on_mismatch(storage_env, tmp_path):
 
 def test_read_path_downgrades_on_mismatch_for_pending_record(storage_env, tmp_path):
     """No storage_key yet is also the normal state of a record read while its
-    upload is still pending (see build_uploaded_file_record). Unlike the
-    write path above, a read has local storage to fall back to, so
-    ``for_write=False`` must downgrade a resolver/snapshot mismatch to the
-    resolver's answer and still serve the file, instead of raising
-    ExecutionScopeAuthorityError into an unhandled 500."""
+    upload is still pending (see build_uploaded_file_record). A read has
+    local storage to fall back to, so construction downgrades a
+    resolver/snapshot mismatch to the resolver's answer and still serves the
+    file, instead of raising ExecutionScopeAuthorityError into an unhandled
+    500 (the namespace decision that must fail closed is deferred to
+    ``sync_to_durable``, see the test above)."""
     register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
     set_execution_scope_snapshot_loader(
         lambda task_id: ExecutionScope(workspace_segments=("other-tenant",))
@@ -403,6 +414,27 @@ def test_read_path_downgrades_on_mismatch_for_pending_record(storage_env, tmp_pa
     source.write_text("pending upload", encoding="utf-8")
     record = _record(source, task_id=99, storage_status="pending")
 
-    ref = ManagedFileRef(record, for_write=False)
+    ref = ManagedFileRef(record)
     assert ref.storage.prefix == "users/7/clients/3/end_users/7"
     assert ref.ensure_local().read_text(encoding="utf-8") == "pending upload"
+
+
+def test_materialize_downgrades_on_mismatch_for_pending_record(storage_env, tmp_path):
+    """``materialize()`` (see ``Workspace``'s
+    ``ManagedFileRef(record).materialize()`` call, and similarly ``kb.py``'s
+    ``ensure_local``/``delete_durable`` calls) reads or addresses bytes
+    already placed, never a namespace decision, so it must not be blocked by
+    a resolver/snapshot mismatch that construction now downgrades instead of
+    raising."""
+    register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(workspace_segments=("other-tenant",))
+    )
+    source = tmp_path / "uploads" / "source.txt"
+    source.parent.mkdir()
+    source.write_text("pending upload", encoding="utf-8")
+    record = _record(source, task_id=99, storage_status="pending")
+
+    ref = ManagedFileRef(record)
+    assert ref.storage.prefix == "users/7/clients/3/end_users/7"
+    assert ref.materialize().read_text(encoding="utf-8") == "pending upload"

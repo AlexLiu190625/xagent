@@ -134,21 +134,26 @@ def _checksum_matches(expected_checksum: str, actual_checksum: str) -> bool:
 class ManagedFileRef:
     """Registered file handle with local-first durable fallback semantics.
 
-    ``for_write`` states the caller's intent for a record that has no durable
-    key yet, since key presence alone cannot distinguish a read from a write
-    (see ``__post_init__``): ``True`` (the default) fails closed on a
-    resolver/snapshot authority mismatch, because it is about to compose the
-    key a new object lands under; ``False`` downgrades that same mismatch to
-    the resolver's answer plus a warning, since a read has local storage to
-    fall back to and failing closed would only turn a servable file into an
-    unhandled error.
+    A record with no durable key yet is ambiguous at construction time: it
+    is either a fresh upload about to be written, or a ``storage_status=
+    "pending"`` record a read-only endpoint is merely trying to serve from
+    local storage (see ``__post_init__``). Rather than asking every caller
+    to declare its intent, this class always resolves off-turn (never
+    raises at construction) and defers the fail-closed authority check to
+    ``sync_to_durable``, the one operation that actually selects a namespace
+    for new bytes (see that method). ``_scope_from_task_recovery`` records
+    whether ``_scope_segments`` came from that off-turn per-task recovery,
+    as opposed to an explicit ``execution_scope`` argument or the ambient
+    turn contextvar -- only the recovered case needs re-checking before a
+    key is composed.
     """
 
     record: UploadedFileLocalPathRecord
     storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
     execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED
-    for_write: bool = True
     _scope_segments: tuple[str, ...] = field(default=(), init=False, repr=False)
+    _scope_from_task_recovery: bool = field(default=False, init=False, repr=False)
+    _recovery_task_id: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Resolve the active scope once, at construction, so the bound handle
@@ -171,40 +176,35 @@ class ManagedFileRef:
             if scope is None:
                 task_id = getattr(self.record, "task_id", None)
                 if task_id is not None and not self.storage_key:
-                    # No durable key yet means a fresh object is about to be
-                    # placed somewhere under this scope's subtree -- but a
-                    # keyless record is routine for reads too (a
+                    # No durable key yet means either a fresh object is
+                    # about to be placed somewhere under this scope's
+                    # subtree, or the record is simply routine for reads (a
                     # freshly-uploaded record sits at storage_status=
                     # "pending" with no key, and list/download/preview
                     # endpoints construct a ref for exactly those records).
                     # Presence of a key cannot tell write intent from read
-                    # intent, so the caller must: ``for_write`` (default
-                    # True, preserving prior behavior for callers that don't
-                    # pass it) says which.
-                    #
-                    # ``for_write=True``: choosing the namespace a new
-                    # object is written under is an authority decision --
-                    # getting it wrong silently and durably writes one
-                    # tenant's bytes under another tenant's subtree -- so
-                    # this fails closed rather than downgrading a
-                    # resolver/snapshot mismatch to a warning.
-                    #
-                    # ``for_write=False``: nothing new is being placed
-                    # anywhere; the ref only needs a best-effort namespace to
-                    # look in (e.g. to decide whether a durable object could
-                    # exist at all before falling back to local storage), so
-                    # a mismatch downgrades to the resolver's answer plus a
-                    # warning instead of raising -- the read still has local
-                    # storage to fall back to, and raising would turn a
-                    # servable file into an unhandled 500.
+                    # intent apart, so construction never picks a side: it
+                    # always resolves off-turn (downgrading a resolver/
+                    # snapshot authority mismatch to the resolver's answer
+                    # plus a warning instead of raising -- a keyless ref
+                    # under construction may only ever be serving a read
+                    # from local storage, and raising here would turn a
+                    # servable file into an unhandled 500). The namespace
+                    # decision that actually matters -- which tenant's
+                    # subtree new bytes land under -- is deferred to
+                    # ``sync_to_durable``, the one place that composes a
+                    # fresh key, which re-resolves fail-closed right before
+                    # doing so. ``_scope_from_task_recovery`` records that
+                    # this ref's ``_scope_segments`` came from this branch,
+                    # so ``sync_to_durable`` knows a re-check is needed.
                     #
                     # A record that already has a durable key is the read
-                    # (or rewrite-in-place) path regardless of ``for_write``:
-                    # that key already fixes the object's location, off-turn
-                    # re-resolution is unnecessary, and -- on a
-                    # resolver/snapshot drift -- would make an
-                    # already-legitimate key look foreign to a narrower
-                    # re-derived scope (see ``storage`` binding below).
+                    # (or rewrite-in-place) path: that key already fixes the
+                    # object's location, off-turn re-resolution is
+                    # unnecessary, and -- on a resolver/snapshot drift --
+                    # would make an already-legitimate key look foreign to a
+                    # narrower re-derived scope (see ``storage`` binding
+                    # below).
                     #
                     # Skipping this branch (or a downgrade landing on
                     # ``None``) leaves ``scope`` at ``None``, so
@@ -233,11 +233,9 @@ class ManagedFileRef:
                     # scope and can raise ``StorageKeyScopeError``), not just
                     # a neutral no-op -- it is deliberate for the reason
                     # above, not an oversight.
-                    scope = (
-                        resolve_execution_scope(task_id)
-                        if self.for_write
-                        else resolve_execution_scope_off_turn(task_id)
-                    )
+                    scope = resolve_execution_scope_off_turn(task_id)
+                    self._scope_from_task_recovery = True
+                    self._recovery_task_id = task_id
         else:
             scope = cast(ExecutionScope | None, scope_input)
         self._scope_segments = (
@@ -369,16 +367,36 @@ class ManagedFileRef:
         if not path.exists() or not path.is_file():
             raise FileNotFoundError(path)
 
-        resolved_key = (
-            storage_key
-            or self.storage_key
-            or build_upload_storage_key(
+        resolved_key = storage_key or self.storage_key
+        if not resolved_key:
+            # Composing a fresh key selects the namespace new bytes land
+            # under -- getting it wrong silently and durably writes one
+            # tenant's bytes under another tenant's subtree. Construction
+            # (see ``__post_init__``) never fails closed for this, because a
+            # keyless ref might just as well be serving a read; this is the
+            # one place that actually needs to fail closed, since this is
+            # the operation that actually places new bytes.
+            #
+            # When ``_scope_segments`` came from off-turn per-task recovery,
+            # re-resolve it here, fail-closed, right before it is baked into
+            # the key. This second resolution cannot disagree with the one
+            # already baked into ``_scope_segments`` in the case that
+            # matters: a disagreement is exactly what makes this fail-closed
+            # call raise, and it raises before ``resolved_key`` is computed
+            # or anything is written -- so this is a genuine re-check, not
+            # redundant work re-deriving the same answer.
+            scope_segments = self._scope_segments
+            if self._scope_from_task_recovery:
+                scope = resolve_execution_scope(self._recovery_task_id)
+                scope_segments = (
+                    scope.durable_storage_segments if scope is not None else ()
+                )
+            resolved_key = build_upload_storage_key(
                 int(self.record.user_id),
                 str(self.record.file_id),
                 self.filename or path.name,
-                scope_segments=self._scope_segments,
+                scope_segments=scope_segments,
             )
-        )
         try:
             stored_object = self.storage.put_file(
                 path,
