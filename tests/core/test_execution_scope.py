@@ -30,6 +30,7 @@ from xagent.core.execution_scope import (
     ExecutionScopeResolverContractError,
     InvalidScopeComponentError,
     defer_to_snapshot,
+    execution_scope_from_agent_config,
     execution_scope_resolver_registered,
     get_execution_scope,
     reset_execution_scope,
@@ -845,6 +846,127 @@ class TestFromDictUntrustedFieldCoercion:
             data = ExecutionScope().to_dict()
             data["memory_dimensions"] = raw
             assert dict(ExecutionScope.from_dict(data).memory_dimensions) == {}
+
+
+# The tuple several websocket handlers wrap around the turn-execution path,
+# including its per-turn ``resolve_execution_scope`` call. Anything in it is
+# answered to the client as a message-format validation error, so an exception
+# that is *not* about the client's message must fall through it.
+_WEBSOCKET_VALIDATION_EXCEPT_TUPLE = (ValueError, KeyError, TypeError)
+
+
+class TestPersistedSnapshotDecodeIsNotAClientMessageFault:
+    """A persisted snapshot that no longer decodes is a persisted-data fault.
+
+    ``execution_scope_from_agent_config`` is where persisted snapshot data is
+    read, and the registered snapshot loaders call it from inside
+    ``resolve_execution_scope``. The field coercions it drives raise
+    ``InvalidScopeComponentError``, which is a ``ValueError`` -- so without a
+    boundary conversion the failure lands in the websocket handlers'
+    ``except (ValueError, KeyError, TypeError)`` clause and the client is told
+    its own message was malformed, for data it may not have sent and cannot
+    fix. ``_coerce_snapshot_version`` was already written to avoid exactly
+    that folding for the ``version`` field; this is the same posture applied
+    to the rest of the snapshot.
+
+    ``InvalidScopeComponentError``'s own bases are deliberately left alone: it
+    is also raised for live, caller-supplied components (``workspace.py``,
+    ``sandbox_keys.py``), where being a ``ValueError`` is correct and is what
+    surrounding handlers already expect.
+    """
+
+    MALFORMED_AGENT_CONFIG = {"execution_scope": {"workspace_segments": 5}}
+
+    def _loader(self, task_id):
+        return execution_scope_from_agent_config(self.MALFORMED_AGENT_CONFIG)
+
+    def test_direct_decode_raises_the_contract_error(self):
+        with pytest.raises(ExecutionScopeResolverContractError):
+            execution_scope_from_agent_config(self.MALFORMED_AGENT_CONFIG)
+
+    def test_decode_failure_chains_the_underlying_validation_error(self):
+        """The conversion must not lose the diagnosis: the coercion error is
+        kept as ``__cause__`` (and its field-level detail is logged where it
+        was raised), so the boundary type costs nothing in debuggability."""
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            execution_scope_from_agent_config(self.MALFORMED_AGENT_CONFIG)
+        assert isinstance(exc_info.value.__cause__, InvalidScopeComponentError)
+
+    def test_decode_failure_message_names_no_snapshot_value(self):
+        """The message travels further than the log does, and a snapshot's
+        segments can carry end-user identifiers."""
+        agent_config = {
+            "execution_scope": {"workspace_segments": "tenant-secret-identifier"}
+        }
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            execution_scope_from_agent_config(agent_config)
+        assert "tenant-secret-identifier" not in str(exc_info.value)
+
+    def test_not_folded_on_the_no_resolver_path(self):
+        set_execution_scope_snapshot_loader(self._loader)
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            resolve_execution_scope("1")
+        assert not isinstance(exc_info.value, _WEBSOCKET_VALIDATION_EXCEPT_TUPLE)
+
+    def test_not_folded_on_the_resolver_abstention_path(self):
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(ExecutionScope()),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(self._loader)
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            resolve_execution_scope("1")
+        assert not isinstance(exc_info.value, _WEBSOCKET_VALIDATION_EXCEPT_TUPLE)
+
+    def test_live_component_validation_is_still_a_value_error(self):
+        """The counterpart the boundary conversion must not disturb: a
+        component validated for a caller right now (not read back from
+        storage) still raises the ``ValueError`` subclass its own callers
+        catch."""
+        assert issubclass(InvalidScopeComponentError, ValueError)
+        with pytest.raises(InvalidScopeComponentError):
+            ExecutionScope(sandbox_key_suffix="not:valid")
+
+
+class TestResolverContractErrorMessageIsClientSafe:
+    """``ExecutionScopeResolverContractError``'s message reaches a generic
+    handler and can surface to the client, exactly like
+    ``ExecutionScopeAuthorityError``'s (which is pinned to task id + field
+    names by ``test_str_carries_task_id_and_field_names_never_values``). A
+    resolver or loader bug that returns an internal object must therefore not
+    publish that object's ``repr()``; the message names its *type* and the
+    value goes only to the server-side log.
+    """
+
+    class _InternalConfig:
+        """Stands in for whatever an embedder's resolver might wrongly return."""
+
+        def __repr__(self) -> str:
+            return "<InternalConfig token='resolver-secret-token'>"
+
+    def test_resolver_return_type_error_names_the_type_not_the_value(self):
+        offender = self._InternalConfig()
+        set_execution_scope_resolver(
+            lambda task_id: offender, acknowledges_snapshot_candidate_contract=True
+        )
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            resolve_execution_scope("1")
+        message = str(exc_info.value)
+        assert "resolver-secret-token" not in message
+        assert "_InternalConfig" in message
+
+    def test_snapshot_type_error_names_the_type_not_the_value(self):
+        offender = self._InternalConfig()
+        set_execution_scope_resolver(
+            lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver"),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: offender)
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            resolve_execution_scope("1")
+        message = str(exc_info.value)
+        assert "resolver-secret-token" not in message
+        assert "_InternalConfig" in message
 
 
 class TestSnapshotCandidateAuthority:
@@ -1791,9 +1913,10 @@ class TestShapeGateLogsFieldDiffLazily:
 class TestResolveExecutionScopeOffTurn:
     """Off-turn consumers (websocket ``_scope_segments_for_task``,
     ``ManagedFileRef``) downgrade a resolver-authoritative namespace
-    mismatch instead of failing, but a resolver-abstention mismatch has no
-    authoritative value to downgrade to and stays fail-closed -- see
-    ``ExecutionScopeAbstentionMismatchError``'s docstring."""
+    mismatch instead of failing, but a mismatch whose ``resolver_scope`` is
+    not an authoritative answer has nothing to downgrade to and stays
+    fail-closed -- see ``ExecutionScopeAbstentionMismatchError``'s
+    docstring."""
 
     def test_passthrough_when_no_mismatch(self):
         scope = ExecutionScope(sandbox_key_suffix="s")
@@ -1853,6 +1976,62 @@ class TestResolveExecutionScopeOffTurn:
 
         with pytest.raises(ExecutionScopeAbstentionMismatchError):
             resolve_execution_scope_off_turn("1")
+
+    def test_a_new_authority_error_subclass_is_not_downgraded_by_default(self):
+        """The downgrade condition is positive -- "this raise site declared an
+        authoritative value" -- rather than an exclusion list of the subclasses
+        known to be unsafe. A subclass defined here, which no exclusion list in
+        the module could name, must therefore propagate: an off-turn face that
+        fails open for anything it has not been taught about would hand out
+        ``resolver_scope`` values no branch ever sanctioned."""
+
+        class _FutureMismatchError(ExecutionScopeAuthorityError):
+            """A mismatch shape added after this predicate was written."""
+
+        def resolver(task_id):
+            raise _FutureMismatchError(
+                str(task_id),
+                resolver_scope=ExecutionScope(sandbox_key_suffix="not-an-authority"),
+                snapshot_scope=ExecutionScope(sandbox_key_suffix="from-snapshot"),
+                mismatched_fields={
+                    "sandbox_key_suffix": ("from-snapshot", "not-an-authority")
+                },
+                resolver_scope_is_authoritative=False,
+            )
+
+        set_execution_scope_resolver(
+            resolver, acknowledges_snapshot_candidate_contract=True
+        )
+        with pytest.raises(_FutureMismatchError):
+            resolve_execution_scope_off_turn("1")
+
+    def test_a_subclass_declaring_an_authority_is_still_downgraded(self):
+        """The other half: the predicate keys on the declaration, not on the
+        class, so a subclass that does have a sanctioned value is downgraded
+        without the function needing to know the type."""
+
+        class _FutureAuthoritativeMismatchError(ExecutionScopeAuthorityError):
+            """A mismatch shape that does carry an authoritative answer."""
+
+        authoritative = ExecutionScope(sandbox_key_suffix="from-resolver")
+
+        def resolver(task_id):
+            raise _FutureAuthoritativeMismatchError(
+                str(task_id),
+                resolver_scope=authoritative,
+                snapshot_scope=ExecutionScope(sandbox_key_suffix="from-snapshot"),
+                mismatched_fields={
+                    "sandbox_key_suffix": ("from-snapshot", "from-resolver")
+                },
+                resolver_scope_is_authoritative=True,
+            )
+
+        set_execution_scope_resolver(
+            resolver, acknowledges_snapshot_candidate_contract=True
+        )
+        with scope_log_records() as records:
+            assert resolve_execution_scope_off_turn("1") == authoritative
+        assert any("authority mismatch" in r.lower() for r in records)
 
     def test_other_exceptions_still_propagate(self):
         def boom(task_id):
