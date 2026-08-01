@@ -7216,11 +7216,18 @@ async def _handle_pause_task_unserialized(
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         expected_run_id = task_fields.run_id
-        # Off-turn: this only locates the already-running agent's existing
-        # workspace/sandbox to pause it, it never selects a namespace for new
-        # bytes. A control operation on an already-running task must stay
-        # available even under a resolver/snapshot dispute, so a mismatch
-        # downgrades to the resolver's answer instead of blocking the pause.
+        # Off-turn: on an agent-cache hit this only locates the already-
+        # running agent's existing workspace/sandbox to pause it. On a miss,
+        # get_agent_for_task below builds a fresh agent, which does select a
+        # namespace for new bytes (workspace directory tree, sandbox mount)
+        # from this value -- but that value is always the resolver's own
+        # authoritative answer (never the client-influenceable snapshot), so
+        # a mismatch downgrading here still cannot hand namespace authority
+        # to an untrusted candidate. Pause schedules no turn, so nothing
+        # downstream re-resolves or corrects a build that happens here. A
+        # control operation on an already-running task must stay available
+        # even under a resolver/snapshot dispute, so a mismatch downgrades
+        # to the resolver's answer instead of blocking the pause.
         execution_scope = await run_db_io_cancellation_safe(
             lambda: resolve_execution_scope_off_turn(task_id)
         )
@@ -7406,16 +7413,23 @@ async def _handle_resume_task_unserialized(
         task_fields = task_setup_snapshot.task
         task_owner_user_id = int(task_fields.user_id)
         task_status = cast(TaskStatus, task_fields.status)
-        # Off-turn: this only locates the paused task's existing
-        # workspace/sandbox for ``get_agent_for_task`` below, it never
-        # selects a namespace for new bytes. A control operation on an
-        # already-running (or resumable) task must stay available even under
-        # a resolver/snapshot dispute, so a mismatch downgrades to the
-        # resolver's answer instead of blocking the resume. The turn this
-        # handler schedules is a different consumer: it is passed
-        # ``EXECUTION_SCOPE_NOT_PROVIDED`` instead of this value below so
-        # ``execute_resume_background`` performs its own fail-closed
-        # resolution for the new turn rather than inheriting this downgrade.
+        # Off-turn: on an agent-cache hit this only locates the paused task's
+        # existing workspace/sandbox for ``get_agent_for_task`` below. On a
+        # miss (or a cached-scope-fingerprint mismatch), that call builds a
+        # fresh agent from this value, which does select a namespace for new
+        # bytes (workspace directory tree, sandbox mount) -- but always the
+        # resolver's own authoritative answer, never the client-influenceable
+        # snapshot, so downgrading here cannot hand namespace authority to an
+        # untrusted candidate. A control operation on an already-running (or
+        # resumable) task must stay available even under a resolver/snapshot
+        # dispute, so a mismatch downgrades to the resolver's answer instead
+        # of blocking the resume. The turn this handler schedules is a
+        # different consumer: it is passed ``EXECUTION_SCOPE_NOT_PROVIDED``
+        # instead of this value below so ``execute_resume_background``
+        # performs its own fail-closed resolution before producing the
+        # resumed turn's own output, rather than inheriting this downgrade --
+        # that protects where the turn's own new bytes land, not the
+        # workspace/sandbox root a build above may already have fixed.
         resolved_execution_scope = await run_db_io_cancellation_safe(
             lambda: resolve_execution_scope_off_turn(task_id)
         )
@@ -7481,9 +7495,12 @@ async def _handle_resume_task_unserialized(
                         expected_run_id=resume_snapshot.run_id,
                         previous_task=previous_task,
                         # Not `resolved_execution_scope`: that value is the
-                        # off-turn downgrade used above only to locate the
-                        # existing agent. The scheduled turn selects a
-                        # namespace for new bytes, so it explicitly gets
+                        # off-turn downgrade used above to obtain
+                        # `agent_service` (which, on an agent-cache miss, may
+                        # itself have built the workspace/sandbox from it --
+                        # see the comment above `resolved_execution_scope`).
+                        # The scheduled turn selects the namespace its own
+                        # output lands under, so it explicitly gets
                         # `EXECUTION_SCOPE_NOT_PROVIDED` and runs its own
                         # fail-closed resolution instead of inheriting a
                         # disputed answer.

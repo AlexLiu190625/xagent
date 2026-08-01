@@ -258,7 +258,12 @@ def isolate_execution_scope_hooks() -> Iterator[None]:
     that registers either without resetting it leaks into every test that
     runs afterward in the same process/worker. Root-level and autouse so no
     test module can forget it; scoped narrowly to just these two globals so
-    it composes with any test's own resolver/loader registration.
+    it composes with any test's own *function-scoped* registration (a
+    session- or module-scoped registration would still be torn down mid-
+    session by this fixture's teardown, since that always re-registers
+    ``None`` regardless of what a wider-scoped fixture set up). That
+    teardown call also never carries the acknowledgement keyword, so this
+    safety net alone never exercises the acknowledged-registration path.
     """
     set_execution_scope_resolver(None)
     set_execution_scope_snapshot_loader(None)

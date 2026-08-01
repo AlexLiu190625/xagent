@@ -16,6 +16,7 @@ from ...core.execution_scope import (
     ExecutionScopeInput,
     get_execution_scope,
     resolve_execution_scope,
+    resolve_execution_scope_off_turn,
 )
 from ...core.file_storage import (
     FsspecFileStorage,
@@ -131,11 +132,22 @@ def _checksum_matches(expected_checksum: str, actual_checksum: str) -> bool:
 
 @dataclass
 class ManagedFileRef:
-    """Registered file handle with local-first durable fallback semantics."""
+    """Registered file handle with local-first durable fallback semantics.
+
+    ``for_write`` states the caller's intent for a record that has no durable
+    key yet, since key presence alone cannot distinguish a read from a write
+    (see ``__post_init__``): ``True`` (the default) fails closed on a
+    resolver/snapshot authority mismatch, because it is about to compose the
+    key a new object lands under; ``False`` downgrades that same mismatch to
+    the resolver's answer plus a warning, since a read has local storage to
+    fall back to and failing closed would only turn a servable file into an
+    unhandled error.
+    """
 
     record: UploadedFileLocalPathRecord
     storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
     execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED
+    for_write: bool = True
     _scope_segments: tuple[str, ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -159,22 +171,43 @@ class ManagedFileRef:
             if scope is None:
                 task_id = getattr(self.record, "task_id", None)
                 if task_id is not None and not self.storage_key:
-                    # A record with no durable key yet is the write path: a
-                    # fresh object is about to be placed under this scope's
-                    # subtree. Choosing that namespace is an authority
-                    # decision -- getting it wrong silently and durably
-                    # writes one tenant's bytes under another tenant's
-                    # subtree -- so this fails closed rather than downgrading
-                    # a resolver/snapshot mismatch to a warning. A record
-                    # that already has a durable key is the read (or
-                    # rewrite-in-place) path: that key already fixes the
-                    # object's location, off-turn re-resolution is
-                    # unnecessary, and -- on a resolver/snapshot drift --
-                    # would make an already-legitimate key look foreign to a
-                    # narrower re-derived scope (see ``storage`` binding
-                    # below).
+                    # No durable key yet means a fresh object is about to be
+                    # placed somewhere under this scope's subtree -- but a
+                    # keyless record is routine for reads too (a
+                    # freshly-uploaded record sits at storage_status=
+                    # "pending" with no key, and list/download/preview
+                    # endpoints construct a ref for exactly those records).
+                    # Presence of a key cannot tell write intent from read
+                    # intent, so the caller must: ``for_write`` (default
+                    # True, preserving prior behavior for callers that don't
+                    # pass it) says which.
                     #
-                    # Skipping this branch leaves ``scope`` at ``None``, so
+                    # ``for_write=True``: choosing the namespace a new
+                    # object is written under is an authority decision --
+                    # getting it wrong silently and durably writes one
+                    # tenant's bytes under another tenant's subtree -- so
+                    # this fails closed rather than downgrading a
+                    # resolver/snapshot mismatch to a warning.
+                    #
+                    # ``for_write=False``: nothing new is being placed
+                    # anywhere; the ref only needs a best-effort namespace to
+                    # look in (e.g. to decide whether a durable object could
+                    # exist at all before falling back to local storage), so
+                    # a mismatch downgrades to the resolver's answer plus a
+                    # warning instead of raising -- the read still has local
+                    # storage to fall back to, and raising would turn a
+                    # servable file into an unhandled 500.
+                    #
+                    # A record that already has a durable key is the read
+                    # (or rewrite-in-place) path regardless of ``for_write``:
+                    # that key already fixes the object's location, off-turn
+                    # re-resolution is unnecessary, and -- on a
+                    # resolver/snapshot drift -- would make an
+                    # already-legitimate key look foreign to a narrower
+                    # re-derived scope (see ``storage`` binding below).
+                    #
+                    # Skipping this branch (or a downgrade landing on
+                    # ``None``) leaves ``scope`` at ``None``, so
                     # ``self._scope_segments`` below is ``()`` and
                     # ``self.storage`` binds to the owner root
                     # (``get_user_file_storage(user_id, scope_segments=())``)
@@ -194,8 +227,17 @@ class ManagedFileRef:
                     # constructing a new key relative to a prefix, so a
                     # containment check against a re-derived (and possibly
                     # drifted) scope would add no protection, only risk
-                    # rejecting an already-legitimate key.
-                    scope = resolve_execution_scope(task_id)
+                    # rejecting an already-legitimate key. This is a real
+                    # loosening relative to the in-turn binding for the same
+                    # read (which narrows through the ambient contextvar
+                    # scope and can raise ``StorageKeyScopeError``), not just
+                    # a neutral no-op -- it is deliberate for the reason
+                    # above, not an oversight.
+                    scope = (
+                        resolve_execution_scope(task_id)
+                        if self.for_write
+                        else resolve_execution_scope_off_turn(task_id)
+                    )
         else:
             scope = cast(ExecutionScope | None, scope_input)
         self._scope_segments = (

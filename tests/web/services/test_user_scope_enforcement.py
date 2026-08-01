@@ -385,3 +385,24 @@ def test_new_object_write_path_fails_closed_on_mismatch(storage_env, tmp_path):
     objects_root = tmp_path / "objects" / "users" / "7"
     assert not (objects_root / "clients").exists()
     assert not (objects_root / "other-tenant").exists()
+
+
+def test_read_path_downgrades_on_mismatch_for_pending_record(storage_env, tmp_path):
+    """No storage_key yet is also the normal state of a record read while its
+    upload is still pending (see build_uploaded_file_record). Unlike the
+    write path above, a read has local storage to fall back to, so
+    ``for_write=False`` must downgrade a resolver/snapshot mismatch to the
+    resolver's answer and still serve the file, instead of raising
+    ExecutionScopeAuthorityError into an unhandled 500."""
+    register_scope_resolver(lambda task_id: _ISOLATED_SCOPE)
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(workspace_segments=("other-tenant",))
+    )
+    source = tmp_path / "uploads" / "source.txt"
+    source.parent.mkdir()
+    source.write_text("pending upload", encoding="utf-8")
+    record = _record(source, task_id=99, storage_status="pending")
+
+    ref = ManagedFileRef(record, for_write=False)
+    assert ref.storage.prefix == "users/7/clients/3/end_users/7"
+    assert ref.ensure_local().read_text(encoding="utf-8") == "pending upload"

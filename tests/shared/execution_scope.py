@@ -21,14 +21,15 @@ under test, not boilerplate.
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from typing import Optional
 
-from xagent.core.execution_scope import ExecutionScope, set_execution_scope_resolver
+from xagent.core.execution_scope import (
+    ExecutionScopeResolver,
+    set_execution_scope_resolver,
+)
 
-ScopeResolver = Callable[[str], Optional[ExecutionScope]]
 
-
-def register_scope_resolver(resolver: Optional[ScopeResolver]) -> None:
+def register_scope_resolver(resolver: Optional[ExecutionScopeResolver]) -> None:
     """Install ``resolver`` as the authoritative scope resolver, or clear it.
 
     ``None`` clears the registration, which needs no acknowledgement: without a

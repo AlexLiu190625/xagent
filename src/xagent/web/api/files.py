@@ -1264,7 +1264,7 @@ async def list_task_files(
 
     files = []
     for record in records:
-        file_ref = ManagedFileRef(record)
+        file_ref = ManagedFileRef(record, for_write=False)
         path = file_ref.local_path
         if not path.exists() and not file_ref.has_durable_object:
             # Skip files that no longer exist on disk
@@ -1311,7 +1311,7 @@ async def download_file(
     # Check access permissions
     if file_record:
         _check_file_access(file_record, user)
-        file_ref = ManagedFileRef(file_record)
+        file_ref = ManagedFileRef(file_record, for_write=False)
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
         local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
@@ -1441,7 +1441,7 @@ async def preview_file(
     # Check access permissions
     if file_record:
         _check_file_access(file_record, user)
-        file_ref = ManagedFileRef(file_record)
+        file_ref = ManagedFileRef(file_record, for_write=False)
         file_name = str(file_record.filename)
         media_type = guess_media_type(file_name)
         local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
@@ -1546,7 +1546,7 @@ async def preview_pptx_as_pdf(
     if file_record:
         _check_file_access(file_record, user)
         file_name = str(file_record.filename)
-        file_ref = ManagedFileRef(file_record)
+        file_ref = ManagedFileRef(file_record, for_write=False)
         local_path_is_trusted = _is_under_uploads(full_path, owner_user_id)
         if file_ref.has_durable_object:
             try:
@@ -1635,7 +1635,7 @@ async def public_download_file(
 
     if file_record:
         _validate_public_task_file_access(db, file_record, token)
-        file_ref = ManagedFileRef(file_record)
+        file_ref = ManagedFileRef(file_record, for_write=False)
         owner_user_id = _file_user_id_value(file_record)
         file_name = str(file_record.filename)
         local_path_is_trusted = _is_under_uploads(file_ref.local_path, owner_user_id)
@@ -1703,7 +1703,7 @@ async def public_preview_file(
 
     if file_record:
         _validate_public_task_file_access(db, file_record, token)
-        file_ref = ManagedFileRef(file_record)
+        file_ref = ManagedFileRef(file_record, for_write=False)
         base_path = file_ref.local_path
         owner_user_id = _file_user_id_value(file_record)
         if file_ref.has_durable_object and not relative_path:
@@ -1751,7 +1751,7 @@ async def public_preview_file(
         )
         if asset_record is not None:
             _validate_public_task_file_access(db, asset_record, token)
-            asset_ref = ManagedFileRef(asset_record)
+            asset_ref = ManagedFileRef(asset_record, for_write=False)
             try:
                 target_path = asset_ref.ensure_local()
             except DurableObjectIntegrityError as exc:

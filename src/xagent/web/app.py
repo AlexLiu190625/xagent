@@ -906,11 +906,18 @@ async def startup_event() -> None:
     )
 
     register_execution_scope_snapshot_loader()
+    # This reflects only whether a resolver is registered at this point in
+    # startup; it is not re-evaluated afterward. An embedder that registers
+    # its resolver later (e.g. from its own startup hook running after this
+    # one) leaves this line reporting "snapshot-only" even once a resolver
+    # is in fact authoritative -- the mode itself is live and re-checked on
+    # every resolution (see resolve_execution_scope), only this log line is
+    # a startup-time snapshot of it.
     logger.info(
-        "Execution scope authority mode: %s",
+        "Execution scope authority mode at startup: %s",
         "resolver-authoritative (snapshot is a corroborating candidate)"
         if execution_scope_resolver_registered()
-        else "snapshot-only (no resolver registered)",
+        else "snapshot-only (no resolver registered yet)",
     )
 
     from .services.trigger_rate_limit import warn_if_rate_limits_are_per_process
