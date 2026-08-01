@@ -291,11 +291,14 @@ async def test_owned_bg_failure_waits_for_exact_settlement_before_broadcast() ->
 
 @pytest.mark.asyncio
 async def test_bg_turn_authority_mismatch_fails_the_turn() -> None:
-    """Turn-face consumer (#296): a namespace-affecting
-    disagreement between the registered resolver and a persisted snapshot
-    must fail the turn -- unlike the off-turn consumers in
-    ``websocket._scope_segments_for_task`` and ``ManagedFileRef``, which
-    downgrade the same mismatch to the resolver's answer plus a warning."""
+    """Turn-face consumer: a namespace-affecting disagreement between the
+    registered resolver and a persisted snapshot must fail the turn --
+    unlike the off-turn consumers (``ManagedFileRef``'s construction, the
+    pause/resume handlers), which downgrade the same mismatch to the
+    resolver's authoritative answer plus a warning. Being reached off a turn
+    is not by itself what decides this: ``websocket._scope_segments_for_task``
+    also runs off-turn yet resolves fail-closed, because its caller composes
+    a storage key for new bytes."""
     register_scope_resolver(
         lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver"),
     )

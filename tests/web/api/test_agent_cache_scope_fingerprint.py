@@ -461,10 +461,13 @@ async def test_unscoped_build_records_legacy_key() -> None:
 @pytest.mark.asyncio
 async def test_turn_face_authority_mismatch_fails_the_turn() -> None:
     """``get_agent_for_task`` is a turn-face consumer of
-    ``resolve_execution_scope`` (#296): unlike the off-turn
-    consumers in ``websocket._scope_segments_for_task`` and
-    ``ManagedFileRef``, a namespace-affecting authority mismatch here must
-    propagate and fail the turn rather than being downgraded to a warning."""
+    ``resolve_execution_scope``: unlike the off-turn consumers
+    (``ManagedFileRef``'s construction, the pause/resume handlers), a
+    namespace-affecting authority mismatch here must propagate and fail the
+    turn rather than being downgraded to a warning.
+    ``websocket._scope_segments_for_task`` is off-turn and still resolves
+    fail-closed, so what decides this is whether a namespace is being chosen
+    for new bytes, not whether a turn is running."""
     register_scope_resolver(
         lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver"),
     )

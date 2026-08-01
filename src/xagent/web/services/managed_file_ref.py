@@ -138,14 +138,27 @@ class ManagedFileRef:
     is either a fresh upload about to be written, or a ``storage_status=
     "pending"`` record a read-only endpoint is merely trying to serve from
     local storage (see ``__post_init__``). Rather than asking every caller
-    to declare its intent, this class always resolves off-turn (never
-    raises at construction) and defers the fail-closed authority check to
-    ``sync_to_durable``, the one operation that actually selects a namespace
-    for new bytes (see that method). ``_scope_from_task_recovery`` records
-    whether ``_scope_segments`` came from that off-turn per-task recovery,
-    as opposed to an explicit ``execution_scope`` argument or the ambient
-    turn contextvar -- only the recovered case needs re-checking before a
-    key is composed.
+    to declare its intent, this class resolves off-turn, so a
+    resolver-authoritative namespace mismatch downgrades instead of turning
+    a servable read into an error, and defers the fail-closed authority
+    check to ``sync_to_durable``, the operation that composes a key from
+    the resolved namespace. ``_scope_from_task_recovery`` records whether
+    ``_scope_segments`` came from that off-turn per-task recovery, as
+    opposed to an explicit ``execution_scope`` argument or the ambient turn
+    contextvar -- only the recovered case needs re-checking before a key is
+    composed.
+
+    Off-turn resolution is not the same as never failing: it downgrades a
+    mismatch only where the resolver produced an authoritative answer to
+    downgrade to. A resolver that abstains and disagrees with the snapshot,
+    a resolver that violates its own return contract, and a snapshot loader
+    that raises all still propagate out of construction, so a read of a
+    keyless record is not unconditionally safe.
+
+    A key supplied by the caller bypasses the re-check below, because the
+    namespace it encodes was chosen wherever that key was composed. Callers
+    that compose a key themselves therefore own that decision; this class
+    only covers the keys it composes.
     """
 
     record: UploadedFileLocalPathRecord
@@ -372,10 +385,12 @@ class ManagedFileRef:
             # Composing a fresh key selects the namespace new bytes land
             # under -- getting it wrong silently and durably writes one
             # tenant's bytes under another tenant's subtree. Construction
-            # (see ``__post_init__``) never fails closed for this, because a
-            # keyless ref might just as well be serving a read; this is the
-            # one place that actually needs to fail closed, since this is
-            # the operation that actually places new bytes.
+            # (see ``__post_init__``) resolves off-turn instead, because a
+            # keyless ref might just as well be serving a read, so the
+            # fail-closed check belongs here, where the namespace is actually
+            # baked into a key. This covers the keys composed here only:
+            # every caller that hands ``sync_to_durable`` a ``storage_key``
+            # skips this branch and owns the namespace in that key itself.
             #
             # When ``_scope_segments`` came from off-turn per-task recovery,
             # re-resolve it here, fail-closed, right before it is baked into
