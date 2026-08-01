@@ -477,10 +477,15 @@ def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerpr
 
     Per-task caches that bake scope-derived state in at build time (sandbox
     keys, workspace paths, sandbox mount root, memory dimensions,
-    ``allowed_external_dirs``) key their eviction checks on this. The mount
-    root is captured via ``effective_mount_segments`` so a changed mount
-    prefix invalidates the cache instead of silently reusing a stale
-    ``base_dir`` (which a later rebuild would then reject in
+    ``allowed_external_dirs``) key their eviction checks on this. Each
+    namespace field is read through
+    :data:`_EXECUTION_SCOPE_NAMESPACE_FIELD_READERS`, the same table
+    ``_execution_scope_field_diff`` and ``_execution_scope_narrowing_violations``
+    use, rather than a raw attribute access here -- the mount slot in
+    particular reads ``effective_mount_segments`` (not the raw
+    ``sandbox_mount_segments`` attribute) so a changed mount prefix
+    invalidates the cache instead of silently reusing a stale ``base_dir``
+    (which a later rebuild would then reject in
     ``SandboxManager._ensure_config_equivalent``). ``isolate_external_dirs``
     is included for the same reason: it is baked
     into the cached ``AgentService``'s ``Workspace.allowed_external_dirs``
@@ -496,12 +501,13 @@ def scope_fingerprint(scope: Optional[ExecutionScope]) -> Optional[ScopeFingerpr
     """
     if scope is None:
         return None
+    reader = _EXECUTION_SCOPE_NAMESPACE_FIELD_READERS
     return (
-        scope.sandbox_key_suffix,
-        scope.workspace_segments,
-        scope.effective_mount_segments,
-        tuple(sorted(scope.memory_dimensions.items())),
-        scope.isolate_external_dirs,
+        reader["sandbox_key_suffix"](scope),
+        reader["workspace_segments"](scope),
+        reader["sandbox_mount_segments"](scope),
+        tuple(sorted(reader["memory_dimensions"](scope).items())),
+        reader["isolate_external_dirs"](scope),
     )
 
 
@@ -852,6 +858,27 @@ _EXECUTION_SCOPE_NAMESPACE_FIELDS: tuple[str, ...] = (
 # and the resolver's value wins, but does not fail the turn.
 _EXECUTION_SCOPE_POLICY_FIELDS: tuple[str, ...] = ("strict_memory_isolation",)
 
+# How to read each namespace field's *namespace value* off a scope. Every
+# field reads its own attribute raw except ``sandbox_mount_segments``, whose
+# namespace value is the derived ``effective_mount_segments`` property
+# (``None`` means "the full workspace segments", so the raw attribute alone
+# does not say what the mount actually covers). All three consumers that
+# compare or fingerprint namespace fields -- ``_execution_scope_field_diff``,
+# ``_execution_scope_narrowing_violations``, and ``scope_fingerprint`` --
+# read through this table instead of picking their own attribute, so "what
+# value does this field contribute to the namespace" has exactly one answer
+# in this module: a future derived field cannot be read raw by one consumer
+# and derived by another.
+_EXECUTION_SCOPE_NAMESPACE_FIELD_READERS: Mapping[
+    str, Callable[[ExecutionScope], Any]
+] = {
+    "sandbox_key_suffix": lambda scope: scope.sandbox_key_suffix,
+    "workspace_segments": lambda scope: scope.workspace_segments,
+    "sandbox_mount_segments": lambda scope: scope.effective_mount_segments,
+    "memory_dimensions": lambda scope: scope.memory_dimensions,
+    "isolate_external_dirs": lambda scope: scope.isolate_external_dirs,
+}
+
 
 def _execution_scope_field_diff(
     snapshot: ExecutionScope, resolver: ExecutionScope
@@ -859,10 +886,23 @@ def _execution_scope_field_diff(
     """Per-field ``(snapshot_value, resolver_value)`` for differing fields.
 
     Compares every namespace/policy field (excludes ``version``, which is
-    shape bookkeeping, not a scope field).
+    shape bookkeeping, not a scope field). Namespace fields are read through
+    :data:`_EXECUTION_SCOPE_NAMESPACE_FIELD_READERS` rather than a raw
+    ``getattr`` so a field whose namespace value is derived (see that
+    table's docstring) is compared on its namespace value, not its raw
+    attribute -- reading ``sandbox_mount_segments`` raw here would flag a
+    conflict between a resolver-built scope (mount left at its default
+    ``None``) and a snapshot with the mount explicitly set equal to the
+    workspace segments, even though the two select the identical mount.
     """
     diff: dict[str, tuple[Any, Any]] = {}
-    for name in _EXECUTION_SCOPE_NAMESPACE_FIELDS + _EXECUTION_SCOPE_POLICY_FIELDS:
+    for name in _EXECUTION_SCOPE_NAMESPACE_FIELDS:
+        reader = _EXECUTION_SCOPE_NAMESPACE_FIELD_READERS[name]
+        snapshot_value = reader(snapshot)
+        resolver_value = reader(resolver)
+        if snapshot_value != resolver_value:
+            diff[name] = (snapshot_value, resolver_value)
+    for name in _EXECUTION_SCOPE_POLICY_FIELDS:
         snapshot_value = getattr(snapshot, name)
         resolver_value = getattr(resolver, name)
         if snapshot_value != resolver_value:
@@ -911,10 +951,10 @@ def _execution_scope_narrowing_violations(
     - ``workspace_segments``: ``snapshot``'s tuple starts with ``fallback``'s
       -- extra trailing path segments only ever place a scope deeper inside
       ``fallback``'s already-claimed directory tree, never outside it.
-    - ``sandbox_mount_segments``: the same prefix test, compared via
-      ``effective_mount_segments`` so an unset field (mount covers the full
-      ``workspace_segments``) compares like its expanded form rather than
-      bypassing the check.
+    - ``sandbox_mount_segments``: the same prefix test, read via
+      :data:`_EXECUTION_SCOPE_NAMESPACE_FIELD_READERS` (``effective_mount_segments``)
+      so an unset field (mount covers the full ``workspace_segments``)
+      compares like its expanded form rather than bypassing the check.
     - ``isolate_external_dirs``: a boolean has no state narrower than
       ``True``, so once ``fallback`` is already ``True`` only ``True`` is
       accepted -- equality, same as ``sandbox_key_suffix``.
@@ -931,14 +971,15 @@ def _execution_scope_narrowing_violations(
     :func:`resolve_execution_scope`), not by this function.
     """
     violations: dict[str, tuple[Any, Any]] = {}
+    reader = _EXECUTION_SCOPE_NAMESPACE_FIELD_READERS
 
-    fallback_suffix = fallback.sandbox_key_suffix
-    snapshot_suffix = snapshot.sandbox_key_suffix
+    fallback_suffix = reader["sandbox_key_suffix"](fallback)
+    snapshot_suffix = reader["sandbox_key_suffix"](snapshot)
     if snapshot_suffix != fallback_suffix:
         violations["sandbox_key_suffix"] = (snapshot_suffix, fallback_suffix)
 
-    fallback_ws = fallback.workspace_segments
-    snapshot_ws = snapshot.workspace_segments
+    fallback_ws = reader["workspace_segments"](fallback)
+    snapshot_ws = reader["workspace_segments"](snapshot)
     workspace_ok = (
         snapshot_ws[: len(fallback_ws)] == fallback_ws
         if fallback_ws
@@ -947,8 +988,8 @@ def _execution_scope_narrowing_violations(
     if not workspace_ok:
         violations["workspace_segments"] = (snapshot_ws, fallback_ws)
 
-    fallback_mount = fallback.effective_mount_segments
-    snapshot_mount = snapshot.effective_mount_segments
+    fallback_mount = reader["sandbox_mount_segments"](fallback)
+    snapshot_mount = reader["sandbox_mount_segments"](snapshot)
     mount_ok = (
         snapshot_mount[: len(fallback_mount)] == fallback_mount
         if fallback_mount
@@ -957,14 +998,13 @@ def _execution_scope_narrowing_violations(
     if not mount_ok:
         violations["sandbox_mount_segments"] = (snapshot_mount, fallback_mount)
 
-    if snapshot.isolate_external_dirs != fallback.isolate_external_dirs:
-        violations["isolate_external_dirs"] = (
-            snapshot.isolate_external_dirs,
-            fallback.isolate_external_dirs,
-        )
+    fallback_isolate = reader["isolate_external_dirs"](fallback)
+    snapshot_isolate = reader["isolate_external_dirs"](snapshot)
+    if snapshot_isolate != fallback_isolate:
+        violations["isolate_external_dirs"] = (snapshot_isolate, fallback_isolate)
 
-    fallback_dims = fallback.memory_dimensions
-    snapshot_dims = snapshot.memory_dimensions
+    fallback_dims = reader["memory_dimensions"](fallback)
+    snapshot_dims = reader["memory_dimensions"](snapshot)
     dims_ok = (
         all(snapshot_dims.get(key) == value for key, value in fallback_dims.items())
         if fallback_dims

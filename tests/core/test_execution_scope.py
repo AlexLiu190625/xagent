@@ -911,6 +911,38 @@ class TestSnapshotCandidateAuthority:
         )
         assert resolve_execution_scope("1") == self.RESOLVER_SCOPE
 
+    def test_mount_authority_compares_effective_value_not_raw_field(self):
+        """A resolver-built scope that leaves the mount at its default
+        (``None``, meaning the full ``workspace_segments``) and a snapshot
+        that explicitly repeats those same segments as its mount select the
+        identical mount -- only the raw ``sandbox_mount_segments`` attribute
+        differs (``None`` vs. an explicit tuple), not the namespace value.
+        Comparing the raw attribute here would be a false-positive authority
+        conflict: a client-supplied snapshot that happens to spell out the
+        workspace segments as its mount must not fail an otherwise-identical
+        turn. A snapshot whose mount genuinely covers different segments
+        must still raise."""
+        resolver_scope = ExecutionScope(workspace_segments=("a",))
+        same_effective_mount_snapshot = ExecutionScope(
+            workspace_segments=("a",), sandbox_mount_segments=("a",)
+        )
+        self._register(
+            lambda task_id: resolver_scope,
+            lambda task_id: same_effective_mount_snapshot,
+        )
+        assert resolve_execution_scope("1") == resolver_scope
+
+        different_effective_mount_snapshot = ExecutionScope(
+            workspace_segments=("a", "b"), sandbox_mount_segments=("a",)
+        )
+        self._register(
+            lambda task_id: ExecutionScope(workspace_segments=("a", "b")),
+            lambda task_id: different_effective_mount_snapshot,
+        )
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
+            resolve_execution_scope("1")
+        assert "sandbox_mount_segments" in exc_info.value.mismatched_fields
+
     @pytest.mark.parametrize(
         "field_name,snapshot_kwargs",
         [
@@ -1574,17 +1606,6 @@ class TestExecutionScopeFieldClassificationCompleteness:
     being misclassified into either one.
     """
 
-    def test_every_field_is_classified_as_namespace_policy_or_version(self):
-        from xagent.core import execution_scope as scope_module
-
-        field_names = {f.name for f in dataclasses.fields(ExecutionScope)}
-        classified = (
-            set(scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS)
-            | set(scope_module._EXECUTION_SCOPE_POLICY_FIELDS)
-            | {"version"}
-        )
-        assert classified == field_names
-
     def test_namespace_field_classification_is_complete_and_disjoint_from_policy(
         self,
     ):
@@ -1611,14 +1632,23 @@ class TestExecutionScopeFieldClassificationCompleteness:
 # so TestScopeFingerprintFieldCoverage can assert this dict's keys track
 # _EXECUTION_SCOPE_NAMESPACE_FIELDS exactly -- a namespace field added
 # without a probe here fails loudly instead of being silently skipped.
+# The ``sandbox_mount_segments`` probe holds ``workspace_segments`` fixed
+# across both sides and varies only the mount, so the fingerprint difference
+# it exercises comes from the mount slot alone. It does not, by itself, prove
+# ``scope_fingerprint`` reads the *derived* mount value rather than the raw
+# field -- see ``test_mount_fingerprint_reads_the_effective_value_not_the_raw_field``
+# below for the probe that actually pins that.
 _NAMESPACE_FIELD_FINGERPRINT_PROBES: dict[str, tuple[dict, dict]] = {
     "sandbox_key_suffix": ({}, {"sandbox_key_suffix": "probe-suffix"}),
     "workspace_segments": ({}, {"workspace_segments": ("probe",)}),
     "sandbox_mount_segments": (
-        {"workspace_segments": ("probe", "deep")},
         {
             "workspace_segments": ("probe", "deep"),
             "sandbox_mount_segments": ("probe",),
+        },
+        {
+            "workspace_segments": ("probe", "deep"),
+            "sandbox_mount_segments": None,
         },
     ),
     "memory_dimensions": ({}, {"memory_dimensions": {"k": "v"}}),
@@ -1667,3 +1697,32 @@ class TestScopeFingerprintFieldCoverage:
         base = ExecutionScope(**base_kwargs)
         changed = ExecutionScope(**changed_kwargs)
         assert scope_fingerprint(base) == scope_fingerprint(changed)
+
+    def test_mount_fingerprint_reads_the_effective_value_not_the_raw_field(self):
+        """The ``!=`` probe above cannot tell a correct (derived) mount read
+        apart from a regression to the raw ``sandbox_mount_segments``
+        attribute: whenever the two probe scopes' raw mount values differ --
+        as they must, to make the mount the only varying input -- a
+        raw-reading ``scope_fingerprint`` also reports a difference, so that
+        assertion passes under either implementation. This test uses the
+        one pair that actually depends on which value is read: a scope left
+        at the mount's default (``None``, meaning the full
+        ``workspace_segments``) and a scope whose mount explicitly repeats
+        those same segments have equal *effective* mounts but different
+        *raw* ones, so their fingerprints must match only if
+        ``scope_fingerprint`` reads ``effective_mount_segments``."""
+        default_mount = ExecutionScope(workspace_segments=("a",))
+        explicit_full_mount = ExecutionScope(
+            workspace_segments=("a",), sandbox_mount_segments=("a",)
+        )
+        assert (
+            default_mount.sandbox_mount_segments
+            != explicit_full_mount.sandbox_mount_segments
+        )
+        assert (
+            default_mount.effective_mount_segments
+            == explicit_full_mount.effective_mount_segments
+        )
+        assert scope_fingerprint(default_mount) == scope_fingerprint(
+            explicit_full_mount
+        )
