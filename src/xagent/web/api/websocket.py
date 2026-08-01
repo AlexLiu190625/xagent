@@ -7218,16 +7218,27 @@ async def _handle_pause_task_unserialized(
         expected_run_id = task_fields.run_id
         # Off-turn: on an agent-cache hit this only locates the already-
         # running agent's existing workspace/sandbox to pause it. On a miss,
-        # get_agent_for_task below builds a fresh agent, which does select a
-        # namespace for new bytes (workspace directory tree, sandbox mount)
-        # from this value -- but that value is always the resolver's own
-        # authoritative answer (never the client-influenceable snapshot), so
-        # a mismatch downgrading here still cannot hand namespace authority
-        # to an untrusted candidate. Pause schedules no turn, so nothing
-        # downstream re-resolves or corrects a build that happens here. A
-        # control operation on an already-running task must stay available
-        # even under a resolver/snapshot dispute, so a mismatch downgrades
-        # to the resolver's answer instead of blocking the pause.
+        # get_agent_for_task below builds a fresh agent from this value,
+        # which can materialize a workspace directory tree and acquire a
+        # sandbox lease. resolve_execution_scope_off_turn resolves this value
+        # through three distinct outcomes:
+        # - resolver authoritative, snapshot disagrees on a namespace field:
+        #   downgrades to the resolver's own answer (with a warning) instead
+        #   of raising, so the pause still proceeds -- the value here is the
+        #   trusted resolver answer, not the snapshot.
+        # - resolver abstains, snapshot widens the abstention's fallback:
+        #   ExecutionScopeAbstentionMismatchError is re-raised rather than
+        #   downgraded, so the pause is refused outright -- an abstention
+        #   never produced an authoritative value to fall back to.
+        # - resolver abstains, snapshot narrows the abstention's fallback:
+        #   the returned value IS the snapshot (policy fields overlaid from
+        #   the fallback). That is persisted, client-influenceable data, and
+        #   it is trusted here only because it was already validated as a
+        #   narrowing of what the resolver granted, so anything the build
+        #   below materializes from it still lands inside the authorised
+        #   subtree.
+        # Pause schedules no turn, so nothing downstream re-resolves or
+        # corrects a build that happens here.
         execution_scope = await run_db_io_cancellation_safe(
             lambda: resolve_execution_scope_off_turn(task_id)
         )
@@ -7416,20 +7427,32 @@ async def _handle_resume_task_unserialized(
         # Off-turn: on an agent-cache hit this only locates the paused task's
         # existing workspace/sandbox for ``get_agent_for_task`` below. On a
         # miss (or a cached-scope-fingerprint mismatch), that call builds a
-        # fresh agent from this value, which does select a namespace for new
-        # bytes (workspace directory tree, sandbox mount) -- but always the
-        # resolver's own authoritative answer, never the client-influenceable
-        # snapshot, so downgrading here cannot hand namespace authority to an
-        # untrusted candidate. A control operation on an already-running (or
-        # resumable) task must stay available even under a resolver/snapshot
-        # dispute, so a mismatch downgrades to the resolver's answer instead
-        # of blocking the resume. The turn this handler schedules is a
-        # different consumer: it is passed ``EXECUTION_SCOPE_NOT_PROVIDED``
-        # instead of this value below so ``execute_resume_background``
-        # performs its own fail-closed resolution before producing the
-        # resumed turn's own output, rather than inheriting this downgrade --
-        # that protects where the turn's own new bytes land, not the
-        # workspace/sandbox root a build above may already have fixed.
+        # fresh agent from this value, which can materialize a workspace
+        # directory tree and acquire a sandbox lease.
+        # resolve_execution_scope_off_turn resolves this value through three
+        # distinct outcomes:
+        # - resolver authoritative, snapshot disagrees on a namespace field:
+        #   downgrades to the resolver's own answer (with a warning) instead
+        #   of raising, so the resume still proceeds -- the value here is the
+        #   trusted resolver answer, not the snapshot.
+        # - resolver abstains, snapshot widens the abstention's fallback:
+        #   ExecutionScopeAbstentionMismatchError is re-raised rather than
+        #   downgraded, so the resume is refused outright -- an abstention
+        #   never produced an authoritative value to fall back to.
+        # - resolver abstains, snapshot narrows the abstention's fallback:
+        #   the returned value IS the snapshot (policy fields overlaid from
+        #   the fallback). That is persisted, client-influenceable data, and
+        #   it is trusted here only because it was already validated as a
+        #   narrowing of what the resolver granted, so anything the build
+        #   below materializes from it still lands inside the authorised
+        #   subtree.
+        # The turn this handler schedules is a different consumer: it is
+        # passed ``EXECUTION_SCOPE_NOT_PROVIDED`` instead of this value below
+        # so ``execute_resume_background`` performs its own fail-closed
+        # resolution before producing the resumed turn's own output, rather
+        # than inheriting this off-turn result -- that protects where the
+        # turn's own new bytes land, not the workspace/sandbox root a build
+        # above may already have fixed.
         resolved_execution_scope = await run_db_io_cancellation_safe(
             lambda: resolve_execution_scope_off_turn(task_id)
         )
