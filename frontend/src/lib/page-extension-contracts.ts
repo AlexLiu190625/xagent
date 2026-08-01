@@ -3,7 +3,8 @@ import type { ComponentType, ReactNode } from "react"
 // Embedding distributions may replace default implementation modules during frontend composition.
 export type HomePageExtensionComponent = ComponentType
 
-// A Build replacement must supply the Provider and card extension together from one implementation module.
+// The page guarantees a stable Provider lifetime and agentId join key.
+// The paired replacement implementation owns data loading, sharing, and invalidation.
 export interface BuildAgentCardExtensionProps {
   // Stable key for joining Provider-owned page data to an Agent card.
   agentId: number

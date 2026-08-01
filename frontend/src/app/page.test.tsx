@@ -129,13 +129,9 @@ describe("Home", () => {
       const slot = container.querySelector('[data-slot="home-page-extension"]')
 
       expect(slot).toBeInTheDocument()
-      expect(slot).toHaveClass("shrink-0")
+      expect(slot).toHaveClass("shrink-0", { exact: true })
+      expect(slot).not.toHaveAttribute("style")
       expect(slot).toBeEmptyDOMElement()
-      expect(
-        Array.from(slot?.classList ?? []).some((className) =>
-          /(?:^|:)(?:p[trblxy]?|m[trblxy]?|min-h)-/.test(className),
-        ),
-      ).toBe(false)
     } finally {
       vi.doMock("@/lib/home-page-extension", createHomeExtensionMock)
       vi.resetModules()

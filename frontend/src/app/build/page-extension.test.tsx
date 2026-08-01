@@ -332,10 +332,8 @@ describe("BuildsPage extension boundaries", () => {
     })
     await screen.findByText("builds.emptyState.title")
     expect(providerLifetime).toEqual({ mounts: 1, unmounts: 0 })
-    expect(providerLoaderMock).toHaveBeenCalledTimes(1)
 
     view.unmount()
     expect(providerLifetime).toEqual({ mounts: 1, unmounts: 1 })
   })
-
 })
