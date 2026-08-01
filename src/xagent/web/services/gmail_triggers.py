@@ -416,13 +416,31 @@ def _message_payload(
     }
 
 
+# Gmail's own non-incoming categories: a message the user sent, drafted, or
+# that landed in spam/trash. `history.list` is called with no `labelId`
+# filter, so these show up alongside real incoming mail and must be excluded
+# explicitly — the UI's "watch all incoming emails" promise otherwise means
+# "watch literally everything, sent mail included."
+_NON_INCOMING_LABELS = {"sent", "draft", "spam", "trash"}
+
+
 def _trigger_matches_message(trigger: AgentTrigger, payload: dict[str, Any]) -> bool:
     config = dict(trigger.config or {})
     label_ids = {str(label_id).lower() for label_id in payload.get("label_ids", [])}
-    watch_label = str(config.get("watch_label") or "INBOX").strip().lower()
-    if watch_label and watch_label not in {"*", "all"}:
-        if watch_label not in label_ids:
-            return False
+    # Strip BEFORE falling back to the default: a whitespace-only stored
+    # value (e.g. " ") is truthy pre-strip, so `... or "inbox"` alone would
+    # skip the default and strip down to "", which matches neither the
+    # wildcard branch below nor a real label — silently disabling all
+    # filtering instead of falling back to INBOX.
+    watch_label = str(config.get("watch_label") or "").strip().lower() or "inbox"
+    # Gmail's own non-incoming categories are excluded regardless of which
+    # branch below matches — a custom label manually applied to an
+    # already-sent/draft/spam/trash message must not fire either, not just
+    # the wildcard "watch everything incoming" case.
+    if label_ids & _NON_INCOMING_LABELS:
+        return False
+    if watch_label not in {"*", "all"} and watch_label not in label_ids:
+        return False
 
     sender_filter = str(config.get("sender_filter") or "").strip().lower()
     if sender_filter and sender_filter not in str(payload.get("from") or "").lower():
