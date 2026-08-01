@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Literal, Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from ...config import get_agent_pattern_for_execution_mode, get_uploads_dir
@@ -37,6 +38,8 @@ from ..services.agent_management import (
     AgentWorkforceConflictError,
     DuplicateAgentNameError,
     TemplateNotFoundError,
+    TemplateQuickAccessRaceError,
+    is_agent_name_unique_violation,
 )
 from ..services.agent_store import (
     AgentStore,
@@ -123,6 +126,7 @@ class AgentResponse(BaseModel):
     name: str
     description: Optional[str]
     instructions: Optional[str]
+    template_id: Optional[str] = None
     execution_mode: str
     models: Optional[dict]
     knowledge_bases: List[str]
@@ -153,6 +157,7 @@ class AgentListItem(BaseModel):
     team_id: Optional[int] = None
     name: str
     description: Optional[str]
+    template_id: Optional[str] = None
     logo_url: Optional[str]
     status: str
     visibility: str = "team"
@@ -508,6 +513,84 @@ class AgentFromTemplateRequest(BaseModel):
     name: Optional[str] = None
 
 
+class ResolvedTemplateAgentResponse(BaseModel):
+    """Result of the get-or-create resolve flow for a template's agent."""
+
+    agent: AgentResponse
+    # True when this call minted (and published) a fresh agent; False when an
+    # existing agent for this template was reused.
+    created: bool
+
+
+@router.post("/from-template/resolve", response_model=ResolvedTemplateAgentResponse)
+async def resolve_agent_from_template(
+    data: AgentFromTemplateRequest,
+    fastapi_request: Request,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> ResolvedTemplateAgentResponse:
+    """Get-or-create the caller's quick-access agent for a template,
+    atomically.
+
+    Reuses the caller's own existing quick-access agent for this template
+    as-is (never silently republishing a draft - see the note on
+    ``_resolve_agent_from_template_sync``), or creates and publishes a new
+    one, disambiguating the name server-side on collision. Idempotent per
+    (user, template) for this flow specifically: unlike the plain
+    POST /from-template (used by the workforce-builder UI to mint several
+    named instances of one template), repeat calls here return the same
+    agent, backed by a DB-level unique index scoped to this flow's own
+    origin marker.
+
+    ``name`` only seeds a freshly created agent; on reuse it is ignored and
+    the existing agent's own name is returned as-is (see
+    ``AgentManagementService.resolve_agent_from_template``).
+    """
+    user_id = int(current_user.id)
+    is_admin = bool(current_user.is_admin)
+    if not release_db_connection_if_clean(db):
+        raise HTTPException(
+            status_code=500,
+            detail="Agent creation requires a clean request database transaction",
+        )
+
+    template_manager = getattr(fastapi_request.app.state, "template_manager", None)
+    try:
+        snapshot, created = await AgentManagementRuntime(
+            template_manager=template_manager
+        ).resolve_agent_from_template(
+            user_id=user_id,
+            is_admin=is_admin,
+            template_id=data.template_id,
+            name=data.name,
+        )
+        return ResolvedTemplateAgentResponse(
+            agent=AgentResponse.model_validate(snapshot.to_response_dict()),
+            created=created,
+        )
+    except TemplateNotFoundError:
+        raise HTTPException(status_code=404, detail="Template not found")
+    except DuplicateAgentNameError:
+        raise HTTPException(
+            status_code=400, detail="Agent with this name already exists"
+        )
+    except TemplateQuickAccessRaceError:
+        # Distinct from the name-collision case above: every one of
+        # TEMPLATE_RESOLVE_RACE_RETRIES concurrent attempts lost the
+        # (user_id, template_id) quick-access race to another request, with
+        # no name collision involved at all - "already exists" would be
+        # misleading here since the client never even chose a name.
+        raise HTTPException(
+            status_code=409,
+            detail="Too many concurrent requests for this template; please retry",
+        )
+    except Exception as e:
+        logger.exception(f"Failed to resolve agent from template {data.template_id}")
+        raise HTTPException(
+            status_code=500, detail="Failed to resolve agent from template"
+        ) from e
+
+
 @router.post("/from-template", response_model=AgentResponse)
 async def create_agent_from_template(
     data: AgentFromTemplateRequest,
@@ -576,19 +659,31 @@ async def create_agent(
         )
         await _validate_knowledge_bases_exist(agent_data.knowledge_bases, current_user)
 
-        agent = store.create_agent(
-            user_id=user_id,
-            name=agent_data.name,
-            description=agent_data.description,
-            instructions=agent_data.instructions,
-            execution_mode=agent_data.execution_mode or "graph",
-            models=agent_data.models,
-            knowledge_bases=agent_data.knowledge_bases,
-            skills=agent_data.skills,
-            tool_categories=agent_data.tool_categories,
-            suggested_prompts=agent_data.suggested_prompts,
-            visibility=agent_data.visibility,
-        )
+        # agent_name_exists above is a fast-path pre-check, not the source of
+        # truth: uq_agents_user_id_name_active is what actually prevents a
+        # concurrent-request race, so the insert itself can still raise
+        # IntegrityError here.
+        try:
+            agent = store.create_agent(
+                user_id=user_id,
+                name=agent_data.name,
+                description=agent_data.description,
+                instructions=agent_data.instructions,
+                execution_mode=agent_data.execution_mode or "graph",
+                models=agent_data.models,
+                knowledge_bases=agent_data.knowledge_bases,
+                skills=agent_data.skills,
+                tool_categories=agent_data.tool_categories,
+                suggested_prompts=agent_data.suggested_prompts,
+                visibility=agent_data.visibility,
+            )
+        except IntegrityError as exc:
+            db.rollback()
+            if not is_agent_name_unique_violation(exc):
+                raise
+            raise HTTPException(
+                status_code=400, detail="Agent with this name already exists"
+            ) from exc
 
         # Save logo if provided
         if agent_data.logo_base64:
@@ -763,16 +858,29 @@ async def update_agent(
             updates["logo_url"] = logo_url
 
         if updates:
-            agent = (
-                store.update_agent_fields(
-                    user_id,
-                    agent_id,
-                    updates,
-                    team_scope=team_scope,
-                    agent=agent,
+            # agent_name_exists above is a fast-path pre-check, not the source
+            # of truth: uq_agents_user_id_name_active is what actually
+            # prevents a concurrent-rename race, so the write itself can
+            # still raise IntegrityError here (see the matching handling in
+            # create_agent above).
+            try:
+                agent = (
+                    store.update_agent_fields(
+                        user_id,
+                        agent_id,
+                        updates,
+                        team_scope=team_scope,
+                        agent=agent,
+                    )
+                    or agent
                 )
-                or agent
-            )
+            except IntegrityError as exc:
+                db.rollback()
+                if not is_agent_name_unique_violation(exc):
+                    raise
+                raise HTTPException(
+                    status_code=400, detail="Agent with this name already exists"
+                ) from exc
 
         logger.info(f"Updated agent {agent_id} for user {current_user.id}")
         return AgentResponse.model_validate(store.agent_to_response_dict(agent))

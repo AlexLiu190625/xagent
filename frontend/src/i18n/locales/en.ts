@@ -217,29 +217,22 @@ const en = {
       startingPrompts: "STARTING PROMPTS",
       chatWithAgents: "CHAT WITH AGENTS",
     },
-    cards: {
-      research: {
-        title: "Research a topic in depth",
-      },
-      linkedin: {
-        title: "Write a LinkedIn post about an achievement",
-      },
-      poster: {
-        title: "Design a poster for an event",
-      },
-      compare: {
-        title: "Compare products with deep research",
-      },
-      visual: {
-        title: "Create visual for a topic",
-      },
-      presentation: {
-        title: "Turn a topic into a presentation deck",
-      }
+    templateQuickAccess: {
+      featuredLabel: "Featured",
+      categoryHeading: "{category} AI Agents",
+      allTemplates: "All templates →",
+      usingTemplateLabel: "Agent template:",
+      agentCreatedToast: "Agent \"{name}\" created from template",
+      viewInAgents: "View in Agents",
+      createAgentError: "Couldn't create the agent from this template. Please try again.",
+      loading: "Loading templates...",
+      loadError: "Couldn't load templates.",
+      retry: "Retry",
     },
     input: {
       placeholder: "Describe your task...",
       processing: "Processing",
+      usingAgentLabel: "Using",
       actions: {
         config: "Configure Model",
         upload: "Upload",
@@ -1564,6 +1557,7 @@ Build when you need.`,
     categoryTitles: {
       featured: "Featured Templates",
       all: "All",
+      general: "General",
       sales: "Sales",
       marketing: "Marketing",
       support: "Support",

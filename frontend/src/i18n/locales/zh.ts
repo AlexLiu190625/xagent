@@ -217,29 +217,22 @@ const zh = {
       startingPrompts: "快捷指令",
       chatWithAgents: "与智能体聊天",
     },
-    cards: {
-      research: {
-        title: "深入研究一个话题",
-      },
-      linkedin: {
-        title: "撰写 LinkedIn 动态",
-      },
-      poster: {
-        title: "设计活动海报",
-      },
-      compare: {
-        title: "深度对比产品",
-      },
-      visual: {
-        title: "为话题创建可视化图表",
-      },
-      presentation: {
-        title: "将话题转化为演示文稿",
-      }
+    templateQuickAccess: {
+      featuredLabel: "推荐",
+      categoryHeading: "{category} 智能体",
+      allTemplates: "全部模板 →",
+      usingTemplateLabel: "智能体模板：",
+      agentCreatedToast: "已根据模板创建智能体 \"{name}\"",
+      viewInAgents: "在智能体中查看",
+      createAgentError: "无法根据该模板创建智能体，请重试。",
+      loading: "正在加载模板...",
+      loadError: "模板加载失败。",
+      retry: "重试",
     },
     input: {
       placeholder: "描述您的任务...",
       processing: "处理中",
+      usingAgentLabel: "使用",
       actions: {
         config: "配置模型",
         upload: "上传文件",
@@ -1564,6 +1557,7 @@ const zh = {
     categoryTitles: {
       all: "全部",
       featured: "推荐模板",
+      general: "通用",
       sales: "销售",
       marketing: "营销",
       support: "支持",

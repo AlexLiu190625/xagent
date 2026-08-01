@@ -2,9 +2,9 @@
 
 import { useI18n } from "@/contexts/i18n-context";
 import { Loader2 } from "lucide-react";
-import { useState, useEffect, useMemo } from "react";
+import { Suspense, useState, useEffect, useMemo } from "react";
 import { getApiUrl } from "@/lib/utils";
-import { useRouter } from "next/navigation";
+import { useRouter, useSearchParams } from "next/navigation";
 import { apiRequest } from "@/lib/api-wrapper";
 import { SearchInput } from "@/components/ui/search-input";
 import { PageHeader } from "@/components/ui/page-header";
@@ -12,6 +12,7 @@ import { SegmentedTabs } from "@/components/ui/segmented-tabs";
 import type { Template } from "@/types/template";
 import { LibraryTemplateCard } from "@/components/templates/library-template-card";
 import type { TranslationKey } from "@/i18n/translations";
+import { normalizeCategoryKey, orderCategoriesWithPreferred } from "@/lib/template-categories";
 
 interface CategorySection {
   id: string;
@@ -20,6 +21,7 @@ interface CategorySection {
 }
 
 const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
+  general: "templates.categoryTitles.general",
   sales: "templates.categoryTitles.sales",
   marketing: "templates.categoryTitles.marketing",
   support: "templates.categoryTitles.support",
@@ -33,18 +35,29 @@ const CATEGORY_LABEL_KEYS: Record<string, TranslationKey> = {
   operations: "templates.categoryTitles.operations",
 };
 
-const normalizeCategoryKey = (category: string) =>
-  category.toLowerCase().replace(/\s*&\s*/g, "_").replace(/\s+/g, "_");
-
 const formatFallbackLabel = (category: string) =>
   category
     .replace(/_/g, " ")
     .replace(/\b\w/g, (char) => char.toUpperCase());
 
 export default function TemplatesPage() {
+  return (
+    <Suspense fallback={null}>
+      <TemplatesPageContent />
+    </Suspense>
+  );
+}
+
+function TemplatesPageContent() {
   const { t, locale } = useI18n();
   const router = useRouter();
-  const [selectedCategory, setSelectedCategory] = useState("All");
+  const searchParams = useSearchParams();
+  // Honors the category the "All templates" escape hatch on the /task
+  // quick-access panel links back to (?category=<id>), so following it
+  // lands on the same category instead of always resetting to "All".
+  const [selectedCategory, setSelectedCategory] = useState(
+    () => searchParams.get("category") || "All"
+  );
   const [searchQuery, setSearchQuery] = useState("");
   const [templates, setTemplates] = useState<Template[]>([]);
   const [loading, setLoading] = useState(true);
@@ -76,10 +89,7 @@ export default function TemplatesPage() {
   const categories = useMemo(() => {
     const preferred = ["Sales", "Marketing", "Support", "Research", "Productivity"];
     const dynamic = Array.from(new Set(templates.map((template) => template.category).filter(Boolean)));
-    const orderedDynamic = [
-      ...preferred.filter((category) => dynamic.includes(category)),
-      ...dynamic.filter((category) => !preferred.includes(category)),
-    ];
+    const orderedDynamic = orderCategoriesWithPreferred(dynamic, preferred);
 
     return [
       { id: "All", label: t("templates.categoryTitles.all") },

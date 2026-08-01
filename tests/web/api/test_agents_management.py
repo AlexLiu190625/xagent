@@ -32,6 +32,7 @@ from xagent.web.services.agent_management import (
     AgentManagementService,
     AgentWorkforceConflictError,
     AgentWorkforceReference,
+    TemplateQuickAccessRaceError,
 )
 from xagent.web.services.task_runtime import (
     TASK_RUNTIME_BINDINGS_AGENT_CONFIG_KEY,
@@ -163,6 +164,589 @@ def test_create_from_template_fails_closed_when_request_session_is_not_clean(
         "Agent creation requires a clean request database transaction"
     )
     assert template_calls == []
+
+
+def test_create_from_template_persists_template_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The created (and later listed) agent must carry its source template id."""
+
+    headers = _admin_headers()
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            return {
+                "id": template_id,
+                "name": "Template-Linked Agent",
+                "descriptions": {"en": "Created from a template"},
+                "agent_config": {
+                    "instructions": "Follow the template.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state, "template_manager", TemplateManagerStub(), raising=False
+    )
+
+    response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "linked-template-id"},
+    )
+    assert response.status_code == 200, response.text
+    agent_id = response.json()["id"]
+    assert response.json()["template_id"] == "linked-template-id"
+
+    list_response = client.get("/api/agents", headers=headers)
+    assert list_response.status_code == 200, list_response.text
+    listed = next(a for a in list_response.json() if a["id"] == agent_id)
+    assert listed["template_id"] == "linked-template-id"
+
+    detail_response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert detail_response.status_code == 200, detail_response.text
+    assert detail_response.json()["template_id"] == "linked-template-id"
+
+
+def test_create_from_template_duplicate_name_returns_400_with_stable_detail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pins the exact 400 detail string POST /api/agents/from-template
+    returns on a name collision - a different endpoint's exception handling
+    from the plain POST /api/agents duplicate-name test above. See PR review
+    finding F2: without this test, a refactor could change this endpoint's
+    exception mapping while every other test (DB-pool release, the
+    clean-transaction 500 guard, template_id persistence) stayed green.
+
+    Note: template-agent-resolution.ts (the frontend's create-or-reuse
+    flow) does not itself branch on this string - it only checks
+    response.ok and surfaces the HTTP status. This test's value is the
+    stable API contract, not a cross-stack string dependency.
+    """
+
+    headers = _admin_headers()
+
+    class TemplateManagerStub:
+        async def get_template(self, template_id: str) -> dict[str, Any]:
+            return {
+                "id": template_id,
+                "name": "Duplicate Name Agent",
+                "descriptions": {"en": "Created from a template"},
+                "agent_config": {
+                    "instructions": "Follow the template.",
+                    "execution_mode": "balanced",
+                },
+            }
+
+    monkeypatch.setattr(
+        client.app.state, "template_manager", TemplateManagerStub(), raising=False
+    )
+
+    first_response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "dup-name-template"},
+    )
+    assert first_response.status_code == 200, first_response.text
+
+    second_response = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "dup-name-template-2"},
+    )
+    assert second_response.status_code == 400
+    assert second_response.json()["detail"] == "Agent with this name already exists"
+
+
+class _ResolveTemplateManagerStub:
+    """Minimal template manager for the resolve-flow tests."""
+
+    def __init__(self, name: str = "Resolve Flow Agent") -> None:
+        self.name = name
+
+    async def get_template(self, template_id: str) -> dict[str, Any]:
+        return {
+            "id": template_id,
+            "name": self.name,
+            "descriptions": {"en": "Created by the resolve flow"},
+            "agent_config": {
+                "instructions": "Follow the template.",
+                "execution_mode": "balanced",
+            },
+        }
+
+
+def _install_resolve_template_stub(
+    monkeypatch: pytest.MonkeyPatch, name: str = "Resolve Flow Agent"
+) -> None:
+    monkeypatch.setattr(
+        client.app.state,
+        "template_manager",
+        _ResolveTemplateManagerStub(name),
+        raising=False,
+    )
+
+
+def test_resolve_from_template_creates_and_publishes_on_first_use(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    response = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["created"] is True
+    assert body["agent"]["template_id"] == "resolve-template"
+    assert body["agent"]["status"] == "published"
+    assert body["agent"]["name"] == "Resolve Flow Agent"
+
+
+def test_resolve_from_template_reuses_the_same_agent_on_repeat_calls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole point of the resolve endpoint (PR review D1): repeat sends
+    must converge on one agent per (user, template), enforced server-side
+    rather than by client-side reconciliation."""
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert second.json()["agent"]["id"] == first.json()["agent"]["id"]
+
+    listed = client.get("/api/agents", headers=headers).json()
+    matching = [a for a in listed if a.get("template_id") == "resolve-template"]
+    assert len(matching) == 1
+
+
+def test_resolve_from_template_does_not_adopt_a_workforce_builder_draft(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B4: the plain POST
+    /from-template (workforce-builder UI, one-off named creates) writes
+    template_id but not the quick-access origin marker. The resolve flow's
+    reuse query must not adopt (and publish) that unrelated draft - it has
+    to mint its own separate quick-access agent instead."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    created = client.post(
+        "/api/agents/from-template",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert created.status_code == 200, created.text
+    assert created.json()["status"] == "draft"
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is True
+    assert resolved.json()["agent"]["id"] != created.json()["id"]
+    assert resolved.json()["agent"]["status"] == "published"
+
+    # The workforce-builder draft is untouched - still its own draft.
+    workforce_draft = client.get(f"/api/agents/{created.json()['id']}", headers=headers)
+    assert workforce_draft.status_code == 200, workforce_draft.text
+    assert workforce_draft.json()["status"] == "draft"
+
+
+def test_resolve_from_template_does_not_republish_a_deliberate_unpublish(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B3: status/published_at alone
+    can't distinguish "never published yet" from "the user explicitly
+    unpublished it" - both are status=draft, published_at=None. Resolve must
+    not silently flip a deliberate unpublish back to published on a later,
+    unrelated call."""
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    first = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["agent"]["status"] == "published"
+    agent_id = first.json()["agent"]["id"]
+
+    unpublished = client.post(f"/api/agents/{agent_id}/unpublish", headers=headers)
+    assert unpublished.status_code == 200, unpublished.text
+    assert unpublished.json()["agent"]["status"] == "draft"
+
+    second = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert second.status_code == 200, second.text
+    assert second.json()["created"] is False
+    assert second.json()["agent"]["id"] == agent_id
+    assert second.json()["agent"]["status"] == "draft"
+
+
+def test_resolve_from_template_never_touches_another_users_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding F1: resolving a template must
+    only ever consider the caller's own agents - another user's draft from
+    the same template stays untouched (not reused, not published)."""
+
+    _install_resolve_template_stub(monkeypatch)
+
+    # Bootstrap the admin (first user) before the public register endpoint
+    # will accept a second account.
+    headers = _admin_headers()
+
+    other_headers = _register_second_user(username="resolveother")
+    other_draft = client.post(
+        "/api/agents/from-template",
+        headers=other_headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert other_draft.status_code == 200, other_draft.text
+    other_agent_id = other_draft.json()["id"]
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is True
+    assert resolved.json()["agent"]["id"] != other_agent_id
+    assert resolved.json()["agent"]["status"] == "published"
+
+    other_view = client.get(f"/api/agents/{other_agent_id}", headers=other_headers)
+    assert other_view.status_code == 200, other_view.text
+    assert other_view.json()["status"] == "draft"
+
+
+def test_resolve_from_template_disambiguates_a_colliding_default_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unrelated agent already holding the template's default name must
+    not fail the resolve - the server picks a free name itself instead of
+    surfacing the duplicate-name 400 the plain create path returns."""
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+    _create_agent(headers, name="Resolve Flow Agent")
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    body = resolved.json()
+    assert body["created"] is True
+    assert body["agent"]["name"] != "Resolve Flow Agent"
+    assert body["agent"]["name"].startswith("Resolve Flow Agent")
+    assert body["agent"]["status"] == "published"
+
+
+def test_resolve_from_template_converges_when_a_racing_insert_wins_the_same_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding F3: if a concurrent request
+    creates this template's agent between our select and our insert, the
+    retry loop must re-select and reuse that row instead of erroring or
+    minting a duplicate. Here the racing insert collides on name too, which
+    is caught by the (user_id, name) unique index alone - see the sibling
+    test below for the interleaving where names do *not* collide (B1/B2)."""
+
+    from xagent.web.services import agent_management as management_module
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    real_resolve_name = management_module.resolve_unique_agent_name
+    racing_agent_id: dict[str, int] = {}
+
+    def race_then_delegate(db: Any, *, user_id: int, name: str) -> str:
+        # Simulate a concurrent request winning the race: insert this
+        # template's agent (as the same user) after resolve's select missed
+        # but before its own insert, then hand back the template's default
+        # name so the insert collides on the unique index.
+        if not racing_agent_id:
+            store = AgentStore(db)
+            racing = store.create_agent(
+                user_id=user_id,
+                name=name,
+                description="raced in first",
+                instructions="Follow the template.",
+                execution_mode="balanced",
+                template_id="resolve-template",
+                origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+            )
+            db.commit()
+            racing_agent_id["id"] = int(racing.id)
+            return name
+        return real_resolve_name(db, user_id=user_id, name=name)
+
+    monkeypatch.setattr(
+        management_module, "resolve_unique_agent_name", race_then_delegate
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is False
+    assert resolved.json()["agent"]["id"] == racing_agent_id["id"]
+
+
+def test_resolve_from_template_converges_when_a_racing_insert_wins_a_different_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding B2: the realistic interleaving
+    is a racing insert that takes its *own* disambiguated name - no
+    (user_id, name) collision at all - which the plain name-collision retry
+    from the sibling test above can't catch (it never fires, so the old
+    code's retry loop never re-selected, and two rows ended up sharing one
+    template_id with different names, both reporting created=True).
+    Convergence here depends entirely on
+    AGENT_TEMPLATE_QUICK_ACCESS_UNIQUE_INDEX - the (user_id, template_id)
+    partial unique index scoped to the quick-access origin (B1/D2/D3)."""
+
+    from xagent.web.services import agent_management as management_module
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    real_resolve_name = management_module.resolve_unique_agent_name
+    racing_agent_id: dict[str, int] = {}
+
+    def race_then_delegate(db: Any, *, user_id: int, name: str) -> str:
+        # Simulate a concurrent request winning the race between our SELECT
+        # and our INSERT - but, unlike the sibling test above, under a
+        # disambiguated name that never collides with our own. Only the
+        # first call (the "our own" resolve's own resolve_unique_agent_name
+        # lookup) triggers the race; the racing insert's own internal
+        # resolve_unique_agent_name call must not recurse into this hook.
+        if not racing_agent_id:
+            store = AgentStore(db)
+            racing = store.create_agent(
+                user_id=user_id,
+                name="Totally Unrelated Name",
+                description="raced in first, under a name that never collides",
+                instructions="Follow the template.",
+                execution_mode="balanced",
+                template_id="resolve-template",
+                origin=AgentOrigin.TEMPLATE_QUICK_ACCESS.value,
+                status=AgentStatus.PUBLISHED,
+            )
+            db.commit()
+            racing_agent_id["id"] = int(racing.id)
+            # Our own insert proceeds under its natural, undisambiguated
+            # name - no name collision occurs at all.
+            return name
+        return real_resolve_name(db, user_id=user_id, name=name)
+
+    monkeypatch.setattr(
+        management_module, "resolve_unique_agent_name", race_then_delegate
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 200, resolved.text
+    assert resolved.json()["created"] is False
+    assert resolved.json()["agent"]["id"] == racing_agent_id["id"]
+    assert resolved.json()["agent"]["name"] == "Totally Unrelated Name"
+
+
+def test_resolve_from_template_reports_409_when_retries_are_exhausted_by_race(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When every TEMPLATE_RESOLVE_RACE_RETRIES attempt loses the
+    (user_id, template_id) quick-access race, the error must say so
+    honestly - not the name-collision 400, since no name collision is
+    involved at all in this failure mode."""
+    from xagent.web.services import agent_management as management_module
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    def always_races(*args: Any, **kwargs: Any) -> Any:
+        raise TemplateQuickAccessRaceError("resolve-template")
+
+    monkeypatch.setattr(
+        management_module.AgentManagementService,
+        "create_agent_with_optional_key",
+        always_races,
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 409, resolved.text
+    assert "name" not in resolved.json()["detail"].lower()
+
+
+def test_resolve_from_template_reports_409_when_a_race_hit_precedes_final_name_collision(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding m6: retry exhaustion must
+    report the quick-access race (409) whenever *any* attempt hit it, even
+    if the *last* attempt's collision happened to be a plain name collision
+    instead. Before this fix, only the last error's type was tracked, so
+    this exact interleaving (race, then name-collision, then name-collision)
+    surfaced a misleading 400 "Agent with this name already exists" - which
+    is wrong, since the caller never even chose a colliding name."""
+    from xagent.web.services import agent_management as management_module
+
+    headers = _admin_headers()
+    _install_resolve_template_stub(monkeypatch)
+
+    attempts = {"n": 0}
+
+    def race_then_name_collisions(*args: Any, **kwargs: Any) -> Any:
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            raise TemplateQuickAccessRaceError("resolve-template")
+        raise management_module.DuplicateAgentNameError("Resolve Flow Agent")
+
+    monkeypatch.setattr(
+        management_module.AgentManagementService,
+        "create_agent_with_optional_key",
+        race_then_name_collisions,
+    )
+
+    resolved = client.post(
+        "/api/agents/from-template/resolve",
+        headers=headers,
+        json={"template_id": "resolve-template"},
+    )
+    assert resolved.status_code == 409, resolved.text
+    assert "name" not in resolved.json()["detail"].lower()
+
+
+def test_manually_created_agent_has_no_template_id() -> None:
+    headers = _admin_headers()
+    agent_id = _create_agent(headers, name="Hand-built agent")
+
+    response = client.get(f"/api/agents/{agent_id}", headers=headers)
+    assert response.status_code == 200, response.text
+    assert response.json()["template_id"] is None
+
+
+def test_duplicate_agent_name_returns_400_with_stable_detail() -> None:
+    """Pins the exact 400 detail string POST /api/agents returns on a name
+    collision, so a refactor of this endpoint's exception mapping doesn't
+    silently change the API contract."""
+
+    headers = _admin_headers()
+    _create_agent(headers, name="Duplicate Name Agent")
+
+    response = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Duplicate Name Agent",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert response.status_code == 400
+    assert response.json()["detail"] == "Agent with this name already exists"
+
+
+def test_db_constraint_catches_name_race_the_app_precheck_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Simulates two concurrent requests both passing the app-level
+    pre-check before either commits: the DB partial unique index must still
+    reject the second insert with a clean DuplicateAgentNameError (400), not
+    a raw IntegrityError (500).
+    """
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    monkeypatch.setattr(AgentStore, "agent_name_exists", lambda self, *a, **k: False)
+
+    first = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Raced Agent Name",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert first.status_code == 200, first.text
+
+    second = client.post(
+        "/api/agents",
+        headers=headers,
+        json={
+            "name": "Raced Agent Name",
+            "description": "test",
+            "instructions": "You are a test agent.",
+            "execution_mode": "balanced",
+        },
+    )
+    assert second.status_code == 400, second.text
+    assert second.json()["detail"] == "Agent with this name already exists"
+
+
+def test_update_agent_translates_a_raced_rename_collision_to_400(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression test for PR review finding R1-1: update_agent's
+    agent_name_exists precheck is a fast path, not the source of truth,
+    exactly like create_agent's - so a rename that races past it must still
+    surface the DB's uq_agents_user_id_name_active violation as a clean 400,
+    not an uncaught IntegrityError leaking as a 500 (update_agent had no
+    equivalent to create_agent's `except IntegrityError` handler)."""
+    from xagent.web.services.agent_store import AgentStore
+
+    headers = _admin_headers()
+    _create_agent(headers, name="Rename Race Target")
+    renamed_id = _create_agent(headers, name="Rename Race Source")
+
+    monkeypatch.setattr(AgentStore, "agent_name_exists", lambda self, *a, **k: False)
+
+    response = client.put(
+        f"/api/agents/{renamed_id}",
+        headers=headers,
+        json={"name": "Rename Race Target"},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["detail"] == "Agent with this name already exists"
 
 
 def _create_agent_row(

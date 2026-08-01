@@ -1,21 +1,26 @@
 "use client";
 
 import { useState, useEffect, useMemo, useRef } from "react";
-import { Bot, Presentation, Search, Smartphone, Wand2 } from "lucide-react";
+import { Bot, CheckCircle2 } from "lucide-react";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { ChatStartScreen, AgentCard } from "@/components/chat/ChatStartScreen";
 import { FilePreviewDialog } from "@/components/file/file-preview-dialog";
+import { Button } from "@/components/ui/button";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { apiRequest } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { findRunnableAgentById } from "@/lib/agent-ui-access";
-import { useSearchParams } from "next/navigation";
+import { resolveAgentForTemplate, toAgentId } from "@/lib/template-agent-resolution";
+import { useRouter, useSearchParams } from "next/navigation";
 import { toast } from "sonner";
+import type { Template, SamplePrompt } from "@/types/template";
+import { FEATURED_CATEGORY_ID } from "@/lib/template-categories";
 
 function TaskHomePageContent() {
-  const { t } = useI18n();
+  const { t, locale } = useI18n();
   const { sendMessage, state, dispatch, closeFilePreview } = useApp();
+  const router = useRouter();
   const searchParams = useSearchParams();
   const starter = searchParams.get("starter");
   const promptFromQuery = searchParams.get("prompt");
@@ -29,6 +34,12 @@ function TaskHomePageContent() {
     model?: string;
     executionMode?: "flash" | "balanced" | "think";
   }>();
+  const [templates, setTemplates] = useState<Template[]>([]);
+  const [templatesLoading, setTemplatesLoading] = useState(false);
+  const [templatesError, setTemplatesError] = useState(false);
+  const [selectedCategory, setSelectedCategory] = useState<string>(FEATURED_CATEGORY_ID);
+  const [selectedTemplate, setSelectedTemplate] = useState<{ id: string; name: string } | null>(null);
+  const [selectedPromptKey, setSelectedPromptKey] = useState<string | null>(null);
   const branding = getBrandingFromEnv();
 
   // Clear state on mount to ensure we are in "new task" mode
@@ -61,6 +72,31 @@ function TaskHomePageContent() {
     fetchAgents();
   }, []);
 
+  // Fetch templates on mount (and when locale changes) for the quick-access grid
+  const fetchTemplates = async () => {
+    setTemplatesLoading(true);
+    setTemplatesError(false);
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
+      if (response.ok) {
+        const data = await response.json();
+        setTemplates(Array.isArray(data) ? data : []);
+      } else {
+        setTemplatesError(true);
+      }
+    } catch (error) {
+      console.error("Failed to fetch templates:", error);
+      setTemplatesError(true);
+    } finally {
+      setTemplatesLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchTemplates();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [locale]);
+
   useEffect(() => {
     if (!agentFromQuery || appliedAgentFromQueryRef.current === agentFromQuery || agents.length === 0) {
       return;
@@ -72,6 +108,8 @@ function TaskHomePageContent() {
     }
 
     setSelectedAgents([selectedAgent]);
+    setSelectedTemplate(null);
+    setSelectedPromptKey(null);
     appliedAgentFromQueryRef.current = agentFromQuery;
   }, [agentFromQuery, agents]);
 
@@ -121,60 +159,17 @@ function TaskHomePageContent() {
     };
   }, [selectedAgents]);
 
-  const samplePrompts = useMemo(() => ([
-    {
-      id: "research",
-      icon: Search,
-      title: t("chatPage.cards.research.title"),
-      prompt: "Research topic and deliver a structured report with key findings, data points, and sources.",
-      promptHighlights: ["topic"],
-    },
-    {
-      id: "linkedin",
-      icon: Smartphone,
-      title: t("chatPage.cards.linkedin.title"),
-      prompt: "Write a LinkedIn post about topic or achievement. Tone: professional / inspirational.",
-      promptHighlights: ["topic or achievement", "professional / inspirational"],
-    },
-    {
-      id: "poster",
-      icon: Wand2,
-      title: t("chatPage.cards.poster.title"),
-      prompt: "Create a promotional poster for event or product. Style: modern / bold / minimal.",
-      promptHighlights: ["event or product", "modern / bold / minimal"],
-    },
-    {
-      id: "compare",
-      icon: Search,
-      title: t("chatPage.cards.compare.title"),
-      prompt: "Compare product A vs product B across key criteria. Provide a detailed analysis with a recommendation.",
-      promptHighlights: ["product A", "product B", "key criteria"],
-    },
-    {
-      id: "visual",
-      icon: Wand2,
-      title: t("chatPage.cards.visual.title"),
-      prompt: "Create a platform graphic for campaign or brand. Size: square / story / banner. Theme: colour or style.",
-      promptHighlights: ["platform", "campaign or brand", "square / story / banner", "colour or style"],
-    },
-    {
-      id: "presentation",
-      icon: Presentation,
-      title: t("chatPage.cards.presentation.title"),
-      prompt: "Build a N-slide presentation on topic for audience.",
-      promptHighlights: ["N", "topic", "audience"],
-    }
-  ]), [t]);
-
+  // Deep-link preset for "?starter=presentation" (the Welcome modal's
+  // Presentation Builder card). Only this one key is ever populated or read,
+  // so a plain check is clearer here than a one-entry lookup map.
   const starterPreset = useMemo(() => {
-    const found = samplePrompts.find((prompt) => prompt.id === starter);
-    if (!found) return null;
+    if (starter !== "presentation") return null;
 
     return {
-      prompt: found.prompt,
-      highlights: found.promptHighlights,
+      prompt: "Build a N-slide presentation on topic for audience.",
+      highlights: ["N", "topic", "audience"],
     };
-  }, [starter, samplePrompts]);
+  }, [starter]);
 
   const queryInputValue = starterPreset?.prompt || promptFromQuery || "";
   const queryPromptHighlightTerms = useMemo(
@@ -193,10 +188,64 @@ function TaskHomePageContent() {
   const handleSend = async (message: string, filesToSend: File[], config?: any) => {
     if (state.isProcessing) return;
 
-    const selectedAgentId = Number(selectedAgents[0]?.id);
+    let agentId = toAgentId(selectedAgents[0]);
+
+    if (agentId === null && selectedTemplate) {
+      let result: { agent: AgentCard; created: boolean };
+      try {
+        result = await resolveAgentForTemplate(selectedTemplate.id);
+      } catch (error) {
+        console.error("Failed to create agent from template:", error);
+        // Rethrow (translated) rather than swallowing: ChatInput's own
+        // catch around onSend shows this as a toast, and - critically -
+        // only clears the typed message/chip when onSend actually
+        // resolves, so a failed creation no longer silently wipes the
+        // user's draft.
+        throw new Error(t("chatPage.templateQuickAccess.createAgentError"));
+      }
+
+      agentId = toAgentId(result.agent);
+      // Keep local `agents` state in sync for other consumers (e.g. the
+      // `?agent=` deep link) - resolveAgentForTemplate always asks the
+      // server (see its own docstring for why), this does not shortcut
+      // that. Only add it if published: `agents` is otherwise exclusively
+      // published agents (see the mount-time fetch above), and the resolve
+      // flow's reuse branch can now return a still-unpublished draft
+      // as-is (PR review finding B3) rather than always republishing it.
+      if (result.agent.status === "published") {
+        setAgents((prev) =>
+          prev.some((agent) => agent.id === result.agent.id) ? prev : [...prev, result.agent]
+        );
+      }
+
+      if (result.created) {
+        const templateName = selectedTemplate.name;
+        toast.custom((toastId) => (
+          <div className="flex w-full flex-col gap-3 rounded-xl border border-green-600 bg-background p-4 shadow-lg">
+            <div className="flex items-start gap-2">
+              <CheckCircle2 className="mt-0.5 h-5 w-5 shrink-0 text-green-600" />
+              <span className="text-sm font-medium text-green-600">
+                {t("chatPage.templateQuickAccess.agentCreatedToast", { name: templateName })}
+              </span>
+            </div>
+            <Button
+              size="sm"
+              className="self-end"
+              onClick={() => {
+                toast.dismiss(toastId);
+                router.push("/build");
+              }}
+            >
+              {t("chatPage.templateQuickAccess.viewInAgents")}
+            </Button>
+          </div>
+        ));
+      }
+    }
+
     const nextConfig = {
       ...config,
-      agentId: Number.isNaN(selectedAgentId) ? undefined : selectedAgentId,
+      agentId: agentId ?? undefined,
     };
 
     try {
@@ -207,6 +256,8 @@ function TaskHomePageContent() {
       setInputValue("");
       setPromptHighlightTerms([]);
       setSelectedAgents([]);
+      setSelectedTemplate(null);
+      setSelectedPromptKey(null);
     } catch (error) {
       console.error("Failed to send message:", error);
       toast.error(error instanceof Error ? error.message : t("builds.list.chat.sendFailed"));
@@ -222,31 +273,39 @@ function TaskHomePageContent() {
     setInputValue(value);
   };
 
-  const handleAgentClick = (agent: AgentCard) => {
-    setSelectedAgents((prev) => {
-      const currentSelected = prev[0];
-      if (currentSelected?.id === agent.id) {
-        return [];
-      }
-      return [agent];
-    });
-  };
-
   const handleRemoveSelectedAgent = (agentId: number | string) => {
     setSelectedAgents((prev) => prev.filter((agent) => agent.id !== agentId));
+  };
+
+  const handleTemplatePromptSelect = (template: Template, prompt: SamplePrompt, index: number) => {
+    setInputValue(prompt.prompt);
+    setPromptHighlightTerms(prompt.highlights || []);
+    setSelectedTemplate({ id: template.id, name: template.name });
+    setSelectedPromptKey(`${template.id}:${index}`);
+    setSelectedAgents([]);
+  };
+
+  const handleRemoveSelectedTemplate = () => {
+    setSelectedTemplate(null);
+    setSelectedPromptKey(null);
   };
 
   return (
     <div className="h-full bg-background flex flex-col overflow-hidden">
       <div className="flex-1 overflow-y-auto">
         <main className="container max-w-4xl mx-auto px-4 py-8">
+          {/* No `agents`/`onAgentClick` props here: the template quick-access
+              grid (passed via `templates` below) replaces the old "Chat with
+              Agents" avatar picker on this page, matching the redesigned
+              Task page. `agents` state itself is still fetched and used -
+              for the `?agent=` deep link above - just not rendered as a
+              picker here. Template-reuse resolution goes through the server
+              unconditionally (see resolveAgentForTemplate); there is no
+              client-side matching against this list anymore. */}
           <ChatStartScreen
             title={t("chatPage.page.emptyTitle", { appName: branding.appName })}
             description={t("chatPage.page.emptyDescription")}
             icon={<Bot className="w-10 h-10 text-[hsl(var(--gradient-from))]" />}
-            prompts={samplePrompts}
-            agents={agents}
-            onAgentClick={handleAgentClick}
             selectedAgents={selectedAgents}
             onRemoveSelectedAgent={handleRemoveSelectedAgent}
             onSend={handleSend}
@@ -262,6 +321,16 @@ function TaskHomePageContent() {
             showModeToggle={true}
             autoFocus={true}
             inputMinHeightClass="min-h-[200px]"
+            templates={templates}
+            templatesLoading={templatesLoading}
+            templatesError={templatesError}
+            onRetryTemplates={fetchTemplates}
+            selectedCategory={selectedCategory}
+            onCategoryChange={setSelectedCategory}
+            selectedTemplate={selectedTemplate}
+            onRemoveSelectedTemplate={handleRemoveSelectedTemplate}
+            selectedPromptKey={selectedPromptKey}
+            onTemplatePromptSelect={handleTemplatePromptSelect}
           />
         </main>
       </div>
