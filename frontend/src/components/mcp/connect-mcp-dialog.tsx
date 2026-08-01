@@ -42,6 +42,9 @@ import { sanitizeAppIntegrations } from "@/lib/team-sharing-sanitizers"
 
 import {
   isValidMcpName,
+  parseMcpOAuthErrorMessage,
+  MCP_OAUTH_POPUP_WINDOW_NAME,
+  type McpOAuthConnectResponse,
   buildCustomApiPayload,
   buildMcpServerPayload,
   customApiDetailToEditState,
@@ -124,6 +127,25 @@ export function ConnectMcpDialog({
   const [customApiEditBaseline, setCustomApiEditBaseline] = useState<CustomApiDetail | null>(null)
   const [mcpEditBaseline, setMcpEditBaseline] = useState<McpServerDetail | null>(null)
   const connectorEditRequestRef = React.useRef(0)
+  // Popup-closed poll intervals for in-flight mcp_oauth/builtin_oauth
+  // connects, so they can be cleared on unmount or dialog-close instead of
+  // leaking (N3: the poll otherwise has no unmount cleanup, unlike
+  // custom-mcp-form's equivalent).
+  const mcpOauthPollTimersRef = React.useRef<Set<number>>(new Set())
+  // The builtin_oauth flow's postMessage listener, tracked the same way so a
+  // dialog-close or unmount removes it too — otherwise a genuinely
+  // successful auth completed after the user closed the dialog would still
+  // fire onSuccess/auto-select via a listener nothing else was going to
+  // remove (its own interval, the only thing that used to remove it, is
+  // itself cleared by the same close/unmount cleanup).
+  const mcpOauthMessageListenersRef = React.useRef<Set<(event: MessageEvent) => void>>(new Set())
+  // F5: this component instance is commonly kept mounted by the parent
+  // across dialog open/close (only the Radix Dialog's own content
+  // unmounts), so the unmount-only cleanup above never fires on an ordinary
+  // close. Checked after every await in handleConnectMcpOAuthApp so an
+  // in-flight connect POST that resolves after the dialog (or the whole
+  // component) is gone doesn't register a poll nothing will ever clear.
+  const isMountedRef = React.useRef(true)
 
   // Custom MCP Server state
   const [isSavingCustom, setIsSavingCustom] = useState(false)
@@ -216,6 +238,22 @@ export function ConnectMcpDialog({
     }
   }
 
+  // Shared by the dialog-close branch below and the unmount cleanup effect:
+  // stop any in-flight OAuth popup poll and remove the builtin_oauth flow's
+  // postMessage listener (F6) — leaving the listener attached would let a
+  // genuinely successful auth, completed after the user closed the dialog,
+  // still fire onSuccess/auto-select via a listener the (now-cleared)
+  // interval was the only thing that used to remove.
+  const clearMcpOauthPollState = () => {
+    mcpOauthPollTimersRef.current.forEach((timer) => window.clearInterval(timer))
+    mcpOauthPollTimersRef.current.clear()
+    mcpOauthMessageListenersRef.current.forEach((listener) =>
+      window.removeEventListener('message', listener)
+    )
+    mcpOauthMessageListenersRef.current.clear()
+    setLoadingApp(null)
+  }
+
   useEffect(() => {
     if (open) {
       setMcpFormData({
@@ -235,11 +273,27 @@ export function ConnectMcpDialog({
       setShareChoice("private")
     } else {
       connectorEditRequestRef.current += 1
+      // F6: closing the dialog (not just unmounting it) must also stop any
+      // in-flight OAuth popup poll — otherwise it can later fire
+      // onSuccess/auto-select against a closed dialog, and leaves a stale
+      // spinner on the card if the dialog is reopened.
+      clearMcpOauthPollState()
     }
   }, [open, t, selectedMcpServers])
 
   useEffect(() => () => {
     connectorEditRequestRef.current += 1
+  }, [])
+
+  useEffect(() => {
+    isMountedRef.current = true
+    return () => {
+      isMountedRef.current = false
+    }
+  }, [])
+
+  useEffect(() => () => {
+    clearMcpOauthPollState()
   }, [])
 
   useEffect(() => {
@@ -516,12 +570,125 @@ export function ConnectMcpDialog({
     }
   }
 
+  // Remote-MCP OAuth catalog app (e.g. Granola): the backend ensures the
+  // shared server row + this user's association, runs Dynamic Client
+  // Registration when the provider has no static client, and returns the
+  // authorization URL. Mirrors custom-mcp-form's handleConnectMcpOAuth,
+  // but keyed by catalog app_id instead of a server id.
+  const handleConnectMcpOAuthApp = async (app: AppIntegration, autoSelect: boolean) => {
+    setLoadingApp(app.id)
+    // Open the popup synchronously on the click, before any await — popup
+    // blockers reject windows opened outside direct user-gesture handling.
+    // The window-features string matters: without it, browsers open a full
+    // new tab instead of the small centered popup the builtin OAuth flow uses.
+    const width = 600
+    const height = 700
+    const left = window.screenX + (window.outerWidth - width) / 2
+    const top = window.screenY + (window.outerHeight - height) / 2
+    const popup = window.open(
+      "about:blank",
+      MCP_OAUTH_POPUP_WINDOW_NAME,
+      `width=${width},height=${height},left=${left},top=${top},scrollbars=yes`,
+    )
+    if (!popup) {
+      toast.error("Popup blocked. Please allow popups for this site to connect.")
+      setLoadingApp(null)
+      return
+    }
+    popup.opener = null
+    try {
+      const response = await apiRequest(`${getApiUrl()}/api/mcp/apps/${app.id}/oauth/connect`, {
+        method: "POST",
+        credentials: "include",
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ redirect_after: "/tools?tab=mcp" }),
+      })
+      if (!response.ok) {
+        popup.close()
+        const message = await parseMcpOAuthErrorMessage(response, t('tools.mcp.dialog.oauthConnectFailed'))
+        toast.error(message)
+        setLoadingApp(null)
+        return
+      }
+      const data = await response.json() as McpOAuthConnectResponse
+      if (!data.authorization_url) {
+        popup.close()
+        toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+        setLoadingApp(null)
+        return
+      }
+      popup.location.href = data.authorization_url
+    } catch (error) {
+      console.error("Failed to start MCP OAuth connect:", error)
+      popup.close()
+      toast.error(t('tools.mcp.dialog.oauthConnectFailed'))
+      setLoadingApp(null)
+      return
+    }
+    // F5: if the dialog closed (or this component unmounted) while the
+    // connect POST was in flight, don't register a poll after the cleanup
+    // effects have already run — it would never get cleared. The popup
+    // itself is left navigating to the authorization URL either way; the
+    // user can still complete auth in it, and the next apps refresh (e.g.
+    // reopening the dialog) will reflect it.
+    if (!isMountedRef.current) return
+
+    // The popup's opener link is severed (popup.opener = null), so unlike the
+    // builtin flow there is no postMessage channel — and a closed popup can
+    // mean success OR a cancelled/denied/failed authorization (the error
+    // redirect leaves the popup open for the user to read, then they close it
+    // by hand). So on close, ask the backend which one actually happened and
+    // gate the success actions on the app really being connected; is_connected
+    // for mcp_oauth apps requires a completed grant, not just the association.
+    const startedAt = Date.now()
+    const maxWaitMs = 5 * 60 * 1000
+    const checkPopup = window.setInterval(() => {
+      const expired = Date.now() - startedAt >= maxWaitMs
+      if (!popup.closed && !expired) return
+      window.clearInterval(checkPopup)
+      mcpOauthPollTimersRef.current.delete(checkPopup)
+      setLoadingApp(null)
+      if (!popup.closed) {
+        // Timed out with the popup still open: stop the spinner. If the user
+        // eventually finishes, the next apps refresh shows the connection.
+        return
+      }
+      void (async () => {
+        let connected = false
+        try {
+          const response = await apiRequest(`${getApiUrl()}/api/mcp/apps?location=remote`)
+          if (response.ok) {
+            const data = sanitizeAppIntegrations(await response.json())
+            connected = data.some(
+              (candidate) => candidate.id === app.id && candidate.is_connected,
+            )
+          }
+        } catch (error) {
+          console.error("Failed to refresh apps after the OAuth popup closed:", error)
+        }
+        loadApps()
+        if (!connected) return
+        if (onSuccess) onSuccess()
+        if (autoSelect && onConnectSelected) {
+          setLocalSelectedServers(prev => prev.includes(app.name) ? prev : [...prev, app.name])
+        }
+        setSelectedApp(null)
+      })()
+    }, 500)
+    mcpOauthPollTimersRef.current.add(checkPopup)
+  }
+
   const handleConnectApp = (app: AppIntegration, autoSelect: boolean = false) => {
     if (app.auth_type !== "builtin_oauth") {
-      // Key-based catalog app: collect the key. Anything else is a mis-authored
-      // entry (neither OAuth nor a launchable key-based command).
+      // Key-based catalog app: collect the key; remote-MCP OAuth app: start
+      // the per-user OAuth (DCR) flow. Anything else is a mis-authored entry.
       if (app.auth_type === "api_key") {
         openKeyConnect(app);
+      } else if (app.auth_type === "mcp_oauth") {
+        handleConnectMcpOAuthApp(app, autoSelect);
       } else {
         toast.error(t('tools.mcp.alerts.notConfigured'));
       }
@@ -561,6 +728,9 @@ export function ConnectMcpDialog({
       if (event.data?.type === 'oauth-success') {
         setLoadingApp(null)
         window.removeEventListener('message', handleMessage)
+        mcpOauthMessageListenersRef.current.delete(handleMessage)
+        window.clearInterval(checkPopup)
+        mcpOauthPollTimersRef.current.delete(checkPopup)
 
         loadApps();
         if (onSuccess) onSuccess();
@@ -575,15 +745,24 @@ export function ConnectMcpDialog({
     };
 
     window.addEventListener('message', handleMessage);
+    mcpOauthMessageListenersRef.current.add(handleMessage)
 
-    // Fallback: check if popup was closed without success message
-    const checkPopup = setInterval(() => {
-      if (popup?.closed) {
-        clearInterval(checkPopup);
-        window.removeEventListener('message', handleMessage);
-        setLoadingApp(null);
-      }
+    // Fallback: check if popup was closed without success message, or give up
+    // after a timeout (N3: this poll previously had neither an unmount-safe
+    // cleanup nor a timeout cap, unlike the mcp_oauth handler above and
+    // custom-mcp-form.tsx's equivalent flow).
+    const startedAt = Date.now()
+    const maxWaitMs = 5 * 60 * 1000
+    const checkPopup: number = window.setInterval(() => {
+      const expired = Date.now() - startedAt >= maxWaitMs
+      if (!popup?.closed && !expired) return
+      window.clearInterval(checkPopup);
+      mcpOauthPollTimersRef.current.delete(checkPopup)
+      window.removeEventListener('message', handleMessage);
+      mcpOauthMessageListenersRef.current.delete(handleMessage)
+      setLoadingApp(null);
     }, 500);
+    mcpOauthPollTimersRef.current.add(checkPopup)
   }
 
   const handleCardClick = (app: AppIntegration, isGloballyConnected: boolean) => {

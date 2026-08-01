@@ -764,6 +764,24 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
         "required_env": ["GOOGLE_MAPS_API_KEY"],
     }
 
+    # Remote MCP (no local command at all): Granola hosts the server itself.
+    assert rows_by_app_id["granola"]["transport"] == "streamable_http"
+    assert rows_by_app_id["granola"]["launch_config"] == {
+        "url": "https://mcp.granola.ai/mcp",
+        "auth": {"type": "mcp_oauth"},
+    }
+
+
+def test_builtin_registry_classifies_granola_as_mcp_oauth() -> None:
+    """The registry shape must classify as mcp_oauth — anything else means the
+    catalog entry is uninstallable (connect_mcp_app rejects non-api_key apps
+    and generic_oauth_login rejects non-"oauth" transports)."""
+    from xagent.web.builtin_mcp_registry import get_builtin_public_mcp_app_rows
+    from xagent.web.mcp_apps import classify_app_auth
+
+    row = next(r for r in get_builtin_public_mcp_app_rows() if r["app_id"] == "granola")
+    assert classify_app_auth(row["transport"], row["launch_config"]) == "mcp_oauth"
+
 
 def test_builtin_registry_helpers_use_exact_ids_and_return_defensive_copies() -> None:
     from xagent.web.builtin_mcp_registry import (
@@ -1183,6 +1201,82 @@ def test_admin_create_app_rejects_keyless_command_entry() -> None:
             pass
 
 
+def test_admin_create_app_rejects_partial_remote_oauth_entry() -> None:
+    """Same write-time constraint (#764), for the remote-MCP-OAuth shape: a
+    streamable_http/sse/websocket entry needs BOTH launch_config.url and
+    launch_config.auth.type == "mcp_oauth", or it classifies as
+    "unconnectable" and must be rejected rather than silently persisted."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        # Shape 1: url without auth.type=mcp_oauth.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-auth-type",
+                "name": "BadNoAuthType",
+                "transport": "streamable_http",
+                "launch_config": {"url": "https://mcp.example.com/mcp"},
+            },
+        )
+        assert resp.status_code == 422
+
+        # Shape 2 (the reverse asymmetric shape): auth.type=mcp_oauth without url.
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "bad-no-url",
+                "name": "BadNoUrl",
+                "transport": "streamable_http",
+                "launch_config": {"auth": {"type": "mcp_oauth"}},
+            },
+        )
+        assert resp.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_create_app_accepts_full_remote_oauth_entry() -> None:
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        resp = client.post(
+            "/api/admin/mcp/apps",
+            headers=admin_headers,
+            json={
+                "app_id": "good-remote-oauth",
+                "name": "GoodRemoteOAuth",
+                "transport": "streamable_http",
+                "launch_config": {
+                    "url": "https://mcp.example.com/mcp",
+                    "auth": {"type": "mcp_oauth"},
+                },
+            },
+        )
+        assert resp.status_code == 200
+        assert resp.json()["launch_config"]["url"] == "https://mcp.example.com/mcp"
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
 def test_admin_update_app_enforces_auth_classification() -> None:
     """The write-time constraint fires on PUT too, not just POST (both use the
     same PublicMCPAppCreate model)."""
@@ -1215,6 +1309,69 @@ def test_admin_update_app_enforces_auth_classification() -> None:
             },
         )
         assert updated.status_code == 422
+    finally:
+        Base.metadata.drop_all(bind=get_engine())
+        try:
+            import shutil
+
+            shutil.rmtree(temp_dir)
+        except OSError:
+            pass
+
+
+def test_admin_update_grandfathers_a_preexisting_bad_shape_row_for_unrelated_edits() -> (
+    None
+):
+    """F4: a row already in an "unconnectable" partial shape (created directly,
+    simulating one that predates a shape rule tightening) must stay editable
+    for fields the shape check doesn't read — otherwise the write-time
+    constraint permanently locks out even an icon change on that row. A PUT
+    that also touches transport/launch_config must still be rejected."""
+    temp_dir = _setup_test_db()
+    try:
+        _setup_admin()
+        admin_headers = _login("admin", "admin123")
+
+        db = next(get_db())
+        try:
+            db.add(
+                PublicMCPApp(
+                    app_id="legacy-partial-oauth",
+                    name="LegacyPartialOAuth",
+                    icon="old-icon",
+                    transport="streamable_http",
+                    launch_config={"url": "https://mcp.example.com/mcp"},
+                )
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        db = next(get_db())
+        try:
+            app_pk = (
+                db.query(PublicMCPApp)
+                .filter(PublicMCPApp.app_id == "legacy-partial-oauth")
+                .one()
+                .id
+            )
+        finally:
+            db.close()
+
+        unrelated_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"icon": "new-icon"},
+        )
+        assert unrelated_edit.status_code == 200
+        assert unrelated_edit.json()["icon"] == "new-icon"
+
+        shape_touching_edit = client.patch(
+            f"/api/admin/mcp/apps/{app_pk}",
+            headers=admin_headers,
+            json={"launch_config": {"url": "https://mcp.example.com/mcp"}},
+        )
+        assert shape_touching_edit.status_code == 422
     finally:
         Base.metadata.drop_all(bind=get_engine())
         try:

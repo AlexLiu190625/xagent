@@ -57,6 +57,8 @@ import {
   mcpServerDetailToEditState,
   parseCustomApiDetail,
   parseMcpServerDetail,
+  shouldSelfCloseMcpOauthPopup,
+  MCP_OAUTH_SUCCESS_PARAM,
   type CustomApiDetail,
   type McpServerDetail,
 } from "@/lib/mcp-utils"
@@ -182,16 +184,44 @@ function ToolsPageContent() {
   const { getAppIcon } = useMcpApps()
   const isAdmin = Boolean(user?.is_admin)
 
+  // F8: strip all three mcp_oauth redirect params in both effects below, not
+  // just the one each effect owns. The two backend redirects are mutually
+  // exclusive today (never both present at once), but if that ever changed,
+  // one effect's router.replace could otherwise undo the other's cleanup and
+  // cause a duplicate-toast loop.
+  const stripMcpOauthRedirectParams = (params: URLSearchParams) => {
+    const next = new URLSearchParams(params.toString())
+    next.delete("mcp_oauth_error")
+    next.delete("mcp_oauth_error_message")
+    next.delete(MCP_OAUTH_SUCCESS_PARAM)
+    const nextQuery = next.toString()
+    router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
+  }
+
   useEffect(() => {
     const oauthErrorMessage = searchParams.get("mcp_oauth_error_message")
     if (!oauthErrorMessage) return
 
     toast.error(oauthErrorMessage)
-    const nextParams = new URLSearchParams(searchParams.toString())
-    nextParams.delete("mcp_oauth_error")
-    nextParams.delete("mcp_oauth_error_message")
-    const nextQuery = nextParams.toString()
-    router.replace(nextQuery ? `/tools?${nextQuery}` : "/tools", { scroll: false })
+    stripMcpOauthRedirectParams(searchParams)
+  }, [router, searchParams])
+
+  useEffect(() => {
+    // The MCP OAuth callback redirects the connect popup here after a
+    // successful authorization, appending mcp_oauth_success=1. The popup was
+    // opened under this window name by the connect flows; self-close it so
+    // the opener's popup-closed poll refreshes connection state, instead of
+    // showing the whole app in the popup. On error the popup stays open so
+    // the toast above is readable. shouldSelfCloseMcpOauthPopup is keyed on
+    // the explicit success param, not the absence of error params, so a
+    // future error param added to the callback can't be mistaken for success.
+    if (!searchParams.get(MCP_OAUTH_SUCCESS_PARAM)) return
+    if (typeof window !== "undefined" && shouldSelfCloseMcpOauthPopup(window.name, searchParams)) {
+      window.close()
+      return
+    }
+    // Not the popup (e.g. the flow ran in a full tab): just tidy the URL.
+    stripMcpOauthRedirectParams(searchParams)
   }, [router, searchParams])
 
   useEffect(() => {

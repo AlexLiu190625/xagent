@@ -452,6 +452,16 @@ def _clear_mcp_oauth_state_cookie(response: Response) -> None:
     response.delete_cookie(MCP_OAUTH_STATE_COOKIE, path="/api/mcp")
 
 
+def _redirect_after_with_params(
+    raw_redirect_after: str | None, params: tuple[tuple[str, str], ...]
+) -> str:
+    redirect_after = _safe_mcp_oauth_redirect_after(raw_redirect_after)
+    parts = urlsplit(redirect_after)
+    query = parse_qsl(parts.query, keep_blank_values=True)
+    query.extend(params)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), ""))
+
+
 def _mcp_oauth_callback_error_redirect(
     flow_state: MCPOAuthFlowState,
     *,
@@ -461,20 +471,15 @@ def _mcp_oauth_callback_error_redirect(
     raw_redirect_after = (
         str(flow_state.redirect_after) if flow_state.redirect_after else None
     )
-    redirect_after = _safe_mcp_oauth_redirect_after(raw_redirect_after)
-    parts = urlsplit(redirect_after)
-    query = parse_qsl(parts.query, keep_blank_values=True)
-    query.extend(
+    redirect_path = _redirect_after_with_params(
+        raw_redirect_after,
         (
             ("mcp_oauth_error", error_code),
             (
                 "mcp_oauth_error_message",
                 oauth_error_message(message, "MCP OAuth authorization failed"),
             ),
-        )
-    )
-    redirect_path = urlunsplit(
-        (parts.scheme, parts.netloc, parts.path, urlencode(query), "")
+        ),
     )
     response = RedirectResponse(_mcp_oauth_redirect_after_url(redirect_path))
     _clear_mcp_oauth_state_cookie(response)
@@ -1812,6 +1817,25 @@ def _connected_non_oauth_server_for_app(
     return cast(int, server.id)
 
 
+def _mcp_oauth_server_is_actually_connected(
+    server: MCPServer, active_grant_server_ids: set[int]
+) -> bool:
+    """An mcp_oauth-shaped server's UserMCPServer association can exist before
+    the user ever completes consent (see connect_mcp_oauth_app), so its mere
+    presence isn't proof of a working connection. Require an active
+    MCPOAuthGrant too, mirroring the check applied in list_mcp_apps' default
+    branch — shared so every code path that reports connection state for an
+    mcp_oauth server (including the location=local/all branch, which used to
+    bypass this check entirely) agrees (F1)."""
+    auth: dict[str, Any] = server.auth if isinstance(server.auth, dict) else {}
+    if (
+        str(server.transport or "").lower() not in HTTP_MCP_TRANSPORTS
+        or auth.get("type") != "mcp_oauth"
+    ):
+        return True
+    return cast(int, server.id) in active_grant_server_ids
+
+
 @mcp_router.get("/apps", response_model=List[dict])
 def list_mcp_apps(
     search: Optional[str] = None,
@@ -1876,6 +1900,22 @@ def list_mcp_apps(
 
     shared_env_by_id = load_shared_env_overrides(db, cast(int, current_user.id))
 
+    # mcp_oauth apps: an active association alone is not a connection — the
+    # association is provisioned before the user ever reaches the consent
+    # screen, so an abandoned/denied/failed authorization would otherwise
+    # render as "Connected" forever with no credential behind it. Require an
+    # active grant too, mirroring how builtin_oauth requires a completed
+    # OAuth account. One query for all apps to avoid an N+1.
+    active_grant_server_ids = {
+        row[0]
+        for row in db.query(MCPOAuthGrant.mcp_server_id)
+        .filter(
+            MCPOAuthGrant.user_id == current_user.id,
+            MCPOAuthGrant.status == "active",
+        )
+        .all()
+    }
+
     if location in ["remote", "all"]:
         for app in library_apps:
             if app.get("auth_type") == "builtin_oauth":
@@ -1893,6 +1933,14 @@ def list_mcp_apps(
                 connected_account = None
                 # Resolve the shared row once and reuse it for all key-source flags.
                 shared_server = _shared_server_for_app(app, server_by_key)
+                if (
+                    server_id is not None
+                    and shared_server is not None
+                    and not _mcp_oauth_server_is_actually_connected(
+                        shared_server, active_grant_server_ids
+                    )
+                ):
+                    server_id = None
                 app_shared_env = _app_shared_env_available(
                     app, shared_server, shared_env_by_id
                 )
@@ -1969,7 +2017,13 @@ def list_mcp_apps(
                     "icon": "",
                     "users": "1",
                     "transport": server.transport,
-                    "is_connected": True,
+                    # F1: this loop's own membership check above (name-based)
+                    # doesn't gate on a real grant, so a custom mcp_oauth
+                    # server the user abandoned mid-consent must not be
+                    # reported connected just because the row exists.
+                    "is_connected": _mcp_oauth_server_is_actually_connected(
+                        server, active_grant_server_ids
+                    ),
                     "provider": "custom",
                     "category": "Local",
                     "is_local": True,
@@ -2197,6 +2251,66 @@ def get_mcp_server(
         )
 
 
+def _reject_user_owned_catalog_squat(db: Session, server: MCPServer) -> None:
+    """409 when the row under a catalog id is owned by a user.
+
+    A matching config is not enough: a row owned by a user is a custom server
+    squatting this catalog id (creatable only before the app was seeded, since
+    create_mcp_server now reserves catalog ids). Its owner keeps edit rights and
+    could later swap in a foreign command/URL that every connected user then
+    uses — refuse to adopt it as the official shared row. The legitimate shared
+    row is created without any association, so it never has an is_owner=True
+    owner. Shared by every catalog-connect shape so a hardening fix here can't
+    land in only one copy.
+    """
+    owned = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.mcpserver_id == server.id,
+            UserMCPServer.is_owner.is_(True),
+        )
+        .first()
+    )
+    if owned is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A user-owned server already exists under this catalog id",
+        )
+
+
+def _add_catalog_server_with_race_recovery(
+    db: Session, config: Any, server_name: str
+) -> MCPServer:
+    """Create the shared catalog server row, tolerating a concurrent first
+    provision. Returns the row (ours or the race winner's); raises 400/500.
+    """
+    manager = DatabaseMCPServerManager(db)
+    add_error: Exception | None = None
+    try:
+        manager.add_server(config)
+    except (ValueError, IntegrityError) as exc:
+        # A concurrent first-provision loses to the other request: add_server's
+        # own duplicate-name check raises ValueError, or the commit trips the
+        # unique constraint (IntegrityError). Either way the row now exists, so
+        # recover by re-reading it below. Any other failure leaves no row.
+        db.rollback()
+        add_error = exc
+    server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    if not server:
+        # No row after the failure => it was not a race but a genuine error.
+        # Surface it instead of masking it as an opaque 500.
+        if add_error is not None:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid app configuration: {add_error}",
+            ) from add_error
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create server",
+        )
+    return server
+
+
 def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dict]:
     """Idempotently ensure the shared server row for a key-based catalog app
     exists, without creating any per-user association. Returns (server, app_info).
@@ -2222,7 +2336,6 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
         )
     launch = app_info.get("launch_config") or {}
     command = launch.get("command")
-    manager = DatabaseMCPServerManager(db)
     # app_id is the stable catalog key: it passes the server-name validator and
     # is what the connector uses to detect an app as connected.
     server_name = str(app_info["id"])
@@ -2242,25 +2355,7 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                 status_code=status.HTTP_409_CONFLICT,
                 detail="A server with this name already exists with a different configuration",
             )
-        # A matching config is not enough: a row owned by a user is a custom server
-        # squatting this catalog id (creatable only before the app was seeded, since
-        # create_mcp_server now reserves catalog ids). Its owner keeps edit rights and
-        # could later swap in a foreign command that every connected user then runs —
-        # refuse to adopt it as the official shared row. The legitimate shared row is
-        # created without any association, so it never has an is_owner=True owner.
-        owned = (
-            db.query(UserMCPServer)
-            .filter(
-                UserMCPServer.mcpserver_id == server.id,
-                UserMCPServer.is_owner.is_(True),
-            )
-            .first()
-        )
-        if owned is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail="A user-owned server already exists under this catalog id",
-            )
+        _reject_user_owned_catalog_squat(db, server)
     if not server:
         try:
             config = _build_server_config(
@@ -2276,29 +2371,89 @@ def _ensure_catalog_app_server(db: Session, app_id: str) -> tuple[MCPServer, dic
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=f"Invalid app configuration: {str(e)}",
             )
-        add_error: Exception | None = None
-        try:
-            manager.add_server(config)
-        except (ValueError, IntegrityError) as exc:
-            # A concurrent first-provision loses to the other request: add_server's
-            # own duplicate-name check raises ValueError, or the commit trips the
-            # unique constraint (IntegrityError). Either way the row now exists, so
-            # recover by re-reading it below. Any other failure leaves no row.
-            db.rollback()
-            add_error = exc
-        server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
-        if not server:
-            # No row after the failure => it was not a race but a genuine error.
-            # Surface it instead of masking it as an opaque 500.
-            if add_error is not None:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"Invalid app configuration: {add_error}",
-                ) from add_error
+        server = _add_catalog_server_with_race_recovery(db, config, server_name)
+    return server, app_info
+
+
+def _ensure_catalog_mcp_oauth_server(
+    db: Session, app_id: str
+) -> tuple[MCPServer, dict]:
+    """Idempotently ensure the shared server row for a remote-MCP OAuth
+    (DCR-capable) catalog app exists, without creating any per-user
+    association. Returns (server, app_info). Mirrors
+    _ensure_catalog_app_server's hijack guards, but for a streamable_http/
+    sse/websocket server row instead of a stdio one.
+    """
+    from ..mcp_apps import get_app_by_id
+
+    app_info = get_app_by_id(db, app_id)
+    if not app_info:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="MCP app not found"
+        )
+    if app_info.get("auth_type") != "mcp_oauth":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="This app is not a remote-OAuth connector",
+        )
+    launch = app_info.get("launch_config") or {}
+    url = launch.get("url")
+    auth = launch.get("auth") or {}
+    transport = str(app_info["transport"])
+    server_name = str(app_info["id"])
+
+    server = db.query(MCPServer).filter(MCPServer.name == server_name).first()
+    # Same reasoning as _ensure_catalog_app_server: a row under this catalog id
+    # may be a hijack (a custom server someone created with a different remote
+    # URL), so only reuse it if it matches the official configuration.
+    if server:
+        if (
+            str(server.transport or "").lower() != transport.lower()
+            or server.url != url
+        ):
             raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create server",
+                status_code=status.HTTP_409_CONFLICT,
+                detail="A server with this name already exists with a different configuration",
             )
+        _reject_user_owned_catalog_squat(db, server)
+        # The catalog stays the source of truth for the row's auth config: if
+        # the registry entry's auth changed since this shared row was created
+        # (e.g. a scope hint or static client_id was added), sync it so
+        # already-connected users don't keep running against stale auth.
+        # Compare on the decrypted form — sensitive auth fields are encrypted
+        # at rest, so comparing the raw stored value against the catalog's
+        # plaintext would spuriously differ on every connect once any secret
+        # is configured. Runs only after the owned-check above: a user-owned
+        # row is rejected, never mutated.
+        if server._decrypt_auth_config(server.auth) != auth:
+            encrypted_auth = dict(auth)
+            for key in SENSITIVE_AUTH_FIELDS:
+                value = encrypted_auth.get(key)
+                # A mis-authored non-string sensitive field (e.g. a nested
+                # object where a string is expected) must not crash this
+                # user-facing connect request — encrypt_value() calls
+                # .encode() unconditionally. Leave it as-is; that's an admin
+                # authoring bug to catch at write time, not here (F13).
+                if value and isinstance(value, str):
+                    encrypted_auth[key] = encrypt_value(value)
+            cast(Any, server).auth = encrypted_auth
+            db.commit()
+    if not server:
+        try:
+            config = _build_server_config(
+                MCPServerCreate(
+                    name=server_name,
+                    transport=transport,
+                    description=app_info.get("description"),
+                    config={"url": url, "auth": auth},
+                )
+            )
+        except ValueError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Invalid app configuration: {str(e)}",
+            )
+        server = _add_catalog_server_with_race_recovery(db, config, server_name)
     return server, app_info
 
 
@@ -2433,6 +2588,72 @@ def connect_mcp_app(
         manager,
         app_id=str(app_info["id"]),
         is_admin=getattr(current_user, "is_admin", False),
+    )
+
+
+@mcp_router.post("/apps/{app_id}/oauth/connect", response_model=None)
+async def connect_mcp_oauth_app(
+    app_id: str,
+    request_data: MCPOAuthConnectRequest,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+    accept: Annotated[str | None, Header()] = None,
+) -> RedirectResponse | JSONResponse:
+    """Connect a remote-MCP OAuth (DCR-capable) catalog app for the current user.
+
+    Ensures the shared server row and this user's association exist, then
+    delegates to connect_mcp_oauth's Authorization Code + PKCE flow — the
+    per-user DCR/token machinery is identical to a self-added custom MCP
+    server; only the server row's origin (catalog vs. a user-typed URL)
+    differs.
+    """
+    server, app_info = _ensure_catalog_mcp_oauth_server(db, app_id)
+
+    assoc: Any = (
+        db.query(UserMCPServer)
+        .filter(
+            UserMCPServer.user_id == current_user.id,
+            UserMCPServer.mcpserver_id == server.id,
+        )
+        .first()
+    )
+    if assoc is None:
+        assoc = UserMCPServer(
+            user_id=current_user.id,
+            mcpserver_id=server.id,
+            is_active=True,
+            is_owner=False,
+            can_edit=False,
+            can_delete=True,
+        )
+        db.add(assoc)
+        try:
+            db.commit()
+        except IntegrityError:
+            # Concurrent same-user connect (double-click/client retry): another
+            # request already inserted the (user_id, mcpserver_id) association.
+            db.rollback()
+            assoc = (
+                db.query(UserMCPServer)
+                .filter(
+                    UserMCPServer.user_id == current_user.id,
+                    UserMCPServer.mcpserver_id == server.id,
+                )
+                .first()
+            )
+            if assoc is None:
+                raise
+    elif not assoc.is_active:
+        # A reconnect after the user previously disconnected their own
+        # association — re-activate it rather than leaving it dormant.
+        assoc.is_active = True
+        db.commit()
+
+    logger.info(
+        f"User {current_user.id} starting OAuth connect for MCP app '{app_info['id']}'"
+    )
+    return await connect_mcp_oauth(
+        cast(int, server.id), request_data, current_user, db, accept
     )
 
 
@@ -2763,7 +2984,7 @@ def _catalog_server_has_platform_key(db: Session, server: MCPServer) -> bool:
 
 
 @mcp_router.delete("/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_mcp_server(
+async def delete_mcp_server(
     server_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -2873,6 +3094,39 @@ def delete_mcp_server(
                             UserOAuth.user_id == user_id,
                             UserOAuth.provider == provider,
                         ).delete(synchronize_session=False)
+
+        # Revoke and purge this user's MCP OAuth grants for the server. On a
+        # shared (multi-user) row the server outlives this disconnect, so
+        # without this the grant's refresh token would stay usable — and its
+        # row would stay stored — until the LAST user disconnects and the
+        # cascade finally removes it. Best-effort external revocation first
+        # (now awaitable, unlike the previous local-only status flip), then a
+        # hard delete rather than a "revoked" status flip: a revoked grant
+        # row is otherwise never swept, accumulating indefinitely as an
+        # inert but secret-bearing row (F10).
+        for grant in (
+            db.query(MCPOAuthGrant)
+            .filter(
+                MCPOAuthGrant.mcp_server_id == server_id,
+                MCPOAuthGrant.user_id == user_id,
+                MCPOAuthGrant.status == "active",
+            )
+            .all()
+        ):
+            if isinstance(grant.oauth_client, MCPOAuthClient):
+                await _revoke_mcp_oauth_grant_externally(
+                    client=grant.oauth_client, grant=grant
+                )
+            db.delete(grant)
+
+        # This user's own flow-state rows (code_verifier etc.) are per-user,
+        # unlike MCPOAuthClient which a shared server's other users may still
+        # reference — safe to purge outright rather than only on server
+        # deletion's cascade.
+        db.query(MCPOAuthFlowState).filter(
+            MCPOAuthFlowState.mcp_server_id == server_id,
+            MCPOAuthFlowState.user_id == user_id,
+        ).delete(synchronize_session=False)
 
         # Remove user-server association
         db.delete(user_mcp)
@@ -3405,8 +3659,17 @@ async def mcp_oauth_callback(
             message="MCP OAuth authorization failed",
         )
 
+    # Positive success signal: the connect popup's self-close logic keys on
+    # this param instead of inferring success from "no error params", so a
+    # future error param added to the error redirect can't be mistaken for
+    # success by an out-of-date guard.
     response = RedirectResponse(
-        _mcp_oauth_redirect_after_url(str(flow_state.redirect_after))
+        _mcp_oauth_redirect_after_url(
+            _redirect_after_with_params(
+                str(flow_state.redirect_after) if flow_state.redirect_after else None,
+                (("mcp_oauth_success", "1"),),
+            )
+        )
     )
     _clear_mcp_oauth_state_cookie(response)
     return response

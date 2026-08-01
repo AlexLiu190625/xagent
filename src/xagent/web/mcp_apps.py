@@ -85,13 +85,31 @@ def classify_app_auth(transport: Any, launch_config: Any) -> str:
     frontend dialogs can't drift apart. Values:
         - "builtin_oauth": provider redirect flow (transport == "oauth")
         - "api_key": static key, connected via /api/mcp/apps/{id}/connect
-        - "unconnectable": neither oauth nor a launchable key-based command
+        - "mcp_oauth": remote MCP server, connected via per-user OAuth
+          Authorization Code + PKCE (Dynamic Client Registration when no
+          static client_id is configured) — /api/mcp/apps/{id}/oauth/connect
+        - "unconnectable": none of the above
     """
+    # Reuses the runtime's notion of which transports are remote ("oauth"
+    # here instead means a static-provider redirect wrapping our own stdio
+    # module). Lowercased like the builtin_oauth check above: an admin PATCH
+    # can store a mixed-case transport, and the two halves of this feature
+    # must not disagree about the same row.
+    from .services.mcp_runtime import HTTP_MCP_TRANSPORTS
+
     if str(transport or "").lower() == "oauth":
         return "builtin_oauth"
     launch = launch_config if isinstance(launch_config, dict) else {}
     if launch.get("required_env") and launch.get("command"):
         return "api_key"
+    auth = launch.get("auth")
+    if (
+        str(transport or "").lower() in HTTP_MCP_TRANSPORTS
+        and launch.get("url")
+        and isinstance(auth, dict)
+        and auth.get("type") == "mcp_oauth"
+    ):
+        return "mcp_oauth"
     return "unconnectable"
 
 

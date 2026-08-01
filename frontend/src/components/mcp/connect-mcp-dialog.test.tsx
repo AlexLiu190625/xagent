@@ -93,9 +93,11 @@ vi.mock("./official-mcp-settings-dialog", () => ({
   OfficialMcpSettingsDialog: ({
     onConfigure,
     onOpenChange,
+    onConnectStart,
   }: {
     onConfigure: (app: object) => void
     onOpenChange: (open: boolean) => void
+    onConnectStart: (app: object) => void
   }) => (
     <div>
       <button
@@ -112,6 +114,12 @@ vi.mock("./official-mcp-settings-dialog", () => ({
       </button>
       <button type="button" onClick={() => onConfigure(mcpApp(3, "aggregated-mcp"))}>
         configure-mcp
+      </button>
+      <button type="button" onClick={() => onConnectStart(mcpOauthApp())}>
+        connect-granola
+      </button>
+      <button type="button" onClick={() => onConnectStart(builtinOauthApp())}>
+        connect-builtin
       </button>
       <button type="button" onClick={() => onOpenChange(false)}>
         close-settings
@@ -158,6 +166,34 @@ function mcpApp(id: number, name: string) {
     is_local: true,
     server_id: id,
     transport: "streamable_http",
+  }
+}
+
+// A remote-MCP OAuth (DCR) catalog app, e.g. Granola: no provider, no
+// launch command — connecting must go through /apps/{id}/oauth/connect.
+function mcpOauthApp() {
+  return {
+    id: "granola",
+    name: "Granola",
+    description: "",
+    icon: "",
+    is_connected: false,
+    transport: "streamable_http",
+    auth_type: "mcp_oauth",
+  }
+}
+
+// A static-provider builtin OAuth catalog app, e.g. Zoom/Gmail.
+function builtinOauthApp() {
+  return {
+    id: "zoom",
+    name: "Zoom",
+    description: "",
+    icon: "",
+    is_connected: false,
+    transport: "oauth",
+    auth_type: "builtin_oauth",
+    provider: "zoom",
   }
 }
 
@@ -344,6 +380,369 @@ describe("ConnectMcpDialog Custom API detail loading", () => {
         description: "Updated MCP description",
       })
     })
+  })
+
+  it("connects a remote-MCP OAuth catalog app through the oauth/connect endpoint", async () => {
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    try {
+      apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          expect(options?.method).toBe("POST")
+          expect((options?.headers as Record<string, string>)?.Accept).toBe("application/json")
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize?client_id=dyn-1" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      renderDialog()
+      fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+
+      await waitFor(() => {
+        expect(popup.location.href).toBe("https://auth.granola.ai/authorize?client_id=dyn-1")
+      })
+      // A features string must be passed: without one, browsers open a full
+      // new tab instead of the small centered popup the builtin flow uses.
+      expect(openSpy).toHaveBeenCalledWith(
+        "about:blank",
+        "mcp-oauth",
+        expect.stringContaining("width=600,height=700"),
+      )
+      expect(popup.close).not.toHaveBeenCalled()
+      expect(toastErrorMock).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
+  it("surfaces the backend error and closes the popup when oauth/connect fails", async () => {
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: false,
+            status: 400,
+            json: async () => ({ detail: "This app is not a remote-OAuth connector" }),
+          })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      renderDialog()
+      fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+
+      await waitFor(() => {
+        expect(toastErrorMock).toHaveBeenCalledWith("This app is not a remote-OAuth connector")
+      })
+      expect(popup.close).toHaveBeenCalled()
+      expect(popup.location.href).toBe("")
+    } finally {
+      openSpy.mockRestore()
+    }
+  })
+
+  it("fires onSuccess and auto-selects only once the closed popup is confirmed connected", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    const onConnectSelected = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url === "http://api.local/api/mcp/apps?location=remote") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => [{ id: "granola", name: "Granola", description: "", icon: "", is_connected: true }],
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+          onConnectSelected={onConnectSelected}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      // The popup closes only after the redirect (simulating the user
+      // completing the real authorization in it).
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500)
+      })
+
+      expect(onSuccess).toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("does not fire onSuccess when the popup closes on a cancelled/failed authorization", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url === "http://api.local/api/mcp/apps?location=remote") {
+          // The user closed the error popup by hand (or cancelled consent) —
+          // the backend never recorded a completed grant, so is_connected
+          // stays false even though the association row already exists (M1).
+          return Promise.resolve({
+            ok: true,
+            json: async () => [{ id: "granola", name: "Granola", description: "", icon: "", is_connected: false }],
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(500)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("stops the loading spinner without firing success after the 5-minute poll timeout", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      const callsBeforeTimeout = apiRequestMock.mock.calls.length
+
+      // Popup never closes (user walked away with it open); the poll must
+      // still give up after 5 minutes rather than spinning forever (N3).
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 1000)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+      // The timeout path stops polling without ever issuing the
+      // is-it-really-connected check the popup-closed path makes.
+      expect(apiRequestMock.mock.calls.length).toBe(callsBeforeTimeout)
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("also times out the sibling builtin_oauth poll after 5 minutes (N3)", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn() }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      fireEvent.click(screen.getByRole("button", { name: "connect-builtin" }))
+
+      // Popup never closes; the builtin_oauth poll previously had no timeout
+      // cap at all (N3), unlike the mcp_oauth handler above.
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5 * 60 * 1000 + 1000)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("clears the in-flight OAuth poll and loading state when the dialog closes, not just unmounts (F6)", async () => {
+    vi.useFakeTimers()
+    const popup = { closed: false, close: vi.fn(), opener: {}, location: { href: "" } }
+    const openSpy = vi.spyOn(window, "open").mockReturnValue(popup as unknown as Window)
+    const onSuccess = vi.fn()
+    try {
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === "http://api.local/api/mcp/apps/granola/oauth/connect") {
+          return Promise.resolve({
+            ok: true,
+            json: async () => ({ authorization_url: "https://auth.granola.ai/authorize" }),
+          })
+        }
+        if (url.includes("/api/mcp/apps?")) {
+          return Promise.resolve({ ok: true, json: async () => [] })
+        }
+        throw new Error(`Unexpected request: ${url}`)
+      })
+
+      const { rerender } = render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      await act(async () => {
+        fireEvent.click(screen.getByRole("button", { name: "connect-granola" }))
+      })
+
+      const callsBeforeClose = apiRequestMock.mock.calls.length
+
+      // The parent typically keeps ConnectMcpDialog mounted and just flips
+      // `open` — only the dialog's own content unmounts, not this component,
+      // so the unmount-only cleanup effect alone would miss this (F6).
+      rerender(
+        <ConnectMcpDialog
+          open={false}
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+
+      popup.closed = true
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000)
+      })
+
+      expect(onSuccess).not.toHaveBeenCalled()
+      // The poll was already cleared on close, so popup.closed flipping true
+      // afterward must not trigger the is-it-connected follow-up check.
+      expect(apiRequestMock.mock.calls.length).toBe(callsBeforeClose)
+    } finally {
+      openSpy.mockRestore()
+      vi.useRealTimers()
+    }
+  })
+
+  it("removes the builtin_oauth postMessage listener on dialog close, not just its interval (F6)", async () => {
+    apiRequestMock.mockImplementation((url: string) => {
+      if (url.includes("/api/mcp/apps?")) {
+        return Promise.resolve({ ok: true, json: async () => [] })
+      }
+      throw new Error(`Unexpected request: ${url}`)
+    })
+    const onSuccess = vi.fn()
+    const openSpy = vi.spyOn(window, "open").mockReturnValue({} as Window)
+    try {
+      const { rerender } = render(
+        <ConnectMcpDialog
+          open
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+      fireEvent.click(screen.getByRole("button", { name: "connect-builtin" }))
+
+      // Close the dialog while the popup (and its postMessage listener) is
+      // still outstanding — only clearing the interval (and not this
+      // listener too) would let a real success message fired afterward
+      // still call onSuccess against a dialog the user already closed.
+      rerender(
+        <ConnectMcpDialog
+          open={false}
+          onOpenChange={vi.fn()}
+          selectedMcpServers={selectedMcpServers}
+          onSuccess={onSuccess}
+        />,
+      )
+
+      window.dispatchEvent(
+        new MessageEvent("message", { data: { type: "oauth-success" } }),
+      )
+
+      expect(onSuccess).not.toHaveBeenCalled()
+    } finally {
+      openSpy.mockRestore()
+    }
   })
 
   it("keeps masked baseline entries in an MCP user-env replacement", async () => {

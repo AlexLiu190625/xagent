@@ -31,6 +31,71 @@ def test_key_based_needs_command_and_required_env():
     )
 
 
+def test_remote_mcp_oauth_shape_is_mcp_oauth():
+    for transport in ("sse", "websocket", "streamable_http"):
+        assert (
+            classify_app_auth(
+                transport,
+                {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+            )
+            == "mcp_oauth"
+        )
+
+
+def test_mcp_oauth_requires_both_url_and_auth_type():
+    # url without auth.type=mcp_oauth -> not launchable via OAuth
+    assert (
+        classify_app_auth("streamable_http", {"url": "https://mcp.example.com/mcp"})
+        == "unconnectable"
+    )
+    # auth.type=mcp_oauth without url -> nothing to connect to
+    assert (
+        classify_app_auth("streamable_http", {"auth": {"type": "mcp_oauth"}})
+        == "unconnectable"
+    )
+    # wrong auth.type is not mcp_oauth
+    assert (
+        classify_app_auth(
+            "streamable_http",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "bearer"}},
+        )
+        == "unconnectable"
+    )
+
+
+def test_remote_mcp_oauth_transport_check_is_case_insensitive():
+    # N1: the builtin_oauth check above lowercases ("OAuth" -> "oauth"); the
+    # remote-transport check must be equally forgiving, or an admin PATCH that
+    # stores a mixed-case transport puts the two halves of this feature in
+    # disagreement about the same row.
+    assert (
+        classify_app_auth(
+            "Streamable_HTTP",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+    assert (
+        classify_app_auth(
+            "SSE",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "mcp_oauth"
+    )
+
+
+def test_mcp_oauth_shape_requires_a_remote_transport():
+    # Same launch_config shape on a stdio transport must not be misrouted —
+    # only sse/websocket/streamable_http describe a genuine remote MCP server.
+    assert (
+        classify_app_auth(
+            "stdio",
+            {"url": "https://mcp.example.com/mcp", "auth": {"type": "mcp_oauth"}},
+        )
+        == "unconnectable"
+    )
+
+
 def test_inconsistent_entries_are_unconnectable_not_misrouted():
     # required_env but no command -> not launchable
     assert classify_app_auth("stdio", {"required_env": ["KEY"]}) == "unconnectable"
