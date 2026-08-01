@@ -15,6 +15,7 @@ const routerPushMock = vi.hoisted(() => vi.fn())
 const routerReplaceMock = vi.hoisted(() => vi.fn())
 const cardRenderMock = vi.hoisted(() => vi.fn())
 const cardPropsMock = vi.hoisted(() => vi.fn())
+const cardActionMock = vi.hoisted(() => vi.fn())
 const providerLoaderMock = vi.hoisted(() => vi.fn())
 const providerLifetime = vi.hoisted(() => ({ mounts: 0, unmounts: 0 }))
 
@@ -118,13 +119,25 @@ vi.mock("@/lib/build-page-extension", async () => {
       cardRenderMock(agentId)
       cardPropsMock(props)
       const supplement = sharedData?.[String(agentId)]
-      return supplement
-        ? ReactModule.createElement(
-          "div",
-          { "data-testid": `agent-card-supplement-${agentId}` },
-          supplement,
-        )
-        : null
+      return ReactModule.createElement(
+        ReactModule.Fragment,
+        null,
+        supplement
+          ? ReactModule.createElement(
+            "div",
+            { "data-testid": `agent-card-supplement-${agentId}` },
+            supplement,
+          )
+          : null,
+        ReactModule.createElement(
+          "button",
+          {
+            type: "button",
+            onClick: () => cardActionMock(agentId),
+          },
+          `extension-action-${agentId}`,
+        ),
+      )
     },
   )
   return {
@@ -191,6 +204,7 @@ describe("BuildsPage extension boundaries", () => {
     routerReplaceMock.mockReset()
     cardRenderMock.mockClear()
     cardPropsMock.mockClear()
+    cardActionMock.mockClear()
     providerLoaderMock.mockReset()
     providerLoaderMock.mockResolvedValue({ "42": "supplement-42" })
     providerLifetime.mounts = 0
@@ -209,6 +223,25 @@ describe("BuildsPage extension boundaries", () => {
       .toBeInTheDocument()
     expect(cardRenderMock).toHaveBeenCalledWith(42)
     expect(cardPropsMock).toHaveBeenCalledWith({ agentId: 42 })
+  })
+
+  it("keeps interactive extension controls inside the card event boundary", async () => {
+    apiRequestMock.mockResolvedValue(jsonResponse([agent]))
+
+    render(<BuildsPage />)
+
+    const cardTitle = await screen.findByText("Research Agent")
+    fireEvent.click(await screen.findByRole("button", {
+      name: "extension-action-42",
+    }))
+
+    expect(cardActionMock).toHaveBeenCalledOnce()
+    expect(cardActionMock).toHaveBeenCalledWith(42)
+    expect(routerPushMock).not.toHaveBeenCalled()
+
+    fireEvent.click(cardTitle)
+    expect(routerPushMock).toHaveBeenCalledOnce()
+    expect(routerPushMock).toHaveBeenCalledWith("/build/42")
   })
 
   it("shares one provider load across multiple Agent card extensions", async () => {

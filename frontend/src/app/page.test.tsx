@@ -5,6 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const homeExtensionRenderMock = vi.hoisted(() => vi.fn())
 
+async function createHomeExtensionMock() {
+  const ReactModule = await vi.importActual<typeof import("react")>("react")
+  const HomePageExtension = ReactModule.memo(() => {
+    ReactModule.useState(null)
+    homeExtensionRenderMock()
+    return ReactModule.createElement("div", { "data-testid": "home-extension" })
+  })
+  return { HomePageExtension }
+}
+
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
     "@/lib/api-wrapper",
@@ -65,17 +75,7 @@ vi.mock("@/components/welcome-modal", () => ({
   WelcomeModal: () => null,
 }))
 
-vi.mock("@/lib/home-page-extension", async () => {
-  const ReactModule = await vi.importActual<typeof import("react")>("react")
-  const HomePageExtension = ReactModule.memo(() => {
-    ReactModule.useState(null)
-    homeExtensionRenderMock()
-    return ReactModule.createElement("div", { "data-testid": "home-extension" })
-  })
-  return {
-    HomePageExtension,
-  }
-})
+vi.mock("@/lib/home-page-extension", createHomeExtensionMock)
 
 import Home from "./page"
 
@@ -107,9 +107,38 @@ describe("Home", () => {
     render(<Home />)
 
     expect(screen.getByRole("button", { name: "voiceInput.start" })).toBeInTheDocument()
-    expect(await screen.findByTestId("home-extension")).toBeInTheDocument()
+    const extension = await screen.findByTestId("home-extension")
+    expect(extension).toBeInTheDocument()
+    expect(extension.parentElement).toHaveAttribute(
+      "data-slot",
+      "home-page-extension",
+    )
+    expect(extension.parentElement).toHaveClass("shrink-0")
     expect(screen.getAllByTestId("home-extension")).toHaveLength(1)
     expect(homeExtensionRenderMock).toHaveBeenCalled()
     await waitFor(() => expect(apiRequestMock).toHaveBeenCalledTimes(2))
+  })
+
+  it("renders the shipped default extension in an inert canonical slot", async () => {
+    vi.doUnmock("@/lib/home-page-extension")
+    vi.resetModules()
+    try {
+      const { default: DefaultHome } = await import("./page")
+
+      const { container } = render(<DefaultHome />)
+      const slot = container.querySelector('[data-slot="home-page-extension"]')
+
+      expect(slot).toBeInTheDocument()
+      expect(slot).toHaveClass("shrink-0")
+      expect(slot).toBeEmptyDOMElement()
+      expect(
+        Array.from(slot?.classList ?? []).some((className) =>
+          /(?:^|:)(?:p[trblxy]?|m[trblxy]?|min-h)-/.test(className),
+        ),
+      ).toBe(false)
+    } finally {
+      vi.doMock("@/lib/home-page-extension", createHomeExtensionMock)
+      vi.resetModules()
+    }
   })
 })

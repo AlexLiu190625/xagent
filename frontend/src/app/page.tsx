@@ -538,7 +538,9 @@ export default function Home() {
 
         </div>
       </div>
-      <HomePageExtension />
+      <div data-slot="home-page-extension" className="shrink-0">
+        <HomePageExtension />
+      </div>
     </div>
   );
 }

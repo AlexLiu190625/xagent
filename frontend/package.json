@@ -11,7 +11,7 @@
     "test": "vitest",
     "test:run": "vitest run",
     "test:pages": "vitest run --config vitest.config.ts src/components/pages",
-    "test:home-build-pages": "vitest run --config vitest.config.ts src/app/page.test.tsx src/app/build/page.test.tsx src/app/build/page-extension.test.tsx",
+    "test:home-build-pages": "vitest run --config vitest.config.ts src/app/build/ src/app/page.test.tsx",
     "test:widget": "vitest run --config vitest.widget.config.ts",
     "test:widget:coverage": "vitest run --config vitest.widget.config.ts --coverage"
   },
