@@ -24,6 +24,7 @@ from xagent.core.execution_scope import (
     EXECUTION_SCOPE_SHAPE_VERSION,
     DeferToSnapshot,
     ExecutionScope,
+    ExecutionScopeAbstentionMismatchError,
     ExecutionScopeAuthorityError,
     ExecutionScopeContext,
     ExecutionScopeResolverContractError,
@@ -970,6 +971,26 @@ class TestSnapshotCandidateAuthority:
         assert exc_info.value.resolver_scope == resolver_scope
         assert exc_info.value.snapshot_scope == snapshot_scope
 
+    def test_namespace_mismatch_error_omits_a_concurrently_differing_policy_field(
+        self,
+    ):
+        """The raise is gated on the namespace diff alone being non-empty,
+        but strict_memory_isolation (policy) also differs here. The
+        exception reaches task.error_message and a client-facing event, so
+        mismatched_fields must carry only the namespace disagreement --
+        listing the policy field there would misleadingly present it as
+        part of the conflict that failed the turn."""
+        resolver_scope = ExecutionScope(strict_memory_isolation=False)
+        snapshot_scope = ExecutionScope(
+            sandbox_key_suffix="other", strict_memory_isolation=True
+        )
+        self._register(lambda task_id: resolver_scope, lambda task_id: snapshot_scope)
+
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
+            resolve_execution_scope("1")
+        assert set(exc_info.value.mismatched_fields) == {"sandbox_key_suffix"}
+        assert "strict_memory_isolation" not in exc_info.value.mismatched_fields
+
     def test_policy_only_mismatch_does_not_fail_the_turn(self):
         """strict_memory_isolation is a policy field: a disagreement there
         does not change which key/path is touched, so the resolver's value
@@ -1430,12 +1451,22 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             "memory_dimensions",
         }
 
-    def test_opt_in_does_not_bypass_the_shape_version_gate(self):
-        """A stale-version snapshot is still shape-gated away even with the
-        opt-in set -- the gate runs before the narrowing check is even
-        reached, so there is nothing for the opt-in to skip past."""
-        fallback = ExecutionScope(sandbox_key_suffix="fallback")
-        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+    def test_opt_in_skips_the_shape_version_gate_snapshot_data_survives(self):
+        """The shape-version gate exists to protect a *comparison*: it
+        guards the default (narrowing) abstention branch and the
+        authoritative branch, both of which compare the snapshot against
+        something. The opt-in branch never compares -- it uses the
+        snapshot verbatim -- so there is nothing for the gate to protect
+        here, and a pre-existing (unversioned) snapshot's real data must
+        survive rather than being silently discarded back to the fallback.
+        This was previously pinned the other way (discarding real data as
+        "correct"), which is exactly the de-scoping bug this test now
+        proves is fixed: an unversioned workforce sub-task snapshot must
+        not be de-scoped just because it predates the version field."""
+        fallback = ExecutionScope()
+        stale_data = ExecutionScope(
+            sandbox_key_suffix="stale", workspace_segments=("workforce", "task-7")
+        ).to_dict()
         del stale_data["version"]
         stale_snapshot = ExecutionScope.from_dict(stale_data)
         assert stale_snapshot.version == 0
@@ -1444,6 +1475,43 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             lambda task_id: defer_to_snapshot(
                 fallback, snapshot_defines_namespace=True
             ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
+        assert resolve_execution_scope("1") == stale_snapshot
+
+    def test_opt_in_still_type_gates_a_non_scope_snapshot(self):
+        """The shape-version gate is skipped on the opt-in branch, but the
+        type check is not -- a candidate that isn't even an ExecutionScope
+        still raises, opt-in or not (see also
+        test_opt_in_does_not_bypass_the_type_check below, which reproduces
+        the same rule via the snapshot loader instead of from_dict)."""
+        fallback = ExecutionScope()
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(
+                fallback, snapshot_defines_namespace=True
+            ),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: object())
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope("1")
+
+    def test_gate_still_applies_on_the_default_abstention_comparing_path(self):
+        """Mirror of the opt-in case above: without the opt-in, the
+        abstention branch narrows against ``fallback`` -- a comparison --
+        so the shape-version gate still applies and a stale snapshot is
+        still ignored. (Same behavior as
+        test_defer_stale_version_snapshot_is_ignored_falls_back; restated
+        here to sit next to the opt-in test for contrast.)"""
+        fallback = ExecutionScope(sandbox_key_suffix="fallback")
+        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+        del stale_data["version"]
+        stale_snapshot = ExecutionScope.from_dict(stale_data)
+        assert stale_snapshot.version == 0
+
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
@@ -1507,9 +1575,65 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         assert resolve_execution_scope("1") == fallback
 
 
+class TestShapeGateLogsFieldDiffLazily:
+    """The shape-version gate's field diff exists only to populate its own
+    log message -- unlike the narrowing/authoritative diffs, which are also
+    needed for control flow, nothing downstream reads this one. It must
+    therefore be computed only when that message will actually be emitted,
+    since the gate runs on every turn for any snapshot that predates a
+    shape bump (see the class docstring reasoning in F3's fix)."""
+
+    def test_field_diff_not_computed_when_warning_is_disabled(self, monkeypatch):
+        from xagent.core import execution_scope as scope_module
+
+        def boom(*_args, **_kwargs):
+            raise AssertionError(
+                "field diff computed even though WARNING logging is disabled"
+            )
+
+        monkeypatch.setattr(scope_module, "_execution_scope_field_diff", boom)
+        original_level = scope_module.logger.level
+        scope_module.logger.setLevel(logging.ERROR)
+        try:
+            resolver_scope = ExecutionScope()
+            stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+            del stale_data["version"]
+            stale_snapshot = ExecutionScope.from_dict(stale_data)
+            set_execution_scope_resolver(
+                lambda task_id: resolver_scope,
+                acknowledges_snapshot_candidate_contract=True,
+            )
+            set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
+            # Gate behavior is unaffected by the logging level: the stale
+            # snapshot is still ignored and the resolver's scope wins.
+            assert resolve_execution_scope("1") == resolver_scope
+        finally:
+            scope_module.logger.setLevel(original_level)
+
+    def test_field_diff_still_computed_and_logged_when_warning_is_enabled(self):
+        """Positive mirror: with WARNING enabled (the default), the gate's
+        existing observable behavior -- a log line naming the differing
+        field -- is unchanged by the lazy guard."""
+        resolver_scope = ExecutionScope()
+        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+        del stale_data["version"]
+        stale_snapshot = ExecutionScope.from_dict(stale_data)
+        set_execution_scope_resolver(
+            lambda task_id: resolver_scope,
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
+        with scope_log_records() as records:
+            assert resolve_execution_scope("1") == resolver_scope
+        assert any("shape" in r and "sandbox_key_suffix" in r for r in records)
+
+
 class TestResolveExecutionScopeOffTurn:
     """Off-turn consumers (websocket ``_scope_segments_for_task``,
-    ``ManagedFileRef``) downgrade a namespace mismatch instead of failing."""
+    ``ManagedFileRef``) downgrade a resolver-authoritative namespace
+    mismatch instead of failing, but a resolver-abstention mismatch has no
+    authoritative value to downgrade to and stays fail-closed -- see
+    ``ExecutionScopeAbstentionMismatchError``'s docstring."""
 
     def test_passthrough_when_no_mismatch(self):
         scope = ExecutionScope(sandbox_key_suffix="s")
@@ -1518,7 +1642,12 @@ class TestResolveExecutionScopeOffTurn:
         )
         assert resolve_execution_scope_off_turn("1") == scope
 
-    def test_namespace_mismatch_downgrades_to_resolver_value_with_warning(self):
+    def test_authoritative_branch_mismatch_downgrades_to_resolver_value_with_warning(
+        self,
+    ):
+        """The resolver returned a real ``ExecutionScope`` (authoritative
+        branch): its value is a genuine answer, so a disagreeing snapshot's
+        mismatch is downgraded to it off-turn instead of raised."""
         resolver_scope = ExecutionScope(sandbox_key_suffix="from-resolver")
         snapshot_scope = ExecutionScope(sandbox_key_suffix="from-snapshot")
         set_execution_scope_resolver(
@@ -1530,14 +1659,40 @@ class TestResolveExecutionScopeOffTurn:
         # A real disagreement: the fail-closed entry point must reject it, or
         # the downgrade below would be indistinguishable from "nothing
         # disagreed" -- which also returns the resolver's scope.
-        with pytest.raises(ExecutionScopeAuthorityError):
+        with pytest.raises(ExecutionScopeAuthorityError) as exc_info:
             resolve_execution_scope("1")
+        assert not isinstance(exc_info.value, ExecutionScopeAbstentionMismatchError)
 
         with scope_log_records() as records:
             result = resolve_execution_scope_off_turn("1")
 
         assert result == resolver_scope
         assert any("authority mismatch" in r.lower() for r in records)
+
+    def test_abstention_branch_mismatch_stays_fail_closed_off_turn(self):
+        """The resolver deferred to the snapshot (abstention branch) and the
+        snapshot widens the fallback: unlike the authoritative case above,
+        ``resolved.fallback`` here is not an authoritative answer -- it is
+        what the resolver supplied while declining to answer, all-default
+        for this test. Downgrading to it off-turn would hand a caller like
+        workspace cleanup an unscoped value indistinguishable from no scope
+        at all, so this must propagate unchanged instead of being
+        downgraded. No existing test covered this off-turn path before --
+        every prior off-turn mismatch case used an authoritative resolver."""
+        fallback = ExecutionScope()
+        snapshot_scope = ExecutionScope(sandbox_key_suffix="attacker-chosen")
+        set_execution_scope_resolver(
+            lambda task_id: defer_to_snapshot(fallback),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: snapshot_scope)
+
+        # Confirm the in-turn behavior this off-turn call must not soften.
+        with pytest.raises(ExecutionScopeAbstentionMismatchError):
+            resolve_execution_scope("1")
+
+        with pytest.raises(ExecutionScopeAbstentionMismatchError):
+            resolve_execution_scope_off_turn("1")
 
     def test_other_exceptions_still_propagate(self):
         def boom(task_id):
@@ -1548,6 +1703,37 @@ class TestResolveExecutionScopeOffTurn:
         )
         with pytest.raises(RuntimeError, match="resolver down"):
             resolve_execution_scope_off_turn("1")
+
+
+class TestExecutionScopeAbstentionMismatchErrorIsDistinguishable:
+    """Pin: the abstention-branch error is a distinct type a caller must
+    explicitly widen its ``except`` clause to catch, so an existing
+    ``except ExecutionScopeAuthorityError: return exc.resolver_scope``
+    downgrade path (written for the authoritative branch) cannot silently
+    also catch and downgrade an abstention mismatch."""
+
+    def test_is_a_subclass_of_the_base_authority_error(self):
+        assert issubclass(
+            ExecutionScopeAbstentionMismatchError, ExecutionScopeAuthorityError
+        )
+
+    def test_base_class_except_clause_still_catches_it(self):
+        """A caller that widens its except clause to the base class (rather
+        than special-casing the subclass) still catches it -- the subclass
+        only prevents *accidental* downgrading via a bare ``except
+        ExecutionScopeAuthorityError`` that assumes ``resolver_scope`` is
+        always authoritative; it does not make the mismatch uncatchable."""
+        caught = None
+        try:
+            raise ExecutionScopeAbstentionMismatchError(
+                "task-1",
+                resolver_scope=ExecutionScope(),
+                snapshot_scope=ExecutionScope(sandbox_key_suffix="x"),
+                mismatched_fields={"sandbox_key_suffix": ("x", None)},
+            )
+        except ExecutionScopeAuthorityError as exc:
+            caught = exc
+        assert isinstance(caught, ExecutionScopeAbstentionMismatchError)
 
 
 class TestDeferCarrierNeverActivated:
@@ -1624,6 +1810,25 @@ class TestExecutionScopeFieldClassificationCompleteness:
         assert namespace_fields | policy_fields | {"version"} == {
             f.name for f in dataclasses.fields(ExecutionScope)
         }
+
+
+class TestNarrowingViolationsFieldCoverage:
+    """``_execution_scope_narrowing_violations`` must classify every
+    namespace field through the shared
+    ``_EXECUTION_SCOPE_NAMESPACE_FIELD_NARROWING`` table rather than a
+    hardcoded per-field check, so a namespace field added to
+    ``_EXECUTION_SCOPE_NAMESPACE_FIELDS`` cannot be silently skipped by this
+    one consumer while the diff (``_execution_scope_field_diff``) and the
+    fingerprint (``scope_fingerprint``), which already iterate their own
+    tables, pick it up automatically.
+    """
+
+    def test_narrowing_table_tracks_the_namespace_fields_exactly(self):
+        from xagent.core import execution_scope as scope_module
+
+        assert set(scope_module._EXECUTION_SCOPE_NAMESPACE_FIELD_NARROWING) == set(
+            scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS
+        )
 
 
 # One (base_kwargs, changed_kwargs) probe per namespace field: constructing
