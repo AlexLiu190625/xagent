@@ -482,6 +482,11 @@ def execution_scope_from_agent_config(
     try:
         return ExecutionScope.from_dict(scope_data)
     except InvalidScopeComponentError as exc:
+        # The field-level detail names the offending value, which can carry an
+        # end-user identifier, so it stays in this server-side log line; the
+        # raised message names only the failure's type, because that message
+        # reaches the task's error column and a client-facing event.
+        logger.error("Persisted execution scope snapshot failed validation: %s", exc)
         raise ExecutionScopeResolverContractError(
             "persisted execution scope snapshot failed validation "
             f"({type(exc).__name__}); see the logged field-level detail"
