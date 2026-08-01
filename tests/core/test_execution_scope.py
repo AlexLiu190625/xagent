@@ -746,7 +746,7 @@ class TestExecutionScopeShapeVersionAlignment:
 
 
 class TestFromDictUntrustedFieldCoercion:
-    """FIX 3: ``from_dict`` decodes a mapping that can originate in a
+    """``from_dict`` decodes a mapping that can originate in a
     client-influenceable ``Task.agent_config`` (see
     :data:`EXECUTION_SCOPE_AGENT_CONFIG_KEY`), so every field it reads must
     be coerced defensively -- never a raw ``int()``/``tuple()``/``dict()``
@@ -1186,8 +1186,8 @@ class TestSnapshotCandidateAuthority:
         assert resolve_execution_scope("1") == snapshot_scope
 
     def test_defer_snapshot_policy_only_disagreement_fallback_wins(self):
-        """FIX 2 coverage: on the abstention branch, the namespace fields
-        agree (both all-default -- no narrowing violation), but
+        """On the abstention branch, the namespace fields agree (both
+        all-default -- no narrowing violation), but
         strict_memory_isolation differs. The fallback plays the
         authoritative role here, so its policy value must win, logged, the
         same way the resolver's policy value wins on the authoritative
@@ -1390,8 +1390,8 @@ class TestSnapshotCandidateAuthority:
             # any dimension, so introducing scoping the fallback never
             # committed to is rejected even though, taken alone, it would
             # look like a narrowing (null -> set; False -> True). See
-            # TestDeferSnapshotAllDefaultFallback for the combined-fields
-            # reproduction of the original vacuous-predicate report.
+            # TestDeferSnapshotAllDefaultFallback for the case that varies
+            # every field of such a fallback at once.
             ("sandbox_key_suffix", {}, {"sandbox_key_suffix": "attacker-chosen"}),
             ("isolate_external_dirs", {}, {"isolate_external_dirs": True}),
         ],
@@ -1525,24 +1525,24 @@ class TestSnapshotCandidateAuthority:
 
 
 class TestDeferSnapshotAllDefaultFallback:
-    """FIX for the vacuous-narrowing report: every per-field narrowing check
-    in ``_execution_scope_narrowing_violations`` used to be evaluated purely
-    relative to the fallback's own value, so it was trivially satisfied by
-    any snapshot value once the fallback's field sat at that field's own
-    no-scoping default -- an all-default ``ExecutionScope()`` fallback (the
-    natural value for a resolver with "no opinion" on a task) made every
-    check pass regardless of the snapshot. The fixed rule: a field at its
-    own identity default admits no narrowing, only an exact match, because
-    there is no scoping there for the snapshot to narrow into.
+    """A namespace field sitting at its own identity default admits no
+    narrowing, only an exact match: there is no scoping there for a snapshot
+    to narrow into.
+
+    This is what a purely relative per-field test cannot express. Evaluated
+    only against the fallback's own value, every narrowing relation is
+    vacuously satisfied once that value is the field's no-scoping default --
+    so an all-default ``ExecutionScope()`` fallback, the natural value for a
+    resolver with no opinion on a task, would accept any snapshot at all.
     """
 
     def test_all_default_fallback_rejects_a_snapshot_widening_every_field_at_once(
         self,
     ):
-        """Reproduces the original report's proof-of-concept: a fully
-        unscoped fallback plus a snapshot that sets every namespace field
-        simultaneously. Every field is out-of-authority for this fallback,
-        so all five must be reported."""
+        """The worst case for a vacuous predicate: a fully unscoped fallback
+        plus a snapshot that sets every namespace field simultaneously. Every
+        field is out-of-authority for this fallback, so all five must be
+        reported."""
         fallback = ExecutionScope()
         snapshot = ExecutionScope(
             sandbox_key_suffix="attacker-chosen",
@@ -2119,12 +2119,10 @@ class TestExecutionScopeFieldClassificationCompleteness:
         self,
     ):
         """Static classification-completeness check only -- this does not
-        call ``scope_fingerprint`` at all. Real per-field fingerprint
-        behavior is covered by ``TestScopeFingerprintFieldCoverage`` below,
-        which does call it. (Renamed from the former
-        ``test_fingerprint_tracks_exactly_the_namespace_fields``: that name
-        claimed fingerprint coverage that a set-vs-hardcoded-set comparison
-        never exercised.)"""
+        call ``scope_fingerprint`` at all, so it claims no fingerprint
+        coverage: a set-vs-set comparison cannot exercise one. Real per-field
+        fingerprint behavior is covered by
+        ``TestScopeFingerprintFieldCoverage`` below, which does call it."""
         from xagent.core import execution_scope as scope_module
 
         namespace_fields = set(scope_module._EXECUTION_SCOPE_NAMESPACE_FIELDS)
