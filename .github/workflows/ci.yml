@@ -284,6 +284,17 @@ jobs:
           set -e
           npm install -g pptxgenjs@4.0.1
 
+      - name: Pre-pull the sandbox image
+        # tests/web/test_sandbox_reconcile_e2e.py drives a real Docker daemon.
+        # Pull with retries here so registry flakes fail in this step instead of
+        # as APIErrors inside the tests (#1099).
+        if: matrix.name == 'web'
+        shell: bash
+        run: |
+          set -e
+          image="$(python3 -m uv run python -c 'from xagent.config import get_sandbox_image; print(get_sandbox_image())')"
+          .github/scripts/docker-pull-retry.sh "$image"
+
       - name: Run tests
         shell: bash
         run: |
@@ -429,6 +440,16 @@ jobs:
         run: |
           set -e
           npm install -g pptxgenjs@4.0.1
+
+      - name: Pre-pull the sandbox image
+        # tests/sandbox drives a real Docker daemon (test_docker_lifecycle_api.py
+        # and friends). Same reasoning as the pytest-fast web leg (#1099).
+        if: matrix.name == 'core'
+        shell: bash
+        run: |
+          set -e
+          image="$(python3 -m uv run python -c 'from xagent.config import get_sandbox_image; print(get_sandbox_image())')"
+          .github/scripts/docker-pull-retry.sh "$image"
 
       - name: Run tests
         shell: bash
@@ -603,21 +624,10 @@ jobs:
       - name: Pull e2e service images
         # Retry service images before pytest so registry failures surface here
         # instead of as confusing Docker daemon errors inside e2e fixtures.
+        shell: bash
         run: |
-          for image in minio/minio postgres:16-bookworm; do
-            pulled=false
-            for i in 1 2 3; do
-              if docker pull "$image"; then
-                pulled=true
-                break
-              fi
-              if [ "$i" -lt 3 ]; then
-                echo "Pull attempt $i for $image failed; retrying in 15s..."
-                sleep 15
-              fi
-            done
-            [ "$pulled" = true ] || exit 1
-          done
+          set -e
+          .github/scripts/docker-pull-retry.sh minio/minio postgres:16-bookworm
 
       - name: Run e2e tests
         shell: bash
