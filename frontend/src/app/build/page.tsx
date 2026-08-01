@@ -39,6 +39,10 @@ import {
 import { toast } from "@/components/ui/sonner"
 import { getBrandingFromEnv } from "@/lib/branding"
 import { useVoiceInputControls } from "@/components/voice-input-controller"
+import {
+  BuildAgentCardExtension,
+  BuildPageExtensionProvider,
+} from "@/lib/build-page-extension"
 
 interface LlmModel {
   model_id: string
@@ -77,7 +81,7 @@ const isTaskCreateResponse = (value: unknown): value is TaskCreateResponse => {
   return typeof candidate.task_id === "number"
 }
 
-export default function BuildsPage() {
+function BuildsPageContent() {
   const { t } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
   const router = useRouter()
@@ -651,70 +655,73 @@ export default function BuildsPage() {
                           {t('builds.card.updatedAt')}: {formatDate(agent.updated_at || agent.created_at)}
                         </div>
                       </div>
-                      <div className="flex gap-2" onClick={(e) => e.stopPropagation()}>
-                        {agent.status === 'published' ? (
-                          <>
-                            <Button
-                              variant="default"
-                              className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
-                              onClick={() => router.push(getAgentChatHref(agent))}
-                            >
-                              <MessageSquare className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.chat')}
-                            </Button>
-                            {canEditAgent(agent) ? (
-                              <>
+                      <div className="space-y-4" onClick={(e) => e.stopPropagation()}>
+                        <BuildAgentCardExtension agentId={agent.id} />
+                        <div className="flex gap-2">
+                          {agent.status === 'published' ? (
+                            <>
+                              <Button
+                                variant="default"
+                                className="flex-1 bg-blue-600 hover:bg-blue-700 text-white"
+                                onClick={() => router.push(getAgentChatHref(agent))}
+                              >
+                                <MessageSquare className="mr-1.5 h-4 w-4" />
+                                {t('builds.list.actions.chat')}
+                              </Button>
+                              {canEditAgent(agent) ? (
+                                <>
+                                  <Button
+                                    variant="outline"
+                                    size="icon"
+                                    onClick={() => {
+                                      setDeployAgent(agent);
+                                    }}
+                                    title="Deploy"
+                                  >
+                                    <Rocket className="h-4 w-4" />
+                                  </Button>
+                                  <Button
+                                    variant="outline"
+                                    className="px-4"
+                                    onClick={() => router.push(`/build/${agent.id}`)}
+                                  >
+                                    <Edit className="mr-1.5 h-4 w-4" />
+                                    {t('builds.list.actions.edit')}
+                                  </Button>
+                                </>
+                              ) : (
                                 <Button
                                   variant="outline"
-                                  size="icon"
-                                  onClick={() => {
-                                    setDeployAgent(agent);
-                                  }}
-                                  title="Deploy"
-                                >
-                                  <Rocket className="h-4 w-4" />
-                                </Button>
-                                <Button
-                                  variant="outline"
-                                  className="px-4"
+                                  className={canRunAgent(agent) ? "px-4" : "flex-1 w-full"}
                                   onClick={() => router.push(`/build/${agent.id}`)}
                                 >
-                                  <Edit className="mr-1.5 h-4 w-4" />
-                                  {t('builds.list.actions.edit')}
+                                  <Settings2 className="mr-1.5 h-4 w-4" />
+                                  {t('builds.list.actions.viewConfig')}
                                 </Button>
-                              </>
+                              )}
+                            </>
+                          ) : (
+                            canEditAgent(agent) ? (
+                              <Button
+                                variant="outline"
+                                className="flex-1 w-full"
+                                onClick={() => router.push(`/build/${agent.id}`)}
+                              >
+                                <Edit className="mr-1.5 h-4 w-4" />
+                                {t('builds.list.actions.edit')}
+                              </Button>
                             ) : (
                               <Button
                                 variant="outline"
-                                className={canRunAgent(agent) ? "px-4" : "flex-1 w-full"}
+                                className="flex-1 w-full"
                                 onClick={() => router.push(`/build/${agent.id}`)}
                               >
                                 <Settings2 className="mr-1.5 h-4 w-4" />
                                 {t('builds.list.actions.viewConfig')}
                               </Button>
-                            )}
-                          </>
-                        ) : (
-                          canEditAgent(agent) ? (
-                            <Button
-                              variant="outline"
-                              className="flex-1 w-full"
-                              onClick={() => router.push(`/build/${agent.id}`)}
-                            >
-                              <Edit className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.edit')}
-                            </Button>
-                          ) : (
-                            <Button
-                              variant="outline"
-                              className="flex-1 w-full"
-                              onClick={() => router.push(`/build/${agent.id}`)}
-                            >
-                              <Settings2 className="mr-1.5 h-4 w-4" />
-                              {t('builds.list.actions.viewConfig')}
-                            </Button>
-                          )
-                        )}
+                            )
+                          )}
+                        </div>
                       </div>
                     </div>
                   </div>
@@ -889,5 +896,13 @@ export default function BuildsPage() {
         </DialogContent>
       </Dialog>
     </div>
+  )
+}
+
+export default function BuildsPage() {
+  return (
+    <BuildPageExtensionProvider>
+      <BuildsPageContent />
+    </BuildPageExtensionProvider>
   )
 }

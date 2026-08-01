@@ -1,5 +1,6 @@
 "use client";
 
+import React from "react";
 import { useRouter } from "next/navigation";
 import {
   ChevronRight, Layers, Bot, Database,
@@ -27,6 +28,7 @@ import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
+import { HomePageExtension } from "@/lib/home-page-extension";
 
 interface RecentTask {
   task_id: number | string;
@@ -535,6 +537,9 @@ export default function Home() {
           )}
 
         </div>
+      </div>
+      <div data-slot="home-page-extension" className="shrink-0">
+        <HomePageExtension />
       </div>
     </div>
   );

@@ -6,6 +6,7 @@ const apiRequestMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const routerReplaceMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
+const voiceInputState = vi.hoisted(() => ({ hasAsrModel: false }))
 
 vi.mock("@/lib/api-wrapper", async () => {
   const actual = await vi.importActual<typeof import("@/lib/api-wrapper")>(
@@ -52,7 +53,7 @@ vi.mock("@/lib/branding", () => ({
 vi.mock("@/components/voice-input-controller", () => ({
   useVoiceInputControls: () => ({
     status: "idle",
-    hasAsrModel: false,
+    hasAsrModel: voiceInputState.hasAsrModel,
     startRecording: vi.fn(),
     stopRecording: vi.fn(),
   }),
@@ -127,17 +128,93 @@ function deferred<T>() {
   return { promise, resolve, reject }
 }
 
-describe("BuildsPage Agent deletion", () => {
-  beforeEach(() => {
-    apiRequestMock.mockReset()
-    routerPushMock.mockReset()
-    routerReplaceMock.mockReset()
-    toastErrorMock.mockReset()
+function resetMocks() {
+  apiRequestMock.mockReset()
+  routerPushMock.mockReset()
+  routerReplaceMock.mockReset()
+  toastErrorMock.mockReset()
+  voiceInputState.hasAsrModel = false
+}
+
+describe("BuildsPage rendering", () => {
+  beforeEach(resetMocks)
+
+  afterEach(() => cleanup())
+
+  it("renders voice input in the create dialog", async () => {
+    apiRequestMock.mockResolvedValue(jsonResponse([]))
+    voiceInputState.hasAsrModel = true
+
+    render(<BuildsPage />)
+    await waitFor(() => {
+      expect(screen.queryByText("common.loading")).not.toBeInTheDocument()
+    })
+    fireEvent.click(screen.getByRole("button", {
+      name: "builds.list.header.create",
+    }))
+
+    expect(screen.getByRole("button", {
+      name: "voiceInput.start",
+    })).toBeInTheDocument()
   })
+
+  it("renders privileged actions for an editable Agent", async () => {
+    apiRequestMock.mockResolvedValue(jsonResponse([agent]))
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+
+    for (const name of [
+      "builds.list.actions.apiKey",
+      "builds.list.actions.triggers",
+      "builds.list.actions.publish",
+      "builds.list.actions.delete",
+      "builds.list.actions.edit",
+    ]) {
+      expect(screen.getByRole("button", { name })).toBeInTheDocument()
+    }
+    expect(screen.queryByRole("button", {
+      name: "builds.list.actions.viewConfig",
+    })).not.toBeInTheDocument()
+  })
+
+  it("limits a published read-only Agent to run and view actions", async () => {
+    apiRequestMock.mockResolvedValue(jsonResponse([{
+      ...agent,
+      status: "published",
+      can_edit: false,
+      can_publish: false,
+      can_delete: false,
+    }]))
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+
+    expect(screen.getByRole("button", {
+      name: "builds.list.actions.chat",
+    })).toBeInTheDocument()
+    expect(screen.getByRole("button", {
+      name: "builds.list.actions.viewConfig",
+    })).toBeInTheDocument()
+    for (const name of [
+      "builds.list.actions.apiKey",
+      "builds.list.actions.triggers",
+      "builds.list.actions.publish",
+      "builds.list.actions.delete",
+      "builds.list.actions.edit",
+    ]) {
+      expect(screen.queryByRole("button", { name })).not.toBeInTheDocument()
+    }
+  })
+})
+
+describe("BuildsPage Agent deletion", () => {
+  beforeEach(resetMocks)
 
   afterEach(() => cleanup())
 
   it("discards an eligible draft but waits for explicit Retry Delete", async () => {
+    expect(voiceInputState.hasAsrModel).toBe(false)
     let listRequests = 0
     let deleteRequests = 0
 
