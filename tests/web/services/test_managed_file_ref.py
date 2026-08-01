@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from xagent.core.file_storage.factory import get_unscoped_file_storage
+from xagent.core.file_storage.scoped import ScopedFileStorage, StorageKeyScopeError
 from xagent.core.file_storage.types import StoredObject
 from xagent.web.models.uploaded_file import UploadedFile
 from xagent.web.services.managed_file_ref import (
@@ -461,6 +462,13 @@ class SameSizeStaleStorage:
 
 
 def test_sync_to_durable_wraps_remote_write_failure(tmp_path):
+    """A backend fault genuinely is a durable-storage operation error.
+
+    Pairs with
+    ``test_sync_to_durable_propagates_scope_violation_unwrapped``: excluding
+    the namespace-authority types from that wrap must not turn it into
+    "propagate everything".
+    """
     source = tmp_path / "uploads" / "sync-fails.txt"
     source.parent.mkdir()
     source.write_text("sync content", encoding="utf-8")
@@ -471,6 +479,32 @@ def test_sync_to_durable_wraps_remote_write_failure(tmp_path):
 
     assert record.storage_status == "legacy"
     assert record.storage_key is None
+
+
+def test_sync_to_durable_propagates_scope_violation_unwrapped(monkeypatch, tmp_path):
+    """A key outside the bound prefix stays a ``StorageKeyScopeError``.
+
+    Folding it into ``DurableStorageOperationError`` would report a permanent
+    containment violation as the retryable storage outage that error means to
+    callers.
+    """
+    _configure_storage(monkeypatch, tmp_path)
+    source = tmp_path / "uploads" / "foreign-key.txt"
+    source.parent.mkdir()
+    source.write_text("scope content", encoding="utf-8")
+    record = _record(source, file_size=source.stat().st_size)
+    storage = ScopedFileStorage(
+        storage=get_unscoped_file_storage(), prefix="users/7/clients/3"
+    )
+    foreign_key = "users/7/clients/4/uploads/file-123/foreign-key.txt"
+
+    with pytest.raises(StorageKeyScopeError) as excinfo:
+        ManagedFileRef(record, storage=storage).sync_to_durable(storage_key=foreign_key)
+
+    assert not isinstance(excinfo.value, DurableStorageOperationError)
+    assert record.storage_status == "legacy"
+    assert record.storage_key is None
+    assert not get_unscoped_file_storage().exists(foreign_key)
 
 
 def test_ensure_local_wraps_remote_read_failure_when_local_missing(tmp_path):

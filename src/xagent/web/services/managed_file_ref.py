@@ -13,6 +13,7 @@ from typing import Any, BinaryIO, Literal, NoReturn, Protocol, cast
 from ...core.execution_scope import (
     EXECUTION_SCOPE_NOT_PROVIDED,
     ExecutionScope,
+    ExecutionScopeAuthorityError,
     ExecutionScopeInput,
     get_execution_scope,
     resolve_execution_scope,
@@ -21,6 +22,7 @@ from ...core.execution_scope import (
 from ...core.file_storage import (
     FsspecFileStorage,
     ScopedFileStorage,
+    StorageKeyScopeError,
     StoredObject,
     get_user_file_storage,
 )
@@ -49,6 +51,26 @@ class DurableStorageOperationError(RuntimeError):
 
 class DurableObjectIntegrityError(DurableStorageOperationError):
     """Raised when restored durable bytes do not match the DB checksum."""
+
+
+# Namespace-authority faults that must never be folded into
+# ``DurableStorageOperationError`` by the storage-call wraps below. That
+# fallback exists for *backend* faults -- an unreachable object store, a lost
+# metadata acknowledgement, a read that times out -- which callers surface as a
+# retryable "durable storage is temporarily unavailable". A containment
+# violation is not one of those: ``StorageKeyScopeError`` means the key falls
+# outside the prefix this handle is bound to (the key encodes the wrong
+# namespace, or the handle was bound to the wrong one), and
+# ``ExecutionScopeAuthorityError`` means the resolver and the persisted
+# snapshot disagree about which namespace the task owns. Both are permanent
+# configuration/authority faults that no retry can clear, so they propagate as
+# themselves and are classified once, at the application boundary (see the
+# handler registered in ``web/app.py``), instead of being reported as an
+# outage an operator would retry.
+_NAMESPACE_AUTHORITY_ERRORS: tuple[type[BaseException], ...] = (
+    StorageKeyScopeError,
+    ExecutionScopeAuthorityError,
+)
 
 
 class UploadedFileLocalPathRecord(Protocol):
@@ -306,6 +328,9 @@ class ManagedFileRef:
         except DurableObjectIntegrityError:
             temp_path.unlink(missing_ok=True)
             raise
+        except _NAMESPACE_AUTHORITY_ERRORS:
+            temp_path.unlink(missing_ok=True)
+            raise
         except Exception as exc:
             temp_path.unlink(missing_ok=True)
             raise DurableStorageOperationError(
@@ -333,6 +358,8 @@ class ManagedFileRef:
                 last_integrity_error = exc
                 if materialized_path is not None:
                     materialized_path.unlink(missing_ok=True)
+            except _NAMESPACE_AUTHORITY_ERRORS:
+                raise
             except Exception as exc:
                 raise DurableStorageOperationError(
                     f"Failed to materialize durable object: {self.storage_key}"
@@ -365,6 +392,8 @@ class ManagedFileRef:
                 content_type=content_type,
                 content_disposition=content_disposition,
             )
+        except _NAMESPACE_AUTHORITY_ERRORS:
+            raise
         except Exception as exc:
             raise DurableStorageOperationError(
                 f"Failed to sign durable object URL: {self.storage_key}"
@@ -418,6 +447,8 @@ class ManagedFileRef:
                 resolved_key,
                 mime_type or getattr(self.record, "mime_type", None),
             )
+        except _NAMESPACE_AUTHORITY_ERRORS:
+            raise
         except Exception as exc:
             raise DurableStorageOperationError(
                 f"Failed to write durable object: {resolved_key}"
@@ -435,6 +466,8 @@ class ManagedFileRef:
             stored_object = self.storage.stat(expected_key)
         except FileNotFoundError:
             return "missing"
+        except _NAMESPACE_AUTHORITY_ERRORS:
+            raise
         except Exception as exc:
             raise DurableStorageOperationError(
                 f"Failed to inspect durable object metadata: {expected_key}"
@@ -471,6 +504,8 @@ class ManagedFileRef:
         if not checksum:
             try:
                 checksum = self.storage.content_hash(expected_key)
+            except _NAMESPACE_AUTHORITY_ERRORS:
+                raise
             except Exception as exc:
                 raise DurableStorageOperationError(
                     f"Failed to inspect durable object metadata: {expected_key}"

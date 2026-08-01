@@ -20,10 +20,7 @@ from xagent.core.execution_scope import (
 from xagent.core.file_storage import StorageKeyScopeError
 from xagent.core.file_storage.factory import get_unscoped_file_storage
 from xagent.web.models.uploaded_file import UploadedFile
-from xagent.web.services.managed_file_ref import (
-    DurableStorageOperationError,
-    ManagedFileRef,
-)
+from xagent.web.services.managed_file_ref import ManagedFileRef
 
 _ISOLATED_SCOPE = ExecutionScope(
     workspace_segments=("clients", "3", "end_users", "7"),
@@ -94,24 +91,21 @@ def test_sync_to_durable_rejects_foreign_explicit_key(storage_env, tmp_path):
     source.write_text("data", encoding="utf-8")
     record = _record(source)
 
-    with pytest.raises(DurableStorageOperationError) as excinfo:
+    with pytest.raises(StorageKeyScopeError):
         ManagedFileRef(record).sync_to_durable(
             storage_key="users/8/uploads/file-123/source.txt"
         )
-    assert isinstance(excinfo.value.__cause__, StorageKeyScopeError)
     assert not get_unscoped_file_storage().exists("users/8/uploads/file-123/source.txt")
 
 
 def test_restore_rejects_foreign_storage_key(storage_env, tmp_path):
     record = _foreign_key_record(tmp_path / "uploads" / "missing.txt")
 
-    with pytest.raises(DurableStorageOperationError) as excinfo:
+    with pytest.raises(StorageKeyScopeError):
         ManagedFileRef(record).ensure_local()
-    assert isinstance(excinfo.value.__cause__, StorageKeyScopeError)
 
-    with pytest.raises(DurableStorageOperationError) as excinfo:
+    with pytest.raises(StorageKeyScopeError):
         ManagedFileRef(record).materialize()
-    assert isinstance(excinfo.value.__cause__, StorageKeyScopeError)
 
 
 def test_signed_url_never_issued_for_foreign_storage_key(storage_env, tmp_path):
@@ -149,11 +143,10 @@ def test_adopt_existing_object_rejects_foreign_expected_key(storage_env, tmp_pat
         b"foreign", "users/8/uploads/file-123/source.txt"
     )
 
-    with pytest.raises(DurableStorageOperationError) as excinfo:
+    with pytest.raises(StorageKeyScopeError):
         ManagedFileRef(record).adopt_existing_object(
             "users/8/uploads/file-123/source.txt"
         )
-    assert isinstance(excinfo.value.__cause__, StorageKeyScopeError)
 
 
 def test_separator_aware_scope_for_record_owner(storage_env, tmp_path):
