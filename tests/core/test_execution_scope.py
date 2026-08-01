@@ -55,13 +55,21 @@ def scope_log_records(level: int = logging.WARNING):
     functions actually read it from observes the call itself, so what is
     asserted is that the code logs, not that a particular logging setup
     delivers it.
+
+    ``level`` is the enablement the recorder itself reports, so code that asks
+    ``logger.isEnabledFor(...)`` before building a message gets a deterministic
+    answer from the recorder rather than from whatever the ambient logging
+    configuration happens to be. Every call that survives that check is
+    recorded verbatim; the caller filters.
     """
-    del level  # every recorded call is returned; the caller filters
 
     class _Recorder:
         def __init__(self, wrapped: logging.Logger) -> None:
             self._wrapped = wrapped
             self.records: list[str] = []
+
+        def isEnabledFor(self, asked: int) -> bool:  # noqa: N802 - logging API
+            return asked >= level
 
         def warning(self, msg: str, *args: object, **kwargs: object) -> None:
             self.records.append(msg % args if args else msg)
@@ -72,6 +80,10 @@ def scope_log_records(level: int = logging.WARNING):
             self._wrapped.error(msg, *args, **kwargs)
 
         def __getattr__(self, name: str) -> object:
+            # Deliberately does not cover ``isEnabledFor``: delegating that to
+            # the wrapped logger would put the ambient level and the global
+            # disable threshold back in charge of what the code under test
+            # does, which is what this helper exists to avoid.
             return getattr(self._wrapped, name)
 
     # The function's own globals: the binding it resolves `logger` against at
@@ -1581,7 +1593,7 @@ class TestShapeGateLogsFieldDiffLazily:
     needed for control flow, nothing downstream reads this one. It must
     therefore be computed only when that message will actually be emitted,
     since the gate runs on every turn for any snapshot that predates a
-    shape bump (see the class docstring reasoning in F3's fix)."""
+    shape bump."""
 
     def test_field_diff_not_computed_when_warning_is_disabled(self, monkeypatch):
         from xagent.core import execution_scope as scope_module
@@ -1592,23 +1604,20 @@ class TestShapeGateLogsFieldDiffLazily:
             )
 
         monkeypatch.setattr(scope_module, "_execution_scope_field_diff", boom)
-        original_level = scope_module.logger.level
-        scope_module.logger.setLevel(logging.ERROR)
-        try:
-            resolver_scope = ExecutionScope()
-            stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
-            del stale_data["version"]
-            stale_snapshot = ExecutionScope.from_dict(stale_data)
-            set_execution_scope_resolver(
-                lambda task_id: resolver_scope,
-                acknowledges_snapshot_candidate_contract=True,
-            )
-            set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
+        resolver_scope = ExecutionScope()
+        stale_data = ExecutionScope(sandbox_key_suffix="stale").to_dict()
+        del stale_data["version"]
+        stale_snapshot = ExecutionScope.from_dict(stale_data)
+        set_execution_scope_resolver(
+            lambda task_id: resolver_scope,
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        set_execution_scope_snapshot_loader(lambda task_id: stale_snapshot)
+        with scope_log_records(level=logging.ERROR) as records:
             # Gate behavior is unaffected by the logging level: the stale
             # snapshot is still ignored and the resolver's scope wins.
             assert resolve_execution_scope("1") == resolver_scope
-        finally:
-            scope_module.logger.setLevel(original_level)
+        assert records == []
 
     def test_field_diff_still_computed_and_logged_when_warning_is_enabled(self):
         """Positive mirror: with WARNING enabled (the default), the gate's
