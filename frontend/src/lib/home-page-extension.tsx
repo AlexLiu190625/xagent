@@ -1,3 +1,8 @@
-import type { HomePageExtensionComponent } from "@/lib/page-extension-contracts"
+import type {
+  HomeGetStartedDestinationOverrides,
+  HomePageExtensionComponent,
+} from "@/lib/page-extension-contracts"
 
 export const HomePageExtension: HomePageExtensionComponent = () => null
+
+export const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides = {}

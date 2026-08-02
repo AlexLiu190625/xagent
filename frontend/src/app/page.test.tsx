@@ -2,6 +2,7 @@ import React, { StrictMode } from "react"
 import { readFileSync } from "node:fs"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { HomeGetStartedDestinationOverrides } from "@/lib/page-extension-contracts"
 
 const apiRequestMock = vi.hoisted(() => vi.fn())
 const resolveTaskLlmSelectionMock = vi.hoisted(() => vi.fn())
@@ -13,6 +14,9 @@ const toastErrorMock = vi.hoisted(() => vi.fn())
 const localeMock = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
 const resolveAgentLogoUrlMock = vi.hoisted(() => vi.fn())
 const formatDisplayDateMock = vi.hoisted(() => vi.fn())
+const homeGetStartedDestinationOverridesMock = vi.hoisted(() => (
+  {} as HomeGetStartedDestinationOverrides
+))
 
 async function createHomeExtensionMock() {
   const ReactModule = await vi.importActual<typeof import("react")>("react")
@@ -21,7 +25,7 @@ async function createHomeExtensionMock() {
     homeExtensionRenderMock()
     return ReactModule.createElement("div", { "data-testid": "home-extension" })
   })
-  return { HomePageExtension }
+  return { HomePageExtension, homeGetStartedDestinationOverrides: homeGetStartedDestinationOverridesMock }
 }
 
 vi.mock("@/lib/api-wrapper", async () => {
@@ -209,6 +213,120 @@ function sourceSlice(source: string, start: string, end: string) {
   return source.slice(startIndex, endIndex)
 }
 
+function getStartedCard(title: string) {
+  const heading = screen.getByRole("heading", { name: title })
+  const card = heading.closest('[data-slot="card"]')
+  if (!(card instanceof HTMLDivElement)) throw new Error(`Get Started card not found: ${title}`)
+  const wrapper = card.parentElement
+  if (!(wrapper instanceof HTMLDivElement || wrapper instanceof HTMLAnchorElement)) {
+    throw new Error(`Get Started wrapper not found: ${title}`)
+  }
+  return { card, wrapper }
+}
+
+function expectInertGetStartedCard(title: string) {
+  const { card, wrapper } = getStartedCard(title)
+  const wrapperAndDescendants = [wrapper, ...Array.from(wrapper.querySelectorAll<HTMLElement | SVGElement>("*"))]
+  const inertInteractionSelector = [
+    "a",
+    "button",
+    "input",
+    "select",
+    "textarea",
+    "[tabindex]:not([tabindex='-1'])",
+    "[role='button']",
+    "[role='checkbox']",
+    "[role='combobox']",
+    "[role='link']",
+    "[role='menuitem']",
+    "[role='menuitemcheckbox']",
+    "[role='menuitemradio']",
+    "[role='option']",
+    "[role='radio']",
+    "[role='searchbox']",
+    "[role='slider']",
+    "[role='spinbutton']",
+    "[role='switch']",
+    "[role='tab']",
+    "[role='treeitem']",
+    "[contenteditable]",
+    "summary",
+    "details",
+    "iframe",
+    "object",
+    "embed",
+    "video[controls]",
+    "audio[controls]",
+    "[draggable='true']",
+  ].join(", ")
+  expect(wrapper.tagName).toBe("DIV")
+  expect(wrapper).not.toHaveAttribute("role")
+  expect(wrapper).not.toHaveAttribute("tabindex")
+  expect(wrapper.tabIndex).toBe(-1)
+  for (const className of [
+    "rounded-xl",
+    "outline-none",
+    "group",
+    "cursor-pointer",
+    "hover:shadow-md",
+    "focus-visible:outline-none",
+    "focus-visible:ring-2",
+    "focus-visible:ring-ring",
+    "focus-visible:ring-offset-2",
+    "focus-visible:ring-offset-background",
+  ]) {
+    expect(wrapper).not.toHaveClass(className)
+  }
+  for (const className of ["group", "cursor-pointer", "hover:shadow-md"]) {
+    expect(card).not.toHaveClass(className)
+  }
+  expect(wrapperAndDescendants.filter((element) => element.matches(inertInteractionSelector))).toHaveLength(0)
+  const wrapperAndDescendantClassTokens = wrapperAndDescendants
+    .flatMap((element) => (element.getAttribute("class") ?? "").split(/\s+/).filter(Boolean))
+  expect(wrapperAndDescendantClassTokens.some((className) => (
+    className.includes("hover")
+    || className.includes("focus-visible")
+    || className.includes("group")
+    || className.includes("cursor-")
+    || /(?:^|:)!?\[cursor:[^\]]+\]$/.test(className)
+  ))).toBe(false)
+  expect(wrapperAndDescendants.some((element) => (element.getAttribute("style") ?? "").trim() !== "")).toBe(false)
+  expect(wrapperAndDescendants.some((element) => (element.getAttribute("cursor") ?? "").trim() !== "")).toBe(false)
+}
+
+function expectLinkedGetStartedCard(title: string, href: string) {
+  const { card, wrapper } = getStartedCard(title)
+  expect(wrapper).toBeInstanceOf(HTMLAnchorElement)
+  expect(wrapper).toHaveAttribute("href", href)
+  expect(wrapper).toHaveAttribute("target", "_blank")
+  expect(wrapper).toHaveAttribute("rel", "noopener noreferrer")
+  expect(wrapper).not.toHaveAttribute("tabindex")
+  expect(wrapper.tabIndex).toBe(0)
+  wrapper.focus()
+  expect(wrapper).toHaveFocus()
+  expect(wrapper).toHaveClass(
+    "focus-visible:outline-none",
+    "focus-visible:ring-2",
+    "focus-visible:ring-ring",
+    "focus-visible:ring-offset-2",
+    "focus-visible:ring-offset-background",
+    "rounded-xl",
+  )
+  expect(card).toHaveClass("group", "cursor-pointer", "hover:shadow-md")
+  expect(card.querySelector("h3")).toHaveClass("group-hover:text-primary")
+  if (title === "home.getStarted.guides.title") {
+    expect(card.querySelector("svg")?.parentElement).toHaveClass("group-hover:scale-110")
+  }
+}
+
+function restoreIntersectionObserver(descriptor: PropertyDescriptor | undefined) {
+  if (descriptor) {
+    Object.defineProperty(globalThis, "IntersectionObserver", descriptor)
+  } else {
+    delete (globalThis as { IntersectionObserver?: typeof IntersectionObserver }).IntersectionObserver
+  }
+}
+
 function templateUrl(locale = localeMock.value) {
   return `http://api.local/api/templates/?lang=${locale}`
 }
@@ -227,6 +345,9 @@ describe("Home", () => {
   }
 
   beforeEach(() => {
+    delete homeGetStartedDestinationOverridesMock.docs
+    delete homeGetStartedDestinationOverridesMock.guides
+    delete homeGetStartedDestinationOverridesMock.whatsNew
     apiRequestMock.mockReset()
     resolveTaskLlmSelectionMock.mockReset()
     homeExtensionRenderMock.mockClear()
@@ -272,6 +393,7 @@ describe("Home", () => {
     vi.resetModules()
     try {
       const { default: DefaultHome } = await import("./page")
+      const defaultExtension = await import("@/lib/home-page-extension")
       const { container } = render(<DefaultHome />)
       const slot = container.querySelector('[data-slot="home-page-extension"]')
 
@@ -279,10 +401,330 @@ describe("Home", () => {
       expect(slot).toHaveClass("shrink-0", { exact: true })
       expect(slot).not.toHaveAttribute("style")
       expect(slot).toBeEmptyDOMElement()
+      expect(defaultExtension.homeGetStartedDestinationOverrides).toEqual({})
     } finally {
       vi.doMock("@/lib/home-page-extension", createHomeExtensionMock)
       vi.resetModules()
     }
+    const restoredMock = await import("@/lib/home-page-extension")
+    expect(restoredMock.homeGetStartedDestinationOverrides).toBe(homeGetStartedDestinationOverridesMock)
+    const { default: RestoredHome } = await import("./page")
+    render(<RestoredHome />)
+    expect(await screen.findByTestId("home-extension")).toBeInTheDocument()
+    expect(homeExtensionRenderMock).toHaveBeenCalledTimes(1)
+  })
+
+  it("resolves canonical and distinct configured Get Started destinations per key", () => {
+    render(<Home />)
+
+    expectLinkedGetStartedCard("home.getStarted.docs.title", "https://docs.xagent.co/api-reference/introduction")
+    expectLinkedGetStartedCard("home.getStarted.guides.title", "https://docs.xagent.co/models/overview")
+    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+    expectInertGetStartedCard("home.getStarted.video.title")
+
+    cleanup()
+    homeGetStartedDestinationOverridesMock.docs = "/docs with internal space"
+    homeGetStartedDestinationOverridesMock.guides = "custom-guide:destination"
+    homeGetStartedDestinationOverridesMock.whatsNew = "  /whats-new  "
+    render(<Home />)
+
+    expectLinkedGetStartedCard("home.getStarted.docs.title", "/docs with internal space")
+    expectLinkedGetStartedCard("home.getStarted.guides.title", "custom-guide:destination")
+    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "  /whats-new  ")
+    expect(getStartedCard("home.getStarted.video.title").wrapper.querySelector("a")).toBeNull()
+  })
+
+  it("rejects pointer, hover, focus, native, inline-style, SVG, and media-control affordances injected into an inert card", () => {
+    render(<Home />)
+    const { card, wrapper } = getStartedCard("home.getStarted.video.title")
+    const video = card.querySelector("video")
+    if (!(video instanceof HTMLVideoElement)) throw new Error("Tutorial video was not eagerly loaded")
+    const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg")
+    card.append(svg)
+    expectInertGetStartedCard("home.getStarted.video.title")
+    try {
+      card.classList.add("cursor-pointer")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("cursor-pointer")
+
+      card.classList.add("cursor-[pointer]")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("cursor-[pointer]")
+
+      card.classList.add("[cursor:pointer]")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("[cursor:pointer]")
+
+      card.classList.add("dark:![cursor:pointer]")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("dark:![cursor:pointer]")
+
+      card.classList.add("hover:shadow-lg")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("hover:shadow-lg")
+
+      card.classList.add("dark:hover:shadow-lg")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("dark:hover:shadow-lg")
+
+      card.classList.add("[&:hover]:shadow-lg")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("[&:hover]:shadow-lg")
+
+      card.classList.add("group-hover/get-started:shadow-lg")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      card.classList.remove("group-hover/get-started:shadow-lg")
+
+      wrapper.classList.add("focus-visible:ring-2")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      wrapper.classList.remove("focus-visible:ring-2")
+
+      wrapper.setAttribute("style", "cursor: url(/pointer.cur), pointer")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      wrapper.removeAttribute("style")
+
+      wrapper.setAttribute("contenteditable", "true")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      wrapper.removeAttribute("contenteditable")
+
+      wrapper.setAttribute("draggable", "true")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      wrapper.removeAttribute("draggable")
+
+      svg.setAttribute("class", "hover:shadow-lg")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      svg.removeAttribute("class")
+
+      svg.setAttribute("cursor", "pointer")
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+      svg.removeAttribute("cursor")
+
+      video.controls = true
+      expect(() => expectInertGetStartedCard("home.getStarted.video.title")).toThrow()
+    } finally {
+      card.classList.remove("cursor-pointer")
+      card.classList.remove("cursor-[pointer]")
+      card.classList.remove("[cursor:pointer]")
+      card.classList.remove("dark:![cursor:pointer]")
+      card.classList.remove("hover:shadow-lg")
+      card.classList.remove("dark:hover:shadow-lg")
+      card.classList.remove("[&:hover]:shadow-lg")
+      card.classList.remove("group-hover/get-started:shadow-lg")
+      wrapper.classList.remove("focus-visible:ring-2")
+      wrapper.removeAttribute("style")
+      wrapper.removeAttribute("contenteditable")
+      wrapper.removeAttribute("draggable")
+      svg.remove()
+      video.controls = false
+    }
+  })
+
+  it("keeps null, blank, and runtime-invalid configured destinations inert without affecting siblings", () => {
+    const invalidValues: unknown[] = [
+      1,
+      true,
+      {},
+      [],
+      new String("boxed"),
+      (globalThis as { BigInt: (value: number) => bigint }).BigInt(1),
+      Symbol("destination"),
+      () => "/not-used",
+    ]
+
+    homeGetStartedDestinationOverridesMock.docs = null
+    homeGetStartedDestinationOverridesMock.guides = null
+    homeGetStartedDestinationOverridesMock.whatsNew = null
+    const nullView = render(<Home />)
+    expectInertGetStartedCard("home.getStarted.docs.title")
+    expectInertGetStartedCard("home.getStarted.guides.title")
+    expectInertGetStartedCard("home.getStarted.whatsNew.title")
+    expectInertGetStartedCard("home.getStarted.video.title")
+    nullView.unmount()
+
+    for (const invalid of [null, "", " \t\n", "\u00a0", ...invalidValues]) {
+      for (const key of ["docs", "guides", "whatsNew"] as const) {
+        delete homeGetStartedDestinationOverridesMock.docs
+        delete homeGetStartedDestinationOverridesMock.guides
+        delete homeGetStartedDestinationOverridesMock.whatsNew
+        if (key === "docs") homeGetStartedDestinationOverridesMock.guides = "/valid-guides"
+        if (key === "guides") homeGetStartedDestinationOverridesMock.docs = "/valid-docs"
+        if (key === "whatsNew") homeGetStartedDestinationOverridesMock.docs = "/valid-docs"
+        ;(homeGetStartedDestinationOverridesMock as Record<string, unknown>)[key] = invalid
+        const { unmount } = render(<Home />)
+
+        if (key === "docs") {
+          expectInertGetStartedCard("home.getStarted.docs.title")
+          expectLinkedGetStartedCard("home.getStarted.guides.title", "/valid-guides")
+          expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+        } else if (key === "guides") {
+          expectLinkedGetStartedCard("home.getStarted.docs.title", "/valid-docs")
+          expectInertGetStartedCard("home.getStarted.guides.title")
+          expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+        } else {
+          expectLinkedGetStartedCard("home.getStarted.docs.title", "/valid-docs")
+          expectLinkedGetStartedCard("home.getStarted.guides.title", "https://docs.xagent.co/models/overview")
+          expectInertGetStartedCard("home.getStarted.whatsNew.title")
+        }
+        expectInertGetStartedCard("home.getStarted.video.title")
+        unmount()
+      }
+    }
+  })
+
+  it("resolves a mixed custom, null, and undefined destination row independently", () => {
+    homeGetStartedDestinationOverridesMock.docs = "custom:docs"
+    homeGetStartedDestinationOverridesMock.guides = null
+    delete homeGetStartedDestinationOverridesMock.whatsNew
+    render(<Home />)
+
+    expectLinkedGetStartedCard("home.getStarted.docs.title", "custom:docs")
+    expectInertGetStartedCard("home.getStarted.guides.title")
+    expectLinkedGetStartedCard("home.getStarted.whatsNew.title", "https://docs.xagent.co/release-notes")
+    expect([
+      "home.getStarted.video.title",
+      "home.getStarted.docs.title",
+      "home.getStarted.guides.title",
+      "home.getStarted.whatsNew.title",
+    ].filter((title) => getStartedCard(title).wrapper instanceof HTMLAnchorElement)).toHaveLength(2)
+  })
+
+  it("observes both video cards with exact options and loads each only after its own intersection", async () => {
+    const originalIntersectionObserverDescriptor = Object.getOwnPropertyDescriptor(globalThis, "IntersectionObserver")
+    const observe = vi.fn()
+    const disconnect = vi.fn()
+    let callback: IntersectionObserverCallback | undefined
+    let options: IntersectionObserverInit | undefined
+    let view: ReturnType<typeof render> | undefined
+    class FakeIntersectionObserver {
+      root = null
+      rootMargin = ""
+      thresholds: readonly number[] = []
+      constructor(nextCallback: IntersectionObserverCallback, nextOptions?: IntersectionObserverInit) {
+        callback = nextCallback
+        options = nextOptions
+      }
+      observe = observe
+      unobserve = vi.fn()
+      disconnect = disconnect
+      takeRecords = () => [] as IntersectionObserverEntry[]
+    }
+
+    Object.defineProperty(globalThis, "IntersectionObserver", {
+      configurable: true,
+      writable: true,
+      value: FakeIntersectionObserver,
+    })
+    homeGetStartedDestinationOverridesMock.docs = null
+    try {
+      view = render(<Home />)
+      const videoTargets = Array.from(document.querySelectorAll<HTMLElement>("[data-get-started-video='true']"))
+      expectInertGetStartedCard("home.getStarted.docs.title")
+      expect(options).toEqual({ rootMargin: "200px 0px", threshold: 0.1 })
+      expect(observe).toHaveBeenCalledTimes(2)
+      expect(observe.mock.calls[0][0]).toBe(videoTargets[0])
+      expect(observe.mock.calls[1][0]).toBe(videoTargets[1])
+      expect(videoTargets.map((target) => target.dataset.videoIndex)).toEqual(["0", "1"])
+      expect(videoTargets[0].querySelector("video")).toBeNull()
+      expect(videoTargets[1].querySelector("video")).toBeNull()
+      expect(videoTargets[0].querySelector("svg")).toBeInTheDocument()
+      expect(videoTargets[1].querySelector("svg")).toBeInTheDocument()
+      expect(document.querySelectorAll("video")).toHaveLength(0)
+      if (!callback) throw new Error("IntersectionObserver callback was not registered")
+
+      await act(async () => callback?.([
+        { isIntersecting: false, target: videoTargets[0] },
+        { isIntersecting: false, target: videoTargets[1] },
+      ] as unknown as IntersectionObserverEntry[], {} as IntersectionObserver))
+      expect(document.querySelectorAll("video")).toHaveLength(0)
+      expect(videoTargets[0].querySelector("video")).toBeNull()
+      expect(videoTargets[1].querySelector("video")).toBeNull()
+      expect(videoTargets[0].querySelector("svg")).toBeInTheDocument()
+      expect(videoTargets[1].querySelector("svg")).toBeInTheDocument()
+
+      await act(async () => callback?.([
+        { isIntersecting: true, target: videoTargets[1] },
+      ] as unknown as IntersectionObserverEntry[], {} as IntersectionObserver))
+      expect(document.querySelector('video[src="/videos/Documentation.mp4"]')).toBeInTheDocument()
+      expect(document.querySelector('video[src="/videos/Tutorial.mp4"]')).toBeNull()
+
+      await act(async () => callback?.([
+        { isIntersecting: true, target: videoTargets[0] },
+      ] as unknown as IntersectionObserverEntry[], {} as IntersectionObserver))
+      expect(document.querySelector('video[src="/videos/Tutorial.mp4"]')).toBeInTheDocument()
+      expect(document.querySelector('video[src="/videos/Documentation.mp4"]')).toBeInTheDocument()
+      view.unmount()
+      view = undefined
+      expect(disconnect).toHaveBeenCalledTimes(1)
+    } finally {
+      view?.unmount()
+      restoreIntersectionObserver(originalIntersectionObserverDescriptor)
+      expect(Object.getOwnPropertyDescriptor(globalThis, "IntersectionObserver")).toEqual(originalIntersectionObserverDescriptor)
+    }
+  })
+
+  it("continues observing disabled destinations and eagerly loads both videos without IntersectionObserver", () => {
+    const originalIntersectionObserverDescriptor = Object.getOwnPropertyDescriptor(globalThis, "IntersectionObserver")
+    homeGetStartedDestinationOverridesMock.docs = null
+    let view: ReturnType<typeof render> | undefined
+    try {
+      Object.defineProperty(globalThis, "IntersectionObserver", {
+        configurable: true,
+        writable: true,
+        value: undefined,
+      })
+      view = render(<Home />)
+      expectInertGetStartedCard("home.getStarted.docs.title")
+      expect(document.querySelector('video[src="/videos/Tutorial.mp4"]')).toBeInTheDocument()
+      expect(document.querySelector('video[src="/videos/Documentation.mp4"]')).toBeInTheDocument()
+      view.unmount()
+      view = undefined
+    } finally {
+      view?.unmount()
+      restoreIntersectionObserver(originalIntersectionObserverDescriptor)
+      expect(Object.getOwnPropertyDescriptor(globalThis, "IntersectionObserver")).toEqual(originalIntersectionObserverDescriptor)
+    }
+  })
+
+  it("keeps the Home replacement contract, resolver, interaction owner, and cumulative manifest non-vacuously source-locked", () => {
+    const contractsSource = readFileSync("src/lib/page-extension-contracts.ts", "utf8")
+    const extensionSource = readFileSync("src/lib/home-page-extension.tsx", "utf8")
+    const pageSource = readFileSync("src/app/page.tsx", "utf8")
+    const packageJson = JSON.parse(readFileSync("package.json", "utf8")) as { scripts: Record<string, string> }
+    const expectedManifest = "vitest run --config vitest.config.ts src/app/build/ src/app/page.test.tsx src/lib/models.test.ts src/lib/task-create.test.ts src/i18n/translations.test.ts src/lib/utils.test.ts src/lib/time-utils.test.ts"
+    const contractInterface = sourceSlice(
+      contractsSource,
+      "export interface HomeGetStartedDestinationOverrides",
+      "// The page guarantees a stable Provider lifetime and agentId join key.",
+    )
+    const resolver = sourceSlice(pageSource, "function resolveHomeGetStartedDestination(", "export default function Home()")
+    const cardRender = sourceSlice(pageSource, "{[", "          {/* Build agents with templates */}")
+
+    expect(contractInterface).toMatch(/docs\?: string \| null/)
+    expect(contractInterface).toMatch(/guides\?: string \| null/)
+    expect(contractInterface).toMatch(/whatsNew\?: string \| null/)
+    expect(contractInterface.match(/\?: string \| null/g)).toHaveLength(3)
+    expect(contractInterface.match(/^\s+\w+\??:/gm)).toHaveLength(3)
+    expect(contractInterface).not.toContain("tutorial")
+    expect(extensionSource).toMatch(/export const homeGetStartedDestinationOverrides: HomeGetStartedDestinationOverrides = \{\}/)
+    expect(pageSource).toMatch(/const configuredHomeGetStartedDestinationOverrides:\s*HomeGetStartedDestinationOverrides = homeGetStartedDestinationOverrides/)
+    expect(pageSource).toMatch(/const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = \{/)
+    expect(resolver).toContain("configured === undefined")
+    expect(resolver).toContain("typeof configured !== \"string\"")
+    expect(resolver).toContain("configured.trim().length === 0")
+    expect(resolver).toContain("return configured")
+    expect(resolver).not.toMatch(/\?\?|return configured\.trim\(\)/)
+    expect(cardRender).toContain("const isLinked = typeof card.link === \"string\"")
+    expect(cardRender).toContain("isLinked &&")
+    expect(cardRender).toContain("focus-visible:ring-2")
+    expect(cardRender).not.toMatch(/\bon[A-Z][A-Za-z]*|\btabIndex\b|\brole\b|\bcontrols\b|\bstyle\b|\bcursor\s*=|\bcontentEditable\b|\bsuppressContentEditableWarning\b|\bdraggable\b|\{\s*\.\.\./)
+    const destinationCalls = Array.from(cardRender.matchAll(
+      /resolveHomeGetStartedDestination\(configuredHomeGetStartedDestinationOverrides\.(docs|guides|whatsNew), defaultHomeGetStartedDestinations\.\1\)/g,
+    )).map((match) => match[1])
+    expect(destinationCalls).toEqual(["docs", "guides", "whatsNew"])
+    expect(cardRender.match(/resolveHomeGetStartedDestination\(/g)).toHaveLength(3)
+    expect(cardRender.match(/defaultHomeGetStartedDestinations\./g)).toHaveLength(3)
+    expect(cardRender).not.toMatch(/https:\/\/docs\.xagent\.co\//)
+    expect(packageJson.scripts["test:home-build-pages"]).toBe(expectedManifest)
   })
 
   it("uses the shared resolver, real task body parser, and ordered successful commit", async () => {

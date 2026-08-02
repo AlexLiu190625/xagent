@@ -21,7 +21,7 @@ import {
 import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
 import { apiRequest, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
-import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils";
+import { cn, getApiUrl, resolveAgentLogoUrl } from "@/lib/utils";
 import { formatDisplayDate } from "@/lib/time-utils";
 import { resolveTaskLlmSelection } from "@/lib/models";
 import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create";
@@ -30,7 +30,11 @@ import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
-import { HomePageExtension } from "@/lib/home-page-extension";
+import {
+  HomePageExtension,
+  homeGetStartedDestinationOverrides,
+} from "@/lib/home-page-extension";
+import type { HomeGetStartedDestinationOverrides } from "@/lib/page-extension-contracts";
 import { toast } from "@/components/ui/sonner";
 
 interface HomeTemplateConnection {
@@ -140,6 +144,24 @@ function decodeRecentTasks(value: unknown): RecentTask[] | null {
     tasks.push(decoded);
   }
   return tasks;
+}
+
+const configuredHomeGetStartedDestinationOverrides:
+  HomeGetStartedDestinationOverrides = homeGetStartedDestinationOverrides
+
+const defaultHomeGetStartedDestinations: Record<keyof HomeGetStartedDestinationOverrides, string> = {
+  docs: "https://docs.xagent.co/api-reference/introduction",
+  guides: "https://docs.xagent.co/models/overview",
+  whatsNew: "https://docs.xagent.co/release-notes",
+}
+
+function resolveHomeGetStartedDestination(
+  configured: unknown,
+  defaultDestination: string,
+): string | null {
+  if (configured === undefined) return defaultDestination
+  if (typeof configured !== "string" || configured.trim().length === 0) return null
+  return configured
 }
 
 export default function Home() {
@@ -491,14 +513,18 @@ export default function Home() {
           <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.getStarted.title")}</h2>
           <div ref={getStartedSectionRef} className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4 mb-10">
             {[
-              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4" },
-              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: "https://docs.xagent.co/api-reference/introduction" },
-              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: "https://docs.xagent.co/models/overview" },
-              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: "https://docs.xagent.co/release-notes" }
+              { title: t("home.getStarted.video.title"), desc: t("home.getStarted.video.description", { appName: branding.appName }), video: "/videos/Tutorial.mp4", link: null },
+              { title: t("home.getStarted.docs.title"), desc: t("home.getStarted.docs.description"), video: "/videos/Documentation.mp4", link: resolveHomeGetStartedDestination(configuredHomeGetStartedDestinationOverrides.docs, defaultHomeGetStartedDestinations.docs) },
+              { title: t("home.getStarted.guides.title"), desc: t("home.getStarted.guides.description"), icon: <ListChecks className="w-8 h-8 text-green-500" />, bg: "bg-green-50 dark:bg-green-950/30", link: resolveHomeGetStartedDestination(configuredHomeGetStartedDestinationOverrides.guides, defaultHomeGetStartedDestinations.guides) },
+              { title: t("home.getStarted.whatsNew.title"), desc: t("home.getStarted.whatsNew.description"), icon: <Sparkles className="w-8 h-8 text-orange-500" />, bg: "bg-orange-50 dark:bg-orange-950/30", link: resolveHomeGetStartedDestination(configuredHomeGetStartedDestinationOverrides.whatsNew, defaultHomeGetStartedDestinations.whatsNew) }
             ].map((card, i) => {
               const shouldLoadVideo = card.video ? visibleGetStartedVideos.has(i) : false;
+              const isLinked = typeof card.link === "string";
               const cardContent = (
-                <Card className="py-0 gap-0 overflow-hidden border-border/60 hover:shadow-md transition-all duration-300 group cursor-pointer bg-card rounded-xl flex flex-col h-full">
+                <Card className={cn(
+                  "py-0 gap-0 overflow-hidden border-border/60 transition-all duration-300 bg-card rounded-xl flex flex-col h-full",
+                  isLinked && "hover:shadow-md group cursor-pointer",
+                )}>
                   <div
                     className={`h-[180px] relative flex items-center justify-center overflow-hidden ${card.video ? 'bg-muted' : card.bg}`}
                     data-get-started-video={card.video ? "true" : undefined}
@@ -524,24 +550,30 @@ export default function Home() {
                         </div>
                       )
                     ) : (
-                      <div className="group-hover:scale-110 transition-transform duration-300">
+                      <div className={cn(
+                        "transition-transform duration-300",
+                        isLinked && "group-hover:scale-110",
+                      )}>
                         {card.icon}
                       </div>
                     )}
                   </div>
                   <CardContent className="p-4 flex-1">
-                    <h3 className="font-semibold text-[13px] mb-1 group-hover:text-primary transition-colors">{card.title}</h3>
+                    <h3 className={cn(
+                      "font-semibold text-[13px] mb-1 transition-colors",
+                      isLinked && "group-hover:text-primary",
+                    )}>{card.title}</h3>
                     <p className="text-[12px] text-muted-foreground leading-relaxed">{card.desc}</p>
                   </CardContent>
                 </Card>
               );
 
-              return card.link ? (
-                <a key={i} href={card.link} target="_blank" rel="noopener noreferrer" className="block outline-none">
+              return isLinked ? (
+                <a key={i} href={card.link!} target="_blank" rel="noopener noreferrer" className="block rounded-xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background">
                   {cardContent}
                 </a>
               ) : (
-                <div key={i} className="block outline-none">
+                <div key={i} className="block">
                   {cardContent}
                 </div>
               );
