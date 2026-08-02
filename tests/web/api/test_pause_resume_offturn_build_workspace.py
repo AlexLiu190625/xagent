@@ -38,9 +38,9 @@ import pytest
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.config import get_uploads_dir
 from xagent.core.execution_scope import (
+    DeferToSnapshot,
     ExecutionScope,
     ExecutionScopeAbstentionMismatchError,
-    defer_to_snapshot,
     scope_fingerprint,
     set_execution_scope_snapshot_loader,
 )
@@ -293,7 +293,7 @@ async def test_resume_cache_miss_builds_under_resolver_namespace_not_snapshot(
 async def test_pause_abstention_mismatch_fails_closed_with_no_workspace_residue(
     monkeypatch: pytest.MonkeyPatch, tmp_path
 ) -> None:
-    """Resolver ABSTAINS (``defer_to_snapshot``) and the snapshot WIDENS the
+    """Resolver ABSTAINS (``DeferToSnapshot``) and the snapshot WIDENS the
     abstention's fallback: this is the
     ``ExecutionScopeAbstentionMismatchError`` path, which
     ``resolve_execution_scope_off_turn`` re-raises instead of downgrading --
@@ -304,9 +304,7 @@ async def test_pause_abstention_mismatch_fails_closed_with_no_workspace_residue(
     uploads_root.mkdir()
     monkeypatch.setenv("XAGENT_UPLOADS_DIR", str(uploads_root))
 
-    register_scope_resolver(
-        lambda task_id: defer_to_snapshot(fallback=ExecutionScope())
-    )
+    register_scope_resolver(lambda task_id: DeferToSnapshot(fallback=ExecutionScope()))
     set_execution_scope_snapshot_loader(
         lambda task_id: ExecutionScope(workspace_segments=("wider",))
     )

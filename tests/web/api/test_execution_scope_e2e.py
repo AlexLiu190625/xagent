@@ -28,8 +28,8 @@ import pytest
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.config import get_uploads_dir
 from xagent.core.execution_scope import (
+    DeferToSnapshot,
     ExecutionScope,
-    defer_to_snapshot,
     scope_fingerprint,
     set_execution_scope_snapshot_loader,
 )
@@ -261,7 +261,7 @@ async def test_two_scopes_under_one_user_are_disjoint_everywhere() -> None:
 async def test_delegated_task_builds_scoped_from_persisted_snapshot() -> None:
     """A delegated task the embedder does not own: the snapshot drives the build.
 
-    This is what :func:`defer_to_snapshot` exists for. The resolver cannot
+    This is what :class:`DeferToSnapshot` exists for. The resolver cannot
     supply the namespace because it does not know it -- that is why it defers
     -- so its fallback claims no scoping at all, and it says so explicitly
     with ``snapshot_defines_namespace=True``. Without that declaration the
@@ -270,7 +270,7 @@ async def test_delegated_task_builds_scoped_from_persisted_snapshot() -> None:
     ``tests/core/test_execution_scope.py``).
     """
     register_scope_resolver(
-        lambda task_id: defer_to_snapshot(
+        lambda task_id: DeferToSnapshot(
             fallback=ExecutionScope(strict_memory_isolation=True),
             snapshot_defines_namespace=True,
         ),
@@ -290,7 +290,7 @@ async def test_delegated_task_builds_scoped_from_persisted_snapshot() -> None:
 async def test_resolver_authoritative_unscoped_ignores_persisted_snapshot() -> None:
     """``None`` from the resolver is authoritative unscoped for the task, not
     an abstention: a persisted snapshot is not consulted at all, unlike the
-    :func:`defer_to_snapshot` case above."""
+    :class:`DeferToSnapshot` case above."""
     register_scope_resolver(lambda task_id: None)
     set_execution_scope_snapshot_loader(
         lambda task_id: SCOPE_A if task_id == "42" else None

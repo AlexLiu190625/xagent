@@ -29,7 +29,6 @@ from xagent.core.execution_scope import (
     ExecutionScopeContext,
     ExecutionScopeResolverContractError,
     InvalidScopeComponentError,
-    defer_to_snapshot,
     execution_scope_from_agent_config,
     execution_scope_resolver_registered,
     get_execution_scope,
@@ -71,6 +70,10 @@ def scope_log_records(level: int = logging.WARNING):
 
         def isEnabledFor(self, asked: int) -> bool:  # noqa: N802 - logging API
             return asked >= level
+
+        def info(self, msg: str, *args: object, **kwargs: object) -> None:
+            self.records.append(msg % args if args else msg)
+            self._wrapped.info(msg, *args, **kwargs)
 
         def warning(self, msg: str, *args: object, **kwargs: object) -> None:
             self.records.append(msg % args if args else msg)
@@ -535,24 +538,33 @@ class TestDeferToSnapshot:
 
     def test_requires_an_execution_scope_fallback(self):
         with pytest.raises(TypeError):
-            defer_to_snapshot("not-a-scope")
+            DeferToSnapshot("not-a-scope")
 
     def test_carrier_is_not_an_execution_scope(self):
-        carrier = defer_to_snapshot(ExecutionScope())
+        carrier = DeferToSnapshot(ExecutionScope())
         assert isinstance(carrier, DeferToSnapshot)
         assert isinstance(carrier, ExecutionScope) is False
 
     def test_carrier_has_no_public_bare_singleton(self):
-        """Only the fallback-carrying factory is exported -- a bare
+        """The fallback-carrying class is the only way to abstain -- a bare
         module-level sentinel would let "defer" mean "unscoped on miss"
         implicitly instead of requiring an explicit fallback."""
         import xagent.core.execution_scope as scope_module
 
         assert not hasattr(scope_module, "DEFER_TO_SNAPSHOT")
 
+    def test_no_passthrough_factory_duplicates_the_carrier(self):
+        """One concept, one public name. The class holds the abstention
+        contract and its own construction-time validation, so a module-level
+        factory wrapping it would be a second spelling resolver authors have
+        to choose between, and a second place validation could drift to."""
+        import xagent.core.execution_scope as scope_module
+
+        assert not hasattr(scope_module, "defer_to_snapshot")
+
     def test_carrier_exposes_the_fallback(self):
         fallback = ExecutionScope(sandbox_key_suffix="fallback")
-        assert defer_to_snapshot(fallback).fallback == fallback
+        assert DeferToSnapshot(fallback).fallback == fallback
 
 
 class TestSetExecutionScopeResolverAckToken:
@@ -755,27 +767,70 @@ class TestFromDictUntrustedFieldCoercion:
     misread/truncate the value.
     """
 
-    # --- version: never raises, never truncates ---------------------------
+    # --- version: readable, or a malformed-snapshot fault -----------------
+    #
+    # ``0`` is the marker for an authentic snapshot written before the field
+    # existed, and that marker is trusted: the older half of the shape-version
+    # gate is relaxed on the ``snapshot_defines_namespace=True`` branch, where
+    # such a snapshot's namespace fields are used verbatim. An unreadable
+    # value must therefore not decode to it.
 
-    @pytest.mark.parametrize("raw_version", ["abc", {"a": 1}, [1], object()])
-    def test_from_dict_malformed_version_is_treated_as_stale_not_raised(
+    @pytest.mark.parametrize(
+        "raw_version", ["abc", {"a": 1}, [1], object(), 1.5, True, -5]
+    )
+    def test_from_dict_unreadable_version_raises_instead_of_claiming_legacy(
         self, raw_version
     ):
+        """Every shape that is not a readable version is a malformed persisted
+        snapshot, not an old one. ``1.5`` and ``True`` are here because a bare
+        ``int()`` turns them into ``1`` -- a claim to be the current shape --
+        and ``-5`` because "older than every version that ever existed" would
+        borrow the legacy marker's verbatim-namespace trust for a value no
+        writer emits (``to_dict`` always stamps the current constant)."""
         data = ExecutionScope(sandbox_key_suffix="x").to_dict()
         data["version"] = raw_version
-        assert ExecutionScope.from_dict(data).version == 0
+        with pytest.raises(ExecutionScopeResolverContractError):
+            ExecutionScope.from_dict(data)
 
-    def test_from_dict_float_version_is_treated_as_stale_not_truncated(self):
-        """1.5 must not silently become 1 (a plausible-looking but wrong
-        current-version claim) via a bare ``int()`` truncation."""
+    def test_from_dict_unreadable_version_is_not_a_client_message_fault(self):
+        """The error stays outside ``(ValueError, KeyError, TypeError)``: the
+        websocket handlers that catch that tuple around the turn path would
+        otherwise answer the client with a message-format validation error for
+        what is a persisted-data fault."""
         data = ExecutionScope(sandbox_key_suffix="x").to_dict()
-        data["version"] = 1.5
-        assert ExecutionScope.from_dict(data).version == 0
+        data["version"] = "abc"
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            ExecutionScope.from_dict(data)
+        assert not isinstance(exc_info.value, _WEBSOCKET_VALIDATION_EXCEPT_TUPLE)
 
-    def test_from_dict_bool_version_is_treated_as_stale(self):
+    def test_from_dict_unreadable_version_message_names_no_value(self):
+        """The raised message reaches the task's error column and a
+        client-facing event, so it names the offending type only; the value
+        goes to the server-side log."""
         data = ExecutionScope(sandbox_key_suffix="x").to_dict()
-        data["version"] = True
-        assert ExecutionScope.from_dict(data).version == 0
+        data["version"] = "9;DROP"
+        with scope_log_records(logging.ERROR) as records:
+            with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+                ExecutionScope.from_dict(data)
+        assert "9;DROP" not in str(exc_info.value)
+        assert "str" in str(exc_info.value)
+        assert any("9;DROP" in r for r in records), records
+
+    def test_from_dict_readable_versions_are_accepted(self):
+        """The accepted domain: an absent key or ``None`` is the pre-versioning
+        marker, a digit string is what a JSON-decoded version can arrive as,
+        and a non-negative ``int`` passes through. Nothing here may raise --
+        an old snapshot is a supported input, not a fault."""
+        for raw, expected in ((None, 0), ("0", 0), ("1", 1), (0, 0), (1, 1), (9, 9)):
+            data = ExecutionScope(sandbox_key_suffix="x").to_dict()
+            data["version"] = raw
+            decoded = ExecutionScope.from_dict(data)
+            assert decoded.version == expected
+            assert isinstance(decoded.version, int)
+
+        missing = ExecutionScope(sandbox_key_suffix="x").to_dict()
+        del missing["version"]
+        assert ExecutionScope.from_dict(missing).version == 0
 
     # --- workspace_segments / sandbox_mount_segments: no silent str/dict
     # iteration, no bare TypeError on a non-iterable ----------------------
@@ -865,9 +920,10 @@ class TestPersistedSnapshotDecodeIsNotAClientMessageFault:
     boundary conversion the failure lands in the websocket handlers'
     ``except (ValueError, KeyError, TypeError)`` clause and the client is told
     its own message was malformed, for data it may not have sent and cannot
-    fix. ``_coerce_snapshot_version`` was already written to avoid exactly
-    that folding for the ``version`` field; this is the same posture applied
-    to the rest of the snapshot.
+    fix. The ``version`` field reaches the same conclusion one step earlier:
+    ``_coerce_snapshot_version`` raises the contract error itself, so an
+    unreadable version leaves this boundary as the same class the field
+    coercions are converted into here.
 
     ``InvalidScopeComponentError``'s own bases are deliberately left alone: it
     is also raised for live, caller-supplied components (``workspace.py``,
@@ -910,12 +966,23 @@ class TestPersistedSnapshotDecodeIsNotAClientMessageFault:
 
     def test_not_folded_on_the_resolver_abstention_path(self):
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(ExecutionScope()),
+            lambda task_id: DeferToSnapshot(ExecutionScope()),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(self._loader)
         with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
             resolve_execution_scope("1")
+        assert not isinstance(exc_info.value, _WEBSOCKET_VALIDATION_EXCEPT_TUPLE)
+
+    def test_unreadable_version_decode_is_not_folded_either(self):
+        """The ``version`` field takes the shorter route -- it raises the
+        contract error directly rather than being converted here -- so this
+        pins that the boundary hands out the same class for it, and that an
+        unreadable version fails the decode instead of being read as a legacy
+        snapshot."""
+        agent_config = {"execution_scope": {"version": "not-a-version"}}
+        with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
+            execution_scope_from_agent_config(agent_config)
         assert not isinstance(exc_info.value, _WEBSOCKET_VALIDATION_EXCEPT_TUPLE)
 
     def test_live_component_validation_is_still_a_value_error(self):
@@ -999,6 +1066,33 @@ class TestSnapshotCandidateAuthority:
         self._register(lambda task_id: None, loader)
         assert resolve_execution_scope("1") is None
         assert loader_calls == []  # None short-circuits before the snapshot
+
+    def test_resolver_none_logs_that_it_de_scoped_the_task(self):
+        """De-scoping a task must leave a trace, like every other branch that
+        overrides or ignores a candidate. A resolver that does not yet
+        recognise older tasks returns ``None`` for all of them, and without
+        this line every one of those turns runs unscoped -- possibly past a
+        persisted snapshot that named a namespace -- with nothing in the log
+        to show it happened.
+
+        ``INFO``, because the resolver is exercising its contract rather than
+        failing, and the line says the snapshot was bypassed *unread*: this
+        branch deliberately never calls the loader, which the assertion below
+        pins so the wording cannot drift into claiming knowledge of whether a
+        snapshot exists."""
+        loader_calls = []
+
+        def loader(task_id):
+            loader_calls.append(task_id)
+            return self.RESOLVER_SCOPE
+
+        self._register(lambda task_id: None, loader)
+        with scope_log_records(logging.INFO) as records:
+            assert resolve_execution_scope("task-7") is None
+        assert loader_calls == []
+        assert any(
+            "task-7" in r and "None" in r and "snapshot" in r for r in records
+        ), records
 
     # --- resolver returns ExecutionScope -----------------------------------
     def test_resolver_scope_with_no_snapshot(self):
@@ -1180,7 +1274,7 @@ class TestSnapshotCandidateAuthority:
         fallback = ExecutionScope(workspace_segments=("tenant-a",))
         snapshot_scope = ExecutionScope(workspace_segments=("tenant-a", "sub"))
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: snapshot_scope,
         )
         assert resolve_execution_scope("1") == snapshot_scope
@@ -1195,7 +1289,7 @@ class TestSnapshotCandidateAuthority:
         fallback = ExecutionScope(strict_memory_isolation=True)
         snapshot_scope = ExecutionScope(strict_memory_isolation=False)
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: snapshot_scope,
         )
 
@@ -1223,7 +1317,7 @@ class TestSnapshotCandidateAuthority:
             workspace_segments=("tenant-a", "sub"), strict_memory_isolation=False
         )
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: snapshot_scope,
         )
 
@@ -1264,7 +1358,7 @@ class TestSnapshotCandidateAuthority:
             strict_memory_isolation=False, **{borrowed: False}
         )
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: snapshot_scope,
         )
 
@@ -1286,16 +1380,14 @@ class TestSnapshotCandidateAuthority:
         snapshot_scope = ExecutionScope.from_dict(snapshot_data)
 
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: snapshot_scope,
         )
         assert resolve_execution_scope("1") == snapshot_scope
 
     def test_defer_uses_fallback_when_snapshot_absent(self):
         fallback = ExecutionScope(strict_memory_isolation=True)
-        self._register(
-            lambda task_id: defer_to_snapshot(fallback), lambda task_id: None
-        )
+        self._register(lambda task_id: DeferToSnapshot(fallback), lambda task_id: None)
         assert resolve_execution_scope("1") == fallback
 
     def test_defer_loader_exception_propagates(self):
@@ -1310,7 +1402,7 @@ class TestSnapshotCandidateAuthority:
             raise RuntimeError("db down")
 
         fallback = ExecutionScope(strict_memory_isolation=True)
-        self._register(lambda task_id: defer_to_snapshot(fallback), boom)
+        self._register(lambda task_id: DeferToSnapshot(fallback), boom)
         with pytest.raises(RuntimeError, match="db down"):
             resolve_execution_scope("1")
 
@@ -1319,7 +1411,7 @@ class TestSnapshotCandidateAuthority:
         the resolver: it must return an ExecutionScope or None."""
         fallback = ExecutionScope(strict_memory_isolation=True)
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: {"not": "a scope"},
         )
         with pytest.raises(ExecutionScopeResolverContractError):
@@ -1331,8 +1423,8 @@ class TestSnapshotCandidateAuthority:
         isinstance(ExecutionScope) gate."""
         fallback = ExecutionScope(strict_memory_isolation=True)
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
-            lambda task_id: defer_to_snapshot(ExecutionScope()),
+            lambda task_id: DeferToSnapshot(fallback),
+            lambda task_id: DeferToSnapshot(ExecutionScope()),
         )
         with pytest.raises(ExecutionScopeResolverContractError):
             resolve_execution_scope("1")
@@ -1345,7 +1437,7 @@ class TestSnapshotCandidateAuthority:
         assert stale_snapshot.version == 0
 
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: stale_snapshot,
         )
         with scope_log_records() as records:
@@ -1408,7 +1500,7 @@ class TestSnapshotCandidateAuthority:
         fallback = ExecutionScope(**fallback_kwargs)
         snapshot = ExecutionScope(**snapshot_kwargs)
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: snapshot,
         )
 
@@ -1458,7 +1550,7 @@ class TestSnapshotCandidateAuthority:
         fallback = ExecutionScope(**fallback_kwargs)
         snapshot = ExecutionScope(**snapshot_kwargs)
         self._register(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             lambda task_id: snapshot,
         )
         assert resolve_execution_scope("1") == snapshot
@@ -1552,7 +1644,7 @@ class TestDeferSnapshotAllDefaultFallback:
             memory_dimensions={"tenant": "other"},
         )
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot)
@@ -1580,7 +1672,7 @@ class TestDeferSnapshotAllDefaultFallback:
         snapshot = ExecutionScope()
         assert snapshot is not fallback
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot)
@@ -1588,7 +1680,7 @@ class TestDeferSnapshotAllDefaultFallback:
 
 
 class TestDeferSnapshotDefinesNamespaceOptIn:
-    """``defer_to_snapshot(fallback, snapshot_defines_namespace=True)``: the
+    """``DeferToSnapshot(fallback, snapshot_defines_namespace=True)``: the
     resolver states it does not own this task and the persisted snapshot is
     the intended namespace authority (the workforce/delegated-task shape).
     A conforming ``fallback`` claims no namespace of its own -- if the
@@ -1612,9 +1704,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             memory_dimensions={"tenant": "acme"},
         )
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(
-                fallback, snapshot_defines_namespace=True
-            ),
+            lambda task_id: DeferToSnapshot(fallback, snapshot_defines_namespace=True),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot)
@@ -1631,7 +1721,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             memory_dimensions={"tenant": "acme"},
         )
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot)
@@ -1661,9 +1751,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         assert older_snapshot.version == 0
 
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(
-                fallback, snapshot_defines_namespace=True
-            ),
+            lambda task_id: DeferToSnapshot(fallback, snapshot_defines_namespace=True),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: older_snapshot)
@@ -1687,9 +1775,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         assert newer_snapshot.version == EXECUTION_SCOPE_SHAPE_VERSION + 1
 
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(
-                fallback, snapshot_defines_namespace=True
-            ),
+            lambda task_id: DeferToSnapshot(fallback, snapshot_defines_namespace=True),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: newer_snapshot)
@@ -1707,7 +1793,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         newer_snapshot = ExecutionScope.from_dict(newer_data)
 
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: newer_snapshot)
@@ -1719,9 +1805,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         not."""
         fallback = ExecutionScope()
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(
-                fallback, snapshot_defines_namespace=True
-            ),
+            lambda task_id: DeferToSnapshot(fallback, snapshot_defines_namespace=True),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: object())
@@ -1741,14 +1825,14 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             memory_dimensions={"tenant": "a"},
         )
         with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
-            defer_to_snapshot(committed, snapshot_defines_namespace=True)
+            DeferToSnapshot(committed, snapshot_defines_namespace=True)
         message = str(exc_info.value)
         for name in ("sandbox_key_suffix", "workspace_segments", "memory_dimensions"):
             assert name in message
         # The same pair is accepted without the opt-in, where the snapshot is
         # held to the narrowing rule instead: it is the flag that is refused,
         # not the fallback.
-        assert defer_to_snapshot(committed).fallback == committed
+        assert DeferToSnapshot(committed).fallback == committed
 
     @pytest.mark.parametrize(
         "field_name,committed_kwargs",
@@ -1774,7 +1858,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         fallback (the mount case necessarily carries the workspace segments
         it must prefix, and reports both)."""
         with pytest.raises(ExecutionScopeResolverContractError) as exc_info:
-            defer_to_snapshot(
+            DeferToSnapshot(
                 ExecutionScope(**committed_kwargs), snapshot_defines_namespace=True
             )
         assert field_name in str(exc_info.value)
@@ -1785,7 +1869,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         test_opt_in_still_honours_policy_field_symmetry), so committing one
         must not be mistaken for claiming a namespace."""
         fallback = ExecutionScope(strict_memory_isolation=True)
-        carrier = defer_to_snapshot(fallback, snapshot_defines_namespace=True)
+        carrier = DeferToSnapshot(fallback, snapshot_defines_namespace=True)
         assert carrier.snapshot_defines_namespace is True
         assert carrier.fallback == fallback
 
@@ -1801,9 +1885,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
             memory_dimensions={"tenant": "acme"},
         )
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(
-                fallback, snapshot_defines_namespace=True
-            ),
+            lambda task_id: DeferToSnapshot(fallback, snapshot_defines_namespace=True),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot)
@@ -1822,9 +1904,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         fallback = ExecutionScope(strict_memory_isolation=True)
         snapshot = ExecutionScope(strict_memory_isolation=False)
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(
-                fallback, snapshot_defines_namespace=True
-            ),
+            lambda task_id: DeferToSnapshot(fallback, snapshot_defines_namespace=True),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot)
@@ -1839,7 +1919,7 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
 
     def test_flag_does_not_make_the_fallback_optional(self):
         """The opt-in changes what a present snapshot is checked against,
-        not whether a fallback is required at all: ``defer_to_snapshot``
+        not whether a fallback is required at all: ``DeferToSnapshot``
         still rejects a non-ExecutionScope fallback even with the flag set,
         and the mandatory fallback still applies on a snapshot miss.
 
@@ -1847,13 +1927,11 @@ class TestDeferSnapshotDefinesNamespaceOptIn:
         does set a policy field, which keeps it distinguishable from the
         all-default scope an unscoped resolution would return."""
         with pytest.raises(TypeError):
-            defer_to_snapshot("not-a-scope", snapshot_defines_namespace=True)
+            DeferToSnapshot("not-a-scope", snapshot_defines_namespace=True)
 
         fallback = ExecutionScope(strict_memory_isolation=True)
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(
-                fallback, snapshot_defines_namespace=True
-            ),
+            lambda task_id: DeferToSnapshot(fallback, snapshot_defines_namespace=True),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: None)
@@ -1911,12 +1989,23 @@ class TestShapeGateLogsFieldDiffLazily:
 
 
 class TestResolveExecutionScopeOffTurn:
-    """Off-turn consumers (websocket ``_scope_segments_for_task``,
-    ``ManagedFileRef``) downgrade a resolver-authoritative namespace
-    mismatch instead of failing, but a mismatch whose ``resolver_scope`` is
-    not an authoritative answer has nothing to downgrade to and stays
-    fail-closed -- see ``ExecutionScopeAbstentionMismatchError``'s
-    docstring."""
+    """What decides whether a consumer may downgrade a mismatch is whether it
+    is selecting a namespace for new bytes, not whether a turn is running.
+
+    A consumer that selects one -- websocket ``_scope_segments_for_task``,
+    whose caller composes the storage key for a brand-new durable object --
+    resolves fail-closed through ``resolve_execution_scope`` even though it
+    runs outside any turn: choosing where new bytes land is an authority
+    decision that must not be downgraded to either side's guess. The
+    consumers that come through this entry point instead read a namespace
+    something else already committed to: ``ManagedFileRef``'s construction,
+    the pause/resume handlers, and workspace cleanup. For them a
+    resolver-authoritative namespace mismatch downgrades to the resolver's
+    answer rather than failing an operation that has no turn left to fail.
+
+    A mismatch whose ``resolver_scope`` is not an authoritative answer has
+    nothing to downgrade to and stays fail-closed even here -- see
+    ``ExecutionScopeAbstentionMismatchError``'s docstring."""
 
     def test_passthrough_when_no_mismatch(self):
         scope = ExecutionScope(sandbox_key_suffix="s")
@@ -1965,7 +2054,7 @@ class TestResolveExecutionScopeOffTurn:
         fallback = ExecutionScope()
         snapshot_scope = ExecutionScope(sandbox_key_suffix="attacker-chosen")
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(lambda task_id: snapshot_scope)
@@ -2062,7 +2151,7 @@ class TestExecutionScopeAbstentionMismatchErrorIsDistinguishable:
         abstention branch's raise site must declare ``False`` for it."""
         fallback = ExecutionScope()
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         set_execution_scope_snapshot_loader(
@@ -2096,7 +2185,7 @@ class TestDeferCarrierNeverActivated:
     def test_turn_activates_the_fallback_not_the_carrier(self):
         fallback = ExecutionScope(sandbox_key_suffix="fallback")
         set_execution_scope_resolver(
-            lambda task_id: defer_to_snapshot(fallback),
+            lambda task_id: DeferToSnapshot(fallback),
             acknowledges_snapshot_candidate_contract=True,
         )
         with turn_execution_scope("1") as active:
