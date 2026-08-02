@@ -771,6 +771,12 @@ def test_builtin_registry_uses_runtime_available_launch_commands() -> None:
         "auth": {"type": "mcp_oauth"},
     }
 
+    assert rows_by_app_id["aws"]["launch_config"] == {
+        "command": "python",
+        "args": ["-m", "xagent.web.tools.mcp.aws"],
+        "required_env": ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION"],
+    }
+
 
 def test_builtin_registry_classifies_granola_as_mcp_oauth() -> None:
     """The registry shape must classify as mcp_oauth — anything else means the
