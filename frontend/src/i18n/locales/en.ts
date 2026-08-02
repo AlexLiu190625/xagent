@@ -3962,6 +3962,31 @@ Build when you need.`,
         copied: "Copied to clipboard",
       },
     },
+    deployHub: {
+      title: "Deploy Workforce",
+      options: {
+        embed: {
+          title: "Embed Widget",
+          desc: "Add a chat widget to any website with a single script tag",
+          action: "Get snippet",
+        },
+        api: {
+          title: "REST API",
+          desc: "Call this workforce programmatically from your backend or app",
+          action: "View endpoints",
+        },
+        share: {
+          title: "Shareable Link",
+          desc: "Generate a public URL anyone can open to chat with this workforce",
+          action: "Generate link",
+        },
+        webhook: {
+          title: "Webhook",
+          desc: "Trigger workforce runs via webhook events from external systems",
+          action: "Configure",
+        },
+      },
+    },
     fields: {
       name: "Name",
       description: "Description",
@@ -4021,7 +4046,20 @@ Build when you need.`,
       page: "Page {page} of {pages}",
       next: "Next"
     },
+    getStarted: {
+      title: "Get started",
+      steps: {
+        name: "Name your workforce",
+        lead: "Choose a Workforce Lead",
+        agents: "Add agents to your team",
+        delegation: "Set a delegation rule for each agent",
+        test: "Send a test message",
+        publish: "Publish your workforce",
+      },
+    },
     create: {
+      unsavedBadge: "Unsaved",
+      discardDraftConfirm: "This workforce hasn't been created yet — leaving now will discard your draft. Continue?",
       backToWorkforces: "Back to Workforces",
       backToCreate: "Back to Create",
       title: "Create a Workforce",
@@ -4149,12 +4187,15 @@ Build when you need.`,
       readyTitle: "Ready when you are",
       readyDesc: "Send a message and {manager} will coordinate the team to complete your request.",
       inactiveDisabled: "Publish this workforce before running it.",
-      archivedDisabled: "Archived workforces cannot run."
+      archivedDisabled: "Archived workforces cannot run.",
+      createToTest: "Choose a manager and add at least one worker to test it."
+    },
+    deploy: {
+      inactiveDisabled: "Publish this workforce before deploying it.",
+      archivedDisabled: "Archived workforces cannot be deployed."
     },
     runs: {
       title: "Runs",
-      historyTitle: "Run history",
-      historyHint: "Previous runs of this workforce. Click a run to reopen its conversation.",
       loading: "Loading runs...",
       loadError: "Failed to load runs",
       retry: "Retry",
@@ -4178,6 +4219,7 @@ Build when you need.`,
     },
     canvas: {
       title: "Workforce flow",
+      configure: "Configure",
       backToDetails: "Back to details",
       connections: "Connections",
       noConnections: "No connections configured.",
@@ -4190,6 +4232,14 @@ Build when you need.`,
         reportsTo: "Reports to",
         activeDelegation: "Active delegation",
         completed: "Completed",
+      },
+      chooseLead: {
+        title: "Choose a Workforce Lead",
+        hint: "The lead receives your request and delegates tasks to the agents below.",
+      },
+      addFirstAgent: {
+        title: "Add your first agent",
+        hint: "Sub-agents the lead can delegate tasks to",
       },
     },
     detail: {
@@ -4206,6 +4256,7 @@ Build when you need.`,
       addMemberTitle: "Add a Member",
       changeLeadTitle: "Choose a Workforce Lead",
       createNewAgent: "Create new agent",
+      discardEditConfirm: "You have unsaved changes to the Workforce Details. Switch views and discard them?",
     },
     loading: {
       list: "Loading workforces...",
@@ -4243,7 +4294,8 @@ Build when you need.`,
       canvasUnavailable: "Canvas unavailable.",
       publish: "Failed to publish workforce",
       unpublish: "Failed to unpublish workforce",
-      archive: "Failed to archive workforce"
+      archive: "Failed to archive workforce",
+      editDiscardedByArchive: "Workforce was archived before this change could save, so it was discarded."
     }
   },
   adminMcp: {
