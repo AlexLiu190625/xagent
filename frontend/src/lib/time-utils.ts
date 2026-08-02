@@ -2,6 +2,26 @@
  * Time formatting utility functions
  * Unified handling of timestamp and ISO format time display
  */
+import type { Locale } from "@/i18n/translations"
+
+const displayDateLocales: Record<Locale, string> = {
+  en: "en-US",
+  zh: "zh-CN",
+}
+
+/** Formats a non-blank, parseable display-date string, returning empty text for invalid input. */
+export function formatDisplayDate(
+  value: unknown,
+  locale: Locale,
+  options: Intl.DateTimeFormatOptions,
+): string {
+  if (typeof value !== "string" || value.trim() === "") return ""
+
+  const date = new Date(value)
+  if (!Number.isFinite(date.getTime())) return ""
+
+  return new Intl.DateTimeFormat(displayDateLocales[locale], options).format(date)
+}
 
 /**
  * Normalizes various timestamp formats (seconds, milliseconds, numeric strings, ISO strings)

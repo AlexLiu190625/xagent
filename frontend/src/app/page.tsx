@@ -21,7 +21,8 @@ import {
 import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
 import { apiRequest, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
-import { getApiUrl } from "@/lib/utils";
+import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils";
+import { formatDisplayDate } from "@/lib/time-utils";
 import { resolveTaskLlmSelection } from "@/lib/models";
 import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create";
 import { useI18n } from "@/contexts/i18n-context";
@@ -630,12 +631,17 @@ export default function Home() {
             <>
               <h2 className="text-[16px] font-bold mb-4 text-foreground">{t("home.recent.title")}</h2>
               <div className="space-y-3">
-                {recentTasks.map(task => (
+                {recentTasks.map((task) => {
+                  const resolvedLogoUrl = resolveAgentLogoUrl(task.agent_logo_url, getApiUrl());
+                  const displayDate = formatDisplayDate(task.created_at, locale, {
+                    month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+                  });
+                  return (
                   <Link key={task.task_id} href={`/task/${task.task_id}`} className="flex items-center justify-between p-4 rounded-2xl border border-border/60 bg-card hover:border-primary/30 hover:shadow-md transition-all duration-300 group">
                     <div className="flex items-center gap-5">
                       <div className="w-12 h-12 rounded-xl bg-primary/5 flex items-center justify-center shrink-0 border border-primary/10">
-                        {task.agent_logo_url ? (
-                          <img src={task.agent_logo_url.startsWith("http") ? task.agent_logo_url : `${getApiUrl()}${task.agent_logo_url}`} alt="Agent" className="w-7 h-7 rounded object-cover" />
+                        {resolvedLogoUrl ? (
+                          <img src={resolvedLogoUrl} alt="Agent" className="w-7 h-7 rounded object-cover" />
                         ) : (
                           <Bot className="w-6 h-6 text-primary/80" />
                         )}
@@ -643,7 +649,7 @@ export default function Home() {
                       <div>
                         <h4 className="font-semibold text-[16px] group-hover:text-primary transition-colors">{task.title || t("home.recent.untitledTask")}</h4>
                         <p className="text-[13px] text-muted-foreground mt-0.5 font-medium">
-                          {task.agent_name || t("home.recent.defaultAgent")} • {new Date(task.created_at === null ? 0 : task.created_at === undefined ? Number.NaN : task.created_at).toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          {task.agent_name || t("home.recent.defaultAgent")}{displayDate ? ` • ${displayDate}` : ""}
                         </p>
                       </div>
                     </div>
@@ -651,7 +657,8 @@ export default function Home() {
                       <ChevronRight className="w-4 h-4" />
                     </div>
                   </Link>
-                ))}
+                  );
+                })}
               </div>
             </>
           )}

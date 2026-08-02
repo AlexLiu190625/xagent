@@ -11,6 +11,8 @@ const setTaskIdMock = vi.hoisted(() => vi.fn())
 const routerPushMock = vi.hoisted(() => vi.fn())
 const toastErrorMock = vi.hoisted(() => vi.fn())
 const localeMock = vi.hoisted(() => ({ value: "en" as "en" | "zh" }))
+const resolveAgentLogoUrlMock = vi.hoisted(() => vi.fn())
+const formatDisplayDateMock = vi.hoisted(() => vi.fn())
 
 async function createHomeExtensionMock() {
   const ReactModule = await vi.importActual<typeof import("react")>("react")
@@ -35,8 +37,24 @@ vi.mock("@/lib/models", () => ({
 
 vi.mock("@/lib/utils", async () => {
   const actual = await vi.importActual<typeof import("@/lib/utils")>("@/lib/utils")
-  return { ...actual, getApiUrl: () => "http://api.local" }
+  return {
+    ...actual,
+    getApiUrl: () => "http://api.local",
+    resolveAgentLogoUrl: (...args: Parameters<typeof actual.resolveAgentLogoUrl>) => {
+      resolveAgentLogoUrlMock(...args)
+      return actual.resolveAgentLogoUrl(...args)
+    },
+  }
 })
+
+vi.mock("@/lib/time-utils", () => ({
+  formatDisplayDate: (...args: [unknown, "en" | "zh", Intl.DateTimeFormatOptions]) => {
+    formatDisplayDateMock(...args)
+    return typeof args[0] === "string" && args[0].startsWith("2024-")
+      ? `formatted:${args[0]}`
+      : ""
+  },
+}))
 
 vi.mock("@/components/ui/sonner", () => ({
   toast: { error: toastErrorMock },
@@ -216,6 +234,8 @@ describe("Home", () => {
     setTaskIdMock.mockReset()
     routerPushMock.mockReset()
     toastErrorMock.mockReset()
+    resolveAgentLogoUrlMock.mockReset()
+    formatDisplayDateMock.mockReset()
     consoleErrorMock = vi.spyOn(console, "error").mockImplementation(() => undefined)
     resolveTaskLlmSelectionMock.mockResolvedValue(successfulSelection)
     apiRequestMock.mockImplementation((url: string) => {
@@ -745,9 +765,7 @@ describe("Home", () => {
 
     it("renders every copied template and recent-task value from distinctive wire fields", async () => {
       const createdAt = "2024-05-06T07:08:09Z"
-      const formattedDate = new Date(createdAt).toLocaleDateString("en-US", {
-        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
-      })
+      const formattedDate = `formatted:${createdAt}`
       apiRequestMock.mockImplementation((url: string) => {
         if (url === templateUrl()) return Promise.resolve(jsonResponse([
           templateCard("distinct-template-id", {
@@ -979,6 +997,67 @@ describe("Home", () => {
       expect(consoleErrorMock).not.toHaveBeenCalled()
     })
 
+    it("resolves each Recent Task Agent logo once and keeps date metadata structurally complete", async () => {
+      const validCreatedAt = "2024-05-06T07:08:09Z"
+      apiRequestMock.mockImplementation((url: string) => {
+        if (url === templateUrl()) return Promise.resolve(jsonResponse([]))
+        if (url === recentTasksUrl) return Promise.resolve(jsonResponse({
+          tasks: [
+            recentTask(71, {
+              created_at: validCreatedAt,
+              agent_name: "Resolved Agent",
+              agent_logo_url: "/logos/resolved.png",
+            }),
+            recentTask(72, {
+              created_at: "not-a-date",
+              agent_name: "Fallback Agent",
+              agent_logo_url: "javascript:alert(1)",
+            }),
+          ],
+        }))
+        throw new Error(`Unexpected apiRequest: ${url}`)
+      })
+
+      render(<Home />)
+
+      const validLink = await screen.findByRole("link", { name: /Task 71/ })
+      const invalidLink = screen.getByRole("link", { name: /Task 72/ })
+      expect(validLink.querySelector("img")).toHaveAttribute(
+        "src",
+        "http://api.local/logos/resolved.png",
+      )
+      const invalidAvatar = invalidLink.querySelector('div[class*="w-12"][class*="h-12"]')
+      expect(invalidAvatar).not.toBeNull()
+      expect(invalidAvatar?.querySelectorAll("img")).toHaveLength(0)
+      expect(invalidAvatar?.querySelectorAll("svg")).toHaveLength(1)
+      const invalidBot = invalidAvatar?.querySelector("svg")
+      expect(invalidBot).not.toHaveClass("lucide-chevron-right")
+      expect(invalidBot?.querySelector('rect[width="18"][height="10"]')).toBeInTheDocument()
+      const validMetadata = validLink.querySelector("p.text-muted-foreground.font-medium")
+      const invalidMetadata = invalidLink.querySelector("p.text-muted-foreground.font-medium")
+      expect(validMetadata?.textContent).toBe(`Resolved Agent • formatted:${validCreatedAt}`)
+      expect(invalidMetadata?.textContent).toBe("Fallback Agent")
+      expect(invalidLink).not.toHaveTextContent("Invalid Date")
+      expect(resolveAgentLogoUrlMock).toHaveBeenCalledTimes(2)
+      expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(
+        1,
+        "/logos/resolved.png",
+        "http://api.local",
+      )
+      expect(resolveAgentLogoUrlMock).toHaveBeenNthCalledWith(
+        2,
+        "javascript:alert(1)",
+        "http://api.local",
+      )
+      expect(formatDisplayDateMock).toHaveBeenCalledTimes(2)
+      expect(formatDisplayDateMock).toHaveBeenNthCalledWith(1, validCreatedAt, "en", {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+      })
+      expect(formatDisplayDateMock).toHaveBeenNthCalledWith(2, "not-a-date", "en", {
+        month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
+      })
+    })
+
     it("does not refetch recents on locale change and suppresses an old locale completion", async () => {
       const en = deferred<Response>()
       const zh = deferred<Response>()
@@ -1167,7 +1246,17 @@ describe("Home", () => {
       expect(`${templateDecoder}\n${recentDecoder}`).not.toMatch(
         /as HomeTemplateCard|as RecentTask|return value;/,
       )
-      expect(source).toMatch(/task\.created_at === null \? 0 : task\.created_at === undefined \? Number\.NaN : task\.created_at/)
+      const recentRender = sourceSlice(
+        source,
+        "{recentTasks.map((task) => {",
+        "              </div>\n            </>",
+      )
+      expect(recentRender).toContain("const resolvedLogoUrl = resolveAgentLogoUrl(task.agent_logo_url, getApiUrl());")
+      expect(recentRender.match(/resolveAgentLogoUrl\(/g)).toHaveLength(1)
+      expect(recentRender).toContain("const displayDate = formatDisplayDate(task.created_at, locale, {")
+      expect(recentRender).toContain("{resolvedLogoUrl ? (")
+      expect(recentRender.match(/\{displayDate \? ` • \$\{displayDate\}` : ""\}/g)).toHaveLength(1)
+      expect(recentRender).not.toMatch(/startsWith\(["']http|new Date\(|toLocaleDateString|\$\{getApiUrl\(\)\}\$\{task\.agent_logo_url\}/)
       expect(source).not.toMatch(/Promise\.all\(\[\s*apiRequest\(`\$\{getApiUrl\(\)\}\/api\/templates/)
     })
   })

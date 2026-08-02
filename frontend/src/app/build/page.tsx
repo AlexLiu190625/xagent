@@ -19,7 +19,8 @@ import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useRouter, useSearchParams } from "next/navigation"
 import { apiRequest, parseApiResponse } from "@/lib/api-wrapper"
-import { getApiUrl } from "@/lib/utils"
+import { getApiUrl, resolveAgentLogoUrl } from "@/lib/utils"
+import { formatDisplayDate } from "@/lib/time-utils"
 import { resolveTaskLlmSelection } from "@/lib/models"
 import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create"
 import {
@@ -47,7 +48,7 @@ import {
 } from "@/lib/build-page-extension"
 
 function BuildsPageContent() {
-  const { t } = useI18n()
+  const { t, locale } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
   const router = useRouter()
   const searchParams = useSearchParams()
@@ -449,11 +450,6 @@ function BuildsPageContent() {
     }
   }
 
-  const formatDate = (dateString: string) => {
-    const date = new Date(dateString)
-    return date.toLocaleDateString()
-  }
-
   return (
     <div className="flex flex-col h-full bg-background">
       {/* Header */}
@@ -519,7 +515,15 @@ function BuildsPageContent() {
             {/* List */}
             {filteredAgents.length > 0 ? (
               <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4">
-                {filteredAgents.map((agent) => (
+                {filteredAgents.map((agent) => {
+                  const resolvedLogoUrl = resolveAgentLogoUrl(agent.logo_url, getApiUrl())
+                  const createdDate = formatDisplayDate(agent.created_at, locale, {
+                    year: "numeric", month: "numeric", day: "numeric",
+                  })
+                  const updatedDate = formatDisplayDate(agent.updated_at, locale, {
+                    year: "numeric", month: "numeric", day: "numeric",
+                  })
+                  return (
                   <div
                     key={agent.id}
                     className="group relative flex flex-col justify-between space-y-4 rounded-xl border bg-card p-6 shadow-sm transition-all cursor-pointer hover:shadow-md hover:border-primary/50"
@@ -529,8 +533,8 @@ function BuildsPageContent() {
                       <div className="space-y-4">
                         <div className="flex items-start gap-4">
                           <div className="h-10 w-10 shrink-0 rounded-lg bg-primary/10 flex items-center justify-center text-primary overflow-hidden">
-                            {agent.logo_url ? (
-                              <img src={`${getApiUrl()}${agent.logo_url}`} alt={agent.name} className="h-full w-full object-cover" />
+                            {resolvedLogoUrl ? (
+                              <img src={resolvedLogoUrl} alt={agent.name} className="h-full w-full object-cover" />
                             ) : (
                               <Bot className="h-6 w-6" />
                             )}
@@ -635,14 +639,18 @@ function BuildsPageContent() {
 
                     <div className="space-y-4 pt-2">
                       <div className="space-y-1.5">
-                        <div className="flex items-center text-xs text-muted-foreground">
-                          <Calendar className="h-3.5 w-3.5 mr-1.5" />
-                          {t('builds.card.createdAt')}: {formatDate(agent.created_at)}
-                        </div>
-                        <div className="flex items-center text-xs text-muted-foreground">
-                          <Clock className="h-3.5 w-3.5 mr-1.5" />
-                          {t('builds.card.updatedAt')}: {formatDate(agent.updated_at || agent.created_at)}
-                        </div>
+                        {createdDate && (
+                          <div className="flex items-center text-xs text-muted-foreground">
+                            <Calendar className="h-3.5 w-3.5 mr-1.5" />
+                            {t('builds.card.createdAt')}: {createdDate}
+                          </div>
+                        )}
+                        {updatedDate && (
+                          <div className="flex items-center text-xs text-muted-foreground">
+                            <Clock className="h-3.5 w-3.5 mr-1.5" />
+                            {t('builds.card.updatedAt')}: {updatedDate}
+                          </div>
+                        )}
                       </div>
                       <div className="space-y-4" onClick={(e) => e.stopPropagation()}>
                         <BuildAgentCardExtension agentId={agent.id} />
@@ -714,7 +722,8 @@ function BuildsPageContent() {
                       </div>
                     </div>
                   </div>
-                ))}
+                  )
+                })}
               </div>
             ) : (
               <div className="flex flex-col items-center justify-center h-[400px] text-center space-y-4 border rounded-lg bg-muted/10 border-dashed">
