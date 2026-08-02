@@ -2360,6 +2360,10 @@ Build when you need.`,
         sendFailed: "Failed to send message. Please try again.",
       }
     },
+    publication: {
+      publishFailed: "Failed to publish agent",
+      unpublishFailed: "Failed to unpublish agent",
+    },
     editor: {
       aiAssistant: "{appName} Assistant",
       stepGuide: {
@@ -2444,8 +2448,6 @@ Build when you need.`,
       },
       error: {
         failed: "Failed to create agent",
-        publishFailed: "Failed to publish agent",
-        unpublishFailed: "Failed to unpublish agent",
         kbToolsNotEnabled: "Knowledge bases are selected but the Knowledge tool category is not enabled. Please enable the Knowledge tools before saving.",
         unknown: "An unknown error occurred",
         notFound: "Agent not found",

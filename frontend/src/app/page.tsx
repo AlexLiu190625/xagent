@@ -20,11 +20,10 @@ import {
 } from "@/components/ui/alert-dialog";
 import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
-import { apiRequest, parseApiResponse } from "@/lib/api-wrapper";
+import { apiRequest, isJsonRecord, parseApiResponse } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
 import { resolveTaskLlmSelection } from "@/lib/models";
 import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create";
-import type { ConnectionInfo, Template } from "@/types/template";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
 import { WelcomeModal } from "@/components/welcome-modal";
@@ -33,12 +32,113 @@ import { useVoiceInputControls } from "@/components/voice-input-controller";
 import { HomePageExtension } from "@/lib/home-page-extension";
 import { toast } from "@/components/ui/sonner";
 
+interface HomeTemplateConnection {
+  name: string;
+  logo: string | null;
+}
+
+interface HomeTemplateCard {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  features: string[];
+  connections: HomeTemplateConnection[];
+  setup_time: string;
+  likes: number;
+  used_count: number;
+}
+
 interface RecentTask {
-  task_id: number | string;
-  title?: string | null;
-  agent_name?: string | null;
+  task_id: number;
+  title: string;
+  created_at?: string | null;
+  agent_name?: string;
   agent_logo_url?: string | null;
-  created_at: string;
+}
+
+function isSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value);
+}
+
+function decodeHomeTemplateCard(value: unknown): HomeTemplateCard | null {
+  if (
+    !isJsonRecord(value) ||
+    typeof value.id !== "string" ||
+    typeof value.name !== "string" ||
+    typeof value.category !== "string" ||
+    typeof value.description !== "string" ||
+    !Array.isArray(value.features) ||
+    !value.features.every((feature) => typeof feature === "string") ||
+    !Array.isArray(value.connections) ||
+    typeof value.setup_time !== "string" ||
+    !isSafeInteger(value.likes) ||
+    !isSafeInteger(value.used_count)
+  ) return null;
+
+  const connections: HomeTemplateConnection[] = [];
+  for (const connection of value.connections) {
+    if (
+      !isJsonRecord(connection) ||
+      typeof connection.name !== "string" ||
+      (typeof connection.logo !== "string" && connection.logo !== null)
+    ) return null;
+    connections.push({ name: connection.name, logo: connection.logo });
+  }
+
+  return {
+    id: value.id,
+    name: value.name,
+    category: value.category,
+    description: value.description,
+    features: [...value.features],
+    connections,
+    setup_time: value.setup_time,
+    likes: value.likes,
+    used_count: value.used_count,
+  };
+}
+
+function decodeHomeTemplates(value: unknown): HomeTemplateCard[] | null {
+  if (!Array.isArray(value)) return null;
+  const templates: HomeTemplateCard[] = [];
+  for (const template of value) {
+    const decoded = decodeHomeTemplateCard(template);
+    if (!decoded) return null;
+    templates.push(decoded);
+  }
+  return templates;
+}
+
+function decodeRecentTask(value: unknown): RecentTask | null {
+  if (
+    !isJsonRecord(value) ||
+    !isSafeInteger(value.task_id) ||
+    value.task_id <= 0 ||
+    typeof value.title !== "string" ||
+    (value.created_at !== undefined && value.created_at !== null && typeof value.created_at !== "string") ||
+    (value.agent_name !== undefined && typeof value.agent_name !== "string") ||
+    (value.agent_logo_url !== undefined && value.agent_logo_url !== null && typeof value.agent_logo_url !== "string")
+  ) return null;
+
+  return {
+    task_id: value.task_id,
+    title: value.title,
+    created_at: value.created_at,
+    agent_name: value.agent_name,
+    agent_logo_url: value.agent_logo_url,
+  };
+}
+
+function decodeRecentTasks(value: unknown): RecentTask[] | null {
+  if (!isJsonRecord(value) || !Array.isArray(value.tasks)) return null;
+  const tasks: RecentTask[] = [];
+  for (const task of value.tasks) {
+    const decoded = decodeRecentTask(task);
+    if (!decoded) return null;
+    tasks.push(decoded);
+  }
+  return tasks;
 }
 
 export default function Home() {
@@ -46,7 +146,7 @@ export default function Home() {
   const { t, locale } = useI18n();
   const { setPendingMessage, setTaskId } = useApp();
   const branding = getBrandingFromEnv();
-  const [templates, setTemplates] = useState<Template[]>([]);
+  const [templates, setTemplates] = useState<HomeTemplateCard[]>([]);
   const [recentTasks, setRecentTasks] = useState<RecentTask[]>([]);
   const [isCreating, setIsCreating] = useState(false);
   const [showNoModelAlert, setShowNoModelAlert] = useState(false);
@@ -57,6 +157,7 @@ export default function Home() {
   const activeTaskCreateAttemptRef = useRef<number | null>(null);
   const taskCreateCounterRef = useRef(0);
   const draftRevisionRef = useRef(0);
+  const templateGenerationRef = useRef(0);
   const homeVoiceInput = useVoiceInputControls();
 
   useEffect(() => {
@@ -65,28 +166,57 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const fetchData = async () => {
+    const generation = ++templateGenerationRef.current;
+    let active = true;
+    const isCurrent = () => active && generation === templateGenerationRef.current;
+
+    const fetchTemplates = async () => {
       try {
-        const [templatesRes, tasksRes] = await Promise.all([
-          apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`),
-          apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=5`)
-        ]);
+        const response = await apiRequest(`${getApiUrl()}/api/templates/?lang=${locale}`);
+        if (!isCurrent()) return;
+        if (!response.ok) throw new Error(`Template request failed: ${response.status}`);
 
-        if (templatesRes.ok) {
-          const data = await templatesRes.json();
-          setTemplates(Array.isArray(data) ? data.slice(0, 3) : []);
-        }
+        const parsed = await parseApiResponse(response);
+        if (!isCurrent()) return;
+        const decoded = decodeHomeTemplates(parsed.data);
+        if (!decoded) throw new Error("Invalid template response");
 
-        if (tasksRes.ok) {
-          const data = await tasksRes.json();
-          setRecentTasks((data.tasks || (Array.isArray(data) ? data : [])) as RecentTask[]);
-        }
+        setTemplates(decoded.slice(0, 3));
       } catch (error) {
-        console.error("Failed to fetch data", error);
+        if (isCurrent()) {
+          setTemplates([]);
+          console.error("Failed to fetch templates:", error);
+        }
       }
     };
-    fetchData();
+
+    void fetchTemplates();
+    return () => { active = false; };
   }, [locale]);
+
+  useEffect(() => {
+    let active = true;
+
+    const fetchRecentTasks = async () => {
+      try {
+        const response = await apiRequest(`${getApiUrl()}/api/chat/tasks?page=1&per_page=5`);
+        if (!active) return;
+        if (!response.ok) throw new Error(`Recent task request failed: ${response.status}`);
+
+        const parsed = await parseApiResponse(response);
+        if (!active) return;
+        const decoded = decodeRecentTasks(parsed.data);
+        if (!decoded) throw new Error("Invalid recent task response");
+
+        setRecentTasks(decoded);
+      } catch (error) {
+        if (active) console.error("Failed to fetch recent tasks:", error);
+      }
+    };
+
+    void fetchRecentTasks();
+    return () => { active = false; };
+  }, []);
 
   useEffect(() => {
     const section = getStartedSectionRef.current;
@@ -463,7 +593,7 @@ export default function Home() {
                         <div className="flex items-center">
                           {template.connections && template.connections.length > 0 ? (
                             <div className="flex gap-1.5">
-                              {template.connections.slice(0, 4).map((conn: ConnectionInfo, idx: number) => (
+                              {template.connections.slice(0, 4).map((conn, idx: number) => (
                                 <div key={idx} className="w-8 h-8 rounded-lg bg-background border border-border flex items-center justify-center overflow-hidden shadow-sm">
                                   {conn.logo ? <img src={conn.logo} alt={conn.name} className="w-5 h-5 object-contain" /> : <span className="text-[10px] font-bold text-primary/70">{(conn.name || "").substring(0, 2).toUpperCase()}</span>}
                                 </div>
@@ -513,7 +643,7 @@ export default function Home() {
                       <div>
                         <h4 className="font-semibold text-[16px] group-hover:text-primary transition-colors">{task.title || t("home.recent.untitledTask")}</h4>
                         <p className="text-[13px] text-muted-foreground mt-0.5 font-medium">
-                          {task.agent_name || t("home.recent.defaultAgent")} • {new Date(task.created_at).toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
+                          {task.agent_name || t("home.recent.defaultAgent")} • {new Date(task.created_at === null ? 0 : task.created_at === undefined ? Number.NaN : task.created_at).toLocaleDateString(locale === 'zh' ? 'zh-CN' : 'en-US', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}
                         </p>
                       </div>
                     </div>

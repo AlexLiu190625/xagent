@@ -2360,6 +2360,10 @@ const zh = {
         sendFailed: "发送消息失败，请重试。",
       }
     },
+    publication: {
+      publishFailed: "发布 Agent 失败",
+      unpublishFailed: "取消发布 Agent 失败",
+    },
     editor: {
       aiAssistant: "{appName} 助手",
       stepGuide: {
@@ -2444,8 +2448,6 @@ const zh = {
       },
       error: {
         failed: "创建 Agent 失败",
-        publishFailed: "发布 Agent 失败",
-        unpublishFailed: "取消发布 Agent 失败",
         kbToolsNotEnabled: "选择了知识库但未启用知识库工具，请在工具类别中勾选「知识库」工具后再保存。",
         unknown: "发生未知错误",
         notFound: "Agent 不存在",

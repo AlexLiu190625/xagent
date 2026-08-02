@@ -1603,7 +1603,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         toast.success(t("builds.editor.success.published"))
       } else {
         const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.publishFailed"))
+        toast.error(error.detail || t("builds.publication.publishFailed"))
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)
@@ -1631,7 +1631,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         toast.success(t("builds.editor.success.unpublished"))
       } else {
         const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.unpublishFailed"))
+        toast.error(error.detail || t("builds.publication.unpublishFailed"))
       }
     } catch (error) {
       console.error("Failed to unpublish agent:", error)
@@ -1660,7 +1660,7 @@ export function AgentBuilder({ agentId }: AgentBuilderProps) {
         }
       } else {
         const error = await response.json()
-        toast.error(error.detail || t("builds.editor.error.publishFailed"))
+        toast.error(error.detail || t("builds.publication.publishFailed"))
       }
     } catch (error) {
       console.error("Failed to publish agent:", error)

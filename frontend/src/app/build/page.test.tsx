@@ -1,4 +1,5 @@
 import React from "react"
+import { readFileSync } from "node:fs"
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -499,6 +500,301 @@ describe("BuildsPage Agent deletion", () => {
       name: "builds.list.deleteDialog.confirmDiscardDraft:Draft Workforce",
     }))
     await waitFor(() => expect(discardRequests).toBe(2))
+  })
+})
+
+function publicationAgent(status: "draft" | "published", id = 42) {
+  return { ...agent, id, status }
+}
+
+function publicationActionName(kind: "publish" | "unpublish") {
+  return `builds.list.actions.${kind}`
+}
+
+describe("BuildsPage publication lifecycle", () => {
+  let consoleErrorMock: ReturnType<typeof vi.spyOn>
+
+  beforeEach(() => {
+    resetMocks()
+    consoleErrorMock = vi.spyOn(console, "error").mockImplementation(() => undefined)
+  })
+
+  afterEach(() => {
+    consoleErrorMock.mockRestore()
+    cleanup()
+  })
+
+  it.each([
+    ["publish", "http://api.local/api/agents/42/publish", "builds.publication.publishFailed", "Failed to publish agent:"],
+    ["unpublish", "http://api.local/api/agents/42/unpublish", "builds.publication.unpublishFailed", "Failed to unpublish agent:"],
+  ] as const)("reports mounted non-OK %s failures with the operation-owned key and diagnostic", async (kind, endpoint, key, diagnostic) => {
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        return Promise.resolve(jsonResponse([publicationAgent(kind === "publish" ? "draft" : "published")]))
+      }
+      if (url === endpoint && options?.method === "POST") {
+        return Promise.resolve(new Response(null, { status: 503 }))
+      }
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+    fireEvent.click(screen.getByRole("button", { name: publicationActionName(kind) }))
+
+    await waitFor(() => {
+      expect(apiRequestMock).toHaveBeenCalledWith(endpoint, { method: "POST" })
+      expect(toastErrorMock).toHaveBeenCalledWith(key)
+      expect(consoleErrorMock).toHaveBeenCalledWith(diagnostic, expect.any(Response))
+    })
+  })
+
+  it.each([
+    ["publish", "http://api.local/api/agents/42/publish", "builds.publication.publishFailed", "Failed to publish agent:"],
+    ["unpublish", "http://api.local/api/agents/42/unpublish", "builds.publication.unpublishFailed", "Failed to unpublish agent:"],
+  ] as const)("reports mounted rejected %s requests with the operation-owned key and diagnostic", async (kind, endpoint, key, diagnostic) => {
+    const rejection = new Error(`${kind} transport rejected`)
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        return Promise.resolve(jsonResponse([publicationAgent(kind === "publish" ? "draft" : "published")]))
+      }
+      if (url === endpoint && options?.method === "POST") return Promise.reject(rejection)
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+    fireEvent.click(screen.getByRole("button", { name: publicationActionName(kind) }))
+
+    await waitFor(() => {
+      expect(toastErrorMock).toHaveBeenCalledWith(key)
+      expect(consoleErrorMock).toHaveBeenCalledWith(diagnostic, rejection)
+    })
+  })
+
+  it("starts one list refresh after a successful publication", async () => {
+    const refresh = deferred<Response>()
+    let listRequests = 0
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        listRequests += 1
+        return listRequests === 1 ? Promise.resolve(jsonResponse([publicationAgent("draft")])) : refresh.promise
+      }
+      if (url === "http://api.local/api/agents/42/publish" && options?.method === "POST") {
+        return Promise.resolve(new Response(null, { status: 204 }))
+      }
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+    fireEvent.click(screen.getByRole("button", { name: publicationActionName("publish") }))
+
+    await waitFor(() => expect(listRequests).toBe(2))
+    expect(toastErrorMock).not.toHaveBeenCalled()
+
+    await act(async () => {
+      refresh.resolve(jsonResponse([]))
+      await refresh.promise
+    })
+  })
+
+  it("keeps refresh rejection in the list owner without a publication toast", async () => {
+    const refreshFailure = new Error("refresh rejected")
+    let listRequests = 0
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        listRequests += 1
+        return listRequests === 1
+          ? Promise.resolve(jsonResponse([publicationAgent("draft")]))
+          : Promise.reject(refreshFailure)
+      }
+      if (url === "http://api.local/api/agents/42/publish" && options?.method === "POST") {
+        return Promise.resolve(new Response(null, { status: 204 }))
+      }
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+    fireEvent.click(screen.getByRole("button", { name: publicationActionName("publish") }))
+
+    await waitFor(() => {
+      expect(listRequests).toBe(2)
+      expect(consoleErrorMock).toHaveBeenCalledWith("Failed to fetch agents:", refreshFailure)
+    })
+    expect(toastErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("keeps a refresh 503 out of publication feedback", async () => {
+    let listRequests = 0
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        listRequests += 1
+        return Promise.resolve(
+          listRequests === 1
+            ? jsonResponse([publicationAgent("draft")])
+            : new Response(null, { status: 503 }),
+        )
+      }
+      if (url === "http://api.local/api/agents/42/publish" && options?.method === "POST") {
+        return Promise.resolve(new Response(null, { status: 204 }))
+      }
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+    fireEvent.click(screen.getByRole("button", { name: publicationActionName("publish") }))
+
+    await waitFor(() => expect(listRequests).toBe(2))
+    expect(toastErrorMock).not.toHaveBeenCalled()
+    expect(consoleErrorMock).not.toHaveBeenCalled()
+  })
+
+  it.each([
+    ["204", () => new Response(null, { status: 204 })],
+    ["503", () => new Response(null, { status: 503 })],
+    ["rejection", () => Promise.reject(new Error("late publication rejection"))],
+  ] as const)("is silent and does not refresh when an unmounted publication settles as %s", async (_outcome, settle) => {
+    const mutation = deferred<Response>()
+    let listRequests = 0
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        listRequests += 1
+        return Promise.resolve(jsonResponse([publicationAgent("draft")]))
+      }
+      if (url === "http://api.local/api/agents/42/publish" && options?.method === "POST") return mutation.promise
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    const { unmount } = render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+    fireEvent.click(screen.getByRole("button", { name: publicationActionName("publish") }))
+    await waitFor(() => expect(apiRequestMock).toHaveBeenCalledWith(
+      "http://api.local/api/agents/42/publish",
+      { method: "POST" },
+    ))
+
+    unmount()
+    await act(async () => {
+      const result = settle()
+      if (result instanceof Promise) {
+        mutation.reject(await result.catch((error) => error))
+      } else {
+        mutation.resolve(result)
+      }
+      await mutation.promise.catch(() => undefined)
+      await Promise.resolve()
+    })
+
+    expect(listRequests).toBe(1)
+    expect(toastErrorMock).not.toHaveBeenCalled()
+    expect(consoleErrorMock).not.toHaveBeenCalled()
+  })
+
+  it("does not silence an older publication failure after a newer success", async () => {
+    const older = deferred<Response>()
+    const newer = deferred<Response>()
+    const refresh = deferred<Response>()
+    let publicationRequests = 0
+    let listRequests = 0
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        listRequests += 1
+        return listRequests === 1 ? Promise.resolve(jsonResponse([publicationAgent("draft")])) : refresh.promise
+      }
+      if (url === "http://api.local/api/agents/42/publish" && options?.method === "POST") {
+        publicationRequests += 1
+        return publicationRequests === 1 ? older.promise : newer.promise
+      }
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    render(<BuildsPage />)
+    await screen.findByText("Research Agent")
+    const publish = screen.getByRole("button", { name: publicationActionName("publish") })
+    fireEvent.click(publish)
+    fireEvent.click(publish)
+
+    await act(async () => {
+      newer.resolve(new Response(null, { status: 204 }))
+      await newer.promise
+    })
+    await waitFor(() => expect(listRequests).toBe(2))
+
+    await act(async () => {
+      older.resolve(new Response(null, { status: 503 }))
+      await older.promise
+    })
+    await waitFor(() => expect(toastErrorMock).toHaveBeenCalledWith("builds.publication.publishFailed"))
+
+    await act(async () => {
+      refresh.resolve(jsonResponse([]))
+      await refresh.promise
+    })
+  })
+
+  it("starts a refresh for each reverse-order successful publish and unpublish", async () => {
+    const publish = deferred<Response>()
+    const unpublish = deferred<Response>()
+    const firstRefresh = deferred<Response>()
+    const secondRefresh = deferred<Response>()
+    let listRequests = 0
+    apiRequestMock.mockImplementation((url: string, options?: RequestInit) => {
+      if (url === "http://api.local/api/agents" && !options?.method) {
+        listRequests += 1
+        if (listRequests === 1) return Promise.resolve(jsonResponse([
+          publicationAgent("draft", 42),
+          publicationAgent("published", 43),
+        ]))
+        return listRequests === 2 ? firstRefresh.promise : secondRefresh.promise
+      }
+      if (url === "http://api.local/api/agents/42/publish" && options?.method === "POST") return publish.promise
+      if (url === "http://api.local/api/agents/43/unpublish" && options?.method === "POST") return unpublish.promise
+      throw new Error(`Unexpected apiRequest: ${url}`)
+    })
+
+    render(<BuildsPage />)
+    await screen.findAllByText("Research Agent")
+    const [publishButton] = screen.getAllByRole("button", { name: publicationActionName("publish") })
+    const [unpublishButton] = screen.getAllByRole("button", { name: publicationActionName("unpublish") })
+    fireEvent.click(publishButton)
+    fireEvent.click(unpublishButton)
+
+    await act(async () => {
+      unpublish.resolve(new Response(null, { status: 204 }))
+      await unpublish.promise
+    })
+    await act(async () => {
+      publish.resolve(new Response(null, { status: 204 }))
+      await publish.promise
+    })
+    await waitFor(() => expect(listRequests).toBe(3))
+
+    await act(async () => {
+      firstRefresh.resolve(jsonResponse([]))
+      secondRefresh.resolve(jsonResponse([]))
+      await Promise.all([firstRefresh.promise, secondRefresh.promise])
+    })
+  })
+
+  it("keeps the mutation and refresh phases structurally separate", () => {
+    const source = readFileSync(`${process.cwd()}/src/app/build/page.tsx`, "utf8")
+    const mutationStart = source.indexOf("const performPublicationMutation")
+    const wrapperStart = source.indexOf("const handlePublication")
+    const nextOwnerStart = source.indexOf("const [agentDeleteSession", wrapperStart)
+
+    expect(mutationStart).toBeGreaterThan(-1)
+    expect(wrapperStart).toBeGreaterThan(mutationStart)
+    expect(nextOwnerStart).toBeGreaterThan(wrapperStart)
+
+    const mutation = source.slice(mutationStart, wrapperStart)
+    const wrapper = source.slice(wrapperStart, nextOwnerStart)
+    expect(mutation).not.toContain("fetchAgents")
+    expect(wrapper).not.toContain("catch")
+    expect(wrapper).toContain("void fetchAgents()")
+    expect(wrapper).not.toContain("await fetchAgents()")
   })
 })
 

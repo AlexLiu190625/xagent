@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest"
+import { readFileSync } from "node:fs"
 
 import {
   resolveDynamicTranslation,
@@ -103,6 +104,44 @@ describe("translations", () => {
       discardNotAllowed: expect.any(String),
       discardHasRuns: expect.any(String),
     }))
+  })
+
+  it("keeps publication failure copy neutral, exact, and fully migrated", () => {
+    expect(translations.en.builds.publication).toEqual({
+      publishFailed: "Failed to publish agent",
+      unpublishFailed: "Failed to unpublish agent",
+    })
+    expect(translations.zh.builds.publication).toEqual({
+      publishFailed: "发布 Agent 失败",
+      unpublishFailed: "取消发布 Agent 失败",
+    })
+    for (const editorError of [
+      translations.en.builds.editor.error,
+      translations.zh.builds.editor.error,
+    ]) {
+      expect(editorError as Record<string, unknown>).not.toHaveProperty("publishFailed")
+      expect(editorError as Record<string, unknown>).not.toHaveProperty("unpublishFailed")
+    }
+
+    const buildPage = readFileSync(`${process.cwd()}/src/app/build/page.tsx`, "utf8")
+    const agentBuilder = readFileSync(
+      `${process.cwd()}/src/components/build/agent-builder.tsx`,
+      "utf8",
+    )
+    const localeSources = [
+      readFileSync(`${process.cwd()}/src/i18n/locales/en.ts`, "utf8"),
+      readFileSync(`${process.cwd()}/src/i18n/locales/zh.ts`, "utf8"),
+    ]
+
+    expect(buildPage.match(/builds\.publication\.publishFailed/g)).toHaveLength(1)
+    expect(buildPage.match(/builds\.publication\.unpublishFailed/g)).toHaveLength(1)
+    expect(agentBuilder.match(/builds\.publication\.publishFailed/g)).toHaveLength(2)
+    expect(agentBuilder.match(/builds\.publication\.unpublishFailed/g)).toHaveLength(1)
+
+    for (const source of [buildPage, agentBuilder, ...localeSources]) {
+      expect(source).not.toContain("builds.editor.error.publishFailed")
+      expect(source).not.toContain("builds.editor.error.unpublishFailed")
+    }
   })
 
   it("provides localized Widget Session lifecycle copy", () => {

@@ -136,29 +136,50 @@ function BuildsPageContent() {
     }
   }, [])
 
-  const handlePublish = async (agentId: number) => {
+  const publicationOperations = {
+    publish: {
+      suffix: "publish",
+      errorKey: "builds.publication.publishFailed",
+      diagnostic: "Failed to publish agent:",
+    },
+    unpublish: {
+      suffix: "unpublish",
+      errorKey: "builds.publication.unpublishFailed",
+      diagnostic: "Failed to unpublish agent:",
+    },
+  } as const
+
+  const performPublicationMutation = async (
+    agentId: number,
+    kind: keyof typeof publicationOperations,
+  ): Promise<"success" | "failed" | "stale"> => {
+    const operation = publicationOperations[kind]
     try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/publish`, {
+      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/${operation.suffix}`, {
         method: "POST",
       })
-      if (response.ok) {
-        fetchAgents() // Refresh list
+      if (!isMountedRef.current) return "stale"
+      if (!response.ok) {
+        console.error(operation.diagnostic, response)
+        toast.error(t(operation.errorKey))
+        return "failed"
       }
+      return "success"
     } catch (error) {
-      console.error("Failed to publish agent:", error)
+      if (!isMountedRef.current) return "stale"
+      console.error(operation.diagnostic, error)
+      toast.error(t(operation.errorKey))
+      return "failed"
     }
   }
 
-  const handleUnpublish = async (agentId: number) => {
-    try {
-      const response = await apiRequest(`${getApiUrl()}/api/agents/${agentId}/unpublish`, {
-        method: "POST",
-      })
-      if (response.ok) {
-        fetchAgents() // Refresh list
-      }
-    } catch (error) {
-      console.error("Failed to unpublish agent:", error)
+  const handlePublication = async (
+    agentId: number,
+    kind: keyof typeof publicationOperations,
+  ) => {
+    const outcome = await performPublicationMutation(agentId, kind)
+    if (outcome === "success" && isMountedRef.current) {
+      void fetchAgents()
     }
   }
 
@@ -574,9 +595,9 @@ function BuildsPageContent() {
                                       onClick={(e) => {
                                         e.stopPropagation()
                                         if (agent.status === 'published') {
-                                          handleUnpublish(agent.id)
+                                          void handlePublication(agent.id, "unpublish")
                                         } else {
-                                          handlePublish(agent.id)
+                                          void handlePublication(agent.id, "publish")
                                         }
                                       }}
                                     >
