@@ -20,8 +20,10 @@ import {
 } from "@/components/ui/alert-dialog";
 import Link from "next/link";
 import { useState, useEffect, useRef } from "react";
-import { apiRequest } from "@/lib/api-wrapper";
+import { apiRequest, parseApiResponse } from "@/lib/api-wrapper";
 import { getApiUrl } from "@/lib/utils";
+import { resolveTaskLlmSelection } from "@/lib/models";
+import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create";
 import type { ConnectionInfo, Template } from "@/types/template";
 import { useI18n } from "@/contexts/i18n-context";
 import { useApp } from "@/contexts/app-context-chat";
@@ -29,6 +31,7 @@ import { WelcomeModal } from "@/components/welcome-modal";
 import { getBrandingFromEnv } from "@/lib/branding";
 import { useVoiceInputControls } from "@/components/voice-input-controller";
 import { HomePageExtension } from "@/lib/home-page-extension";
+import { toast } from "@/components/ui/sonner";
 
 interface RecentTask {
   task_id: number | string;
@@ -36,18 +39,6 @@ interface RecentTask {
   agent_name?: string | null;
   agent_logo_url?: string | null;
   created_at: string;
-}
-
-interface LlmModel {
-  model_id: string;
-  is_default?: boolean;
-}
-
-interface DefaultModelRecord {
-  config_type?: "general" | "small_fast" | "visual" | "compact";
-  model?: {
-    model_id?: string;
-  } | null;
 }
 
 export default function Home() {
@@ -62,7 +53,16 @@ export default function Home() {
   const [visibleGetStartedVideos, setVisibleGetStartedVideos] = useState<Set<number>>(new Set());
   const getStartedSectionRef = useRef<HTMLDivElement | null>(null);
   const homeChatInputRef = useRef<HTMLTextAreaElement | null>(null);
+  const mountedRef = useRef(false);
+  const activeTaskCreateAttemptRef = useRef<number | null>(null);
+  const taskCreateCounterRef = useRef(0);
+  const draftRevisionRef = useRef(0);
   const homeVoiceInput = useVoiceInputControls();
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; activeTaskCreateAttemptRef.current = null; };
+  }, []);
 
   useEffect(() => {
     const fetchData = async () => {
@@ -134,103 +134,92 @@ export default function Home() {
     router.push(`/build/new?template=${templateId}`);
   };
 
-  const resolveTaskLlmIds = async (): Promise<[string, string | null, string | null, string | null] | null> => {
-    const apiUrl = getApiUrl();
-    const [modelsResponse, defaultResponse] = await Promise.all([
-      apiRequest(`${apiUrl}/api/models/?category=llm`, { headers: {} }),
-      apiRequest(`${apiUrl}/api/models/user-default`, { headers: {} }),
-    ]);
-
-    let allModels: LlmModel[] = [];
-    if (modelsResponse.ok) {
-      const modelsData = await modelsResponse.json();
-      if (Array.isArray(modelsData)) {
-        allModels = modelsData as LlmModel[];
-      }
-    }
-
-    const defaultModels: Record<string, string | undefined> = {};
-    if (defaultResponse.ok) {
-      const defaultsData = await defaultResponse.json();
-      if (Array.isArray(defaultsData)) {
-        defaultsData.forEach((defaultConfig: DefaultModelRecord) => {
-          if (defaultConfig?.config_type && defaultConfig.model?.model_id) {
-            defaultModels[defaultConfig.config_type] = defaultConfig.model.model_id;
-          }
-        });
-      }
-    }
-
-    const generalModelId =
-      defaultModels.general ||
-      allModels.find((model) => model.is_default)?.model_id ||
-      allModels[0]?.model_id;
-
-    if (!generalModelId) {
-      return null;
-    }
-
-    return [
-      generalModelId,
-      defaultModels.small_fast ?? null,
-      defaultModels.visual ?? null,
-      defaultModels.compact ?? null,
-    ];
-  };
-
   const handleCreateTask = async (content: string) => {
-    if (isCreating) return;
+    const rawPrompt = content;
+    const submittedPrompt = rawPrompt.trim();
+    if (!submittedPrompt) return;
+    if (activeTaskCreateAttemptRef.current !== null) return;
+
+    const attempt = ++taskCreateCounterRef.current;
+    activeTaskCreateAttemptRef.current = attempt;
+    const revision = draftRevisionRef.current;
+    const isCurrent = () => mountedRef.current && activeTaskCreateAttemptRef.current === attempt;
+
     setIsCreating(true);
+
     try {
-      const llmIds = await resolveTaskLlmIds();
-      if (!llmIds) {
-        setShowNoModelAlert(true);
+      let task = null;
+
+      try {
+        const selection = await resolveTaskLlmSelection();
+        if (!isCurrent()) return;
+
+        if (selection.kind === "no_model") {
+          setShowNoModelAlert(true);
+          return;
+        }
+        if (selection.kind === "operational_error") throw selection.error;
+
+        const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: normalizeTaskPromptTitle(submittedPrompt),
+            description: submittedPrompt,
+            llm_ids: selection.llmIds,
+          }),
+        });
+
+        if (!isCurrent()) return;
+        const parsed = await parseApiResponse(taskResponse);
+        if (!isCurrent()) return;
+
+        task = taskResponse.ok ? parseTaskCreateCore(parsed.data) : null;
+        if (!task) throw new Error("Failed to create task");
+      } catch (error) {
+        if (isCurrent()) {
+          console.error("Failed to create task:", error);
+          toast.error(t("common.errors.taskFailed"));
+        }
         return;
       }
 
-      const requestBody = {
-        title: content,
-        description: content,
-        llm_ids: llmIds,
-      };
+      if (!isCurrent() || !task) return;
 
-      const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify(requestBody),
-      });
+      try {
+        if (!isCurrent()) return;
+        setPendingMessage({
+          message: submittedPrompt,
+          files: [],
+          targetTaskId: task.taskId,
+        });
 
-      if (taskResponse.ok) {
-        const taskData = await taskResponse.json();
-        const taskId = taskData.id || taskData.task_id;
+        if (!isCurrent()) return;
+        setTaskId(task.taskId);
 
-        if (taskId) {
-          const parsedTaskId = typeof taskId === 'string' ? parseInt(taskId) : taskId;
-
-          setPendingMessage({
-            message: content,
-            files: [],
-            targetTaskId: parsedTaskId
-          });
-
-          setTaskId(parsedTaskId);
+        if (!isCurrent()) return;
+        if (draftRevisionRef.current === revision && homeChatInputRef.current) {
+          homeChatInputRef.current.value = "";
+          homeChatInputRef.current.style.height = "auto";
+          draftRevisionRef.current += 1;
         }
-      } else {
-        console.error("Failed to create task");
+      } catch (error) {
+        if (isCurrent()) console.error("Failed to commit task creation:", error);
       }
-    } catch (err) {
-      console.error("Failed to send message:", err);
     } finally {
-      setIsCreating(false);
+      if (isCurrent()) {
+        activeTaskCreateAttemptRef.current = null;
+        setIsCreating(false);
+      }
     }
   };
 
   const handleChatButtonClick = () => {
     const val = homeChatInputRef.current?.value;
     if (val && val.trim()) {
-      handleCreateTask(val.trim());
+      handleCreateTask(val);
     }
   };
 
@@ -296,6 +285,7 @@ export default function Home() {
               className="border-0 bg-transparent text-white text-[16px] leading-relaxed placeholder:text-[hsl(240_5%_60%)] focus-visible:ring-0 focus-visible:outline-none flex-1 resize-none overflow-hidden min-h-[28px] max-h-[120px] py-1 px-2"
               rows={1}
               onInput={(e) => {
+                draftRevisionRef.current += 1;
                 const target = e.target as HTMLTextAreaElement;
                 target.style.height = "auto";
                 target.style.height = Math.min(target.scrollHeight, 120) + "px";
@@ -304,7 +294,7 @@ export default function Home() {
                 if (e.key === 'Enter' && !e.shiftKey) {
                   e.preventDefault();
                   if (e.currentTarget.value.trim() && !isCreating) {
-                    handleCreateTask(e.currentTarget.value.trim());
+                    handleCreateTask(e.currentTarget.value);
                   }
                 }
               }}

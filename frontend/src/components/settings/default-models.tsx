@@ -27,9 +27,9 @@ import {
   getUserDefaultModels,
   setUserDefaultModel,
   removeUserDefaultModel,
-  DefaultModelConfig,
   DefaultModelType,
-  Model,
+  ModelWithAccess,
+  UserDefaultModelMap,
 } from "@/lib/models"
 import { useAuth } from "@/contexts/auth-context"
 import { useI18n } from "@/contexts/i18n-context"
@@ -89,27 +89,26 @@ const modelTypeConfig = {
   },
 }
 
-const defaultModelTypes = Object.keys(modelTypeConfig) as DefaultModelType[]
+type SettingsDefaultModelType = Exclude<DefaultModelType, 'rerank'>
+const defaultModelTypes = Object.keys(modelTypeConfig) as SettingsDefaultModelType[]
 
-const getModelCategory = (model: Model): string => {
-  return model.category || ''
+const getModelCategory = (model: ModelWithAccess): string => {
+  return model.category
 }
 
-const getModelAbilities = (model: Model): string[] => {
+const getModelAbilities = (model: ModelWithAccess): string[] => {
   return model.abilities || []
 }
 
-const getModelDisplayName = (model: Model): string => {
-  if (model.model_name) return model.model_name
-  return model.name
+const getModelDisplayName = (model: ModelWithAccess): string => {
+  return model.model_name
 }
 
-const getModelProviderLabel = (model: Model): string => {
-  if (model.model_provider) return model.model_provider
-  return model.provider
+const getModelProviderLabel = (model: ModelWithAccess): string => {
+  return model.model_provider
 }
 
-const getCompatibleModels = (models: Model[], configType: DefaultModelType): Model[] => {
+const getCompatibleModels = (models: ModelWithAccess[], configType: SettingsDefaultModelType): ModelWithAccess[] => {
   if (configType === 'embedding') {
     return models.filter((model) => getModelCategory(model) === 'embedding')
   }
@@ -145,8 +144,8 @@ const getCompatibleModels = (models: Model[], configType: DefaultModelType): Mod
 
 export function DefaultModelsSettings() {
   const { token } = useAuth()
-  const [models, setModels] = useState<Model[]>([])
-  const [defaultModels, setDefaultModels] = useState<DefaultModelConfig>({})
+  const [models, setModels] = useState<ModelWithAccess[]>([])
+  const [defaultModels, setDefaultModels] = useState<UserDefaultModelMap>({})
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState<string | null>(null)
   const [message, setMessage] = useState<{ type: 'success' | 'error', text: string } | null>(null)
@@ -162,19 +161,19 @@ export function DefaultModelsSettings() {
     try {
       setLoading(true)
       const [modelsData, defaultsData] = await Promise.all([
-        getUserModels(token),
-        getUserDefaultModels(token),
+        getUserModels(),
+        getUserDefaultModels(),
       ])
       setModels(modelsData)
       setDefaultModels(defaultsData)
-    } catch (error) {
+    } catch {
       setMessage({ type: 'error', text: t('settings.defaultModels.messages.loadFailed') })
     } finally {
       setLoading(false)
     }
   }
 
-  const handleSetDefault = async (configType: DefaultModelType, modelId: number) => {
+  const handleSetDefault = async (configType: SettingsDefaultModelType, modelId: number) => {
     if (!token) return
 
     try {
@@ -184,19 +183,19 @@ export function DefaultModelsSettings() {
       await setUserDefaultModel(token, configType, modelId)
 
       // Reload defaults
-      const defaultsData = await getUserDefaultModels(token)
+      const defaultsData = await getUserDefaultModels()
       setDefaultModels(defaultsData)
 
       const typeTitle = t(`settings.defaultModels.types.${configType}.title`)
       setMessage({ type: 'success', text: t('settings.defaultModels.messages.updated', { type: typeTitle }) })
-    } catch (error) {
+    } catch {
       setMessage({ type: 'error', text: t('settings.defaultModels.messages.setFailed') })
     } finally {
       setSaving(null)
     }
   }
 
-  const handleRemoveDefault = async (configType: DefaultModelType) => {
+  const handleRemoveDefault = async (configType: SettingsDefaultModelType) => {
     if (!token) return
 
     try {
@@ -206,12 +205,12 @@ export function DefaultModelsSettings() {
       await removeUserDefaultModel(token, configType)
 
       // Reload defaults
-      const defaultsData = await getUserDefaultModels(token)
+      const defaultsData = await getUserDefaultModels()
       setDefaultModels(defaultsData)
 
       const typeTitle = t(`settings.defaultModels.types.${configType}.title`)
       setMessage({ type: 'success', text: t('settings.defaultModels.messages.removed', { type: typeTitle }) })
-    } catch (error) {
+    } catch {
       setMessage({ type: 'error', text: t('settings.defaultModels.messages.removeFailed') })
     } finally {
       setSaving(null)

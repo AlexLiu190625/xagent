@@ -18,8 +18,10 @@ import { FeatureEmptyState } from "@/components/ui/feature-empty-state"
 import { useI18n } from "@/contexts/i18n-context"
 import { useApp } from "@/contexts/app-context-chat"
 import { useRouter, useSearchParams } from "next/navigation"
-import { apiRequest } from "@/lib/api-wrapper"
+import { apiRequest, parseApiResponse } from "@/lib/api-wrapper"
 import { getApiUrl } from "@/lib/utils"
+import { resolveTaskLlmSelection } from "@/lib/models"
+import { normalizeTaskPromptTitle, parseTaskCreateCore } from "@/lib/task-create"
 import {
   canDeleteAgent,
   canEditAgent,
@@ -44,43 +46,6 @@ import {
   BuildPageExtensionProvider,
 } from "@/lib/build-page-extension"
 
-interface LlmModel {
-  model_id: string
-  is_default?: boolean
-}
-
-interface DefaultModelRecord {
-  config_type?: "general" | "small_fast" | "visual" | "compact"
-  model?: {
-    model_id?: string
-  } | null
-}
-
-interface TaskCreateResponse {
-  task_id: number
-}
-
-const isLlmModel = (value: unknown): value is LlmModel => {
-  if (!value || typeof value !== "object") {
-    return false
-  }
-
-  const candidate = value as Record<string, unknown>
-  return (
-    typeof candidate.model_id === "string" &&
-    (candidate.is_default === undefined || typeof candidate.is_default === "boolean")
-  )
-}
-
-const isTaskCreateResponse = (value: unknown): value is TaskCreateResponse => {
-  if (!value || typeof value !== "object") {
-    return false
-  }
-
-  const candidate = value as Record<string, unknown>
-  return typeof candidate.task_id === "number"
-}
-
 function BuildsPageContent() {
   const { t } = useI18n()
   const { dispatch, setTaskId, setPendingMessage } = useApp()
@@ -91,6 +56,9 @@ function BuildsPageContent() {
   const isMountedRef = useRef(false)
   const agentListRequestGenerationRef = useRef(0)
   const agentDeleteActionGenerationRef = useRef(0)
+  const activeTaskCreateAttemptRef = useRef<number | null>(null)
+  const taskCreateCounterRef = useRef(0)
+  const draftRevisionRef = useRef(0)
   const [searchTerm, setSearchTerm] = useState("")
   const [agents, setAgents] = useState<Agent[]>([])
   const [loading, setLoading] = useState(true)
@@ -162,6 +130,7 @@ function BuildsPageContent() {
     void fetchAgents()
     return () => {
       isMountedRef.current = false
+      activeTaskCreateAttemptRef.current = null
       agentListRequestGenerationRef.current += 1
       agentDeleteActionGenerationRef.current += 1
     }
@@ -339,106 +308,105 @@ function BuildsPageContent() {
     setIsCreateModalOpen(true)
   }
 
-  const resolveTaskLlmIds = async (): Promise<[string, string | null, string | null, string | null] | null> => {
-    const apiUrl = getApiUrl()
-    const [modelsResponse, defaultResponse] = await Promise.all([
-      apiRequest(`${apiUrl}/api/models/?category=llm`, { headers: {} }),
-      apiRequest(`${apiUrl}/api/models/user-default`, { headers: {} }),
-    ])
-
-    let allModels: LlmModel[] = []
-    if (modelsResponse.ok) {
-      const modelsData = await modelsResponse.json()
-      if (Array.isArray(modelsData)) {
-        allModels = modelsData.filter(isLlmModel)
-      }
-    }
-
-    const defaultModels: Record<string, string | undefined> = {}
-    if (defaultResponse.ok) {
-      const defaultsData = await defaultResponse.json()
-      if (Array.isArray(defaultsData)) {
-        defaultsData.forEach((defaultConfig: DefaultModelRecord) => {
-          if (defaultConfig?.config_type && defaultConfig.model?.model_id) {
-            defaultModels[defaultConfig.config_type] = defaultConfig.model.model_id
-          }
-        })
-      }
-    }
-
-    const generalModelId =
-      defaultModels.general ||
-      allModels.find((model) => model.is_default)?.model_id ||
-      allModels[0]?.model_id
-
-    if (!generalModelId) {
-      return null
-    }
-
-    return [
-      generalModelId,
-      defaultModels.small_fast ?? null,
-      defaultModels.visual ?? null,
-      defaultModels.compact ?? null,
-    ]
-  }
-
   const handleBuildWithPrompt = async () => {
-    const prompt = createPrompt.trim()
-    if (!prompt || isStartingTask) return
+    const rawPrompt = createPrompt
+    const prompt = rawPrompt.trim()
+    if (!prompt || activeTaskCreateAttemptRef.current !== null) return
+
+    const attempt = ++taskCreateCounterRef.current
+    activeTaskCreateAttemptRef.current = attempt
+    const revision = draftRevisionRef.current
+    const isCurrent = () => isMountedRef.current && activeTaskCreateAttemptRef.current === attempt
 
     setIsStartingTask(true)
     try {
-      dispatch({ type: "RESET_STATE" })
-      const llmIds = await resolveTaskLlmIds()
-      if (!llmIds) {
-        toast.error(t("chatPage.input.noModelAlert"))
+      let task = null
+
+      try {
+        const selection = await resolveTaskLlmSelection()
+        if (!isCurrent()) return
+
+        if (selection.kind === "no_model") {
+          toast.error(t("chatPage.input.noModelAlert"))
+          return
+        }
+        if (selection.kind === "operational_error") throw selection.error
+
+        const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            title: normalizeTaskPromptTitle(rawPrompt),
+            description: prompt,
+            llm_ids: selection.llmIds,
+          }),
+        })
+
+        if (!isCurrent()) return
+        const parsed = await parseApiResponse(taskResponse)
+        if (!isCurrent()) return
+
+        task = taskResponse.ok ? parseTaskCreateCore(parsed.data) : null
+        if (!task) throw new Error("Task create response is invalid")
+      } catch (error) {
+        if (isCurrent()) {
+          console.error("Failed to start task from build modal:", error)
+          toast.error(t("builds.list.createModal.startTaskFailed"))
+        }
         return
       }
 
-      const taskResponse = await apiRequest(`${getApiUrl()}/api/chat/task/create`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          title: prompt,
-          description: prompt,
-          llm_ids: llmIds,
-        }),
-      })
+      if (!isCurrent() || !task) return
 
-      if (!taskResponse.ok) {
-        throw new Error("Failed to create task")
+      try {
+        if (!isCurrent()) return
+        dispatch({ type: "RESET_STATE" })
+
+        if (!isCurrent()) return
+        setPendingMessage({
+          message: prompt,
+          files: [],
+          targetTaskId: task.taskId,
+        })
+
+        if (!isCurrent()) return
+        dispatch({ type: "TRIGGER_TASK_UPDATE" })
+
+        if (!isCurrent()) return
+        setTaskId(task.taskId)
+
+        if (!isCurrent()) return
+        setIsCreateModalOpen(false)
+
+        if (!isCurrent()) return
+        if (draftRevisionRef.current === revision) {
+          draftRevisionRef.current += 1
+          setCreatePrompt("")
+        }
+      } catch (error) {
+        if (isCurrent()) console.error("Failed to commit task creation:", error)
       }
-
-      const taskData = await taskResponse.json()
-      if (!isTaskCreateResponse(taskData)) {
-        throw new Error("Task create response is missing task_id")
-      }
-
-      setPendingMessage({
-        message: prompt,
-        files: [],
-        targetTaskId: taskData.task_id,
-      })
-      dispatch({ type: "TRIGGER_TASK_UPDATE" })
-      setTaskId(taskData.task_id)
-      setIsCreateModalOpen(false)
-      setCreatePrompt("")
-    } catch (error) {
-      console.error("Failed to start task from build modal:", error)
-      toast.error(t("builds.list.createModal.startTaskFailed"))
-      setIsCreateModalOpen(true)
-      setCreatePrompt(prompt)
     } finally {
-      setIsStartingTask(false)
+      if (isCurrent()) {
+        activeTaskCreateAttemptRef.current = null
+        setIsStartingTask(false)
+      }
     }
   }
 
+  const handleCreateModalOpenChange = (open: boolean) => {
+    if (!open) {
+      activeTaskCreateAttemptRef.current = null
+      setIsStartingTask(false)
+    }
+    setIsCreateModalOpen(open)
+  }
+
   const handleManualCreate = () => {
+    handleCreateModalOpenChange(false)
     router.push("/build/new")
-    setIsCreateModalOpen(false)
   }
 
   const createPromptVoiceInputLabel =
@@ -778,7 +746,7 @@ function BuildsPageContent() {
         onOpenChange={(open) => { if (!open) setTriggersAgent(null) }}
       />
 
-      <Dialog open={isCreateModalOpen} onOpenChange={setIsCreateModalOpen}>
+      <Dialog open={isCreateModalOpen} onOpenChange={handleCreateModalOpenChange}>
         <DialogContent className="sm:max-w-[550px] gap-0 p-0 overflow-hidden bg-background shadow-lg rounded-xl">
           <DialogHeader className="px-6 py-5 border-b pr-10">
             <DialogTitle className="flex items-start sm:items-center gap-2 text-xl font-semibold">
@@ -809,7 +777,7 @@ function BuildsPageContent() {
                   ref={createPromptRef}
                   data-voice-input="false"
                   value={createPrompt}
-                  onChange={(e) => setCreatePrompt(e.target.value)}
+                  onChange={(e) => { draftRevisionRef.current += 1; setCreatePrompt(e.target.value) }}
                   placeholder={t("builds.list.createModal.placeholder")}
                   className="min-h-[100px] flex-1 resize-none border-0 shadow-none focus-visible:ring-0"
                   onKeyDown={(e) => {
