@@ -6,6 +6,7 @@ import hashlib
 import logging
 import mimetypes
 import tempfile
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, BinaryIO, Literal, NoReturn, Protocol, cast
@@ -160,22 +161,25 @@ class ManagedFileRef:
     is either a fresh upload about to be written, or a ``storage_status=
     "pending"`` record a read-only endpoint is merely trying to serve from
     local storage (see ``__post_init__``). Rather than asking every caller
-    to declare its intent, this class resolves off-turn, so a
-    resolver-authoritative namespace mismatch downgrades instead of turning
-    a servable read into an error, and defers the fail-closed authority
-    check to ``sync_to_durable``, the operation that composes a key from
-    the resolved namespace. ``_scope_from_task_recovery`` records whether
-    ``_scope_segments`` came from that off-turn per-task recovery, as
-    opposed to an explicit ``execution_scope`` argument or the ambient turn
-    contextvar -- only the recovered case needs re-checking before a key is
-    composed.
+    to declare its intent, this class settles the namespace per operation:
+    an operation that addresses bytes that already exist resolves off-turn,
+    so a resolver-authoritative mismatch downgrades instead of turning a
+    servable read into an error, while ``sync_to_durable`` -- the operation
+    that composes a key from the resolved namespace -- resolves fail-closed
+    before it does so. ``_pending_scope_task_id`` records that the namespace
+    still has to be recovered per task, as opposed to having come from an
+    explicit ``execution_scope`` argument or the ambient turn contextvar.
 
     Off-turn resolution is not the same as never failing: it downgrades a
     mismatch only where the resolver produced an authoritative answer to
-    downgrade to. A resolver that abstains and disagrees with the snapshot,
-    a resolver that violates its own return contract, and a snapshot loader
-    that raises all still propagate out of construction, so a read of a
-    keyless record is not unconditionally safe.
+    downgrade to. An abstaining resolver that disagrees with the snapshot, a
+    resolver that violates its own return contract, and a snapshot loader
+    that raises all propagate rather than downgrade. Construction therefore
+    does not perform that resolution at all: it records the task to recover
+    from and resolves on first use by an operation that needs a namespace.
+    A read of a keyless record needs none -- ``ensure_local`` and
+    ``materialize`` refuse a record with no durable object before they touch
+    storage -- so a dispute cannot turn a servable read into an error.
 
     A key supplied by the caller bypasses the re-check below, because the
     namespace it encodes was chosen wherever that key was composed. Callers
@@ -187,13 +191,19 @@ class ManagedFileRef:
     storage: FsspecFileStorage | ScopedFileStorage = field(default=None)  # type: ignore[assignment]
     execution_scope: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED
     _scope_segments: tuple[str, ...] = field(default=(), init=False, repr=False)
-    _scope_from_task_recovery: bool = field(default=False, init=False, repr=False)
-    _recovery_task_id: Any = field(default=None, init=False, repr=False)
+    # Not None while a per-task scope recovery is owed but has not run yet.
+    # Cleared by the recovery, so two operations on one ref cannot bind to
+    # two different namespaces.
+    _pending_scope_task_id: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
-        # Resolve the active scope once, at construction, so the bound handle
-        # and any key written through it (see ``sync_to_durable``) agree even
-        # if the ambient scope changes later or the ref outlives the turn.
+        # Settle the active scope once, so the bound handle and any key
+        # written through it (see ``sync_to_durable``) agree even if the
+        # ambient scope changes later or the ref outlives the turn. The
+        # ambient contextvar is sampled here, at construction, for exactly
+        # that reason; only the per-task resolver/snapshot recovery is
+        # deferred, because that is the one step that can raise and the one
+        # whose answer a read of a keyless record never consumes.
         #
         # Precedence mirrors ``AgentServiceManager.get_agent_for_task``:
         # explicit arg -> ambient turn contextvar -> the per-task
@@ -218,20 +228,17 @@ class ManagedFileRef:
                     # "pending" with no key, and list/download/preview
                     # endpoints construct a ref for exactly those records).
                     # Presence of a key cannot tell write intent from read
-                    # intent apart, so construction never picks a side: it
-                    # always resolves off-turn (downgrading a resolver/
-                    # snapshot authority mismatch to the resolver's answer
-                    # plus a warning instead of raising -- a keyless ref
-                    # under construction may only ever be serving a read
-                    # from local storage, and raising here would turn a
-                    # servable file into an unhandled 500). The namespace
-                    # decision that actually matters -- which tenant's
-                    # subtree new bytes land under -- is deferred to
-                    # ``sync_to_durable``, the one place that composes a
-                    # fresh key, which re-resolves fail-closed right before
-                    # doing so. ``_scope_from_task_recovery`` records that
-                    # this ref's ``_scope_segments`` came from this branch,
-                    # so ``sync_to_durable`` knows a re-check is needed.
+                    # intent apart, so construction picks neither: it records
+                    # the task and resolves nothing. Whichever operation
+                    # first needs a namespace supplies the policy --
+                    # ``sync_to_durable`` fail-closed before it composes a
+                    # key, everything else off-turn, downgrading a
+                    # resolver-authoritative mismatch to the resolver's
+                    # answer plus a warning. A read of a keyless record asks
+                    # for no namespace at all, so the paths that can raise
+                    # (an abstaining resolver disagreeing with the snapshot,
+                    # a resolver breaking its return contract, a loader that
+                    # raises) cannot turn a servable file into a 500.
                     #
                     # A record that already has a durable key is the read
                     # (or rewrite-in-place) path: that key already fixes the
@@ -268,24 +275,54 @@ class ManagedFileRef:
                     # scope and can raise ``StorageKeyScopeError``), not just
                     # a neutral no-op -- it is deliberate for the reason
                     # above, not an oversight.
-                    scope = resolve_execution_scope_off_turn(task_id)
-                    self._scope_from_task_recovery = True
-                    self._recovery_task_id = task_id
+                    self._pending_scope_task_id = task_id
+                    return
         else:
             scope = cast(ExecutionScope | None, scope_input)
         self._scope_segments = (
             scope.durable_storage_segments if scope is not None else ()
         )
-        if self.storage is None:
-            user_id = self.record.user_id
-            if user_id is None:
-                raise ValueError(
-                    "Record user_id is required to bind user-scoped storage; "
-                    "pass an explicit storage handle for records without an owner"
-                )
-            self.storage = get_user_file_storage(
-                int(user_id), scope_segments=self._scope_segments
+        self._bind_storage()
+
+    def _bind_storage(self) -> None:
+        """Bind the handle to the settled namespace, unless one was passed in."""
+        if self.storage is not None:
+            return
+        user_id = self.record.user_id
+        if user_id is None:
+            raise ValueError(
+                "Record user_id is required to bind user-scoped storage; "
+                "pass an explicit storage handle for records without an owner"
             )
+        self.storage = get_user_file_storage(
+            int(user_id), scope_segments=self._scope_segments
+        )
+
+    def _settle_pending_scope(
+        self, resolve: Callable[[Any], ExecutionScope | None]
+    ) -> None:
+        """Run the deferred per-task recovery, then bind.
+
+        ``resolve`` is the caller's policy: the off-turn form for operations
+        that address bytes that already exist, and the fail-closed form where
+        a namespace is being chosen for new bytes. Whichever runs first wins
+        for the life of this ref, which is why the only caller that passes
+        the fail-closed form does so before composing a key.
+        """
+        task_id = self._pending_scope_task_id
+        if task_id is not None:
+            scope = resolve(task_id)
+            self._scope_segments = (
+                scope.durable_storage_segments if scope is not None else ()
+            )
+            self._pending_scope_task_id = None
+        self._bind_storage()
+
+    def _bound_storage(self) -> FsspecFileStorage | ScopedFileStorage:
+        """The storage handle, settling a deferred scope recovery on first use."""
+        if self.storage is None:
+            self._settle_pending_scope(resolve_execution_scope_off_turn)
+        return self.storage
 
     @property
     def local_path(self) -> Path:
@@ -321,7 +358,7 @@ class ManagedFileRef:
         temp_path = Path(temp_file.name)
         temp_file.close()
         try:
-            self.storage.copy_to_path(self.storage_key, temp_path)
+            self._bound_storage().copy_to_path(self.storage_key, temp_path)
             self._verify_content_checksum(temp_path)
             temp_path.replace(path)
             return path
@@ -349,7 +386,7 @@ class ManagedFileRef:
         for _attempt in range(2):
             materialized_path: Path | None = None
             try:
-                materialized_path = self.storage.materialize(
+                materialized_path = self._bound_storage().materialize(
                     self.storage_key, self.filename
                 )
                 self._verify_content_checksum(materialized_path)
@@ -386,7 +423,7 @@ class ManagedFileRef:
         if not self._verify_durable_checksum_for_direct_access():
             return None
         try:
-            return self.storage.signed_url(
+            return self._bound_storage().signed_url(
                 self.storage_key,
                 expires=expires,
                 content_type=content_type,
@@ -429,12 +466,8 @@ class ManagedFileRef:
             # call raise, and it raises before ``resolved_key`` is computed
             # or anything is written -- so this is a genuine re-check, not
             # redundant work re-deriving the same answer.
+            self._settle_pending_scope(resolve_execution_scope)
             scope_segments = self._scope_segments
-            if self._scope_from_task_recovery:
-                scope = resolve_execution_scope(self._recovery_task_id)
-                scope_segments = (
-                    scope.durable_storage_segments if scope is not None else ()
-                )
             resolved_key = build_upload_storage_key(
                 int(self.record.user_id),
                 str(self.record.file_id),
@@ -442,7 +475,7 @@ class ManagedFileRef:
                 scope_segments=scope_segments,
             )
         try:
-            stored_object = self.storage.put_file(
+            stored_object = self._bound_storage().put_file(
                 path,
                 resolved_key,
                 mime_type or getattr(self.record, "mime_type", None),
@@ -463,7 +496,7 @@ class ManagedFileRef:
         local_path = self.local_path
         local_exists = local_path.exists() and local_path.is_file()
         try:
-            stored_object = self.storage.stat(expected_key)
+            stored_object = self._bound_storage().stat(expected_key)
         except FileNotFoundError:
             return "missing"
         except _NAMESPACE_AUTHORITY_ERRORS:
@@ -486,7 +519,7 @@ class ManagedFileRef:
                 return "uploaded"
             if not checksum:
                 try:
-                    checksum = self.storage.content_hash(expected_key)
+                    checksum = self._bound_storage().content_hash(expected_key)
                 except Exception:
                     self.sync_to_durable(
                         storage_key=expected_key,
@@ -503,7 +536,7 @@ class ManagedFileRef:
 
         if not checksum:
             try:
-                checksum = self.storage.content_hash(expected_key)
+                checksum = self._bound_storage().content_hash(expected_key)
             except _NAMESPACE_AUTHORITY_ERRORS:
                 raise
             except Exception as exc:
@@ -537,7 +570,7 @@ class ManagedFileRef:
 
     def delete_durable(self) -> None:
         if self.has_durable_object:
-            self.storage.delete(self.storage_key)
+            self._bound_storage().delete(self.storage_key)
 
     def _verify_content_checksum(self, path: Path) -> None:
         expected_checksum = getattr(self.record, "checksum", None)
@@ -562,7 +595,7 @@ class ManagedFileRef:
             return False
 
         try:
-            actual_checksum = self.storage.content_hash(self.storage_key)
+            actual_checksum = self._bound_storage().content_hash(self.storage_key)
         except Exception as exc:
             logger.warning(
                 "Falling back to backend-mediated durable access because content "

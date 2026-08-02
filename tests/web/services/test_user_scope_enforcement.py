@@ -11,8 +11,10 @@ import pytest
 
 from tests.shared.execution_scope import register_scope_resolver
 from xagent.core.execution_scope import (
+    DeferToSnapshot,
     ExecutionScope,
     ExecutionScopeAuthorityError,
+    ExecutionScopeResolverContractError,
     reset_execution_scope,
     set_execution_scope,
     set_execution_scope_snapshot_loader,
@@ -266,7 +268,12 @@ def test_resolver_narrows_handle_when_contextvar_absent(storage_env, tmp_path):
     )
     record = _record(tmp_path / "uploads" / "missing.txt", task_id=99)
     # No ambient contextvar, no explicit scope: fall back to the resolver.
-    assert ManagedFileRef(record).storage.prefix == "users/7/clients/3/end_users/7"
+    # The record carries no durable key, so the per-task recovery is owed
+    # rather than already done -- it settles when an operation first needs a
+    # namespace, and the handle it settles on is the resolver's.
+    ref = ManagedFileRef(record)
+    assert ref.storage is None
+    assert ref._bound_storage().prefix == "users/7/clients/3/end_users/7"
 
 
 def test_contextvar_beats_resolver(storage_env, tmp_path):
@@ -407,9 +414,11 @@ def test_read_path_downgrades_on_mismatch_for_pending_record(storage_env, tmp_pa
     source.write_text("pending upload", encoding="utf-8")
     record = _record(source, task_id=99, storage_status="pending")
 
+    # Serving the local copy needs no namespace at all, so nothing is
+    # resolved and nothing can be disputed.
     ref = ManagedFileRef(record)
-    assert ref.storage.prefix == "users/7/clients/3/end_users/7"
     assert ref.ensure_local().read_text(encoding="utf-8") == "pending upload"
+    assert ref.storage is None
 
 
 def test_materialize_downgrades_on_mismatch_for_pending_record(storage_env, tmp_path):
@@ -429,5 +438,90 @@ def test_materialize_downgrades_on_mismatch_for_pending_record(storage_env, tmp_
     record = _record(source, task_id=99, storage_status="pending")
 
     ref = ManagedFileRef(record)
-    assert ref.storage.prefix == "users/7/clients/3/end_users/7"
     assert ref.materialize().read_text(encoding="utf-8") == "pending upload"
+    assert ref.storage is None
+
+
+def _pending_record(tmp_path: Path) -> UploadedFile:
+    source = tmp_path / "uploads" / "source.txt"
+    source.parent.mkdir(exist_ok=True)
+    source.write_text("pending upload", encoding="utf-8")
+    return _record(source, task_id=99, storage_status="pending")
+
+
+def test_read_serves_when_an_abstaining_resolver_disagrees_with_the_snapshot(
+    storage_env, tmp_path
+):
+    """An abstention mismatch has no authoritative value to downgrade to, so
+    it fails closed wherever a namespace is required. A read of a pending
+    record requires none, and must still be served."""
+    register_scope_resolver(
+        lambda task_id: DeferToSnapshot(fallback=ExecutionScope()),
+    )
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(workspace_segments=("wider",))
+    )
+    ref = ManagedFileRef(_pending_record(tmp_path))
+
+    assert ref.ensure_local().read_text(encoding="utf-8") == "pending upload"
+    assert ref.materialize().read_text(encoding="utf-8") == "pending upload"
+
+
+def test_read_serves_when_the_resolver_breaks_its_return_contract(
+    storage_env, tmp_path
+):
+    register_scope_resolver(lambda task_id: "not-a-scope")
+    ref = ManagedFileRef(_pending_record(tmp_path))
+
+    assert ref.ensure_local().read_text(encoding="utf-8") == "pending upload"
+
+
+def test_read_serves_when_the_snapshot_loader_raises(storage_env, tmp_path):
+    """No resolver registered is this repository's shape today, and there the
+    loader's answer is the whole authority -- a database hiccup while reading
+    it must not take a read-only endpoint down with it."""
+
+    def _explode(task_id):
+        raise RuntimeError("snapshot row unreadable")
+
+    set_execution_scope_snapshot_loader(_explode)
+    ref = ManagedFileRef(_pending_record(tmp_path))
+
+    assert ref.ensure_local().read_text(encoding="utf-8") == "pending upload"
+
+
+def test_sync_to_durable_still_fails_closed_when_the_resolver_abstains_and_disagrees(
+    storage_env, tmp_path
+):
+    """The half that must not regress: deferring the resolution must not
+    weaken the check that runs where a namespace is chosen for new bytes."""
+    register_scope_resolver(
+        lambda task_id: DeferToSnapshot(fallback=ExecutionScope()),
+    )
+    set_execution_scope_snapshot_loader(
+        lambda task_id: ExecutionScope(workspace_segments=("wider",))
+    )
+    record = _pending_record(tmp_path)
+    ref = ManagedFileRef(record)
+
+    with pytest.raises(ExecutionScopeAuthorityError):
+        ref.sync_to_durable()
+
+    assert record.storage_status == "pending"
+    objects_root = tmp_path / "objects" / "users" / "7"
+    assert not (objects_root / "wider").exists()
+    assert not (objects_root / "uploads").exists()
+
+
+def test_sync_to_durable_still_fails_closed_when_the_resolver_breaks_its_contract(
+    storage_env, tmp_path
+):
+    register_scope_resolver(lambda task_id: "not-a-scope")
+    record = _pending_record(tmp_path)
+    ref = ManagedFileRef(record)
+
+    with pytest.raises(ExecutionScopeResolverContractError):
+        ref.sync_to_durable()
+
+    assert record.storage_status == "pending"
+    assert not (tmp_path / "objects" / "users" / "7" / "uploads").exists()
