@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import type { Locale } from "@/i18n/translations"
 import { formatDisplayDate } from "./time-utils"
 
 const bigintValue = (globalThis as { BigInt: (value: number) => bigint }).BigInt(1)
@@ -66,6 +67,19 @@ describe("formatDisplayDate", () => {
     expect(homeDate).not.toBe("")
     expect(formatSpy).toHaveBeenNthCalledWith(1, expectedLocale, dateOptions)
     expect(formatSpy).toHaveBeenNthCalledWith(2, expectedLocale, homeDateOptions)
+  })
+
+  it("falls back to the locale tag itself for locales without an explicit mapping", () => {
+    const formatSpy = vi.spyOn(Intl, "DateTimeFormat")
+    const widenedLocale = "vi" as unknown as Locale
+
+    const formatted = formatDisplayDate("2024-05-06T07:08:09Z", widenedLocale, dateOptions)
+
+    expect(formatted).not.toBe("")
+    expect(formatSpy).toHaveBeenCalledWith("vi", dateOptions)
+
+    const source = readFileSync("src/lib/time-utils.ts", "utf8")
+    expect(source).toContain("const displayDateLocales: Partial<Record<Locale, string>> = {")
   })
 
   it("formats a cross-day timestamp in the fixed UTC test environment", () => {

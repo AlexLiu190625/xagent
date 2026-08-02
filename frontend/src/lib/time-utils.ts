@@ -4,7 +4,9 @@
  */
 import type { Locale } from "@/i18n/translations"
 
-const displayDateLocales: Record<Locale, string> = {
+// Partial with a lookup fallback: distributions may replace @/i18n/translations
+// with a widened Locale union, and any unmapped locale is itself a BCP 47 tag.
+const displayDateLocales: Partial<Record<Locale, string>> = {
   en: "en-US",
   zh: "zh-CN",
 }
@@ -20,7 +22,7 @@ export function formatDisplayDate(
   const date = new Date(value)
   if (!Number.isFinite(date.getTime())) return ""
 
-  return new Intl.DateTimeFormat(displayDateLocales[locale], options).format(date)
+  return new Intl.DateTimeFormat(displayDateLocales[locale] ?? locale, options).format(date)
 }
 
 /**
