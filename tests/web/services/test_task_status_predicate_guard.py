@@ -331,9 +331,7 @@ def test_guard_detects_orm_query_update_writes() -> None:
 
 
 def test_guard_detects_column_keyed_writes() -> None:
-    """Replaces the old test_guard_does_not_flag_the_column_keyed_write_shape
-    -- the guard now covers this shape instead of documenting it as a gap.
-    """
+    """A Column-keyed status entry is a scanned write shape."""
     violations = scan_source(_FIXTURE_COLUMN_KEYED_WRITE, "fixture_column_keyed.py")
     assert len(violations) == 1, violations
     (violation,) = violations
