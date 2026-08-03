@@ -23,7 +23,7 @@ import ast
 from pathlib import Path
 
 import pytest
-from sqlalchemy import Column, Integer, String, case, func, or_, text, update
+from sqlalchemy import Column, Enum, Integer, case, func, or_, text, update
 from sqlalchemy.orm import declarative_base
 
 from tests.web.services.task_status_storage_shared import (
@@ -223,16 +223,25 @@ def test_poison_write_control_throwaway_model_without_validate_strings(
 
     Once Task.status has validate_strings=True, the "before" behavior can
     no longer be demonstrated on the real Task column. A throwaway model
-    with the pre-fix Enum(TaskStatus) (no validate_strings) shows the ORM
-    write that Half A above now rejects used to succeed silently -- proof
-    validate_strings=True is doing real work here, not a no-op on SQLite.
+    uses the pre-fix declaration -- Enum(TaskStatus), no validate_strings --
+    and three assertions bracket what the fix changed:
+
+    1. The ORM write of the lowercase enum *value* succeeds, explicitly
+       asserted rather than left to an uncaught exception, so a future
+       SQLAlchemy version that starts validating turns this assertion red
+       instead of silently making the control vacuous.
+    2. The raw stored value is the poisoned lowercase string
+       ("waiting_for_user"), not the member name.
+    3. A subsequent ORM read of that row raises LookupError -- the
+       identical failure the real Task.status column now prevents at
+       write time, so this pair of tests brackets the fix.
     """
     ThrowawayBase = declarative_base()
 
     class _LegacyStyleThrowawayTask(ThrowawayBase):  # type: ignore[misc, valid-type]
         __tablename__ = "throwaway_legacy_style_tasks"
         id = Column(Integer, primary_key=True)
-        status = Column(String(32))
+        status = Column(Enum(TaskStatus))
 
     from sqlalchemy import create_engine
     from sqlalchemy.orm import Session as OrmSession
@@ -246,19 +255,29 @@ def test_poison_write_control_throwaway_model_without_validate_strings(
             # No validate_strings on this throwaway column -- the write
             # below must succeed where the real Task.status column (with
             # validate_strings=True) raises StatementError.
-            db.execute(
-                update(_LegacyStyleThrowawayTask)
-                .where(_LegacyStyleThrowawayTask.id == 1)
-                .values(status=TaskStatus.WAITING_FOR_USER.value)
-            )
-            db.commit()
+            try:
+                db.execute(
+                    update(_LegacyStyleThrowawayTask)
+                    .where(_LegacyStyleThrowawayTask.id == 1)
+                    .values(status=TaskStatus.WAITING_FOR_USER.value)
+                )
+                db.commit()
+            except Exception as exc:
+                pytest.fail(
+                    "control write must succeed without validate_strings -- "
+                    "if this raises, the control no longer demonstrates the "
+                    f"pre-fix behavior it exists to bracket: {exc!r}"
+                )
             stored = db.execute(
                 text("SELECT status FROM throwaway_legacy_style_tasks WHERE id = 1")
             ).scalar_one()
             assert stored == TaskStatus.WAITING_FOR_USER.value, (
                 "control case must show the pre-fix write succeeding "
-                f"silently; got {stored!r}"
+                f"silently with the poisoned lowercase value; got {stored!r}"
             )
+            db.expire_all()
+            with pytest.raises(LookupError):
+                db.get(_LegacyStyleThrowawayTask, 1).status  # noqa: B018
     finally:
         ThrowawayBase.metadata.drop_all(engine)
 
@@ -268,12 +287,12 @@ def test_poison_write_control_throwaway_model_without_validate_strings(
 # --------------------------------------------------------------------------
 # Mutation check: flipping task_status_predicate.eq to return
 # `Task.status == status.value` (lowercase) turns
-# test_predicate_eq_matches_raw_comparison and all four
-# test_where_eq_site_matches_raw_comparison cases red, because the compiled
-# literal no longer matches the raw-literal reference on the right-hand
-# side. The round-trip sentinels are unaffected by that mutation: they write
-# through the ORM and never call the binding, so equivalence coverage here is
-# what catches an eq regression, not the round trip.
+# test_predicate_eq_matches_raw_comparison and
+# test_where_eq_matches_raw_comparison red, because the compiled literal no
+# longer matches the raw-literal reference on the right-hand side. The
+# round-trip sentinels are unaffected by that mutation: they write through
+# the ORM and never call the binding, so equivalence coverage here is what
+# catches an eq regression, not the round trip.
 
 
 def test_predicate_eq_matches_raw_comparison() -> None:
@@ -508,24 +527,27 @@ def test_lease_case_builders_are_the_only_case_calls_in_the_lease_service() -> N
 # --- WHERE-clause equivalence for the 6 WHERE sites (constants, not case) -
 
 
-@pytest.mark.parametrize(
-    "site,status",
-    [
-        ("expired_candidates_query", TaskStatus.RUNNING),  # :271
-        ("recover_expired_lease_where", TaskStatus.RUNNING),  # :394
-        ("refresh_lease_where", TaskStatus.RUNNING),  # :581
-        ("fail_and_release_where", TaskStatus.RUNNING),  # :740
-    ],
-)
-def test_where_eq_site_matches_raw_comparison(site, status) -> None:
-    raw = Task.status == status
-    bound = task_status_predicate.eq(status)
+def test_where_eq_matches_raw_comparison() -> None:
+    """The four production WHERE sites that compare
+    Task.status == TaskStatus.RUNNING --
+    _expired_task_lease_candidates_query, recover_expired_task_lease_no_commit,
+    _refresh_task_lease_no_commit, and fail_and_release_task_lease_no_commit
+    (all in task_lease_service.py) -- are, verbatim, the same
+    task_status_predicate.eq(TaskStatus.RUNNING) call; there is no per-site
+    expression left to differentiate once that is true. Each site's AST
+    shape is already covered with zero exemptions allowed by
+    test_task_lease_service_and_monitor_have_no_raw_status_comparisons in
+    test_task_status_predicate_guard.py; this is the one compiled-SQL
+    equivalence claim behind that proof.
+    """
+    raw = Task.status == TaskStatus.RUNNING
+    bound = task_status_predicate.eq(TaskStatus.RUNNING)
     assert _compiled(raw) == _compiled(bound)
 
 
 def test_where_ne_site_or_clause_matches_raw_comparison() -> None:
-    """task_lease_service.py:510 (acquire_task_lease_no_commit) -- the ne()
-    inside the or_() that gates whether the lease can be taken.
+    """acquire_task_lease_no_commit -- the ne() inside the or_() that gates
+    whether the lease can be taken.
     """
     stmt_raw = update(Task).where(
         Task.id == 1,
@@ -545,11 +567,11 @@ def test_where_ne_site_or_clause_matches_raw_comparison() -> None:
 
 
 def test_where_ne_new_run_site_matches_raw_comparison() -> None:
-    """task_lease_service.py:520 (acquire_task_lease_no_commit) -- the
-    standalone new_run guard, appended as its own .where() on an existing
-    statement rather than nested in an or_(). Different composition from the
-    site above, so it gets its own full-statement diff instead of being
-    assumed equivalent by shape.
+    """acquire_task_lease_no_commit -- the standalone new_run guard,
+    appended as its own .where() on an existing statement rather than
+    nested in an or_(). Different composition from the site above, so it
+    gets its own full-statement diff instead of being assumed equivalent by
+    shape.
     """
     stmt_raw = update(Task).where(Task.id == 1)
     stmt_raw = stmt_raw.where(Task.status != TaskStatus.RUNNING)
@@ -559,7 +581,7 @@ def test_where_ne_new_run_site_matches_raw_comparison() -> None:
 
 
 def test_monitor_active_agents_in_site_matches_raw_comparison() -> None:
-    """monitor.py:564 (dashboard-stats active_agents query)."""
+    """monitor.py get_dashboard_stats -- the active_agents query."""
     raw = Task.status.in_(["RUNNING", "PENDING"])
     bound = task_status_predicate.in_([TaskStatus.RUNNING, TaskStatus.PENDING])
     assert (
