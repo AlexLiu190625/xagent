@@ -1989,3 +1989,40 @@ def test_checkpoint_partition_read_failure_is_translated_and_chained(
     finally:
         clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
         db.close()
+
+
+def test_checkpoint_read_for_missing_task_row_is_unavailable_not_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A vanished task row is an exceptional condition, not a policy one.
+
+    Refusal means "a checkpoint may exist but this reader is not the one
+    allowed to observe it", which callers answer by leaving the task
+    alone. A task row that is simply gone tells the reader nothing about
+    the partition, so it belongs with the read failures instead -- the two
+    verdicts are decided on adjacent branches and must not collapse.
+    """
+    from xagent.core.agent.checkpoint import (
+        CheckpointAccessRefusedError,
+        CheckpointUnavailableError,
+    )
+    from xagent.web.services.ops_signals import (
+        CHECKPOINT_LOAD_UNAVAILABLE,
+        clear_degradation,
+    )
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        monkeypatch.setattr(
+            "xagent.web.api.trace_handlers.get_db",
+            lambda: _get_db_factory(SessionLocal),
+        )
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        handler = DatabaseTraceHandler(999999)
+        with pytest.raises(CheckpointUnavailableError) as missing_row:
+            handler._sync_load_latest_checkpoint("exec-missing-task")
+        assert not isinstance(missing_row.value, CheckpointAccessRefusedError)
+    finally:
+        clear_degradation(CHECKPOINT_LOAD_UNAVAILABLE)
+        db.close()
