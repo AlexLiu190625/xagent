@@ -157,6 +157,7 @@ async def _schedule_waiting_a2a_resume(
     task_lease: TaskLease,
     heartbeat_stop: asyncio.Event,
     heartbeat_task: asyncio.Task[TaskLeaseHeartbeatOutcome],
+    resumable_status: TaskStatus,
 ) -> None:
     from .websocket import background_task_manager, execute_resume_background
 
@@ -177,6 +178,10 @@ async def _schedule_waiting_a2a_resume(
                 preacquired_lease=task_lease,
                 preacquired_heartbeat_stop=heartbeat_stop,
                 preacquired_heartbeat_task=heartbeat_task,
+                # The prelease claimed this task out of an input-required
+                # status; hand that over so a checkpoint the resume cannot
+                # read restores it instead of failing it terminally.
+                preacquired_prior_status=resumable_status,
             )
         )
         background_task_manager.register_reserved_resume(task_id, bg_task)
@@ -444,6 +449,7 @@ async def _resume_input_required_a2a_task(
             task_lease=task_lease,
             heartbeat_stop=heartbeat_stop,
             heartbeat_task=heartbeat_task,
+            resumable_status=resumable_status,
         )
         ownership_transferred = True
     except (

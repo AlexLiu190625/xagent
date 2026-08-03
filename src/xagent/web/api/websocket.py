@@ -2983,6 +2983,7 @@ async def execute_resume_background(
     preacquired_lease: TaskLease | None = None,
     preacquired_heartbeat_stop: asyncio.Event | None = None,
     preacquired_heartbeat_task: (asyncio.Task[TaskLeaseHeartbeatOutcome] | None) = None,
+    preacquired_prior_status: TaskStatus | None = None,
 ) -> None:
     """Resume an agent execution after an interrupt/user-message checkpoint.
 
@@ -3000,10 +3001,13 @@ async def execute_resume_background(
     settlement_error: str | None = None
     broadcast_error_message: str | None = None
     defer_db_cleanup_to_ttl_recovery = False
-    # Captured just before lease acquisition flips the task to RUNNING; the
-    # checkpoint-unavailable/refused recovery path below restores to this
-    # instead of a terminal FAILED. Stays None when this call adopted a
-    # preacquired lease (no acquisition happened here to capture it from).
+    # The status this task held before a lease claim flipped it to RUNNING;
+    # the checkpoint-unavailable/refused recovery path below restores to
+    # this instead of a terminal FAILED. Captured at acquisition when this
+    # call claims the lease, and handed over by the claimant when the lease
+    # was preacquired -- a caller that claims the lease elsewhere owns the
+    # same obligation, or its resume would answer a transient read failure
+    # by downgrading a still-resumable task.
     resume_prior_status: TaskStatus | None = None
     restore_lease_to_prior_status: TaskStatus | None = None
     result: Dict[str, Any] | None = None
@@ -3105,6 +3109,10 @@ async def execute_resume_background(
                 raise ValueError(
                     "The preacquired resume lease does not match expected_run_id"
                 )
+            # Adopt the claimant's pre-acquisition status so the recovery
+            # path below is wired on this entry too, not only when this
+            # call claimed the lease itself.
+            resume_prior_status = preacquired_prior_status
         if previous_task is not None and not previous_task.done():
             try:
                 await previous_task
