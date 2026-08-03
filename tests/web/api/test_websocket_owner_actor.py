@@ -24,6 +24,11 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import QueuePool
 
 from tests.shared.execution_scope import register_scope_resolver
+from xagent.core.agent.checkpoint import (
+    CheckpointAccessRefusedError,
+    CheckpointCorruptError,
+    CheckpointUnavailableError,
+)
 from xagent.core.execution_scope import (
     ExecutionScope,
 )
@@ -1388,6 +1393,148 @@ async def test_deferred_chat_message_is_acked_after_durable_command_commit(
     assert kwargs["delivery_already_dispatched"] is False
     assert kwargs["delivery_websocket"] is None
     assert kwargs["delivery_client_message_id"] is None
+
+
+@pytest.mark.asyncio
+async def test_live_lease_injection_degrades_to_deferred_on_checkpoint_unavailable(
+    db_session,
+) -> None:
+    """A checkpoint read failure during live injection must fold into the
+    same posted=False deferred-delivery path as no exact lease at all --
+    not a raw exception and not a rejection."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "unavailable-runner"
+    task.run_id = "unavailable-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(
+        side_effect=CheckpointUnavailableError("checkpoint query failed")
+    )
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+    websocket = MagicMock()
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await handle_chat_message(
+            websocket,
+            int(task.id),
+            {
+                "message": "Wait for the checkpoint",
+                "client_message_id": "unavailable-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+        for _ in range(100):
+            db_session.expire_all()
+            stored_command = (
+                db_session.query(TaskExecutionCommand)
+                .filter_by(task_id=int(task.id), command_id="unavailable-turn-1")
+                .one()
+            )
+            if (
+                stored_command.status == "pending"
+                and int(stored_command.attempt_count or 0) >= 1
+                and resume_bg.await_count == 1
+            ):
+                break
+            await asyncio.sleep(0.01)
+        else:
+            raise AssertionError("deferred command claim was not released in time")
+
+    accepted = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_accepted"
+    ]
+    assert len(accepted) == 1
+    assert accepted[0]["client_message_id"] == "unavailable-turn-1"
+    assert stored_command.status == "pending"
+    assert not any(
+        call.args[0].get("type") == "message_rejected"
+        for call in ws_manager.send_personal_message.call_args_list
+    )
+    kwargs = resume_bg.call_args.kwargs
+    assert kwargs["delivery_already_dispatched"] is False
+    assert kwargs["delivery_websocket"] is None
+    assert kwargs["delivery_client_message_id"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [
+        CheckpointCorruptError("all matching rows undecodable"),
+        CheckpointAccessRefusedError("active lease is not bound to this reader"),
+    ],
+)
+async def test_live_lease_injection_rejects_delivery_on_corrupt_or_refused(
+    db_session,
+    error: Exception,
+) -> None:
+    """Corrupt/refused are not retryable by deferring -- reject the claimed
+    delivery outright instead of scheduling a resume attempt."""
+    owner = _user(db_session, "owner")
+    task = _task(db_session, owner.id, status=TaskStatus.RUNNING)
+    task.runner_id = "rejected-runner"
+    task.run_id = "rejected-run"
+    db_session.commit()
+    agent = MagicMock()
+    agent.supports_live_control.return_value = True
+    agent.get_dag_pattern.return_value = None
+    agent.post_user_message = AsyncMock(side_effect=error)
+    mgr = MagicMock(get_agent_for_task=AsyncMock(return_value=agent))
+    ws_manager = MagicMock(
+        broadcast_to_task=AsyncMock(),
+        send_personal_message=AsyncMock(),
+    )
+    resume_bg = AsyncMock()
+    bg_mgr = MagicMock()
+    bg_mgr.reserve_resume.return_value = True
+    bg_mgr.running_tasks.get.return_value = None
+
+    with (
+        patch("xagent.web.api.chat.get_agent_manager", return_value=mgr),
+        patch("xagent.web.api.websocket.manager", ws_manager),
+        patch("xagent.web.api.websocket.execute_resume_background", resume_bg),
+        patch("xagent.web.api.websocket.background_task_manager", bg_mgr),
+    ):
+        await _handle_chat_message_unserialized(
+            MagicMock(),
+            int(task.id),
+            {
+                "message": "Wait for the checkpoint",
+                "client_message_id": "rejected-turn-1",
+                "user": owner,
+                "files": [],
+            },
+        )
+
+    resume_bg.assert_not_awaited()
+    bg_mgr.release_resume_reservation.assert_called_once_with(int(task.id))
+    rejected = [
+        call.args[0]
+        for call in ws_manager.send_personal_message.call_args_list
+        if call.args[0].get("type") == "message_rejected"
+    ]
+    assert len(rejected) == 1
+    assert rejected[0]["client_message_id"] == "rejected-turn-1"
+    assert rejected[0]["rejection_outcome"] == "not_accepted"
 
 
 @pytest.mark.asyncio
