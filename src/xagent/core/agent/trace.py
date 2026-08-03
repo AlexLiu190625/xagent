@@ -6,7 +6,7 @@ import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 from uuid import uuid4
 
 from ..utils.security import redact_sensitive_text
@@ -1028,7 +1028,14 @@ class Tracer:
         self,
         execution_id: str,
     ) -> Optional[Dict[str, Any]]:
-        """Load the latest checkpoint from the first handler that supports it."""
+        """Load the latest checkpoint from the first handler that supports it.
+
+        The first capable handler's result is authoritative -- including
+        ``None`` for "no checkpoint" -- and is returned verbatim without
+        probing a second handler. Every production stack today runs a
+        single reader, so treating a raise as "try the next handler" would
+        silently hide a failure instead of surfacing it to the caller.
+        """
         for handler in list(self.handlers):
             method = getattr(handler, "load_latest_checkpoint", None)
             if not callable(method):
@@ -1036,8 +1043,7 @@ class Tracer:
             payload = method(execution_id)
             if inspect.isawaitable(payload):
                 payload = await payload
-            if isinstance(payload, dict):
-                return payload
+            return cast(Optional[Dict[str, Any]], payload)
         return None
 
     async def get_latest_checkpoint(

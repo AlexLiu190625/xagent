@@ -9,8 +9,11 @@ from xagent.core.agent.checkpoint import (
     CHECKPOINT_EVENT_TYPE,
     CHECKPOINT_TYPE,
     LEGACY_CHECKPOINT_TYPES,
+    CheckpointCorruptError,
     CheckpointPersistenceError,
+    CheckpointUnavailableError,
     TraceCheckpointStore,
+    read_latest_checkpoint_payload,
 )
 from xagent.core.agent.trace import TraceEvent, TraceHandler, Tracer
 
@@ -253,3 +256,128 @@ async def test_runner_can_use_trace_checkpoint_store_for_resume() -> None:
     assert loaded is not None
     assert loaded["label"] == "final"
     assert loaded["context"]["messages"][-1]["content"] == "done"
+
+
+class RaisingCheckpointReader:
+    """Sole checkpoint-capable handler; a second handler must never run."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        raise self.error
+
+
+class UnreachableCheckpointReader:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        del execution_id
+        self.calls += 1
+        raise AssertionError("a prior capable reader already answered")
+
+
+@pytest.mark.asyncio
+async def test_tracer_returns_first_reader_result_verbatim_including_none() -> None:
+    """The first capable handler's result is authoritative -- Tracer must not
+    probe a second handler after a valid ``None`` (absent) result."""
+    tracer = Tracer()
+
+    class NoneReturningHandler:
+        async def load_latest_checkpoint(
+            self, execution_id: str
+        ) -> dict[str, Any] | None:
+            del execution_id
+            return None
+
+    unreachable = UnreachableCheckpointReader()
+    tracer.add_handler(NoneReturningHandler())
+    tracer.add_handler(unreachable)
+
+    result = await tracer.load_latest_checkpoint("exec-first-reader-wins")
+
+    assert result is None
+    assert unreachable.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_tracer_propagates_first_reader_exception() -> None:
+    """A raising first reader must abort the lookup, not fall through to a
+    second handler -- today's production stacks all run a single reader, so
+    treating a raise as "try the next one" would hide the failure."""
+    tracer = Tracer()
+    unreachable = UnreachableCheckpointReader()
+    tracer.add_handler(RaisingCheckpointReader(CheckpointUnavailableError("down")))
+    tracer.add_handler(unreachable)
+
+    with pytest.raises(CheckpointUnavailableError):
+        await tracer.load_latest_checkpoint("exec-raising-reader")
+
+    assert unreachable.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_read_latest_checkpoint_payload_propagates_reader_exception() -> None:
+    reader = RaisingCheckpointReader(CheckpointUnavailableError("down"))
+
+    with pytest.raises(CheckpointUnavailableError):
+        await read_latest_checkpoint_payload(reader, "exec-raising-probe")
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_propagates_reader_exception() -> None:
+    store = TraceCheckpointStore(
+        RaisingCheckpointReader(CheckpointUnavailableError("down"))
+    )
+
+    with pytest.raises(CheckpointUnavailableError):
+        await store.load_latest_checkpoint("exec-raising-store")
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_returns_none_without_raising() -> None:
+    """A wrapped reader's authoritative ``None`` must pass through as
+    absence, not be misread as an unrecognized (corrupt) shape."""
+
+    class NoneReturningReader:
+        async def load_latest_checkpoint(
+            self, execution_id: str
+        ) -> dict[str, Any] | None:
+            del execution_id
+            return None
+
+    store = TraceCheckpointStore(NoneReturningReader())
+
+    assert await store.load_latest_checkpoint("exec-none-passthrough") is None
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_unrecognized_shape_raises_corrupt() -> None:
+    class UnrecognizedShapeReader:
+        async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+            del execution_id
+            return {"unexpected": "shape"}
+
+    store = TraceCheckpointStore(UnrecognizedShapeReader())
+
+    with pytest.raises(CheckpointCorruptError):
+        await store.load_latest_checkpoint("exec-unrecognized-shape")
+
+
+@pytest.mark.asyncio
+async def test_trace_checkpoint_store_readable_type_without_snapshot_raises_corrupt() -> (
+    None
+):
+    class NoSnapshotReader:
+        async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+            return {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": execution_id,
+            }
+
+    store = TraceCheckpointStore(NoSnapshotReader())
+
+    with pytest.raises(CheckpointCorruptError):
+        await store.load_latest_checkpoint("exec-no-snapshot")

@@ -14,6 +14,7 @@ from xagent.core.agent import (
     PatternRuntime,
     TraceEventCallback,
 )
+from xagent.core.agent.checkpoint import CheckpointUnavailableError
 from xagent.core.agent.runner import AgentRunner
 from xagent.core.agent.runtime import LLMCallInterrupted
 from xagent.core.task_runtime import PREFERRED_INPUT_MODALITIES_METADATA_KEY
@@ -305,6 +306,118 @@ async def test_runner_treats_canonical_empty_checkpoint_as_authoritative() -> No
 
     assert context is None
     assert checkpoint_store.legacy_reads == 0
+
+
+class UnavailableCheckpointStore:
+    """Every read fails -- distinct from ``EmptyCanonicalCheckpointStore``,
+    whose ``None`` is an authoritative "no checkpoint" the runner may act
+    on by building fresh state."""
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any]:
+        del execution_id
+        raise CheckpointUnavailableError("checkpoint store unavailable")
+
+
+class FlakyOnceCheckpointStore:
+    """Fails the first read, then behaves like a normal checkpoint store.
+
+    Models a transient failure during ``inject_user_message``'s baseline
+    read: the retry after the failure must actually persist the message,
+    not find a "ghost" confirmation left behind by the rejected attempt.
+    """
+
+    def __init__(self) -> None:
+        self.by_execution_id: dict[str, dict[str, Any]] = {}
+        self.load_calls = 0
+
+    async def checkpoint(self, **payload: Any) -> None:
+        self.by_execution_id[str(payload["execution_id"])] = dict(payload)
+
+    async def load_latest_checkpoint(self, execution_id: str) -> dict[str, Any] | None:
+        self.load_calls += 1
+        if self.load_calls == 1:
+            raise CheckpointUnavailableError("transient")
+        payload = self.by_execution_id.get(execution_id)
+        return dict(payload) if payload is not None else None
+
+
+@pytest.mark.asyncio
+async def test_run_resume_does_not_build_fresh_context_on_unavailable() -> None:
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=UnavailableCheckpointStore(),
+    )
+    build_context_calls: list[Any] = []
+    original_build_context = runner._build_context
+
+    async def spy_build_context(*args: Any, **kwargs: Any) -> Any:
+        build_context_calls.append((args, kwargs))
+        return await original_build_context(*args, **kwargs)
+
+    runner._build_context = spy_build_context  # type: ignore[method-assign]
+
+    with pytest.raises(CheckpointUnavailableError):
+        await runner.run(
+            task=None,
+            execution_id="exec-resume-unavailable",
+            resume=True,
+        )
+
+    assert build_context_calls == []
+    assert runner.context_manager.get_context("exec-resume-unavailable") is None
+
+
+@pytest.mark.asyncio
+async def test_inject_user_message_propagates_unavailable() -> None:
+    """Distinct from the canonical-empty-checkpoint case above: a read
+    failure must not be swallowed into the same ``None`` "no checkpoint"
+    result -- the caller cannot tell a real failure from genuine absence."""
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=UnavailableCheckpointStore(),
+    )
+
+    with pytest.raises(CheckpointUnavailableError):
+        await runner.inject_user_message(
+            "missing-execution-unavailable",
+            "Continue",
+            request_interrupt=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_inject_rejection_leaves_no_dedupe_residue() -> None:
+    tracer = FlakyOnceCheckpointStore()
+    runner = AgentRunner(
+        agent=Agent(name="checkpoint-reader", patterns=[], llm=None),
+        tracer=tracer,
+    )
+    context = ExecutionContext(execution_id="exec-residue")
+    runner.context_manager.set_context(context)
+
+    with pytest.raises(CheckpointUnavailableError):
+        await runner.inject_user_message(
+            "exec-residue",
+            "Continue",
+            turn_id="turn-1",
+            request_interrupt=False,
+        )
+
+    # The rejected attempt must not have mutated the in-memory context.
+    assert context.messages == []
+
+    # A retry must actually persist the message -- it must not find a
+    # ghost confirmation left behind by the failed attempt above.
+    result = await runner.inject_user_message(
+        "exec-residue",
+        "Continue",
+        turn_id="turn-1",
+        request_interrupt=False,
+    )
+
+    assert result is context
+    assert len(context.messages) == 1
+    assert tracer.by_execution_id["exec-residue"]["context"]["messages"]
 
 
 @pytest.mark.asyncio

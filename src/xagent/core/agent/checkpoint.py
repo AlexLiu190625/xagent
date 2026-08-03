@@ -220,21 +220,39 @@ class TraceCheckpointStore:
         }
 
     def _unwrap_checkpoint_payload(self, payload: Any) -> dict[str, Any] | None:
-        if not isinstance(payload, dict):
+        # ``None`` is the reader's authoritative "no checkpoint" -- pass it
+        # through unchanged. Anything else that isn't a recognized shape is
+        # corrupt, not absent: a caller must not treat a malformed payload
+        # as "build fresh state".
+        if payload is None:
             return None
+        if not isinstance(payload, dict):
+            raise CheckpointCorruptError(
+                "Checkpoint reader returned a non-dict, non-None payload."
+            )
         if payload.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES:
             snapshot = payload.get("snapshot")
-            return dict(snapshot) if isinstance(snapshot, dict) else None
+            if isinstance(snapshot, dict):
+                return dict(snapshot)
+            raise CheckpointCorruptError(
+                "Checkpoint payload has a readable checkpoint_type but no snapshot."
+            )
         data = payload.get("data")
         if (
             isinstance(data, dict)
             and data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES
         ):
             snapshot = data.get("snapshot")
-            return dict(snapshot) if isinstance(snapshot, dict) else None
+            if isinstance(snapshot, dict):
+                return dict(snapshot)
+            raise CheckpointCorruptError(
+                "Checkpoint payload has a readable checkpoint_type but no snapshot."
+            )
         if payload.get("type") == "checkpoint" or "context" in payload:
             return dict(payload)
-        return None
+        raise CheckpointCorruptError(
+            "Checkpoint payload shape is not recognized by any reader."
+        )
 
     def _execution_id(self, payload: dict[str, Any]) -> str:
         execution_id = payload.get("execution_id")
