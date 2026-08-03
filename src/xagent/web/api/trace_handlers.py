@@ -57,6 +57,31 @@ logger = logging.getLogger(__name__)
 CHECKPOINT_ROW_SCAN_LIMIT = 100
 
 
+def _checkpoint_execution_id_predicate(execution_id: str) -> Any:
+    """SQL mirror of ``checkpoint_execution_id()``: root wins, then the flat
+    field, then the snapshot's own id -- so legacy rows that only set one of
+    them are not skipped. The read query and history pruning must agree on
+    which rows belong to one execution, or pruning could drop a row the read
+    path still considers current (or vice versa); both consume this one
+    predicate rather than keeping independently maintained copies in sync by
+    hand.
+    """
+    return (
+        func.coalesce(
+            func.nullif(
+                DatabaseTraceEvent.data["root_execution_id"].as_string(),
+                "",
+            ),
+            func.nullif(
+                DatabaseTraceEvent.data["execution_id"].as_string(),
+                "",
+            ),
+            DatabaseTraceEvent.data["snapshot"]["execution_id"].as_string(),
+        )
+        == execution_id
+    )
+
+
 def _convert_float_to_datetime(timestamp: Any) -> datetime:
     """Convert float timestamp to datetime for database storage."""
     if isinstance(timestamp, (int, float)):
@@ -155,22 +180,11 @@ class DatabaseTraceHandler(BaseTraceHandler):
                 DatabaseTraceEvent.data["checkpoint_type"]
                 .as_string()
                 .in_(sorted(READABLE_CHECKPOINT_TYPES)),
-                # SQL mirror of checkpoint_execution_id(): root wins, then
-                # the flat field, then the snapshot's own id. The LIMIT
-                # below bounds this predicate's matching set, not an
-                # unfiltered row scan, so a zero-row result is authoritative.
-                func.coalesce(
-                    func.nullif(
-                        DatabaseTraceEvent.data["root_execution_id"].as_string(),
-                        "",
-                    ),
-                    func.nullif(
-                        DatabaseTraceEvent.data["execution_id"].as_string(),
-                        "",
-                    ),
-                    DatabaseTraceEvent.data["snapshot"]["execution_id"].as_string(),
-                )
-                == str(execution_id),
+                # The page size below bounds this predicate's matching set,
+                # not an unfiltered row scan, so a page shorter than it
+                # proves the matching set exhausted (see the scan loop
+                # below), and a zero-row first page is authoritative.
+                _checkpoint_execution_id_predicate(str(execution_id)),
             )
             if self.build_id is None:
                 try:
@@ -586,21 +600,7 @@ class DatabaseTraceHandler(BaseTraceHandler):
                     DatabaseTraceEvent.data["checkpoint_type"]
                     .as_string()
                     .in_(sorted(READABLE_CHECKPOINT_TYPES)),
-                    # SQL mirror of checkpoint_execution_id(): root wins,
-                    # then the flat field, then the snapshot's own id, so
-                    # legacy rows that only set one of them are not skipped.
-                    func.coalesce(
-                        func.nullif(
-                            DatabaseTraceEvent.data["root_execution_id"].as_string(),
-                            "",
-                        ),
-                        func.nullif(
-                            DatabaseTraceEvent.data["execution_id"].as_string(),
-                            "",
-                        ),
-                        DatabaseTraceEvent.data["snapshot"]["execution_id"].as_string(),
-                    )
-                    == execution_id,
+                    _checkpoint_execution_id_predicate(execution_id),
                 )
                 .order_by(
                     DatabaseTraceEvent.timestamp.desc(),

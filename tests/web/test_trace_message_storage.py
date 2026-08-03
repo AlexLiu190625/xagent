@@ -1412,6 +1412,85 @@ def test_prune_matches_legacy_execution_id_shapes(
         db.close()
 
 
+def test_checkpoint_execution_id_predicate_matches_the_python_helper() -> None:
+    """The read query and history pruning share one SQL predicate; it must
+    agree with ``checkpoint_execution_id()`` (the Python SSOT the storage
+    encoder also follows) on every shape a stored row can take, not just the
+    common one. A row with no execution-id information anywhere never
+    matches a real, non-empty id -- absence and the empty string are the
+    same SQL fact."""
+    from xagent.core.agent.checkpoint import checkpoint_execution_id
+    from xagent.web.api.trace_handlers import _checkpoint_execution_id_predicate
+
+    real_execution_id = "exec-parity-real"
+
+    SessionLocal = _session_factory()
+    db = SessionLocal()
+    try:
+        task = _create_task(db)
+        task_id = int(task.id)
+        rows = {
+            "absent-fields": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {"context": {"messages": []}},
+            },
+            "present-but-empty": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": "",
+                "execution_id": "",
+                "snapshot": {"context": {"messages": []}},
+            },
+            "snapshot-only": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "snapshot": {
+                    "execution_id": real_execution_id,
+                    "context": {"messages": []},
+                },
+            },
+            "tagged-only": {
+                "checkpoint_type": CHECKPOINT_TYPE,
+                "root_execution_id": real_execution_id,
+                "snapshot": {"context": {"messages": []}},
+            },
+        }
+        for event_id, data in rows.items():
+            db.add(
+                DatabaseTraceEvent(
+                    task_id=task_id,
+                    event_id=event_id,
+                    event_type="system_update_general",
+                    timestamp=datetime.now(timezone.utc),
+                    data=data,
+                )
+            )
+        db.commit()
+
+        # The Python SSOT: only the two id-bearing shapes resolve to the
+        # real execution id, regardless of whether it came from the root
+        # tag or the nested snapshot.
+        expected_matches = {"snapshot-only", "tagged-only"}
+        for event_id, data in rows.items():
+            resolved = checkpoint_execution_id(data)
+            if event_id in expected_matches:
+                assert resolved == real_execution_id, event_id
+            else:
+                assert resolved == "", event_id
+
+        # The SQL predicate must select exactly the same matching set.
+        matched_ids = {
+            row.event_id
+            for row in db.query(DatabaseTraceEvent)
+            .filter(
+                DatabaseTraceEvent.task_id == task_id,
+                _checkpoint_execution_id_predicate(real_execution_id),
+            )
+            .all()
+        }
+        assert matched_ids == expected_matches
+    finally:
+        db.close()
+
+
 def test_database_trace_handler_prune_disabled_keeps_all_checkpoints(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

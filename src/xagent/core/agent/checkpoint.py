@@ -232,6 +232,20 @@ class TraceCheckpointStore:
             "snapshot": dict(payload),
         }
 
+    def _validate_snapshot(self, container: dict[str, Any]) -> dict[str, Any]:
+        """Return the readable checkpoint's snapshot, or raise if absent.
+
+        A container whose ``checkpoint_type`` is readable but that carries no
+        ``snapshot`` dict claims to be a checkpoint while holding no payload
+        -- corrupt, not absent.
+        """
+        snapshot = container.get("snapshot")
+        if isinstance(snapshot, dict):
+            return dict(snapshot)
+        raise CheckpointCorruptError(
+            "Checkpoint payload has a readable checkpoint_type but no snapshot."
+        )
+
     def _unwrap_checkpoint_payload(self, payload: Any) -> dict[str, Any] | None:
         # ``None`` is the reader's authoritative "no checkpoint" -- pass it
         # through unchanged. Anything else that isn't a recognized shape is
@@ -244,23 +258,13 @@ class TraceCheckpointStore:
                 "Checkpoint reader returned a non-dict, non-None payload."
             )
         if payload.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES:
-            snapshot = payload.get("snapshot")
-            if isinstance(snapshot, dict):
-                return dict(snapshot)
-            raise CheckpointCorruptError(
-                "Checkpoint payload has a readable checkpoint_type but no snapshot."
-            )
+            return self._validate_snapshot(payload)
         data = payload.get("data")
         if (
             isinstance(data, dict)
             and data.get("checkpoint_type") in READABLE_CHECKPOINT_TYPES
         ):
-            snapshot = data.get("snapshot")
-            if isinstance(snapshot, dict):
-                return dict(snapshot)
-            raise CheckpointCorruptError(
-                "Checkpoint payload has a readable checkpoint_type but no snapshot."
-            )
+            return self._validate_snapshot(data)
         if payload.get("type") == "checkpoint" or "context" in payload:
             return dict(payload)
         raise CheckpointCorruptError(
