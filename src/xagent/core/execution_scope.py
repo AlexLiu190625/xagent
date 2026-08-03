@@ -95,7 +95,7 @@ ExecutionScopeInput = Union[
 # ``agent_config`` mapping, NOT an already-decoded scope. Decoding here rather
 # than at the caller is what keeps each resolution branch's tolerance for a
 # malformed snapshot correct by construction -- see
-# :func:`_load_execution_scope_snapshot`.
+# :func:`_decode_execution_scope_snapshot`.
 ExecutionScopeSnapshotSource = Union[
     Mapping[str, Any],
     None,
@@ -533,9 +533,27 @@ def execution_scope_from_agent_config(
 
     if not isinstance(agent_config, Mapping):
         return None
-    scope_data = agent_config.get(EXECUTION_SCOPE_AGENT_CONFIG_KEY)
-    if not isinstance(scope_data, Mapping):
+    if EXECUTION_SCOPE_AGENT_CONFIG_KEY not in agent_config:
         return None
+    scope_data = agent_config.get(EXECUTION_SCOPE_AGENT_CONFIG_KEY)
+    if scope_data is None:
+        return None
+    if not isinstance(scope_data, Mapping):
+        # Present but the wrong shape is corrupt, not absent. Reporting "no
+        # candidate" here would make the same silent substitution the
+        # invalid-field case below already refuses to make: on the branches
+        # where the snapshot is the only namespace authority, "absent" resolves
+        # to unscoped, or to the abstention's fallback -- which is the widest
+        # value the narrowing check would ever admit.
+        logger.error(
+            "Persisted execution scope snapshot for a task is a %s, not a "
+            "mapping; treating it as corrupt rather than absent",
+            type(scope_data).__name__,
+        )
+        raise ExecutionScopeResolverContractError(
+            "persisted execution scope snapshot is not a mapping "
+            f"({type(scope_data).__name__}); it cannot be decoded"
+        )
     try:
         return ExecutionScope.from_dict(scope_data)
     except InvalidScopeComponentError as exc:
@@ -1325,7 +1343,7 @@ def _execution_scope_narrowing_violations(
     return violations
 
 
-def _load_execution_scope_snapshot(
+def _decode_execution_scope_snapshot(
     task_id: str | int,
     persisted_agent_config: ExecutionScopeSnapshotSource,
 ) -> Optional[ExecutionScope]:
@@ -1351,17 +1369,6 @@ def _load_execution_scope_snapshot(
             if _execution_scope_snapshot_loader is not None
             else None
         )
-    if isinstance(persisted_agent_config, ExecutionScope):
-        # An already-decoded scope would not be a Mapping, so the decode below
-        # would read it as "this task carries no snapshot" -- which on the
-        # branches that must fail closed is indistinguishable from an
-        # authoritative unscoped answer. Refuse it instead of silently
-        # dropping the caller's value.
-        raise ExecutionScopeResolverContractError(
-            "persisted_agent_config takes the task's raw agent_config mapping, "
-            "not an already-decoded ExecutionScope; the snapshot inside it is "
-            "decoded here so each resolution branch keeps its own tolerance"
-        )
     return execution_scope_from_agent_config(
         cast(Optional[Mapping[str, Any]], persisted_agent_config)
     )
@@ -1378,7 +1385,7 @@ def _validate_execution_scope_snapshot_candidate(
 
     Both the authoritative and resolver-abstention branches of
     :func:`resolve_execution_scope` route a freshly loaded snapshot through
-    this one check rather than duplicating it. ``_load_execution_scope_snapshot``
+    this one check rather than duplicating it. ``_decode_execution_scope_snapshot``
     only ``cast()``s the loader's return (a static type hint, not a runtime
     check), so nothing upstream of this function enforces that the loader
     actually honored its contract -- without this gate, a loader returning a
@@ -1571,10 +1578,27 @@ def resolve_execution_scope(
             "task_id cannot be None; a caller without a task identity "
             "must treat the execution as unscoped instead"
         )
+    if isinstance(persisted_agent_config, ExecutionScope):
+        # Checked here, before any branch dispatch, and deliberately not where
+        # the value is consumed: the authoritative branch wraps its load in a
+        # tolerant except so a bad *candidate* cannot veto a real answer, and a
+        # raise from inside that wrapper would be absorbed and reported as a
+        # loader failure. This is a caller bug, not a data problem, so which
+        # branch happens to be active must not decide whether it is heard.
+        #
+        # The value itself would otherwise fail silently rather than loudly: an
+        # already-decoded scope is not a Mapping, so it decodes to "this task
+        # carries no snapshot", which on the two fail-closed branches is
+        # indistinguishable from an authoritative unscoped answer.
+        raise ExecutionScopeResolverContractError(
+            "persisted_agent_config takes the task's raw agent_config mapping, "
+            "not an already-decoded ExecutionScope; the snapshot inside it is "
+            "decoded during resolution so each branch keeps its own tolerance"
+        )
 
     resolver = _execution_scope_resolver
     if resolver is None:
-        return _load_execution_scope_snapshot(task_id, persisted_agent_config)
+        return _decode_execution_scope_snapshot(task_id, persisted_agent_config)
 
     resolved = resolver(str(task_id))
 
@@ -1583,7 +1607,7 @@ def resolve_execution_scope(
         # this task's scope, so a broken loader means nobody knows, and the
         # turn faces that reach this branch must fail closed rather than
         # silently proceed unscoped or under a stale fallback.
-        snapshot = _load_execution_scope_snapshot(task_id, persisted_agent_config)
+        snapshot = _decode_execution_scope_snapshot(task_id, persisted_agent_config)
         snapshot = _validate_execution_scope_snapshot_candidate(
             task_id,
             snapshot,
@@ -1684,7 +1708,7 @@ def resolve_execution_scope(
         )
 
     try:
-        snapshot = _load_execution_scope_snapshot(task_id, persisted_agent_config)
+        snapshot = _decode_execution_scope_snapshot(task_id, persisted_agent_config)
     except Exception:
         logger.warning(
             "Snapshot loader failed while the resolver returned an "

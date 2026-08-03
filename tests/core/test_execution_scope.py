@@ -2403,3 +2403,68 @@ class TestPersistedAgentConfigRejectsADecodedScope:
             )
             == scope
         )
+
+
+class TestWrongTypedSnapshotIsCorruptNotAbsent:
+    """A present ``execution_scope`` that is not a mapping cannot be decoded,
+    exactly like a mapping with an invalid field. Reporting "no candidate" for
+    one shape and raising for the other would make the same accidental
+    namespace decision on every branch where the snapshot is the only
+    authority."""
+
+    @pytest.mark.parametrize("value", ["garbage-string", ["a"], 5, True])
+    def test_present_but_wrong_typed_raises(self, value):
+        with pytest.raises(ExecutionScopeResolverContractError):
+            execution_scope_from_agent_config({EXECUTION_SCOPE_AGENT_CONFIG_KEY: value})
+
+    def test_absent_key_is_still_absent(self):
+        assert execution_scope_from_agent_config({"other": 1}) is None
+
+    def test_explicit_null_is_still_absent(self):
+        assert (
+            execution_scope_from_agent_config({EXECUTION_SCOPE_AGENT_CONFIG_KEY: None})
+            is None
+        )
+
+    def test_wrong_typed_snapshot_fails_the_abstention_branch(self):
+        """The branch where "absent" would resolve to the abstention's
+        fallback -- the widest value the narrowing check would ever admit."""
+        set_execution_scope_resolver(
+            lambda task_id: DeferToSnapshot(fallback=ExecutionScope()),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope(
+                "1",
+                persisted_agent_config={
+                    EXECUTION_SCOPE_AGENT_CONFIG_KEY: "garbage-string"
+                },
+            )
+
+
+class TestDecodedScopeGuardRunsBeforeBranchDispatch:
+    """The guard rejects a caller bug, so which resolver happens to be
+    registered must not decide whether it is heard. The authoritative branch
+    wraps its snapshot load in a tolerant except -- so a bad candidate cannot
+    veto a real answer -- and a raise from inside that wrapper would be
+    absorbed and misreported as a loader failure."""
+
+    def test_raises_with_an_authoritative_resolver_registered(self):
+        set_execution_scope_resolver(
+            lambda task_id: ExecutionScope(sandbox_key_suffix="from-resolver"),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope(
+                "1", persisted_agent_config=ExecutionScope(sandbox_key_suffix="s")
+            )
+
+    def test_raises_when_the_resolver_abstains(self):
+        set_execution_scope_resolver(
+            lambda task_id: DeferToSnapshot(fallback=ExecutionScope()),
+            acknowledges_snapshot_candidate_contract=True,
+        )
+        with pytest.raises(ExecutionScopeResolverContractError):
+            resolve_execution_scope(
+                "1", persisted_agent_config=ExecutionScope(sandbox_key_suffix="s")
+            )

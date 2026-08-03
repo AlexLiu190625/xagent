@@ -16,8 +16,7 @@ The resolve and bind steps are deliberately split:
     caller-owned claim transaction. :func:`bind_turn_files` is the
     compatibility wrapper for owners that need an immediate commit.
 
-The WebSocket path keeps its resolve-then-bind-in-one behavior via
-``handle_file_upload_for_task``, which now delegates to both.
+Both transports call the two steps directly.
 """
 
 from __future__ import annotations
