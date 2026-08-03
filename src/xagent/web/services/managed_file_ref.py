@@ -16,6 +16,7 @@ from ...core.execution_scope import (
     ExecutionScope,
     ExecutionScopeAuthorityError,
     ExecutionScopeInput,
+    ExecutionScopeResolverContractError,
     get_execution_scope,
     resolve_execution_scope,
     resolve_execution_scope_off_turn,
@@ -63,14 +64,19 @@ class DurableObjectIntegrityError(DurableStorageOperationError):
 # outside the prefix this handle is bound to (the key encodes the wrong
 # namespace, or the handle was bound to the wrong one), and
 # ``ExecutionScopeAuthorityError`` means the resolver and the persisted
-# snapshot disagree about which namespace the task owns. Both are permanent
-# configuration/authority faults that no retry can clear, so they propagate as
-# themselves and are classified once, at the application boundary (see the
-# handler registered in ``web/app.py``), instead of being reported as an
-# outage an operator would retry.
+# snapshot disagree about which namespace the task owns, and
+# ``ExecutionScopeResolverContractError`` means a resolver broke its return
+# contract or the persisted snapshot cannot be decoded at all -- reachable
+# here because binding the handle settles a deferred per-task resolution (see
+# ``_bound_storage``). All three are permanent configuration/authority faults
+# that no retry can clear, so they propagate as themselves and are classified
+# once, at the application boundary (see the handlers registered in
+# ``web/app.py``), instead of being reported as an outage an operator would
+# retry.
 _NAMESPACE_AUTHORITY_ERRORS: tuple[type[BaseException], ...] = (
     StorageKeyScopeError,
     ExecutionScopeAuthorityError,
+    ExecutionScopeResolverContractError,
 )
 
 

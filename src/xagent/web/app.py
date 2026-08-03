@@ -31,7 +31,10 @@ from ..config import (
     get_uploaded_file_recovery_stale_seconds,
     get_uploads_dir,
 )
-from ..core.execution_scope import ExecutionScopeAuthorityError
+from ..core.execution_scope import (
+    ExecutionScopeAuthorityError,
+    ExecutionScopeResolverContractError,
+)
 from ..core.file_storage import StorageKeyScopeError
 from ..core.tracing.langfuse import flush_langfuse, initialize_langfuse
 from .api.a2a import router as a2a_router
@@ -812,9 +815,11 @@ async def storage_namespace_authority_error_handler(
     """Answer a storage namespace containment/authority fault once, app-wide.
 
     ``StorageKeyScopeError`` (a storage key outside the prefix its handle is
-    bound to) and ``ExecutionScopeAuthorityError`` (the scope resolver and a
-    task's persisted snapshot disagree about the task's namespace) are
-    permanent server-side configuration/authority faults. Registering them
+    bound to), ``ExecutionScopeAuthorityError`` (the scope resolver and a
+    task's persisted snapshot disagree about the task's namespace) and
+    ``ExecutionScopeResolverContractError`` (a resolver broke its return
+    contract, or a persisted snapshot cannot be decoded at all) are permanent
+    server-side configuration/authority faults. Registering them
     here instead of at each file endpoint keeps one classification for every
     route that touches durable storage -- and keeps them out of the retryable
     503 that ``DurableStorageOperationError`` maps to, since retrying a
@@ -874,6 +879,12 @@ app.add_exception_handler(
 # handler by walking the raised exception's MRO.
 app.add_exception_handler(
     ExecutionScopeAuthorityError, storage_namespace_authority_error_handler
+)
+# A resolver that broke its return contract, or a persisted snapshot that
+# cannot be decoded, is the same permanent authority fault: nothing about the
+# request can be corrected or retried into working.
+app.add_exception_handler(
+    ExecutionScopeResolverContractError, storage_namespace_authority_error_handler
 )
 
 # /v1/* SDK surface uses a stable {"error": {"code", "message"}} envelope

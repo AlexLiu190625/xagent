@@ -25,6 +25,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -33,12 +34,7 @@ from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from ...core.agent.attachments import project_file_info_to_chip
-from ...core.execution_scope import (
-    ExecutionScope,
-    ExecutionScopeResolverContractError,
-    execution_scope_from_agent_config,
-    resolve_execution_scope,
-)
+from ...core.execution_scope import resolve_execution_scope
 from ...core.file_ref import FILE_REF_MODEL_INSTRUCTIONS
 from ..models.database import release_db_connection_if_clean
 from ..models.task import Task
@@ -66,32 +62,22 @@ class _TurnFileRecordSnapshot:
 def _task_execution_scope_in_session(
     db: Session,
     task_id: int | None,
-) -> tuple[int | None, ExecutionScope | None]:
-    """Read the persisted half of canonical scope resolution in this Session.
+) -> tuple[int | None, Mapping[str, Any] | None]:
+    """Read the raw ``agent_config`` this Session owns, undecoded.
 
-    A snapshot that fails field validation is reported as "no candidate"
-    rather than raised. The registered-loader path decodes inside
-    ``resolve_execution_scope``'s own try/except, where a malformed candidate
-    is logged and ignored so an authoritative resolver still answers the
-    turn; this call site sits outside that umbrella, so it applies the same
-    tolerance itself. Without it the two paths would refuse and accept the
-    very same persisted row differently, and a corrupt row would fail a turn
-    that the resolver could have answered on its own.
+    The snapshot inside it is decoded by ``resolve_execution_scope``, not
+    here. Whether a malformed snapshot is tolerated depends on which
+    resolution branch is active -- an authoritative resolver can ignore a bad
+    candidate and answer on its own, while an abstaining resolver or no
+    resolver at all must fail closed, because there the snapshot is the only
+    namespace authority and "no candidate" would silently mean "unscoped".
+    Only the resolver knows which case it is in, so the decode belongs there.
     """
 
     if task_id is None:
         return None, None
     row = db.query(Task.agent_config).filter(Task.id == task_id).first()
-    try:
-        return task_id, execution_scope_from_agent_config(row[0] if row else None)
-    except ExecutionScopeResolverContractError:
-        logger.warning(
-            "Ignoring malformed persisted execution scope snapshot for task %s; "
-            "the resolver's answer stands alone for this turn",
-            task_id,
-            exc_info=True,
-        )
-        return task_id, None
+    return task_id, (row[0] if row else None)
 
 
 def normalize_filename(filename: str) -> str:
@@ -232,7 +218,9 @@ def resolve_turn_file_infos(
             )
         )
 
-    scope_task_id, persisted_scope = _task_execution_scope_in_session(db, task_id)
+    scope_task_id, persisted_agent_config = _task_execution_scope_in_session(
+        db, task_id
+    )
     if snapshots and not release_db_connection_if_clean(db):
         raise RuntimeError(
             "Turn file materialization requires a read-only database phase"
@@ -240,7 +228,7 @@ def resolve_turn_file_infos(
     execution_scope = (
         resolve_execution_scope(
             scope_task_id,
-            persisted_snapshot=persisted_scope,
+            persisted_agent_config=persisted_agent_config,
         )
         if scope_task_id is not None
         else None

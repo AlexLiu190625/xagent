@@ -174,16 +174,23 @@ class TestSnapshotCandidatePrecedence:
         assert exc_info.value.snapshot_scope == SCOPE
         assert "sandbox_key_suffix" in exc_info.value.mismatched_fields
 
-    def test_caller_supplied_snapshot_skips_registered_loader(self):
+    def test_caller_supplied_agent_config_skips_registered_loader(self):
+        """A caller that already read the task row hands over the raw
+        ``agent_config``; the snapshot inside it is decoded here rather than by
+        the caller, so a malformed one is tolerated or fatal per branch."""
         loader_calls = []
         set_execution_scope_snapshot_loader(
             lambda task_id: loader_calls.append(task_id)
         )
 
-        assert resolve_execution_scope(42, persisted_snapshot=SCOPE) == SCOPE
+        resolved = resolve_execution_scope(
+            42,
+            persisted_agent_config={EXECUTION_SCOPE_AGENT_CONFIG_KEY: SCOPE.to_dict()},
+        )
+        assert resolved == SCOPE
         assert loader_calls == []
 
-    def test_caller_supplied_missing_snapshot_leaves_resolver_authoritative(self):
+    def test_caller_supplied_missing_agent_config_leaves_resolver_authoritative(self):
         loader_calls = []
         resolver_calls = []
         resolved = ExecutionScope(sandbox_key_suffix="from-resolver")
@@ -194,7 +201,9 @@ class TestSnapshotCandidatePrecedence:
             lambda task_id: resolver_calls.append(task_id) or resolved,
         )
 
-        assert resolve_execution_scope(42, persisted_snapshot=None) == resolved
+        # Explicit ``None`` means "this task carries no agent_config", which
+        # leaves the resolver's answer standing rather than forcing unscoped.
+        assert resolve_execution_scope(42, persisted_agent_config=None) == resolved
         assert loader_calls == []
         assert resolver_calls == ["42"]
 

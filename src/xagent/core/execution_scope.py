@@ -90,6 +90,18 @@ ExecutionScopeInput = Union[
     ExecutionScopeNotProvided,
 ]
 
+# What a caller may hand :func:`resolve_execution_scope` in place of letting
+# the registered loader read the persisted snapshot: the task's raw
+# ``agent_config`` mapping, NOT an already-decoded scope. Decoding here rather
+# than at the caller is what keeps each resolution branch's tolerance for a
+# malformed snapshot correct by construction -- see
+# :func:`_load_execution_scope_snapshot`.
+ExecutionScopeSnapshotSource = Union[
+    Mapping[str, Any],
+    None,
+    ExecutionScopeNotProvided,
+]
+
 
 class InvalidScopeComponentError(ValueError):
     """A scope component failed validation.
@@ -1315,21 +1327,33 @@ def _execution_scope_narrowing_violations(
 
 def _load_execution_scope_snapshot(
     task_id: str | int,
-    persisted_snapshot: ExecutionScopeInput,
+    persisted_agent_config: ExecutionScopeSnapshotSource,
 ) -> Optional[ExecutionScope]:
-    """Fetch the persisted snapshot, honoring an explicitly-passed override.
+    """Produce the snapshot candidate, decoding it here rather than upstream.
 
-    A database owner that already read the persisted snapshot in its own
-    Session may pass it via ``persisted_snapshot`` to skip the registered
-    loader (see :func:`resolve_execution_scope`).
+    A database owner that already read the task row in its own Session may
+    hand over the raw ``agent_config`` via ``persisted_agent_config`` to skip
+    the registered loader (see :func:`resolve_execution_scope`).
+
+    The decode deliberately happens inside this function, so a snapshot that
+    fails field validation raises from the same place the registered loader
+    would raise: whether that is tolerated is then decided by which branch of
+    :func:`resolve_execution_scope` is calling, exactly as it is for the
+    loader. A caller that decoded first and passed the result would have to
+    reimplement that per-branch policy, and passing ``None`` after a failed
+    decode would read as "no snapshot exists" -- which on the branches that
+    must fail closed is indistinguishable from an authoritative
+    "unscoped".
     """
-    if persisted_snapshot is EXECUTION_SCOPE_NOT_PROVIDED:
+    if persisted_agent_config is EXECUTION_SCOPE_NOT_PROVIDED:
         return (
             _execution_scope_snapshot_loader(str(task_id))
             if _execution_scope_snapshot_loader is not None
             else None
         )
-    return cast(Optional[ExecutionScope], persisted_snapshot)
+    return execution_scope_from_agent_config(
+        cast(Optional[Mapping[str, Any]], persisted_agent_config)
+    )
 
 
 def _validate_execution_scope_snapshot_candidate(
@@ -1427,7 +1451,9 @@ def _validate_execution_scope_snapshot_candidate(
 def resolve_execution_scope(
     task_id: str | int,
     *,
-    persisted_snapshot: ExecutionScopeInput = EXECUTION_SCOPE_NOT_PROVIDED,
+    persisted_agent_config: ExecutionScopeSnapshotSource = (
+        EXECUTION_SCOPE_NOT_PROVIDED
+    ),
 ) -> Optional[ExecutionScope]:
     """Resolve the scope for ``task_id``.
 
@@ -1502,10 +1528,12 @@ def resolve_execution_scope(
       :data:`_EXECUTION_SCOPE_POLICY_FIELDS`) is logged and the resolver's
       value still wins.
 
-    A database owner that already read the persisted snapshot may pass it
-    explicitly via ``persisted_snapshot``; this skips the registered loader
-    while preserving the same precedence. Explicit ``None`` means "snapshot
-    absent", not "force an unscoped task".
+    A database owner that already read the task row may hand over its raw
+    ``agent_config`` via ``persisted_agent_config``; this skips the registered
+    loader while preserving the same precedence, and the snapshot inside it is
+    decoded here so that a malformed one is tolerated or fatal according to
+    the branch below rather than according to the caller. Explicit ``None``
+    means "this task carries no agent_config", not "force an unscoped task".
 
     Raises:
         ValueError: ``task_id`` is None — ``str(None)`` would silently
@@ -1535,7 +1563,7 @@ def resolve_execution_scope(
 
     resolver = _execution_scope_resolver
     if resolver is None:
-        return _load_execution_scope_snapshot(task_id, persisted_snapshot)
+        return _load_execution_scope_snapshot(task_id, persisted_agent_config)
 
     resolved = resolver(str(task_id))
 
@@ -1544,7 +1572,7 @@ def resolve_execution_scope(
         # this task's scope, so a broken loader means nobody knows, and the
         # turn faces that reach this branch must fail closed rather than
         # silently proceed unscoped or under a stale fallback.
-        snapshot = _load_execution_scope_snapshot(task_id, persisted_snapshot)
+        snapshot = _load_execution_scope_snapshot(task_id, persisted_agent_config)
         snapshot = _validate_execution_scope_snapshot_candidate(
             task_id,
             snapshot,
@@ -1645,7 +1673,7 @@ def resolve_execution_scope(
         )
 
     try:
-        snapshot = _load_execution_scope_snapshot(task_id, persisted_snapshot)
+        snapshot = _load_execution_scope_snapshot(task_id, persisted_agent_config)
     except Exception:
         logger.warning(
             "Snapshot loader failed while the resolver returned an "
@@ -1679,7 +1707,11 @@ def resolve_execution_scope(
             "Execution scope authority mismatch for task %s: %s. Every turn of "
             "this task fails until the persisted snapshot agrees with the "
             "resolver: clear the %r key from this task's agent_config to let "
-            "the resolver's answer stand alone, or correct it to match.",
+            "the resolver's answer stand alone, or correct it to match. "
+            "Clearing relocates the task to the resolver's namespace, so any "
+            "workspace or sandbox subtree it already owns under the snapshot's "
+            "namespace is left behind -- correct the snapshot instead where "
+            "that subtree still matters.",
             task_id,
             diff,
             EXECUTION_SCOPE_AGENT_CONFIG_KEY,
