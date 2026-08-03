@@ -570,3 +570,10 @@ def test_monitor_active_agents_in_site_matches_raw_comparison() -> None:
     assert (
         _compiled(raw) == _compiled(bound) == "tasks.status IN ('RUNNING', 'PENDING')"
     )
+
+
+def test_in_rejects_a_bare_member_with_a_descriptive_error() -> None:
+    with pytest.raises(TypeError, match="wrap a single member in a list"):
+        task_status_predicate.in_(TaskStatus.RUNNING)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="wrap a single member in a list"):
+        task_status_predicate.not_in("RUNNING")  # type: ignore[arg-type]

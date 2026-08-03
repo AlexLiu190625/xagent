@@ -119,12 +119,14 @@ def _compare_touches_task_status(node: ast.Compare) -> bool:
 
 
 def _is_update_task_call(node: ast.AST) -> bool:
-    return (
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "update"
-        and any(isinstance(arg, ast.Name) and arg.id == "Task" for arg in node.args)
-    )
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    is_update_name = isinstance(func, ast.Name) and func.id == "update"
+    is_update_attr = isinstance(func, ast.Attribute) and func.attr == "update"
+    if not (is_update_name or is_update_attr):
+        return False
+    return any(isinstance(arg, ast.Name) and arg.id == "Task" for arg in node.args)
 
 
 def _chain_contains_update_task(node: ast.AST) -> bool:

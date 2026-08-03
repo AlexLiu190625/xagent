@@ -233,3 +233,16 @@ def test_scan_root_is_src_xagent() -> None:
     # subpackage would silently shrink the forward guard's coverage without
     # any test going red elsewhere.
     assert SCAN_ROOT == REPO_ROOT / "src" / "xagent"
+
+
+def test_guard_detects_attribute_style_update_calls() -> None:
+    source = (
+        "import sqlalchemy as sa\n"
+        "def f(db):\n"
+        "    db.execute(sa.update(Task).values(status=TaskStatus.RUNNING))\n"
+    )
+    violations = scan_source(source, "fixture_attribute_update.py")
+    assert {v.kind for v in violations} == {ViolationKind.VALUES_KEYWORD}, (
+        "an update(Task) call reached through an attribute (sa.update, "
+        "sqlalchemy.update) must be scanned the same as a bare update(Task)"
+    )

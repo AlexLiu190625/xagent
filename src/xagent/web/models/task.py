@@ -275,6 +275,11 @@ def _require_task_status(status: Any) -> TaskStatus:
 def _require_task_status_members(
     statuses: Collection[TaskStatus],
 ) -> tuple[TaskStatus, ...]:
+    if isinstance(statuses, (TaskStatus, str)):
+        raise TypeError(
+            "expected a collection of TaskStatus members, got a bare "
+            f"{type(statuses).__name__}; wrap a single member in a list"
+        )
     members = tuple(statuses)
     if not members:
         raise ValueError("task status predicate requires at least one TaskStatus")
