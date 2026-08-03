@@ -24,7 +24,6 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -61,8 +60,14 @@ class _TurnFileRecordSnapshot:
 def _task_execution_scope_in_session(
     db: Session,
     task_id: int | None,
-) -> tuple[int | None, Mapping[str, Any] | None]:
+) -> tuple[int | None, Any]:
     """Read the raw ``agent_config`` this Session owns, undecoded.
+
+    The second element is whatever the untyped JSON column holds, which is why
+    it is not annotated as a mapping: nothing between the database and here
+    validates its shape, and claiming one would describe a guarantee no layer
+    provides. ``resolve_execution_scope`` narrows it, and rejects a value the
+    column should never have held.
 
     The snapshot inside it is decoded by ``resolve_execution_scope``, not
     here. Whether a malformed snapshot is tolerated depends on which
