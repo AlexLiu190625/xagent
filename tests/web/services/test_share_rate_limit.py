@@ -142,6 +142,64 @@ def test_ws_connect_is_per_ip(monkeypatch: pytest.MonkeyPatch) -> None:
     assert limiter.allow_ws_connect(None) is False
 
 
+def test_widget_ws_connect_is_per_ip(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The widget WS handshake budget mirrors the share one (#1056): keyed per
+    caller IP because it runs pre-auth, but in its own bucket so probes against
+    one public channel cannot consume the other's budget."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT="2/minute",
+        XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_widget_ws_connect("1.2.3.4") is True
+    assert limiter.allow_widget_ws_connect("1.2.3.4") is True
+    assert limiter.allow_widget_ws_connect("1.2.3.4") is False
+    # Another caller is unaffected; a missing IP degrades to a shared bucket
+    # rather than bypassing the gate.
+    assert limiter.allow_widget_ws_connect("5.6.7.8") is True
+    assert limiter.allow_widget_ws_connect(None) is True
+    assert limiter.allow_widget_ws_connect(None) is True
+    assert limiter.allow_widget_ws_connect(None) is False
+    # The share connect bucket is untouched by widget attempts.
+    assert limiter.allow_ws_connect("1.2.3.4") is True
+
+
+def test_widget_ws_turn_per_ip_bucket_trips_across_entities(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-IP is the tight abuser bucket (#1056): the widget guest_id is
+    client-supplied (rotatable at will), so unlike the share turn gate the
+    widget one is keyed on caller IP — rotating the entity (or guest) must not
+    escape it."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_WS_TURN_RATE_LIMIT="100/minute",
+        XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT="2/minute",
+    )
+    assert limiter.allow_widget_ws_turn("agent:1", "9.9.9.9") is True
+    assert limiter.allow_widget_ws_turn("workforce:2", "9.9.9.9") is True
+    assert limiter.allow_widget_ws_turn("agent:3", "9.9.9.9") is False
+    # A different caller is unaffected.
+    assert limiter.allow_widget_ws_turn("agent:1", "8.8.8.8") is True
+
+
+def test_widget_ws_turn_entity_ceiling_trips_across_ips(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Per-entity is the loose backstop bounding total owner-billed turn volume
+    through one widget, across many callers."""
+    limiter = _limiter_with(
+        monkeypatch,
+        XAGENT_WIDGET_WS_TURN_RATE_LIMIT="2/minute",
+        XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT="100/minute",
+    )
+    assert limiter.allow_widget_ws_turn("workforce:7", "1.1.1.1") is True
+    assert limiter.allow_widget_ws_turn("workforce:7", "2.2.2.2") is True
+    assert limiter.allow_widget_ws_turn("workforce:7", "3.3.3.3") is False
+    # A different widget entity has its own bucket.
+    assert limiter.allow_widget_ws_turn("workforce:8", "4.4.4.4") is True
+
+
 def test_run_quota_per_share_and_per_guest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -206,4 +264,6 @@ def test_all_gates_fail_open_on_backend_error(
     assert limiter.allow_ws_connect("1.1.1.1") is True
     assert limiter.allow_upload("g") is True
     assert limiter.allow_widget_upload("agent:1", "1.1.1.1") is True
+    assert limiter.allow_widget_ws_connect("1.1.1.1") is True
+    assert limiter.allow_widget_ws_turn("agent:1", "1.1.1.1") is True
     assert limiter.allow_run("agent:1", "g") is True

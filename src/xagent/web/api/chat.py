@@ -2905,20 +2905,19 @@ class AgentServiceManager:
                     lambda: _load_task_share_quota_config_isolated(int(tracker_task_id))
                 )
                 if share_config is not None:
+                    from ..services.share_rate_limit import (
+                        entity_rate_limit_key,
+                        get_share_rate_limiter,
+                    )
+
                     guest_id = share_config.get("guest_id")
                     workforce_id = share_config.get("share_workforce_id")
                     agent_share_id = share_config.get("share_agent_id")
-                    if workforce_id is not None:
-                        share_key = f"workforce:{int(workforce_id)}"
-                    elif agent_share_id is not None:
-                        share_key = f"agent:{int(agent_share_id)}"
-                    else:
-                        share_key = None
+                    share_key = entity_rate_limit_key(
+                        int(agent_share_id) if agent_share_id is not None else None,
+                        int(workforce_id) if workforce_id is not None else None,
+                    )
                     if share_key and isinstance(guest_id, str) and guest_id:
-                        from ..services.share_rate_limit import (
-                            get_share_rate_limiter,
-                        )
-
                         if not get_share_rate_limiter().allow_run(share_key, guest_id):
                             reason_message = (
                                 "This shared link has reached its usage limit. "

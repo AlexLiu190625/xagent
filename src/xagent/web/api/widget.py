@@ -28,6 +28,7 @@ from ..models.workforce import Workforce
 from ..schemas.chat import TaskCreateRequest, TaskCreateResponse
 from ..services.deployments import find_enabled_widget_deployment, get_deployment
 from ..services.share_rate_limit import (
+    entity_rate_limit_key,
     get_share_rate_limiter,
     remote_ip_from_request,
 )
@@ -469,10 +470,8 @@ async def upload_widget_file(
     # widget guest_id is client-supplied, so a guest-keyed bucket is
     # rotatable at will. Matters most for the task-less workforce branch,
     # where each admitted request can mint orphan rows until GC catches up.
-    entity_key = (
-        f"workforce:{widget_info.widget_workforce_id}"
-        if widget_info.widget_workforce_id is not None
-        else f"agent:{widget_info.widget_agent_id}"
+    entity_key = entity_rate_limit_key(
+        widget_info.widget_agent_id, widget_info.widget_workforce_id
     )
     if not get_share_rate_limiter().allow_widget_upload(
         entity_key, remote_ip_from_request(request)

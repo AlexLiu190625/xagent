@@ -40,7 +40,15 @@ async def test_public_access_websocket_authorization_uses_worker_owned_session(
     closed_sessions: list[bool] = []
     session = object()
     user = SimpleNamespace(id=73, is_admin=True)
-    access_context = SimpleNamespace(user=user, guest_id="guest-73")
+    # The widget entity ids are read by the public (widget) authorize path to
+    # derive the principal's rate-limit key (#1056); the share path never
+    # touches them.
+    access_context = SimpleNamespace(
+        user=user,
+        guest_id="guest-73",
+        widget_agent_id=7,
+        widget_workforce_id=None,
+    )
 
     class TrackingSession:
         def __enter__(self) -> object:
@@ -119,8 +127,19 @@ async def test_public_access_websocket_authorization_uses_worker_owned_session(
     assert all(thread_id != event_loop_thread for thread_id in operation_threads)
     assert is_dataclass(principal)
     assert principal.__dataclass_params__.frozen is True
-    assert {field.name for field in fields(principal)} == {"id", "is_admin", "guest_id"}
-    assert principal == WebSocketPrincipal(id=73, is_admin=True, guest_id="guest-73")
+    assert {field.name for field in fields(principal)} == {
+        "id",
+        "is_admin",
+        "guest_id",
+        "widget_entity_key",
+    }
+    # Only the widget authorize path derives the entity rate-limit key (#1056).
+    assert principal == WebSocketPrincipal(
+        id=73,
+        is_admin=True,
+        guest_id="guest-73",
+        widget_entity_key="agent:7" if endpoint_kind == "public" else None,
+    )
 
 
 @pytest.mark.asyncio

@@ -4701,6 +4701,11 @@ class WebSocketPrincipal:
     # Per-guest isolation credential for public widget/share transports
     # (#973). ``None`` for owner-authenticated sockets, which have no guest.
     guest_id: str | None = None
+    # Widget entity scope ("agent:<id>" / "workforce:<id>") for widget
+    # transports; ``None`` elsewhere. Carried as the turn rate-limit key
+    # (#1056): the widget ``guest_id`` above is client-supplied (rotatable at
+    # will), so widget throttles key on the entity + caller IP instead.
+    widget_entity_key: str | None = None
 
 
 def _load_websocket_principal_sync(token: str) -> WebSocketPrincipal | None:

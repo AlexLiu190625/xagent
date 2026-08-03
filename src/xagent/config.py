@@ -125,6 +125,9 @@ SHARE_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_SHARE_WS_CONNECT_IP_RATE_LIMIT"
 SHARE_UPLOAD_RATE_LIMIT = "XAGENT_SHARE_UPLOAD_RATE_LIMIT"
 WIDGET_UPLOAD_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_RATE_LIMIT"
 WIDGET_UPLOAD_IP_RATE_LIMIT = "XAGENT_WIDGET_UPLOAD_IP_RATE_LIMIT"
+WIDGET_WS_CONNECT_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_CONNECT_IP_RATE_LIMIT"
+WIDGET_WS_TURN_IP_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_IP_RATE_LIMIT"
+WIDGET_WS_TURN_RATE_LIMIT = "XAGENT_WIDGET_WS_TURN_RATE_LIMIT"
 SHARE_RUN_QUOTA = "XAGENT_SHARE_RUN_QUOTA"
 SHARE_RUN_GUEST_QUOTA = "XAGENT_SHARE_RUN_GUEST_QUOTA"
 GMAIL_PUBSUB_PROJECT_ID = "XAGENT_GMAIL_PUBSUB_PROJECT_ID"
@@ -937,6 +940,43 @@ def get_widget_upload_ip_rate_limit() -> str:
     The tighter bucket: bounds one abuser without a trustworthy per-guest
     key. Kept loose enough for enterprise NAT."""
     return _get_rate_limit(WIDGET_UPLOAD_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_ws_connect_ip_rate_limit() -> str:
+    """Per-IP limit on widget websocket connection attempts (#1056).
+
+    The widget websocket path mirrors the share handshake budget but in its
+    own bucket, so probes against one public channel cannot consume the
+    other's. Keyed per IP because the gate runs pre-auth; over-limit attempts
+    are refused pre-accept (no upgrade cost).
+    """
+    return _get_rate_limit(WIDGET_WS_CONNECT_IP_RATE_LIMIT, "120/minute")
+
+
+def get_widget_ws_turn_ip_rate_limit() -> str:
+    """Per-caller-IP limit on widget websocket turns (#1056).
+
+    The tighter turn bucket. Unlike the share turn gate this cannot key on
+    the guest: the widget ``guest_id`` is client-supplied and rotatable at
+    will, so the caller IP is the only per-abuser key available. The default
+    numerically matches the share per-guest turn rate, but this bucket is
+    per-IP: N guests behind one NAT egress share a single 60/minute budget
+    here, where the share path gives each guest its own. Raise it for
+    deployments with large shared-egress populations — and behind a reverse
+    proxy, set XAGENT_TRUSTED_PROXY_HOPS so all traffic does not collapse
+    onto the proxy's IP.
+    """
+    return _get_rate_limit(WIDGET_WS_TURN_IP_RATE_LIMIT, "60/minute")
+
+
+def get_widget_ws_turn_rate_limit() -> str:
+    """Per-widget-entity limit on widget websocket turns (#1056).
+
+    The loose backstop bounding total owner-billed turn volume through one
+    embedded agent/workforce across all callers (one widget serves many
+    legitimate guests).
+    """
+    return _get_rate_limit(WIDGET_WS_TURN_RATE_LIMIT, "240/minute")
 
 
 def get_share_run_quota() -> str:
